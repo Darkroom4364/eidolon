@@ -112,6 +112,7 @@ crates/
 
 docs/
   completed-project.md
+  landscape-validation-2026-05-03.md
   proposal.md
   architecture.md
   learning-hardness.md

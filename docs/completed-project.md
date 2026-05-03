@@ -8,6 +8,8 @@ The completed project is:
 Agentwall: an open-source active defense system for autonomous pentesting agents.
 ```
 
+`Agentwall` is the current internal project name. Public naming should be revisited before launch because multiple unrelated AgentWall / Agent Wall projects already exist in AI-agent security, MCP firewalling, and anti-scraping.
+
 It is not:
 
 - an AI honeypot
@@ -32,6 +34,13 @@ If a defender can safely control part of that evidence, the defender can:
 - generate evidence reports
 
 The complete system should make agentic reconnaissance measurable, misdirectable, and containable.
+
+After the 2026-05-03 landscape validation, the project should not claim novelty as generic cyber deception or active defense. The narrow claim is:
+
+```text
+target-side causal evidence and controlled-reality routing
+evaluated against modern autonomous pentesting agents
+```
 
 ## Completed Products
 
@@ -164,6 +173,7 @@ A strong completed v1 includes:
 - local demo target
 - pwnkit-style benchmark harness
 - one or more polymorphic bait chains
+- baseline comparison against no defense, static canary, static honeypot, and WAF-style block
 - trace engine
 - risk scoring
 - HTML/Markdown reports
@@ -190,4 +200,3 @@ A strong completed v2 includes:
 - published research results
 
 At v2, Agentwall becomes active defense infrastructure for autonomous cyber agents.
-

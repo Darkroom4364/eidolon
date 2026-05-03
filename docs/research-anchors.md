@@ -27,9 +27,30 @@ This file records the systems, papers, and categories that motivated Agentwall.
 - Thinkst Canarytokens
 - OpenCanary
 - Tracebit-style canaries
+- Acalvio 360 Deception / ShadowPlex
+- Cloudflare AI Labyrinth
+- DataDome Agent Trust
+- Palisade LLM Agent Honeypot
 - MITRE Engage / D3FEND
 - Kill-Chain Canaries
 - agent-aware canary systems such as Canar.ai
+
+## Agent / MCP Firewall Naming Collision
+
+The phrase "agent firewall" and the name "AgentWall" are already used by unrelated projects:
+
+- AgentWall for paywall / AI browser protection
+- Agent Wall for MCP/tool-call firewalling
+- Agent Wall for coding-agent OS safety
+- PipeLab / Pipelock style agent firewalls
+- Docker MCP Gateway, ToolHive, agentgateway, Invariant MCP-Scan
+
+Implication:
+
+```text
+Do not position Agentwall as a generic agent firewall.
+Position it as target-side active defense for autonomous pentesting agents.
+```
 
 ## Competitive Positioning
 
@@ -48,3 +69,10 @@ target-side active defense against autonomous pentesting agents
 through causal bait and trace reconstruction
 ```
 
+The 2026-05-03 validation tightened this to:
+
+```text
+target-side active defense against autonomous pentesting agents
+through causal bait, black-box trace reconstruction,
+controlled-reality routing, and baseline-measured causal lift
+```
