@@ -76,3 +76,5 @@ target-side active defense against autonomous pentesting agents
 through causal bait, black-box trace reconstruction,
 controlled-reality routing, and baseline-measured causal lift
 ```
+
+See [ai-labyrinth-vs-eidolon.md](ai-labyrinth-vs-eidolon.md) for the explicit distinction between crawler mazes and Eidolon's semantic bait-to-action model.

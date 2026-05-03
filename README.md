@@ -115,6 +115,7 @@ crates/
 docs/
   completed-project.md
   name.md
+  ai-labyrinth-vs-eidolon.md
   landscape-validation-2026-05-03.md
   proposal.md
   architecture.md
@@ -140,3 +141,5 @@ This repository is a project scaffold and documentation base. The first implemen
 - trace report
 
 For the end-state definition, see [docs/completed-project.md](docs/completed-project.md).
+
+For the key distinction from crawler mazes such as Cloudflare AI Labyrinth, see [docs/ai-labyrinth-vs-eidolon.md](docs/ai-labyrinth-vs-eidolon.md).
