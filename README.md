@@ -111,12 +111,14 @@ crates/
   agentwall-proxy/  reverse proxy entrypoint
 
 docs/
+  completed-project.md
   proposal.md
   architecture.md
   learning-hardness.md
   threat-model.md
   mvp-plan.md
   safety.md
+  research-anchors.md
 
 examples/
   scenarios/
@@ -132,3 +134,4 @@ This repository is a project scaffold and documentation base. The first implemen
 - event logging
 - trace report
 
+For the end-state definition, see [docs/completed-project.md](docs/completed-project.md).
