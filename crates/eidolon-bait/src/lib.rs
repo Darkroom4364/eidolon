@@ -1,4 +1,4 @@
-use agentwall_core::{Bait, BaitId, ExpectedAction, SurfaceKind};
+use eidolon_core::{Bait, BaitId, ExpectedAction, SurfaceKind};
 
 #[derive(Debug, Clone)]
 pub struct BasicBaitTemplate {

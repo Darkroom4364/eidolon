@@ -3,45 +3,6 @@
 version = 3
 
 [[package]]
-name = "agentwall-bait"
-version = "0.1.0"
-dependencies = [
- "agentwall-core",
- "serde",
-]
-
-[[package]]
-name = "agentwall-core"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "agentwall-proxy"
-version = "0.1.0"
-dependencies = [
- "agentwall-bait",
- "agentwall-core",
- "agentwall-trace",
- "anyhow",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "agentwall-trace"
-version = "0.1.0"
-dependencies = [
- "agentwall-core",
- "serde",
-]
-
-[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -107,6 +68,45 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "eidolon-bait"
+version = "0.1.0"
+dependencies = [
+ "eidolon-core",
+ "serde",
+]
+
+[[package]]
+name = "eidolon-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "eidolon-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eidolon-bait",
+ "eidolon-core",
+ "eidolon-trace",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "eidolon-trace"
+version = "0.1.0"
+dependencies = [
+ "eidolon-core",
+ "serde",
+]
 
 [[package]]
 name = "equivalent"

@@ -2,7 +2,7 @@
 
 ## Verdict
 
-Agentwall is not unique at the broad strategy level.
+Eidolon is not unique at the broad strategy level.
 
 The following areas are already active and crowded:
 
@@ -29,9 +29,9 @@ evaluated against modern autonomous pentesting agents rather than humans,
 generic malware, or simple crawlers.
 ```
 
-## Naming Risk
+## Naming Decision
 
-The name `Agentwall` is already crowded.
+The previous working name, `Agentwall`, was already crowded.
 
 Observed conflicts:
 
@@ -40,9 +40,14 @@ Observed conflicts:
 - [Agent Wall](https://agent-wall.github.io/agent-wall/) for MCP security.
 - `agentwall` packages for coding-agent OS/tool safety.
 
-This does not kill the technical project, but it does mean public naming and positioning need a deliberate decision before a serious launch.
+Decision:
 
-Working internal name can remain Agentwall. Public naming should be revisited.
+```text
+Use Eidolon as the project name.
+Treat Agentwall as the legacy codename.
+```
+
+This does not eliminate trademark/domain diligence, but it avoids the most immediate category confusion around "agent firewall" and AgentWall.
 
 ## Strongest Competitor Classes
 
@@ -61,7 +66,7 @@ Risk:
 
 They already sell deception, decoys, breadcrumbs, and SOC alerts.
 
-Agentwall must not look like a smaller deception platform.
+Eidolon must not look like a smaller deception platform.
 
 Differentiation:
 
@@ -87,7 +92,7 @@ They can detect, score, block, challenge, or misroute automated traffic at the e
 
 Differentiation:
 
-Agentwall should not compete on generic bot detection. It should focus on multi-step pentest-agent reasoning traces:
+Eidolon should not compete on generic bot detection. It should focus on multi-step pentest-agent reasoning traces:
 
 ```text
 agent saw decoy docs -> used fake token/header -> called fake API -> continued down decoy state machine
@@ -110,11 +115,11 @@ Risk:
 
 Differentiation:
 
-Agentwall protects the target being probed by external or unauthorized agents.
+Eidolon protects the target being probed by external or unauthorized agents.
 
 ```text
 agent firewall: protects the agent owner
-Agentwall wedge: protects the target from agentic recon and validation loops
+Eidolon wedge: protects the target from agentic recon and validation loops
 ```
 
 ### AI Agent Canaries / Honeypots
@@ -133,7 +138,7 @@ Canary tokens and prompt-injection probes are easy to copy. Agent-aware canaries
 
 Differentiation:
 
-Agentwall must go beyond "token was touched" into causal chains and controlled routing.
+Eidolon must go beyond "token was touched" into causal chains and controlled routing.
 
 ```text
 weak: an agent touched a canary
@@ -158,7 +163,7 @@ They define the threat model and may eventually add deception-resistance feature
 
 Differentiation:
 
-Agentwall should use these tools as evaluation subjects and publish evidence that its baits change their behavior under authorized lab conditions.
+Eidolon should use these tools as evaluation subjects and publish evidence that its baits change their behavior under authorized lab conditions.
 
 ## Academic Signals
 
@@ -173,7 +178,7 @@ Relevant findings:
 
 Implication:
 
-The roadmap must include a rigorous uniqueness bakeoff. Without metrics, Agentwall will be dismissed as another honeypot.
+The roadmap must include a rigorous uniqueness bakeoff. Without metrics, Eidolon will be dismissed as another honeypot.
 
 ## Forum And Practitioner Signals
 
@@ -190,7 +195,7 @@ Recurring objections:
 
 Implication:
 
-Agentwall should lead with boring evidence:
+Eidolon should lead with boring evidence:
 
 - false-positive rate
 - verified crawler/agent separation
@@ -253,7 +258,7 @@ one metrics table
 
 ## Go / No-Go Criteria
 
-Continue if Agentwall can show:
+Continue if Eidolon can show:
 
 - bait-derived action rate is meaningfully higher for agentic scanners than benign crawlers
 - false positives remain low under browser, crawler, and baseline DAST traffic
@@ -268,4 +273,3 @@ Kill or reframe if:
 - agentic scanners ignore all bait without loss of effectiveness
 - controlled reality creates unacceptable production safety or SEO/accessibility issues
 - reports cannot prove anything stronger than "someone touched a fake route"
-

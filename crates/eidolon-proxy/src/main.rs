@@ -1,6 +1,6 @@
-use agentwall_bait::{docs_for_bait, BasicBaitTemplate};
-use agentwall_core::{Event, EventKind, SessionId};
-use agentwall_trace::score_events;
+use eidolon_bait::{docs_for_bait, BasicBaitTemplate};
+use eidolon_core::{Event, EventKind, SessionId};
+use eidolon_trace::score_events;
 
 fn main() {
     let session_id = SessionId::new();

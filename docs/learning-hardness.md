@@ -2,7 +2,7 @@
 
 ## Goal
 
-Agentwall should be cheap for the defender and expensive for the attacker to learn.
+Eidolon should be cheap for the defender and expensive for the attacker to learn.
 
 This is not literal NP-completeness. The better target is:
 
@@ -14,7 +14,7 @@ The attacker-side problem:
 
 ```text
 Given only target-side observations, classify which surfaces are real
-and which surfaces are Agentwall-controlled.
+and which surfaces are Eidolon-controlled.
 ```
 
 We want that classification to be hard because:
@@ -51,7 +51,7 @@ This should be expensive.
 
 ## The Trilemma
 
-Agentwall should force autonomous pentesting agents into one of three bad modes:
+Eidolon should force autonomous pentesting agents into one of three bad modes:
 
 ```text
 1. Gullible
@@ -68,7 +68,7 @@ That trilemma is the real "Blackwall" effect.
 
 ## Public Algorithm, Private Seed
 
-Assume the attacker knows Agentwall exists.
+Assume the attacker knows Eidolon exists.
 
 Assume the source code is public.
 
@@ -94,7 +94,7 @@ hard classification for attacker
 
 Avoid:
 
-- fixed `/agentwall` paths
+- fixed `/eidolon` paths
 - fixed `aw-*` markers
 - repeated fake debug docs
 - obvious fake admin panels
@@ -113,7 +113,7 @@ Prefer:
 
 ## Runtime Should Not Require An LLM
 
-Agentwall Shield should not call an LLM on every request.
+Eidolon Shield should not call an LLM on every request.
 
 The production path should use:
 

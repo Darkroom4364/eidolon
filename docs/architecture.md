@@ -2,7 +2,7 @@
 
 ## Mental Model
 
-The full Agentwall project has five major parts:
+The full Eidolon project has five major parts:
 
 ```text
 1. Edge Boundary
@@ -19,7 +19,7 @@ external actor / scanner / autonomous agent
                   |
                   v
           +------------------+
-          | Agentwall Edge   |
+          | Eidolon Edge   |
           +------------------+
              |            |
              |            |
@@ -45,7 +45,7 @@ Responsibilities:
 - listen on a local/public port
 - identify or assign a session
 - forward normal traffic to the protected target
-- serve Agentwall-owned routes
+- serve Eidolon-owned routes
 - optionally inject controlled surfaces
 - emit structured events
 - enforce current policy state
@@ -82,7 +82,7 @@ For suspicious sessions it may expose controlled reality:
 - fake internal hostnames
 - decoy state machines
 
-Agentwall does not need to pollute the real app. The proxy can serve controlled surfaces itself.
+Eidolon does not need to pollute the real app. The proxy can serve controlled surfaces itself.
 
 ## 3. Bait/Canary Engine
 
@@ -221,11 +221,11 @@ The first useful version is much smaller than the full project:
 scanner
   |
   v
-agentwall-proxy
+eidolon-proxy
   |
   +--> real target
   |
-  +--> Agentwall-owned bait routes
+  +--> Eidolon-owned bait routes
 ```
 
 V0 components:
