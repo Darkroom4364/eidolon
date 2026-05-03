@@ -1,6 +1,6 @@
 # Research Anchors
 
-This file records the systems, papers, and categories that motivated Agentwall.
+This file records the systems, papers, and categories that motivated Eidolon.
 
 ## Autonomous Pentesting And Vulnerability Research
 
@@ -37,7 +37,7 @@ This file records the systems, papers, and categories that motivated Agentwall.
 
 ## Agent / MCP Firewall Naming Collision
 
-The phrase "agent firewall" and the name "AgentWall" are already used by unrelated projects:
+The phrase "agent firewall" and the previous working name "Agentwall" are already used by unrelated projects:
 
 - AgentWall for paywall / AI browser protection
 - Agent Wall for MCP/tool-call firewalling
@@ -48,13 +48,13 @@ The phrase "agent firewall" and the name "AgentWall" are already used by unrelat
 Implication:
 
 ```text
-Do not position Agentwall as a generic agent firewall.
+Do not position Eidolon as a generic agent firewall.
 Position it as target-side active defense for autonomous pentesting agents.
 ```
 
 ## Competitive Positioning
 
-Agentwall should not compete head-on as:
+Eidolon should not compete head-on as:
 
 - another autonomous pentester
 - another WAF

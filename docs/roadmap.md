@@ -1,6 +1,6 @@
 # Roadmap
 
-This roadmap turns the Agentwall vision into GitHub milestones and issue-sized chunks.
+This roadmap turns the Eidolon vision into GitHub milestones and issue-sized chunks.
 
 The intended order was revised after the 2026-05-03 landscape validation.
 
@@ -14,7 +14,7 @@ The intended order is now:
 
 ```text
 M0 Defensive Scope and Foundations
-M0.5 Agentwall Evaluation Harness
+M0.5 Eidolon Evaluation Harness
 M1 Observation and Intervention Proxy
 M1.5 Correlated Bait Primitives
 M2 Causal Evidence and Scoring
@@ -36,10 +36,10 @@ Issues:
 2. Add CI for fmt, build, clippy, and tests
 3. Add issue and PR templates with safety boundaries
 4. Add first unit tests for core bait/event/score types
-5. Decide public naming and positioning given AgentWall naming conflicts
+5. Confirm Eidolon public naming and positioning
 6. Document landscape validation and uniqueness risks
 
-## M0.5 Agentwall Evaluation Harness
+## M0.5 Eidolon Evaluation Harness
 
 Goal:
 
@@ -121,11 +121,11 @@ Issues:
 
 Goal:
 
-Prove whether Agentwall is meaningfully better than static deception and generic bot/WAF responses.
+Prove whether Eidolon is meaningfully better than static deception and generic bot/WAF responses.
 
 Issues:
 
-1. Run Agentwall MVP bakeoff against baselines
+1. Run Eidolon MVP bakeoff against baselines
 2. Produce internal uniqueness report with metrics table
 3. Identify bait classes that actually influence agent plans
 4. Decide go/no-go criteria for adaptive bait policy
@@ -140,14 +140,14 @@ Issues:
 
 1. Spike Cloudflare Worker deployment model
 2. Define integration contract for WAF/CDN bot scores
-3. Export Agentwall decisions as webhook/SIEM/WAF events
+3. Export Eidolon decisions as webhook/SIEM/WAF events
 4. Document SEO, accessibility, verified crawler, Tor/VPN, and analytics-safety constraints
 
 ## M5 Adaptive Bait Policy And Shield Hardening
 
 Goal:
 
-Only after the bakeoff succeeds, harden Agentwall Shield toward production-safe adaptive deception.
+Only after the bakeoff succeeds, harden Eidolon Shield toward production-safe adaptive deception.
 
 Issues:
 

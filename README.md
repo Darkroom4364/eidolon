@@ -1,6 +1,8 @@
-# Agentwall
+# Eidolon
 
-Agentwall is a Rust-first active defense project for autonomous cyber agents.
+Eidolon is a Rust-first active defense project for autonomous cyber agents.
+
+An eidolon is a phantom or constructed likeness. The name fits the core mechanism: show hostile autonomous agents a controlled likeness of the target, then trace whether they act on that synthetic evidence.
 
 The core idea:
 
@@ -13,18 +15,18 @@ and route suspicious sessions away from real assets.
 Short framing:
 
 ```text
-Agentwall is a Blackwall for autonomous cyber agents.
+Eidolon is a Blackwall for autonomous cyber agents.
 ```
 
 Precise framing:
 
 ```text
-Agentwall is target-side active defense for agentic reconnaissance and exploitation loops.
+Eidolon is target-side active defense for agentic reconnaissance and exploitation loops.
 ```
 
 ## What It Does
 
-Agentwall sits in front of a web app, API, docs site, repo mirror, or other exposed developer surface.
+Eidolon sits in front of a web app, API, docs site, repo mirror, or other exposed developer surface.
 
 It can:
 
@@ -39,14 +41,14 @@ It can:
 The first proof-of-concept is deliberately narrow:
 
 ```text
-agentic scanner -> Agentwall proxy -> local target app
+agentic scanner -> Eidolon proxy -> local target app
 ```
 
-Agentwall adds safe fake surfaces such as docs, OpenAPI routes, and sterile debug endpoints. If a scanner consumes the fake evidence and acts on it, Agentwall can correlate the chain.
+Eidolon adds safe fake surfaces such as docs, OpenAPI routes, and sterile debug endpoints. If a scanner consumes the fake evidence and acts on it, Eidolon can correlate the chain.
 
 ## What It Is Not
 
-Agentwall is not:
+Eidolon is not:
 
 - a hack-back tool
 - malware
@@ -81,20 +83,20 @@ later:
   X-Debug-Bypass: rel_2025_04_b7f2
 ```
 
-Agentwall does not need the agent's chain of thought. It infers behavior from target-side observations.
+Eidolon does not need the agent's chain of thought. It infers behavior from target-side observations.
 
 ## Project Modes
 
-Agentwall has two related modes.
+Eidolon has two related modes.
 
 ```text
-Agentwall Lab
+Eidolon Lab
 ```
 
 A research harness for evaluating autonomous pentesting systems under controlled deception.
 
 ```text
-Agentwall Shield
+Eidolon Shield
 ```
 
 A deployable target-side defense layer for web/API surfaces.
@@ -105,13 +107,14 @@ Lab comes first. Shield comes after the mechanism is proven.
 
 ```text
 crates/
-  agentwall-core/   shared event, bait, policy, and scoring types
-  agentwall-bait/   bait generation and verification primitives
-  agentwall-trace/  event correlation and trace reconstruction
-  agentwall-proxy/  reverse proxy entrypoint
+  eidolon-core/   shared event, bait, policy, and scoring types
+  eidolon-bait/   bait generation and verification primitives
+  eidolon-trace/  event correlation and trace reconstruction
+  eidolon-proxy/  reverse proxy entrypoint
 
 docs/
   completed-project.md
+  name.md
   landscape-validation-2026-05-03.md
   proposal.md
   architecture.md

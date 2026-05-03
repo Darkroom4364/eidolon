@@ -1,4 +1,4 @@
-# Agentwall Target Shield Proposal
+# Eidolon Target Shield Proposal
 
 ## One-Line Thesis
 
@@ -7,13 +7,13 @@ Build a Rust-first active defense layer that protects web apps, APIs, docs, repo
 Short version:
 
 ```text
-Agentwall is a Blackwall for autonomous cyber agents.
+Eidolon is a Blackwall for autonomous cyber agents.
 ```
 
 More precise version:
 
 ```text
-Agentwall is target-side active defense for agentic reconnaissance and exploitation loops.
+Eidolon is target-side active defense for agentic reconnaissance and exploitation loops.
 ```
 
 ## Ausgangslage
@@ -32,7 +32,7 @@ The relevant shift is not merely that language models can write exploit code. Th
 
 That creates a different defensive surface. Traditional tools mostly look at packets, payloads, signatures, indicators, users, endpoint behavior, or known exploit patterns.
 
-Agentwall focuses on the agent loop:
+Eidolon focuses on the agent loop:
 
 ```text
 observe -> hypothesize -> act -> interpret -> continue
@@ -44,7 +44,7 @@ The project starts from a simple question:
 
 ## Full Project Picture
 
-Agentwall is not just a proxy with fake routes.
+Eidolon is not just a proxy with fake routes.
 
 The full project is a defensive boundary that controls the reality an autonomous cyber agent is allowed to observe.
 
@@ -62,14 +62,14 @@ There are three worlds:
    The boundary that decides which actor sees which reality.
 ```
 
-Agentwall is the observation layer.
+Eidolon is the observation layer.
 
 ```text
 external actor
       |
       v
 +----------------+
-|   Agentwall    |
+|   Eidolon    |
 +----------------+
    |          |
    v          v
@@ -80,9 +80,9 @@ The goal is not just to catch agents.
 
 The goal is to move suspicious autonomous agents out of the real world and into a controlled world before they get useful access.
 
-## What Agentwall Does
+## What Eidolon Does
 
-Agentwall does four things:
+Eidolon does four things:
 
 ```text
 observe
@@ -157,7 +157,7 @@ this session followed a bait-induced action chain
 
 ### Contain
 
-Once confidence rises, Agentwall changes the environment:
+Once confidence rises, Eidolon changes the environment:
 
 - observe only
 - slow down
@@ -192,11 +192,11 @@ later:
   X-Migration-Trace: rel_2025_04_b7f2
 ```
 
-That sequence proves the actor consumed the planted clue and acted on it. Agentwall does not need access to the agent's chain of thought.
+That sequence proves the actor consumed the planted clue and acted on it. Eidolon does not need access to the agent's chain of thought.
 
 ## Definition Of Sabotage
 
-Agentwall may sabotage a hostile agent's attack loop inside the protected boundary.
+Eidolon may sabotage a hostile agent's attack loop inside the protected boundary.
 
 Allowed:
 
@@ -220,8 +220,8 @@ Not allowed:
 The rule:
 
 ```text
-Agentwall may degrade hostile behavior inside our boundary.
-Agentwall may not compromise infrastructure outside our boundary.
+Eidolon may degrade hostile behavior inside our boundary.
+Eidolon may not compromise infrastructure outside our boundary.
 ```
 
 ## Why This Is Not Just A Honeypot
@@ -232,7 +232,7 @@ A classic honeypot or canary says:
 someone touched a fake thing
 ```
 
-Agentwall should say:
+Eidolon should say:
 
 ```text
 this actor consumed controlled evidence, selected a hypothesis from it,
@@ -250,11 +250,11 @@ The novelty must be:
 - measurement of verification discipline
 - comparison of autonomous pentesting agents under deception
 
-If Agentwall does not build the trace/correlation layer, it collapses into a normal deception tool.
+If Eidolon does not build the trace/correlation layer, it collapses into a normal deception tool.
 
 ## Product Modes
 
-### Agentwall Lab
+### Eidolon Lab
 
 A research and evaluation harness.
 
@@ -268,7 +268,7 @@ Purpose:
 
 Lab comes first because it is easier to prove safely.
 
-### Agentwall Shield
+### Eidolon Shield
 
 A deployable target-side defense layer.
 
@@ -286,7 +286,7 @@ Shield comes after Lab proves the core mechanism.
 Build first as:
 
 ```text
-Agentwall Lab + Target Shield MVP
+Eidolon Lab + Target Shield MVP
 ```
 
 Do not start with:

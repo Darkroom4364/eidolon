@@ -1,5 +1,5 @@
 [package]
-name = "agentwall-proxy"
+name = "eidolon-proxy"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agentwall-bait = { path = "../agentwall-bait" }
-agentwall-core = { path = "../agentwall-core" }
-agentwall-trace = { path = "../agentwall-trace" }
+eidolon-bait = { path = "../eidolon-bait" }
+eidolon-core = { path = "../eidolon-core" }
+eidolon-trace = { path = "../eidolon-trace" }
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true

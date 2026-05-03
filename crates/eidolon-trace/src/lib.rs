@@ -1,4 +1,4 @@
-use agentwall_core::{ConfidenceBand, Event, EventKind, Score};
+use eidolon_core::{ConfidenceBand, Event, EventKind, Score};
 
 pub fn score_events(events: &[Event]) -> Score {
     let mut points = 0;

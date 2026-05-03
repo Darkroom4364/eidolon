@@ -2,7 +2,7 @@
 
 ## In Scope
 
-Agentwall is designed for:
+Eidolon is designed for:
 
 - autonomous pentesting frameworks
 - LLM-driven web/API scanners
@@ -37,9 +37,9 @@ The first target class is web/API/developer-surface reconnaissance:
 
 ## Defensive Boundary
 
-Agentwall may degrade hostile behavior inside the protected boundary.
+Eidolon may degrade hostile behavior inside the protected boundary.
 
-Agentwall may not compromise infrastructure outside the protected boundary.
+Eidolon may not compromise infrastructure outside the protected boundary.
 
 Allowed:
 
@@ -98,5 +98,5 @@ Prefer:
 High-confidence bait-derived autonomous recon/action chain observed
 ```
 
-Agentwall detects behavior, not ontology. It does not need to prove the actor is an LLM.
+Eidolon detects behavior, not ontology. It does not need to prove the actor is an LLM.
 

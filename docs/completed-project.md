@@ -5,10 +5,10 @@
 The completed project is:
 
 ```text
-Agentwall: an open-source active defense system for autonomous pentesting agents.
+Eidolon: an open-source active defense system for autonomous pentesting agents.
 ```
 
-`Agentwall` is the current internal project name. Public naming should be revisited before launch because multiple unrelated AgentWall / Agent Wall projects already exist in AI-agent security, MCP firewalling, and anti-scraping.
+`Eidolon` replaces the previous working name `Agentwall`, which was too close to existing AgentWall / Agent Wall projects in AI-agent security, MCP firewalling, and anti-scraping.
 
 It is not:
 
@@ -22,7 +22,7 @@ The finished system controls the reality autonomous cyber agents are allowed to 
 
 ## Core Claim
 
-Agentwall exists because autonomous pentesting agents depend on target-side evidence.
+Eidolon exists because autonomous pentesting agents depend on target-side evidence.
 
 If a defender can safely control part of that evidence, the defender can:
 
@@ -44,9 +44,9 @@ evaluated against modern autonomous pentesting agents
 
 ## Completed Products
 
-### Agentwall Lab
+### Eidolon Lab
 
-Agentwall Lab is the research and evaluation harness.
+Eidolon Lab is the research and evaluation harness.
 
 It tests pwnkit/XBOW-style systems against instrumented targets and answers:
 
@@ -67,9 +67,9 @@ Outputs:
 
 Lab is the scientific core of the project.
 
-### Agentwall Shield
+### Eidolon Shield
 
-Agentwall Shield is the deployable defensive boundary.
+Eidolon Shield is the deployable defensive boundary.
 
 Runtime shape:
 
@@ -77,7 +77,7 @@ Runtime shape:
 internet / scanner / agent
         |
         v
-Agentwall Shield
+Eidolon Shield
         |
         +--> real target
         |
@@ -104,10 +104,10 @@ Shield is the operational form of the research primitive proven in Lab.
 
 ```text
 1. Agent scans target.
-2. Agentwall exposes plausible controlled evidence.
+2. Eidolon exposes plausible controlled evidence.
 3. Agent acts on that evidence.
-4. Agentwall correlates action to bait.
-5. Agentwall raises confidence.
+4. Eidolon correlates action to bait.
+5. Eidolon raises confidence.
 6. Session is moved into controlled reality.
 7. Real assets are shielded.
 8. Defender gets a trace report.
@@ -121,7 +121,7 @@ The key feature is causal bait:
 bait clue -> unique expected action -> observed follow-up
 ```
 
-That is what makes Agentwall different from a normal honeypot.
+That is what makes Eidolon different from a normal honeypot.
 
 A honeypot says:
 
@@ -129,7 +129,7 @@ A honeypot says:
 someone touched a fake thing
 ```
 
-Agentwall should say:
+Eidolon should say:
 
 ```text
 this actor consumed controlled evidence, acted on it,
@@ -140,7 +140,7 @@ and followed a bait-induced action chain
 
 The deeper moat is not secrecy of implementation.
 
-Assume attackers know Agentwall exists and can read the source.
+Assume attackers know Eidolon exists and can read the source.
 
 The completed system should still be difficult to bypass because the attacker does not know:
 
@@ -150,7 +150,7 @@ The completed system should still be difficult to bypass because the attacker do
 - which session-specific variants were generated
 - which behavior threshold routes them into controlled reality
 
-Agentwall should force agents into a trilemma:
+Eidolon should force agents into a trilemma:
 
 ```text
 1. Gullible
@@ -183,7 +183,7 @@ The project is credible at v1 when it can show:
 
 ```text
 an autonomous pentesting agent interacts with a protected target,
-Agentwall infers its attack loop from black-box behavior,
+Eidolon infers its attack loop from black-box behavior,
 and the agent is contained without exposing real assets.
 ```
 
@@ -199,4 +199,4 @@ A strong completed v2 includes:
 - benchmark suite for autonomous pentesting agents
 - published research results
 
-At v2, Agentwall becomes active defense infrastructure for autonomous cyber agents.
+At v2, Eidolon becomes active defense infrastructure for autonomous cyber agents.

@@ -1,6 +1,6 @@
 # Safety And Ethics
 
-Agentwall is defensive active defense.
+Eidolon is defensive active defense.
 
 The project can intentionally degrade hostile autonomous attack loops, but only by controlling surfaces inside the protected boundary.
 

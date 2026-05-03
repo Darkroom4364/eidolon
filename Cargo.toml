@@ -1,16 +1,16 @@
 [workspace]
 members = [
-    "crates/agentwall-core",
-    "crates/agentwall-bait",
-    "crates/agentwall-trace",
-    "crates/agentwall-proxy",
+    "crates/eidolon-core",
+    "crates/eidolon-bait",
+    "crates/eidolon-trace",
+    "crates/eidolon-proxy",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/darkroom/agentwall"
+repository = "https://github.com/Darkroom4364/agentwall"
 rust-version = "1.80"
 
 [workspace.dependencies]
@@ -22,4 +22,3 @@ thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-
