@@ -119,6 +119,7 @@ docs/
   mvp-plan.md
   safety.md
   research-anchors.md
+  roadmap.md
 
 examples/
   scenarios/
