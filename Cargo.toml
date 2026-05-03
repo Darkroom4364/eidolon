@@ -10,7 +10,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/Darkroom4364/agentwall"
+repository = "https://github.com/Darkroom4364/eidolon"
 rust-version = "1.80"
 
 [workspace.dependencies]
