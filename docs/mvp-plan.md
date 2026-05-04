@@ -22,12 +22,15 @@ and is routed into controlled reality.
 Build a Rust reverse proxy and lab harness with:
 
 - session IDs
+- stable v0 event contract
+- surface controller boundary
 - one fake docs route
 - one fake OpenAPI operation
 - one fake endpoint
 - one expected header/value pair
 - event logging
 - trace scoring
+- initial policy state model
 - report generation
 
 No ML.
@@ -60,18 +63,21 @@ Normal baseline:
 Week 1:
 
 - scaffold Rust workspace
+- define v0 event contract
 - implement basic proxy
-- implement event model
+- implement JSONL event logging
+- define surface controller boundary
 - implement bait registry
 - implement first docs/header/path bait chain
 - create local target fixture
-- log events to JSONL or SQLite
 
 Week 2:
 
+- define initial policy state model
 - implement trace builder
 - implement behavior score
 - add OpenAPI injection
+- route one confirmed bait-derived action to decoy response
 - run pwnkit-style demo
 - run browser/crawler baseline
 - generate Markdown/HTML report
@@ -103,8 +109,9 @@ one report
 Avoid:
 
 - high-performance proxy work before proof
+- proxy-special-case logic that bypasses the surface controller
+- scoring logic hidden inside request forwarding
 - LLM in hot path
 - large deception catalogs
 - production-grade policy engine
 - vague "AI firewall" positioning
-
