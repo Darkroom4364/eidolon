@@ -24,18 +24,42 @@ M4 Edge/CDN Integration
 M5 Adaptive Bait Policy and Shield Hardening
 ```
 
+## Architectural Spine
+
+The roadmap is organized around one runtime loop:
+
+```text
+observe request
+  -> append event
+  -> reconstruct trace
+  -> score evidence
+  -> update policy
+  -> choose next surface
+```
+
+Three contracts should be made explicit before the system grows:
+
+1. Event contract
+   The proxy, bait engine, trace engine, reports, and integrations communicate through versioned structured events. JSONL is the first storage format, but event names and fields are the durable interface.
+
+2. Surface controller boundary
+   The proxy should ask a surface controller what to serve or rewrite. Bait docs, OpenAPI injection, decoy endpoints, and controlled reality should not become unrelated proxy special cases.
+
+3. Policy state model
+   Policy states should be defined early so events and reports can reference them consistently. Full controlled-reality enforcement can wait until M2.5.
+
 ## M0 Defensive Scope And Foundations
 
 Goal:
 
-Establish repo hygiene, safety boundaries, and a testable Rust baseline.
+Establish repo hygiene, safety boundaries, the initial event contract, and a testable Rust baseline.
 
 Issues:
 
 1. Add license, security policy, and defensive-use disclaimer
 2. Add CI for fmt, build, clippy, and tests
 3. Add issue and PR templates with safety boundaries
-4. Add first unit tests for core bait/event/score types
+4. Define the stable v0 event contract and add first unit tests for core bait/event/score types
 5. Confirm Eidolon public naming and positioning
 6. Document landscape validation and uniqueness risks
 
@@ -58,7 +82,7 @@ Issues:
 
 Goal:
 
-Turn the current demo binary into a minimal HTTP reverse proxy that can observe traffic, emit structured events, and safely alter selected responses.
+Turn the current demo binary into a minimal HTTP reverse proxy that can observe traffic, emit structured events, enforce the initial policy state model, and safely alter selected responses through a surface controller.
 
 Issues:
 
@@ -66,14 +90,15 @@ Issues:
 2. Implement basic HTTP reverse proxy forwarding
 3. Add session identification strategy
 4. Emit JSONL request events from the proxy
-5. Add safe response rewriter for HTML, robots.txt, OpenAPI, and JSON
-6. Add intervention kill switch and audit log
+5. Define surface controller interface and add safe response rewriter for HTML, robots.txt, OpenAPI, and JSON
+6. Define initial policy state model for observe, controlled reality, and rate-limit decisions
+7. Add intervention kill switch and audit log
 
 ## M1.5 Correlated Bait Primitives
 
 Goal:
 
-Implement a small set of concrete bait primitives before building a general bait engine.
+Implement a small set of concrete bait primitives that plug into the surface controller before building a general bait engine.
 
 Issues:
 
@@ -89,7 +114,7 @@ Issues:
 
 Goal:
 
-Convert raw proxy events into evidence bundles proving or rejecting bait-induced action chains.
+Convert raw proxy events into evidence bundles proving or rejecting bait-induced action chains, without depending on proxy internals.
 
 Issues:
 
@@ -104,11 +129,11 @@ Issues:
 
 Goal:
 
-Build one narrow controlled-reality branch early enough to avoid becoming only a honeypot dashboard.
+Build one narrow controlled-reality branch early enough to avoid becoming only a honeypot dashboard, using the policy state model defined in M1.
 
 Issues:
 
-1. Implement policy state machine
+1. Implement policy state transitions and persistence
 2. Implement controlled-reality decoy responder
 3. Add rate-limit and tarpit policies
 4. Prepare v1 release checklist and research note

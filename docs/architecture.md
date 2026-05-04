@@ -34,6 +34,56 @@ external actor / scanner / autonomous agent
           events -> traces -> score -> policy -> report
 ```
 
+## Component Boundaries
+
+The proxy is the runtime entrypoint, not the architecture boundary.
+
+The durable boundary between components is the event and policy contract:
+
+```text
+proxy / surface controller / bait engine
+  -> append structured events
+  -> trace intelligence reads events
+  -> policy router updates session state
+  -> proxy enforces current policy on later requests
+```
+
+Ownership:
+
+- Edge Boundary owns HTTP I/O, forwarding, session attachment, and enforcement of the current policy state.
+- Surface Controller owns the decision of whether a request sees protected reality, controlled surfaces, or rewritten content.
+- Bait/Canary Engine owns bait definitions, expected actions, matching rules, and safe generated values.
+- Trace Intelligence owns event reading, session timelines, scoring inputs, and evidence reports.
+- Policy Router owns state transitions and reasons; it should not directly rewrite HTTP responses.
+
+This keeps the proxy boring and makes causal trace reconstruction the central product surface.
+
+## Event Contract
+
+V0 should define a small structured event vocabulary before adding more behavior:
+
+```text
+request_seen
+response_served
+bait_exposed
+bait_action_observed
+policy_changed
+controlled_reality_entered
+rate_limit_applied
+```
+
+Every event should include:
+
+- schema version
+- event id
+- session id
+- timestamp
+- source component
+- current policy state
+- reason or correlation fields when applicable
+
+Request events should log method, path, selected safe header metadata, and routing decision. They should not log request bodies or secrets by default.
+
 ## 1. Edge Boundary
 
 The edge boundary is where traffic enters.
@@ -45,8 +95,7 @@ Responsibilities:
 - listen on a local/public port
 - identify or assign a session
 - forward normal traffic to the protected target
-- serve Eidolon-owned routes
-- optionally inject controlled surfaces
+- call the surface controller for Eidolon-owned routes and rewrites
 - emit structured events
 - enforce current policy state
 
@@ -64,6 +113,19 @@ The hard part is not high-performance proxying. The hard part is causal trace re
 ## 2. Surface Controller
 
 The surface controller decides what the actor sees.
+
+The surface controller should expose a narrow interface:
+
+```text
+session + normalized request + policy state
+  -> protected upstream
+  -> Eidolon-owned response
+  -> rewritten upstream response
+  -> controlled-reality response
+  -> rate-limit or delay action
+```
+
+It may consult the bait engine, but it should not own trace scoring.
 
 For benign sessions it may expose protected reality:
 
@@ -87,6 +149,13 @@ Eidolon does not need to pollute the real app. The proxy can serve controlled su
 ## 3. Bait/Canary Engine
 
 The bait engine creates traceable false evidence.
+
+It should produce two things:
+
+- the controlled surface shown to the actor
+- the expected follow-up action used for later correlation
+
+It should not depend on HTTP proxy internals.
 
 Bad bait:
 
@@ -122,6 +191,8 @@ expected_action:
 ## 4. Trace Intelligence
 
 Trace intelligence turns raw events into behavior.
+
+Trace intelligence should be able to run offline against an event log. That keeps Lab evaluation, reports, and future SIEM export from depending on a live proxy process.
 
 Raw logs:
 
@@ -174,6 +245,8 @@ High-confidence bait-derived autonomous recon/action chain observed
 ## 5. Policy Router
 
 The policy router decides what happens next.
+
+The policy router consumes trace/scoring output and emits explicit state transitions with reasons. The proxy should treat policy state as input, not as hidden scoring logic.
 
 Possible states:
 
@@ -231,8 +304,10 @@ eidolon-proxy
 V0 components:
 
 - proxy
+- surface controller boundary
 - bait registry
 - event log
+- policy state model
 - trace report
 
 The loop:
@@ -240,4 +315,3 @@ The loop:
 ```text
 serve clue -> observe action -> correlate -> report
 ```
-
