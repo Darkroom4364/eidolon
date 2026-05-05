@@ -62,6 +62,14 @@ Eidolon is not:
 
 The project is defensive. It may degrade hostile behavior inside a protected boundary, but it must not compromise infrastructure outside that boundary.
 
+## License And Defensive Use
+
+Eidolon is licensed under the Apache License, Version 2.0.
+
+This project is intended for defensive use on owned or authorized systems. Contributions and reports must stay within that boundary: no hack-back, malware, real exploit bait, real secrets, third-party targeting, or attacker infrastructure compromise.
+
+For details, see [SECURITY.md](SECURITY.md), [docs/safety.md](docs/safety.md), and [docs/threat-model.md](docs/threat-model.md).
+
 ## Core Primitive
 
 The important primitive is **causal bait**.
