@@ -17,6 +17,14 @@ gets correlated,
 and is routed into controlled reality.
 ```
 
+This is the Blackwall loop:
+
+```text
+controlled perception -> causal proof -> containment -> protected reality stays protected
+```
+
+The MVP should not become an agent benchmark. Lab runs exist only to benchmark Eidolon's boundary behavior: whether Eidolon changes, proves, and contains agent behavior.
+
 ## V0 Scope
 
 Build a Rust reverse proxy and lab harness with:
@@ -57,6 +65,15 @@ Normal baseline:
 - simple crawler may fetch docs but should not synthesize the custom request
 - DAST may probe paths but should not produce the exact bait-derived header/path combination
 - agentic pentester is more likely to connect the clue to action
+
+Lab guardrails:
+
+- no leaderboard
+- no benchmark corpus
+- no agent ranking
+- no solve-rate competition
+- benchmark Eidolon, not the agents
+- only enough agent/baseline traffic to validate causal lift, false positives, and containment
 
 ## First Two Weeks
 

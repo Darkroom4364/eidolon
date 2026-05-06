@@ -150,4 +150,8 @@ This repository is a project scaffold and documentation base. The first implemen
 
 For the end-state definition, see [docs/completed-project.md](docs/completed-project.md).
 
+For naming and positioning, see [docs/name.md](docs/name.md).
+
+For landscape validation, uniqueness risks, and go/no-go criteria, see [docs/landscape-validation-2026-05-03.md](docs/landscape-validation-2026-05-03.md).
+
 For the key distinction from crawler mazes such as Cloudflare AI Labyrinth, see [docs/ai-labyrinth-vs-eidolon.md](docs/ai-labyrinth-vs-eidolon.md).
