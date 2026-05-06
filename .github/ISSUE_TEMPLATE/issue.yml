@@ -1,0 +1,43 @@
+name: Issue
+description: Report a bug, propose a feature, or suggest documentation work.
+title: "[Issue]: "
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What should change, or what is not working?
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What owned or authorized environment, workflow, or component does this relate to?
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety notes
+      description: Note any bait, decoy, credential-like value, endpoint, logging, or controlled-reality behavior involved.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: How could this be tested or reviewed?
+    validations:
+      required: false
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Boundary
+      options:
+        - label: Intended for defensive use on owned or authorized systems.
+          required: true
+        - label: Does not include real secrets, live target data, malware, or third-party targeting.
+          required: true
+        - label: Synthetic examples are clearly non-sensitive.
+          required: true
