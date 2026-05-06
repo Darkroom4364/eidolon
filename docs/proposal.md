@@ -16,6 +16,8 @@ More precise version:
 Eidolon is target-side active defense for agentic reconnaissance and exploitation loops.
 ```
 
+The public project name is `Eidolon`. `Agentwall` is the retired legacy codename.
+
 ## Ausgangslage
 
 Autonomous pentesting is becoming real enough to deserve a dedicated defensive primitive.
@@ -305,4 +307,3 @@ acts on it,
 gets correlated,
 and is routed into controlled reality.
 ```
-

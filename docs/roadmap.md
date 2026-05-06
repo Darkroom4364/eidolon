@@ -24,6 +24,34 @@ M4 Edge/CDN Integration
 M5 Adaptive Bait Policy and Shield Hardening
 ```
 
+## North Star
+
+Eidolon is a target-side Blackwall for autonomous cyber agents.
+
+Every roadmap item should strengthen the same defensive loop:
+
+```text
+control perception
+  -> prove bait-derived behavior
+  -> contain suspicious sessions
+  -> protect real assets
+```
+
+The product center is the boundary, not the benchmark.
+
+Lab exists to calibrate and validate the boundary. Benchmarking is allowed only when it measures Eidolon's defensive outcomes. It must not become a leaderboard, benchmark corpus, offensive-agent ranking system, or general cyber-range project.
+
+When prioritizing work, ask whether it improves at least one of these:
+
+- control what unknown or suspicious agents observe
+- create safe causal evidence from target-side behavior
+- reconstruct behavior without needing the agent's internals
+- route suspicious sessions away from protected reality
+- reduce access to real assets after confidence rises
+- prove the boundary beats static deception and blocking baselines
+
+If not, it is secondary.
+
 ## Architectural Spine
 
 The roadmap is organized around one runtime loop:
@@ -67,7 +95,11 @@ Issues:
 
 Goal:
 
-Create a local, owned, authorized evaluation environment before overbuilding product features.
+Create a local, owned, authorized evaluation environment that validates Eidolon's defensive boundary before overbuilding product features.
+
+Constraint:
+
+M0.5 is not a benchmark product. Keep it small enough to benchmark Eidolon's boundary behavior: causal lift, false-positive behavior, controlled-reality containment, and reduction of real-surface access after confidence rises.
 
 Issues:
 
