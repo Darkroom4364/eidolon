@@ -132,6 +132,7 @@ docs/
   mvp-plan.md
   safety.md
   lab.md
+  lab-runbook.md
   lab-metrics.md
   research-anchors.md
   roadmap.md
@@ -158,6 +159,8 @@ For the end-state definition, see [docs/completed-project.md](docs/completed-pro
 For naming and positioning, see [docs/name.md](docs/name.md).
 
 For the local owned-target Lab guardrails and demo target, see [docs/lab.md](docs/lab.md).
+
+For the current local Lab runbook, see [docs/lab-runbook.md](docs/lab-runbook.md).
 
 For the first Lab metric definitions and summary schema, see [docs/lab-metrics.md](docs/lab-metrics.md).
 
