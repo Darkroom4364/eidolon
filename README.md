@@ -135,6 +135,7 @@ docs/
   roadmap.md
 
 examples/
+  demo-target/
   scenarios/
 ```
 
@@ -151,6 +152,8 @@ This repository is a project scaffold and documentation base. The first implemen
 For the end-state definition, see [docs/completed-project.md](docs/completed-project.md).
 
 For naming and positioning, see [docs/name.md](docs/name.md).
+
+For the local owned-target Lab guardrails and demo target, see [docs/lab.md](docs/lab.md).
 
 For landscape validation, uniqueness risks, and go/no-go criteria, see [docs/landscape-validation-2026-05-03.md](docs/landscape-validation-2026-05-03.md).
 
