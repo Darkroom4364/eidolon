@@ -1,13 +1,18 @@
 use std::{
     env, fmt,
-    net::{IpAddr, SocketAddr},
+    io::{self, Read, Write},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::ExitCode,
+    thread,
 };
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
 const DEFAULT_EVENT_LOG: &str = "/tmp/eidolon-events.jsonl";
+const DEFAULT_HTTP_PORT: u16 = 80;
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 fn main() -> ExitCode {
     match CliAction::from_args(env::args().skip(1)) {
@@ -20,8 +25,14 @@ fn main() -> ExitCode {
             println!("listen_addr: {}", config.listen_addr);
             println!("upstream: {}", config.upstream);
             println!("event_log: {}", config.event_log_path.display());
-            println!("proxy forwarding is not implemented yet; issue #6 adds the HTTP path");
-            ExitCode::SUCCESS
+
+            match run_proxy(config) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::FAILURE
+                }
+            }
         }
         Err(error) => {
             eprintln!("error: {error}\n\n{}", usage());
@@ -40,6 +51,8 @@ struct ProxyConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UpstreamTarget {
     raw: String,
+    authority: String,
+    connect_addr: String,
 }
 
 impl fmt::Display for UpstreamTarget {
@@ -246,8 +259,12 @@ fn parse_upstream(raw: &str) -> Result<UpstreamTarget, ConfigError> {
         return Err(ConfigError::new("upstream target port must not be 0"));
     }
 
+    let connect_addr = connect_addr(host, port.unwrap_or(DEFAULT_HTTP_PORT));
+
     Ok(UpstreamTarget {
         raw: format!("http://{authority}"),
+        authority: authority.to_string(),
+        connect_addr,
     })
 }
 
@@ -360,6 +377,269 @@ fn meaningful_parent(path: &Path) -> Option<&Path> {
         .filter(|parent| !parent.as_os_str().is_empty())
 }
 
+fn connect_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn run_proxy(config: ProxyConfig) -> io::Result<()> {
+    let listener = TcpListener::bind(config.listen_addr)?;
+    println!(
+        "eidolon-proxy listening on http://{}",
+        listener.local_addr()?
+    );
+    println!("forwarding normal traffic to {}", config.upstream);
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let upstream = config.upstream.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_connection(stream, &upstream) {
+                        eprintln!("proxy connection error: {error}");
+                    }
+                });
+            }
+            Err(error) => eprintln!("proxy accept error: {error}"),
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_connection(mut client_stream: TcpStream, upstream: &UpstreamTarget) -> io::Result<()> {
+    let Some(request) = read_http_request(&mut client_stream)? else {
+        return Ok(());
+    };
+
+    let upstream_request = request.to_upstream_bytes(upstream)?;
+    let mut upstream_stream = TcpStream::connect(&upstream.connect_addr)?;
+    upstream_stream.write_all(&upstream_request)?;
+    upstream_stream.flush()?;
+
+    io::copy(&mut upstream_stream, &mut client_stream)?;
+    client_stream.flush()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpRequest {
+    method: String,
+    target: String,
+    version: String,
+    headers: Vec<HttpHeader>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpHeader {
+    name: String,
+    value: String,
+}
+
+impl HttpRequest {
+    fn to_upstream_bytes(&self, upstream: &UpstreamTarget) -> io::Result<Vec<u8>> {
+        let target = normalize_request_target(&self.target)?;
+        let mut bytes = Vec::new();
+
+        write!(
+            bytes,
+            "{} {} {}\r\nHost: {}\r\nConnection: close\r\n",
+            self.method, target, self.version, upstream.authority
+        )?;
+
+        for header in &self.headers {
+            if should_skip_forwarded_header(&header.name) {
+                continue;
+            }
+
+            write!(bytes, "{}: {}\r\n", header.name, header.value)?;
+        }
+
+        bytes.extend_from_slice(b"\r\n");
+        bytes.extend_from_slice(&self.body);
+        Ok(bytes)
+    }
+}
+
+fn read_http_request<R>(reader: &mut R) -> io::Result<Option<HttpRequest>>
+where
+    R: Read,
+{
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let header_end = loop {
+        let bytes_read = reader.read(&mut chunk)?;
+        if bytes_read == 0 {
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+
+            return Err(invalid_data(
+                "connection closed before HTTP headers completed",
+            ));
+        }
+
+        buffer.extend_from_slice(&chunk[..bytes_read]);
+        if buffer.len() > MAX_HEADER_BYTES {
+            return Err(invalid_data("HTTP request headers exceed size limit"));
+        }
+
+        if let Some(header_end) = find_header_end(&buffer) {
+            break header_end;
+        }
+    };
+
+    let head = &buffer[..header_end - 4];
+    let mut request = parse_http_request_head(head)?;
+    let content_length = request_content_length(&request)?;
+    if content_length > MAX_BODY_BYTES {
+        return Err(invalid_data("HTTP request body exceeds size limit"));
+    }
+
+    let body_start = header_end;
+    request
+        .body
+        .extend_from_slice(&buffer[body_start..buffer.len().min(body_start + content_length)]);
+
+    while request.body.len() < content_length {
+        let remaining = content_length - request.body.len();
+        let read_len = remaining.min(chunk.len());
+        let bytes_read = reader.read(&mut chunk[..read_len])?;
+        if bytes_read == 0 {
+            return Err(invalid_data("connection closed before HTTP body completed"));
+        }
+
+        request.body.extend_from_slice(&chunk[..bytes_read]);
+    }
+
+    Ok(Some(request))
+}
+
+fn parse_http_request_head(head: &[u8]) -> io::Result<HttpRequest> {
+    let head = std::str::from_utf8(head).map_err(|_| invalid_data("HTTP headers are not UTF-8"))?;
+    let mut lines = head.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| invalid_data("missing HTTP request line"))?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .ok_or_else(|| invalid_data("missing HTTP method"))?;
+    let target = request_parts
+        .next()
+        .ok_or_else(|| invalid_data("missing HTTP request target"))?;
+    let version = request_parts
+        .next()
+        .ok_or_else(|| invalid_data("missing HTTP version"))?;
+
+    if request_parts.next().is_some() {
+        return Err(invalid_data("HTTP request line has too many fields"));
+    }
+
+    if !version.starts_with("HTTP/") {
+        return Err(invalid_data("HTTP version must start with HTTP/"));
+    }
+
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(invalid_data("HTTP header is missing `:`"));
+        };
+
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(invalid_data("HTTP header name cannot be empty"));
+        }
+
+        headers.push(HttpHeader {
+            name: name.to_string(),
+            value: value.trim().to_string(),
+        });
+    }
+
+    Ok(HttpRequest {
+        method: method.to_string(),
+        target: target.to_string(),
+        version: version.to_string(),
+        headers,
+        body: Vec::new(),
+    })
+}
+
+fn request_content_length(request: &HttpRequest) -> io::Result<usize> {
+    if request.headers.iter().any(|header| {
+        header.name.eq_ignore_ascii_case("transfer-encoding")
+            && header.value.to_ascii_lowercase().contains("chunked")
+    }) {
+        return Err(invalid_data(
+            "chunked request bodies are not supported by the v0 proxy",
+        ));
+    }
+
+    let mut content_length = None;
+    for header in &request.headers {
+        if header.name.eq_ignore_ascii_case("content-length") {
+            let parsed = header
+                .value
+                .parse::<usize>()
+                .map_err(|error| invalid_data(format!("invalid Content-Length: {error}")))?;
+            content_length = Some(parsed);
+        }
+    }
+
+    Ok(content_length.unwrap_or(0))
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+}
+
+fn normalize_request_target(target: &str) -> io::Result<&str> {
+    if target.is_empty() {
+        return Err(invalid_data("HTTP request target cannot be empty"));
+    }
+
+    if target.starts_with('/') {
+        return Ok(target);
+    }
+
+    if let Some(rest) = target.strip_prefix("http://") {
+        return Ok(match rest.find('/') {
+            Some(index) => &rest[index..],
+            None => "/",
+        });
+    }
+
+    if target == "*" {
+        return Ok(target);
+    }
+
+    Err(invalid_data(
+        "HTTP request target must be origin-form or http absolute-form",
+    ))
+}
+
+fn should_skip_forwarded_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
 fn usage() -> String {
     format!(
         "\
@@ -424,6 +704,8 @@ mod tests {
 
         assert_eq!(config.listen_addr, "127.0.0.1:8181".parse().unwrap());
         assert_eq!(config.upstream.to_string(), "http://localhost:9101");
+        assert_eq!(config.upstream.authority, "localhost:9101");
+        assert_eq!(config.upstream.connect_addr, "localhost:9101");
         assert_eq!(
             config.event_log_path,
             PathBuf::from("/tmp/eidolon-proxy-test.jsonl")
@@ -441,6 +723,18 @@ mod tests {
 
         assert_eq!(config.listen_addr, "[::1]:8081".parse().unwrap());
         assert_eq!(config.upstream.to_string(), "http://[::1]:9001");
+        assert_eq!(config.upstream.authority, "[::1]:9001");
+        assert_eq!(config.upstream.connect_addr, "[::1]:9001");
+    }
+
+    #[test]
+    fn upstream_without_port_uses_default_http_connect_port() {
+        let config =
+            run_config(&["--upstream", "http://127.0.0.1"]).expect("upstream should parse");
+
+        assert_eq!(config.upstream.to_string(), "http://127.0.0.1");
+        assert_eq!(config.upstream.authority, "127.0.0.1");
+        assert_eq!(config.upstream.connect_addr, "127.0.0.1:80");
     }
 
     #[test]
@@ -503,5 +797,57 @@ mod tests {
             &["--event-log", missing_path.to_str().unwrap()],
             "parent directory does not exist",
         );
+    }
+
+    #[test]
+    fn parses_http_request_with_body() {
+        let mut request_bytes = &b"POST /api/v1/imports HTTP/1.1\r\nHost: proxy.local\r\nContent-Length: 16\r\n\r\n{\"source\":\"lab\"}"[..];
+        let request = read_http_request(&mut request_bytes)
+            .expect("request should parse")
+            .expect("request should be present");
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/api/v1/imports");
+        assert_eq!(request.version, "HTTP/1.1");
+        assert_eq!(request.body, br#"{"source":"lab"}"#);
+    }
+
+    #[test]
+    fn rewrites_request_for_upstream() {
+        let upstream = parse_upstream("http://127.0.0.1:9001").expect("upstream should parse");
+        let mut request_bytes = &b"GET /docs?view=full HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: keep-alive\r\nUser-Agent: eidolon-test\r\n\r\n"[..];
+        let request = read_http_request(&mut request_bytes)
+            .expect("request should parse")
+            .expect("request should be present");
+
+        let forwarded = String::from_utf8(request.to_upstream_bytes(&upstream).unwrap())
+            .expect("forwarded request should be utf8");
+
+        assert!(forwarded.starts_with("GET /docs?view=full HTTP/1.1\r\n"));
+        assert!(forwarded.contains("\r\nHost: 127.0.0.1:9001\r\n"));
+        assert!(forwarded.contains("\r\nConnection: close\r\n"));
+        assert!(forwarded.contains("\r\nUser-Agent: eidolon-test\r\n"));
+        assert!(!forwarded.contains("keep-alive"));
+    }
+
+    #[test]
+    fn normalizes_absolute_form_request_targets() {
+        assert_eq!(
+            normalize_request_target("http://127.0.0.1:8080/openapi.json?x=1").unwrap(),
+            "/openapi.json?x=1"
+        );
+        assert_eq!(
+            normalize_request_target("http://127.0.0.1:8080").unwrap(),
+            "/"
+        );
+    }
+
+    #[test]
+    fn rejects_chunked_request_bodies_for_v0() {
+        let mut request_bytes =
+            &b"POST /api/v1/imports HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"[..];
+        let error = read_http_request(&mut request_bytes).expect_err("chunked should fail");
+
+        assert!(error.to_string().contains("chunked"));
     }
 }
