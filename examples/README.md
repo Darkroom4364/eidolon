@@ -54,3 +54,23 @@ Collect a v0 metrics summary:
 examples/baselines/benign.sh all > /tmp/eidolon-benign.jsonl
 examples/metrics/collect-benign.sh /tmp/eidolon-benign.jsonl
 ```
+
+## Defense Baseline Modes
+
+Run comparison modes against the same local target:
+
+```sh
+examples/baselines/defense-modes.sh all > /tmp/eidolon-baselines.jsonl
+examples/metrics/collect-baselines.sh /tmp/eidolon-baselines.jsonl
+```
+
+The runner supports:
+
+```text
+no-defense
+static-token
+static-honeypot
+waf-style-block
+```
+
+These modes are local comparison controls for Eidolon's boundary metrics. They are not agent rankings.
