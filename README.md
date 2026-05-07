@@ -131,11 +131,15 @@ docs/
   threat-model.md
   mvp-plan.md
   safety.md
+  lab.md
+  lab-metrics.md
   research-anchors.md
   roadmap.md
 
 examples/
+  baselines/
   demo-target/
+  metrics/
   scenarios/
 ```
 
@@ -154,6 +158,8 @@ For the end-state definition, see [docs/completed-project.md](docs/completed-pro
 For naming and positioning, see [docs/name.md](docs/name.md).
 
 For the local owned-target Lab guardrails and demo target, see [docs/lab.md](docs/lab.md).
+
+For the first Lab metric definitions and summary schema, see [docs/lab-metrics.md](docs/lab-metrics.md).
 
 For landscape validation, uniqueness risks, and go/no-go criteria, see [docs/landscape-validation-2026-05-03.md](docs/landscape-validation-2026-05-03.md).
 
