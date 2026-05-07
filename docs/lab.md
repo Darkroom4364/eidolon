@@ -6,6 +6,8 @@ Lab exists to benchmark Eidolon, not offensive agents.
 
 For metric definitions and the first summary schema, see [lab-metrics.md](lab-metrics.md).
 
+For the current M0.5 runbook, see [lab-runbook.md](lab-runbook.md).
+
 ## Safety Boundary
 
 Use Lab only against systems you own or are explicitly authorized to test.
