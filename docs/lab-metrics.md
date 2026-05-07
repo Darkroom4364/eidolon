@@ -98,6 +98,39 @@ trace_confidence_score: 0
 
 The collector is a temporary v0 tool. Later M1/M2 work should produce richer metrics from proxy events, bait exposure events, trace scores, and policy transition events.
 
+## Collecting Defense Baseline Metrics
+
+Run the baseline comparison modes against the same owned demo target:
+
+```sh
+examples/baselines/defense-modes.sh all > /tmp/eidolon-baselines.jsonl
+examples/metrics/collect-baselines.sh /tmp/eidolon-baselines.jsonl
+```
+
+The mode collector emits the same v0 metric keys for each comparison mode:
+
+```json
+{
+  "schema_version": 0,
+  "run_kind": "defense_baseline_comparison",
+  "boundary": "owned_loopback_lab",
+  "baseline_modes": {
+    "static_token": {
+      "source_mode": "static-token",
+      "metrics": {
+        "time_to_first_bait_action_seconds": 0.0,
+        "bait_follow_rate": 1.0,
+        "false_positive_rate": 0.0,
+        "trace_confidence_score": 50,
+        "real_surface_requests_after_containment": null
+      }
+    }
+  }
+}
+```
+
+The v0 static baseline trace score is capped. Static clues can show that a trap was followed, but they do not prove per-session causal control the way Eidolon is meant to prove it.
+
 ## Interpretation Guardrail
 
 Metrics must describe Eidolon boundary behavior:
