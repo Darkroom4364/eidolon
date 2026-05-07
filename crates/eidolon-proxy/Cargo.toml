@@ -11,6 +11,6 @@ eidolon-bait = { path = "../eidolon-bait" }
 eidolon-core = { path = "../eidolon-core" }
 eidolon-trace = { path = "../eidolon-trace" }
 anyhow.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
