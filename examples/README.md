@@ -24,7 +24,7 @@ The target binds to `127.0.0.1:9001` by default. To change the port, keep the bi
 EIDOLON_LAB_TARGET_ADDR=127.0.0.1:9101 cargo run -p eidolon-demo-target
 ```
 
-See [../docs/lab.md](../docs/lab.md) for Lab guardrails and target routes.
+See [../docs/lab.md](../docs/lab.md) for Lab guardrails and target routes. See [../docs/lab-runbook.md](../docs/lab-runbook.md) for the current local runbook.
 
 ## Benign Baselines
 
