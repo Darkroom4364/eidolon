@@ -4,6 +4,7 @@ members = [
     "crates/eidolon-bait",
     "crates/eidolon-trace",
     "crates/eidolon-proxy",
+    "examples/demo-target",
 ]
 resolver = "2"
 

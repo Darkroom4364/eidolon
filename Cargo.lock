@@ -89,6 +89,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "eidolon-demo-target"
+version = "0.1.0"
+
+[[package]]
 name = "eidolon-proxy"
 version = "0.1.0"
 dependencies = [
