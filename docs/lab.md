@@ -117,3 +117,29 @@ Summarize benign baseline output:
 examples/baselines/benign.sh all > /tmp/eidolon-benign.jsonl
 examples/metrics/collect-benign.sh /tmp/eidolon-benign.jsonl
 ```
+
+## Defense Baseline Modes
+
+Defense baseline modes compare Eidolon's future boundary behavior against simple alternatives:
+
+- `no-defense`
+- `static-token`
+- `static-honeypot`
+- `waf-style-block`
+
+Run all comparison modes against the same local demo target:
+
+```sh
+examples/baselines/defense-modes.sh all > /tmp/eidolon-baselines.jsonl
+examples/metrics/collect-baselines.sh /tmp/eidolon-baselines.jsonl
+```
+
+Run one comparison mode:
+
+```sh
+examples/baselines/defense-modes.sh static-token
+```
+
+The v0 comparison runner is a small accounting shim, not a production defense. Target-bound requests still go to the loopback demo target. The WAF-style mode records a local block before target forwarding. Static token and static honeypot modes use sterile lab clues and candidate Eidolon-owned routes, not real exploit chains or secrets.
+
+These modes exist to measure whether Eidolon eventually proves stronger boundary outcomes than static deception and blocking controls. They must not become an agent leaderboard.
