@@ -106,7 +106,28 @@ When the M1 proxy exists, the same local scan shape should point at the loopback
 agent or runner -> http://127.0.0.1:8080 -> Eidolon proxy -> http://127.0.0.1:9001
 ```
 
-At that point, the runbook should be updated to collect proxy events, bait exposure events, trace scores, and policy decisions.
+Start the M1 proxy in front of the demo target:
+
+```sh
+cargo run -p eidolon-proxy -- \
+  --listen-addr 127.0.0.1:8080 \
+  --upstream http://127.0.0.1:9001 \
+  --event-log /tmp/eidolon-events.jsonl \
+  --intervention-control /tmp/eidolon-interventions.txt
+```
+
+Replay the benign baseline through the proxy:
+
+```sh
+EIDOLON_LAB_BASE_URL=http://127.0.0.1:8080 examples/baselines/benign.sh all > /tmp/eidolon-proxy-benign.jsonl
+examples/metrics/collect-benign.sh /tmp/eidolon-proxy-benign.jsonl
+```
+
+The proxy assigns a first-party `eidolon_session` cookie when no valid session cookie is present. The cookie is host-only, `HttpOnly`, `SameSite=Lax`, scoped to `/`, and intentionally omits `Secure` for local HTTP Lab use.
+
+The event log is JSONL. Request events record method, path, policy state, routing decision, session ID, and selected safe header presence. They do not log request bodies or header values.
+
+The intervention control file is read per request. If it contains `disabled`, `disable`, `off`, or `0`, interventions are disabled without restarting the proxy and traffic is forwarded to protected upstream.
 
 ## What M0.5 Proves
 
