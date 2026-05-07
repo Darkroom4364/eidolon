@@ -47,3 +47,10 @@ Use `EIDOLON_LAB_BASE_URL` to point the same traffic at a loopback proxy later:
 ```sh
 EIDOLON_LAB_BASE_URL=http://127.0.0.1:8080 examples/baselines/benign.sh all
 ```
+
+Collect a v0 metrics summary:
+
+```sh
+examples/baselines/benign.sh all > /tmp/eidolon-benign.jsonl
+examples/metrics/collect-benign.sh /tmp/eidolon-benign.jsonl
+```
