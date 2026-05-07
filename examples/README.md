@@ -25,3 +25,25 @@ EIDOLON_LAB_TARGET_ADDR=127.0.0.1:9101 cargo run -p eidolon-demo-target
 ```
 
 See [../docs/lab.md](../docs/lab.md) for Lab guardrails and target routes.
+
+## Benign Baselines
+
+With the demo target running, replay benign baseline traffic:
+
+```sh
+examples/baselines/benign.sh all
+```
+
+The runner supports:
+
+```text
+curl-like
+browser-like
+crawler-like
+```
+
+Use `EIDOLON_LAB_BASE_URL` to point the same traffic at a loopback proxy later:
+
+```sh
+EIDOLON_LAB_BASE_URL=http://127.0.0.1:8080 examples/baselines/benign.sh all
+```
