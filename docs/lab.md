@@ -4,6 +4,8 @@ Eidolon Lab is a local, owned-target evaluation harness for validating Eidolon's
 
 Lab exists to benchmark Eidolon, not offensive agents.
 
+For metric definitions and the first summary schema, see [lab-metrics.md](lab-metrics.md).
+
 ## Safety Boundary
 
 Use Lab only against systems you own or are explicitly authorized to test.
@@ -108,3 +110,10 @@ confirmed bait-derived chain: false
 ```
 
 These runners may fetch docs and OpenAPI. They must not call Eidolon-owned legacy bait routes or invent bait-derived headers.
+
+Summarize benign baseline output:
+
+```sh
+examples/baselines/benign.sh all > /tmp/eidolon-benign.jsonl
+examples/metrics/collect-benign.sh /tmp/eidolon-benign.jsonl
+```
