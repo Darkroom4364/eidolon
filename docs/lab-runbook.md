@@ -1,17 +1,19 @@
 # Eidolon Lab Runbook v0
 
-This runbook validates the M0.5 local Lab harness.
+This runbook separates M0.5 local Lab harness proof, M1 proxy validation, and M1.5 correlated bait primitive validation.
 
-It does not prove the full Eidolon Blackwall loop yet. M0.5 does not have the real proxy path, runtime bait exposure events, session correlation, trace reports, or controlled-reality routing. Those begin in M1 and M2.
+It does not prove the full Eidolon Blackwall loop yet. M0.5 proves only the owned local evaluation harness. M1 adds a reachable proxy path with honest forwarding, session correlation, JSONL request auditing, and operator-controlled intervention toggling. M1.5 validates the first same-session bait exposure to bait action observation loop. Full causal evidence bundles, scoring reports, controlled-reality routing, and production readiness are later work.
 
 Use this runbook to verify:
 
 - the owned demo target runs locally
 - benign traffic produces no bait-follow chain
 - static comparison modes produce comparable metrics
-- the future agentic scan shape stays local, defensive, and non-destructive
+- the M0.5 agentic scan shape stays local, defensive, and non-destructive
+- the M1 proxy is reachable, forwards honestly, records auditable events, and honors intervention control
+- the M1.5 proxy can correlate one owned bait exposure with one matching bait-derived action in the same session when that code path is supported
 
-Do not use this runbook to rank agents, demonstrate exploitation, or claim Eidolon has detected an autonomous attacker.
+Do not use this runbook to rank agents, demonstrate exploitation, claim Eidolon has detected an autonomous attacker, or claim controlled-reality containment is complete.
 
 ## Safety Boundary
 
@@ -86,7 +88,7 @@ Interpret them narrowly:
 
 Eidolon needs to beat these controls by proving controlled evidence led to observed action and by reducing real-surface access after confidence rises.
 
-## Local Agentic Scan Shape
+## M0.5 Local Agentic Scan Shape
 
 M0.5 does not include a committed agent runner. If an operator uses a local authorized agentic scanner manually, the run must stay inside this shape:
 
@@ -100,7 +102,11 @@ record: requested paths, whether docs/OpenAPI were fetched, whether any bait-der
 
 For M0.5, the expected result is observational only. A request to an Eidolon-owned candidate bait path such as `/api/v2/import/reconcile` is a signal to record, not proof that the full Eidolon mechanism exists.
 
-When the M1 proxy exists, the same local scan shape should point at the loopback proxy instead of the direct target:
+## M1 Proxy Validation
+
+M1 validates a real loopback proxy path in front of the same owned demo target. The goal is to prove the proxy is honest and reachable, correlates requests by session, emits an auditable request trail, and can be put into a non-intervening mode without restart.
+
+Point any local scan or baseline replay at the loopback proxy instead of the direct target:
 
 ```text
 agent or runner -> http://127.0.0.1:8080 -> Eidolon proxy -> http://127.0.0.1:9001
@@ -129,6 +135,59 @@ The event log is JSONL. Request events record method, path, policy state, routin
 
 The intervention control file is read per request. If it contains `disabled`, `disable`, `off`, or `0`, interventions are disabled without restarting the proxy and traffic is forwarded to protected upstream.
 
+With interventions enabled, M1 exposes a small built-in demo surface so the proxy path can be validated without claiming the full bait engine is complete:
+
+```sh
+curl -i http://127.0.0.1:8080/docs/legacy-import
+curl -i 'http://127.0.0.1:8080/openapi.json?eidolon_surface=legacy-import'
+```
+
+The first request is served by Eidolon as an owned markdown surface. The second forwards to the protected upstream and rewrites the OpenAPI response with one demo legacy-import operation. Plain `/openapi.json` remains an ordinary protected-upstream request.
+
+Validate the M1 proxy narrowly:
+
+- Requests to ordinary demo target paths are forwarded to the upstream target.
+- `/docs/legacy-import` is served as an Eidolon-owned response while interventions are enabled.
+- `/openapi.json?eidolon_surface=legacy-import` is audited as `rewritten_upstream` only when the OpenAPI rewrite actually changes the response.
+- A missing or invalid `eidolon_session` cookie receives a new first-party session cookie.
+- Multiple requests with the same valid session cookie produce events with the same session ID.
+- `/tmp/eidolon-events.jsonl` contains request events with routing and policy state, without request bodies or header values.
+- Updating `/tmp/eidolon-interventions.txt` to an off value disables interventions for the next request without restarting the proxy.
+
+M1 proxy validation does not prove per-session bait generation, causal trace reconstruction, controlled-reality containment, autonomous-agent attribution, or production readiness.
+
+## M1.5 Correlated Bait Primitive Validation
+
+M1.5 validates only the first correlated bait loop: an owned bait surface is exposed through the proxy, and a later bait-derived request with the expected marker is observed for the same proxy session. It is still a Lab primitive, not a full evidence, scoring, or containment system.
+
+Use the same M1 proxy setup and keep interventions enabled. Start with a fresh cookie jar so the exposure and action share one explicit session:
+
+```sh
+rm -f /tmp/eidolon-m15-cookies.txt
+curl -i -c /tmp/eidolon-m15-cookies.txt \
+  http://127.0.0.1:8080/docs/legacy-import
+curl -i -b /tmp/eidolon-m15-cookies.txt \
+  -H 'X-Migration-Trace: rel_2025_04_b7f2' \
+  -X POST http://127.0.0.1:8080/api/v2/import/reconcile
+```
+
+The first request fetches the owned `/docs/legacy-import` surface through the proxy and exposes the demo bait. The second request attempts the correlated bait-derived action using the same `eidolon_session` cookie and the expected `X-Migration-Trace: rel_2025_04_b7f2` marker.
+
+When M1.5 support is present, `/tmp/eidolon-events.jsonl` should show this sequence:
+
+- `bait_exposed` for `/docs/legacy-import`, with a session ID and exposure identifier.
+- `bait_action_observed` for `POST /api/v2/import/reconcile`, with the same session ID and the matching exposure identifier.
+
+The expected safety property is that this bait-derived POST is observed by Eidolon but is not forwarded to the protected upstream. Ordinary protected target traffic should continue to follow the M1 forwarding rules.
+
+Run near-miss and negative controls to keep the claim narrow:
+
+- Wrong marker: repeat the POST with another `X-Migration-Trace` value. It must not produce a matching `bait_action_observed` for the prior exposure.
+- Wrong session: fetch `/docs/legacy-import` with one cookie jar and POST with a different or empty cookie jar. It must not correlate to the first exposure.
+- Ordinary traffic: send normal `/api/v1/*` requests through the proxy. They should be treated as ordinary protected-upstream traffic and must not create a bait action observation.
+
+M1.5 does not prove full causal evidence bundles, scoring reports, controlled reality, autonomous-agent attribution, production readiness, or M2/M2.5 behavior. It validates only that the proxy can connect one owned bait exposure to one matching bait-derived action in the same session, and block that bait-derived action from reaching the protected upstream.
+
 ## What M0.5 Proves
 
 M0.5 proves that Eidolon has a local, owned, replayable evaluation harness:
@@ -151,3 +210,44 @@ M0.5 does not yet prove:
 - production readiness
 
 Those are the M1, M1.5, M2, and M2.5 workstreams.
+
+## What M1 Proves
+
+M1 proves that Eidolon has a reachable local proxy in front of the owned demo target:
+
+- honest upstream forwarding for normal requests
+- first-party session assignment and correlation
+- JSONL request audit events
+- policy and routing fields visible in the event stream
+- runtime intervention disable control
+
+## What M1 Does Not Prove
+
+M1 does not yet prove:
+
+- per-session bait generation
+- causal trace reconstruction from bait exposure to follow-up action
+- controlled-reality containment
+- autonomous-agent attribution
+- production readiness
+
+## What M1.5 Proves
+
+M1.5 proves that Eidolon can validate the first correlated bait primitive in the local proxy Lab:
+
+- an owned `/docs/legacy-import` exposure can be recorded as `bait_exposed`
+- a same-session `POST /api/v2/import/reconcile` with `X-Migration-Trace: rel_2025_04_b7f2` can be recorded as `bait_action_observed`
+- the observation is expected to share the same session and exposure when code support is present
+- the bait-derived POST is expected not to be forwarded to the protected upstream
+- wrong marker, wrong session, and ordinary `/api/v1/*` traffic remain negative controls
+
+## What M1.5 Does Not Prove
+
+M1.5 does not yet prove:
+
+- full causal evidence bundles
+- scoring reports
+- controlled reality
+- autonomous-agent attribution
+- production readiness
+- M2 or M2.5 behavior
