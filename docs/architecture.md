@@ -60,13 +60,14 @@ This keeps the proxy boring and makes causal trace reconstruction the central pr
 
 ## Event Contract
 
-V0 should define a small structured event vocabulary before adding more behavior:
+Event schema version 1 defines a small structured event vocabulary before adding more behavior:
 
 ```text
 request_seen
 response_served
 bait_exposed
 bait_action_observed
+policy_decision
 policy_changed
 controlled_reality_entered
 rate_limit_applied
@@ -83,6 +84,9 @@ Every event should include:
 - reason or correlation fields when applicable
 
 Request events should log method, path, selected safe header metadata, and routing decision. They should not log request bodies or secrets by default.
+
+`policy_decision` records an audited routing decision without claiming the policy state changed. `policy_changed` is reserved for actual state transitions where `from` and `to` differ.
+`controlled_reality_entered` and `rate_limit_applied` are per-request enforcement markers, not policy-state transition events.
 
 ## 1. Edge Boundary
 
@@ -248,28 +252,29 @@ The policy router decides what happens next.
 
 The policy router consumes trace/scoring output and emits explicit state transitions with reasons. The proxy should treat policy state as input, not as hidden scoring logic.
 
-Possible states:
+Policy state values serialize in snake_case:
 
 ```text
 normal
 observe
 suspicious
-controlled-reality
-rate-limited
+controlled_reality
+rate_limited
 blocked
-reported
 ```
 
-V1 should implement only:
+Routing decision values serialize separately:
 
 ```text
-normal
-observe
-controlled-reality
-rate-limited
+protected_upstream
+eidolon_owned
+rewritten_upstream
+controlled_reality
+rate_limited
 ```
 
-Blocking comes later because it teaches the attacker too much.
+M1/M1.5 may use the `blocked` policy state in local validation, but production-grade
+blocking policy comes later because it can teach the attacker too much.
 
 ## Request Lifecycle
 

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const EVENT_SCHEMA_VERSION: u16 = 0;
+pub const EVENT_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
@@ -105,6 +105,10 @@ pub enum EventKind {
     PolicyChanged {
         from: PolicyState,
         to: PolicyState,
+        reason: String,
+    },
+    PolicyDecision {
+        routing_decision: RoutingDecision,
         reason: String,
     },
     ControlledRealityEntered {
@@ -224,6 +228,34 @@ mod tests {
         assert_eq!(serialized["kind"]["type"], json!("policy_changed"));
         assert_eq!(serialized["kind"]["from"], json!("observe"));
         assert_eq!(serialized["kind"]["to"], json!("suspicious"));
+    }
+
+    #[test]
+    fn policy_decision_event_serializes_actual_routing_decision() {
+        let session_id = SessionId::new();
+        let event = Event::new(
+            session_id,
+            EventSource::PolicyRouter,
+            PolicyState::ControlledReality,
+            EventKind::PolicyDecision {
+                routing_decision: RoutingDecision::ProtectedUpstream,
+                reason: "interventions disabled; forwarding to protected upstream".to_string(),
+            },
+        );
+
+        let serialized = serde_json::to_value(event).expect("event should serialize");
+
+        assert_eq!(serialized["source"], json!("policy_router"));
+        assert_eq!(serialized["policy_state"], json!("controlled_reality"));
+        assert_eq!(serialized["kind"]["type"], json!("policy_decision"));
+        assert_eq!(
+            serialized["kind"]["routing_decision"],
+            json!("protected_upstream")
+        );
+        assert_eq!(
+            serialized["kind"]["reason"],
+            json!("interventions disabled; forwarding to protected upstream")
+        );
     }
 
     #[test]
