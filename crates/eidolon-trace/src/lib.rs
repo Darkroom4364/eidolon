@@ -2,7 +2,24 @@ use std::collections::HashSet;
 
 use eidolon_core::{BaitId, ConfidenceBand, Event, EventKind, ExposureId, Score, SessionId};
 
+mod reader;
+mod timeline;
+
+pub use reader::{read_events_jsonl, read_events_jsonl_file, TraceReadError};
+pub use timeline::{build_session_timelines, SessionTimeline, TimelineEvent, TimelineEventRef};
+
 pub fn score_events(events: &[Event]) -> Score {
+    score_event_iter(events.iter())
+}
+
+pub fn score_timeline(timeline: &SessionTimeline) -> Score {
+    score_event_iter(timeline.events.iter().map(|event| &event.event))
+}
+
+fn score_event_iter<'a, I>(events: I) -> Score
+where
+    I: IntoIterator<Item = &'a Event>,
+{
     let mut points = 0;
     let mut reasons = Vec::new();
     let mut exposures = HashSet::new();
@@ -133,6 +150,31 @@ mod tests {
         assert_eq!(score.points, 85);
         assert_eq!(score.confidence, ConfidenceBand::ConfirmedBaitDerivedChain);
         assert_eq!(score.reasons.len(), 2);
+    }
+
+    #[test]
+    fn score_timeline_scores_ordered_timeline_events() {
+        let session_id = SessionId::new();
+        let timeline = SessionTimeline {
+            session_id,
+            events: vec![
+                TimelineEvent {
+                    file_order: 0,
+                    line_number: 1,
+                    event: bait_exposed(session_id),
+                },
+                TimelineEvent {
+                    file_order: 1,
+                    line_number: 2,
+                    event: bait_action(session_id),
+                },
+            ],
+        };
+
+        let score = score_timeline(&timeline);
+
+        assert_eq!(score.points, 85);
+        assert_eq!(score.confidence, ConfidenceBand::ConfirmedBaitDerivedChain);
     }
 
     #[test]

@@ -109,8 +109,11 @@ dependencies = [
 name = "eidolon-trace"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "eidolon-core",
  "serde",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
