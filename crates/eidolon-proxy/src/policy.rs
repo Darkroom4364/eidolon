@@ -104,16 +104,10 @@ pub fn policy_intervention_event(session_id: SessionId, decision: &PolicyDecisio
         RoutingDecision::RateLimited => EventKind::RateLimitApplied {
             reason: decision.reason.clone(),
         },
-        _ => {
-            // Core does not yet have a dedicated policy decision/audit event.
-            // PolicyChanged is the closest vocabulary for recording the decision
-            // reason until a dedicated audit kind is added.
-            EventKind::PolicyChanged {
-                from: decision.policy_state,
-                to: decision.policy_state,
-                reason: decision.reason.clone(),
-            }
-        }
+        _ => EventKind::PolicyDecision {
+            routing_decision: decision.routing_decision,
+            reason: decision.reason.clone(),
+        },
     };
 
     Event::new(
@@ -131,7 +125,7 @@ pub fn response_audit_event(
 ) -> Event {
     Event::new(
         session_id,
-        EventSource::PolicyRouter,
+        EventSource::Proxy,
         decision.policy_state,
         EventKind::ResponseServed {
             status,
@@ -200,6 +194,25 @@ mod tests {
     }
 
     #[test]
+    fn policy_intervention_event_audits_noop_without_fake_state_change() {
+        let session_id = SessionId::new();
+        let decision = decide_for_state(PolicyState::ControlledReality, InterventionMode::Disabled);
+
+        let event = policy_intervention_event(session_id, &decision);
+
+        assert_eq!(event.session_id, session_id);
+        assert_eq!(event.source, EventSource::PolicyRouter);
+        assert_eq!(event.policy_state, PolicyState::ControlledReality);
+        assert!(matches!(
+            event.kind,
+            EventKind::PolicyDecision {
+                routing_decision: RoutingDecision::ProtectedUpstream,
+                ref reason,
+            } if reason == &decision.reason
+        ));
+    }
+
+    #[test]
     fn response_audit_event_records_status_and_routing_decision() {
         let session_id = SessionId::new();
         let decision = PolicyDecision::new(
@@ -211,7 +224,7 @@ mod tests {
         let event = response_audit_event(session_id, &decision, 203);
 
         assert_eq!(event.session_id, session_id);
-        assert_eq!(event.source, EventSource::PolicyRouter);
+        assert_eq!(event.source, EventSource::Proxy);
         assert_eq!(event.policy_state, PolicyState::ControlledReality);
         assert!(matches!(
             event.kind,

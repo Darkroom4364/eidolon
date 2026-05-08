@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, VecDeque},
     env, fmt, fs,
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
@@ -8,24 +9,33 @@ use std::{
     thread,
 };
 
-use eidolon_core::{Event, EventKind, EventSource, RoutingDecision, SafeHeaderObservation};
+use eidolon_bait::{docs_for_bait, BaitRegistry};
+use eidolon_core::{
+    Bait, BaitId, Event, EventKind, EventSource, ExposureId, PolicyState, RoutingDecision,
+    SafeHeaderObservation, SessionId,
+};
 use eidolon_proxy::{
     event_log::FileEventLogWriter,
     policy::{self, InterventionMode},
     session::{self, SessionContext},
     surface::{
-        rewrite_response_body, ProtectedUpstreamController, SurfaceAction, SurfaceController,
+        rewrite_response_body, OpenApiPathInsertion, RewritePlan, SurfaceAction, SurfaceController,
         SurfaceHeader, SurfaceRequestMeta, SurfaceResponse, SurfaceResponseMeta,
     },
 };
+use serde_json::json;
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
 const DEFAULT_EVENT_LOG: &str = "/tmp/eidolon-events.jsonl";
 const DEFAULT_INTERVENTION_CONTROL: &str = "/tmp/eidolon-interventions.txt";
+const LEGACY_IMPORT_DOCS_SURFACE: &str = "/docs/legacy-import";
+const LEGACY_IMPORT_OPENAPI_TARGET: &str = "/openapi.json";
+const LEGACY_IMPORT_OPENAPI_QUERY: &str = "eidolon_surface=legacy-import";
 const DEFAULT_HTTP_PORT: u16 = 80;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+const MAX_BAIT_EXPOSURES: usize = 4096;
 const SAFE_HEADER_NAMES: &[&str] = &[
     "accept",
     "authorization",
@@ -441,13 +451,17 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     );
     println!("forwarding normal traffic to {}", config.upstream);
 
+    let bait_registry = Arc::new(BaitRegistry::m1_demo());
     let runtime = ProxyRuntime {
         upstream: config.upstream,
+        policy_state: policy::initial_policy_state(),
         event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
             &config.event_log_path,
         )?)),
         intervention_control_path: config.intervention_control_path,
-        surface_controller: ProtectedUpstreamController,
+        surface_controller: Arc::new(M1DemoSurfaceController::new(Arc::clone(&bait_registry))),
+        bait_registry,
+        bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
     };
 
     for stream in listener.incoming() {
@@ -470,9 +484,107 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
 #[derive(Clone)]
 struct ProxyRuntime {
     upstream: UpstreamTarget,
+    policy_state: PolicyState,
     event_log: Arc<Mutex<FileEventLogWriter>>,
     intervention_control_path: PathBuf,
-    surface_controller: ProtectedUpstreamController,
+    surface_controller: Arc<dyn SurfaceController + Send + Sync>,
+    bait_registry: Arc<BaitRegistry>,
+    bait_exposures: Arc<Mutex<BaitExposureStore>>,
+}
+
+#[derive(Debug, Default)]
+struct BaitExposureStore {
+    exposures: HashMap<(SessionId, BaitId), ExposureId>,
+    exposure_order: VecDeque<(SessionId, BaitId)>,
+}
+
+impl BaitExposureStore {
+    fn record_exposure(&mut self, session_id: SessionId, bait_id: BaitId, exposure_id: ExposureId) {
+        let key = (session_id, bait_id);
+        if self.exposures.insert(key.clone(), exposure_id).is_some() {
+            self.exposure_order.retain(|existing| existing != &key);
+        }
+        self.exposure_order.push_back(key);
+
+        while self.exposures.len() > MAX_BAIT_EXPOSURES {
+            if let Some(oldest) = self.exposure_order.pop_front() {
+                self.exposures.remove(&oldest);
+            }
+        }
+    }
+
+    fn exposure_for_action(&self, session_id: SessionId, bait_id: &BaitId) -> Option<ExposureId> {
+        self.exposures.get(&(session_id, bait_id.clone())).cloned()
+    }
+}
+
+struct M1DemoSurfaceController {
+    bait_registry: Arc<BaitRegistry>,
+}
+
+impl M1DemoSurfaceController {
+    fn new(bait_registry: Arc<BaitRegistry>) -> Self {
+        Self { bait_registry }
+    }
+
+    fn legacy_import_bait(&self) -> Option<&Bait> {
+        self.bait_registry
+            .bait_for_surface(LEGACY_IMPORT_DOCS_SURFACE)
+    }
+}
+
+impl SurfaceController for M1DemoSurfaceController {
+    fn decide(&self, request: &SurfaceRequestMeta) -> SurfaceAction {
+        let Some(bait) = self.legacy_import_bait() else {
+            return SurfaceAction::ProtectedUpstream;
+        };
+
+        if request.method == "GET" && request.path == bait.surface {
+            return SurfaceAction::EidolonOwned {
+                response: SurfaceResponse::new(
+                    200,
+                    vec![SurfaceHeader::new(
+                        "Content-Type",
+                        "text/markdown; charset=utf-8",
+                    )],
+                    docs_for_bait(bait),
+                ),
+            };
+        }
+
+        if request.method == "GET"
+            && request.path == LEGACY_IMPORT_OPENAPI_TARGET
+            && request.query.as_deref() == Some(LEGACY_IMPORT_OPENAPI_QUERY)
+        {
+            let action = &bait.expected_action;
+            let header_name = action.header_name.as_deref().unwrap_or("X-Migration-Trace");
+            let header_value = action.header_value.as_deref().unwrap_or(&bait.id.0);
+
+            return SurfaceAction::RewrittenUpstream {
+                plan: RewritePlan::openapi_paths(vec![OpenApiPathInsertion::new(
+                    action.path.clone(),
+                    json!({
+                        "post": {
+                            "summary": "Legacy import reconciliation compatibility hook",
+                            "parameters": [
+                                {
+                                    "name": header_name,
+                                    "in": "header",
+                                    "required": true,
+                                    "schema": { "type": "string", "example": header_value }
+                                }
+                            ],
+                            "responses": {
+                                "202": { "description": "Compatibility import reconciliation queued" }
+                            }
+                        }
+                    }),
+                )]),
+            };
+        }
+
+        SurfaceAction::ProtectedUpstream
+    }
 }
 
 fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io::Result<()> {
@@ -482,45 +594,121 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
 
     let session = session::derive_session_from_headers(header_pairs(&request.headers));
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
-    let decision = policy::decide_for_state(policy::initial_policy_state(), intervention_mode);
+    let decision = policy::decide_for_state(runtime.policy_state, intervention_mode);
     let path = normalized_event_path(&request)?;
     let surface_request = surface_request_meta(&request, &path);
-    let surface_action = match decision.routing_decision {
-        RoutingDecision::ProtectedUpstream => runtime.surface_controller.decide(&surface_request),
-        RoutingDecision::ControlledReality => SurfaceAction::ControlledReality {
-            reason: decision.reason.clone(),
-            response: surface_text_response(200, "controlled reality is not implemented in M1\n"),
-        },
-        RoutingDecision::RateLimited => SurfaceAction::RateLimited {
-            reason: decision.reason.clone(),
-            response: surface_text_response(429, "rate limited\n"),
-        },
-        RoutingDecision::EidolonOwned | RoutingDecision::RewrittenUpstream => {
-            SurfaceAction::ProtectedUpstream
+    let surface_action = if intervention_mode.interventions_enabled() {
+        match decision.routing_decision {
+            RoutingDecision::ProtectedUpstream => {
+                runtime.surface_controller.decide(&surface_request)
+            }
+            RoutingDecision::ControlledReality => SurfaceAction::ControlledReality {
+                reason: decision.reason.clone(),
+                response: surface_text_response(
+                    200,
+                    "controlled reality is not implemented in M1\n",
+                ),
+            },
+            RoutingDecision::RateLimited => SurfaceAction::RateLimited {
+                reason: decision.reason.clone(),
+                response: surface_text_response(429, "rate limited\n"),
+            },
+            RoutingDecision::EidolonOwned => SurfaceAction::EidolonOwned {
+                response: surface_text_response(403, "blocked by eidolon policy\n"),
+            },
+            RoutingDecision::RewrittenUpstream => {
+                return Err(invalid_data(
+                    "policy requested rewritten upstream without a surface rewrite plan",
+                ));
+            }
         }
+    } else {
+        SurfaceAction::ProtectedUpstream
     };
     let mut effective_decision = policy::PolicyDecision::new(
         decision.policy_state,
         surface_action.routing_decision(),
         decision.reason.clone(),
     );
+    let surface_requested_intervention =
+        !matches!(&surface_action, SurfaceAction::ProtectedUpstream);
 
-    write_event(
-        &runtime.event_log,
-        &request_seen_event(&request, &path, &session, &effective_decision),
-    )?;
-
-    if intervention_mode == InterventionMode::Disabled
-        || effective_decision.routing_decision != RoutingDecision::ProtectedUpstream
+    if intervention_mode.interventions_enabled()
+        && matches!(&surface_action, SurfaceAction::ProtectedUpstream)
     {
-        write_event(
-            &runtime.event_log,
-            &policy::policy_intervention_event(session.session_id, &effective_decision),
-        )?;
+        if let Some(action_match) = runtime.bait_registry.match_action(
+            &request.method,
+            &surface_request.path,
+            header_pairs(&request.headers),
+        ) {
+            effective_decision = policy::PolicyDecision::new(
+                decision.policy_state,
+                RoutingDecision::EidolonOwned,
+                "bait-derived decoy action intercepted before protected upstream",
+            );
+            write_event(
+                &runtime.event_log,
+                &request_seen_event(&request, &path, &session, &effective_decision),
+            )?;
+            write_bait_action_observed_event(
+                runtime,
+                &session,
+                decision.policy_state,
+                &action_match.bait,
+                &request.method,
+                &surface_request.path,
+            )?;
+            write_event(
+                &runtime.event_log,
+                &policy::policy_intervention_event(session.session_id, &effective_decision),
+            )?;
+
+            let mut response = bait_action_synthetic_response();
+            apply_response_headers(&mut response, &session);
+            write_event(
+                &runtime.event_log,
+                &policy::response_audit_event(
+                    session.session_id,
+                    &effective_decision,
+                    response.status,
+                ),
+            )?;
+
+            client_stream.write_all(&response.to_http_bytes())?;
+            return client_stream.flush();
+        }
     }
 
     if let Some(mut response) = direct_surface_response(surface_action.clone()) {
+        effective_decision = direct_surface_decision(
+            decision.policy_state,
+            &surface_action,
+            decision.reason.clone(),
+        );
+        write_request_and_policy_events(
+            runtime,
+            &request,
+            &path,
+            &session,
+            &effective_decision,
+            intervention_mode,
+            surface_requested_intervention,
+        )?;
         apply_response_headers(&mut response, &session);
+        if let Some(bait) = bait_exposure_for_direct_surface(
+            &decision,
+            &surface_action,
+            &surface_request,
+            &runtime.bait_registry,
+        ) {
+            write_bait_exposed_event(
+                runtime,
+                &session,
+                decision.policy_state,
+                bait,
+                surface_request.path.clone(),
+            )?;
+        }
         write_event(
             &runtime.event_log,
             &policy::response_audit_event(session.session_id, &effective_decision, response.status),
@@ -530,12 +718,29 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         return client_stream.flush();
     }
 
+    let upstream_request_decision = upstream_request_decision(
+        decision.policy_state,
+        &surface_action,
+        decision.reason.clone(),
+    );
+    write_event(
+        &runtime.event_log,
+        &request_seen_event(&request, &path, &session, &upstream_request_decision),
+    )?;
+    if intervention_mode == InterventionMode::Disabled {
+        write_event(
+            &runtime.event_log,
+            &policy::policy_intervention_event(session.session_id, &upstream_request_decision),
+        )?;
+    }
+
     let upstream_request = request.to_upstream_bytes(&runtime.upstream)?;
     let mut upstream_stream = TcpStream::connect(&runtime.upstream.connect_addr)?;
     upstream_stream.write_all(&upstream_request)?;
     upstream_stream.flush()?;
 
     let mut response = read_http_response(&mut upstream_stream)?;
+    let mut pending_bait_exposure = None;
     if let SurfaceAction::RewrittenUpstream { plan } = surface_action {
         let meta = surface_response_meta(&response, &path);
         let outcome = rewrite_response_body(&meta, &response.body, &plan);
@@ -545,11 +750,43 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 RoutingDecision::RewrittenUpstream,
                 "surface controller rewrote upstream response",
             );
+            if surface_request.method == "GET"
+                && surface_request.path == LEGACY_IMPORT_OPENAPI_TARGET
+                && surface_request.query.as_deref() == Some(LEGACY_IMPORT_OPENAPI_QUERY)
+            {
+                if let Some(bait) = runtime
+                    .bait_registry
+                    .bait_for_surface(LEGACY_IMPORT_DOCS_SURFACE)
+                {
+                    pending_bait_exposure = Some((bait.clone(), surface_request.target.clone()));
+                }
+            }
+        } else if let Some(refusal) = outcome.refusal() {
+            effective_decision = policy::PolicyDecision::new(
+                decision.policy_state,
+                RoutingDecision::ProtectedUpstream,
+                format!("surface controller rewrite refused; forwarded original upstream response: {refusal}"),
+            );
+        } else {
+            effective_decision = policy::PolicyDecision::new(
+                decision.policy_state,
+                RoutingDecision::ProtectedUpstream,
+                "surface controller rewrite made no changes; forwarded original upstream response",
+            );
         }
         response.body = outcome.into_body();
     }
     apply_response_headers(&mut response, &session);
 
+    if surface_requested_intervention {
+        write_event(
+            &runtime.event_log,
+            &policy::policy_intervention_event(session.session_id, &effective_decision),
+        )?;
+    }
+    if let Some((bait, surface)) = pending_bait_exposure {
+        write_bait_exposed_event(runtime, &session, decision.policy_state, &bait, surface)?;
+    }
     write_event(
         &runtime.event_log,
         &policy::response_audit_event(session.session_id, &effective_decision, response.status),
@@ -557,6 +794,104 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
 
     client_stream.write_all(&response.to_http_bytes())?;
     client_stream.flush()
+}
+
+fn bait_exposure_for_direct_surface<'a>(
+    policy_decision: &policy::PolicyDecision,
+    surface_action: &SurfaceAction,
+    surface_request: &SurfaceRequestMeta,
+    bait_registry: &'a BaitRegistry,
+) -> Option<&'a Bait> {
+    if policy_decision.routing_decision != RoutingDecision::ProtectedUpstream
+        || !matches!(surface_action, SurfaceAction::EidolonOwned { .. })
+        || surface_request.method != "GET"
+    {
+        return None;
+    }
+
+    bait_registry.bait_for_surface(&surface_request.path)
+}
+
+fn upstream_request_decision(
+    policy_state: PolicyState,
+    surface_action: &SurfaceAction,
+    default_reason: String,
+) -> policy::PolicyDecision {
+    match surface_action {
+        SurfaceAction::RewrittenUpstream { .. } => policy::PolicyDecision::new(
+            policy_state,
+            RoutingDecision::ProtectedUpstream,
+            "surface controller requested upstream response rewrite; request forwarded to protected upstream before rewrite outcome",
+        ),
+        _ => policy::PolicyDecision::protected_upstream(policy_state, default_reason),
+    }
+}
+
+fn write_bait_exposed_event(
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    policy_state: PolicyState,
+    bait: &Bait,
+    surface: impl Into<String>,
+) -> io::Result<ExposureId> {
+    let exposure_id = ExposureId(format!("exp-{}", SessionId::new().0));
+    let mut exposures = runtime
+        .bait_exposures
+        .lock()
+        .map_err(|_| io::Error::other("bait exposure store lock poisoned"))?;
+
+    write_event(
+        &runtime.event_log,
+        &Event::new(
+            session.session_id,
+            EventSource::SurfaceController,
+            policy_state,
+            EventKind::BaitExposed {
+                bait_id: bait.id.clone(),
+                exposure_id: exposure_id.clone(),
+                surface: surface.into(),
+            },
+        ),
+    )?;
+
+    exposures.record_exposure(session.session_id, bait.id.clone(), exposure_id.clone());
+    Ok(exposure_id)
+}
+
+fn write_bait_action_observed_event(
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    policy_state: PolicyState,
+    bait: &Bait,
+    method: &str,
+    path: &str,
+) -> io::Result<()> {
+    let exposure_id = {
+        let exposures = runtime
+            .bait_exposures
+            .lock()
+            .map_err(|_| io::Error::other("bait exposure store lock poisoned"))?;
+        exposures.exposure_for_action(session.session_id, &bait.id)
+    };
+
+    write_event(
+        &runtime.event_log,
+        &Event::new(
+            session.session_id,
+            EventSource::BaitEngine,
+            policy_state,
+            EventKind::BaitActionObserved {
+                bait_id: bait.id.clone(),
+                exposure_id,
+                method: method.to_string(),
+                path: path.to_string(),
+            },
+        ),
+    )
+}
+
+fn bait_action_synthetic_response() -> HttpResponse {
+    surface_response_to_http(surface_text_response(202, "accepted\n"))
 }
 
 fn header_pairs(headers: &[HttpHeader]) -> impl Iterator<Item = (&str, &str)> {
@@ -596,6 +931,36 @@ fn direct_surface_response(action: SurfaceAction) -> Option<HttpResponse> {
         | SurfaceAction::ControlledReality { response, .. }
         | SurfaceAction::RateLimited { response, .. } => Some(surface_response_to_http(response)),
         SurfaceAction::ProtectedUpstream | SurfaceAction::RewrittenUpstream { .. } => None,
+    }
+}
+
+fn direct_surface_decision(
+    policy_state: PolicyState,
+    action: &SurfaceAction,
+    default_reason: String,
+) -> policy::PolicyDecision {
+    match action {
+        SurfaceAction::ProtectedUpstream => {
+            policy::PolicyDecision::protected_upstream(policy_state, default_reason)
+        }
+        SurfaceAction::EidolonOwned { .. } => policy::PolicyDecision::new(
+            policy_state,
+            RoutingDecision::EidolonOwned,
+            "surface controller served eidolon-owned response",
+        ),
+        SurfaceAction::ControlledReality { reason, .. } => policy::PolicyDecision::new(
+            policy_state,
+            RoutingDecision::ControlledReality,
+            reason.clone(),
+        ),
+        SurfaceAction::RateLimited { reason, .. } => {
+            policy::PolicyDecision::new(policy_state, RoutingDecision::RateLimited, reason.clone())
+        }
+        SurfaceAction::RewrittenUpstream { .. } => policy::PolicyDecision::new(
+            policy_state,
+            RoutingDecision::RewrittenUpstream,
+            "surface controller requested upstream response rewrite",
+        ),
     }
 }
 
@@ -664,6 +1029,33 @@ fn request_seen_event(
     )
 }
 
+fn write_request_and_policy_events(
+    runtime: &ProxyRuntime,
+    request: &HttpRequest,
+    path: &str,
+    session: &SessionContext,
+    decision: &policy::PolicyDecision,
+    intervention_mode: InterventionMode,
+    surface_requested_intervention: bool,
+) -> io::Result<()> {
+    write_event(
+        &runtime.event_log,
+        &request_seen_event(request, path, session, decision),
+    )?;
+
+    if intervention_mode == InterventionMode::Disabled
+        || surface_requested_intervention
+        || decision.routing_decision != RoutingDecision::ProtectedUpstream
+    {
+        write_event(
+            &runtime.event_log,
+            &policy::policy_intervention_event(session.session_id, decision),
+        )?;
+    }
+
+    Ok(())
+}
+
 fn safe_header_observations(headers: &[HttpHeader]) -> Vec<SafeHeaderObservation> {
     SAFE_HEADER_NAMES
         .iter()
@@ -677,6 +1069,33 @@ fn safe_header_observations(headers: &[HttpHeader]) -> Vec<SafeHeaderObservation
 }
 
 fn apply_response_headers(response: &mut HttpResponse, session: &SessionContext) {
+    let connection_nominated_headers: Vec<String> = response
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("connection"))
+        .flat_map(|header| header.value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    for name in connection_nominated_headers {
+        response.remove_header(&name);
+    }
+
+    for name in [
+        "Connection",
+        "Keep-Alive",
+        "Proxy-Authenticate",
+        "Proxy-Authorization",
+        "TE",
+        "Trailer",
+        "Transfer-Encoding",
+        "Upgrade",
+    ] {
+        response.remove_header(name);
+    }
+
     response.set_header("Connection", "close");
     response.set_header("Content-Length", response.body.len().to_string());
 
@@ -787,15 +1206,13 @@ impl HttpResponse {
     fn set_header(&mut self, name: impl Into<String>, value: impl Into<String>) {
         let name = name.into();
         let value = value.into();
-        if let Some(header) = self
-            .headers
-            .iter_mut()
-            .find(|header| header.name.eq_ignore_ascii_case(&name))
-        {
-            header.value = value;
-        } else {
-            self.headers.push(HttpHeader { name, value });
-        }
+        self.remove_header(&name);
+        self.headers.push(HttpHeader { name, value });
+    }
+
+    fn remove_header(&mut self, name: &str) {
+        self.headers
+            .retain(|header| !header.name.eq_ignore_ascii_case(name));
     }
 
     fn append_header(&mut self, name: impl Into<String>, value: impl Into<String>) {
@@ -889,38 +1306,45 @@ where
     let body_start = header_end;
     response.body.extend_from_slice(&buffer[body_start..]);
 
-    if let Some(content_length) = response_content_length(&response)? {
-        if content_length > MAX_BODY_BYTES {
-            return Err(invalid_data("HTTP response body exceeds size limit"));
-        }
+    match response_transfer_coding(&response)? {
+        ResponseTransferCoding::Identity => {
+            if let Some(content_length) = response_content_length(&response)? {
+                if content_length > MAX_BODY_BYTES {
+                    return Err(invalid_data("HTTP response body exceeds size limit"));
+                }
 
-        if response.body.len() > content_length {
-            response.body.truncate(content_length);
-        }
+                if response.body.len() > content_length {
+                    response.body.truncate(content_length);
+                }
 
-        while response.body.len() < content_length {
-            let remaining = content_length - response.body.len();
-            let read_len = remaining.min(chunk.len());
-            let bytes_read = reader.read(&mut chunk[..read_len])?;
-            if bytes_read == 0 {
-                return Err(invalid_data(
-                    "connection closed before HTTP response body completed",
-                ));
+                while response.body.len() < content_length {
+                    let remaining = content_length - response.body.len();
+                    let read_len = remaining.min(chunk.len());
+                    let bytes_read = reader.read(&mut chunk[..read_len])?;
+                    if bytes_read == 0 {
+                        return Err(invalid_data(
+                            "connection closed before HTTP response body completed",
+                        ));
+                    }
+
+                    response.body.extend_from_slice(&chunk[..bytes_read]);
+                }
+            } else {
+                while response.body.len() <= MAX_BODY_BYTES {
+                    let bytes_read = reader.read(&mut chunk)?;
+                    if bytes_read == 0 {
+                        return Ok(response);
+                    }
+
+                    response.body.extend_from_slice(&chunk[..bytes_read]);
+                }
+
+                return Err(invalid_data("HTTP response body exceeds size limit"));
             }
-
-            response.body.extend_from_slice(&chunk[..bytes_read]);
         }
-    } else {
-        while response.body.len() <= MAX_BODY_BYTES {
-            let bytes_read = reader.read(&mut chunk)?;
-            if bytes_read == 0 {
-                return Ok(response);
-            }
-
-            response.body.extend_from_slice(&chunk[..bytes_read]);
+        ResponseTransferCoding::Chunked => {
+            response.body = read_chunked_response_body(reader, response.body)?;
         }
-
-        return Err(invalid_data("HTTP response body exceeds size limit"));
     }
 
     Ok(response)
@@ -1067,11 +1491,144 @@ fn response_content_length(response: &HttpResponse) -> io::Result<Option<usize>>
                 .value
                 .parse::<usize>()
                 .map_err(|error| invalid_data(format!("invalid Content-Length: {error}")))?;
+            if content_length.is_some_and(|existing| existing != parsed) {
+                return Err(invalid_data("conflicting upstream Content-Length headers"));
+            }
             content_length = Some(parsed);
         }
     }
 
     Ok(content_length)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseTransferCoding {
+    Identity,
+    Chunked,
+}
+
+fn response_transfer_coding(response: &HttpResponse) -> io::Result<ResponseTransferCoding> {
+    let codings: Vec<String> = response
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("transfer-encoding"))
+        .flat_map(|header| header.value.split(','))
+        .map(|coding| coding.trim().to_ascii_lowercase())
+        .filter(|coding| !coding.is_empty())
+        .collect();
+
+    match codings.as_slice() {
+        [] => Ok(ResponseTransferCoding::Identity),
+        [coding] if coding == "chunked" => Ok(ResponseTransferCoding::Chunked),
+        _ => Err(invalid_data(format!(
+            "unsupported upstream Transfer-Encoding: {}",
+            codings.join(", ")
+        ))),
+    }
+}
+
+fn read_chunked_response_body<R>(reader: &mut R, mut buffer: Vec<u8>) -> io::Result<Vec<u8>>
+where
+    R: Read,
+{
+    let mut body = Vec::new();
+
+    loop {
+        let size_line = read_crlf_line(reader, &mut buffer)?;
+        let chunk_size = parse_chunk_size(&size_line)?;
+
+        if chunk_size == 0 {
+            loop {
+                let trailer_line = read_crlf_line(reader, &mut buffer)?;
+                if trailer_line.is_empty() {
+                    return Ok(body);
+                }
+            }
+        }
+
+        let body_len = body
+            .len()
+            .checked_add(chunk_size)
+            .ok_or_else(|| invalid_data("HTTP response body exceeds size limit"))?;
+        if body_len > MAX_BODY_BYTES {
+            return Err(invalid_data("HTTP response body exceeds size limit"));
+        }
+
+        let chunk_with_crlf = chunk_size
+            .checked_add(2)
+            .ok_or_else(|| invalid_data("HTTP response chunk exceeds size limit"))?;
+        ensure_buffer_len(reader, &mut buffer, chunk_with_crlf)?;
+        body.extend(buffer.drain(..chunk_size));
+        if buffer.drain(..2).ne(b"\r\n".iter().copied()) {
+            return Err(invalid_data("invalid chunked response body"));
+        }
+    }
+}
+
+fn read_crlf_line<R>(reader: &mut R, buffer: &mut Vec<u8>) -> io::Result<Vec<u8>>
+where
+    R: Read,
+{
+    loop {
+        if let Some(line_end) = find_crlf(buffer) {
+            let line = buffer[..line_end].to_vec();
+            buffer.drain(..line_end + 2);
+            return Ok(line);
+        }
+
+        if buffer.len() > MAX_HEADER_BYTES {
+            return Err(invalid_data("chunked response metadata exceeds size limit"));
+        }
+
+        read_more(reader, buffer)?;
+    }
+}
+
+fn ensure_buffer_len<R>(reader: &mut R, buffer: &mut Vec<u8>, len: usize) -> io::Result<()>
+where
+    R: Read,
+{
+    while buffer.len() < len {
+        read_more(reader, buffer)?;
+    }
+
+    Ok(())
+}
+
+fn read_more<R>(reader: &mut R, buffer: &mut Vec<u8>) -> io::Result<()>
+where
+    R: Read,
+{
+    let mut chunk = [0_u8; 1024];
+    let bytes_read = reader.read(&mut chunk)?;
+    if bytes_read == 0 {
+        return Err(invalid_data(
+            "connection closed before chunked HTTP response body completed",
+        ));
+    }
+
+    buffer.extend_from_slice(&chunk[..bytes_read]);
+    Ok(())
+}
+
+fn parse_chunk_size(line: &[u8]) -> io::Result<usize> {
+    let line = std::str::from_utf8(line)
+        .map_err(|_| invalid_data("chunked response size line is not UTF-8"))?;
+    let size = line
+        .split_once(';')
+        .map_or(line, |(size, _extension)| size)
+        .trim();
+
+    if size.is_empty() {
+        return Err(invalid_data("missing chunked response size"));
+    }
+
+    usize::from_str_radix(size, 16)
+        .map_err(|error| invalid_data(format!("invalid chunked response size: {error}")))
+}
+
+fn find_crlf(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(2).position(|window| window == b"\r\n")
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
@@ -1140,6 +1697,27 @@ Example:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpListener},
+        thread::JoinHandle,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use eidolon_core::SessionId;
+    use eidolon_proxy::surface::{HtmlInsertion, RewritePlan};
+    use serde_json::Value;
+
+    #[derive(Clone)]
+    struct StaticSurfaceController {
+        action: SurfaceAction,
+    }
+
+    impl SurfaceController for StaticSurfaceController {
+        fn decide(&self, _request: &SurfaceRequestMeta) -> SurfaceAction {
+            self.action.clone()
+        }
+    }
 
     fn run_config(args: &[&str]) -> Result<ProxyConfig, ConfigError> {
         match CliAction::from_args(args.iter().copied())? {
@@ -1156,6 +1734,292 @@ mod tests {
             error,
             expected
         );
+    }
+
+    fn unique_temp_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+
+        env::temp_dir().join(format!(
+            "eidolon-proxy-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn test_runtime(
+        upstream: UpstreamTarget,
+        event_log_path: &Path,
+        intervention_control_path: PathBuf,
+        action: SurfaceAction,
+    ) -> ProxyRuntime {
+        test_runtime_with_surface_controller(
+            upstream,
+            event_log_path,
+            intervention_control_path,
+            Arc::new(StaticSurfaceController { action }),
+        )
+    }
+
+    fn test_runtime_with_surface_controller(
+        upstream: UpstreamTarget,
+        event_log_path: &Path,
+        intervention_control_path: PathBuf,
+        surface_controller: Arc<dyn SurfaceController + Send + Sync>,
+    ) -> ProxyRuntime {
+        let bait_registry = Arc::new(BaitRegistry::m1_demo());
+        ProxyRuntime {
+            upstream,
+            policy_state: policy::initial_policy_state(),
+            event_log: Arc::new(Mutex::new(
+                FileEventLogWriter::open(event_log_path).expect("event log should open"),
+            )),
+            intervention_control_path,
+            surface_controller,
+            bait_registry,
+            bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+        }
+    }
+
+    fn test_runtime_with_m1_controller(
+        upstream: UpstreamTarget,
+        event_log_path: &Path,
+        intervention_control_path: PathBuf,
+    ) -> ProxyRuntime {
+        let bait_registry = Arc::new(BaitRegistry::m1_demo());
+        ProxyRuntime {
+            upstream,
+            policy_state: policy::initial_policy_state(),
+            event_log: Arc::new(Mutex::new(
+                FileEventLogWriter::open(event_log_path).expect("event log should open"),
+            )),
+            intervention_control_path,
+            surface_controller: Arc::new(M1DemoSurfaceController::new(Arc::clone(&bait_registry))),
+            bait_registry,
+            bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+        }
+    }
+
+    fn spawn_upstream(response: impl Into<Vec<u8>>) -> (UpstreamTarget, JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("upstream should bind");
+        let addr = listener.local_addr().expect("upstream should have address");
+        let response = response.into();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("upstream should accept");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+
+            loop {
+                let bytes_read = stream.read(&mut chunk).expect("upstream request read");
+                if bytes_read == 0 {
+                    break;
+                }
+
+                request.extend_from_slice(&chunk[..bytes_read]);
+                if find_header_end(&request).is_some() {
+                    break;
+                }
+            }
+
+            stream
+                .write_all(&response)
+                .expect("upstream response should write");
+            stream.flush().expect("upstream response should flush");
+            request
+        });
+        let upstream =
+            parse_upstream(&format!("http://{addr}")).expect("upstream target should parse");
+
+        (upstream, handle)
+    }
+
+    fn closed_upstream() -> UpstreamTarget {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("upstream should bind");
+        let addr = listener.local_addr().expect("upstream should have address");
+        drop(listener);
+
+        parse_upstream(&format!("http://{addr}")).expect("upstream target should parse")
+    }
+
+    fn run_runtime_request(runtime: ProxyRuntime, request: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("proxy should bind");
+        let addr = listener.local_addr().expect("proxy should have address");
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("proxy should accept");
+            handle_connection(stream, &runtime).expect("runtime should handle request");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client should connect");
+        client.write_all(request).expect("request should write");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("client write side should close");
+
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .expect("response should read");
+        handle.join().expect("proxy thread should join");
+
+        response
+    }
+
+    fn run_runtime_request_result(
+        runtime: ProxyRuntime,
+        request: &[u8],
+    ) -> (io::Result<()>, Vec<u8>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("proxy should bind");
+        let addr = listener.local_addr().expect("proxy should have address");
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("proxy should accept");
+            handle_connection(stream, &runtime)
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client should connect");
+        client.write_all(request).expect("request should write");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("client write side should close");
+
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        let result = handle.join().expect("proxy thread should join");
+
+        (result, response)
+    }
+
+    fn parse_downstream_response(response: &[u8]) -> HttpResponse {
+        read_http_response(&mut &response[..]).expect("downstream response should parse")
+    }
+
+    fn cookie_header() -> String {
+        format!("eidolon_session={}", SessionId::new().0)
+    }
+
+    fn request_with_cookie(
+        method: &str,
+        path: &str,
+        cookie: &str,
+        headers: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut request =
+            format!("{method} {path} HTTP/1.1\r\nHost: proxy.local\r\nCookie: {cookie}\r\n");
+        for (name, value) in headers {
+            request.push_str(name);
+            request.push_str(": ");
+            request.push_str(value);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        request.into_bytes()
+    }
+
+    fn get_request(path: &str) -> Vec<u8> {
+        request_with_cookie("GET", path, &cookie_header(), &[])
+    }
+
+    fn get_request_with_cookie(path: &str, cookie: &str) -> Vec<u8> {
+        request_with_cookie("GET", path, cookie, &[])
+    }
+
+    fn post_request_with_cookie(path: &str, cookie: &str, headers: &[(&str, &str)]) -> Vec<u8> {
+        request_with_cookie("POST", path, cookie, headers)
+    }
+
+    fn html_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
+    fn json_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
+    fn html_rewrite_action(snippet: &str) -> SurfaceAction {
+        SurfaceAction::RewrittenUpstream {
+            plan: RewritePlan::html(HtmlInsertion::new(snippet)),
+        }
+    }
+
+    fn event_values(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .expect("event log should read")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event line should be json"))
+            .collect()
+    }
+
+    fn events_of_type(path: &Path, event_type: &str) -> Vec<Value> {
+        event_values(path)
+            .into_iter()
+            .filter(|event| event["kind"]["type"].as_str() == Some(event_type))
+            .collect()
+    }
+
+    fn first_event_of_type(path: &Path, event_type: &str) -> Value {
+        events_of_type(path, event_type)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{event_type} event should exist"))
+    }
+
+    fn assert_event_routing(path: &Path, event_type: &str, expected: &str) {
+        let events = event_values(path);
+        let event = events
+            .iter()
+            .find(|event| event["kind"]["type"].as_str() == Some(event_type))
+            .expect("event should exist");
+
+        assert_eq!(event["kind"]["routing_decision"].as_str(), Some(expected));
+    }
+
+    fn assert_event_type_absent(path: &Path, event_type: &str) {
+        let events = event_values(path);
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event["kind"]["type"].as_str() != Some(event_type)),
+            "did not expect {event_type} in {events:#?}"
+        );
+    }
+
+    fn assert_policy_decision_reason_contains(path: &Path, expected: &str) {
+        let events = event_values(path);
+        let event = events
+            .iter()
+            .find(|event| event["kind"]["type"].as_str() == Some("policy_decision"))
+            .expect("policy decision event should exist");
+
+        assert_eq!(
+            event["kind"]["routing_decision"].as_str(),
+            Some("protected_upstream")
+        );
+        assert!(
+            event["kind"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(expected)),
+            "expected policy decision reason to contain `{expected}`, got {event:#?}"
+        );
+    }
+
+    fn header_values<'a>(response: &'a HttpResponse, name: &str) -> Vec<&'a str> {
+        response
+            .headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case(name))
+            .map(|header| header.value.as_str())
+            .collect()
     }
 
     #[test]
@@ -1372,6 +2236,122 @@ mod tests {
     }
 
     #[test]
+    fn decodes_chunked_upstream_responses() {
+        let mut response_bytes =
+            &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"[..];
+        let response = read_http_response(&mut response_bytes).expect("chunked should decode");
+
+        assert_eq!(response.body, b"ok");
+    }
+
+    #[test]
+    fn rejects_chunked_response_size_overflow_after_prior_chunk() {
+        let response_bytes = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n{:x}\r\n",
+            usize::MAX
+        );
+        let mut response_bytes = response_bytes.as_bytes();
+
+        let error =
+            read_http_response(&mut response_bytes).expect_err("oversize chunk should fail");
+
+        assert!(error.to_string().contains("size limit"));
+    }
+
+    #[test]
+    fn rejects_unsupported_upstream_transfer_encodings() {
+        let mut response_bytes = &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nopaque"[..];
+        let error =
+            read_http_response(&mut response_bytes).expect_err("transfer encoding should fail");
+
+        assert!(error.to_string().contains("Transfer-Encoding"));
+    }
+
+    #[test]
+    fn downstream_headers_remove_transfer_encoding_and_duplicate_singletons() {
+        let session = session::derive_session_from_headers([("Cookie", cookie_header())]);
+        let mut response = HttpResponse {
+            version: "HTTP/1.1".to_string(),
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![
+                HttpHeader {
+                    name: "Transfer-Encoding".to_string(),
+                    value: "chunked".to_string(),
+                },
+                HttpHeader {
+                    name: "Content-Length".to_string(),
+                    value: "999".to_string(),
+                },
+                HttpHeader {
+                    name: "content-length".to_string(),
+                    value: "1000".to_string(),
+                },
+                HttpHeader {
+                    name: "Connection".to_string(),
+                    value: "keep-alive, X-Hop-By-Hop".to_string(),
+                },
+                HttpHeader {
+                    name: "connection".to_string(),
+                    value: "upgrade".to_string(),
+                },
+                HttpHeader {
+                    name: "Keep-Alive".to_string(),
+                    value: "timeout=5".to_string(),
+                },
+                HttpHeader {
+                    name: "Trailer".to_string(),
+                    value: "Expires".to_string(),
+                },
+                HttpHeader {
+                    name: "Upgrade".to_string(),
+                    value: "websocket".to_string(),
+                },
+                HttpHeader {
+                    name: "X-Hop-By-Hop".to_string(),
+                    value: "remove me".to_string(),
+                },
+            ],
+            body: b"ok".to_vec(),
+        };
+
+        apply_response_headers(&mut response, &session);
+
+        assert!(header_values(&response, "transfer-encoding").is_empty());
+        assert!(header_values(&response, "keep-alive").is_empty());
+        assert!(header_values(&response, "trailer").is_empty());
+        assert!(header_values(&response, "upgrade").is_empty());
+        assert!(header_values(&response, "x-hop-by-hop").is_empty());
+        assert_eq!(header_values(&response, "content-length"), vec!["2"]);
+        assert_eq!(header_values(&response, "connection"), vec!["close"]);
+    }
+
+    #[test]
+    fn bait_exposure_store_evicts_oldest_exposure_at_cap() {
+        let mut store = BaitExposureStore::default();
+        let oldest_session_id = SessionId::new();
+        let oldest_bait_id = BaitId("oldest".to_string());
+        store.record_exposure(
+            oldest_session_id,
+            oldest_bait_id.clone(),
+            ExposureId("oldest-exposure".to_string()),
+        );
+
+        for index in 0..MAX_BAIT_EXPOSURES {
+            store.record_exposure(
+                SessionId::new(),
+                BaitId(format!("bait-{index}")),
+                ExposureId(format!("exp-{index}")),
+            );
+        }
+
+        assert_eq!(store.exposures.len(), MAX_BAIT_EXPOSURES);
+        assert!(store
+            .exposure_for_action(oldest_session_id, &oldest_bait_id)
+            .is_none());
+    }
+
+    #[test]
     fn serializes_http_response_after_header_update() {
         let mut response = HttpResponse {
             version: "HTTP/1.1".to_string(),
@@ -1394,6 +2374,513 @@ mod tests {
         assert!(serialized.contains("\r\nConnection: close\r\n"));
         assert!(serialized.contains("\r\nSet-Cookie: eidolon_session=abc; Path=/\r\n"));
         assert!(serialized.ends_with("\r\n\r\nok"));
+    }
+
+    #[test]
+    fn runtime_path_serves_eidolon_owned_surface_response() {
+        let event_log_path = unique_temp_path("owned-events.jsonl");
+        let runtime = test_runtime(
+            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            &event_log_path,
+            unique_temp_path("owned-control.txt"),
+            SurfaceAction::EidolonOwned {
+                response: SurfaceResponse::new(
+                    202,
+                    vec![SurfaceHeader::new("Content-Type", "text/plain")],
+                    "owned surface\n",
+                ),
+            },
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(runtime, &get_request("/")));
+
+        assert_eq!(response.status, 202);
+        assert_eq!(response.body, b"owned surface\n");
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+        assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+    }
+
+    #[test]
+    fn runtime_default_controller_serves_demo_owned_surface() {
+        let event_log_path = unique_temp_path("default-owned-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            &event_log_path,
+            unique_temp_path("default-owned-control.txt"),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request("/docs/legacy-import"),
+        ));
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert!(body.contains("/api/v2/import/reconcile"));
+        assert!(body.contains("X-Migration-Trace"));
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+        assert_event_routing(&event_log_path, "policy_decision", "eidolon_owned");
+        assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(exposure["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert_eq!(exposure["kind"]["surface"], "/docs/legacy-import");
+        assert!(exposure["kind"]["exposure_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("exp-")));
+    }
+
+    #[test]
+    fn runtime_default_controller_rewrites_demo_openapi_when_requested() {
+        let event_log_path = unique_temp_path("default-rewrite-events.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, upstream_handle) = spawn_upstream(json_response(original));
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("default-rewrite-control.txt"),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request("/openapi.json?eidolon_surface=legacy-import"),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        let rewritten: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert!(rewritten["paths"]["/api/v2/import/reconcile"].is_object());
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_routing(&event_log_path, "policy_decision", "rewritten_upstream");
+        assert_event_routing(&event_log_path, "response_served", "rewritten_upstream");
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(exposure["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert_eq!(
+            exposure["kind"]["surface"],
+            "/openapi.json?eidolon_surface=legacy-import"
+        );
+    }
+
+    #[test]
+    fn runtime_default_controller_forwards_ordinary_openapi_unchanged() {
+        let event_log_path = unique_temp_path("default-forward-events.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, upstream_handle) = spawn_upstream(json_response(original));
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("default-forward-control.txt"),
+        );
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/openapi.json")));
+        upstream_handle.join().expect("upstream thread should join");
+
+        assert_eq!(response.body, original.as_bytes());
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_routing(&event_log_path, "response_served", "protected_upstream");
+        assert_event_type_absent(&event_log_path, "policy_decision");
+        assert_event_type_absent(&event_log_path, "bait_exposed");
+    }
+
+    #[test]
+    fn runtime_decodes_chunked_upstream_response_before_downstream_send() {
+        let event_log_path = unique_temp_path("chunked-upstream-events.jsonl");
+        let (upstream, upstream_handle) = spawn_upstream(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        );
+        let runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            unique_temp_path("chunked-upstream-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/chunked")));
+        upstream_handle.join().expect("upstream thread should join");
+
+        assert_eq!(response.body, b"hello");
+        assert!(header_values(&response, "transfer-encoding").is_empty());
+        assert_eq!(header_values(&response, "content-length"), vec!["5"]);
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_routing(&event_log_path, "response_served", "protected_upstream");
+    }
+
+    #[test]
+    fn runtime_correlates_same_session_bait_action_and_does_not_forward() {
+        let event_log_path = unique_temp_path("bait-action-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("bait-action-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        let exposure_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        let action_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "rel_2025_04_b7f2")],
+            ),
+        ));
+
+        assert_eq!(exposure_response.status, 200);
+        assert_eq!(action_response.status, 202);
+        assert_eq!(action_response.body, b"accepted\n");
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        let action = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(action["session_id"], exposure["session_id"]);
+        assert_eq!(action["kind"]["bait_id"], exposure["kind"]["bait_id"]);
+        assert_eq!(
+            action["kind"]["exposure_id"],
+            exposure["kind"]["exposure_id"]
+        );
+        assert_eq!(action["kind"]["method"], "POST");
+        assert_eq!(action["kind"]["path"], "/api/v2/import/reconcile");
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+        assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+
+        let events = event_values(&event_log_path);
+        let action_index = events
+            .iter()
+            .position(|event| event["kind"]["type"].as_str() == Some("bait_action_observed"))
+            .expect("bait action event should exist");
+        assert_eq!(
+            events[action_index - 1]["kind"]["type"].as_str(),
+            Some("request_seen")
+        );
+        assert_eq!(
+            events[action_index + 1]["kind"]["type"].as_str(),
+            Some("policy_decision")
+        );
+    }
+
+    #[test]
+    fn runtime_bait_action_without_same_session_exposure_is_not_correlated() {
+        let event_log_path = unique_temp_path("wrong-session-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("wrong-session-control.txt"),
+        );
+        let exposed_cookie = cookie_header();
+        let action_cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &exposed_cookie),
+        ));
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &action_cookie,
+                &[("X-Migration-Trace", "rel_2025_04_b7f2")],
+            ),
+        ));
+
+        assert_eq!(response.status, 202);
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        let action = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_ne!(action["session_id"], exposure["session_id"]);
+        assert_eq!(action["kind"]["bait_id"], exposure["kind"]["bait_id"]);
+        assert!(action["kind"]["exposure_id"].is_null());
+    }
+
+    #[test]
+    fn runtime_emits_correlated_action_after_prior_uncorrelated_action() {
+        let event_log_path = unique_temp_path("late-correlated-action-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("late-correlated-action-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "rel_2025_04_b7f2")],
+            ),
+        ));
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "rel_2025_04_b7f2")],
+            ),
+        ));
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        let actions = events_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0]["kind"]["exposure_id"].is_null());
+        assert_eq!(
+            actions[1]["kind"]["exposure_id"],
+            exposure["kind"]["exposure_id"]
+        );
+    }
+
+    #[test]
+    fn runtime_logs_repeated_correlated_bait_actions_for_audit() {
+        let event_log_path = unique_temp_path("repeated-correlated-action-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("repeated-correlated-action-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        for _ in 0..2 {
+            parse_downstream_response(&run_runtime_request(
+                runtime.clone(),
+                &post_request_with_cookie(
+                    "/api/v2/import/reconcile",
+                    &cookie,
+                    &[("X-Migration-Trace", "rel_2025_04_b7f2")],
+                ),
+            ));
+        }
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        let actions = events_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(actions.len(), 2);
+        assert!(actions
+            .iter()
+            .all(|action| action["kind"]["exposure_id"] == exposure["kind"]["exposure_id"]));
+    }
+
+    #[test]
+    fn runtime_wrong_bait_header_value_forwards_as_near_miss() {
+        let event_log_path = unique_temp_path("near-miss-events.jsonl");
+        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("near-miss-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "wrong")],
+            ),
+        ));
+        let upstream_request = upstream_handle.join().expect("upstream thread should join");
+
+        assert_eq!(response.body, br#"{"mode":"upstream"}"#);
+        assert!(String::from_utf8(upstream_request)
+            .expect("request should be utf8")
+            .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+        assert_eq!(events_of_type(&event_log_path, "bait_exposed").len(), 1);
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+    }
+
+    #[test]
+    fn disabled_interventions_bypass_bait_action_matching_at_runtime() {
+        let event_log_path = unique_temp_path("disabled-bait-events.jsonl");
+        let control_path = unique_temp_path("disabled-bait-control.txt");
+        fs::write(&control_path, "disabled").expect("control file should write");
+        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let runtime = test_runtime_with_m1_controller(upstream, &event_log_path, control_path);
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie_header(),
+                &[("X-Migration-Trace", "rel_2025_04_b7f2")],
+            ),
+        ));
+        let upstream_request = upstream_handle.join().expect("upstream thread should join");
+
+        assert_eq!(response.body, br#"{"mode":"upstream"}"#);
+        assert!(String::from_utf8(upstream_request)
+            .expect("request should be utf8")
+            .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+        assert_event_type_absent(&event_log_path, "bait_exposed");
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+    }
+
+    #[test]
+    fn runtime_path_uses_injected_policy_state_for_intervention_routing() {
+        let event_log_path = unique_temp_path("controlled-events.jsonl");
+        let mut runtime = test_runtime(
+            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            &event_log_path,
+            unique_temp_path("controlled-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.policy_state = PolicyState::ControlledReality;
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/controlled")));
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.body,
+            b"controlled reality is not implemented in M1\n"
+        );
+        assert_event_routing(&event_log_path, "request_seen", "controlled_reality");
+        assert_event_routing(&event_log_path, "response_served", "controlled_reality");
+    }
+
+    #[test]
+    fn runtime_policy_owned_response_does_not_log_bait_exposure() {
+        let event_log_path = unique_temp_path("blocked-no-exposure-events.jsonl");
+        let mut runtime = test_runtime_with_m1_controller(
+            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            &event_log_path,
+            unique_temp_path("blocked-no-exposure-control.txt"),
+        );
+        runtime.policy_state = PolicyState::Blocked;
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request("/docs/legacy-import"),
+        ));
+
+        assert_eq!(response.status, 403);
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+        assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+        assert_event_type_absent(&event_log_path, "bait_exposed");
+    }
+
+    #[test]
+    fn runtime_audits_forwarded_request_before_upstream_failure() {
+        let event_log_path = unique_temp_path("upstream-failure-events.jsonl");
+        let runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("upstream-failure-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+
+        let (result, response) = run_runtime_request_result(runtime, &get_request("/upstream"));
+
+        assert!(result.is_err());
+        assert!(response.is_empty());
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_type_absent(&event_log_path, "policy_decision");
+    }
+
+    #[test]
+    fn runtime_path_audits_rewritten_upstream_only_after_successful_rewrite() {
+        let event_log_path = unique_temp_path("rewritten-events.jsonl");
+        let (upstream, upstream_handle) =
+            spawn_upstream(html_response("<html><body>upstream</body></html>"));
+        let runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            unique_temp_path("rewritten-control.txt"),
+            html_rewrite_action(r#"<div data-eidolon-surface="test"></div>"#),
+        );
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/docs")));
+
+        upstream_handle.join().expect("upstream thread should join");
+        assert!(String::from_utf8(response.body)
+            .expect("body should be utf8")
+            .contains(r#"data-eidolon-surface="test""#));
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_routing(&event_log_path, "policy_decision", "rewritten_upstream");
+        assert_event_routing(&event_log_path, "response_served", "rewritten_upstream");
+    }
+
+    #[test]
+    fn runtime_path_audits_unchanged_rewrite_as_protected_upstream() {
+        let event_log_path = unique_temp_path("unchanged-events.jsonl");
+        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"status":"ok"}"#));
+        let runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            unique_temp_path("unchanged-control.txt"),
+            html_rewrite_action(r#"<div data-eidolon-surface="test"></div>"#),
+        );
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/api")));
+
+        upstream_handle.join().expect("upstream thread should join");
+        assert_eq!(response.body, br#"{"status":"ok"}"#);
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_policy_decision_reason_contains(&event_log_path, "made no changes");
+        assert_event_routing(&event_log_path, "response_served", "protected_upstream");
+    }
+
+    #[test]
+    fn runtime_path_audits_refused_rewrite_as_protected_upstream() {
+        let event_log_path = unique_temp_path("refused-events.jsonl");
+        let original = "<html><body>upstream</body></html>";
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            unique_temp_path("refused-control.txt"),
+            html_rewrite_action("<script>alert(1)</script>"),
+        );
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/docs")));
+
+        upstream_handle.join().expect("upstream thread should join");
+        assert_eq!(response.body, original.as_bytes());
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_policy_decision_reason_contains(&event_log_path, "rewrite refused");
+        assert_event_routing(&event_log_path, "response_served", "protected_upstream");
+    }
+
+    #[test]
+    fn disabled_interventions_bypass_surface_controller_at_runtime() {
+        let event_log_path = unique_temp_path("disabled-events.jsonl");
+        let control_path = unique_temp_path("disabled-control.txt");
+        fs::write(&control_path, "disabled").expect("control file should write");
+        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            control_path,
+            SurfaceAction::EidolonOwned {
+                response: SurfaceResponse::new(202, Vec::new(), "should not serve"),
+            },
+        );
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/disabled")));
+        let upstream_request = upstream_handle.join().expect("upstream thread should join");
+
+        assert!(String::from_utf8(upstream_request)
+            .expect("request should be utf8")
+            .starts_with("GET /disabled HTTP/1.1\r\n"));
+        assert_eq!(response.body, br#"{"mode":"upstream"}"#);
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_routing(&event_log_path, "response_served", "protected_upstream");
     }
 
     #[test]

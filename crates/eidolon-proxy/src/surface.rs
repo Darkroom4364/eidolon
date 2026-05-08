@@ -166,18 +166,58 @@ impl SurfaceController for ProtectedUpstreamController {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct RewritePlan {
-    pub html: Option<HtmlInsertion>,
-    pub robots_txt: Option<RobotsTxtAppend>,
-    pub openapi_paths: Vec<OpenApiPathInsertion>,
-    pub json_fields: Vec<JsonFieldInsertion>,
+    pub operation: Option<RewriteOperation>,
 }
 
 impl RewritePlan {
+    pub fn html(insertion: HtmlInsertion) -> Self {
+        Self {
+            operation: Some(RewriteOperation::Html(insertion)),
+        }
+    }
+
+    pub fn robots_txt(appendix: RobotsTxtAppend) -> Self {
+        Self {
+            operation: Some(RewriteOperation::RobotsTxt(appendix)),
+        }
+    }
+
+    pub fn openapi_paths(insertions: Vec<OpenApiPathInsertion>) -> Self {
+        Self {
+            operation: Some(RewriteOperation::OpenApiPaths(insertions)),
+        }
+    }
+
+    pub fn json_fields(fields: Vec<JsonFieldInsertion>) -> Self {
+        Self {
+            operation: Some(RewriteOperation::JsonFields(fields)),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.html.is_none()
-            && self.robots_txt.is_none()
-            && self.openapi_paths.is_empty()
-            && self.json_fields.is_empty()
+        self.operation
+            .as_ref()
+            .map(RewriteOperation::is_empty)
+            .unwrap_or(true)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RewriteOperation {
+    Html(HtmlInsertion),
+    RobotsTxt(RobotsTxtAppend),
+    OpenApiPaths(Vec<OpenApiPathInsertion>),
+    JsonFields(Vec<JsonFieldInsertion>),
+}
+
+impl RewriteOperation {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Html(insertion) => insertion.snippet.is_empty(),
+            Self::RobotsTxt(appendix) => appendix.text.trim_matches('\n').is_empty(),
+            Self::OpenApiPaths(insertions) => insertions.is_empty(),
+            Self::JsonFields(fields) => fields.is_empty(),
+        }
     }
 }
 
@@ -270,6 +310,13 @@ pub enum RewriteOutcome {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteDisposition {
+    Unchanged,
+    Rewritten,
+    Refused,
+}
+
 impl RewriteOutcome {
     pub fn body(&self) -> &[u8] {
         match self {
@@ -289,6 +336,14 @@ impl RewriteOutcome {
         matches!(self, Self::Rewritten { .. })
     }
 
+    pub fn disposition(&self) -> RewriteDisposition {
+        match self {
+            Self::Unchanged { .. } => RewriteDisposition::Unchanged,
+            Self::Rewritten { .. } => RewriteDisposition::Rewritten,
+            Self::Refused { .. } => RewriteDisposition::Refused,
+        }
+    }
+
     pub fn refusal(&self) -> Option<&RewriteRefusal> {
         match self {
             Self::Refused { reason, .. } => Some(reason),
@@ -302,7 +357,7 @@ pub enum RewriteRefusal {
     BodyTooLarge { actual: usize, limit: usize },
     RewrittenBodyTooLarge { actual: usize, limit: usize },
     InvalidUtf8,
-    UnsafeHtmlSnippet,
+    HtmlSnippetDeniedByDenylist,
     InvalidJson(String),
     JsonRootNotObject,
     NotOpenApiDocument,
@@ -327,7 +382,9 @@ impl fmt::Display for RewriteRefusal {
                 )
             }
             Self::InvalidUtf8 => formatter.write_str("body is not valid UTF-8"),
-            Self::UnsafeHtmlSnippet => formatter.write_str("HTML snippet is not CSP-safe"),
+            Self::HtmlSnippetDeniedByDenylist => {
+                formatter.write_str("HTML snippet matched the rewrite denylist")
+            }
             Self::InvalidJson(error) => write!(formatter, "invalid JSON: {error}"),
             Self::JsonRootNotObject => formatter.write_str("JSON root is not an object"),
             Self::NotOpenApiDocument => {
@@ -358,31 +415,30 @@ pub fn rewrite_response_body(
     body: &[u8],
     plan: &RewritePlan,
 ) -> RewriteOutcome {
-    if plan.is_empty() {
+    let Some(operation) = &plan.operation else {
+        return unchanged(body);
+    };
+
+    if operation.is_empty() {
         return unchanged(body);
     }
 
-    if let Some(html) = &plan.html {
-        if is_html_response(meta) {
-            return rewrite_html(body, html);
+    match operation {
+        RewriteOperation::Html(html) if is_html_response(meta) => rewrite_html(body, html),
+        RewriteOperation::RobotsTxt(robots_txt) if is_robots_response(meta) => {
+            rewrite_robots_txt(body, robots_txt)
         }
-    }
-
-    if let Some(robots_txt) = &plan.robots_txt {
-        if is_robots_response(meta) {
-            return rewrite_robots_txt(body, robots_txt);
+        RewriteOperation::OpenApiPaths(paths) if is_json_response(meta) => {
+            rewrite_openapi_json(body, paths)
         }
+        RewriteOperation::JsonFields(fields) if is_json_response(meta) => {
+            rewrite_json_object(body, fields)
+        }
+        RewriteOperation::Html(_)
+        | RewriteOperation::RobotsTxt(_)
+        | RewriteOperation::OpenApiPaths(_)
+        | RewriteOperation::JsonFields(_) => unchanged(body),
     }
-
-    if !plan.openapi_paths.is_empty() && is_json_response(meta) {
-        return rewrite_openapi_json(body, &plan.openapi_paths);
-    }
-
-    if !plan.json_fields.is_empty() && is_json_response(meta) {
-        return rewrite_json_object(body, &plan.json_fields);
-    }
-
-    unchanged(body)
 }
 
 pub fn rewrite_html(body: &[u8], insertion: &HtmlInsertion) -> RewriteOutcome {
@@ -394,8 +450,8 @@ pub fn rewrite_html(body: &[u8], insertion: &HtmlInsertion) -> RewriteOutcome {
         return unchanged(body);
     }
 
-    if !is_csp_safe_html_snippet(&insertion.snippet) {
-        return refused(body, RewriteRefusal::UnsafeHtmlSnippet);
+    if !html_snippet_passes_rewrite_denylist(&insertion.snippet) {
+        return refused(body, RewriteRefusal::HtmlSnippetDeniedByDenylist);
     }
 
     let Ok(original) = std::str::from_utf8(body) else {
@@ -660,7 +716,8 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
     haystack.to_ascii_lowercase().find(needle)
 }
 
-fn is_csp_safe_html_snippet(snippet: &str) -> bool {
+fn html_snippet_passes_rewrite_denylist(snippet: &str) -> bool {
+    // This denylist catches obvious active-content snippets; it is not a CSP proof.
     let normalized = snippet.to_ascii_lowercase();
     !normalized.contains("<script")
         && !normalized.contains("javascript:")
@@ -709,10 +766,7 @@ mod tests {
     #[test]
     fn surface_action_reports_core_routing_decision() {
         let action = SurfaceAction::RewrittenUpstream {
-            plan: RewritePlan {
-                html: Some(HtmlInsertion::new(r#"<div id="eidolon"></div>"#)),
-                ..RewritePlan::default()
-            },
+            plan: RewritePlan::html(HtmlInsertion::new(r#"<div id="eidolon"></div>"#)),
         };
 
         assert_eq!(
@@ -742,6 +796,7 @@ mod tests {
         let outcome = rewrite_html(original, &snippet);
 
         assert!(outcome.is_rewritten());
+        assert_eq!(outcome.disposition(), RewriteDisposition::Rewritten);
         assert_eq!(
             std::str::from_utf8(outcome.body()).unwrap(),
             r#"<html><body><main>docs</main><div data-eidolon-surface="legacy"></div></body></html>"#
@@ -814,12 +869,107 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_plan_selects_one_json_operation_without_priority_masking() {
+        let original = br#"{"openapi":"3.0.0","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let meta = SurfaceResponseMeta::new(
+            200,
+            vec![SurfaceHeader::new("content-type", "application/json")],
+            original.len(),
+        );
+        let path_item = json!({"get":{"responses":{"200":{"description":"ok"}}}});
+
+        let openapi_outcome = rewrite_response_body(
+            &meta,
+            original,
+            &RewritePlan::openapi_paths(vec![OpenApiPathInsertion::new(
+                "/api/v2/import/reconcile",
+                path_item.clone(),
+            )]),
+        );
+
+        assert_eq!(openapi_outcome.disposition(), RewriteDisposition::Rewritten);
+        let openapi_rewritten: Value = serde_json::from_slice(openapi_outcome.body()).unwrap();
+        assert_eq!(
+            openapi_rewritten["paths"]["/api/v2/import/reconcile"],
+            path_item
+        );
+        assert!(openapi_rewritten.get("eidolon_surface").is_none());
+
+        let json_outcome = rewrite_response_body(
+            &meta,
+            original,
+            &RewritePlan::json_fields(vec![JsonFieldInsertion::new(
+                "eidolon_surface",
+                json!("legacy-import"),
+            )]),
+        );
+
+        assert_eq!(json_outcome.disposition(), RewriteDisposition::Rewritten);
+        let json_rewritten: Value = serde_json::from_slice(json_outcome.body()).unwrap();
+        assert_eq!(json_rewritten["eidolon_surface"], json!("legacy-import"));
+        assert!(json_rewritten["paths"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rewrite_outcome_distinguishes_unchanged_rewritten_and_refused() {
+        let meta = SurfaceResponseMeta::new(
+            200,
+            vec![SurfaceHeader::new("content-type", "text/html")],
+            0,
+        );
+
+        let unchanged = rewrite_response_body(&meta, b"<html></html>", &RewritePlan::default());
+        assert_eq!(unchanged.disposition(), RewriteDisposition::Unchanged);
+        assert_eq!(unchanged.refusal(), None);
+
+        let rewritten = rewrite_response_body(
+            &meta,
+            b"<html><body></body></html>",
+            &RewritePlan::html(HtmlInsertion::new("<div></div>")),
+        );
+        assert_eq!(rewritten.disposition(), RewriteDisposition::Rewritten);
+        assert_eq!(rewritten.refusal(), None);
+
+        let refused = rewrite_response_body(
+            &meta,
+            b"<html><body></body></html>",
+            &RewritePlan::html(HtmlInsertion::new("<script>alert(1)</script>")),
+        );
+        assert_eq!(refused.disposition(), RewriteDisposition::Refused);
+        assert_eq!(
+            refused.refusal(),
+            Some(&RewriteRefusal::HtmlSnippetDeniedByDenylist)
+        );
+    }
+
+    #[test]
+    fn refuses_html_snippet_that_matches_rewrite_denylist() {
+        let original = b"<html><body></body></html>";
+
+        let outcome = rewrite_html(
+            original,
+            &HtmlInsertion::new(r#"<img src="/x" onerror="alert(1)">"#),
+        );
+
+        assert_eq!(outcome.body(), original);
+        assert_eq!(
+            outcome.refusal(),
+            Some(&RewriteRefusal::HtmlSnippetDeniedByDenylist)
+        );
+        assert_eq!(
+            outcome.refusal().unwrap().to_string(),
+            "HTML snippet matched the rewrite denylist"
+        );
+    }
+
+    #[test]
     fn refuses_oversize_body_without_changing_bytes() {
         let original = vec![b'a'; MAX_REWRITE_BODY_BYTES + 1];
 
         let outcome = rewrite_html(&original, &HtmlInsertion::new("<div></div>"));
 
         assert_eq!(outcome.body(), original.as_slice());
+        assert_eq!(outcome.disposition(), RewriteDisposition::Refused);
         assert_eq!(
             outcome.refusal(),
             Some(&RewriteRefusal::BodyTooLarge {
