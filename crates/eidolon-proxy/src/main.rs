@@ -7,6 +7,7 @@ use std::{
     process::ExitCode,
     sync::{Arc, Mutex},
     thread,
+    time::Duration,
 };
 
 use eidolon_bait::{docs_for_bait, BaitRegistry};
@@ -15,8 +16,12 @@ use eidolon_core::{
     SafeHeaderObservation, SessionId,
 };
 use eidolon_proxy::{
+    controlled_reality::{
+        rate_limited_response, ControlledRealityResponder, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+    },
     event_log::FileEventLogWriter,
     policy::{self, InterventionMode},
+    policy_store::PolicyStateStore,
     session::{self, SessionContext},
     surface::{
         rewrite_response_body, OpenApiPathInsertion, RewritePlan, SurfaceAction, SurfaceController,
@@ -29,6 +34,7 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
 const DEFAULT_EVENT_LOG: &str = "/tmp/eidolon-events.jsonl";
 const DEFAULT_INTERVENTION_CONTROL: &str = "/tmp/eidolon-interventions.txt";
+const DEFAULT_POLICY_STATE: &str = "/tmp/eidolon-policy-state.json";
 const LEGACY_IMPORT_DOCS_SURFACE: &str = "/docs/legacy-import";
 const LEGACY_IMPORT_OPENAPI_TARGET: &str = "/openapi.json";
 const LEGACY_IMPORT_OPENAPI_QUERY: &str = "eidolon_surface=legacy-import";
@@ -36,6 +42,8 @@ const DEFAULT_HTTP_PORT: u16 = 80;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BAIT_EXPOSURES: usize = 4096;
+// Lab-only delay for the current thread-per-connection server.
+const CONTROLLED_REALITY_TARPIT_DELAY: Duration = Duration::from_millis(25);
 const SAFE_HEADER_NAMES: &[&str] = &[
     "accept",
     "authorization",
@@ -61,6 +69,7 @@ fn main() -> ExitCode {
                 "intervention_control: {}",
                 config.intervention_control_path.display()
             );
+            println!("policy_state: {}", config.policy_state_path.display());
 
             match run_proxy(config) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -83,6 +92,7 @@ struct ProxyConfig {
     upstream: UpstreamTarget,
     event_log_path: PathBuf,
     intervention_control_path: PathBuf,
+    policy_state_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +154,14 @@ impl CliAction {
                         parse_control_path(&value)?,
                     )?;
                 }
+                "--policy-state" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.policy_state_path,
+                        flag,
+                        parse_policy_state_path(&value)?,
+                    )?;
+                }
                 _ if flag.starts_with('-') => {
                     return Err(ConfigError::new(format!("unknown option `{flag}`")));
                 }
@@ -165,6 +183,7 @@ struct ConfigBuilder {
     upstream: Option<UpstreamTarget>,
     event_log_path: Option<PathBuf>,
     intervention_control_path: Option<PathBuf>,
+    policy_state_path: Option<PathBuf>,
 }
 
 impl ConfigBuilder {
@@ -185,6 +204,10 @@ impl ConfigBuilder {
             intervention_control_path: match self.intervention_control_path {
                 Some(value) => value,
                 None => parse_control_path(DEFAULT_INTERVENTION_CONTROL)?,
+            },
+            policy_state_path: match self.policy_state_path {
+                Some(value) => value,
+                None => parse_policy_state_path(DEFAULT_POLICY_STATE)?,
             },
         })
     }
@@ -398,6 +421,10 @@ fn parse_control_path(raw: &str) -> Result<PathBuf, ConfigError> {
     parse_file_path(raw, "intervention control")
 }
 
+fn parse_policy_state_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    parse_file_path(raw, "policy state")
+}
+
 fn parse_file_path(raw: &str, label: &str) -> Result<PathBuf, ConfigError> {
     if raw.trim().is_empty() {
         return Err(ConfigError::new(format!("{label} path cannot be empty")));
@@ -454,11 +481,14 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     let bait_registry = Arc::new(BaitRegistry::m1_demo());
     let runtime = ProxyRuntime {
         upstream: config.upstream,
-        policy_state: policy::initial_policy_state(),
         event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
             &config.event_log_path,
         )?)),
         intervention_control_path: config.intervention_control_path,
+        policy_store: Arc::new(Mutex::new(PolicyStateStore::open(
+            &config.policy_state_path,
+        )?)),
+        controlled_reality: Arc::new(ControlledRealityResponder),
         surface_controller: Arc::new(M1DemoSurfaceController::new(Arc::clone(&bait_registry))),
         bait_registry,
         bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
@@ -484,9 +514,10 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
 #[derive(Clone)]
 struct ProxyRuntime {
     upstream: UpstreamTarget,
-    policy_state: PolicyState,
     event_log: Arc<Mutex<FileEventLogWriter>>,
     intervention_control_path: PathBuf,
+    policy_store: Arc<Mutex<PolicyStateStore>>,
+    controlled_reality: Arc<ControlledRealityResponder>,
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
     bait_registry: Arc<BaitRegistry>,
     bait_exposures: Arc<Mutex<BaitExposureStore>>,
@@ -594,24 +625,50 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
 
     let session = session::derive_session_from_headers(header_pairs(&request.headers));
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
-    let decision = policy::decide_for_state(runtime.policy_state, intervention_mode);
     let path = normalized_event_path(&request)?;
     let surface_request = surface_request_meta(&request, &path);
+    let policy_state = policy_state_for_session(runtime, session.session_id)?;
+
+    if !intervention_mode.interventions_enabled() {
+        if let Some(response) = runtime
+            .controlled_reality
+            .fail_closed_response(&surface_request)
+        {
+            let decision = policy::PolicyDecision::new(
+                policy_state,
+                RoutingDecision::EidolonOwned,
+                "interventions disabled; known controlled-reality write path failed closed",
+            );
+
+            return write_direct_response(DirectResponseContext {
+                client_stream,
+                runtime,
+                session: &session,
+                request: &request,
+                path: &path,
+                decision: &decision,
+                response,
+                intervention_mode,
+                surface_requested_intervention: true,
+            });
+        }
+    }
+
+    let decision = policy::decide_for_state(policy_state, intervention_mode);
     let surface_action = if intervention_mode.interventions_enabled() {
         match decision.routing_decision {
             RoutingDecision::ProtectedUpstream => {
                 runtime.surface_controller.decide(&surface_request)
             }
-            RoutingDecision::ControlledReality => SurfaceAction::ControlledReality {
-                reason: decision.reason.clone(),
-                response: surface_text_response(
-                    200,
-                    "controlled reality is not implemented in M1\n",
-                ),
-            },
+            RoutingDecision::ControlledReality => controlled_reality_action(
+                runtime,
+                session.session_id,
+                &surface_request,
+                decision.reason.clone(),
+            )?,
             RoutingDecision::RateLimited => SurfaceAction::RateLimited {
                 reason: decision.reason.clone(),
-                response: surface_text_response(429, "rate limited\n"),
+                response: rate_limited_response(),
             },
             RoutingDecision::EidolonOwned => SurfaceAction::EidolonOwned {
                 response: surface_text_response(403, "blocked by eidolon policy\n"),
@@ -650,7 +707,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 &runtime.event_log,
                 &request_seen_event(&request, &path, &session, &effective_decision),
             )?;
-            write_bait_action_observed_event(
+            let action_exposure_id = write_bait_action_observed_event(
                 runtime,
                 &session,
                 decision.policy_state,
@@ -658,12 +715,37 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 &request.method,
                 &surface_request.path,
             )?;
-            write_event(
-                &runtime.event_log,
-                &policy::policy_intervention_event(session.session_id, &effective_decision),
-            )?;
 
-            let mut response = bait_action_synthetic_response();
+            let mut response = if let Some(transition) =
+                policy::transition_after_correlated_bait_action(decision.policy_state)
+                    .filter(|_| action_exposure_id.is_some())
+            {
+                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_changed_event(session.session_id, &transition),
+                )?;
+                let action = controlled_reality_action(
+                    runtime,
+                    session.session_id,
+                    &surface_request,
+                    transition.reason.clone(),
+                )?;
+                effective_decision =
+                    direct_surface_decision(transition.to, &action, transition.reason);
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                )?;
+                direct_surface_response(action)
+                    .expect("controlled reality action should produce direct response")
+            } else {
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                )?;
+                bait_action_synthetic_response()
+            };
             apply_response_headers(&mut response, &session);
             write_event(
                 &runtime.event_log,
@@ -796,6 +878,111 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     client_stream.flush()
 }
 
+struct DirectResponseContext<'a> {
+    client_stream: TcpStream,
+    runtime: &'a ProxyRuntime,
+    session: &'a SessionContext,
+    request: &'a HttpRequest,
+    path: &'a str,
+    decision: &'a policy::PolicyDecision,
+    response: SurfaceResponse,
+    intervention_mode: InterventionMode,
+    surface_requested_intervention: bool,
+}
+
+fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
+    let DirectResponseContext {
+        mut client_stream,
+        runtime,
+        session,
+        request,
+        path,
+        decision,
+        response,
+        intervention_mode,
+        surface_requested_intervention,
+    } = context;
+
+    write_request_and_policy_events(
+        runtime,
+        request,
+        path,
+        session,
+        decision,
+        intervention_mode,
+        surface_requested_intervention,
+    )?;
+
+    let mut response = surface_response_to_http(response);
+    apply_response_headers(&mut response, session);
+    write_event(
+        &runtime.event_log,
+        &policy::response_audit_event(session.session_id, decision, response.status),
+    )?;
+
+    client_stream.write_all(&response.to_http_bytes())?;
+    client_stream.flush()
+}
+
+fn policy_state_for_session(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+) -> io::Result<PolicyState> {
+    let store = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+
+    Ok(store.policy_state(session_id))
+}
+
+fn set_policy_state_for_session(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    policy_state: PolicyState,
+) -> io::Result<()> {
+    let mut store = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+
+    store.set_policy_state(session_id, policy_state)
+}
+
+fn controlled_reality_action(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    request: &SurfaceRequestMeta,
+    default_reason: String,
+) -> io::Result<SurfaceAction> {
+    let depth = {
+        let mut store = runtime
+            .policy_store
+            .lock()
+            .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+        store.increment_controlled_reality_depth(session_id)?
+    };
+
+    if depth > MAX_CONTROLLED_REALITY_ACTION_DEPTH {
+        thread::sleep(CONTROLLED_REALITY_TARPIT_DELAY);
+        return Ok(SurfaceAction::RateLimited {
+            reason: format!(
+                "controlled reality action depth {depth} exceeded limit {MAX_CONTROLLED_REALITY_ACTION_DEPTH}"
+            ),
+            response: rate_limited_response(),
+        });
+    }
+
+    let mut action = runtime.controlled_reality.decide(request, depth);
+    if let SurfaceAction::ControlledReality { reason, .. } = &mut action {
+        if depth == 1 {
+            *reason = default_reason;
+        }
+    }
+
+    Ok(action)
+}
+
 fn bait_exposure_for_direct_surface<'a>(
     policy_decision: &policy::PolicyDecision,
     surface_action: &SurfaceAction,
@@ -865,7 +1052,7 @@ fn write_bait_action_observed_event(
     bait: &Bait,
     method: &str,
     path: &str,
-) -> io::Result<()> {
+) -> io::Result<Option<ExposureId>> {
     let exposure_id = {
         let exposures = runtime
             .bait_exposures
@@ -882,12 +1069,14 @@ fn write_bait_action_observed_event(
             policy_state,
             EventKind::BaitActionObserved {
                 bait_id: bait.id.clone(),
-                exposure_id,
+                exposure_id: exposure_id.clone(),
                 method: method.to_string(),
                 path: path.to_string(),
             },
         ),
-    )
+    )?;
+
+    Ok(exposure_id)
 }
 
 fn bait_action_synthetic_response() -> HttpResponse {
@@ -1686,10 +1875,11 @@ Options:
   --intervention-control <PATH>
                          Optional control file; write `disabled` to force protected forwarding
                          [default: {DEFAULT_INTERVENTION_CONTROL}]
+  --policy-state <PATH> Per-session policy state JSON file path [default: {DEFAULT_POLICY_STATE}]
   -h, --help            Show this help text
 
 Example:
-  cargo run -p eidolon-proxy -- --listen-addr 127.0.0.1:8080 --upstream http://127.0.0.1:9001 --event-log /tmp/eidolon-events.jsonl --intervention-control /tmp/eidolon-interventions.txt
+  cargo run -p eidolon-proxy -- --listen-addr 127.0.0.1:8080 --upstream http://127.0.0.1:9001 --event-log /tmp/eidolon-events.jsonl --intervention-control /tmp/eidolon-interventions.txt --policy-state /tmp/eidolon-policy-state.json
 "
     )
 }
@@ -1771,11 +1961,12 @@ mod tests {
         let bait_registry = Arc::new(BaitRegistry::m1_demo());
         ProxyRuntime {
             upstream,
-            policy_state: policy::initial_policy_state(),
             event_log: Arc::new(Mutex::new(
                 FileEventLogWriter::open(event_log_path).expect("event log should open"),
             )),
             intervention_control_path,
+            policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller,
             bait_registry,
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
@@ -1790,15 +1981,23 @@ mod tests {
         let bait_registry = Arc::new(BaitRegistry::m1_demo());
         ProxyRuntime {
             upstream,
-            policy_state: policy::initial_policy_state(),
             event_log: Arc::new(Mutex::new(
                 FileEventLogWriter::open(event_log_path).expect("event log should open"),
             )),
             intervention_control_path,
+            policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller: Arc::new(M1DemoSurfaceController::new(Arc::clone(&bait_registry))),
             bait_registry,
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
         }
+    }
+
+    fn set_runtime_policy_state(runtime: &ProxyRuntime, cookie: &str, policy_state: PolicyState) {
+        let session_id =
+            session::session_id_from_cookie_header(cookie).expect("cookie should contain session");
+        set_policy_state_for_session(runtime, session_id, policy_state)
+            .expect("policy state should set");
     }
 
     fn spawn_upstream(response: impl Into<Vec<u8>>) -> (UpstreamTarget, JoinHandle<Vec<u8>>) {
@@ -2036,6 +2235,10 @@ mod tests {
             config.intervention_control_path,
             PathBuf::from(DEFAULT_INTERVENTION_CONTROL)
         );
+        assert_eq!(
+            config.policy_state_path,
+            PathBuf::from(DEFAULT_POLICY_STATE)
+        );
     }
 
     #[test]
@@ -2049,6 +2252,8 @@ mod tests {
             "/tmp/eidolon-proxy-test.jsonl",
             "--intervention-control",
             "/tmp/eidolon-interventions-test.txt",
+            "--policy-state",
+            "/tmp/eidolon-policy-state-test.json",
         ])
         .expect("explicit config should parse");
 
@@ -2063,6 +2268,10 @@ mod tests {
         assert_eq!(
             config.intervention_control_path,
             PathBuf::from("/tmp/eidolon-interventions-test.txt")
+        );
+        assert_eq!(
+            config.policy_state_path,
+            PathBuf::from("/tmp/eidolon-policy-state-test.json")
         );
     }
 
@@ -2532,7 +2741,9 @@ mod tests {
 
         assert_eq!(exposure_response.status, 200);
         assert_eq!(action_response.status, 202);
-        assert_eq!(action_response.body, b"accepted\n");
+        assert!(String::from_utf8(action_response.body)
+            .expect("body should be utf8")
+            .contains(r#""write_committed":false"#));
 
         let exposure = first_event_of_type(&event_log_path, "bait_exposed");
         let action = first_event_of_type(&event_log_path, "bait_action_observed");
@@ -2545,7 +2756,16 @@ mod tests {
         assert_eq!(action["kind"]["method"], "POST");
         assert_eq!(action["kind"]["path"], "/api/v2/import/reconcile");
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
-        assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "controlled_reality");
+        assert_eq!(
+            first_event_of_type(&event_log_path, "controlled_reality_entered")["policy_state"],
+            "controlled_reality"
+        );
+        assert!(events_of_type(&event_log_path, "response_served")
+            .iter()
+            .any(|event| event["kind"]["routing_decision"].as_str() == Some("controlled_reality")));
 
         let events = event_values(&event_log_path);
         let action_index = events
@@ -2558,7 +2778,7 @@ mod tests {
         );
         assert_eq!(
             events[action_index + 1]["kind"]["type"].as_str(),
-            Some("policy_decision")
+            Some("policy_changed")
         );
     }
 
@@ -2662,10 +2882,15 @@ mod tests {
 
         let exposure = first_event_of_type(&event_log_path, "bait_exposed");
         let actions = events_of_type(&event_log_path, "bait_action_observed");
-        assert_eq!(actions.len(), 2);
-        assert!(actions
-            .iter()
-            .all(|action| action["kind"]["exposure_id"] == exposure["kind"]["exposure_id"]));
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0]["kind"]["exposure_id"],
+            exposure["kind"]["exposure_id"]
+        );
+        assert_eq!(
+            events_of_type(&event_log_path, "controlled_reality_entered").len(),
+            2
+        );
     }
 
     #[test]
@@ -2702,12 +2927,12 @@ mod tests {
     }
 
     #[test]
-    fn disabled_interventions_bypass_bait_action_matching_at_runtime() {
+    fn disabled_interventions_fail_closed_for_known_decoy_write_path() {
         let event_log_path = unique_temp_path("disabled-bait-events.jsonl");
         let control_path = unique_temp_path("disabled-bait-control.txt");
         fs::write(&control_path, "disabled").expect("control file should write");
-        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
-        let runtime = test_runtime_with_m1_controller(upstream, &event_log_path, control_path);
+        let runtime =
+            test_runtime_with_m1_controller(closed_upstream(), &event_log_path, control_path);
 
         let response = parse_downstream_response(&run_runtime_request(
             runtime,
@@ -2717,12 +2942,12 @@ mod tests {
                 &[("X-Migration-Trace", "rel_2025_04_b7f2")],
             ),
         ));
-        let upstream_request = upstream_handle.join().expect("upstream thread should join");
 
-        assert_eq!(response.body, br#"{"mode":"upstream"}"#);
-        assert!(String::from_utf8(upstream_request)
-            .expect("request should be utf8")
-            .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+        assert_eq!(response.status, 403);
+        assert!(String::from_utf8(response.body)
+            .expect("body should be utf8")
+            .contains("failed closed"));
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_type_absent(&event_log_path, "bait_exposed");
         assert_event_type_absent(&event_log_path, "bait_action_observed");
     }
@@ -2730,39 +2955,73 @@ mod tests {
     #[test]
     fn runtime_path_uses_injected_policy_state_for_intervention_routing() {
         let event_log_path = unique_temp_path("controlled-events.jsonl");
-        let mut runtime = test_runtime(
+        let runtime = test_runtime(
             parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
             &event_log_path,
             unique_temp_path("controlled-control.txt"),
             SurfaceAction::ProtectedUpstream,
         );
-        runtime.policy_state = PolicyState::ControlledReality;
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
 
-        let response =
-            parse_downstream_response(&run_runtime_request(runtime, &get_request("/controlled")));
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/api/v2/import/reconcile", &cookie),
+        ));
 
         assert_eq!(response.status, 200);
-        assert_eq!(
-            response.body,
-            b"controlled reality is not implemented in M1\n"
-        );
+        assert!(String::from_utf8(response.body)
+            .expect("body should be utf8")
+            .contains(r#""synthetic":true"#));
         assert_event_routing(&event_log_path, "request_seen", "controlled_reality");
         assert_event_routing(&event_log_path, "response_served", "controlled_reality");
     }
 
     #[test]
+    fn runtime_rate_limits_after_controlled_reality_action_depth_limit() {
+        let event_log_path = unique_temp_path("controlled-rate-limit-events.jsonl");
+        let runtime = test_runtime(
+            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            &event_log_path,
+            unique_temp_path("controlled-rate-limit-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+
+        let mut response = None;
+        for _ in 0..=MAX_CONTROLLED_REALITY_ACTION_DEPTH {
+            response = Some(parse_downstream_response(&run_runtime_request(
+                runtime.clone(),
+                &get_request_with_cookie("/api/v2/import/reconcile", &cookie),
+            )));
+        }
+
+        let response = response.expect("response should exist");
+
+        assert_eq!(response.status, 429);
+        assert_eq!(header_values(&response, "retry-after"), vec!["30"]);
+        assert_eq!(
+            first_event_of_type(&event_log_path, "rate_limit_applied")["policy_state"],
+            "controlled_reality"
+        );
+        assert!(events_of_type(&event_log_path, "controlled_reality_entered").len() >= 4);
+    }
+
+    #[test]
     fn runtime_policy_owned_response_does_not_log_bait_exposure() {
         let event_log_path = unique_temp_path("blocked-no-exposure-events.jsonl");
-        let mut runtime = test_runtime_with_m1_controller(
+        let runtime = test_runtime_with_m1_controller(
             parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
             &event_log_path,
             unique_temp_path("blocked-no-exposure-control.txt"),
         );
-        runtime.policy_state = PolicyState::Blocked;
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Blocked);
 
         let response = parse_downstream_response(&run_runtime_request(
             runtime,
-            &get_request("/docs/legacy-import"),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
         ));
 
         assert_eq!(response.status, 403);

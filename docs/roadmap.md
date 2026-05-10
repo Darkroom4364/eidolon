@@ -161,18 +161,29 @@ Issues:
 
 Goal:
 
-Build one narrow controlled-reality branch early enough to avoid becoming only a honeypot dashboard, using the policy state model defined in M1.
+Build one narrow Lab-only controlled-reality branch early enough to avoid becoming only a honeypot dashboard, using the policy state model defined in M1.
 
 Issues:
 
 1. Implement policy state transitions and persistence
 2. Implement controlled-reality decoy responder
 3. Add rate-limit and tarpit policies
-4. Prepare v1 release checklist and research note
+4. Prepare Lab-only v1-candidate checklist and research note
 5. Build controlled reality v0 for one decoy admin/API path
 6. Add synthetic data boundary and no-write enforcement
 7. Measure dwell time and action depth inside controlled reality
 8. Add reality escape detection and emergency disable
+
+Acceptance criteria:
+
+- The feature runs only in the owned loopback Lab against synthetic data and an owned demo target.
+- A session can move from observation to controlled reality only through documented policy-state transitions backed by auditable events.
+- The first controlled-reality branch covers one decoy admin/API path and does not forward bait-derived writes to the protected upstream.
+- Controlled-reality responses use synthetic, non-sensitive data that is safe if copied, indexed, or disclosed.
+- No controlled-reality path writes to the protected upstream, mutates real target state, or depends on real secrets, customer data, or internal hostnames.
+- Ordinary traffic and negative controls remain outside controlled reality unless the documented confidence conditions are met.
+- Reality escape attempts and operator emergency-disable behavior are observable in the event log.
+- The M2.5 research note and checklist are explicitly Lab-only v1-candidate artifacts and make no public-v1 or production-ready claim.
 
 ## M3 Uniqueness Bakeoff
 
@@ -204,11 +215,11 @@ Issues:
 
 Goal:
 
-Only after the bakeoff succeeds, harden Eidolon Shield toward production-safe adaptive deception.
+Only after the bakeoff succeeds, harden Eidolon Shield toward deployment-grade adaptive deception.
 
 Issues:
 
 1. Design adaptive bait policy from measured bait classes
 2. Add per-session polymorphic bait generation
-3. Add production-safe allowlists and verified crawler handling
-4. Prepare public v1 research note and release checklist
+3. Add deployment-safe allowlists and verified crawler handling
+4. Prepare external-readiness research note and release checklist

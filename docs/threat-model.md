@@ -23,7 +23,7 @@ The first target class is web/API/developer-surface reconnaissance:
 - fake internal hostnames
 - cloud/identity canaries
 
-## Out Of Scope For V1
+## Out Of Scope For Lab V1 Candidate
 
 - nation-state operators with strong OPSEC
 - malware delivery
@@ -34,6 +34,7 @@ The first target class is web/API/developer-surface reconnaissance:
 - production deception involving real secrets
 - internal enterprise agent governance
 - generic MCP gateway enforcement
+- public-v1 or production-ready claims
 
 ## Defensive Boundary
 
@@ -84,6 +85,27 @@ Bait must not include:
 - real customer data
 - instructions that improve attacker capability against third parties
 
+## M2.5 Controlled-Reality Boundary
+
+M2.5 controlled reality is in scope only for the owned Lab and one narrow decoy admin/API branch.
+
+Allowed:
+
+- synthetic records
+- synthetic account, import, admin, or job states
+- decoy success, delay, and error responses
+- disposable Lab-only decoy state
+- event logging for policy state, routing, dwell time, action depth, and escape attempts
+
+Not allowed:
+
+- forwarding bait-derived writes to the protected upstream
+- mutating real target state
+- using production services, real secrets, customer data, or internal hostnames
+- creating exploit instructions that apply to third-party systems
+- claiming autonomous-agent identity from controlled-reality behavior alone
+- presenting M2.5 as public-v1 or production-ready
+
 ## Claim Boundaries
 
 Do not claim:
@@ -99,4 +121,3 @@ High-confidence bait-derived autonomous recon/action chain observed
 ```
 
 Eidolon detects behavior, not ontology. It does not need to prove the actor is an LLM.
-
