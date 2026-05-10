@@ -66,6 +66,7 @@ pub enum PolicyEvidenceKind {
     PolicyChanged,
     ControlledRealityEntered,
     RateLimitApplied,
+    RealityEscapeAttempt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +84,7 @@ pub(crate) struct TraceMetricSummary {
     pub real_surface_requests_after_containment: Option<usize>,
     pub controlled_reality_dwell_seconds: Option<f64>,
     pub controlled_reality_action_depth: usize,
+    pub controlled_reality_branch_count: usize,
 }
 
 impl Default for BaselineComparison {
@@ -128,6 +130,7 @@ pub(crate) fn trace_metric_summary_for_timeline(
         controlled_reality_dwell_seconds: containment_bounds
             .map(|(first, last)| seconds_between(&timeline.events[first], &timeline.events[last])),
         controlled_reality_action_depth: controlled_reality_action_depth(timeline),
+        controlled_reality_branch_count: controlled_reality_branch_count(timeline),
     }
 }
 
@@ -268,6 +271,22 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     reason: Some(reason.clone()),
                 });
             }
+            EventKind::RealityEscapeAttempt {
+                routing_decision,
+                reason,
+                ..
+            } => {
+                bundle.policy_events.push(PolicyEventEvidence {
+                    event_ref,
+                    policy_state: timeline_event.event.policy_state,
+                    kind: PolicyEvidenceKind::RealityEscapeAttempt,
+                    routing_decision: Some(*routing_decision),
+                    from_policy_state: None,
+                    to_policy_state: None,
+                    status: None,
+                    reason: Some(reason.clone()),
+                });
+            }
             EventKind::RequestSeen { .. } => {}
         }
     }
@@ -363,6 +382,41 @@ fn controlled_reality_action_depth(timeline: &SessionTimeline) -> usize {
     }
 
     depth
+}
+
+fn controlled_reality_branch_count(timeline: &SessionTimeline) -> usize {
+    let mut branches = std::collections::HashSet::new();
+    let mut pending_request = None;
+
+    for event in &timeline.events {
+        match &event.event.kind {
+            EventKind::RequestSeen {
+                path,
+                routing_decision,
+                ..
+            } => {
+                let contained = containment_policy_state(event.event.policy_state)
+                    || containment_routing_decision(*routing_decision);
+                if contained {
+                    branches.insert(path.clone());
+                }
+                pending_request = Some((path.clone(), contained));
+            }
+            EventKind::ResponseServed {
+                routing_decision, ..
+            } if containment_routing_decision(*routing_decision) => {
+                if let Some((path, false)) = pending_request.take() {
+                    branches.insert(path);
+                }
+            }
+            EventKind::ResponseServed { .. } => {
+                pending_request = None;
+            }
+            _ => {}
+        }
+    }
+
+    branches.len()
 }
 
 fn request_or_response_routes_to_containment(kind: &EventKind) -> bool {
@@ -482,13 +536,22 @@ mod tests {
         policy_state: PolicyState,
         routing_decision: RoutingDecision,
     ) -> Event {
+        request_to_path(session_id, policy_state, routing_decision, "/admin/decoy")
+    }
+
+    fn request_to_path(
+        session_id: SessionId,
+        policy_state: PolicyState,
+        routing_decision: RoutingDecision,
+        path: &str,
+    ) -> Event {
         Event::new(
             session_id,
             EventSource::Proxy,
             policy_state,
             EventKind::RequestSeen {
                 method: "GET".to_string(),
-                path: "/admin/decoy".to_string(),
+                path: path.to_string(),
                 safe_headers: Vec::new(),
                 routing_decision,
             },
@@ -634,10 +697,12 @@ mod tests {
         assert_eq!(summary.real_surface_requests_after_containment, Some(1));
         assert_eq!(summary.controlled_reality_dwell_seconds, Some(10.0));
         assert_eq!(summary.controlled_reality_action_depth, 2);
+        assert_eq!(summary.controlled_reality_branch_count, 1);
 
         let serialized =
             serde_json::to_value(&summary).expect("trace metric summary should serialize");
         assert_eq!(serialized["controlled_reality_action_depth"], json!(2));
+        assert_eq!(serialized["controlled_reality_branch_count"], json!(1));
         assert_eq!(
             serialized["real_surface_requests_after_containment"],
             json!(1)
@@ -661,6 +726,7 @@ mod tests {
         assert_eq!(summary.real_surface_requests_after_containment, None);
         assert_eq!(summary.controlled_reality_dwell_seconds, None);
         assert_eq!(summary.controlled_reality_action_depth, 0);
+        assert_eq!(summary.controlled_reality_branch_count, 0);
     }
 
     #[test]
@@ -690,6 +756,48 @@ mod tests {
         let summary = trace_metric_summary_for_timeline(&timeline, &bundle);
 
         assert_eq!(summary.controlled_reality_action_depth, 1);
+        assert_eq!(summary.controlled_reality_branch_count, 1);
         assert_eq!(summary.controlled_reality_dwell_seconds, Some(1.0));
+    }
+
+    #[test]
+    fn trace_summary_counts_distinct_controlled_reality_branches() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            at(controlled_reality_entered(session_id), 0),
+            at(
+                request_to_path(
+                    session_id,
+                    PolicyState::ControlledReality,
+                    RoutingDecision::ControlledReality,
+                    "/api/v2/import/reconcile",
+                ),
+                1,
+            ),
+            at(
+                request_to_path(
+                    session_id,
+                    PolicyState::ControlledReality,
+                    RoutingDecision::ControlledReality,
+                    "/admin/decoy",
+                ),
+                2,
+            ),
+            at(
+                request_to_path(
+                    session_id,
+                    PolicyState::ControlledReality,
+                    RoutingDecision::RateLimited,
+                    "/admin/decoy",
+                ),
+                3,
+            ),
+        ]);
+        let bundle = evidence_bundle_for_timeline(&timeline);
+
+        let summary = trace_metric_summary_for_timeline(&timeline, &bundle);
+
+        assert_eq!(summary.controlled_reality_action_depth, 3);
+        assert_eq!(summary.controlled_reality_branch_count, 2);
     }
 }

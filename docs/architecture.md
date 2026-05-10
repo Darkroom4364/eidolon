@@ -71,6 +71,7 @@ policy_decision
 policy_changed
 controlled_reality_entered
 rate_limit_applied
+reality_escape_attempt
 ```
 
 Every event should include:
@@ -86,7 +87,7 @@ Every event should include:
 Request events should log method, path, selected safe header metadata, and routing decision. They should not log request bodies or secrets by default.
 
 `policy_decision` records an audited routing decision without claiming the policy state changed. `policy_changed` is reserved for actual state transitions where `from` and `to` differ.
-`controlled_reality_entered` and `rate_limit_applied` are per-request enforcement markers, not policy-state transition events.
+`controlled_reality_entered` and `rate_limit_applied` are per-request enforcement markers, not policy-state transition events. `reality_escape_attempt` records a contained session requesting outside the configured controlled branch without logging request bodies or secret values.
 
 ## 1. Edge Boundary
 

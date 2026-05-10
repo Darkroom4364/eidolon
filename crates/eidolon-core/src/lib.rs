@@ -117,6 +117,12 @@ pub enum EventKind {
     RateLimitApplied {
         reason: String,
     },
+    RealityEscapeAttempt {
+        method: String,
+        path: String,
+        routing_decision: RoutingDecision,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
