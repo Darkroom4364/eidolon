@@ -171,6 +171,12 @@ fn render_metric_summary(timeline: &SessionTimeline, bundle: &EvidenceBundle, re
         summary.controlled_reality_action_depth
     )
     .expect("writing to string should not fail");
+    writeln!(
+        report,
+        "| `controlled_reality_branch_count` | `{}` |",
+        summary.controlled_reality_branch_count
+    )
+    .expect("writing to string should not fail");
 }
 
 pub fn render_replay_view(timeline: &SessionTimeline, bundle: &EvidenceBundle) -> String {
@@ -291,6 +297,18 @@ fn replay_summary(event: &TimelineEvent, bundle: &EvidenceBundle) -> String {
         EventKind::RateLimitApplied { reason } => {
             format!("rate limit applied: {}", markdown_text(reason))
         }
+        EventKind::RealityEscapeAttempt {
+            method,
+            path,
+            routing_decision,
+            reason,
+        } => format!(
+            "reality escape attempt `{}` `{}` routed `{}`: {}",
+            inline_code(method),
+            inline_code(&report_target(path)),
+            snake_case_debug(routing_decision),
+            markdown_text(reason)
+        ),
     }
 }
 
@@ -353,6 +371,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::PolicyDecision { .. } => "policy_decision",
         EventKind::ControlledRealityEntered { .. } => "controlled_reality_entered",
         EventKind::RateLimitApplied { .. } => "rate_limit_applied",
+        EventKind::RealityEscapeAttempt { .. } => "reality_escape_attempt",
     }
 }
 
@@ -636,6 +655,7 @@ mod tests {
         assert!(report.contains("| `real_surface_requests_after_containment` | `1` |"));
         assert!(report.contains("| `controlled_reality_dwell_seconds` | `10.000` |"));
         assert!(report.contains("| `controlled_reality_action_depth` | `2` |"));
+        assert!(report.contains("| `controlled_reality_branch_count` | `1` |"));
     }
 
     #[test]

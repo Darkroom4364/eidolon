@@ -22,8 +22,10 @@ The M2.5 candidate should include:
 - event log showing the controlled-reality policy-state transition and reason
 - event log showing decoy branch routing and response ownership
 - evidence that bait-derived writes and decoy writes were not forwarded to the protected upstream
+- event log showing `reality_escape_attempt` when a contained session requests outside the configured branch
 - negative controls for wrong marker, wrong session, ordinary traffic, and emergency disable
-- dwell time and action-depth measurements for the controlled-reality branch
+- dwell time, action-depth, and branch-count measurements for the controlled-reality branch
+- configured max depth, tarpit delay, and retry-after behavior for rate-limited containment
 
 ## Safety Boundary
 

@@ -182,6 +182,27 @@ pub fn response_audit_event(
     )
 }
 
+pub fn reality_escape_attempt_event(
+    session_id: SessionId,
+    policy_state: PolicyState,
+    method: impl Into<String>,
+    path: impl Into<String>,
+    routing_decision: RoutingDecision,
+    reason: impl Into<String>,
+) -> Event {
+    Event::new(
+        session_id,
+        EventSource::PolicyRouter,
+        policy_state,
+        EventKind::RealityEscapeAttempt {
+            method: method.into(),
+            path: path.into(),
+            routing_decision,
+            reason: reason.into(),
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
