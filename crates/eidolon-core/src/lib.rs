@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const EVENT_SCHEMA_VERSION: u16 = 1;
+pub const EVENT_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
@@ -115,6 +115,12 @@ pub enum EventKind {
         reason: String,
     },
     RateLimitApplied {
+        reason: String,
+    },
+    RealityEscapeAttempt {
+        method: String,
+        path: String,
+        routing_decision: RoutingDecision,
         reason: String,
     },
 }

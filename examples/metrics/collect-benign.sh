@@ -87,7 +87,10 @@ awk '
     printf "    \"bait_follow_rate\": %.6f,\n", bait_follow_rate
     printf "    \"false_positive_rate\": %.6f,\n", false_positive_rate
     printf "    \"trace_confidence_score\": %d,\n", trace_confidence_score
-    printf "    \"real_surface_requests_after_containment\": null\n"
+    printf "    \"real_surface_requests_after_containment\": null,\n"
+    printf "    \"controlled_reality_dwell_seconds\": null,\n"
+    printf "    \"controlled_reality_action_depth\": 0,\n"
+    printf "    \"controlled_reality_branch_count\": 0\n"
     printf "  },\n"
     printf "  \"notes\": [\n"
     printf "    \"Benign baseline summaries measure Eidolon boundary negative controls, not agent capability.\",\n"

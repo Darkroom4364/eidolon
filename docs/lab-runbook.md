@@ -120,7 +120,8 @@ cargo run -p eidolon-proxy -- \
   --listen-addr 127.0.0.1:8080 \
   --upstream http://127.0.0.1:9001 \
   --event-log /tmp/eidolon-events.jsonl \
-  --intervention-control /tmp/eidolon-interventions.txt
+  --intervention-control /tmp/eidolon-interventions.txt \
+  --policy-state /tmp/eidolon-policy-state.json
 ```
 
 Replay the benign baseline through the proxy:
@@ -135,6 +136,16 @@ The proxy assigns a first-party `eidolon_session` cookie when no valid session c
 The event log is JSONL. Request events record method, path, policy state, routing decision, session ID, and selected safe header presence. They do not log request bodies or header values.
 
 The intervention control file is read per request. If it contains `disabled`, `disable`, `off`, or `0`, interventions are disabled without restarting the proxy and traffic is forwarded to protected upstream.
+
+M2.5 controlled-reality tuning is local CLI configuration:
+
+```sh
+--controlled-reality-max-depth 4
+--controlled-reality-tarpit-ms 25
+--controlled-reality-retry-after-seconds 30
+```
+
+The tarpit delay is bounded by the proxy CLI for the thread-per-connection Lab server.
 
 With interventions enabled, M1 exposes a small built-in demo surface so the proxy path can be validated without claiming the full bait engine is complete:
 
@@ -220,13 +231,15 @@ Expected event properties:
 - decoy branch requests are served as Eidolon-owned controlled-reality responses
 - bait-derived writes and decoy writes are not forwarded to the protected upstream
 - response data is synthetic and contains no real secrets, customer data, internal hostnames, or real bypasses
-- dwell time, action depth, and routing decisions are visible in the event log
+- dwell time, action depth, branch count, and routing decisions are visible in trace/report output
+- controlled sessions requesting paths outside the configured branch produce a `reality_escape_attempt` event while interventions are enabled
 
 Run negative controls:
 
 - Use a fresh session with no bait exposure and request the decoy branch. It must not inherit another session's controlled-reality state.
 - Use the correct path with the wrong marker. It must not satisfy the same policy transition.
-- Send ordinary `/api/v1/*` traffic. It should remain ordinary protected-upstream traffic unless the documented policy state says otherwise.
+- Send ordinary `/api/v1/*` traffic before controlled-reality entry. It should remain ordinary protected-upstream traffic.
+- Send ordinary `/api/v1/*` traffic after controlled-reality entry. It should produce a `reality_escape_attempt` event and stay inside controlled reality while interventions are enabled.
 - Trigger the configured emergency disable. The next request must stop controlled-reality intervention and record the disable behavior; known decoy write paths should fail closed locally instead of forwarding to the protected upstream.
 
 M2.5 does not prove broad containment, attribution, adaptive bait policy, public-v1 readiness, production readiness, or safe deployment outside the Lab. It proves only that one qualifying Lab session can be routed into one synthetic no-write branch and audited.

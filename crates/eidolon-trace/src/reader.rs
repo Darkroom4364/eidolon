@@ -7,6 +7,7 @@ use std::{
 };
 
 use eidolon_core::{Event, EVENT_SCHEMA_VERSION};
+use serde_json::Value;
 
 use crate::TimelineEvent;
 
@@ -45,20 +46,33 @@ where
             line_number,
             source,
         })?;
-        let event: Event =
+        let value: Value =
             serde_json::from_str(&line).map_err(|source| TraceReadError::ParseLine {
                 path: path.clone(),
                 line_number,
                 source,
             })?;
-        if event.schema_version != EVENT_SCHEMA_VERSION {
+
+        let schema_version =
+            event_schema_version(&value).ok_or_else(|| TraceReadError::MissingSchemaVersion {
+                path: path.clone(),
+                line_number,
+            })?;
+        if schema_version != EVENT_SCHEMA_VERSION {
             return Err(TraceReadError::UnsupportedSchemaVersion {
                 path: path.clone(),
                 line_number,
-                schema_version: event.schema_version,
+                schema_version,
                 expected_schema_version: EVENT_SCHEMA_VERSION,
             });
         }
+
+        let event: Event =
+            serde_json::from_value(value).map_err(|source| TraceReadError::ParseLine {
+                path: path.clone(),
+                line_number,
+                source,
+            })?;
 
         events.push(TimelineEvent {
             file_order: events.len(),
@@ -85,6 +99,10 @@ pub enum TraceReadError {
         path: Option<PathBuf>,
         line_number: usize,
         source: serde_json::Error,
+    },
+    MissingSchemaVersion {
+        path: Option<PathBuf>,
+        line_number: usize,
     },
     UnsupportedSchemaVersion {
         path: Option<PathBuf>,
@@ -118,6 +136,11 @@ impl fmt::Display for TraceReadError {
                 "could not parse event JSON on {}: {source}",
                 line_location(path.as_deref(), *line_number)
             ),
+            Self::MissingSchemaVersion { path, line_number } => write!(
+                formatter,
+                "event JSON on {} is missing numeric schema_version",
+                line_location(path.as_deref(), *line_number)
+            ),
             Self::UnsupportedSchemaVersion {
                 path,
                 line_number,
@@ -137,9 +160,16 @@ impl Error for TraceReadError {
         match self {
             Self::Open { source, .. } | Self::ReadLine { source, .. } => Some(source),
             Self::ParseLine { source, .. } => Some(source),
-            Self::UnsupportedSchemaVersion { .. } => None,
+            Self::MissingSchemaVersion { .. } | Self::UnsupportedSchemaVersion { .. } => None,
         }
     }
+}
+
+fn event_schema_version(value: &Value) -> Option<u16> {
+    value
+        .get("schema_version")?
+        .as_u64()
+        .and_then(|version| u16::try_from(version).ok())
 }
 
 fn line_location(path: Option<&Path>, line_number: usize) -> String {
@@ -216,6 +246,32 @@ mod tests {
             } => {
                 assert_eq!(line_number, 1);
                 assert_eq!(schema_version, 0);
+                assert_eq!(expected_schema_version, EVENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected unsupported schema error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_events_jsonl_rejects_unsupported_schema_before_unknown_kind_parse() {
+        let session_id = SessionId::new();
+        let mut value = serde_json::to_value(event(session_id, "/future")).unwrap();
+        value["schema_version"] = serde_json::json!(EVENT_SCHEMA_VERSION + 1);
+        value["kind"] = serde_json::json!({
+            "type": "future_event_kind",
+            "field": "not supported by this reader"
+        });
+        let input = serde_json::to_string(&value).unwrap();
+
+        let error = read_events_jsonl(input.as_bytes()).expect_err("future schema should fail");
+
+        match error {
+            TraceReadError::UnsupportedSchemaVersion {
+                schema_version,
+                expected_schema_version,
+                ..
+            } => {
+                assert_eq!(schema_version, EVENT_SCHEMA_VERSION + 1);
                 assert_eq!(expected_schema_version, EVENT_SCHEMA_VERSION);
             }
             other => panic!("expected unsupported schema error, got {other:?}"),
