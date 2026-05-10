@@ -1,8 +1,8 @@
 # Eidolon Lab Runbook v0
 
-This runbook separates M0.5 local Lab harness proof, M1 proxy validation, and M1.5 correlated bait primitive validation.
+This runbook separates M0.5 local Lab harness proof, M1 proxy validation, M1.5 correlated bait primitive validation, and M2.5 micro controlled-reality validation.
 
-It does not prove the full Eidolon Blackwall loop yet. M0.5 proves only the owned local evaluation harness. M1 adds a reachable proxy path with honest forwarding, session correlation, JSONL request auditing, and operator-controlled intervention toggling. M1.5 validates the first same-session bait exposure to bait action observation loop. Full causal evidence bundles, scoring reports, controlled-reality routing, and production readiness are later work.
+It does not prove the full Eidolon Blackwall loop yet. M0.5 proves only the owned local evaluation harness. M1 adds a reachable proxy path with honest forwarding, session correlation, JSONL request auditing, and operator-controlled intervention toggling. M1.5 validates the first same-session bait exposure to bait action observation loop. M2.5 validates only one Lab controlled-reality branch when that code path is supported. Public-v1, production readiness, and broad deployment claims are out of scope.
 
 Use this runbook to verify:
 
@@ -12,6 +12,7 @@ Use this runbook to verify:
 - the M0.5 agentic scan shape stays local, defensive, and non-destructive
 - the M1 proxy is reachable, forwards honestly, records auditable events, and honors intervention control
 - the M1.5 proxy can correlate one owned bait exposure with one matching bait-derived action in the same session when that code path is supported
+- the M2.5 proxy can route one qualifying session into one synthetic controlled-reality branch when that code path is supported
 
 Do not use this runbook to rank agents, demonstrate exploitation, claim Eidolon has detected an autonomous attacker, or claim controlled-reality containment is complete.
 
@@ -188,6 +189,48 @@ Run near-miss and negative controls to keep the claim narrow:
 
 M1.5 does not prove full causal evidence bundles, scoring reports, controlled reality, autonomous-agent attribution, production readiness, or M2/M2.5 behavior. It validates only that the proxy can connect one owned bait exposure to one matching bait-derived action in the same session, and block that bait-derived action from reaching the protected upstream.
 
+## M2.5 Micro Controlled-Reality Validation
+
+M2.5 validates one Lab-only controlled-reality branch after the proxy has enough evidence to move a session into the documented controlled-reality policy state. It is not a general sandbox, public release gate, or production deployment guide.
+
+Use only the owned loopback proxy and synthetic demo target from the M1 setup. Keep interventions enabled and start with a fresh cookie jar:
+
+```sh
+rm -f /tmp/eidolon-m25-cookies.txt
+curl -i -c /tmp/eidolon-m25-cookies.txt \
+  http://127.0.0.1:8080/docs/legacy-import
+curl -i -b /tmp/eidolon-m25-cookies.txt \
+  -H 'X-Migration-Trace: rel_2025_04_b7f2' \
+  -X POST http://127.0.0.1:8080/api/v2/import/reconcile
+```
+
+When M2.5 support is present, the matching same-session bait action may move that session into controlled reality. Validate the configured decoy admin/API branch only. The current M2.5 branch is the bait-derived API path:
+
+```sh
+curl -i -b /tmp/eidolon-m25-cookies.txt \
+  http://127.0.0.1:8080/api/v2/import/reconcile
+curl -i -b /tmp/eidolon-m25-cookies.txt \
+  -X POST http://127.0.0.1:8080/api/v2/import/reconcile
+```
+
+Expected event properties:
+
+- the same session has a prior `bait_exposed` and matching `bait_action_observed`
+- a policy-state transition records why controlled reality was selected
+- decoy branch requests are served as Eidolon-owned controlled-reality responses
+- bait-derived writes and decoy writes are not forwarded to the protected upstream
+- response data is synthetic and contains no real secrets, customer data, internal hostnames, or real bypasses
+- dwell time, action depth, and routing decisions are visible in the event log
+
+Run negative controls:
+
+- Use a fresh session with no bait exposure and request the decoy branch. It must not inherit another session's controlled-reality state.
+- Use the correct path with the wrong marker. It must not satisfy the same policy transition.
+- Send ordinary `/api/v1/*` traffic. It should remain ordinary protected-upstream traffic unless the documented policy state says otherwise.
+- Trigger the configured emergency disable. The next request must stop controlled-reality intervention and record the disable behavior; known decoy write paths should fail closed locally instead of forwarding to the protected upstream.
+
+M2.5 does not prove broad containment, attribution, adaptive bait policy, public-v1 readiness, production readiness, or safe deployment outside the Lab. It proves only that one qualifying Lab session can be routed into one synthetic no-write branch and audited.
+
 ## What M0.5 Proves
 
 M0.5 proves that Eidolon has a local, owned, replayable evaluation harness:
@@ -251,3 +294,23 @@ M1.5 does not yet prove:
 - autonomous-agent attribution
 - production readiness
 - M2 or M2.5 behavior
+
+## What M2.5 Proves
+
+M2.5 proves only the first Lab-controlled reality branch when code support is present:
+
+- policy-state transition into controlled reality is auditable
+- one configured decoy admin/API branch can return synthetic responses
+- bait-derived writes and decoy writes are not forwarded to the protected upstream
+- dwell time, action depth, routing, escape attempts, and emergency disable behavior are observable
+
+## What M2.5 Does Not Prove
+
+M2.5 does not yet prove:
+
+- broad controlled-reality coverage
+- adaptive bait policy
+- autonomous-agent attribution
+- public-v1 readiness
+- production readiness
+- safe deployment outside the owned loopback Lab

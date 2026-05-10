@@ -5,6 +5,8 @@ pub const INITIAL_POLICY_STATE: PolicyState = PolicyState::Observe;
 const DEFAULT_OBSERVE_REASON: &str = "observe policy forwards traffic to the protected upstream";
 const INTERVENTIONS_DISABLED_REASON: &str =
     "interventions disabled; forwarding to protected upstream";
+const BAIT_ACTION_CONTROLLED_REALITY_REASON: &str =
+    "confirmed bait-derived action moved session into controlled reality";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDecision {
@@ -37,6 +39,23 @@ impl Default for PolicyDecision {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyTransition {
+    pub from: PolicyState,
+    pub to: PolicyState,
+    pub reason: String,
+}
+
+impl PolicyTransition {
+    pub fn new(from: PolicyState, to: PolicyState, reason: impl Into<String>) -> Self {
+        Self {
+            from,
+            to,
+            reason: reason.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InterventionMode {
     Enabled,
@@ -56,6 +75,22 @@ pub fn initial_policy_state() -> PolicyState {
 
 pub fn v0_protected_upstream_decision() -> PolicyDecision {
     PolicyDecision::default()
+}
+
+pub fn transition_after_correlated_bait_action(
+    current_state: PolicyState,
+) -> Option<PolicyTransition> {
+    match current_state {
+        PolicyState::Observe | PolicyState::Suspicious => Some(PolicyTransition::new(
+            current_state,
+            PolicyState::ControlledReality,
+            BAIT_ACTION_CONTROLLED_REALITY_REASON,
+        )),
+        PolicyState::Normal
+        | PolicyState::ControlledReality
+        | PolicyState::RateLimited
+        | PolicyState::Blocked => None,
+    }
 }
 
 pub fn decide_for_state(
@@ -118,6 +153,19 @@ pub fn policy_intervention_event(session_id: SessionId, decision: &PolicyDecisio
     )
 }
 
+pub fn policy_changed_event(session_id: SessionId, transition: &PolicyTransition) -> Event {
+    Event::new(
+        session_id,
+        EventSource::PolicyRouter,
+        transition.to,
+        EventKind::PolicyChanged {
+            from: transition.from,
+            to: transition.to,
+            reason: transition.reason.clone(),
+        },
+    )
+}
+
 pub fn response_audit_event(
     session_id: SessionId,
     decision: &PolicyDecision,
@@ -174,6 +222,52 @@ mod tests {
             RoutingDecision::ControlledReality
         );
         assert_eq!(rate_limited.routing_decision, RoutingDecision::RateLimited);
+    }
+
+    #[test]
+    fn correlated_bait_action_transitions_observe_or_suspicious_to_controlled_reality() {
+        let observe = transition_after_correlated_bait_action(PolicyState::Observe)
+            .expect("observe should transition");
+        let suspicious = transition_after_correlated_bait_action(PolicyState::Suspicious)
+            .expect("suspicious should transition");
+
+        assert_eq!(observe.from, PolicyState::Observe);
+        assert_eq!(observe.to, PolicyState::ControlledReality);
+        assert_eq!(suspicious.from, PolicyState::Suspicious);
+        assert_eq!(suspicious.to, PolicyState::ControlledReality);
+    }
+
+    #[test]
+    fn correlated_bait_action_does_not_transition_terminal_or_already_controlled_states() {
+        for state in [
+            PolicyState::Normal,
+            PolicyState::ControlledReality,
+            PolicyState::RateLimited,
+            PolicyState::Blocked,
+        ] {
+            assert_eq!(transition_after_correlated_bait_action(state), None);
+        }
+    }
+
+    #[test]
+    fn policy_changed_event_records_real_state_transition() {
+        let session_id = SessionId::new();
+        let transition = transition_after_correlated_bait_action(PolicyState::Observe)
+            .expect("observe should transition");
+
+        let event = policy_changed_event(session_id, &transition);
+
+        assert_eq!(event.session_id, session_id);
+        assert_eq!(event.source, EventSource::PolicyRouter);
+        assert_eq!(event.policy_state, PolicyState::ControlledReality);
+        assert!(matches!(
+            event.kind,
+            EventKind::PolicyChanged {
+                from: PolicyState::Observe,
+                to: PolicyState::ControlledReality,
+                ref reason,
+            } if reason == &transition.reason
+        ));
     }
 
     #[test]

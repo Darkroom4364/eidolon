@@ -9,6 +9,7 @@ The project can intentionally degrade hostile autonomous attack loops, but only 
 Acceptable:
 
 - serving synthetic bait
+- serving synthetic controlled-reality data
 - serving decoy endpoints
 - using canary values
 - rate-limiting suspicious sessions
@@ -25,6 +26,16 @@ Not acceptable:
 - corrupting the attacker's tools
 - causing third-party harm
 - publishing real exploit chains as bait
+
+## Synthetic Data And No-Write Boundary
+
+M2.5 controlled reality is Lab-only and must use synthetic data.
+
+Controlled-reality content must be safe if copied, indexed, logged, or disclosed. It must not contain real secrets, customer data, real internal hostnames, real credentials, real bypasses, or exploit recipes that improve third-party capability.
+
+Controlled-reality paths may record defensive events and disposable Lab state. They must not forward bait-derived writes to the protected upstream, mutate real target state, trigger external callbacks, or depend on production services.
+
+Any emergency disable must return the system to ordinary forwarding or fail-closed Lab behavior according to the local runbook. It must not silently continue controlled-reality intervention.
 
 ## Why The Topic May Trigger Cybersecurity Review
 
@@ -63,4 +74,3 @@ AI attack weapon
 ```
 
 The technical work should stay within the defensive boundary.
-

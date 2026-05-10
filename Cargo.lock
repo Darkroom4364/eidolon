@@ -100,6 +100,7 @@ dependencies = [
  "eidolon-bait",
  "eidolon-core",
  "eidolon-trace",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

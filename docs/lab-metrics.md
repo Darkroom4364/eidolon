@@ -13,6 +13,8 @@ Required v0 metric names:
 - `false_positive_rate`
 - `trace_confidence_score`
 - `real_surface_requests_after_containment`
+- `controlled_reality_dwell_seconds`
+- `controlled_reality_action_depth`
 
 ### `time_to_first_bait_action_seconds`
 
@@ -42,7 +44,21 @@ For direct benign baseline traffic before the proxy/trace pipeline exists, this 
 
 Number of requests to protected target routes after a session enters controlled reality.
 
-This is `null` until policy routing and controlled reality exist.
+In trace/report summaries, this is `null` until a containment marker exists in the session. Once containment exists, it is the count of later `request_seen` events routed to `protected_upstream` or `rewritten_upstream`.
+
+The temporary v0 shell collectors may still emit `null` until they consume proxy/trace events.
+
+### `controlled_reality_dwell_seconds`
+
+Elapsed time between the first and last controlled-reality containment marker in a session.
+
+This is `null` until the session enters controlled reality or rate-limited containment.
+
+### `controlled_reality_action_depth`
+
+Number of request actions observed while the session is inside controlled reality or rate-limited containment.
+
+This is `0` until the session enters controlled reality or rate-limited containment.
 
 ## V0 Summary Schema
 
@@ -68,10 +84,27 @@ The first summary artifact is JSON:
     "bait_follow_rate": 0.0,
     "false_positive_rate": 0.0,
     "trace_confidence_score": 0,
-    "real_surface_requests_after_containment": null
+    "real_surface_requests_after_containment": null,
+    "controlled_reality_dwell_seconds": null,
+    "controlled_reality_action_depth": 0
   }
 }
 ```
+
+## M2.5 Trace/Report Derivation
+
+The trace/report summary derives controlled-reality metrics only from the existing core event vocabulary:
+
+- `controlled_reality_entered`
+- `request_seen` and `response_served` with routing decision `controlled_reality` or `rate_limited`
+- policy state values `controlled_reality` or `rate_limited`
+- `policy_changed` events whose `from` or `to` state is `controlled_reality` or `rate_limited`
+
+`controlled_reality_dwell_seconds` uses the first and last containment markers in trace order and computes elapsed event time. If there is only one marker, dwell is `0.0`.
+
+`controlled_reality_action_depth` counts `request_seen` events whose routing decision or policy state places the request inside controlled reality or rate-limited containment.
+
+`real_surface_requests_after_containment` counts later `request_seen` events routed to `protected_upstream` or `rewritten_upstream`. These are the trace/report signal for protected-surface access after containment has started.
 
 ## Collecting Benign Metrics
 
@@ -122,7 +155,9 @@ The mode collector emits the same v0 metric keys for each comparison mode:
         "bait_follow_rate": 1.0,
         "false_positive_rate": 0.0,
         "trace_confidence_score": 50,
-        "real_surface_requests_after_containment": null
+        "real_surface_requests_after_containment": null,
+        "controlled_reality_dwell_seconds": null,
+        "controlled_reality_action_depth": 0
       }
     }
   }
