@@ -2,6 +2,7 @@ use std::fmt::Write;
 
 use eidolon_core::{EventKind, RoutingDecision};
 
+use crate::evidence::trace_metric_summary_for_timeline;
 use crate::{
     evidence_bundle_for_timeline, BaitActionEvidence, BaitExposureEvidence, EvidenceBundle,
     SessionTimeline, TimelineEvent, TimelineEventRef,
@@ -40,6 +41,8 @@ pub fn render_evidence_markdown(timeline: &SessionTimeline, bundle: &EvidenceBun
         "- Safety note: this report is behavioral evidence from the owned lab trace. It is not proof of AI identity and does not include request bodies, secret header values, or raw query values."
     )
     .expect("writing to string should not fail");
+
+    render_metric_summary(timeline, bundle, &mut report);
 
     writeln!(report, "\n## Score Reasons").expect("writing to string should not fail");
     if bundle.score.reasons.is_empty() {
@@ -124,6 +127,50 @@ pub fn render_evidence_markdown(timeline: &SessionTimeline, bundle: &EvidenceBun
     report.push_str(&render_replay_view(timeline, bundle));
 
     report
+}
+
+fn render_metric_summary(timeline: &SessionTimeline, bundle: &EvidenceBundle, report: &mut String) {
+    let summary = trace_metric_summary_for_timeline(timeline, bundle);
+
+    writeln!(report, "\n## Metrics Summary").expect("writing to string should not fail");
+    writeln!(report, "| Metric | Value |").expect("writing to string should not fail");
+    writeln!(report, "| --- | --- |").expect("writing to string should not fail");
+    writeln!(
+        report,
+        "| `time_to_first_bait_action_seconds` | {} |",
+        optional_seconds(summary.time_to_first_bait_action_seconds)
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        report,
+        "| `bait_follow_rate` | `{:.3}` |",
+        summary.bait_follow_rate
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        report,
+        "| `trace_confidence_score` | `{}` |",
+        summary.trace_confidence_score
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        report,
+        "| `real_surface_requests_after_containment` | {} |",
+        optional_usize(summary.real_surface_requests_after_containment)
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        report,
+        "| `controlled_reality_dwell_seconds` | {} |",
+        optional_seconds(summary.controlled_reality_dwell_seconds)
+    )
+    .expect("writing to string should not fail");
+    writeln!(
+        report,
+        "| `controlled_reality_action_depth` | `{}` |",
+        summary.controlled_reality_action_depth
+    )
+    .expect("writing to string should not fail");
 }
 
 pub fn render_replay_view(timeline: &SessionTimeline, bundle: &EvidenceBundle) -> String {
@@ -284,6 +331,18 @@ fn optional_reason(reason: Option<&str>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn optional_seconds(seconds: Option<f64>) -> String {
+    seconds
+        .map(|seconds| format!("`{seconds:.3}`"))
+        .unwrap_or_else(|| "`null`".to_string())
+}
+
+fn optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|value| format!("`{value}`"))
+        .unwrap_or_else(|| "`null`".to_string())
+}
+
 fn event_kind_name(kind: &EventKind) -> &'static str {
     match kind {
         EventKind::RequestSeen { .. } => "request_seen",
@@ -364,6 +423,7 @@ fn markdown_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeDelta, TimeZone, Utc};
     use eidolon_core::{
         BaitId, Event, EventKind, EventSource, ExposureId, PolicyState, RoutingDecision,
         SafeHeaderObservation, SessionId,
@@ -451,6 +511,60 @@ mod tests {
         )
     }
 
+    fn controlled_reality_entered(session_id: SessionId) -> Event {
+        Event::new(
+            session_id,
+            EventSource::PolicyRouter,
+            PolicyState::ControlledReality,
+            EventKind::ControlledRealityEntered {
+                reason: "confirmed bait-derived action".to_string(),
+            },
+        )
+    }
+
+    fn routed_request(
+        session_id: SessionId,
+        policy_state: PolicyState,
+        routing_decision: RoutingDecision,
+    ) -> Event {
+        Event::new(
+            session_id,
+            EventSource::Proxy,
+            policy_state,
+            EventKind::RequestSeen {
+                method: "GET".to_string(),
+                path: "/admin/decoy".to_string(),
+                safe_headers: Vec::new(),
+                routing_decision,
+            },
+        )
+    }
+
+    fn routed_response(
+        session_id: SessionId,
+        policy_state: PolicyState,
+        routing_decision: RoutingDecision,
+    ) -> Event {
+        Event::new(
+            session_id,
+            EventSource::Proxy,
+            policy_state,
+            EventKind::ResponseServed {
+                status: 200,
+                routing_decision,
+            },
+        )
+    }
+
+    fn at(mut event: Event, seconds: i64) -> Event {
+        event.observed_at = Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .expect("test timestamp should be valid")
+            + TimeDelta::seconds(seconds);
+        event
+    }
+
     #[test]
     fn report_contains_score_bait_chain_policy_and_safety_note() {
         let session_id = SessionId::new();
@@ -470,6 +584,58 @@ mod tests {
         assert!(report.contains("Policy Actions"));
         assert!(report.contains("bait-derived action intercepted"));
         assert!(report.contains("## Replay"));
+    }
+
+    #[test]
+    fn report_contains_metric_summary_for_controlled_reality() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            at(exposure(session_id), 0),
+            at(action(session_id, Some("exp-1")), 3),
+            at(controlled_reality_entered(session_id), 10),
+            at(
+                routed_request(
+                    session_id,
+                    PolicyState::ControlledReality,
+                    RoutingDecision::ControlledReality,
+                ),
+                12,
+            ),
+            at(
+                routed_response(
+                    session_id,
+                    PolicyState::ControlledReality,
+                    RoutingDecision::ControlledReality,
+                ),
+                18,
+            ),
+            at(
+                routed_request(
+                    session_id,
+                    PolicyState::RateLimited,
+                    RoutingDecision::RateLimited,
+                ),
+                20,
+            ),
+            at(
+                routed_request(
+                    session_id,
+                    PolicyState::Observe,
+                    RoutingDecision::ProtectedUpstream,
+                ),
+                25,
+            ),
+        ]);
+
+        let report = render_markdown_report(&timeline);
+
+        assert!(report.contains("## Metrics Summary"));
+        assert!(report.contains("| `time_to_first_bait_action_seconds` | `3.000` |"));
+        assert!(report.contains("| `bait_follow_rate` | `1.000` |"));
+        assert!(report.contains("| `trace_confidence_score` | `85` |"));
+        assert!(report.contains("| `real_surface_requests_after_containment` | `1` |"));
+        assert!(report.contains("| `controlled_reality_dwell_seconds` | `10.000` |"));
+        assert!(report.contains("| `controlled_reality_action_depth` | `2` |"));
     }
 
     #[test]

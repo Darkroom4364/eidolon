@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use eidolon_core::{BaitId, EventKind, ExposureId, PolicyState, RoutingDecision, Score, SessionId};
 use serde::{Deserialize, Serialize};
 
-use crate::{SessionTimeline, TimelineEventRef};
+use crate::{SessionTimeline, TimelineEvent, TimelineEventRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceBundle {
@@ -75,6 +75,16 @@ pub struct BaselineComparison {
     pub notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TraceMetricSummary {
+    pub time_to_first_bait_action_seconds: Option<f64>,
+    pub bait_follow_rate: f64,
+    pub trace_confidence_score: i32,
+    pub real_surface_requests_after_containment: Option<usize>,
+    pub controlled_reality_dwell_seconds: Option<f64>,
+    pub controlled_reality_action_depth: usize,
+}
+
 impl Default for BaselineComparison {
     fn default() -> Self {
         Self {
@@ -91,6 +101,34 @@ pub fn evidence_bundle_for_timeline(timeline: &SessionTimeline) -> EvidenceBundl
     let mut bundle = collect_evidence(timeline);
     bundle.score = crate::score_evidence(&bundle);
     bundle
+}
+
+pub(crate) fn trace_metric_summary_for_timeline(
+    timeline: &SessionTimeline,
+    bundle: &EvidenceBundle,
+) -> TraceMetricSummary {
+    let containment_bounds = containment_bounds(timeline);
+
+    TraceMetricSummary {
+        time_to_first_bait_action_seconds: time_to_first_bait_action_seconds(timeline, bundle),
+        bait_follow_rate: if bundle.matched_actions.is_empty() {
+            0.0
+        } else {
+            1.0
+        },
+        trace_confidence_score: bundle.score.points,
+        real_surface_requests_after_containment: containment_bounds.map(|(first, _)| {
+            timeline
+                .events
+                .iter()
+                .skip(first + 1)
+                .filter(|event| request_routes_to_real_surface(event))
+                .count()
+        }),
+        controlled_reality_dwell_seconds: containment_bounds
+            .map(|(first, last)| seconds_between(&timeline.events[first], &timeline.events[last])),
+        controlled_reality_action_depth: controlled_reality_action_depth(timeline),
+    }
 }
 
 pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
@@ -237,11 +275,160 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
     bundle
 }
 
+fn time_to_first_bait_action_seconds(
+    timeline: &SessionTimeline,
+    bundle: &EvidenceBundle,
+) -> Option<f64> {
+    bundle
+        .matched_actions
+        .iter()
+        .filter_map(|action| {
+            let exposure = event_by_ref(timeline, action.matched_exposure?)?;
+            let action = event_by_ref(timeline, action.event_ref)?;
+            Some(seconds_between(exposure, action))
+        })
+        .min_by(|left, right| left.total_cmp(right))
+}
+
+fn event_by_ref(timeline: &SessionTimeline, event_ref: TimelineEventRef) -> Option<&TimelineEvent> {
+    timeline.events.iter().find(|event| {
+        event.event.id == event_ref.event_id
+            && event.file_order == event_ref.file_order
+            && event.line_number == event_ref.line_number
+    })
+}
+
+fn containment_bounds(timeline: &SessionTimeline) -> Option<(usize, usize)> {
+    let mut first = None;
+    let mut last = None;
+
+    for (index, event) in timeline.events.iter().enumerate() {
+        if containment_marker(event) {
+            first.get_or_insert(index);
+            last = Some(index);
+        }
+    }
+
+    first.zip(last)
+}
+
+fn containment_marker(event: &TimelineEvent) -> bool {
+    containment_policy_state(event.event.policy_state)
+        || policy_change_touches_containment(&event.event.kind)
+        || request_or_response_routes_to_containment(&event.event.kind)
+        || matches!(
+            &event.event.kind,
+            EventKind::ControlledRealityEntered { .. }
+        )
+}
+
+fn controlled_reality_request(event: &TimelineEvent) -> bool {
+    match &event.event.kind {
+        EventKind::RequestSeen {
+            routing_decision, ..
+        } => {
+            containment_policy_state(event.event.policy_state)
+                || containment_routing_decision(*routing_decision)
+        }
+        _ => false,
+    }
+}
+
+fn controlled_reality_action_depth(timeline: &SessionTimeline) -> usize {
+    let mut depth = 0;
+    let mut pending_request_was_containment = None;
+
+    for event in &timeline.events {
+        match &event.event.kind {
+            EventKind::RequestSeen { .. } => {
+                let contained = controlled_reality_request(event);
+                if contained {
+                    depth += 1;
+                }
+                pending_request_was_containment = Some(contained);
+            }
+            EventKind::ResponseServed {
+                routing_decision, ..
+            } if containment_routing_decision(*routing_decision) => {
+                if pending_request_was_containment != Some(true) {
+                    depth += 1;
+                }
+                pending_request_was_containment = None;
+            }
+            EventKind::ResponseServed { .. } => {
+                pending_request_was_containment = None;
+            }
+            _ => {}
+        }
+    }
+
+    depth
+}
+
+fn request_or_response_routes_to_containment(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::RequestSeen {
+            routing_decision, ..
+        }
+        | EventKind::ResponseServed {
+            routing_decision, ..
+        } => containment_routing_decision(*routing_decision),
+        _ => false,
+    }
+}
+
+fn request_routes_to_real_surface(event: &TimelineEvent) -> bool {
+    match &event.event.kind {
+        EventKind::RequestSeen {
+            routing_decision, ..
+        } => matches!(
+            *routing_decision,
+            RoutingDecision::ProtectedUpstream | RoutingDecision::RewrittenUpstream
+        ),
+        _ => false,
+    }
+}
+
+fn policy_change_touches_containment(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::PolicyChanged { from, to, .. } => {
+            containment_policy_state(*from) || containment_policy_state(*to)
+        }
+        _ => false,
+    }
+}
+
+fn containment_policy_state(policy_state: PolicyState) -> bool {
+    matches!(
+        policy_state,
+        PolicyState::ControlledReality | PolicyState::RateLimited
+    )
+}
+
+fn containment_routing_decision(routing_decision: RoutingDecision) -> bool {
+    matches!(
+        routing_decision,
+        RoutingDecision::ControlledReality | RoutingDecision::RateLimited
+    )
+}
+
+fn seconds_between(start: &TimelineEvent, end: &TimelineEvent) -> f64 {
+    let milliseconds = end
+        .event
+        .observed_at
+        .signed_duration_since(start.event.observed_at)
+        .num_milliseconds()
+        .max(0);
+    milliseconds as f64 / 1000.0
+}
+
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeDelta, TimeZone, Utc};
     use eidolon_core::{
         Event, EventKind, EventSource, ExposureId, PolicyState, RoutingDecision, SessionId,
     };
+    use serde_json::json;
 
     use crate::TimelineEvent;
 
@@ -288,6 +475,60 @@ mod tests {
                 path: "/api/v2/import/reconcile".to_string(),
             },
         )
+    }
+
+    fn request(
+        session_id: SessionId,
+        policy_state: PolicyState,
+        routing_decision: RoutingDecision,
+    ) -> Event {
+        Event::new(
+            session_id,
+            EventSource::Proxy,
+            policy_state,
+            EventKind::RequestSeen {
+                method: "GET".to_string(),
+                path: "/admin/decoy".to_string(),
+                safe_headers: Vec::new(),
+                routing_decision,
+            },
+        )
+    }
+
+    fn response(
+        session_id: SessionId,
+        policy_state: PolicyState,
+        routing_decision: RoutingDecision,
+    ) -> Event {
+        Event::new(
+            session_id,
+            EventSource::Proxy,
+            policy_state,
+            EventKind::ResponseServed {
+                status: 200,
+                routing_decision,
+            },
+        )
+    }
+
+    fn controlled_reality_entered(session_id: SessionId) -> Event {
+        Event::new(
+            session_id,
+            EventSource::PolicyRouter,
+            PolicyState::ControlledReality,
+            EventKind::ControlledRealityEntered {
+                reason: "confirmed bait-derived action".to_string(),
+            },
+        )
+    }
+
+    fn at(mut event: Event, seconds: i64) -> Event {
+        event.observed_at = Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .expect("test timestamp should be valid")
+            + TimeDelta::seconds(seconds);
+        event
     }
 
     #[test]
@@ -341,5 +582,114 @@ mod tests {
             bundle.unmatched_actions[0].prior_same_bait_exposure,
             Some(bundle.bait_exposures[0].event_ref)
         );
+    }
+
+    #[test]
+    fn trace_summary_measures_bait_follow_and_controlled_reality_depth() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            at(exposure(session_id), 0),
+            at(action(session_id, Some("exp-1")), 5),
+            at(controlled_reality_entered(session_id), 10),
+            at(
+                request(
+                    session_id,
+                    PolicyState::ControlledReality,
+                    RoutingDecision::ControlledReality,
+                ),
+                12,
+            ),
+            at(
+                response(
+                    session_id,
+                    PolicyState::ControlledReality,
+                    RoutingDecision::ControlledReality,
+                ),
+                14,
+            ),
+            at(
+                request(
+                    session_id,
+                    PolicyState::RateLimited,
+                    RoutingDecision::RateLimited,
+                ),
+                20,
+            ),
+            at(
+                request(
+                    session_id,
+                    PolicyState::Observe,
+                    RoutingDecision::ProtectedUpstream,
+                ),
+                21,
+            ),
+        ]);
+        let bundle = evidence_bundle_for_timeline(&timeline);
+
+        let summary = trace_metric_summary_for_timeline(&timeline, &bundle);
+
+        assert_eq!(summary.time_to_first_bait_action_seconds, Some(5.0));
+        assert_eq!(summary.bait_follow_rate, 1.0);
+        assert_eq!(summary.trace_confidence_score, 85);
+        assert_eq!(summary.real_surface_requests_after_containment, Some(1));
+        assert_eq!(summary.controlled_reality_dwell_seconds, Some(10.0));
+        assert_eq!(summary.controlled_reality_action_depth, 2);
+
+        let serialized =
+            serde_json::to_value(&summary).expect("trace metric summary should serialize");
+        assert_eq!(serialized["controlled_reality_action_depth"], json!(2));
+        assert_eq!(
+            serialized["real_surface_requests_after_containment"],
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn trace_summary_leaves_containment_metrics_null_before_entry() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![request(
+            session_id,
+            PolicyState::Observe,
+            RoutingDecision::ProtectedUpstream,
+        )]);
+        let bundle = evidence_bundle_for_timeline(&timeline);
+
+        let summary = trace_metric_summary_for_timeline(&timeline, &bundle);
+
+        assert_eq!(summary.time_to_first_bait_action_seconds, None);
+        assert_eq!(summary.bait_follow_rate, 0.0);
+        assert_eq!(summary.real_surface_requests_after_containment, None);
+        assert_eq!(summary.controlled_reality_dwell_seconds, None);
+        assert_eq!(summary.controlled_reality_action_depth, 0);
+    }
+
+    #[test]
+    fn trace_summary_counts_transition_response_as_first_controlled_action() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            at(
+                request(
+                    session_id,
+                    PolicyState::Observe,
+                    RoutingDecision::EidolonOwned,
+                ),
+                0,
+            ),
+            at(controlled_reality_entered(session_id), 1),
+            at(
+                response(
+                    session_id,
+                    PolicyState::ControlledReality,
+                    RoutingDecision::ControlledReality,
+                ),
+                2,
+            ),
+        ]);
+        let bundle = evidence_bundle_for_timeline(&timeline);
+
+        let summary = trace_metric_summary_for_timeline(&timeline, &bundle);
+
+        assert_eq!(summary.controlled_reality_action_depth, 1);
+        assert_eq!(summary.controlled_reality_dwell_seconds, Some(1.0));
     }
 }
