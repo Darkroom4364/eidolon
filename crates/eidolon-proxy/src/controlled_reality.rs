@@ -6,6 +6,7 @@ use serde_json::json;
 pub const DECOY_RECONCILE_PATH: &str = "/api/v2/import/reconcile";
 pub const MAX_CONTROLLED_REALITY_ACTION_DEPTH: u32 = 4;
 pub const DEFAULT_TARPIT_DELAY: Duration = Duration::from_millis(25);
+pub const MAX_TARPIT_DELAY: Duration = Duration::from_secs(5);
 pub const DEFAULT_RETRY_AFTER_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

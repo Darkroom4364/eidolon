@@ -60,7 +60,7 @@ This keeps the proxy boring and makes causal trace reconstruction the central pr
 
 ## Event Contract
 
-Event schema version 1 defines a small structured event vocabulary before adding more behavior:
+Event schema version 2 defines a small structured event vocabulary for the current M2.5 runtime:
 
 ```text
 request_seen
