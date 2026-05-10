@@ -145,6 +145,8 @@ M2.5 controlled-reality tuning is local CLI configuration:
 --controlled-reality-retry-after-seconds 30
 ```
 
+The tarpit delay is bounded by the proxy CLI for the thread-per-connection Lab server.
+
 With interventions enabled, M1 exposes a small built-in demo surface so the proxy path can be validated without claiming the full bait engine is complete:
 
 ```sh

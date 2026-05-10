@@ -19,6 +19,7 @@ use eidolon_proxy::{
     controlled_reality::{
         rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
         DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+        MAX_TARPIT_DELAY,
     },
     event_log::FileEventLogWriter,
     policy::{self, InterventionMode},
@@ -181,10 +182,7 @@ impl CliAction {
                     set_once(
                         &mut builder.controlled_reality_tarpit_delay,
                         flag,
-                        Duration::from_millis(parse_u64_option(
-                            &value,
-                            "controlled reality tarpit milliseconds",
-                        )?),
+                        parse_tarpit_delay(&value, "controlled reality tarpit milliseconds")?,
                     )?;
                 }
                 "--controlled-reality-retry-after-seconds" => {
@@ -458,6 +456,19 @@ fn parse_u64_option(raw: &str, label: &str) -> Result<u64, ConfigError> {
     raw.parse::<u64>().map_err(|error| {
         ConfigError::new(format!("{label} must be a non-negative integer: {error}"))
     })
+}
+
+fn parse_tarpit_delay(raw: &str, label: &str) -> Result<Duration, ConfigError> {
+    let milliseconds = parse_u64_option(raw, label)?;
+    let delay = Duration::from_millis(milliseconds);
+    if delay > MAX_TARPIT_DELAY {
+        return Err(ConfigError::new(format!(
+            "{label} must be at most {}ms for the local lab",
+            MAX_TARPIT_DELAY.as_millis()
+        )));
+    }
+
+    Ok(delay)
 }
 
 fn ensure_loopback_host(host: &str) -> Result<(), ConfigError> {
@@ -1998,7 +2009,7 @@ Options:
                          [default: {MAX_CONTROLLED_REALITY_ACTION_DEPTH}]
   --controlled-reality-tarpit-ms <MS>
                          Lab-only delay before over-depth rate-limit responses
-                         [default: {default_tarpit_ms}]
+                         [default: {default_tarpit_ms}; max: {max_tarpit_ms}]
   --controlled-reality-retry-after-seconds <SECONDS>
                          Retry-After value for controlled-reality rate limits
                          [default: {DEFAULT_RETRY_AFTER_SECONDS}]
@@ -2008,7 +2019,8 @@ Example:
   cargo run -p eidolon-proxy -- --listen-addr 127.0.0.1:8080 --upstream http://127.0.0.1:9001 --event-log /tmp/eidolon-events.jsonl --intervention-control /tmp/eidolon-interventions.txt --policy-state /tmp/eidolon-policy-state.json --controlled-reality-max-depth 4 --controlled-reality-tarpit-ms {default_tarpit_ms} --controlled-reality-retry-after-seconds {DEFAULT_RETRY_AFTER_SECONDS}
 "
 ,
-        default_tarpit_ms = DEFAULT_TARPIT_DELAY.as_millis()
+        default_tarpit_ms = DEFAULT_TARPIT_DELAY.as_millis(),
+        max_tarpit_ms = MAX_TARPIT_DELAY.as_millis()
     )
 }
 
@@ -2485,6 +2497,11 @@ mod tests {
         assert_error_contains(
             &["--controlled-reality-tarpit-ms", "nope"],
             "non-negative integer",
+        );
+        let too_large_tarpit = (MAX_TARPIT_DELAY.as_millis() + 1).to_string();
+        assert_error_contains(
+            &["--controlled-reality-tarpit-ms", &too_large_tarpit],
+            "must be at most",
         );
         assert_error_contains(
             &["--controlled-reality-retry-after-seconds", "nope"],

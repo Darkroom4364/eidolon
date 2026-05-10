@@ -398,9 +398,9 @@ fn controlled_reality_branch_count(timeline: &SessionTimeline) -> usize {
                 let contained = containment_policy_state(event.event.policy_state)
                     || containment_routing_decision(*routing_decision);
                 if contained {
-                    branches.insert(path.clone());
+                    branches.insert(normalized_branch_path(path).to_string());
                 }
-                pending_request = Some((path.clone(), contained));
+                pending_request = Some((normalized_branch_path(path).to_string(), contained));
             }
             EventKind::ResponseServed {
                 routing_decision, ..
@@ -417,6 +417,13 @@ fn controlled_reality_branch_count(timeline: &SessionTimeline) -> usize {
     }
 
     branches.len()
+}
+
+fn normalized_branch_path(target: &str) -> &str {
+    let without_fragment = target.split_once('#').map_or(target, |(path, _)| path);
+    without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(path, _)| path)
 }
 
 fn request_or_response_routes_to_containment(kind: &EventKind) -> bool {
@@ -770,7 +777,7 @@ mod tests {
                     session_id,
                     PolicyState::ControlledReality,
                     RoutingDecision::ControlledReality,
-                    "/api/v2/import/reconcile",
+                    "/api/v2/import/reconcile?a=1",
                 ),
                 1,
             ),
@@ -779,9 +786,18 @@ mod tests {
                     session_id,
                     PolicyState::ControlledReality,
                     RoutingDecision::ControlledReality,
-                    "/admin/decoy",
+                    "/api/v2/import/reconcile?a=2",
                 ),
                 2,
+            ),
+            at(
+                request_to_path(
+                    session_id,
+                    PolicyState::ControlledReality,
+                    RoutingDecision::ControlledReality,
+                    "/admin/decoy",
+                ),
+                3,
             ),
             at(
                 request_to_path(
@@ -790,14 +806,14 @@ mod tests {
                     RoutingDecision::RateLimited,
                     "/admin/decoy",
                 ),
-                3,
+                4,
             ),
         ]);
         let bundle = evidence_bundle_for_timeline(&timeline);
 
         let summary = trace_metric_summary_for_timeline(&timeline, &bundle);
 
-        assert_eq!(summary.controlled_reality_action_depth, 3);
+        assert_eq!(summary.controlled_reality_action_depth, 4);
         assert_eq!(summary.controlled_reality_branch_count, 2);
     }
 }
