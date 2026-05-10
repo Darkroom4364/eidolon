@@ -17,7 +17,9 @@ use eidolon_core::{
 };
 use eidolon_proxy::{
     controlled_reality::{
-        rate_limited_response, ControlledRealityResponder, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+        rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
+        DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+        MAX_TARPIT_DELAY,
     },
     event_log::FileEventLogWriter,
     policy::{self, InterventionMode},
@@ -42,8 +44,6 @@ const DEFAULT_HTTP_PORT: u16 = 80;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BAIT_EXPOSURES: usize = 4096;
-// Lab-only delay for the current thread-per-connection server.
-const CONTROLLED_REALITY_TARPIT_DELAY: Duration = Duration::from_millis(25);
 const SAFE_HEADER_NAMES: &[&str] = &[
     "accept",
     "authorization",
@@ -70,8 +70,14 @@ fn main() -> ExitCode {
                 config.intervention_control_path.display()
             );
             println!("policy_state: {}", config.policy_state_path.display());
+            println!(
+                "controlled_reality: max_depth={}, tarpit_ms={}, retry_after_seconds={}",
+                config.controlled_reality_config.max_action_depth,
+                config.controlled_reality_config.tarpit_delay.as_millis(),
+                config.controlled_reality_config.retry_after_seconds
+            );
 
-            match run_proxy(config) {
+            match run_proxy(*config) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("error: {error}");
@@ -93,6 +99,7 @@ struct ProxyConfig {
     event_log_path: PathBuf,
     intervention_control_path: PathBuf,
     policy_state_path: PathBuf,
+    controlled_reality_config: ControlledRealityConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +117,7 @@ impl fmt::Display for UpstreamTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
-    Run(ProxyConfig),
+    Run(Box<ProxyConfig>),
     Help,
 }
 
@@ -162,6 +169,30 @@ impl CliAction {
                         parse_policy_state_path(&value)?,
                     )?;
                 }
+                "--controlled-reality-max-depth" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.controlled_reality_max_depth,
+                        flag,
+                        parse_u32_option(&value, "controlled reality max depth")?,
+                    )?;
+                }
+                "--controlled-reality-tarpit-ms" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.controlled_reality_tarpit_delay,
+                        flag,
+                        parse_tarpit_delay(&value, "controlled reality tarpit milliseconds")?,
+                    )?;
+                }
+                "--controlled-reality-retry-after-seconds" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.controlled_reality_retry_after_seconds,
+                        flag,
+                        parse_u64_option(&value, "controlled reality retry-after seconds")?,
+                    )?;
+                }
                 _ if flag.starts_with('-') => {
                     return Err(ConfigError::new(format!("unknown option `{flag}`")));
                 }
@@ -173,7 +204,7 @@ impl CliAction {
             }
         }
 
-        builder.build().map(Self::Run)
+        builder.build().map(Box::new).map(Self::Run)
     }
 }
 
@@ -184,6 +215,9 @@ struct ConfigBuilder {
     event_log_path: Option<PathBuf>,
     intervention_control_path: Option<PathBuf>,
     policy_state_path: Option<PathBuf>,
+    controlled_reality_max_depth: Option<u32>,
+    controlled_reality_tarpit_delay: Option<Duration>,
+    controlled_reality_retry_after_seconds: Option<u64>,
 }
 
 impl ConfigBuilder {
@@ -208,6 +242,17 @@ impl ConfigBuilder {
             policy_state_path: match self.policy_state_path {
                 Some(value) => value,
                 None => parse_policy_state_path(DEFAULT_POLICY_STATE)?,
+            },
+            controlled_reality_config: ControlledRealityConfig {
+                max_action_depth: self
+                    .controlled_reality_max_depth
+                    .unwrap_or(MAX_CONTROLLED_REALITY_ACTION_DEPTH),
+                tarpit_delay: self
+                    .controlled_reality_tarpit_delay
+                    .unwrap_or(DEFAULT_TARPIT_DELAY),
+                retry_after_seconds: self
+                    .controlled_reality_retry_after_seconds
+                    .unwrap_or(DEFAULT_RETRY_AFTER_SECONDS),
             },
         })
     }
@@ -393,6 +438,39 @@ fn parse_port(raw: &str, label: &str) -> Result<u16, ConfigError> {
         .map_err(|error| ConfigError::new(format!("{label} must be a valid TCP port: {error}")))
 }
 
+fn parse_u32_option(raw: &str, label: &str) -> Result<u32, ConfigError> {
+    if raw.is_empty() {
+        return Err(ConfigError::new(format!("{label} cannot be empty")));
+    }
+
+    raw.parse::<u32>().map_err(|error| {
+        ConfigError::new(format!("{label} must be a non-negative integer: {error}"))
+    })
+}
+
+fn parse_u64_option(raw: &str, label: &str) -> Result<u64, ConfigError> {
+    if raw.is_empty() {
+        return Err(ConfigError::new(format!("{label} cannot be empty")));
+    }
+
+    raw.parse::<u64>().map_err(|error| {
+        ConfigError::new(format!("{label} must be a non-negative integer: {error}"))
+    })
+}
+
+fn parse_tarpit_delay(raw: &str, label: &str) -> Result<Duration, ConfigError> {
+    let milliseconds = parse_u64_option(raw, label)?;
+    let delay = Duration::from_millis(milliseconds);
+    if delay > MAX_TARPIT_DELAY {
+        return Err(ConfigError::new(format!(
+            "{label} must be at most {}ms for the local lab",
+            MAX_TARPIT_DELAY.as_millis()
+        )));
+    }
+
+    Ok(delay)
+}
+
 fn ensure_loopback_host(host: &str) -> Result<(), ConfigError> {
     if host.eq_ignore_ascii_case("localhost") {
         return Ok(());
@@ -488,6 +566,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         policy_store: Arc::new(Mutex::new(PolicyStateStore::open(
             &config.policy_state_path,
         )?)),
+        controlled_reality_config: config.controlled_reality_config,
         controlled_reality: Arc::new(ControlledRealityResponder),
         surface_controller: Arc::new(M1DemoSurfaceController::new(Arc::clone(&bait_registry))),
         bait_registry,
@@ -517,6 +596,7 @@ struct ProxyRuntime {
     event_log: Arc<Mutex<FileEventLogWriter>>,
     intervention_control_path: PathBuf,
     policy_store: Arc<Mutex<PolicyStateStore>>,
+    controlled_reality_config: ControlledRealityConfig,
     controlled_reality: Arc<ControlledRealityResponder>,
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
     bait_registry: Arc<BaitRegistry>,
@@ -668,7 +748,9 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             )?,
             RoutingDecision::RateLimited => SurfaceAction::RateLimited {
                 reason: decision.reason.clone(),
-                response: rate_limited_response(),
+                response: rate_limited_response(
+                    runtime.controlled_reality_config.retry_after_seconds,
+                ),
             },
             RoutingDecision::EidolonOwned => SurfaceAction::EidolonOwned {
                 response: surface_text_response(403, "blocked by eidolon policy\n"),
@@ -776,6 +858,13 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             intervention_mode,
             surface_requested_intervention,
         )?;
+        write_reality_escape_attempt_if_needed(
+            runtime,
+            &session,
+            &request,
+            &surface_request,
+            &effective_decision,
+        )?;
         apply_response_headers(&mut response, &session);
         if let Some(bait) = bait_exposure_for_direct_surface(
             &decision,
@@ -878,6 +967,38 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     client_stream.flush()
 }
 
+fn write_reality_escape_attempt_if_needed(
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    request: &HttpRequest,
+    surface_request: &SurfaceRequestMeta,
+    decision: &policy::PolicyDecision,
+) -> io::Result<()> {
+    if decision.policy_state != PolicyState::ControlledReality
+        || !matches!(
+            decision.routing_decision,
+            RoutingDecision::ControlledReality | RoutingDecision::RateLimited
+        )
+        || runtime
+            .controlled_reality
+            .is_controlled_branch(surface_request)
+    {
+        return Ok(());
+    }
+
+    write_event(
+        &runtime.event_log,
+        &policy::reality_escape_attempt_event(
+            session.session_id,
+            decision.policy_state,
+            request.method.clone(),
+            surface_request.path.clone(),
+            decision.routing_decision,
+            "controlled session requested a path outside the configured controlled-reality branch",
+        ),
+    )
+}
+
 struct DirectResponseContext<'a> {
     client_stream: TcpStream,
     runtime: &'a ProxyRuntime,
@@ -963,13 +1084,20 @@ fn controlled_reality_action(
         store.increment_controlled_reality_depth(session_id)?
     };
 
-    if depth > MAX_CONTROLLED_REALITY_ACTION_DEPTH {
-        thread::sleep(CONTROLLED_REALITY_TARPIT_DELAY);
+    let depth_limit = runtime.controlled_reality_config.max_action_depth;
+    if depth > depth_limit {
+        let tarpit_delay = runtime.controlled_reality_config.tarpit_delay;
+        if !tarpit_delay.is_zero() {
+            thread::sleep(tarpit_delay);
+        }
         return Ok(SurfaceAction::RateLimited {
             reason: format!(
-                "controlled reality action depth {depth} exceeded limit {MAX_CONTROLLED_REALITY_ACTION_DEPTH}"
+                "controlled reality action depth {depth} exceeded limit {depth_limit}; tarpit delay {}ms",
+                tarpit_delay.as_millis()
             ),
-            response: rate_limited_response(),
+            response: rate_limited_response(
+                runtime.controlled_reality_config.retry_after_seconds,
+            ),
         });
     }
 
@@ -1876,11 +2004,23 @@ Options:
                          Optional control file; write `disabled` to force protected forwarding
                          [default: {DEFAULT_INTERVENTION_CONTROL}]
   --policy-state <PATH> Per-session policy state JSON file path [default: {DEFAULT_POLICY_STATE}]
+  --controlled-reality-max-depth <N>
+                         Controlled-reality actions before rate limiting
+                         [default: {MAX_CONTROLLED_REALITY_ACTION_DEPTH}]
+  --controlled-reality-tarpit-ms <MS>
+                         Lab-only delay before over-depth rate-limit responses
+                         [default: {default_tarpit_ms}; max: {max_tarpit_ms}]
+  --controlled-reality-retry-after-seconds <SECONDS>
+                         Retry-After value for controlled-reality rate limits
+                         [default: {DEFAULT_RETRY_AFTER_SECONDS}]
   -h, --help            Show this help text
 
 Example:
-  cargo run -p eidolon-proxy -- --listen-addr 127.0.0.1:8080 --upstream http://127.0.0.1:9001 --event-log /tmp/eidolon-events.jsonl --intervention-control /tmp/eidolon-interventions.txt --policy-state /tmp/eidolon-policy-state.json
+  cargo run -p eidolon-proxy -- --listen-addr 127.0.0.1:8080 --upstream http://127.0.0.1:9001 --event-log /tmp/eidolon-events.jsonl --intervention-control /tmp/eidolon-interventions.txt --policy-state /tmp/eidolon-policy-state.json --controlled-reality-max-depth 4 --controlled-reality-tarpit-ms {default_tarpit_ms} --controlled-reality-retry-after-seconds {DEFAULT_RETRY_AFTER_SECONDS}
 "
+,
+        default_tarpit_ms = DEFAULT_TARPIT_DELAY.as_millis(),
+        max_tarpit_ms = MAX_TARPIT_DELAY.as_millis()
     )
 }
 
@@ -1911,7 +2051,7 @@ mod tests {
 
     fn run_config(args: &[&str]) -> Result<ProxyConfig, ConfigError> {
         match CliAction::from_args(args.iter().copied())? {
-            CliAction::Run(config) => Ok(config),
+            CliAction::Run(config) => Ok(*config),
             CliAction::Help => Err(ConfigError::new("expected runnable config")),
         }
     }
@@ -1966,6 +2106,7 @@ mod tests {
             )),
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller,
             bait_registry,
@@ -1986,6 +2127,7 @@ mod tests {
             )),
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller: Arc::new(M1DemoSurfaceController::new(Arc::clone(&bait_registry))),
             bait_registry,
@@ -2239,6 +2381,10 @@ mod tests {
             config.policy_state_path,
             PathBuf::from(DEFAULT_POLICY_STATE)
         );
+        assert_eq!(
+            config.controlled_reality_config,
+            ControlledRealityConfig::default()
+        );
     }
 
     #[test]
@@ -2254,6 +2400,12 @@ mod tests {
             "/tmp/eidolon-interventions-test.txt",
             "--policy-state",
             "/tmp/eidolon-policy-state-test.json",
+            "--controlled-reality-max-depth",
+            "2",
+            "--controlled-reality-tarpit-ms",
+            "5",
+            "--controlled-reality-retry-after-seconds",
+            "9",
         ])
         .expect("explicit config should parse");
 
@@ -2272,6 +2424,14 @@ mod tests {
         assert_eq!(
             config.policy_state_path,
             PathBuf::from("/tmp/eidolon-policy-state-test.json")
+        );
+        assert_eq!(
+            config.controlled_reality_config,
+            ControlledRealityConfig {
+                max_action_depth: 2,
+                tarpit_delay: Duration::from_millis(5),
+                retry_after_seconds: 9,
+            }
         );
     }
 
@@ -2326,6 +2486,27 @@ mod tests {
     fn rejects_missing_values() {
         assert_error_contains(&["--listen-addr"], "missing value");
         assert_error_contains(&["--listen-addr", "--upstream"], "missing value");
+    }
+
+    #[test]
+    fn rejects_invalid_controlled_reality_numeric_options() {
+        assert_error_contains(
+            &["--controlled-reality-max-depth", "nope"],
+            "non-negative integer",
+        );
+        assert_error_contains(
+            &["--controlled-reality-tarpit-ms", "nope"],
+            "non-negative integer",
+        );
+        let too_large_tarpit = (MAX_TARPIT_DELAY.as_millis() + 1).to_string();
+        assert_error_contains(
+            &["--controlled-reality-tarpit-ms", &too_large_tarpit],
+            "must be at most",
+        );
+        assert_error_contains(
+            &["--controlled-reality-retry-after-seconds", "nope"],
+            "non-negative integer",
+        );
     }
 
     #[test]
@@ -3009,6 +3190,66 @@ mod tests {
     }
 
     #[test]
+    fn runtime_rate_limit_uses_configured_depth_delay_and_retry_after() {
+        let event_log_path = unique_temp_path("controlled-configured-rate-limit-events.jsonl");
+        let mut runtime = test_runtime(
+            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            &event_log_path,
+            unique_temp_path("controlled-configured-rate-limit-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.controlled_reality_config = ControlledRealityConfig {
+            max_action_depth: 1,
+            tarpit_delay: Duration::from_millis(0),
+            retry_after_seconds: 7,
+        };
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/api/v2/import/reconcile", &cookie),
+        ));
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/api/v2/import/reconcile", &cookie),
+        ));
+
+        assert_eq!(response.status, 429);
+        assert_eq!(header_values(&response, "retry-after"), vec!["7"]);
+        let rate_limit = first_event_of_type(&event_log_path, "rate_limit_applied");
+        assert!(rate_limit["kind"]["reason"]
+            .as_str()
+            .expect("reason should be a string")
+            .contains("exceeded limit 1; tarpit delay 0ms"));
+    }
+
+    #[test]
+    fn controlled_session_logs_escape_attempt_outside_configured_branch() {
+        let event_log_path = unique_temp_path("controlled-escape-events.jsonl");
+        let runtime = test_runtime(
+            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            &event_log_path,
+            unique_temp_path("controlled-escape-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/api/v1/projects", &cookie),
+        ));
+
+        assert_eq!(response.status, 404);
+        let escape = first_event_of_type(&event_log_path, "reality_escape_attempt");
+        assert_eq!(escape["policy_state"], "controlled_reality");
+        assert_eq!(escape["kind"]["method"], "GET");
+        assert_eq!(escape["kind"]["path"], "/api/v1/projects");
+        assert_eq!(escape["kind"]["routing_decision"], "controlled_reality");
+    }
+
+    #[test]
     fn runtime_policy_owned_response_does_not_log_bait_exposure() {
         let event_log_path = unique_temp_path("blocked-no-exposure-events.jsonl");
         let runtime = test_runtime_with_m1_controller(
@@ -3140,6 +3381,36 @@ mod tests {
         assert_eq!(response.body, br#"{"mode":"upstream"}"#);
         assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
         assert_event_routing(&event_log_path, "response_served", "protected_upstream");
+    }
+
+    #[test]
+    fn disabled_interventions_forward_controlled_session_on_next_request() {
+        let event_log_path = unique_temp_path("disabled-controlled-events.jsonl");
+        let control_path = unique_temp_path("disabled-controlled-control.txt");
+        fs::write(&control_path, "disabled").expect("control file should write");
+        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            control_path,
+            SurfaceAction::ProtectedUpstream,
+        );
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/api/v1/projects", &cookie),
+        ));
+        let upstream_request = upstream_handle.join().expect("upstream thread should join");
+
+        assert!(String::from_utf8(upstream_request)
+            .expect("request should be utf8")
+            .starts_with("GET /api/v1/projects HTTP/1.1\r\n"));
+        assert_eq!(response.body, br#"{"mode":"upstream"}"#);
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_type_absent(&event_log_path, "reality_escape_attempt");
+        assert_policy_decision_reason_contains(&event_log_path, "interventions disabled");
     }
 
     #[test]

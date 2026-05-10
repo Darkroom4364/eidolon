@@ -15,6 +15,7 @@ Required v0 metric names:
 - `real_surface_requests_after_containment`
 - `controlled_reality_dwell_seconds`
 - `controlled_reality_action_depth`
+- `controlled_reality_branch_count`
 
 ### `time_to_first_bait_action_seconds`
 
@@ -56,7 +57,13 @@ This is `null` until the session enters controlled reality or rate-limited conta
 
 ### `controlled_reality_action_depth`
 
-Number of request actions observed while the session is inside controlled reality or rate-limited containment.
+Number of actions observed while the session is inside controlled reality or rate-limited containment. The transition response that first moves a bait-derived request into controlled reality counts as the first action even though its request was initially audited as `eidolon_owned`.
+
+This is `0` until the session enters controlled reality or rate-limited containment.
+
+### `controlled_reality_branch_count`
+
+Number of distinct controlled-reality paths touched by the session. This includes the transition request path when its response is served by controlled reality.
 
 This is `0` until the session enters controlled reality or rate-limited containment.
 
@@ -86,7 +93,8 @@ The first summary artifact is JSON:
     "trace_confidence_score": 0,
     "real_surface_requests_after_containment": null,
     "controlled_reality_dwell_seconds": null,
-    "controlled_reality_action_depth": 0
+    "controlled_reality_action_depth": 0,
+    "controlled_reality_branch_count": 0
   }
 }
 ```
@@ -102,7 +110,9 @@ The trace/report summary derives controlled-reality metrics only from the existi
 
 `controlled_reality_dwell_seconds` uses the first and last containment markers in trace order and computes elapsed event time. If there is only one marker, dwell is `0.0`.
 
-`controlled_reality_action_depth` counts `request_seen` events whose routing decision or policy state places the request inside controlled reality or rate-limited containment.
+`controlled_reality_action_depth` counts `request_seen` events whose routing decision or policy state places the request inside controlled reality or rate-limited containment, plus transition responses routed to controlled reality when the preceding request was not already counted.
+
+`controlled_reality_branch_count` counts distinct request paths in those controlled actions, including the transition request path when the response is controlled.
 
 `real_surface_requests_after_containment` counts later `request_seen` events routed to `protected_upstream` or `rewritten_upstream`. These are the trace/report signal for protected-surface access after containment has started.
 
@@ -157,7 +167,8 @@ The mode collector emits the same v0 metric keys for each comparison mode:
         "trace_confidence_score": 50,
         "real_surface_requests_after_containment": null,
         "controlled_reality_dwell_seconds": null,
-        "controlled_reality_action_depth": 0
+        "controlled_reality_action_depth": 0,
+        "controlled_reality_branch_count": 0
       }
     }
   }

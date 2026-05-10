@@ -178,10 +178,14 @@ awk '
       printf "        \"trace_confidence_score\": %d,\n", trace_confidence_score
 
       if (blocked[mode] > 0) {
-        printf "        \"real_surface_requests_after_containment\": %d\n", real_surface_after_decision[mode] + 0
+        printf "        \"real_surface_requests_after_containment\": %d,\n", real_surface_after_decision[mode] + 0
       } else {
-        printf "        \"real_surface_requests_after_containment\": null\n"
+        printf "        \"real_surface_requests_after_containment\": null,\n"
       }
+
+      printf "        \"controlled_reality_dwell_seconds\": null,\n"
+      printf "        \"controlled_reality_action_depth\": 0,\n"
+      printf "        \"controlled_reality_branch_count\": 0\n"
 
       printf "      }\n"
 

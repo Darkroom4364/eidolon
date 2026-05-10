@@ -15,8 +15,9 @@ This checklist gates an internal Lab-only v1 candidate for M2.5. It is not a pub
 - [ ] A matching `bait_action_observed` event exists before controlled-reality entry.
 - [ ] The policy-state transition into controlled reality is recorded with a reason.
 - [ ] Decoy branch requests are recorded as Eidolon-owned controlled-reality responses.
-- [ ] Dwell time and action depth are measured for the branch.
+- [ ] Dwell time, action depth, and branch count are measured for the branch.
 - [ ] Reality escape attempts and emergency-disable behavior are visible in the event log.
+- [ ] Rate-limit depth, tarpit delay, and retry-after behavior are explicitly configured or left at documented defaults.
 
 ## Synthetic Data And No-Write Checks
 
@@ -32,7 +33,7 @@ This checklist gates an internal Lab-only v1 candidate for M2.5. It is not a pub
 
 - [ ] Wrong marker does not trigger controlled-reality entry.
 - [ ] Wrong session does not inherit another session's controlled-reality state.
-- [ ] Ordinary `/api/v1/*` traffic remains ordinary protected-upstream traffic unless documented policy state says otherwise.
+- [ ] Ordinary `/api/v1/*` traffic remains protected-upstream before controlled-reality entry and becomes an audited escape attempt after controlled-reality entry.
 - [ ] Emergency disable stops controlled-reality intervention on the next request.
 - [ ] Any tarpit delay is documented as Lab-only and bounded for the thread-per-connection proxy.
 

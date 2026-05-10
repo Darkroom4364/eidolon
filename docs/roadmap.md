@@ -171,7 +171,7 @@ Issues:
 4. Prepare Lab-only v1-candidate checklist and research note
 5. Build controlled reality v0 for one decoy admin/API path
 6. Add synthetic data boundary and no-write enforcement
-7. Measure dwell time and action depth inside controlled reality
+7. Measure dwell time, action depth, and branch count inside controlled reality
 8. Add reality escape detection and emergency disable
 
 Acceptance criteria:
