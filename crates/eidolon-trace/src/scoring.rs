@@ -25,7 +25,7 @@ pub fn score_timelines(timelines: &[SessionTimeline]) -> Score {
     timelines
         .iter()
         .map(score_timeline)
-        .max_by_key(|score| confidence_rank(score.confidence) * 1_000 + score.points)
+        .max_by_key(|score| (confidence_rank(score.confidence), score.points))
         .unwrap_or_else(low_score)
 }
 
@@ -184,6 +184,7 @@ mod tests {
         assert_eq!(score.points, 85);
         assert_eq!(score.confidence, ConfidenceBand::ConfirmedBaitDerivedChain);
         assert_eq!(score.reasons.len(), 2);
+        assert!(score.reasons[0].contains("controlled bait was exposed"));
     }
 
     #[test]
@@ -306,5 +307,33 @@ mod tests {
         let score = score_timelines(&timelines);
 
         assert_eq!(score.confidence, ConfidenceBand::ConfirmedBaitDerivedChain);
+    }
+
+    #[test]
+    fn score_timelines_uses_points_as_tie_breaker_within_confidence_band() {
+        let action_only_session = SessionId::new();
+        let action_before_exposure_session = SessionId::new();
+        let timelines = vec![
+            timeline(vec![bait_action(action_only_session)]),
+            timeline(vec![
+                bait_action(action_before_exposure_session),
+                bait_exposed(action_before_exposure_session),
+            ]),
+        ];
+
+        let score = score_timelines(&timelines);
+
+        assert_eq!(score.confidence, ConfidenceBand::Medium);
+        assert_eq!(score.points, 55);
+    }
+
+    #[test]
+    fn confidence_rank_order_is_stable_for_timeline_selection() {
+        assert!(
+            confidence_rank(ConfidenceBand::ConfirmedBaitDerivedChain)
+                > confidence_rank(ConfidenceBand::High)
+        );
+        assert!(confidence_rank(ConfidenceBand::High) > confidence_rank(ConfidenceBand::Medium));
+        assert!(confidence_rank(ConfidenceBand::Medium) > confidence_rank(ConfidenceBand::Low));
     }
 }

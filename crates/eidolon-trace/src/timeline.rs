@@ -74,6 +74,7 @@ where
 mod tests {
     use chrono::TimeDelta;
     use eidolon_core::{EventKind, EventSource, PolicyState};
+    use uuid::Uuid;
 
     use super::*;
 
@@ -169,5 +170,27 @@ mod tests {
 
         assert_eq!(timelines[0].events[0].file_order, 2);
         assert_eq!(timelines[0].events[1].file_order, 10);
+    }
+
+    #[test]
+    fn build_session_timelines_returns_sessions_in_stable_id_order() {
+        let later_session = SessionId(Uuid::from_u128(2));
+        let earlier_session = SessionId(Uuid::from_u128(1));
+
+        let timelines = build_session_timelines([
+            TimelineEvent {
+                file_order: 0,
+                line_number: 1,
+                event: event(later_session),
+            },
+            TimelineEvent {
+                file_order: 1,
+                line_number: 2,
+                event: event(earlier_session),
+            },
+        ]);
+
+        assert_eq!(timelines[0].session_id, earlier_session);
+        assert_eq!(timelines[1].session_id, later_session);
     }
 }

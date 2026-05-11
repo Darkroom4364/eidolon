@@ -2466,6 +2466,10 @@ mod tests {
             CliAction::from_args(["--help", "--listen-addr", "0.0.0.0:8080"]),
             Ok(CliAction::Help)
         );
+        assert_eq!(
+            CliAction::from_args(["-h", "--listen-addr", "0.0.0.0:8080"]),
+            Ok(CliAction::Help)
+        );
     }
 
     #[test]
@@ -2739,6 +2743,42 @@ mod tests {
         assert!(store
             .exposure_for_action(oldest_session_id, &oldest_bait_id)
             .is_none());
+    }
+
+    #[test]
+    fn bait_exposure_store_refreshes_duplicate_exposure_order() {
+        let mut store = BaitExposureStore::default();
+        let session_id = SessionId::new();
+        let bait_id = BaitId("refreshable".to_string());
+        store.record_exposure(
+            session_id,
+            bait_id.clone(),
+            ExposureId("old-exposure".to_string()),
+        );
+
+        for index in 0..MAX_BAIT_EXPOSURES - 1 {
+            store.record_exposure(
+                SessionId::new(),
+                BaitId(format!("bait-{index}")),
+                ExposureId(format!("exp-{index}")),
+            );
+        }
+        store.record_exposure(
+            session_id,
+            bait_id.clone(),
+            ExposureId("new-exposure".to_string()),
+        );
+        store.record_exposure(
+            SessionId::new(),
+            BaitId("overflow".to_string()),
+            ExposureId("overflow-exp".to_string()),
+        );
+
+        assert_eq!(store.exposures.len(), MAX_BAIT_EXPOSURES);
+        assert_eq!(
+            store.exposure_for_action(session_id, &bait_id),
+            Some(ExposureId("new-exposure".to_string()))
+        );
     }
 
     #[test]

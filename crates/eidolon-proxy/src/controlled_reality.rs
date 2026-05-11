@@ -157,6 +157,19 @@ mod tests {
     }
 
     #[test]
+    fn default_controlled_reality_config_matches_lab_contract() {
+        assert_eq!(
+            ControlledRealityConfig::default(),
+            ControlledRealityConfig {
+                max_action_depth: 4,
+                tarpit_delay: Duration::from_millis(25),
+                retry_after_seconds: 30,
+            }
+        );
+        assert_eq!(MAX_TARPIT_DELAY, Duration::from_secs(5));
+    }
+
+    #[test]
     fn decoy_write_returns_synthetic_no_write_response() {
         let responder = ControlledRealityResponder;
         let action = responder.decide(&request("POST", DECOY_RECONCILE_PATH), 1);
@@ -202,5 +215,20 @@ mod tests {
         assert!(String::from_utf8(response.body)
             .expect("body should be utf8")
             .contains(r#""retry_after_seconds":7"#));
+    }
+
+    #[test]
+    fn unsupported_decoy_methods_return_method_not_allowed() {
+        let responder = ControlledRealityResponder;
+        let action = responder.decide(&request("OPTIONS", DECOY_RECONCILE_PATH), 1);
+
+        let SurfaceAction::ControlledReality { response, .. } = action else {
+            panic!("expected controlled reality response");
+        };
+
+        assert_eq!(response.status, 405);
+        assert!(String::from_utf8(response.body)
+            .expect("body should be utf8")
+            .contains(r#""status":"method_not_allowed""#));
     }
 }
