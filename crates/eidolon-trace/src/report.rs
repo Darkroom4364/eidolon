@@ -606,6 +606,23 @@ mod tests {
     }
 
     #[test]
+    fn replay_labels_only_exactly_matched_bait_actions_as_confirmed() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            exposure(session_id),
+            action(session_id, Some("exp-1")),
+            action(session_id, None),
+        ]);
+
+        let report = render_markdown_report(&timeline);
+
+        assert!(report.contains("confirmed match: `POST` `/api/v2/import/reconcile`"));
+        assert!(
+            report.contains("unconfirmed bait-shaped action: `POST` `/api/v2/import/reconcile`")
+        );
+    }
+
+    #[test]
     fn report_contains_metric_summary_for_controlled_reality() {
         let session_id = SessionId::new();
         let timeline = timeline(vec![
@@ -734,5 +751,23 @@ mod tests {
         assert!(report.contains("No confirmed bait exposure to action chain"));
         assert!(report.contains("Unconfirmed Bait-Shaped Actions"));
         assert!(report.contains("did not carry the matching exposure identifier"));
+    }
+
+    #[test]
+    fn markdown_text_replaces_newlines_with_spaces_for_table_cells() {
+        assert_eq!(markdown_text("first\nsecond\rthird"), "first second third");
+    }
+
+    #[test]
+    fn snake_case_debug_handles_adjacent_initial_capitals() {
+        struct Ab;
+
+        impl std::fmt::Debug for Ab {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("AB")
+            }
+        }
+
+        assert_eq!(snake_case_debug(&Ab), "a_b");
     }
 }

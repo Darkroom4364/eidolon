@@ -180,6 +180,16 @@ mod tests {
     }
 
     #[test]
+    fn cookie_pair_rejects_empty_names_and_values() {
+        assert_eq!(cookie_pair("=value"), None);
+        assert_eq!(cookie_pair("eidolon_session="), None);
+        assert_eq!(
+            cookie_pair(" eidolon_session = value "),
+            Some(("eidolon_session", "value"))
+        );
+    }
+
+    #[test]
     fn formats_set_cookie_for_local_http_lab() {
         let session_id = SessionId::new();
 
