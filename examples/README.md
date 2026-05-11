@@ -74,3 +74,14 @@ waf-style-block
 ```
 
 These modes are local comparison controls for Eidolon's boundary metrics. They are not agent rankings.
+
+## M3 Scripted Bakeoff
+
+With the demo target and proxy running, emit the M3 comparison matrix:
+
+```sh
+examples/m3/bakeoff.sh all > /tmp/eidolon-m3-bakeoff.jsonl
+examples/m3/collect-bakeoff.sh /tmp/eidolon-m3-bakeoff.jsonl
+```
+
+The runner compares `no-defense`, `static-token`, `static-honeypot`, `waf-style-block`, and `eidolon-mvp` against the five deterministic M3 bait classes. It validates the local artifact shape; final M3 still requires authorized agentic/scanner runs and trace evidence.
