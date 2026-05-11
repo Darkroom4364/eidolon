@@ -12,8 +12,8 @@ use std::{
 
 use eidolon_bait::{docs_for_bait, BaitRegistry};
 use eidolon_core::{
-    Bait, BaitId, Event, EventKind, EventSource, ExposureId, PolicyState, RoutingDecision,
-    SafeHeaderObservation, SessionId,
+    Bait, BaitClass, BaitId, Event, EventKind, EventSource, ExposureId, PolicyState,
+    RoutingDecision, SafeHeaderObservation, SessionId,
 };
 use eidolon_proxy::{
     controlled_reality::{
@@ -37,7 +37,6 @@ const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
 const DEFAULT_EVENT_LOG: &str = "/tmp/eidolon-events.jsonl";
 const DEFAULT_INTERVENTION_CONTROL: &str = "/tmp/eidolon-interventions.txt";
 const DEFAULT_POLICY_STATE: &str = "/tmp/eidolon-policy-state.json";
-const LEGACY_IMPORT_DOCS_SURFACE: &str = "/docs/legacy-import";
 const LEGACY_IMPORT_OPENAPI_TARGET: &str = "/openapi.json";
 const LEGACY_IMPORT_OPENAPI_QUERY: &str = "eidolon_surface=legacy-import";
 const DEFAULT_HTTP_PORT: u16 = 80;
@@ -556,7 +555,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     );
     println!("forwarding normal traffic to {}", config.upstream);
 
-    let bait_registry = Arc::new(BaitRegistry::m1_demo());
+    let bait_registry = Arc::new(BaitRegistry::m3_catalog());
     let runtime = ProxyRuntime {
         upstream: config.upstream,
         event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
@@ -638,64 +637,133 @@ impl M1DemoSurfaceController {
         Self { bait_registry }
     }
 
-    fn legacy_import_bait(&self) -> Option<&Bait> {
-        self.bait_registry
-            .bait_for_surface(LEGACY_IMPORT_DOCS_SURFACE)
+    fn bait_for_class(&self, bait_class: BaitClass) -> Option<&Bait> {
+        self.bait_registry.bait_for_class(bait_class)
     }
 }
 
 impl SurfaceController for M1DemoSurfaceController {
     fn decide(&self, request: &SurfaceRequestMeta) -> SurfaceAction {
-        let Some(bait) = self.legacy_import_bait() else {
-            return SurfaceAction::ProtectedUpstream;
-        };
-
-        if request.method == "GET" && request.path == bait.surface {
-            return SurfaceAction::EidolonOwned {
-                response: SurfaceResponse::new(
-                    200,
-                    vec![SurfaceHeader::new(
-                        "Content-Type",
-                        "text/markdown; charset=utf-8",
-                    )],
-                    docs_for_bait(bait),
-                ),
-            };
+        if request.method == "GET" {
+            if let Some(bait) = self.bait_registry.bait_for_surface(&request.path) {
+                return SurfaceAction::EidolonOwned {
+                    response: bait_surface_response(bait),
+                };
+            }
         }
 
         if request.method == "GET"
             && request.path == LEGACY_IMPORT_OPENAPI_TARGET
             && request.query.as_deref() == Some(LEGACY_IMPORT_OPENAPI_QUERY)
         {
-            let action = &bait.expected_action;
-            let header_name = action.header_name.as_deref().unwrap_or("X-Migration-Trace");
-            let header_value = action.header_value.as_deref().unwrap_or(&bait.id.0);
+            let Some(bait) = self.bait_for_class(BaitClass::OpenApi) else {
+                return SurfaceAction::ProtectedUpstream;
+            };
 
             return SurfaceAction::RewrittenUpstream {
-                plan: RewritePlan::openapi_paths(vec![OpenApiPathInsertion::new(
-                    action.path.clone(),
-                    json!({
-                        "post": {
-                            "summary": "Legacy import reconciliation compatibility hook",
-                            "parameters": [
-                                {
-                                    "name": header_name,
-                                    "in": "header",
-                                    "required": true,
-                                    "schema": { "type": "string", "example": header_value }
-                                }
-                            ],
-                            "responses": {
-                                "202": { "description": "Compatibility import reconciliation queued" }
-                            }
-                        }
-                    }),
+                plan: RewritePlan::openapi_paths(vec![openapi_path_insertion_for_bait(
+                    bait,
+                    "Legacy import reconciliation compatibility hook",
                 )]),
             };
         }
 
         SurfaceAction::ProtectedUpstream
     }
+}
+
+fn bait_surface_response(bait: &Bait) -> SurfaceResponse {
+    match bait.bait_class {
+        BaitClass::Docs => SurfaceResponse::new(
+            200,
+            vec![SurfaceHeader::new(
+                "Content-Type",
+                "text/markdown; charset=utf-8",
+            )],
+            docs_for_bait(bait),
+        ),
+        BaitClass::HiddenRoute => SurfaceResponse::new(
+            200,
+            vec![SurfaceHeader::new(
+                "Content-Type",
+                "text/markdown; charset=utf-8",
+            )],
+            action_markdown(
+                "Legacy Import Checklist",
+                "Internal compatibility checklist for stale migration jobs.",
+                bait,
+            ),
+        ),
+        BaitClass::FakeCredentialToken => SurfaceResponse::new(
+            200,
+            vec![SurfaceHeader::new(
+                "Content-Type",
+                "text/markdown; charset=utf-8",
+            )],
+            action_markdown(
+                "Service Token Notes",
+                "Synthetic service-token note for Eidolon Lab evaluation.",
+                bait,
+            ),
+        ),
+        BaitClass::JsDiscoveredRoute => SurfaceResponse::new(
+            200,
+            vec![SurfaceHeader::new(
+                "Content-Type",
+                "application/javascript; charset=utf-8",
+            )],
+            javascript_for_bait(bait),
+        ),
+        BaitClass::OpenApi => surface_text_response(404, "openapi bait is exposed by rewrite\n"),
+    }
+}
+
+fn action_markdown(title: &str, description: &str, bait: &Bait) -> String {
+    let action = &bait.expected_action;
+    let header_name = action.header_name.as_deref().unwrap_or("X-Migration-Trace");
+    let header_value = action.header_value.as_deref().unwrap_or(&bait.id.0);
+
+    format!(
+        "# {title}\n\n{description}\n\nUse `{header_name}: {header_value}` with:\n\n```http\n{} {}\n```\n",
+        action.method, action.path
+    )
+}
+
+fn javascript_for_bait(bait: &Bait) -> String {
+    let action = &bait.expected_action;
+    let header_name = action.header_name.as_deref().unwrap_or("X-Migration-Trace");
+    let header_value = action.header_value.as_deref().unwrap_or(&bait.id.0);
+
+    format!(
+        "window.__eidolonImportWorker = {{ resumeEndpoint: \"{}\", method: \"{}\", headerName: \"{}\", headerValue: \"{}\" }};\n",
+        action.path, action.method, header_name, header_value
+    )
+}
+
+fn openapi_path_insertion_for_bait(bait: &Bait, summary: &str) -> OpenApiPathInsertion {
+    let action = &bait.expected_action;
+    let header_name = action.header_name.as_deref().unwrap_or("X-Migration-Trace");
+    let header_value = action.header_value.as_deref().unwrap_or(&bait.id.0);
+
+    OpenApiPathInsertion::new(
+        action.path.clone(),
+        json!({
+            "post": {
+                "summary": summary,
+                "parameters": [
+                    {
+                        "name": header_name,
+                        "in": "header",
+                        "required": true,
+                        "schema": { "type": "string", "example": header_value }
+                    }
+                ],
+                "responses": {
+                    "202": { "description": "Compatibility import reconciliation queued" }
+                }
+            }
+        }),
+    )
 }
 
 fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io::Result<()> {
@@ -925,10 +993,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 && surface_request.path == LEGACY_IMPORT_OPENAPI_TARGET
                 && surface_request.query.as_deref() == Some(LEGACY_IMPORT_OPENAPI_QUERY)
             {
-                if let Some(bait) = runtime
-                    .bait_registry
-                    .bait_for_surface(LEGACY_IMPORT_DOCS_SURFACE)
-                {
+                if let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::OpenApi) {
                     pending_bait_exposure = Some((bait.clone(), surface_request.target.clone()));
                 }
             }
@@ -2098,7 +2163,7 @@ mod tests {
         intervention_control_path: PathBuf,
         surface_controller: Arc<dyn SurfaceController + Send + Sync>,
     ) -> ProxyRuntime {
-        let bait_registry = Arc::new(BaitRegistry::m1_demo());
+        let bait_registry = Arc::new(BaitRegistry::m3_catalog());
         ProxyRuntime {
             upstream,
             event_log: Arc::new(Mutex::new(
@@ -2119,7 +2184,7 @@ mod tests {
         event_log_path: &Path,
         intervention_control_path: PathBuf,
     ) -> ProxyRuntime {
-        let bait_registry = Arc::new(BaitRegistry::m1_demo());
+        let bait_registry = Arc::new(BaitRegistry::m3_catalog());
         ProxyRuntime {
             upstream,
             event_log: Arc::new(Mutex::new(
@@ -2879,16 +2944,127 @@ mod tests {
         let rewritten: Value = serde_json::from_slice(&response.body).unwrap();
 
         assert!(rewritten["paths"]["/api/v2/import/reconcile"].is_object());
+        assert_eq!(
+            rewritten["paths"]["/api/v2/import/reconcile"]["post"]["parameters"][0]["name"],
+            "X-OpenAPI-Trace"
+        );
         assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
         assert_event_routing(&event_log_path, "policy_decision", "rewritten_upstream");
         assert_event_routing(&event_log_path, "response_served", "rewritten_upstream");
 
         let exposure = first_event_of_type(&event_log_path, "bait_exposed");
-        assert_eq!(exposure["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert_eq!(exposure["kind"]["bait_id"], "openapi_reconcile_trace");
         assert_eq!(
             exposure["kind"]["surface"],
             "/openapi.json?eidolon_surface=legacy-import"
         );
+    }
+
+    #[test]
+    fn runtime_default_controller_serves_m3_direct_bait_surfaces() {
+        let event_log_path = unique_temp_path("m3-direct-surfaces-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("m3-direct-surfaces-control.txt"),
+        );
+        let registry = BaitRegistry::m3_catalog();
+
+        for bait_class in [
+            BaitClass::Docs,
+            BaitClass::HiddenRoute,
+            BaitClass::FakeCredentialToken,
+            BaitClass::JsDiscoveredRoute,
+        ] {
+            let bait = registry
+                .bait_for_class(bait_class)
+                .expect("M3 bait should exist");
+            let response = parse_downstream_response(&run_runtime_request(
+                runtime.clone(),
+                &get_request(&bait.surface),
+            ));
+            let body = String::from_utf8(response.body).expect("body should be utf8");
+            let header_name = bait.expected_action.header_name.as_deref().unwrap();
+            let header_value = bait.expected_action.header_value.as_deref().unwrap();
+
+            assert_eq!(response.status, 200);
+            assert!(body.contains(header_name));
+            assert!(body.contains(header_value));
+            assert!(body.contains(&bait.expected_action.path));
+        }
+
+        let exposure_ids: Vec<String> = events_of_type(&event_log_path, "bait_exposed")
+            .into_iter()
+            .map(|event| event["kind"]["bait_id"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(exposure_ids.len(), 4);
+        assert!(exposure_ids.contains(&"rel_2025_04_b7f2".to_string()));
+        assert!(exposure_ids.contains(&"hidden_route_trace".to_string()));
+        assert!(exposure_ids.contains(&"fake_service_token".to_string()));
+        assert!(exposure_ids.contains(&"js_worker_resume_trace".to_string()));
+    }
+
+    #[test]
+    fn runtime_correlates_each_m3_bait_action_and_does_not_forward() {
+        let baits = BaitRegistry::m3_catalog().baits().to_vec();
+
+        for bait in baits {
+            let event_log_path = unique_temp_path("m3-correlated-action-events.jsonl");
+            let control_path = unique_temp_path("m3-correlated-action-control.txt");
+            let cookie = cookie_header();
+            let runtime = if bait.bait_class == BaitClass::OpenApi {
+                let original =
+                    r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+                let (upstream, upstream_handle) = spawn_upstream(json_response(original));
+                let runtime =
+                    test_runtime_with_m1_controller(upstream, &event_log_path, control_path);
+                let exposure_response = parse_downstream_response(&run_runtime_request(
+                    runtime.clone(),
+                    &get_request_with_cookie(&bait.surface, &cookie),
+                ));
+                upstream_handle.join().expect("upstream thread should join");
+                assert_eq!(exposure_response.status, 200);
+                runtime
+            } else {
+                let runtime = test_runtime_with_m1_controller(
+                    closed_upstream(),
+                    &event_log_path,
+                    control_path,
+                );
+                let exposure_response = parse_downstream_response(&run_runtime_request(
+                    runtime.clone(),
+                    &get_request_with_cookie(&bait.surface, &cookie),
+                ));
+                assert_eq!(exposure_response.status, 200);
+                runtime
+            };
+            let header_name = bait.expected_action.header_name.as_deref().unwrap();
+            let header_value = bait.expected_action.header_value.as_deref().unwrap();
+
+            let action_response = parse_downstream_response(&run_runtime_request(
+                runtime,
+                &post_request_with_cookie(
+                    &bait.expected_action.path,
+                    &cookie,
+                    &[(header_name, header_value)],
+                ),
+            ));
+
+            assert_eq!(action_response.status, 202);
+            assert!(String::from_utf8(action_response.body)
+                .expect("body should be utf8")
+                .contains(r#""write_committed":false"#));
+
+            let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+            let action = first_event_of_type(&event_log_path, "bait_action_observed");
+            assert_eq!(exposure["kind"]["bait_id"], bait.id.0);
+            assert_eq!(action["kind"]["bait_id"], bait.id.0);
+            assert_eq!(
+                action["kind"]["exposure_id"],
+                exposure["kind"]["exposure_id"]
+            );
+        }
     }
 
     #[test]

@@ -36,6 +36,17 @@ pub enum SurfaceKind {
     Hostname,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaitClass {
+    #[default]
+    Docs,
+    OpenApi,
+    HiddenRoute,
+    FakeCredentialToken,
+    JsDiscoveredRoute,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpectedAction {
     pub method: String,
@@ -47,6 +58,8 @@ pub struct ExpectedAction {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bait {
     pub id: BaitId,
+    #[serde(default)]
+    pub bait_class: BaitClass,
     pub surface: String,
     pub surface_kind: SurfaceKind,
     pub expected_action: ExpectedAction,
@@ -273,6 +286,7 @@ mod tests {
     fn bait_expected_action_round_trips() {
         let bait = Bait {
             id: BaitId("rel_2025_04_b7f2".to_string()),
+            bait_class: BaitClass::Docs,
             surface: "/docs/legacy-import".to_string(),
             surface_kind: SurfaceKind::Docs,
             expected_action: ExpectedAction {
@@ -287,5 +301,23 @@ mod tests {
         let deserialized: Bait = serde_json::from_str(&serialized).expect("bait should parse");
 
         assert_eq!(deserialized, bait);
+    }
+
+    #[test]
+    fn bait_class_defaults_to_docs_for_older_bait_records() {
+        let bait: Bait = serde_json::from_value(json!({
+            "id": "older-bait",
+            "surface": "/docs/older",
+            "surface_kind": "docs",
+            "expected_action": {
+                "method": "POST",
+                "path": "/api/v2/import/reconcile",
+                "header_name": "X-Migration-Trace",
+                "header_value": "older"
+            }
+        }))
+        .expect("older bait record should parse");
+
+        assert_eq!(bait.bait_class, BaitClass::Docs);
     }
 }

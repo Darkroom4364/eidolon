@@ -244,6 +244,36 @@ Run negative controls:
 
 M2.5 does not prove broad containment, attribution, adaptive bait policy, public-v1 readiness, production readiness, or safe deployment outside the Lab. It proves only that one qualifying Lab session can be routed into one synthetic no-write branch and audited.
 
+## M3 Bait Catalog Smoke
+
+M3 catalog support adds five deterministic Lab-only bait classes. This smoke validates that each class can expose a safe clue and correlate the class-specific follow-up marker. It is not the M3 bakeoff, does not compare baselines, and does not prove uniqueness.
+
+Current catalog:
+
+- docs bait: `GET /docs/legacy-import`, then `POST /api/v2/import/reconcile` with `X-Migration-Trace: rel_2025_04_b7f2`
+- OpenAPI bait: `GET /openapi.json?eidolon_surface=legacy-import`, then `POST /api/v2/import/reconcile` with `X-OpenAPI-Trace: openapi_2026_05_f3a1`
+- hidden route bait: `GET /internal/legacy-import-checklist`, then `POST /api/v2/import/reconcile` with `X-Hidden-Route-Trace: hidden_route_2026_05_d91c`
+- fake credential/token bait: `GET /docs/service-token`, then `POST /api/v2/import/reconcile` with `X-Api-Key: eidolon_lab_token_2026_05_7e2a`
+- JS-discovered route bait: `GET /assets/import-helper.js`, then `POST /api/v2/import/reconcile` with `X-Import-Worker: worker_2026_05_c19b`
+
+Each smoke should use one fresh cookie jar per bait class so exposure and action share a session:
+
+```sh
+rm -f /tmp/eidolon-m3-cookies.txt
+curl -i -c /tmp/eidolon-m3-cookies.txt \
+  http://127.0.0.1:8080/docs/service-token
+curl -i -b /tmp/eidolon-m3-cookies.txt \
+  -H 'X-Api-Key: eidolon_lab_token_2026_05_7e2a' \
+  -X POST http://127.0.0.1:8080/api/v2/import/reconcile
+```
+
+Expected event properties:
+
+- each exposure emits `bait_exposed` for the class-specific bait ID and surface
+- each matching same-session action emits `bait_action_observed` with the matching exposure identifier
+- wrong headers, wrong sessions, and ordinary `/api/v1/*` traffic remain negative controls
+- matched bait actions are synthetic and are not forwarded to the protected upstream while interventions are enabled
+
 ## What M0.5 Proves
 
 M0.5 proves that Eidolon has a local, owned, replayable evaluation harness:
