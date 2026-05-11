@@ -177,6 +177,19 @@ The mode collector emits the same v0 metric keys for each comparison mode:
 
 The v0 static baseline trace score is capped. Static clues can show that a trap was followed, but they do not prove per-session causal control the way Eidolon is meant to prove it.
 
+## Collecting M3 Scripted Bakeoff Metrics
+
+The M3 scripted runner compares the deterministic bait catalog against the same owned Lab target and emits one JSONL stream for all comparison modes:
+
+```sh
+examples/m3/bakeoff.sh all > /tmp/eidolon-m3-bakeoff.jsonl
+examples/m3/collect-bakeoff.sh /tmp/eidolon-m3-bakeoff.jsonl
+```
+
+The summary uses the same v0 metric keys per defense mode and per bait class. It adds `bait_classes` under each mode so the M3 report can later classify each bait class as keep, revise, or kill.
+
+This scripted summary is not sufficient for the final M3 uniqueness claim. It validates the matrix and artifact format before authorized agentic/scanner runs and proxy trace-derived reports.
+
 ## Interpretation Guardrail
 
 Metrics must describe Eidolon boundary behavior:

@@ -274,6 +274,29 @@ Expected event properties:
 - wrong headers, wrong sessions, and ordinary `/api/v1/*` traffic remain negative controls
 - matched bait actions are synthetic and are not forwarded to the protected upstream while interventions are enabled
 
+## M3 Scripted Bakeoff Runner
+
+The scripted M3 runner creates the first comparable artifact shape across the four static controls and Eidolon MVP. It is runner plumbing for M3, not the final empirical uniqueness result. Final M3 still requires authorized agentic or scanner runs and proxy trace artifacts.
+
+Start the owned demo target on `127.0.0.1:9001` and the proxy on `127.0.0.1:8080`, then run:
+
+```sh
+examples/m3/bakeoff.sh all > /tmp/eidolon-m3-bakeoff.jsonl
+examples/m3/collect-bakeoff.sh /tmp/eidolon-m3-bakeoff.jsonl
+```
+
+The runner emits the same five bait classes across these modes:
+
+- `no-defense`
+- `static-token`
+- `static-honeypot`
+- `waf-style-block`
+- `eidolon-mvp`
+
+The direct target URL is controlled with `EIDOLON_LAB_TARGET_URL`. The proxy URL is controlled with `EIDOLON_LAB_PROXY_URL`. Both must remain loopback URLs.
+
+Use this artifact to check that the scenario matrix is stable before running real M3 agentic/scanner subjects. Do not use the scripted runner alone to close the uniqueness report or make public-v1 claims.
+
 ## What M0.5 Proves
 
 M0.5 proves that Eidolon has a local, owned, replayable evaluation harness:
