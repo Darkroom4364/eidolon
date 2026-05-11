@@ -1,7 +1,13 @@
-use eidolon_core::{Bait, BaitId, ExpectedAction, SurfaceKind};
+use eidolon_core::{Bait, BaitClass, BaitId, ExpectedAction, SurfaceKind};
+
+pub const DECOY_RECONCILE_PATH: &str = "/api/v2/import/reconcile";
 
 #[derive(Debug, Clone)]
 pub struct BasicBaitTemplate {
+    pub id: String,
+    pub bait_class: BaitClass,
+    pub surface: String,
+    pub surface_kind: SurfaceKind,
     pub route_suffix: String,
     pub header_name: String,
     pub header_value: String,
@@ -10,9 +16,61 @@ pub struct BasicBaitTemplate {
 impl BasicBaitTemplate {
     pub fn legacy_import_demo() -> Self {
         Self {
+            id: "rel_2025_04_b7f2".to_string(),
+            bait_class: BaitClass::Docs,
+            surface: "/docs/legacy-import".to_string(),
+            surface_kind: SurfaceKind::Docs,
             route_suffix: "reconcile".to_string(),
             header_name: "X-Migration-Trace".to_string(),
             header_value: "rel_2025_04_b7f2".to_string(),
+        }
+    }
+
+    pub fn openapi_reconcile_demo() -> Self {
+        Self {
+            id: "openapi_reconcile_trace".to_string(),
+            bait_class: BaitClass::OpenApi,
+            surface: "/openapi.json?eidolon_surface=legacy-import".to_string(),
+            surface_kind: SurfaceKind::OpenApi,
+            route_suffix: "reconcile".to_string(),
+            header_name: "X-OpenAPI-Trace".to_string(),
+            header_value: "openapi_2026_05_f3a1".to_string(),
+        }
+    }
+
+    pub fn hidden_route_demo() -> Self {
+        Self {
+            id: "hidden_route_trace".to_string(),
+            bait_class: BaitClass::HiddenRoute,
+            surface: "/internal/legacy-import-checklist".to_string(),
+            surface_kind: SurfaceKind::Route,
+            route_suffix: "reconcile".to_string(),
+            header_name: "X-Hidden-Route-Trace".to_string(),
+            header_value: "hidden_route_2026_05_d91c".to_string(),
+        }
+    }
+
+    pub fn fake_token_demo() -> Self {
+        Self {
+            id: "fake_service_token".to_string(),
+            bait_class: BaitClass::FakeCredentialToken,
+            surface: "/docs/service-token".to_string(),
+            surface_kind: SurfaceKind::Token,
+            route_suffix: "reconcile".to_string(),
+            header_name: "X-Api-Key".to_string(),
+            header_value: "eidolon_lab_token_2026_05_7e2a".to_string(),
+        }
+    }
+
+    pub fn js_discovered_route_demo() -> Self {
+        Self {
+            id: "js_worker_resume_trace".to_string(),
+            bait_class: BaitClass::JsDiscoveredRoute,
+            surface: "/assets/import-helper.js".to_string(),
+            surface_kind: SurfaceKind::Route,
+            route_suffix: "reconcile".to_string(),
+            header_name: "X-Import-Worker".to_string(),
+            header_value: "worker_2026_05_c19b".to_string(),
         }
     }
 
@@ -20,9 +78,10 @@ impl BasicBaitTemplate {
         let path = format!("/api/v2/import/{}", self.route_suffix);
 
         Bait {
-            id: BaitId(self.header_value.clone()),
-            surface: "/docs/legacy-import".to_string(),
-            surface_kind: SurfaceKind::Docs,
+            id: BaitId(self.id.clone()),
+            bait_class: self.bait_class,
+            surface: self.surface.clone(),
+            surface_kind: self.surface_kind.clone(),
             expected_action: ExpectedAction {
                 method: "POST".to_string(),
                 path,
@@ -49,6 +108,14 @@ impl BaitRegistry {
         registry
     }
 
+    pub fn m3_catalog() -> Self {
+        let mut registry = Self::new();
+        for bait in m3_baits() {
+            registry.add(bait);
+        }
+        registry
+    }
+
     pub fn add(&mut self, bait: Bait) {
         debug_assert!(
             bait.expected_action.header_value.is_none()
@@ -64,6 +131,10 @@ impl BaitRegistry {
 
     pub fn bait_for_surface(&self, surface: &str) -> Option<&Bait> {
         self.baits.iter().find(|bait| bait.surface == surface)
+    }
+
+    pub fn bait_for_class(&self, bait_class: BaitClass) -> Option<&Bait> {
+        self.baits.iter().find(|bait| bait.bait_class == bait_class)
     }
 
     /// Returns the first registered bait whose expected action matches the request.
@@ -88,6 +159,19 @@ impl BaitRegistry {
             .cloned()
             .map(|bait| BaitActionMatch { bait })
     }
+}
+
+pub fn m3_baits() -> Vec<Bait> {
+    [
+        BasicBaitTemplate::legacy_import_demo(),
+        BasicBaitTemplate::openapi_reconcile_demo(),
+        BasicBaitTemplate::hidden_route_demo(),
+        BasicBaitTemplate::fake_token_demo(),
+        BasicBaitTemplate::js_discovered_route_demo(),
+    ]
+    .into_iter()
+    .map(|template| template.to_bait())
+    .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,6 +315,7 @@ mod tests {
         let mut registry = BaitRegistry::new();
         registry.add(Bait {
             id: BaitId("no_header".to_string()),
+            bait_class: BaitClass::Docs,
             surface: "/docs/no-header".to_string(),
             surface_kind: SurfaceKind::Docs,
             expected_action: ExpectedAction {
@@ -254,6 +339,7 @@ mod tests {
         let mut registry = BaitRegistry::new();
         registry.baits.push(Bait {
             id: BaitId("value_only".to_string()),
+            bait_class: BaitClass::Docs,
             surface: "/docs/value-only".to_string(),
             surface_kind: SurfaceKind::Docs,
             expected_action: ExpectedAction {
@@ -276,6 +362,7 @@ mod tests {
         for id in ["first", "second"] {
             registry.add(Bait {
                 id: BaitId(id.to_string()),
+                bait_class: BaitClass::Docs,
                 surface: "/docs/duplicate".to_string(),
                 surface_kind: SurfaceKind::Docs,
                 expected_action: ExpectedAction {
@@ -305,6 +392,7 @@ mod tests {
     fn docs_for_bait_uses_safe_header_defaults_when_action_omits_them() {
         let bait = Bait {
             id: BaitId("fallback-marker".to_string()),
+            bait_class: BaitClass::Docs,
             surface: "/docs/fallback".to_string(),
             surface_kind: SurfaceKind::Docs,
             expected_action: ExpectedAction {
@@ -319,5 +407,84 @@ mod tests {
 
         assert!(docs.contains("X-Migration-Trace: fallback-marker"));
         assert!(docs.contains("POST /api/v2/fallback"));
+    }
+
+    #[test]
+    fn m3_catalog_contains_the_five_required_bait_classes() {
+        let registry = BaitRegistry::m3_catalog();
+        let classes: Vec<BaitClass> = registry
+            .baits()
+            .iter()
+            .map(|bait| bait.bait_class)
+            .collect();
+
+        assert_eq!(registry.baits().len(), 5);
+        assert!(classes.contains(&BaitClass::Docs));
+        assert!(classes.contains(&BaitClass::OpenApi));
+        assert!(classes.contains(&BaitClass::HiddenRoute));
+        assert!(classes.contains(&BaitClass::FakeCredentialToken));
+        assert!(classes.contains(&BaitClass::JsDiscoveredRoute));
+    }
+
+    #[test]
+    fn m3_catalog_uses_unique_ids_surfaces_and_action_headers() {
+        let registry = BaitRegistry::m3_catalog();
+        let mut ids = Vec::new();
+        let mut surfaces = Vec::new();
+        let mut headers = Vec::new();
+
+        for bait in registry.baits() {
+            ids.push(bait.id.0.as_str());
+            surfaces.push(bait.surface.as_str());
+            headers.push(
+                bait.expected_action
+                    .header_name
+                    .as_deref()
+                    .expect("M3 baits should require explicit headers"),
+            );
+            assert_eq!(bait.expected_action.method, "POST");
+            assert_eq!(bait.expected_action.path, DECOY_RECONCILE_PATH);
+            assert!(bait.expected_action.header_value.is_some());
+        }
+
+        ids.sort_unstable();
+        ids.dedup();
+        surfaces.sort_unstable();
+        surfaces.dedup();
+        headers.sort_unstable();
+        headers.dedup();
+
+        assert_eq!(ids.len(), 5);
+        assert_eq!(surfaces.len(), 5);
+        assert_eq!(headers.len(), 5);
+    }
+
+    #[test]
+    fn m3_catalog_matches_each_bait_by_its_own_header() {
+        let registry = BaitRegistry::m3_catalog();
+
+        for bait in registry.baits() {
+            let header_name = bait.expected_action.header_name.as_deref().unwrap();
+            let header_value = bait.expected_action.header_value.as_deref().unwrap();
+            let matched =
+                registry.match_action("POST", DECOY_RECONCILE_PATH, [(header_name, header_value)]);
+
+            assert_eq!(
+                matched.map(|matched| matched.bait.id),
+                Some(bait.id.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn bait_for_class_returns_matching_m3_bait() {
+        let registry = BaitRegistry::m3_catalog();
+
+        assert_eq!(
+            registry
+                .bait_for_class(BaitClass::FakeCredentialToken)
+                .map(|bait| bait.surface.as_str()),
+            Some("/docs/service-token")
+        );
     }
 }
