@@ -189,6 +189,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn event_schema_version_is_the_m2_5_contract_version() {
+        assert_eq!(EVENT_SCHEMA_VERSION, 2);
+    }
+
+    #[test]
     fn new_event_carries_contract_metadata() {
         let session_id = SessionId::new();
         let event = Event::new(

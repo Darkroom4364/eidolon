@@ -727,14 +727,12 @@ fn html_snippet_passes_rewrite_denylist(snippet: &str) -> bool {
 
 fn has_inline_event_handler(normalized: &str) -> bool {
     let bytes = normalized.as_bytes();
-    let mut index = 0;
 
-    while index + 3 < bytes.len() {
+    for index in 0..bytes.len().saturating_sub(3) {
         if !bytes[index].is_ascii_whitespace()
             || bytes[index + 1] != b'o'
             || bytes[index + 2] != b'n'
         {
-            index += 1;
             continue;
         }
 
@@ -750,8 +748,6 @@ fn has_inline_event_handler(normalized: &str) -> bool {
         if cursor < bytes.len() && bytes[cursor] == b'=' {
             return true;
         }
-
-        index = cursor.max(index + 1);
     }
 
     false
@@ -789,6 +785,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_rewrite_plans_report_empty() {
+        assert!(RewritePlan::default().is_empty());
+        assert!(RewritePlan::html(HtmlInsertion::new("")).is_empty());
+        assert!(RewritePlan::robots_txt(RobotsTxtAppend::new("\n\n")).is_empty());
+        assert!(RewritePlan::openapi_paths(Vec::new()).is_empty());
+        assert!(RewritePlan::json_fields(Vec::new()).is_empty());
+    }
+
+    #[test]
     fn rewrites_html_by_inserting_before_body_close() {
         let original = b"<html><body><main>docs</main></body></html>";
         let snippet = HtmlInsertion::new(r#"<div data-eidolon-surface="legacy"></div>"#);
@@ -810,6 +815,19 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_html_by_appending_when_body_close_is_absent() {
+        let original = b"<html><main>docs</main></html>";
+        let snippet = HtmlInsertion::new(r#"<div data-eidolon-surface="legacy"></div>"#);
+
+        let outcome = rewrite_html(original, &snippet);
+
+        assert_eq!(
+            std::str::from_utf8(outcome.body()).unwrap(),
+            r#"<html><main>docs</main></html><div data-eidolon-surface="legacy"></div>"#
+        );
+    }
+
+    #[test]
     fn appends_robots_txt_with_line_boundaries() {
         let original = b"User-agent: *\nDisallow: /admin";
         let appendix = RobotsTxtAppend::new("Allow: /docs/legacy-import");
@@ -820,6 +838,41 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(outcome.body()).unwrap(),
             "User-agent: *\nDisallow: /admin\nAllow: /docs/legacy-import\n"
+        );
+    }
+
+    #[test]
+    fn appends_robots_txt_without_leading_blank_line_for_empty_original() {
+        let outcome = rewrite_robots_txt(b"", &RobotsTxtAppend::new("Disallow: /decoy"));
+
+        assert_eq!(
+            std::str::from_utf8(outcome.body()).unwrap(),
+            "Disallow: /decoy\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_response_body_only_applies_media_specific_operations() {
+        let html_plan = RewritePlan::html(HtmlInsertion::new("<div></div>"));
+        let html_without_content_type = SurfaceResponseMeta::new(200, Vec::new(), 0);
+        assert_eq!(
+            rewrite_response_body(&html_without_content_type, b"<html></html>", &html_plan)
+                .disposition(),
+            RewriteDisposition::Unchanged
+        );
+
+        let robots_plan = RewritePlan::robots_txt(RobotsTxtAppend::new("Disallow: /decoy"));
+        let nested_robots =
+            SurfaceResponseMeta::for_surface(200, "/assets/robots.txt", Vec::new(), 0);
+        assert_eq!(
+            rewrite_response_body(&nested_robots, b"User-agent: *\n", &robots_plan).disposition(),
+            RewriteDisposition::Rewritten
+        );
+
+        let unrelated_path = SurfaceResponseMeta::for_surface(200, "/docs", Vec::new(), 0);
+        assert_eq!(
+            rewrite_response_body(&unrelated_path, b"User-agent: *\n", &robots_plan).disposition(),
+            RewriteDisposition::Unchanged
         );
     }
 
@@ -977,5 +1030,20 @@ mod tests {
                 limit: MAX_REWRITE_BODY_BYTES
             })
         );
+    }
+
+    #[test]
+    fn rewrite_body_limit_allows_exactly_the_configured_limit() {
+        let original = vec![b'a'; MAX_REWRITE_BODY_BYTES];
+
+        assert_eq!(ensure_bounded_body(&original), Ok(()));
+        assert_eq!(MAX_REWRITE_BODY_BYTES, 256 * 1024);
+    }
+
+    #[test]
+    fn inline_event_handler_detection_does_not_treat_prefix_without_equals_as_handler() {
+        assert!(html_snippet_passes_rewrite_denylist(
+            r#"<div onload class="passive"></div>"#
+        ));
     }
 }

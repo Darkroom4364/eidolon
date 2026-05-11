@@ -300,4 +300,24 @@ mod tests {
             Some(BaitId("first".to_string()))
         );
     }
+
+    #[test]
+    fn docs_for_bait_uses_safe_header_defaults_when_action_omits_them() {
+        let bait = Bait {
+            id: BaitId("fallback-marker".to_string()),
+            surface: "/docs/fallback".to_string(),
+            surface_kind: SurfaceKind::Docs,
+            expected_action: ExpectedAction {
+                method: "POST".to_string(),
+                path: "/api/v2/fallback".to_string(),
+                header_name: None,
+                header_value: None,
+            },
+        };
+
+        let docs = docs_for_bait(&bait);
+
+        assert!(docs.contains("X-Migration-Trace: fallback-marker"));
+        assert!(docs.contains("POST /api/v2/fallback"));
+    }
 }
