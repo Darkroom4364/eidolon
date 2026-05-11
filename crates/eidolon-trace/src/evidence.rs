@@ -639,6 +639,46 @@ mod tests {
     }
 
     #[test]
+    fn collected_evidence_defaults_to_unscored_low_confidence() {
+        let session_id = SessionId::new();
+        let bundle = collect_evidence(&timeline(vec![exposure(session_id)]));
+
+        assert_eq!(bundle.score.points, 0);
+        assert_eq!(bundle.score.confidence, eidolon_core::ConfidenceBand::Low);
+        assert!(bundle.score.reasons.is_empty());
+    }
+
+    #[test]
+    fn event_lookup_requires_all_replay_coordinates_to_match() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            exposure(session_id),
+            action(session_id, Some("exp-1")),
+        ]);
+        let exposure_ref = timeline.events[0].event_ref();
+
+        assert!(event_by_ref(&timeline, exposure_ref).is_some());
+        assert!(event_by_ref(
+            &timeline,
+            TimelineEventRef {
+                event_id: exposure_ref.event_id,
+                file_order: exposure_ref.file_order + 1,
+                line_number: exposure_ref.line_number,
+            },
+        )
+        .is_none());
+        assert!(event_by_ref(
+            &timeline,
+            TimelineEventRef {
+                event_id: exposure_ref.event_id,
+                file_order: exposure_ref.file_order,
+                line_number: exposure_ref.line_number + 1,
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
     fn bundle_keeps_same_bait_unmatched_action_for_negative_controls() {
         let session_id = SessionId::new();
         let bundle = evidence_bundle_for_timeline(&timeline(vec![
@@ -714,6 +754,80 @@ mod tests {
             serialized["real_surface_requests_after_containment"],
             json!(1)
         );
+    }
+
+    #[test]
+    fn trace_summary_counts_only_real_surface_requests_after_containment_marker() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            request(
+                session_id,
+                PolicyState::ControlledReality,
+                RoutingDecision::ProtectedUpstream,
+            ),
+            request(
+                session_id,
+                PolicyState::Observe,
+                RoutingDecision::ProtectedUpstream,
+            ),
+            request(
+                session_id,
+                PolicyState::Observe,
+                RoutingDecision::RewrittenUpstream,
+            ),
+        ]);
+        let bundle = evidence_bundle_for_timeline(&timeline);
+
+        let summary = trace_metric_summary_for_timeline(&timeline, &bundle);
+
+        assert_eq!(summary.real_surface_requests_after_containment, Some(2));
+    }
+
+    #[test]
+    fn trace_summary_treats_policy_change_to_containment_as_containment_marker() {
+        let session_id = SessionId::new();
+        let policy_changed = Event::new(
+            session_id,
+            EventSource::PolicyRouter,
+            PolicyState::Observe,
+            EventKind::PolicyChanged {
+                from: PolicyState::Observe,
+                to: PolicyState::ControlledReality,
+                reason: "confirmed bait-derived action".to_string(),
+            },
+        );
+        let timeline = timeline(vec![
+            at(policy_changed, 0),
+            at(
+                request(
+                    session_id,
+                    PolicyState::Observe,
+                    RoutingDecision::ProtectedUpstream,
+                ),
+                1,
+            ),
+        ]);
+        let bundle = evidence_bundle_for_timeline(&timeline);
+
+        let summary = trace_metric_summary_for_timeline(&timeline, &bundle);
+
+        assert_eq!(summary.controlled_reality_dwell_seconds, Some(0.0));
+        assert_eq!(summary.real_surface_requests_after_containment, Some(1));
+    }
+
+    #[test]
+    fn trace_summary_does_not_treat_bait_events_as_containment() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            exposure(session_id),
+            action(session_id, Some("exp-1")),
+        ]);
+        let bundle = evidence_bundle_for_timeline(&timeline);
+
+        let summary = trace_metric_summary_for_timeline(&timeline, &bundle);
+
+        assert_eq!(summary.real_surface_requests_after_containment, None);
+        assert_eq!(summary.controlled_reality_dwell_seconds, None);
     }
 
     #[test]
@@ -815,5 +929,26 @@ mod tests {
 
         assert_eq!(summary.controlled_reality_action_depth, 4);
         assert_eq!(summary.controlled_reality_branch_count, 2);
+    }
+
+    #[test]
+    fn reversed_event_timestamps_do_not_produce_negative_dwell_time() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            at(controlled_reality_entered(session_id), 10),
+            at(
+                response(
+                    session_id,
+                    PolicyState::ControlledReality,
+                    RoutingDecision::ControlledReality,
+                ),
+                9,
+            ),
+        ]);
+        let bundle = evidence_bundle_for_timeline(&timeline);
+
+        let summary = trace_metric_summary_for_timeline(&timeline, &bundle);
+
+        assert_eq!(summary.controlled_reality_dwell_seconds, Some(0.0));
     }
 }

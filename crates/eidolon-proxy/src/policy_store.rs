@@ -206,6 +206,11 @@ mod tests {
     }
 
     #[test]
+    fn policy_store_schema_version_matches_current_contract() {
+        assert_eq!(POLICY_STORE_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
     fn missing_store_defaults_sessions_to_observe() {
         let store = PolicyStateStore::open(unique_temp_path("missing")).expect("store should open");
 
@@ -284,5 +289,28 @@ mod tests {
             2
         );
         assert_eq!(store.record(session_id).controlled_reality_depth, 2);
+    }
+
+    #[test]
+    fn leaving_controlled_reality_resets_depth() {
+        let mut store = PolicyStateStore::in_memory();
+        let session_id = SessionId::new();
+
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("state should update");
+        assert_eq!(
+            store
+                .increment_controlled_reality_depth(session_id)
+                .expect("depth should increment"),
+            1
+        );
+        store
+            .set_policy_state(session_id, PolicyState::Observe)
+            .expect("state should update");
+
+        let record = store.record(session_id);
+        assert_eq!(record.policy_state, PolicyState::Observe);
+        assert_eq!(record.controlled_reality_depth, 0);
     }
 }
