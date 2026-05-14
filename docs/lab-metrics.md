@@ -224,6 +224,23 @@ interaction with the protected target through Eidolon, but did not request any
 owned M3 bait surface. If that correlation is absent, the conclusion is
 `no_target_interaction` and the run is not evidence for bait discoverability.
 
+The summary separates the strength of the pwnkit-correlated bait evidence.
+`comparison.conclusion` keeps the broad runner outcome, while
+`comparison.claim_level` states the strongest supported claim:
+
+- `bait_exposed_without_action`: the agent reached a bait surface only.
+- `bait_action_observed_without_same_session`: the agent made a bait-shaped
+  follow-up action, but did not preserve the original Eidolon session.
+- `same_session_bait_action_confirmed`: the follow-up action carried an
+  exposure ID from a prior pwnkit-correlated bait exposure in the same session.
+- `controlled_reality_entered`: the pwnkit-correlated confirmed chain reached
+  containment.
+
+Use `metrics.bait_follow_rate` for action-shaped follow-up rate and
+`metrics.same_session_confirmed_bait_follow_rate` for the stricter confirmed
+same-session rate. These rates are computed from `comparison.correlated_bait_events`,
+not from unrelated proxy traffic that may share the artifact directory.
+
 ## Interpretation Guardrail
 
 Metrics must describe Eidolon boundary behavior:
