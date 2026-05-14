@@ -111,6 +111,10 @@ at `~/Projects/pwnkit/dist/pwnkit.js`:
 PWNKIT_NODE_ENTRY=/path/to/pwnkit/dist/pwnkit.js examples/m3/pwnkit-codex.sh all "$ART"
 ```
 
+Some pwnkit builds exit nonzero when findings are present even after writing a
+valid JSON report. The runner keeps those reports and continues the comparison;
+missing or invalid reports still fail the run.
+
 The collector reports whether pwnkit HTTP artifacts correlate with Eidolon proxy
 requests by method, path, and timestamp window, and whether any M3 bait surface
 or bait action was reached. It is evidence for the M3 bakeoff, not an agent

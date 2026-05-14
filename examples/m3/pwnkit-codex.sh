@@ -31,6 +31,10 @@ Environment:
 
 For source checkouts, either set PWNKIT_NODE_ENTRY or keep a built checkout at
 ~/Projects/pwnkit/dist/pwnkit.js.
+
+Some pwnkit builds exit nonzero after writing a valid JSON report with findings.
+This runner keeps those reports and continues; missing or invalid reports remain
+fatal.
 USAGE
 }
 
@@ -76,14 +80,22 @@ resolve_pwnkit_command() {
     return
   fi
 
+  if [[ -n "${PWNKIT_BIN:-}" ]]; then
+    if ! command -v "$PWNKIT_BIN" >/dev/null 2>&1; then
+      echo "error: PWNKIT_BIN command not found: $PWNKIT_BIN" >&2
+      exit 2
+    fi
+    PWNKIT_COMMAND=("$PWNKIT_BIN")
+    return
+  fi
+
   if [[ -f "$HOME/Projects/pwnkit/dist/pwnkit.js" ]]; then
     PWNKIT_COMMAND=(node "$HOME/Projects/pwnkit/dist/pwnkit.js")
     return
   fi
 
-  local bin="${PWNKIT_BIN:-pwnkit}"
-  if command -v "$bin" >/dev/null 2>&1; then
-    PWNKIT_COMMAND=("$bin")
+  if command -v pwnkit >/dev/null 2>&1; then
+    PWNKIT_COMMAND=(pwnkit)
     return
   fi
 
@@ -96,6 +108,31 @@ resolve_pwnkit_command() {
   exit 2
 }
 
+valid_pwnkit_report() {
+  local report_file="$1"
+
+  if [[ ! -s "$report_file" ]]; then
+    return 1
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "error: jq is required to validate nonzero pwnkit reports" >&2
+    return 1
+  fi
+
+  jq -e 'type == "object" and (.findings | type == "array")' "$report_file" >/dev/null
+}
+
+has_findings() {
+  local report_file="$1"
+  jq -e '(.findings // []) | length > 0' "$report_file" >/dev/null
+}
+
+finding_count() {
+  local report_file="$1"
+  jq -r '(.findings // []) | length' "$report_file"
+}
+
 run_scan() {
   local label="$1"
   local url="$2"
@@ -105,6 +142,7 @@ run_scan() {
 
   echo "m3 pwnkit $label -> $url" >&2
 
+  set +e
   PWNKIT_FEATURE_CODEX_LIVE_TARGETS="$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" \
   PWNKIT_NO_UPDATE_CHECK=1 \
     "${PWNKIT_COMMAND[@]}" scan \
@@ -118,6 +156,34 @@ run_scan() {
       --verbose \
       > "$output_json" \
       2> "$output_stderr"
+  local exit_code=$?
+  set -e
+
+  if [[ "$exit_code" -eq 0 ]]; then
+    if valid_pwnkit_report "$output_json"; then
+      return 0
+    fi
+
+    echo "error: pwnkit $label exited 0 without a valid report; see $output_json" \
+      >&2
+    return 2
+  fi
+
+  if valid_pwnkit_report "$output_json" && has_findings "$output_json"; then
+    echo "warning: pwnkit $label exited $exit_code after writing a valid report with $(finding_count "$output_json") findings; continuing" \
+      >&2
+    return 0
+  fi
+
+  if valid_pwnkit_report "$output_json"; then
+    echo "error: pwnkit $label exited $exit_code with a valid report but no findings; see $output_stderr" \
+      >&2
+    return "$exit_code"
+  fi
+
+  echo "error: pwnkit $label exited $exit_code without a valid report; see $output_stderr" \
+    >&2
+  return "$exit_code"
 }
 
 main() {
