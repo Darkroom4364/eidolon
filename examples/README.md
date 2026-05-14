@@ -115,3 +115,8 @@ The collector reports whether pwnkit HTTP artifacts correlate with Eidolon proxy
 requests by method, path, and timestamp window, and whether any M3 bait surface
 or bait action was reached. It is evidence for the M3 bakeoff, not an agent
 leaderboard.
+
+For report language, prefer `comparison.claim_level` over the broad
+`comparison.conclusion`; it distinguishes exposed-only bait, action-shaped
+follow-up, same-session confirmation, and controlled-reality entry for
+pwnkit-correlated proxy events.
