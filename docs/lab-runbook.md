@@ -150,17 +150,19 @@ The tarpit delay is bounded by the proxy CLI for the thread-per-connection Lab s
 With interventions enabled, M1 exposes a small built-in demo surface so the proxy path can be validated without claiming the full bait engine is complete:
 
 ```sh
+curl -i http://127.0.0.1:8080/docs
 curl -i http://127.0.0.1:8080/docs/legacy-import
-curl -i 'http://127.0.0.1:8080/openapi.json?eidolon_surface=legacy-import'
+curl -i http://127.0.0.1:8080/openapi.json
 ```
 
-The first request is served by Eidolon as an owned markdown surface. The second forwards to the protected upstream and rewrites the OpenAPI response with one demo legacy-import operation. Plain `/openapi.json` remains an ordinary protected-upstream request.
+The `/docs` request forwards to the protected upstream and receives safe M3 discovery links when the upstream docs page returns a successful HTML response. `/docs/legacy-import` is served by Eidolon as an owned markdown surface. Plain `/openapi.json` forwards to the protected upstream and rewrites the OpenAPI response with one demo legacy-import operation. The legacy query form `/openapi.json?eidolon_surface=legacy-import` remains supported for older runbooks; other `/openapi.json` query variants are ordinary protected-upstream requests.
 
 Validate the M1 proxy narrowly:
 
 - Requests to ordinary demo target paths are forwarded to the upstream target.
+- `/docs` is audited as `rewritten_upstream` only when the successful-response safe M3 discovery-link rewrite actually changes the response.
 - `/docs/legacy-import` is served as an Eidolon-owned response while interventions are enabled.
-- `/openapi.json?eidolon_surface=legacy-import` is audited as `rewritten_upstream` only when the OpenAPI rewrite actually changes the response.
+- `/openapi.json` and `/openapi.json?eidolon_surface=legacy-import` are audited as `rewritten_upstream` only when the OpenAPI rewrite actually changes the response.
 - A missing or invalid `eidolon_session` cookie receives a new first-party session cookie.
 - Multiple requests with the same valid session cookie produce events with the same session ID.
 - `/tmp/eidolon-events.jsonl` contains request events with routing and policy state, without request bodies or header values.
@@ -251,7 +253,7 @@ M3 catalog support adds five deterministic Lab-only bait classes. This smoke val
 Current catalog:
 
 - docs bait: `GET /docs/legacy-import`, then `POST /api/v2/import/reconcile` with `X-Migration-Trace: rel_2025_04_b7f2`
-- OpenAPI bait: `GET /openapi.json?eidolon_surface=legacy-import`, then `POST /api/v2/import/reconcile` with `X-OpenAPI-Trace: openapi_2026_05_f3a1`
+- OpenAPI bait: `GET /openapi.json`, then `POST /api/v2/import/reconcile` with `X-OpenAPI-Trace: openapi_2026_05_f3a1`
 - hidden route bait: `GET /internal/legacy-import-checklist`, then `POST /api/v2/import/reconcile` with `X-Hidden-Route-Trace: hidden_route_2026_05_d91c`
 - fake credential/token bait: `GET /docs/service-token`, then `POST /api/v2/import/reconcile` with `X-Api-Key: eidolon_lab_token_2026_05_7e2a`
 - JS-discovered route bait: `GET /assets/import-helper.js`, then `POST /api/v2/import/reconcile` with `X-Import-Worker: worker_2026_05_c19b`
