@@ -190,6 +190,40 @@ The summary uses the same v0 metric keys per defense mode and per bait class. It
 
 This scripted summary is not sufficient for the final M3 uniqueness claim. It validates the matrix and artifact format before authorized agentic/scanner runs and proxy trace-derived reports.
 
+## Collecting M3 pwnkit Codex Metrics
+
+The pwnkit Codex runner records an authorized local agentic scan against the
+Eidolon proxy and the direct demo target. Start the demo target and proxy first,
+using one artifact directory for the proxy event log:
+
+```sh
+ART=/tmp/eidolon-m3-pwnkit-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$ART"
+```
+
+Start `eidolon-proxy` with:
+
+```sh
+--event-log "$ART/proxy-events.jsonl"
+--intervention-control "$ART/interventions.txt"
+--policy-state "$ART/policy-state.json"
+```
+
+Then run the pwnkit scans and collector:
+
+```sh
+examples/m3/pwnkit-codex.sh all "$ART"
+examples/m3/collect-pwnkit-codex.sh "$ART" > "$ART/pwnkit-summary.json"
+```
+
+The collector consumes pwnkit SQLite `tool_artifact` events and Eidolon proxy
+JSONL events. It treats target interaction as observed only when a pwnkit HTTP
+artifact matches an Eidolon proxy request by method, path, and timestamp window.
+A `bait_not_reached` conclusion therefore means pwnkit had correlated
+interaction with the protected target through Eidolon, but did not request any
+owned M3 bait surface. If that correlation is absent, the conclusion is
+`no_target_interaction` and the run is not evidence for bait discoverability.
+
 ## Interpretation Guardrail
 
 Metrics must describe Eidolon boundary behavior:
