@@ -292,7 +292,10 @@ fn project_detail(path: &str) -> Response {
 
 fn import_detail(path: &str) -> Response {
     let id = path.trim_start_matches("/api/v1/imports/");
-    Response::ok_json(import_job_json(id))
+    match id {
+        "demo-import-1" => Response::ok_json(import_job_json(id)),
+        _ => Response::not_found(path),
+    }
 }
 
 fn import_job_json(id: &str) -> String {
@@ -349,6 +352,16 @@ mod tests {
         let response = route_request("POST", "/api/v1/imports");
         assert_eq!(response.status, 202);
         assert!(response.body.contains(r#""writes":"none""#));
+    }
+
+    #[test]
+    fn import_status_only_returns_known_synthetic_job() {
+        let known = route_request("GET", "/api/v1/imports/demo-import-1");
+        assert_eq!(known.status, 200);
+        assert!(known.body.contains(r#""id":"demo-import-1""#));
+
+        let unknown = route_request("GET", "/api/v1/imports/not-a-real-import-xyz");
+        assert_eq!(unknown.status, 404);
     }
 
     #[test]
