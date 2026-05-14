@@ -30,7 +30,7 @@ impl BasicBaitTemplate {
         Self {
             id: "openapi_reconcile_trace".to_string(),
             bait_class: BaitClass::OpenApi,
-            surface: "/openapi.json?eidolon_surface=legacy-import".to_string(),
+            surface: "/openapi.json".to_string(),
             surface_kind: SurfaceKind::OpenApi,
             route_suffix: "reconcile".to_string(),
             header_name: "X-OpenAPI-Trace".to_string(),
