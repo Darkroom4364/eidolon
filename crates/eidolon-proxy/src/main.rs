@@ -26,8 +26,8 @@ use eidolon_proxy::{
     policy_store::PolicyStateStore,
     session::{self, SessionContext},
     surface::{
-        rewrite_response_body, OpenApiPathInsertion, RewritePlan, SurfaceAction, SurfaceController,
-        SurfaceHeader, SurfaceRequestMeta, SurfaceResponse, SurfaceResponseMeta,
+        rewrite_response_body, HtmlInsertion, OpenApiPathInsertion, RewritePlan, SurfaceAction,
+        SurfaceController, SurfaceHeader, SurfaceRequestMeta, SurfaceResponse, SurfaceResponseMeta,
     },
 };
 use serde_json::json;
@@ -37,6 +37,7 @@ const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
 const DEFAULT_EVENT_LOG: &str = "/tmp/eidolon-events.jsonl";
 const DEFAULT_INTERVENTION_CONTROL: &str = "/tmp/eidolon-interventions.txt";
 const DEFAULT_POLICY_STATE: &str = "/tmp/eidolon-policy-state.json";
+const DOCS_DISCOVERY_TARGET: &str = "/docs";
 const LEGACY_IMPORT_OPENAPI_TARGET: &str = "/openapi.json";
 const LEGACY_IMPORT_OPENAPI_QUERY: &str = "eidolon_surface=legacy-import";
 const DEFAULT_HTTP_PORT: u16 = 80;
@@ -646,16 +647,23 @@ impl SurfaceController for M1DemoSurfaceController {
     fn decide(&self, request: &SurfaceRequestMeta) -> SurfaceAction {
         if request.method == "GET" {
             if let Some(bait) = self.bait_registry.bait_for_surface(&request.path) {
-                return SurfaceAction::EidolonOwned {
-                    response: bait_surface_response(bait),
-                };
+                if bait.bait_class != BaitClass::OpenApi {
+                    return SurfaceAction::EidolonOwned {
+                        response: bait_surface_response(bait),
+                    };
+                }
             }
         }
 
-        if request.method == "GET"
-            && request.path == LEGACY_IMPORT_OPENAPI_TARGET
-            && request.query.as_deref() == Some(LEGACY_IMPORT_OPENAPI_QUERY)
-        {
+        if request.method == "GET" && request.path == DOCS_DISCOVERY_TARGET {
+            return SurfaceAction::RewrittenUpstream {
+                plan: RewritePlan::html(HtmlInsertion::new(m3_docs_discovery_html(
+                    &self.bait_registry,
+                ))),
+            };
+        }
+
+        if is_openapi_discovery_request(request) {
             let Some(bait) = self.bait_for_class(BaitClass::OpenApi) else {
                 return SurfaceAction::ProtectedUpstream;
             };
@@ -670,6 +678,63 @@ impl SurfaceController for M1DemoSurfaceController {
 
         SurfaceAction::ProtectedUpstream
     }
+}
+
+fn is_openapi_discovery_request(request: &SurfaceRequestMeta) -> bool {
+    request.method == "GET"
+        && request.path == LEGACY_IMPORT_OPENAPI_TARGET
+        && matches!(
+            request.query.as_deref(),
+            None | Some(LEGACY_IMPORT_OPENAPI_QUERY)
+        )
+}
+
+fn m3_docs_discovery_html(bait_registry: &BaitRegistry) -> String {
+    let mut html = String::from(
+        r#"
+    <section data-eidolon-discovery="m3-legacy-import">
+      <h2>Legacy import compatibility</h2>
+"#,
+    );
+
+    for bait in bait_registry
+        .baits()
+        .iter()
+        .filter(|bait| bait.bait_class != BaitClass::OpenApi)
+    {
+        html.push_str(&format!(
+            "      <p><a href=\"{}\">{}</a></p>\n",
+            html_escape(&bait.surface),
+            html_escape(discovery_label(bait.bait_class)),
+        ));
+    }
+
+    html.push_str("    </section>\n    ");
+    html
+}
+
+fn discovery_label(bait_class: BaitClass) -> &'static str {
+    match bait_class {
+        BaitClass::Docs => "Legacy import notes",
+        BaitClass::HiddenRoute => "Legacy import checklist",
+        BaitClass::FakeCredentialToken => "Service token note",
+        BaitClass::JsDiscoveredRoute => "Import helper manifest",
+        BaitClass::OpenApi => "OpenAPI compatibility hook",
+    }
+}
+
+fn html_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '"' => escaped.push_str("&quot;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn bait_surface_response(bait: &Bait) -> SurfaceResponse {
@@ -764,6 +829,10 @@ fn openapi_path_insertion_for_bait(bait: &Bait, summary: &str) -> OpenApiPathIns
             }
         }),
     )
+}
+
+fn is_success_status(status: u16) -> bool {
+    (200..300).contains(&status)
 }
 
 fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io::Result<()> {
@@ -982,35 +1051,41 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let mut pending_bait_exposure = None;
     if let SurfaceAction::RewrittenUpstream { plan } = surface_action {
         let meta = surface_response_meta(&response, &path);
-        let outcome = rewrite_response_body(&meta, &response.body, &plan);
-        if outcome.is_rewritten() {
-            effective_decision = policy::PolicyDecision::new(
-                decision.policy_state,
-                RoutingDecision::RewrittenUpstream,
-                "surface controller rewrote upstream response",
-            );
-            if surface_request.method == "GET"
-                && surface_request.path == LEGACY_IMPORT_OPENAPI_TARGET
-                && surface_request.query.as_deref() == Some(LEGACY_IMPORT_OPENAPI_QUERY)
-            {
-                if let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::OpenApi) {
-                    pending_bait_exposure = Some((bait.clone(), surface_request.target.clone()));
+        if is_success_status(response.status) {
+            let outcome = rewrite_response_body(&meta, &response.body, &plan);
+            if outcome.is_rewritten() {
+                effective_decision = policy::PolicyDecision::new(
+                    decision.policy_state,
+                    RoutingDecision::RewrittenUpstream,
+                    "surface controller rewrote upstream response",
+                );
+                if is_openapi_discovery_request(&surface_request) {
+                    if let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::OpenApi) {
+                        pending_bait_exposure =
+                            Some((bait.clone(), surface_request.target.clone()));
+                    }
                 }
+            } else if let Some(refusal) = outcome.refusal() {
+                effective_decision = policy::PolicyDecision::new(
+                    decision.policy_state,
+                    RoutingDecision::ProtectedUpstream,
+                    format!("surface controller rewrite refused; forwarded original upstream response: {refusal}"),
+                );
+            } else {
+                effective_decision = policy::PolicyDecision::new(
+                    decision.policy_state,
+                    RoutingDecision::ProtectedUpstream,
+                    "surface controller rewrite made no changes; forwarded original upstream response",
+                );
             }
-        } else if let Some(refusal) = outcome.refusal() {
-            effective_decision = policy::PolicyDecision::new(
-                decision.policy_state,
-                RoutingDecision::ProtectedUpstream,
-                format!("surface controller rewrite refused; forwarded original upstream response: {refusal}"),
-            );
+            response.body = outcome.into_body();
         } else {
             effective_decision = policy::PolicyDecision::new(
                 decision.policy_state,
                 RoutingDecision::ProtectedUpstream,
-                "surface controller rewrite made no changes; forwarded original upstream response",
+                "surface controller skipped rewrite for non-success upstream response",
             );
         }
-        response.body = outcome.into_body();
     }
     apply_response_headers(&mut response, &session);
 
@@ -2342,6 +2417,15 @@ mod tests {
         .into_bytes()
     }
 
+    fn html_response_with_status(status: u16, reason: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
     fn json_response(body: &str) -> Vec<u8> {
         format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -2961,6 +3045,115 @@ mod tests {
     }
 
     #[test]
+    fn runtime_default_controller_rewrites_plain_openapi_for_discovery() {
+        let event_log_path = unique_temp_path("plain-openapi-rewrite-events.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, upstream_handle) = spawn_upstream(json_response(original));
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("plain-openapi-rewrite-control.txt"),
+        );
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/openapi.json")));
+        upstream_handle.join().expect("upstream thread should join");
+        let rewritten: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert!(rewritten["paths"]["/api/v2/import/reconcile"].is_object());
+        assert_eq!(
+            rewritten["paths"]["/api/v2/import/reconcile"]["post"]["parameters"][0]["name"],
+            "X-OpenAPI-Trace"
+        );
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_routing(&event_log_path, "policy_decision", "rewritten_upstream");
+        assert_event_routing(&event_log_path, "response_served", "rewritten_upstream");
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(exposure["kind"]["bait_id"], "openapi_reconcile_trace");
+        assert_eq!(exposure["kind"]["surface"], "/openapi.json");
+    }
+
+    #[test]
+    fn runtime_default_controller_does_not_rewrite_unknown_openapi_query() {
+        let event_log_path = unique_temp_path("unknown-openapi-query-events.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, upstream_handle) = spawn_upstream(json_response(original));
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("unknown-openapi-query-control.txt"),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request("/openapi.json?version=prod"),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+
+        assert_eq!(response.body, original.as_bytes());
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_routing(&event_log_path, "response_served", "protected_upstream");
+        assert_event_type_absent(&event_log_path, "policy_decision");
+        assert_event_type_absent(&event_log_path, "bait_exposed");
+    }
+
+    #[test]
+    fn runtime_default_controller_rewrites_docs_with_m3_discovery_links() {
+        let event_log_path = unique_temp_path("docs-discovery-events.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("docs-discovery-control.txt"),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request("/docs?topic=imports"),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert!(body.contains("/docs/legacy-import"));
+        assert!(body.contains("/docs/service-token"));
+        assert!(body.contains("/internal/legacy-import-checklist"));
+        assert!(body.contains("/assets/import-helper.js"));
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_routing(&event_log_path, "policy_decision", "rewritten_upstream");
+        assert_event_routing(&event_log_path, "response_served", "rewritten_upstream");
+        assert_event_type_absent(&event_log_path, "bait_exposed");
+    }
+
+    #[test]
+    fn runtime_default_controller_does_not_rewrite_non_success_docs() {
+        let event_log_path = unique_temp_path("docs-non-success-events.jsonl");
+        let original = r#"<!doctype html><html><body><main>not found</main></body></html>"#;
+        let (upstream, upstream_handle) =
+            spawn_upstream(html_response_with_status(404, "Not Found", original));
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("docs-non-success-control.txt"),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request("/docs?topic=imports"),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+
+        assert_eq!(response.status, 404);
+        assert_eq!(response.body, original.as_bytes());
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_policy_decision_reason_contains(&event_log_path, "non-success upstream response");
+        assert_event_routing(&event_log_path, "response_served", "protected_upstream");
+        assert_event_type_absent(&event_log_path, "bait_exposed");
+    }
+
+    #[test]
     fn runtime_default_controller_serves_m3_direct_bait_surfaces() {
         let event_log_path = unique_temp_path("m3-direct-surfaces-events.jsonl");
         let runtime = test_runtime_with_m1_controller(
@@ -3068,7 +3261,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_default_controller_forwards_ordinary_openapi_unchanged() {
+    fn runtime_default_controller_forwards_non_discovery_json_unchanged() {
         let event_log_path = unique_temp_path("default-forward-events.jsonl");
         let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
         let (upstream, upstream_handle) = spawn_upstream(json_response(original));
@@ -3079,7 +3272,7 @@ mod tests {
         );
 
         let response =
-            parse_downstream_response(&run_runtime_request(runtime, &get_request("/openapi.json")));
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/schema.json")));
         upstream_handle.join().expect("upstream thread should join");
 
         assert_eq!(response.body, original.as_bytes());
