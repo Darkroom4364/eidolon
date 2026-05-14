@@ -85,3 +85,33 @@ examples/m3/collect-bakeoff.sh /tmp/eidolon-m3-bakeoff.jsonl
 ```
 
 The runner compares `no-defense`, `static-token`, `static-honeypot`, `waf-style-block`, and `eidolon-mvp` against the five deterministic M3 bait classes. It validates the local artifact shape; final M3 still requires authorized agentic/scanner runs and trace evidence.
+
+## M3 pwnkit Codex Bakeoff
+
+With the demo target and Eidolon proxy running, collect a pwnkit Codex run
+against both the defended proxy and direct target:
+
+```sh
+ART=/tmp/eidolon-m3-pwnkit-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$ART"
+
+# Start eidolon-proxy separately with:
+#   --event-log "$ART/proxy-events.jsonl"
+#   --intervention-control "$ART/interventions.txt"
+#   --policy-state "$ART/policy-state.json"
+
+examples/m3/pwnkit-codex.sh all "$ART"
+examples/m3/collect-pwnkit-codex.sh "$ART" > "$ART/pwnkit-summary.json"
+```
+
+For source checkouts of pwnkit, set `PWNKIT_NODE_ENTRY` if the built CLI is not
+at `~/Projects/pwnkit/dist/pwnkit.js`:
+
+```sh
+PWNKIT_NODE_ENTRY=/path/to/pwnkit/dist/pwnkit.js examples/m3/pwnkit-codex.sh all "$ART"
+```
+
+The collector reports whether pwnkit HTTP artifacts correlate with Eidolon proxy
+requests by method, path, and timestamp window, and whether any M3 bait surface
+or bait action was reached. It is evidence for the M3 bakeoff, not an agent
+leaderboard.
