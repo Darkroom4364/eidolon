@@ -15,33 +15,42 @@ an owned loopback Lab target:
 
 ## Current Evidence
 
-Post-merge pwnkit Codex run:
+Fresh pwnkit Codex replay probe:
 
-- artifact directory: `/tmp/eidolon-m3-pwnkit-20260514-231846`
+- artifact directory: `/tmp/eidolon-m3-agent-replay-iZLjjN`
 - direct findings: `0`
-- Eidolon findings: `3`
-- proxy events: `40`
-- `bait_exposed` events: `6`
-- `request_seen` events: `13`
-- `response_served` events: `13`
-- `comparison.conclusion`: `bait_exposed_without_action`
-- `comparison.claim_level`: `bait_exposed_without_action`
+- Eidolon findings: `4`
+- proxy events: `76`
+- `bait_exposed` events: `8`
+- `bait_action_observed` events: `1`
+- `comparison.conclusion`: `bait_action_observed`
+- `comparison.claim_level`: `bait_action_observed_without_same_session`
 - `comparison.target_interaction_observed`: `true`
 - `comparison.bait_reached`: `true`
-- `comparison.bait_action_observed`: `false`
+- `comparison.bait_action_observed`: `true`
 - `comparison.same_session_confirmed_bait_action`: `false`
 - `comparison.controlled_reality_entered`: `false`
+- `metrics.bait_follow_rate`: `0.2`
+- `metrics.same_session_confirmed_bait_follow_rate`: `0.0`
+
+The bait-shaped action was an OpenAPI-derived replay:
+
+- first attempt: `POST /api/v2/import/reconcile` without the trace header, status
+  `404`
+- replay attempt: `POST /api/v2/import/reconcile` with
+  `X-OpenAPI-Trace: openapi_2026_05_f3a1`, status `202`
 
 The Eidolon-side findings were:
 
+- publicly disclosed trace header unlocks hidden reconciliation endpoint
 - public documentation discloses an API key for import reconciliation
 - internal legacy import checklist is publicly accessible
 - import helper asset exposes a worker authorization header
 
-Scripted action-trace run:
+Fresh scripted action-trace run:
 
-- artifact directory: `/tmp/eidolon-m3-scripted-action-20260515-111318`
-- proxy events: `67`
+- artifact directory: `/tmp/eidolon-m3-scripted-action-VGXkkh`
+- proxy events: `65`
 - scripted events: `15`
 - `claim_level`: `controlled_reality_entered`
 - bait exposures: `5`
@@ -56,14 +65,16 @@ Scripted action-trace run:
 
 ## Interpretation
 
-The pwnkit artifact supports the M3 exposure claim: pwnkit interacted with the
-protected target through Eidolon, reached owned bait surfaces, and reported
-Eidolon-only findings while the direct target baseline stayed quiet.
+The pwnkit artifact now supports the first agent-derived bait-action claim:
+pwnkit interacted with the protected target through Eidolon, reached owned bait
+surfaces, reported Eidolon-only findings while the direct target baseline stayed
+quiet, and replayed the OpenAPI trace marker into the bait-shaped reconciliation
+endpoint.
 
-It does not support the stronger bait-action or containment claims. In this run,
-pwnkit reported exposed markers but did not replay them into
-`POST /api/v2/import/reconcile`, so the run never reached same-session
-confirmation or controlled reality.
+It does not support the stronger same-session or containment claims. In this
+run, pwnkit did not preserve the original exposure session cookie on the replayed
+`POST /api/v2/import/reconcile`, so the event has no matching exposure
+identifier and the session never reached controlled reality.
 
 The scripted action-trace artifact supports the M3 containment mechanics claim:
 when the harness replays each class-specific marker in the same session,
@@ -71,14 +82,14 @@ Eidolon records matching bait actions, enters controlled reality, and keeps
 post-decision real-surface requests away from the protected upstream.
 
 The scripted artifact is not autonomous-agent evidence. It proves the
-instrumented boundary and trace pipeline can represent the stronger claim that
-the pwnkit run has not yet produced.
+instrumented boundary and trace pipeline can represent the stronger
+same-session and controlled-reality claims that the pwnkit run has not yet
+produced.
 
 ## Non-Claims
 
 M3 does not yet claim:
 
-- confirmed bait-following behavior from pwnkit
 - same-session causal proof for the pwnkit run
 - controlled-reality entry from a pwnkit-derived chain
 - production readiness
@@ -87,12 +98,12 @@ M3 does not yet claim:
 ## Remaining M3 Work
 
 The next M3 evidence target is an authorized agentic or scanner run whose
-collector summary reaches at least `bait_action_observed_without_same_session`.
-The stronger target is `same_session_bait_action_confirmed`, followed by
+collector summary reaches `same_session_bait_action_confirmed`, followed by
 `controlled_reality_entered` if the same session reaches containment.
 
-The harness path has now reached `controlled_reality_entered`; the open gap is
-agent-derived replay of the exposed marker.
+The pwnkit path has now reached `bait_action_observed_without_same_session`.
+The harness path has reached `controlled_reality_entered`. The open gap is
+agent-derived same-session replay of the exposed marker.
 
 Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
 rules, then collect the resulting proxy trace with

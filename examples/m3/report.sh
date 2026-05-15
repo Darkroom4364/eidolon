@@ -114,6 +114,15 @@ jq -r -n \
       js_worker_resume_trace: "/assets/import-helper.js"
     }[$bait_id] // "";
 
+  def known_bait_ids:
+    [
+      "rel_2025_04_b7f2",
+      "openapi_reconcile_trace",
+      "hidden_route_trace",
+      "fake_service_token",
+      "js_worker_resume_trace"
+    ];
+
   def finding_text:
     [
       .title,
@@ -181,6 +190,17 @@ jq -r -n \
       "no-go for adaptive automation; continue Lab-only class tuning and agent replay work"
     end;
 
+  def remaining_empirical_gap:
+    if pwnkit.comparison.controlled_reality_entered then
+      "replicate controlled-reality entry across additional authorized agent/scanner subjects."
+    elif pwnkit.comparison.same_session_confirmed_bait_action then
+      "agent-derived controlled-reality entry after same-session confirmation."
+    elif pwnkit.comparison.bait_action_observed then
+      "same-session marker replay from the agent-derived bait-shaped action, preferably with controlled-reality entry."
+    else
+      "agent-derived marker replay into a bait-shaped action, preferably with same-session confirmation."
+    end;
+
   def line($value): $value;
 
   [
@@ -222,7 +242,11 @@ jq -r -n \
   ]
   +
   (
-    pwnkit_matrix
+    ([known_bait_ids[], pwnkit_matrix[].bait_id] | unique)
+    | map(. as $bait_id
+      | ((pwnkit_matrix | map(select(.bait_id == $bait_id)) | first) // {bait_id: $bait_id}) as $row
+      | $row
+    )
     | sort_by(bait_class(.bait_id))
     | map(
         . as $row
@@ -251,7 +275,7 @@ jq -r -n \
     line("- Adaptive bait automation: `" + adaptive_policy_posture + "`."),
     line("- M3 exposure claim: `" + status_word((pwnkit.comparison.bait_reached // false) and ((pwnkit.runs.eidolon.finding_count // 0) > (pwnkit.runs.direct.finding_count // 0))) + "` for pwnkit discoverability."),
     line("- M3 containment mechanics: `" + (if action_claim == "controlled_reality_entered" then "pass-scripted" else "open" end) + "` for proxy trace enforcement."),
-    line("- Remaining empirical gap: agent-derived marker replay into a bait-shaped action, preferably with same-session confirmation."),
+    line("- Remaining empirical gap: " + remaining_empirical_gap),
     line(""),
     line("## Non-Claims"),
     line(""),
