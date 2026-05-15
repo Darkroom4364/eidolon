@@ -241,6 +241,12 @@ Use `metrics.bait_follow_rate` for action-shaped follow-up rate and
 same-session rate. These rates are computed from `comparison.correlated_bait_events`,
 not from unrelated proxy traffic that may share the artifact directory.
 
+The current post-merge M3 pwnkit evidence is recorded in
+[`docs/research-note-m3.md`](research-note-m3.md). It supports
+`bait_exposed_without_action`: direct target findings were zero and Eidolon
+findings were nonzero, but the pwnkit run did not replay exposed markers into a
+bait action.
+
 ## Interpretation Guardrail
 
 Metrics must describe Eidolon boundary behavior:
