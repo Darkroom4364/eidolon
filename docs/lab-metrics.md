@@ -266,18 +266,21 @@ not from unrelated proxy traffic that may share the artifact directory.
 
 The current post-merge M3 pwnkit evidence is recorded in
 [`docs/research-note-m3.md`](research-note-m3.md). It supports
-`bait_exposed_without_action`: direct target findings were zero and Eidolon
-findings were nonzero, but the pwnkit run did not replay exposed markers into a
-bait action. The same note also records the scripted action-trace artifact that
-reaches `controlled_reality_entered` without claiming autonomous-agent behavior.
+`bait_action_observed_without_same_session`: direct target findings were zero,
+Eidolon findings were nonzero, and the pwnkit run replayed the OpenAPI trace
+marker into a bait-shaped action. It did not preserve the original exposure
+session, so the pwnkit run still does not support same-session confirmation or
+controlled-reality entry. The same note also records the scripted action-trace
+artifact that reaches `controlled_reality_entered` without claiming autonomous
+agent behavior.
 
 To generate the internal M3 uniqueness report from the pwnkit and scripted
 action-trace artifacts:
 
 ```sh
 examples/m3/report.sh \
-  --pwnkit-artifact /tmp/eidolon-m3-pwnkit-20260514-231846 \
-  --action-artifact /tmp/eidolon-m3-scripted-action-20260515-111318 \
+  --pwnkit-artifact /tmp/eidolon-m3-agent-replay-iZLjjN \
+  --action-artifact /tmp/eidolon-m3-scripted-action-VGXkkh \
   > docs/research-report-m3.md
 ```
 
