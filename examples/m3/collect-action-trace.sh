@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ARTIFACT_DIR="${1:-${EIDOLON_M3_ARTIFACT_DIR:-}}"
+RUN_KIND="${EIDOLON_M3_TRACE_RUN_KIND:-m3_scripted_action_trace}"
+EVIDENCE_SOURCE="${EIDOLON_M3_TRACE_EVIDENCE_SOURCE:-proxy_trace}"
 
 usage() {
   cat <<'USAGE'
@@ -13,6 +15,10 @@ run. This collector reads the proxy trace itself; it does not infer action or
 containment from the scripted runner's JSONL.
 
 Requires jq.
+
+Environment:
+  EIDOLON_M3_TRACE_RUN_KIND         Output run_kind. Defaults to m3_scripted_action_trace.
+  EIDOLON_M3_TRACE_EVIDENCE_SOURCE  Output evidence_source. Defaults to proxy_trace.
 USAGE
 }
 
@@ -37,7 +43,10 @@ if [[ ! -s "$PROXY_LOG" ]]; then
   exit 2
 fi
 
-jq -s --arg artifact_dir "$ARTIFACT_DIR" '
+jq -s \
+  --arg artifact_dir "$ARTIFACT_DIR" \
+  --arg run_kind "$RUN_KIND" \
+  --arg evidence_source "$EVIDENCE_SOURCE" '
   def observed_at_ms($event):
     (($event.observed_at // "")
      | sub("\\.[0-9]+Z$"; "Z")
@@ -312,15 +321,22 @@ jq -s --arg artifact_dir "$ARTIFACT_DIR" '
         }
     );
 
+  def source_note:
+    if $run_kind == "m3_agent_replay_trace" then
+      "This collector reads Eidolon proxy trace events from an authorized agent/scanner run. Agent-derived claims require the companion agent/tool artifact, not proxy trace alone."
+    else
+      "This collector reads Eidolon proxy trace events. It is suitable for scripted harness evidence, not for claiming autonomous agent behavior."
+    end;
+
   exposures as $bait_exposures
   | actions as $bait_actions
   | confirmed_actions($bait_exposures) as $confirmed_bait_actions
   | controlled_reality_entries_after_confirmed_action($confirmed_bait_actions) as $controlled_after_confirmed
   | {
       schema_version: 1,
-      run_kind: "m3_scripted_action_trace",
+      run_kind: $run_kind,
       boundary: "owned_loopback_lab",
-      evidence_source: "proxy_trace",
+      evidence_source: $evidence_source,
       artifact_dir: $artifact_dir,
       claim_level: claim_level($bait_exposures; $bait_actions; $confirmed_bait_actions; $controlled_after_confirmed),
       counts: {
@@ -358,7 +374,7 @@ jq -s --arg artifact_dir "$ARTIFACT_DIR" '
         controlled_reality_entries_after_confirmed_action: $controlled_after_confirmed
       },
       notes: [
-        "This collector reads Eidolon proxy trace events. It is suitable for scripted harness evidence, not for claiming autonomous agent behavior.",
+        source_note,
         "same_session_confirmed_bait_actions require matching session_id, bait_id, exposure_id, and prior exposure event order.",
         "controlled_reality_entered is claimed only when a controlled-reality entry follows a same-session confirmed bait action."
       ]

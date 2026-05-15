@@ -323,6 +323,37 @@ controlled_reality_entered` when all five class-specific same-session actions
 are observed. This proves the harness and proxy trace mechanics, not autonomous
 agent bait-following.
 
+## M3 Agent Replay Probe
+
+The open M3 gap is agent-derived marker replay. Use the blind probe brief in
+`examples/m3/agent-replay-probe.md` when running an authorized local agent or
+scanner subject. The subject should see only the loopback target, objective, and
+safety bounds; do not seed it with known bait IDs, header names, marker values,
+prior M3 reports, or source-code bait catalog details.
+
+After the subject finishes, collect the proxy trace from the same artifact
+directory:
+
+```sh
+examples/m3/collect-agent-replay-trace.sh "$ART" \
+  > "$ART/agent-replay-trace-summary.json"
+```
+
+Use the resulting `claim_level` as the evidence boundary:
+
+- `bait_exposed_without_action` means the subject reached owned bait but did not
+  replay it
+- `bait_action_observed_without_same_session` means the subject performed a
+  bait-shaped action without preserving the original exposure session
+- `same_session_bait_action_confirmed` means the action matched a prior exposure
+  in the same session
+- `controlled_reality_entered` means the same-session chain moved into controlled
+  reality
+
+The proxy trace alone is not enough to claim autonomous behavior. Keep the
+companion agent or tool artifact with the prompt, requested paths, and reasoning
+so seeded or scripted replay can be distinguished from agent-derived replay.
+
 ## What M0.5 Proves
 
 M0.5 proves that Eidolon has a local, owned, replayable evaluation harness:
