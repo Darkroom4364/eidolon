@@ -153,8 +153,8 @@ scripted action-trace artifact:
 
 ```sh
 examples/m3/report.sh \
-  --pwnkit-artifact /tmp/eidolon-m3-pwnkit-20260514-231846 \
-  --action-artifact /tmp/eidolon-m3-scripted-action-20260515-111318 \
+  --pwnkit-artifact /tmp/eidolon-m3-agent-replay-iZLjjN \
+  --action-artifact /tmp/eidolon-m3-scripted-action-VGXkkh \
   > docs/research-report-m3.md
 ```
 
