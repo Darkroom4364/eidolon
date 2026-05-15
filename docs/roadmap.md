@@ -191,6 +191,13 @@ Goal:
 
 Prove whether Eidolon is meaningfully better than static deception and generic bot/WAF responses.
 
+Current status:
+
+- pwnkit Codex exposure artifact collected; see `docs/research-note-m3.md`
+- direct target baseline is quiet after the demo import-status cleanup
+- Eidolon produces owned bait findings in the pwnkit run
+- bait action, same-session confirmation, and controlled-reality entry remain open evidence targets
+
 Issues:
 
 1. Run Eidolon MVP bakeoff against baselines
