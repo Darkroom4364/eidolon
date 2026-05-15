@@ -299,6 +299,30 @@ The direct target URL is controlled with `EIDOLON_LAB_TARGET_URL`. The proxy URL
 
 Use this artifact to check that the scenario matrix is stable before running real M3 agentic/scanner subjects. Do not use the scripted runner alone to close the uniqueness report or make public-v1 claims.
 
+For a proxy-trace-backed scripted action artifact, run only `eidolon-mvp`
+against a proxy whose event log is written into the same artifact directory:
+
+```sh
+ART=/tmp/eidolon-m3-scripted-action-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$ART"
+
+# Start eidolon-proxy separately with:
+#   --event-log "$ART/proxy-events.jsonl"
+#   --intervention-control "$ART/interventions.txt"
+#   --policy-state "$ART/policy-state.json"
+
+EIDOLON_M3_RUNNER_KIND=scripted-action-trace \
+  examples/m3/bakeoff.sh eidolon-mvp > "$ART/scripted-bakeoff.jsonl"
+examples/m3/collect-bakeoff.sh "$ART/scripted-bakeoff.jsonl" \
+  > "$ART/scripted-bakeoff-summary.json"
+examples/m3/collect-action-trace.sh "$ART" > "$ART/action-trace-summary.json"
+```
+
+`action-trace-summary.json` should reach `claim_level:
+controlled_reality_entered` when all five class-specific same-session actions
+are observed. This proves the harness and proxy trace mechanics, not autonomous
+agent bait-following.
+
 ## What M0.5 Proves
 
 M0.5 proves that Eidolon has a local, owned, replayable evaluation harness:
