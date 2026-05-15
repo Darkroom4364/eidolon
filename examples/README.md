@@ -161,3 +161,21 @@ examples/m3/report.sh \
 The report is Lab-only. It can summarize differential bait discovery and
 scripted containment mechanics, but it must not be used to claim pwnkit reached
 controlled reality until the pwnkit-correlated trace supports that claim.
+
+## M3 Agent Replay Probe
+
+The remaining M3 evidence gap is agent-derived replay of a discovered bait
+marker. Use [m3/agent-replay-probe.md](m3/agent-replay-probe.md) for the blind
+prompt and contamination rules.
+
+After an authorized loopback subject finishes, collect its proxy trace:
+
+```sh
+examples/m3/collect-agent-replay-trace.sh "$ART" \
+  > "$ART/agent-replay-trace-summary.json"
+```
+
+This wrapper uses the same trace claim ladder as the scripted action collector,
+but labels the artifact as an authorized agent/scanner replay trace. It still
+does not prove autonomous behavior unless the companion agent/tool artifact shows
+the subject was not seeded with the bait catalog.

@@ -93,3 +93,9 @@ The stronger target is `same_session_bait_action_confirmed`, followed by
 
 The harness path has now reached `controlled_reality_entered`; the open gap is
 agent-derived replay of the exposed marker.
+
+Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
+rules, then collect the resulting proxy trace with
+`examples/m3/collect-agent-replay-trace.sh`. The collector reuses the scripted
+trace claim ladder while labeling the evidence as an authorized agent/scanner
+replay trace.
