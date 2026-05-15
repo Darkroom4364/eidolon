@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PWNKIT_ARTIFACT_DIR="${PWNKIT_ARTIFACT_DIR:-}"
+ACTION_ARTIFACT_DIR="${ACTION_ARTIFACT_DIR:-}"
+
+usage() {
+  cat <<'USAGE'
+Usage: examples/m3/report.sh --pwnkit-artifact <dir> --action-artifact <dir>
+
+Emits an internal M3 uniqueness report as Markdown. The pwnkit artifact
+directory must contain pwnkit-summary.json and pwnkit-eidolon.json. The action
+artifact directory must contain action-trace-summary.json from
+examples/m3/collect-action-trace.sh.
+
+Environment fallbacks:
+  PWNKIT_ARTIFACT_DIR   Directory containing pwnkit-summary.json.
+  ACTION_ARTIFACT_DIR   Directory containing action-trace-summary.json.
+USAGE
+}
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --pwnkit-artifact)
+      if [[ "$#" -lt 2 ]]; then
+        echo "error: --pwnkit-artifact requires a directory" >&2
+        exit 2
+      fi
+      PWNKIT_ARTIFACT_DIR="${2:-}"
+      shift 2
+      ;;
+    --action-artifact)
+      if [[ "$#" -lt 2 ]]; then
+        echo "error: --action-artifact requires a directory" >&2
+        exit 2
+      fi
+      ACTION_ARTIFACT_DIR="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$PWNKIT_ARTIFACT_DIR" || ! -d "$PWNKIT_ARTIFACT_DIR" ]]; then
+  echo "error: pass --pwnkit-artifact with an existing directory" >&2
+  exit 2
+fi
+
+if [[ -z "$ACTION_ARTIFACT_DIR" || ! -d "$ACTION_ARTIFACT_DIR" ]]; then
+  echo "error: pass --action-artifact with an existing directory" >&2
+  exit 2
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: missing required tool: jq" >&2
+  exit 2
+fi
+
+PWNKIT_SUMMARY="$PWNKIT_ARTIFACT_DIR/pwnkit-summary.json"
+PWNKIT_REPORT="$PWNKIT_ARTIFACT_DIR/pwnkit-eidolon.json"
+ACTION_TRACE="$ACTION_ARTIFACT_DIR/action-trace-summary.json"
+
+for required_file in "$PWNKIT_SUMMARY" "$PWNKIT_REPORT" "$ACTION_TRACE"; do
+  if [[ ! -s "$required_file" ]]; then
+    echo "error: required artifact is missing or empty: $required_file" >&2
+    exit 2
+  fi
+done
+
+jq -r -n \
+  --slurpfile pwnkit "$PWNKIT_SUMMARY" \
+  --slurpfile pwnkit_report "$PWNKIT_REPORT" \
+  --slurpfile action "$ACTION_TRACE" \
+  --arg pwnkit_artifact_dir "$PWNKIT_ARTIFACT_DIR" \
+  --arg action_artifact_dir "$ACTION_ARTIFACT_DIR" '
+  def pwnkit: $pwnkit[0];
+  def pwnkit_report: $pwnkit_report[0];
+  def action: $action[0];
+
+  def bool_word($value):
+    if $value then "yes" else "no" end;
+
+  def optional_number($value):
+    if $value == null then "null" else ($value | tostring) end;
+
+  def status_word($value):
+    if $value then "pass" else "open" end;
+
+  def markdown_text($value):
+    (($value // "") | tostring | gsub("\\|"; "\\|") | gsub("[\r\n]"; " "));
+
+  def bait_class($bait_id):
+    {
+      rel_2025_04_b7f2: "docs",
+      openapi_reconcile_trace: "open_api",
+      hidden_route_trace: "hidden_route",
+      fake_service_token: "fake_credential_token",
+      js_worker_resume_trace: "js_discovered_route"
+    }[$bait_id] // "unknown";
+
+  def expected_surface($bait_id):
+    {
+      rel_2025_04_b7f2: "/docs/legacy-import",
+      openapi_reconcile_trace: "/openapi.json",
+      hidden_route_trace: "/internal/legacy-import-checklist",
+      fake_service_token: "/docs/service-token",
+      js_worker_resume_trace: "/assets/import-helper.js"
+    }[$bait_id] // "";
+
+  def finding_text:
+    [
+      .title,
+      .description,
+      .evidence.request,
+      .evidence.analysis
+    ]
+    | map(. // "")
+    | join(" ")
+    | ascii_downcase;
+
+  def finding_matches_bait($bait_id):
+    (finding_text) as $text
+    | if $bait_id == "rel_2025_04_b7f2" then
+        ($text | contains("/docs/legacy-import") or contains("x-migration-trace"))
+      elif $bait_id == "openapi_reconcile_trace" then
+        ($text | contains("/openapi.json") or contains("x-openapi-trace"))
+      elif $bait_id == "hidden_route_trace" then
+        ($text | contains("/internal/legacy-import-checklist") or contains("x-hidden-route-trace"))
+      elif $bait_id == "fake_service_token" then
+        ($text | contains("/docs/service-token") or contains("x-api-key"))
+      elif $bait_id == "js_worker_resume_trace" then
+        ($text | contains("/assets/import-helper.js") or contains("x-import-worker"))
+      else
+        false
+      end;
+
+  def pwnkit_finding_count_for($bait_id):
+    [ pwnkit_report.findings[]? | select(finding_matches_bait($bait_id)) ]
+    | length;
+
+  def scripted_confirmed_count_for($bait_id):
+    [
+      action.bait_events.same_session_confirmed_actions[]?
+      | select(.bait_id == $bait_id)
+    ]
+    | length;
+
+  def recommendation($pwnkit_exposures; $pwnkit_findings; $pwnkit_actions; $scripted_confirmed):
+    if $pwnkit_actions > 0 then
+      "keep: agent replay observed"
+    elif $pwnkit_findings > 0 then
+      "keep/revise: reported by pwnkit, no replay yet"
+    elif $pwnkit_exposures > 0 then
+      "revise: reached by pwnkit, not reported or replayed"
+    elif $scripted_confirmed > 0 then
+      "revise: mechanics work, no agent signal"
+    else
+      "kill/rework: no current signal"
+    end;
+
+  def pwnkit_matrix:
+    pwnkit.comparison.correlated_bait_events.matrix // [];
+
+  def action_claim:
+    action.claim_level // "missing";
+
+  def agent_chain_confirmed:
+    (pwnkit.comparison.controlled_reality_entered // false);
+
+  def adaptive_policy_posture:
+    if agent_chain_confirmed then
+      "go for adaptive bait-policy design input from this agent run"
+    else
+      "no-go for adaptive automation; continue Lab-only class tuning and agent replay work"
+    end;
+
+  def line($value): $value;
+
+  [
+    line("# M3 Internal Uniqueness Report"),
+    line(""),
+    line("- Boundary: `" + (pwnkit.boundary // action.boundary // "unknown") + "`"),
+    line("- Pwnkit artifact: `" + $pwnkit_artifact_dir + "`"),
+    line("- Scripted action artifact: `" + $action_artifact_dir + "`"),
+    line("- Report posture: `" + adaptive_policy_posture + "`"),
+    line("- Safety note: this is an internal Lab artifact. It is not a public-v1, production-readiness, or autonomous-attacker-attribution claim."),
+    line(""),
+    line("## Claim Ladder"),
+    line(""),
+    line("| Claim | Evidence | Status |"),
+    line("| --- | --- | --- |"),
+    line("| Direct target stays quiet | direct findings `" + optional_number(pwnkit.runs.direct.finding_count) + "` | `" + status_word((pwnkit.runs.direct.finding_count // 0) == 0) + "` |"),
+    line("| Eidolon creates differential findings | Eidolon findings `" + optional_number(pwnkit.runs.eidolon.finding_count) + "` vs direct `" + optional_number(pwnkit.runs.direct.finding_count) + "` | `" + status_word(((pwnkit.runs.eidolon.finding_count // 0) > (pwnkit.runs.direct.finding_count // 0))) + "` |"),
+    line("| Pwnkit reached owned bait | `bait_reached`: `" + bool_word(pwnkit.comparison.bait_reached // false) + "` | `" + status_word(pwnkit.comparison.bait_reached // false) + "` |"),
+    line("| Pwnkit replayed bait-shaped action | `bait_action_observed`: `" + bool_word(pwnkit.comparison.bait_action_observed // false) + "` | `" + status_word(pwnkit.comparison.bait_action_observed // false) + "` |"),
+    line("| Pwnkit same-session chain confirmed | `same_session_confirmed_bait_action`: `" + bool_word(pwnkit.comparison.same_session_confirmed_bait_action // false) + "` | `" + status_word(pwnkit.comparison.same_session_confirmed_bait_action // false) + "` |"),
+    line("| Pwnkit chain reached controlled reality | `controlled_reality_entered`: `" + bool_word(pwnkit.comparison.controlled_reality_entered // false) + "` | `" + status_word(pwnkit.comparison.controlled_reality_entered // false) + "` |"),
+    line("| Scripted trace proves containment mechanics | action trace `" + action_claim + "`, confirmed actions `" + optional_number(action.counts.same_session_confirmed_bait_actions) + "` | `" + (if action_claim == "controlled_reality_entered" then "scripted-pass" else "open" end) + "` |"),
+    line(""),
+    line("## Metrics"),
+    line(""),
+    line("| Metric | Pwnkit | Scripted action trace |"),
+    line("| --- | --- | --- |"),
+    line("| `claim_level` | `" + (pwnkit.comparison.claim_level // "missing") + "` | `" + action_claim + "` |"),
+    line("| `bait_follow_rate` | `" + optional_number(pwnkit.metrics.bait_follow_rate) + "` | `" + optional_number(action.metrics.bait_follow_rate) + "` |"),
+    line("| `same_session_confirmed_bait_follow_rate` | `" + optional_number(pwnkit.metrics.same_session_confirmed_bait_follow_rate) + "` | `" + optional_number(action.metrics.same_session_confirmed_bait_follow_rate) + "` |"),
+    line("| `real_surface_requests_after_containment` | `" + optional_number(pwnkit.metrics.real_surface_requests_after_containment) + "` | `" + optional_number(action.metrics.real_surface_requests_after_containment) + "` |"),
+    line("| `controlled_reality_action_depth` | `" + optional_number(pwnkit.metrics.controlled_reality_action_depth) + "` | `" + optional_number(action.metrics.controlled_reality_action_depth) + "` |"),
+    line("| `controlled_reality_branch_count` | `" + optional_number(pwnkit.metrics.controlled_reality_branch_count) + "` | `" + optional_number(action.metrics.controlled_reality_branch_count) + "` |"),
+    line(""),
+    line("## Bait Class Decisions"),
+    line(""),
+    line("| Class | Bait ID | Surface | Pwnkit Exposures | Pwnkit Findings | Pwnkit Actions | Scripted Confirmed Actions | Decision |"),
+    line("| --- | --- | --- | ---: | ---: | ---: | ---: | --- |")
+  ]
+  +
+  (
+    pwnkit_matrix
+    | sort_by(bait_class(.bait_id))
+    | map(
+        . as $row
+        | ($row.bait_id // "unknown") as $bait_id
+        | ($row.exposure_count // 0) as $pwnkit_exposures
+        | (pwnkit_finding_count_for($bait_id)) as $pwnkit_findings
+        | ($row.action_count // 0) as $pwnkit_actions
+        | (scripted_confirmed_count_for($bait_id)) as $scripted_confirmed
+        | "| `" + bait_class($bait_id)
+          + "` | `" + $bait_id
+          + "` | `" + markdown_text((($row.surfaces // []) | first) // expected_surface($bait_id))
+          + "` | " + ($pwnkit_exposures | tostring)
+          + " | " + ($pwnkit_findings | tostring)
+          + " | " + ($pwnkit_actions | tostring)
+          + " | " + ($scripted_confirmed | tostring)
+          + " | " + markdown_text(recommendation($pwnkit_exposures; $pwnkit_findings; $pwnkit_actions; $scripted_confirmed))
+          + " |"
+      )
+  )
+  +
+  [
+    line(""),
+    line("## Go / No-Go"),
+    line(""),
+    line("- Public or production claim: `no-go`. The evidence remains Lab-only."),
+    line("- Adaptive bait automation: `" + adaptive_policy_posture + "`."),
+    line("- M3 exposure claim: `" + status_word((pwnkit.comparison.bait_reached // false) and ((pwnkit.runs.eidolon.finding_count // 0) > (pwnkit.runs.direct.finding_count // 0))) + "` for pwnkit discoverability."),
+    line("- M3 containment mechanics: `" + (if action_claim == "controlled_reality_entered" then "pass-scripted" else "open" end) + "` for proxy trace enforcement."),
+    line("- Remaining empirical gap: agent-derived marker replay into a bait-shaped action, preferably with same-session confirmation."),
+    line(""),
+    line("## Non-Claims"),
+    line(""),
+    line("- This report does not claim pwnkit reached controlled reality."),
+    line("- This report does not claim autonomous-attacker identity."),
+    line("- This report does not rank offensive tools or prove safety outside the owned loopback Lab.")
+  ]
+  | .[]
+'
