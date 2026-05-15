@@ -190,6 +190,29 @@ The summary uses the same v0 metric keys per defense mode and per bait class. It
 
 This scripted summary is not sufficient for the final M3 uniqueness claim. It validates the matrix and artifact format before authorized agentic/scanner runs and proxy trace-derived reports.
 
+For the scripted containment mechanics claim, collect the proxy trace from the
+same run:
+
+```sh
+ART=/tmp/eidolon-m3-scripted-action-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$ART"
+
+# Start eidolon-proxy separately with:
+#   --event-log "$ART/proxy-events.jsonl"
+#   --intervention-control "$ART/interventions.txt"
+#   --policy-state "$ART/policy-state.json"
+
+EIDOLON_M3_RUNNER_KIND=scripted-action-trace \
+  examples/m3/bakeoff.sh eidolon-mvp > "$ART/scripted-bakeoff.jsonl"
+examples/m3/collect-bakeoff.sh "$ART/scripted-bakeoff.jsonl" \
+  > "$ART/scripted-bakeoff-summary.json"
+examples/m3/collect-action-trace.sh "$ART" > "$ART/action-trace-summary.json"
+```
+
+`collect-action-trace.sh` reads the proxy JSONL directly. It can support
+`controlled_reality_entered` for the scripted harness, but it is not autonomous
+agent evidence.
+
 ## Collecting M3 pwnkit Codex Metrics
 
 The pwnkit Codex runner records an authorized local agentic scan against the
@@ -245,7 +268,8 @@ The current post-merge M3 pwnkit evidence is recorded in
 [`docs/research-note-m3.md`](research-note-m3.md). It supports
 `bait_exposed_without_action`: direct target findings were zero and Eidolon
 findings were nonzero, but the pwnkit run did not replay exposed markers into a
-bait action.
+bait action. The same note also records the scripted action-trace artifact that
+reaches `controlled_reality_entered` without claiming autonomous-agent behavior.
 
 ## Interpretation Guardrail
 
