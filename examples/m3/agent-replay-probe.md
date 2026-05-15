@@ -88,6 +88,17 @@ For pwnkit Codex as the subject, run the subject first:
 examples/m3/pwnkit-codex.sh all "$ART"
 ```
 
+To run the session-control variant, pin the Eidolon leg to one generated
+`eidolon_session` cookie:
+
+```sh
+EIDOLON_M3_PIN_SESSION=1 examples/m3/pwnkit-codex.sh all "$ART"
+```
+
+This can test whether a discovered marker replay becomes same-session evidence.
+It does not give the subject any bait IDs, header names, marker values, or
+manual replay commands.
+
 After the subject finishes, collect the proxy trace:
 
 ```sh

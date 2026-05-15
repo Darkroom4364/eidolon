@@ -134,6 +134,18 @@ at `~/Projects/pwnkit/dist/pwnkit.js`:
 PWNKIT_NODE_ENTRY=/path/to/pwnkit/dist/pwnkit.js examples/m3/pwnkit-codex.sh all "$ART"
 ```
 
+To test whether an observed replay can preserve one Eidolon Lab session without
+seeding any bait markers, pin the Eidolon leg to a generated session cookie:
+
+```sh
+EIDOLON_M3_PIN_SESSION=1 examples/m3/pwnkit-codex.sh all "$ART"
+```
+
+The runner writes the generated UUID to
+`$ART/pinned-eidolon-session-id.txt` and passes it only as the
+`eidolon_session` cookie for the Eidolon scan leg. This is a session-control
+experiment, not a marker-seeding experiment.
+
 Some pwnkit builds exit nonzero when findings are present even after writing a
 valid JSON report. The runner keeps those reports and continues the comparison;
 missing or invalid reports still fail the run.
