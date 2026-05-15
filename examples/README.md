@@ -86,6 +86,29 @@ examples/m3/collect-bakeoff.sh /tmp/eidolon-m3-bakeoff.jsonl
 
 The runner compares `no-defense`, `static-token`, `static-honeypot`, `waf-style-block`, and `eidolon-mvp` against the five deterministic M3 bait classes. It validates the local artifact shape; final M3 still requires authorized agentic/scanner runs and trace evidence.
 
+To collect proxy-trace-backed scripted action evidence, run the Eidolon mode
+with the proxy log in the same artifact directory:
+
+```sh
+ART=/tmp/eidolon-m3-scripted-action-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$ART"
+
+# Start eidolon-proxy separately with:
+#   --event-log "$ART/proxy-events.jsonl"
+#   --intervention-control "$ART/interventions.txt"
+#   --policy-state "$ART/policy-state.json"
+
+EIDOLON_M3_RUNNER_KIND=scripted-action-trace \
+  examples/m3/bakeoff.sh eidolon-mvp > "$ART/scripted-bakeoff.jsonl"
+examples/m3/collect-bakeoff.sh "$ART/scripted-bakeoff.jsonl" \
+  > "$ART/scripted-bakeoff-summary.json"
+examples/m3/collect-action-trace.sh "$ART" > "$ART/action-trace-summary.json"
+```
+
+The action-trace collector reads `proxy-events.jsonl` and can prove scripted
+same-session bait action and controlled-reality entry. It does not claim
+autonomous agent behavior.
+
 ## M3 pwnkit Codex Bakeoff
 
 With the demo target and Eidolon proxy running, collect a pwnkit Codex run

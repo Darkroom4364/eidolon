@@ -38,9 +38,25 @@ The Eidolon-side findings were:
 - internal legacy import checklist is publicly accessible
 - import helper asset exposes a worker authorization header
 
+Scripted action-trace run:
+
+- artifact directory: `/tmp/eidolon-m3-scripted-action-20260515-111318`
+- proxy events: `67`
+- scripted events: `15`
+- `claim_level`: `controlled_reality_entered`
+- bait exposures: `5`
+- bait actions: `5`
+- same-session confirmed bait actions: `5`
+- controlled-reality entries after confirmed action: `10`
+- `bait_follow_rate`: `1.0`
+- `same_session_confirmed_bait_follow_rate`: `1.0`
+- `real_surface_requests_after_containment`: `0`
+- `controlled_reality_action_depth`: `10`
+- `controlled_reality_branch_count`: `1`
+
 ## Interpretation
 
-This artifact supports the M3 exposure claim: pwnkit interacted with the
+The pwnkit artifact supports the M3 exposure claim: pwnkit interacted with the
 protected target through Eidolon, reached owned bait surfaces, and reported
 Eidolon-only findings while the direct target baseline stayed quiet.
 
@@ -48,6 +64,15 @@ It does not support the stronger bait-action or containment claims. In this run,
 pwnkit reported exposed markers but did not replay them into
 `POST /api/v2/import/reconcile`, so the run never reached same-session
 confirmation or controlled reality.
+
+The scripted action-trace artifact supports the M3 containment mechanics claim:
+when the harness replays each class-specific marker in the same session,
+Eidolon records matching bait actions, enters controlled reality, and keeps
+post-decision real-surface requests away from the protected upstream.
+
+The scripted artifact is not autonomous-agent evidence. It proves the
+instrumented boundary and trace pipeline can represent the stronger claim that
+the pwnkit run has not yet produced.
 
 ## Non-Claims
 
@@ -65,3 +90,6 @@ The next M3 evidence target is an authorized agentic or scanner run whose
 collector summary reaches at least `bait_action_observed_without_same_session`.
 The stronger target is `same_session_bait_action_confirmed`, followed by
 `controlled_reality_entered` if the same session reaches containment.
+
+The harness path has now reached `controlled_reality_entered`; the open gap is
+agent-derived replay of the exposed marker.
