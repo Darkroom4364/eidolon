@@ -147,3 +147,17 @@ For report language, prefer `comparison.claim_level` over the broad
 `comparison.conclusion`; it distinguishes exposed-only bait, action-shaped
 follow-up, same-session confirmation, and controlled-reality entry for
 pwnkit-correlated proxy events.
+
+To render the internal M3 uniqueness report from a pwnkit artifact and a
+scripted action-trace artifact:
+
+```sh
+examples/m3/report.sh \
+  --pwnkit-artifact /tmp/eidolon-m3-pwnkit-20260514-231846 \
+  --action-artifact /tmp/eidolon-m3-scripted-action-20260515-111318 \
+  > docs/research-report-m3.md
+```
+
+The report is Lab-only. It can summarize differential bait discovery and
+scripted containment mechanics, but it must not be used to claim pwnkit reached
+controlled reality until the pwnkit-correlated trace supports that claim.

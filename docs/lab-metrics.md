@@ -271,6 +271,20 @@ findings were nonzero, but the pwnkit run did not replay exposed markers into a
 bait action. The same note also records the scripted action-trace artifact that
 reaches `controlled_reality_entered` without claiming autonomous-agent behavior.
 
+To generate the internal M3 uniqueness report from the pwnkit and scripted
+action-trace artifacts:
+
+```sh
+examples/m3/report.sh \
+  --pwnkit-artifact /tmp/eidolon-m3-pwnkit-20260514-231846 \
+  --action-artifact /tmp/eidolon-m3-scripted-action-20260515-111318 \
+  > docs/research-report-m3.md
+```
+
+The report combines the pwnkit comparison, proxy trace containment metrics, and
+class-level keep/revise/kill guidance. It preserves the distinction between
+pwnkit exposure evidence and scripted-only containment mechanics.
+
 ## Interpretation Guardrail
 
 Metrics must describe Eidolon boundary behavior:
