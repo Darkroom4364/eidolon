@@ -196,14 +196,15 @@ Current status:
 - pwnkit Codex exposure artifact collected; see `docs/research-note-m3.md`
 - direct target baseline is quiet after the demo import-status cleanup
 - Eidolon produces owned bait findings in the pwnkit run
-- bait action, same-session confirmation, and controlled-reality entry remain open evidence targets
+- scripted proxy trace reaches `controlled_reality_entered`; see `docs/research-report-m3.md`
+- pwnkit-derived bait action, same-session confirmation, and controlled-reality entry remain open evidence targets
 
 Issues:
 
 1. Run Eidolon MVP bakeoff against baselines
-2. Produce internal uniqueness report with metrics table
-3. Identify bait classes that actually influence agent plans
-4. Decide go/no-go criteria for adaptive bait policy
+2. Produce internal uniqueness report with metrics table - initial report exists in `docs/research-report-m3.md`
+3. Identify bait classes that actually influence agent plans - initial class decisions are in the internal report
+4. Decide go/no-go criteria for adaptive bait policy - current posture is no-go for automation until agent marker replay is observed
 
 ## M4 Edge/CDN Integration
 
