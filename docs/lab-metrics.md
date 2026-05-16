@@ -239,6 +239,13 @@ examples/m3/pwnkit-codex.sh all "$ART"
 examples/m3/collect-pwnkit-codex.sh "$ART" > "$ART/pwnkit-summary.json"
 ```
 
+For a session-control replay probe, set `EIDOLON_M3_PIN_SESSION=1` on the
+pwnkit command. The runner gives only the Eidolon leg one generated
+`eidolon_session` cookie and records the UUID in
+`$ART/pinned-eidolon-session-id.txt`. This is useful when testing whether an
+observed marker replay can become same-session evidence without seeding the
+marker itself.
+
 The collector consumes pwnkit SQLite `tool_artifact` events and Eidolon proxy
 JSONL events. It treats target interaction as observed only when a pwnkit HTTP
 artifact matches an Eidolon proxy request by method, path, and timestamp window.

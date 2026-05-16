@@ -10,6 +10,8 @@ PWNKIT_MODE="${PWNKIT_MODE:-web}"
 PWNKIT_RUNTIME="${PWNKIT_RUNTIME:-codex}"
 PWNKIT_RATE_LIMIT="${PWNKIT_RATE_LIMIT:-2}"
 PWNKIT_FEATURE_CODEX_LIVE_TARGETS="${PWNKIT_FEATURE_CODEX_LIVE_TARGETS:-1}"
+EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-0}"
+EIDOLON_M3_SESSION_ID="${EIDOLON_M3_SESSION_ID:-}"
 
 usage() {
   cat <<'USAGE'
@@ -28,6 +30,9 @@ Environment:
   PWNKIT_MODE               pwnkit mode. Defaults to web.
   PWNKIT_RUNTIME            pwnkit runtime. Defaults to codex.
   PWNKIT_RATE_LIMIT         pwnkit --rate-limit value. Defaults to 2.
+  EIDOLON_M3_PIN_SESSION    If true, pass one fixed eidolon_session cookie to
+                            the Eidolon leg. Defaults to 0.
+  EIDOLON_M3_SESSION_ID     Optional UUID for EIDOLON_M3_PIN_SESSION.
 
 For source checkouts, either set PWNKIT_NODE_ENTRY or keep a built checkout at
 ~/Projects/pwnkit/dist/pwnkit.js.
@@ -108,6 +113,47 @@ resolve_pwnkit_command() {
   exit 2
 }
 
+truthy() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    1|true|yes|on)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+new_session_id() {
+  if ! command -v uuidgen >/dev/null 2>&1; then
+    echo "error: EIDOLON_M3_PIN_SESSION requires uuidgen or EIDOLON_M3_SESSION_ID" >&2
+    exit 2
+  fi
+
+  uuidgen | tr '[:upper:]' '[:lower:]'
+}
+
+validate_session_id() {
+  local session_id="$1"
+
+  if [[ ! "$session_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo "error: EIDOLON_M3_SESSION_ID must be a UUID, got: $session_id" >&2
+    exit 2
+  fi
+}
+
+write_eidolon_auth_file() {
+  local label="$1"
+  local auth_file="$ARTIFACT_DIR/pwnkit-$label-auth.json"
+
+  printf '{"type":"cookie","value":"eidolon_session=%s"}\n' \
+    "$PINNED_EIDOLON_SESSION_ID" > "$auth_file"
+  printf '%s\n' "$PINNED_EIDOLON_SESSION_ID" > "$ARTIFACT_DIR/pinned-eidolon-session-id.txt"
+  printf '%s' "$auth_file"
+}
+
 valid_pwnkit_report() {
   local report_file="$1"
 
@@ -139,21 +185,28 @@ run_scan() {
   local output_json="$ARTIFACT_DIR/pwnkit-$label.json"
   local output_db="$ARTIFACT_DIR/pwnkit-$label.db"
   local output_stderr="$ARTIFACT_DIR/pwnkit-$label.stderr.log"
+  local -a scan_args=(
+    scan
+    --target "$url"
+    --mode "$PWNKIT_MODE"
+    --depth "$PWNKIT_DEPTH"
+    --runtime "$PWNKIT_RUNTIME"
+    --format json
+    --db-path "$output_db"
+    --rate-limit "$PWNKIT_RATE_LIMIT"
+  )
+
+  if [[ "$label" == "eidolon" && "$PIN_EIDOLON_SESSION" == true ]]; then
+    scan_args+=(--auth "$(write_eidolon_auth_file "$label")")
+  fi
+  scan_args+=(--verbose)
 
   echo "m3 pwnkit $label -> $url" >&2
 
   set +e
   PWNKIT_FEATURE_CODEX_LIVE_TARGETS="$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" \
   PWNKIT_NO_UPDATE_CHECK=1 \
-    "${PWNKIT_COMMAND[@]}" scan \
-      --target "$url" \
-      --mode "$PWNKIT_MODE" \
-      --depth "$PWNKIT_DEPTH" \
-      --runtime "$PWNKIT_RUNTIME" \
-      --format json \
-      --db-path "$output_db" \
-      --rate-limit "$PWNKIT_RATE_LIMIT" \
-      --verbose \
+    "${PWNKIT_COMMAND[@]}" "${scan_args[@]}" \
       > "$output_json" \
       2> "$output_stderr"
   local exit_code=$?
@@ -196,6 +249,14 @@ main() {
   require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
   mkdir -p "$ARTIFACT_DIR"
   printf '%s\n' "$ARTIFACT_DIR" > "$ARTIFACT_DIR/artifact-dir.txt"
+
+  PIN_EIDOLON_SESSION=false
+  PINNED_EIDOLON_SESSION_ID=""
+  if truthy "$EIDOLON_M3_PIN_SESSION"; then
+    PIN_EIDOLON_SESSION=true
+    PINNED_EIDOLON_SESSION_ID="${EIDOLON_M3_SESSION_ID:-$(new_session_id)}"
+    validate_session_id "$PINNED_EIDOLON_SESSION_ID"
+  fi
 
   declare -a PWNKIT_COMMAND
   resolve_pwnkit_command
