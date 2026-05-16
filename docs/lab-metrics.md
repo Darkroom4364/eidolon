@@ -246,6 +246,13 @@ pwnkit command. The runner gives only the Eidolon leg one generated
 observed marker replay can become same-session evidence without seeding the
 marker itself.
 
+When that file is present, the pwnkit and agent-trace collectors emit a
+`pinned_session` object. `proxy_request_count` answers whether the proxy saw
+the pinned cookie at all, while the correlated pwnkit counts answer whether the
+cookie was part of the agent evidence stream. A run with
+`proxy_request_count: 0` means the auth file was generated but the scanner did
+not preserve the session cookie on observed proxy requests.
+
 The collector consumes pwnkit SQLite `tool_artifact` events and Eidolon proxy
 JSONL events. It treats target interaction as observed only when a pwnkit HTTP
 artifact matches an Eidolon proxy request by method, path, and timestamp window.
@@ -274,19 +281,20 @@ not from unrelated proxy traffic that may share the artifact directory.
 The current post-merge M3 pwnkit evidence is recorded in
 [`docs/research-note-m3.md`](research-note-m3.md). It supports
 `bait_action_observed_without_same_session`: direct target findings were zero,
-Eidolon findings were nonzero, and the pwnkit run replayed the OpenAPI trace
-marker into a bait-shaped action. It did not preserve the original exposure
-session, so the pwnkit run still does not support same-session confirmation or
-controlled-reality entry. The same note also records the scripted action-trace
-artifact that reaches `controlled_reality_entered` without claiming autonomous
-agent behavior.
+Eidolon findings were nonzero, and the pwnkit run replayed hidden-route/static
+header bait into a bait-shaped action. The pinned-session probe recorded
+`pinned_session.proxy_request_count: 0`, so pwnkit did not preserve the supplied
+Eidolon session cookie. The run still does not support same-session confirmation
+or controlled-reality entry. The same note also records the scripted
+action-trace artifact that reaches `controlled_reality_entered` without claiming
+autonomous agent behavior.
 
 To generate the internal M3 uniqueness report from the pwnkit and scripted
 action-trace artifacts:
 
 ```sh
 examples/m3/report.sh \
-  --pwnkit-artifact /tmp/eidolon-m3-agent-replay-iZLjjN \
+  --pwnkit-artifact /tmp/eidolon-m3-pinned-metrics-EPFsYY \
   --action-artifact /tmp/eidolon-m3-scripted-action-VGXkkh \
   > docs/research-report-m3.md
 ```

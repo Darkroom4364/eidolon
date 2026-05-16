@@ -43,10 +43,17 @@ if [[ ! -s "$PROXY_LOG" ]]; then
   exit 2
 fi
 
+PINNED_SESSION_ID=""
+PINNED_SESSION_FILE="$ARTIFACT_DIR/pinned-eidolon-session-id.txt"
+if [[ -s "$PINNED_SESSION_FILE" ]]; then
+  read -r PINNED_SESSION_ID < "$PINNED_SESSION_FILE"
+fi
+
 jq -s \
   --arg artifact_dir "$ARTIFACT_DIR" \
   --arg run_kind "$RUN_KIND" \
-  --arg evidence_source "$EVIDENCE_SOURCE" '
+  --arg evidence_source "$EVIDENCE_SOURCE" \
+  --arg pinned_session_id "$PINNED_SESSION_ID" '
   def observed_at_ms($event):
     (($event.observed_at // "")
      | sub("\\.[0-9]+Z$"; "Z")
@@ -321,6 +328,38 @@ jq -s \
         }
     );
 
+  def pinned_session_summary($exposures; $actions; $confirmed_actions; $controlled_after_confirmed):
+    if $pinned_session_id == "" then
+      {
+        present: false,
+        session_id: null,
+        proxy_request_count: 0,
+        bait_exposure_count: 0,
+        bait_action_count: 0,
+        same_session_confirmed_bait_action_count: 0,
+        controlled_reality_entry_count: 0,
+        same_session_confirmation_possible: false
+      }
+    else
+      (request_events | map(select(.session_id == $pinned_session_id))) as $session_requests
+      | ($exposures | map(select(.session_id == $pinned_session_id))) as $session_exposures
+      | ($actions | map(select(.session_id == $pinned_session_id))) as $session_actions
+      | ($confirmed_actions | map(select(.session_id == $pinned_session_id))) as $session_confirmed_actions
+      | ($controlled_after_confirmed | map(select(.session_id == $pinned_session_id))) as $session_controlled
+      | {
+          present: true,
+          session_id: $pinned_session_id,
+          proxy_request_count: ($session_requests | length),
+          bait_exposure_count: ($session_exposures | length),
+          bait_action_count: ($session_actions | length),
+          same_session_confirmed_bait_action_count: ($session_confirmed_actions | length),
+          controlled_reality_entry_count: ($session_controlled | length),
+          same_session_confirmation_possible: (
+            ($session_exposures | length) > 0 and ($session_actions | length) > 0
+          )
+        }
+    end;
+
   def source_note:
     if $run_kind == "m3_agent_replay_trace" then
       "This collector reads Eidolon proxy trace events from an authorized agent/scanner run. Agent-derived claims require the companion agent/tool artifact, not proxy trace alone."
@@ -366,6 +405,7 @@ jq -s \
         controlled_reality_action_depth: controlled_reality_action_depth,
         controlled_reality_branch_count: controlled_reality_branch_count
       },
+      pinned_session: pinned_session_summary($bait_exposures; $bait_actions; $confirmed_bait_actions; $controlled_after_confirmed),
       sessions: session_summaries($bait_exposures; $bait_actions; $confirmed_bait_actions; $controlled_after_confirmed),
       bait_events: {
         exposures: $bait_exposures,

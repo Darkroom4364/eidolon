@@ -317,9 +317,15 @@ proxy_summary() {
 direct_summary="$(run_summary direct)"
 eidolon_summary="$(run_summary eidolon)"
 proxy_events="$(proxy_summary)"
+PINNED_SESSION_ID=""
+PINNED_SESSION_FILE="$ARTIFACT_DIR/pinned-eidolon-session-id.txt"
+if [[ -s "$PINNED_SESSION_FILE" ]]; then
+  read -r PINNED_SESSION_ID < "$PINNED_SESSION_FILE"
+fi
 
 jq -n \
   --arg artifact_dir "$ARTIFACT_DIR" \
+  --arg pinned_session_id "$PINNED_SESSION_ID" \
   --argjson direct "$direct_summary" \
   --argjson eidolon "$eidolon_summary" \
   --argjson proxy "$proxy_events" \
@@ -427,6 +433,48 @@ jq -n \
          )
        | $entry
      ];
+   def pinned_session_summary:
+     if $pinned_session_id == "" then
+       {
+         present: false,
+         session_id: null,
+         cookie_preserved: false,
+         proxy_request_count: 0,
+         correlated_target_request_count: 0,
+         bait_exposure_count: 0,
+         correlated_bait_exposure_count: 0,
+         bait_action_count: 0,
+         correlated_bait_action_count: 0,
+         same_session_confirmed_bait_action_count: 0,
+         controlled_reality_entry_count: 0,
+         same_session_confirmation_possible: false
+       }
+     else
+       (($proxy.request_paths // []) | map(select(.session_id == $pinned_session_id))) as $proxy_requests
+       | (correlated_target_requests | map(select(.proxy_session_id == $pinned_session_id))) as $correlated_requests
+       | (($proxy.bait_events.exposures // []) | map(select(.session_id == $pinned_session_id))) as $proxy_exposures
+       | (correlated_bait_exposures | map(select(.session_id == $pinned_session_id))) as $correlated_exposures
+       | (($proxy.bait_events.actions // []) | map(select(.session_id == $pinned_session_id))) as $proxy_actions
+       | (correlated_bait_actions | map(select(.session_id == $pinned_session_id))) as $correlated_actions
+       | (correlated_confirmed_bait_actions | map(select(.session_id == $pinned_session_id))) as $confirmed_actions
+       | (correlated_controlled_reality_entries | map(select(.session_id == $pinned_session_id))) as $controlled_entries
+       | {
+           present: true,
+           session_id: $pinned_session_id,
+           cookie_preserved: (($proxy_requests | length) > 0),
+           proxy_request_count: ($proxy_requests | length),
+           correlated_target_request_count: ($correlated_requests | length),
+           bait_exposure_count: ($proxy_exposures | length),
+           correlated_bait_exposure_count: ($correlated_exposures | length),
+           bait_action_count: ($proxy_actions | length),
+           correlated_bait_action_count: ($correlated_actions | length),
+           same_session_confirmed_bait_action_count: ($confirmed_actions | length),
+           controlled_reality_entry_count: ($controlled_entries | length),
+           same_session_confirmation_possible: (
+             ($correlated_exposures | length) > 0 and ($correlated_actions | length) > 0
+           )
+         }
+     end;
    def target_observed: ((correlated_target_requests | length) > 0);
    def status:
      if (target_observed | not) then
@@ -462,6 +510,7 @@ jq -n \
       eidolon: $eidolon
     },
     eidolon_proxy: $proxy,
+    pinned_session: pinned_session_summary,
     comparison: {
       direct_requested_paths: unique_paths($direct),
       eidolon_requested_paths: unique_paths($eidolon),
