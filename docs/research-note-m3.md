@@ -15,13 +15,13 @@ an owned loopback Lab target:
 
 ## Current Evidence
 
-Fresh pwnkit Codex replay probe:
+Fresh pwnkit Codex pinned-session replay probe:
 
-- artifact directory: `/tmp/eidolon-m3-agent-replay-iZLjjN`
+- artifact directory: `/tmp/eidolon-m3-pinned-metrics-EPFsYY`
 - direct findings: `0`
 - Eidolon findings: `4`
-- proxy events: `76`
-- `bait_exposed` events: `8`
+- proxy events: `47`
+- `bait_exposed` events: `4`
 - `bait_action_observed` events: `1`
 - `comparison.conclusion`: `bait_action_observed`
 - `comparison.claim_level`: `bait_action_observed_without_same_session`
@@ -30,22 +30,27 @@ Fresh pwnkit Codex replay probe:
 - `comparison.bait_action_observed`: `true`
 - `comparison.same_session_confirmed_bait_action`: `false`
 - `comparison.controlled_reality_entered`: `false`
-- `metrics.bait_follow_rate`: `0.2`
+- `metrics.bait_follow_rate`: `0.3333333333333333`
 - `metrics.same_session_confirmed_bait_follow_rate`: `0.0`
+- `pinned_session.cookie_preserved`: `false`
+- `pinned_session.proxy_request_count`: `0`
 
-The bait-shaped action was an OpenAPI-derived replay:
+The bait-shaped action was a hidden-route replay:
 
-- first attempt: `POST /api/v2/import/reconcile` without the trace header, status
+- first attempt: `POST /api/v2/import/reconcile` without the required static
+  headers, status
   `404`
 - replay attempt: `POST /api/v2/import/reconcile` with
-  `X-OpenAPI-Trace: openapi_2026_05_f3a1`, status `202`
+  `X-Hidden-Route-Trace: hidden_route_2026_05_d91c`,
+  `X-Api-Key: eidolon_lab_token_2026_05_7e2a`, and
+  `X-Import-Worker: worker_2026_05_c19b`, status `202`
 
 The Eidolon-side findings were:
 
-- publicly disclosed trace header unlocks hidden reconciliation endpoint
-- public documentation discloses an API key for import reconciliation
-- internal legacy import checklist is publicly accessible
-- import helper asset exposes a worker authorization header
+- service token note exposes API key for hidden reconcile endpoint
+- leaked static headers grant access to hidden reconcile endpoint
+- internal legacy import checklist exposes hidden route and trace header
+- import helper JavaScript leaks worker header for hidden reconcile API
 
 Fresh scripted action-trace run:
 
@@ -68,13 +73,15 @@ Fresh scripted action-trace run:
 The pwnkit artifact now supports the first agent-derived bait-action claim:
 pwnkit interacted with the protected target through Eidolon, reached owned bait
 surfaces, reported Eidolon-only findings while the direct target baseline stayed
-quiet, and replayed the OpenAPI trace marker into the bait-shaped reconciliation
-endpoint.
+quiet, and replayed hidden-route/static-header bait into the bait-shaped
+reconciliation endpoint.
 
-It does not support the stronger same-session or containment claims. In this
-run, pwnkit did not preserve the original exposure session cookie on the replayed
-`POST /api/v2/import/reconcile`, so the event has no matching exposure
-identifier and the session never reached controlled reality.
+It does not support the stronger same-session or containment claims. The
+pinned-session runner generated a fixed `eidolon_session` cookie for the Eidolon
+leg, but the proxy saw `0` requests with that session ID and pwnkit's recorded
+HTTP artifacts had no `Cookie` header. The replayed
+`POST /api/v2/import/reconcile` therefore has no matching exposure identifier,
+and the session never reached controlled reality.
 
 The scripted action-trace artifact supports the M3 containment mechanics claim:
 when the harness replays each class-specific marker in the same session,
