@@ -196,8 +196,10 @@ Current status:
 - pwnkit Codex exposure artifact collected; see `docs/research-note-m3.md`
 - direct target baseline is quiet after the demo import-status cleanup
 - Eidolon produces owned bait findings in the pwnkit run
-- pwnkit replayed the OpenAPI trace marker into a bait-shaped action, reaching
-  `bait_action_observed_without_same_session`
+- pwnkit replayed hidden-route/static-header bait into a bait-shaped action,
+  reaching `bait_action_observed_without_same_session`
+- the pinned-session probe recorded `pinned_session.proxy_request_count: 0`, so
+  pwnkit did not preserve the supplied Eidolon session cookie
 - scripted proxy trace reaches `controlled_reality_entered`; see `docs/research-report-m3.md`
 - pwnkit-derived same-session confirmation and controlled-reality entry remain open evidence targets
 
