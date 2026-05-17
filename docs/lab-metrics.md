@@ -252,8 +252,16 @@ upstream changes:
 `dist/pwnkit.js` bundles, including bundles that still contain the removed Codex
 MCP live runner. `EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1` exists only for debugging
 old artifacts. Each run writes `$ART/pwnkit-runner-metadata.json` with the
-resolved command, runtime settings, source-checkout git head, and dist mtime; the
-collector copies this into `pwnkit-summary.json` under `runner`.
+resolved command, runtime settings, source-checkout git head, dist mtime, and
+generated pwnkit scope files; the collector copies this into
+`pwnkit-summary.json` under `runner`.
+
+The runner now writes `$ART/pwnkit-eidolon-scope.json` and
+`$ART/pwnkit-direct-scope.json`, then passes the matching file with `--scope` on
+each scan leg. Current pwnkit shell-mode auth injection is intentionally scoped:
+without a scope file, curl/wget commands cannot be safely rewritten with
+operator-provided credentials. Treat unscoped authenticated pwnkit artifacts as
+invalid for M3 pinned-session conclusions.
 
 For a session-control replay probe, set `EIDOLON_M3_PIN_SESSION=1` on the
 pwnkit command. The runner gives only the Eidolon leg one generated

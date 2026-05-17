@@ -42,6 +42,11 @@ Environment:
                             If true, skip the source-checkout dist freshness
                             guard. Defaults to 0.
 
+The runner writes one pwnkit scope file per scan leg and always passes
+`--scope`. This keeps pwnkit's shell-mode auth injection active for the
+pinned-session Eidolon leg and fails closed if a leg target falls outside the
+generated loopback scope.
+
 For source checkouts, either set PWNKIT_NODE_ENTRY or keep a built checkout at
 ~/Projects/pwnkit/dist/pwnkit.js. This runner refuses obviously stale ignored
 dist bundles unless EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1 is set.
@@ -82,6 +87,22 @@ require_loopback_url() {
 
   echo "error: $name must be an http loopback URL, got: $url" >&2
   exit 2
+}
+
+loopback_host_for_url() {
+  local url="$1"
+  local rest="${url#http://}"
+  local authority="$rest"
+  local host
+
+  if [[ "$authority" == \[*\]* ]]; then
+    host="${authority%%]*}"
+    host="${host#[}"
+  else
+    host="${authority%%:*}"
+  fi
+
+  printf '%s' "$host"
 }
 
 resolve_pwnkit_command() {
@@ -217,6 +238,39 @@ json_bool() {
   fi
 }
 
+require_jq() {
+  local context="$1"
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "error: jq is required to $context" >&2
+    exit 2
+  fi
+}
+
+write_pwnkit_scope_file() {
+  local label="$1"
+  local url="$2"
+  local scope_file="$ARTIFACT_DIR/pwnkit-$label-scope.json"
+  local host
+  local bracketed_host=""
+
+  host="$(loopback_host_for_url "$url")"
+  if [[ "$host" == *:* ]]; then
+    bracketed_host="[$host]"
+  fi
+
+  require_jq "write pwnkit scope files"
+  jq -n \
+    --arg host "$host" \
+    --arg bracketed_host "$bracketed_host" \
+    '{
+      in_scope: ([ $host, $bracketed_host ] | map(select(. != "")) | unique),
+      out_of_scope: []
+    }' > "$scope_file"
+
+  printf '%s' "$scope_file"
+}
+
 write_runner_metadata() {
   local metadata_file="$ARTIFACT_DIR/pwnkit-runner-metadata.json"
   local pwnkit_command_quoted
@@ -227,10 +281,7 @@ write_runner_metadata() {
   local allow_stale_dist
   local pin_session
 
-  if ! command -v jq >/dev/null 2>&1; then
-    echo "error: jq is required to write pwnkit runner metadata" >&2
-    exit 2
-  fi
+  require_jq "write pwnkit runner metadata"
 
   printf -v pwnkit_command_quoted '%q ' "${PWNKIT_COMMAND[@]}"
   pwnkit_command_quoted="${pwnkit_command_quoted% }"
@@ -264,6 +315,10 @@ write_runner_metadata() {
     --arg pwnkit_repo_dir "$pwnkit_repo_dir" \
     --arg pwnkit_git_head "$pwnkit_git_head" \
     --arg pwnkit_git_head_time "$pwnkit_git_head_time" \
+    --arg pwnkit_eidolon_scope_file "$PWNKIT_EIDOLON_SCOPE_FILE" \
+    --arg pwnkit_direct_scope_file "$PWNKIT_DIRECT_SCOPE_FILE" \
+    --slurpfile pwnkit_eidolon_scope "$PWNKIT_EIDOLON_SCOPE_FILE" \
+    --slurpfile pwnkit_direct_scope "$PWNKIT_DIRECT_SCOPE_FILE" \
     --argjson allow_stale_dist "$allow_stale_dist" \
     --argjson pin_session "$pin_session" \
     '{
@@ -300,7 +355,19 @@ write_runner_metadata() {
           else ($pwnkit_git_head_time | tonumber)
           end
         ),
-        stale_dist_guard_bypassed: $allow_stale_dist
+        stale_dist_guard_bypassed: $allow_stale_dist,
+        scopes: {
+          eidolon: {
+            path: $pwnkit_eidolon_scope_file,
+            in_scope: ($pwnkit_eidolon_scope[0].in_scope // []),
+            out_of_scope: ($pwnkit_eidolon_scope[0].out_of_scope // [])
+          },
+          direct: {
+            path: $pwnkit_direct_scope_file,
+            in_scope: ($pwnkit_direct_scope[0].in_scope // []),
+            out_of_scope: ($pwnkit_direct_scope[0].out_of_scope // [])
+          }
+        }
       },
       eidolon: {
         pinned_session_enabled: $pin_session
@@ -367,6 +434,7 @@ run_scan() {
   local output_json="$ARTIFACT_DIR/pwnkit-$label.json"
   local output_db="$ARTIFACT_DIR/pwnkit-$label.db"
   local output_stderr="$ARTIFACT_DIR/pwnkit-$label.stderr.log"
+  local scope_file
   local -a scan_args=(
     scan
     --target "$url"
@@ -377,6 +445,20 @@ run_scan() {
     --db-path "$output_db"
     --rate-limit "$PWNKIT_RATE_LIMIT"
   )
+
+  case "$label" in
+    eidolon)
+      scope_file="$PWNKIT_EIDOLON_SCOPE_FILE"
+      ;;
+    direct)
+      scope_file="$PWNKIT_DIRECT_SCOPE_FILE"
+      ;;
+    *)
+      echo "error: unknown pwnkit scan label: $label" >&2
+      return 2
+      ;;
+  esac
+  scan_args+=(--scope "$scope_file")
 
   if [[ "$label" == "eidolon" && "$PIN_EIDOLON_SESSION" == true ]]; then
     scan_args+=(--auth "$(write_eidolon_auth_file "$label")")
@@ -448,6 +530,8 @@ main() {
   PWNKIT_COMMAND_SOURCE="unknown"
   PWNKIT_ENTRY_PATH=""
   resolve_pwnkit_command
+  PWNKIT_EIDOLON_SCOPE_FILE="$(write_pwnkit_scope_file "eidolon" "$PROXY_URL")"
+  PWNKIT_DIRECT_SCOPE_FILE="$(write_pwnkit_scope_file "direct" "$TARGET_URL")"
   write_runner_metadata
 
   case "$MODE" in
