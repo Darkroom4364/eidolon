@@ -15,9 +15,10 @@ an owned loopback Lab target:
 
 ## Current Evidence
 
-Fresh pwnkit Codex pinned-session replay probe:
+Historical pwnkit Codex pinned-session replay probe:
 
 - artifact directory: `/tmp/eidolon-m3-pinned-metrics-EPFsYY`
+- validity: `stale-runner artifact; current pwnkit rerun required`
 - direct findings: `0`
 - Eidolon findings: `4`
 - proxy events: `47`
@@ -34,6 +35,12 @@ Fresh pwnkit Codex pinned-session replay probe:
 - `metrics.same_session_confirmed_bait_follow_rate`: `0.0`
 - `pinned_session.cookie_preserved`: `false`
 - `pinned_session.proxy_request_count`: `0`
+
+After syncing pwnkit main, this artifact was traced to an ignored stale
+source-checkout `dist/pwnkit.js` bundle that still contained pwnkit's removed
+Codex MCP live runner. Keep the artifact as a historical Lab record only. Do not
+use it to claim current pwnkit behavior, current pinned-session handling, or a
+current same-session failure.
 
 The bait-shaped action was a hidden-route replay:
 
@@ -70,18 +77,18 @@ Fresh scripted action-trace run:
 
 ## Interpretation
 
-The pwnkit artifact now supports the first agent-derived bait-action claim:
-pwnkit interacted with the protected target through Eidolon, reached owned bait
-surfaces, reported Eidolon-only findings while the direct target baseline stayed
-quiet, and replayed hidden-route/static-header bait into the bait-shaped
-reconciliation endpoint.
+The stale-runner pwnkit artifact previously appeared to support the first
+agent-derived bait-action claim: pwnkit interacted with the protected target
+through Eidolon, reached owned bait surfaces, reported Eidolon-only findings
+while the direct target baseline stayed quiet, and replayed hidden-route/static
+header bait into the bait-shaped reconciliation endpoint. That interpretation is
+now superseded for current pwnkit main until the run is repeated with a fresh
+built pwnkit bundle and the direct ChatGPT Codex provider.
 
-It does not support the stronger same-session or containment claims. The
-pinned-session runner generated a fixed `eidolon_session` cookie for the Eidolon
-leg, but the proxy saw `0` requests with that session ID and pwnkit's recorded
-HTTP artifacts had no `Cookie` header. The replayed
-`POST /api/v2/import/reconcile` therefore has no matching exposure identifier,
-and the session never reached controlled reality.
+The stale artifact did not support the stronger same-session or containment
+claims. Because the pwnkit bundle was stale, the recorded
+`pinned_session.proxy_request_count: 0` result must not be interpreted as current
+pwnkit's cookie behavior.
 
 The scripted action-trace artifact supports the M3 containment mechanics claim:
 when the harness replays each class-specific marker in the same session,
@@ -97,6 +104,7 @@ produced.
 
 M3 does not yet claim:
 
+- current pwnkit main behavior from the stale pinned-session artifact
 - same-session causal proof for the pwnkit run
 - controlled-reality entry from a pwnkit-derived chain
 - production readiness
@@ -104,13 +112,16 @@ M3 does not yet claim:
 
 ## Remaining M3 Work
 
-The next M3 evidence target is an authorized agentic or scanner run whose
-collector summary reaches `same_session_bait_action_confirmed`, followed by
-`controlled_reality_entered` if the same session reaches containment.
+The next M3 evidence target is a fresh authorized pwnkit or scanner run against
+current subject code. For pwnkit, rebuild the source checkout before running
+`examples/m3/pwnkit-codex.sh`; the runner now blocks obviously stale
+`dist/pwnkit.js` bundles. The target collector summary is
+`same_session_bait_action_confirmed`, followed by `controlled_reality_entered` if
+the same session reaches containment.
 
-The pwnkit path has now reached `bait_action_observed_without_same_session`.
-The harness path has reached `controlled_reality_entered`. The open gap is
-agent-derived same-session replay of the exposed marker.
+The historical pwnkit path reached `bait_action_observed_without_same_session`
+with a stale runner. The harness path has reached `controlled_reality_entered`.
+The open gap is fresh agent-derived same-session replay of the exposed marker.
 
 Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
 rules, then collect the resulting proxy trace with
