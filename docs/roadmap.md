@@ -193,15 +193,18 @@ Prove whether Eidolon is meaningfully better than static deception and generic b
 
 Current status:
 
-- pwnkit Codex exposure artifact collected; see `docs/research-note-m3.md`
-- direct target baseline is quiet after the demo import-status cleanup
-- Eidolon produces owned bait findings in the pwnkit run
-- pwnkit replayed hidden-route/static-header bait into a bait-shaped action,
-  reaching `bait_action_observed_without_same_session`
-- the pinned-session probe recorded `pinned_session.proxy_request_count: 0`, so
-  pwnkit did not preserve the supplied Eidolon session cookie
+- historical pwnkit Codex exposure artifact collected; see
+  `docs/research-note-m3.md`
+- that pwnkit artifact was later traced to a stale ignored source-checkout
+  `dist/pwnkit.js`; current pwnkit main requires a fresh rerun
+- the stale pwnkit run produced owned bait findings and replayed
+  hidden-route/static-header bait into a bait-shaped action, but it no longer
+  supports current pwnkit claims
+- the stale pinned-session probe recorded `pinned_session.proxy_request_count: 0`;
+  do not interpret that as current pwnkit cookie behavior
 - scripted proxy trace reaches `controlled_reality_entered`; see `docs/research-report-m3.md`
-- pwnkit-derived same-session confirmation and controlled-reality entry remain open evidence targets
+- fresh pwnkit-derived same-session confirmation and controlled-reality entry
+  remain open evidence targets
 
 Issues:
 

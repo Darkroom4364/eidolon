@@ -9,9 +9,10 @@ PWNKIT_DEPTH="${PWNKIT_DEPTH:-quick}"
 PWNKIT_MODE="${PWNKIT_MODE:-web}"
 PWNKIT_RUNTIME="${PWNKIT_RUNTIME:-codex}"
 PWNKIT_RATE_LIMIT="${PWNKIT_RATE_LIMIT:-2}"
-PWNKIT_FEATURE_CODEX_LIVE_TARGETS="${PWNKIT_FEATURE_CODEX_LIVE_TARGETS:-1}"
+PWNKIT_FEATURE_CODEX_LIVE_TARGETS="${PWNKIT_FEATURE_CODEX_LIVE_TARGETS:-}"
 EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-0}"
 EIDOLON_M3_SESSION_ID="${EIDOLON_M3_SESSION_ID:-}"
+EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST="${EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST:-0}"
 
 usage() {
   cat <<'USAGE'
@@ -30,12 +31,20 @@ Environment:
   PWNKIT_MODE               pwnkit mode. Defaults to web.
   PWNKIT_RUNTIME            pwnkit runtime. Defaults to codex.
   PWNKIT_RATE_LIMIT         pwnkit --rate-limit value. Defaults to 2.
+  PWNKIT_FEATURE_CODEX_LIVE_TARGETS
+                            Optional legacy pwnkit feature flag. Not set by
+                            default; current pwnkit Codex live scans use the
+                            direct ChatGPT Codex provider.
   EIDOLON_M3_PIN_SESSION    If true, pass one fixed eidolon_session cookie to
                             the Eidolon leg. Defaults to 0.
   EIDOLON_M3_SESSION_ID     Optional UUID for EIDOLON_M3_PIN_SESSION.
+  EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST
+                            If true, skip the source-checkout dist freshness
+                            guard. Defaults to 0.
 
 For source checkouts, either set PWNKIT_NODE_ENTRY or keep a built checkout at
-~/Projects/pwnkit/dist/pwnkit.js.
+~/Projects/pwnkit/dist/pwnkit.js. This runner refuses obviously stale ignored
+dist bundles unless EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1 is set.
 
 Some pwnkit builds exit nonzero after writing a valid JSON report with findings.
 This runner keeps those reports and continues; missing or invalid reports remain
@@ -81,6 +90,7 @@ resolve_pwnkit_command() {
       echo "error: PWNKIT_NODE_ENTRY does not exist: $PWNKIT_NODE_ENTRY" >&2
       exit 2
     fi
+    validate_pwnkit_node_entry "$PWNKIT_NODE_ENTRY"
     PWNKIT_COMMAND=(node "$PWNKIT_NODE_ENTRY")
     return
   fi
@@ -95,6 +105,7 @@ resolve_pwnkit_command() {
   fi
 
   if [[ -f "$HOME/Projects/pwnkit/dist/pwnkit.js" ]]; then
+    validate_pwnkit_node_entry "$HOME/Projects/pwnkit/dist/pwnkit.js"
     PWNKIT_COMMAND=(node "$HOME/Projects/pwnkit/dist/pwnkit.js")
     return
   fi
@@ -124,6 +135,55 @@ truthy() {
       return 1
       ;;
   esac
+}
+
+mtime_seconds() {
+  local path="$1"
+
+  if stat -f %m "$path" >/dev/null 2>&1; then
+    stat -f %m "$path"
+    return
+  fi
+
+  stat -c %Y "$path"
+}
+
+validate_pwnkit_node_entry() {
+  local entry="$1"
+  local entry_dir
+  local repo_dir
+  local head_time
+  local dist_time
+
+  if truthy "$EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST"; then
+    return
+  fi
+
+  entry_dir="$(cd "$(dirname "$entry")" && pwd -P)"
+  if [[ "$(basename "$entry_dir")" != "dist" || "$(basename "$entry")" != "pwnkit.js" ]]; then
+    return
+  fi
+
+  repo_dir="$(cd "$entry_dir/.." && pwd -P)"
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
+
+  head_time="$(git -C "$repo_dir" log -1 --format=%ct 2>/dev/null || true)"
+  dist_time="$(mtime_seconds "$entry")"
+  if [[ -n "$head_time" && "$dist_time" -lt "$head_time" ]]; then
+    echo "error: pwnkit dist bundle is older than the source checkout HEAD: $entry" >&2
+    echo "       run: (cd \"$repo_dir\" && pnpm run build)" >&2
+    echo "       or set EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1 to bypass." >&2
+    exit 2
+  fi
+
+  if grep -q 'codex_mcp_runner\|PWNKIT_FEATURE_CODEX_LIVE_TARGETS' "$entry"; then
+    echo "error: pwnkit dist bundle still contains the removed Codex MCP live runner: $entry" >&2
+    echo "       run: (cd \"$repo_dir\" && pnpm run build)" >&2
+    echo "       or set EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1 to bypass." >&2
+    exit 2
+  fi
 }
 
 new_session_id() {
@@ -202,11 +262,15 @@ run_scan() {
   scan_args+=(--verbose)
 
   echo "m3 pwnkit $label -> $url" >&2
+  local -a pwnkit_env=(
+    PWNKIT_NO_UPDATE_CHECK=1
+  )
+  if [[ -n "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" ]]; then
+    pwnkit_env+=(PWNKIT_FEATURE_CODEX_LIVE_TARGETS="$PWNKIT_FEATURE_CODEX_LIVE_TARGETS")
+  fi
 
   set +e
-  PWNKIT_FEATURE_CODEX_LIVE_TARGETS="$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" \
-  PWNKIT_NO_UPDATE_CHECK=1 \
-    "${PWNKIT_COMMAND[@]}" "${scan_args[@]}" \
+  env "${pwnkit_env[@]}" "${PWNKIT_COMMAND[@]}" "${scan_args[@]}" \
       > "$output_json" \
       2> "$output_stderr"
   local exit_code=$?

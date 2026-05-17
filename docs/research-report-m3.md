@@ -5,6 +5,8 @@
 - Scripted action artifact: `/tmp/eidolon-m3-scripted-action-VGXkkh`
 - Report posture: `no-go for adaptive automation; continue Lab-only class tuning and agent replay work`
 - Safety note: this is an internal Lab artifact. It is not a public-v1, production-readiness, or autonomous-attacker-attribution claim.
+- Runner freshness note: source-checkout pwnkit artifacts must come from a fresh built `dist/pwnkit.js`; stale source-checkout artifacts should be regenerated before making current pwnkit claims.
+- Validity note: the pwnkit artifact was later traced to a stale ignored source-checkout `dist/pwnkit.js` bundle. Treat pwnkit rows below as historical only; rerun with a fresh pwnkit build before making current pwnkit claims. Scripted action-trace rows remain useful for containment mechanics.
 
 ## Claim Ladder
 

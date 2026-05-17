@@ -239,6 +239,20 @@ examples/m3/pwnkit-codex.sh all "$ART"
 examples/m3/collect-pwnkit-codex.sh "$ART" > "$ART/pwnkit-summary.json"
 ```
 
+Current pwnkit main routes `--runtime codex` through the direct ChatGPT Codex
+provider. The runner no longer sets the removed legacy Codex-live feature flag by
+default. When running from a pwnkit source checkout, rebuild after pulling
+upstream changes:
+
+```sh
+(cd ~/Projects/pwnkit && pnpm run build)
+```
+
+`examples/m3/pwnkit-codex.sh` refuses obviously stale source-checkout
+`dist/pwnkit.js` bundles, including bundles that still contain the removed Codex
+MCP live runner. `EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1` exists only for debugging
+old artifacts.
+
 For a session-control replay probe, set `EIDOLON_M3_PIN_SESSION=1` on the
 pwnkit command. The runner gives only the Eidolon leg one generated
 `eidolon_session` cookie and records the UUID in
@@ -278,16 +292,15 @@ Use `metrics.bait_follow_rate` for action-shaped follow-up rate and
 same-session rate. These rates are computed from `comparison.correlated_bait_events`,
 not from unrelated proxy traffic that may share the artifact directory.
 
-The current post-merge M3 pwnkit evidence is recorded in
-[`docs/research-note-m3.md`](research-note-m3.md). It supports
-`bait_action_observed_without_same_session`: direct target findings were zero,
-Eidolon findings were nonzero, and the pwnkit run replayed hidden-route/static
-header bait into a bait-shaped action. The pinned-session probe recorded
-`pinned_session.proxy_request_count: 0`, so pwnkit did not preserve the supplied
-Eidolon session cookie. The run still does not support same-session confirmation
-or controlled-reality entry. The same note also records the scripted
-action-trace artifact that reaches `controlled_reality_entered` without claiming
-autonomous agent behavior.
+The current post-merge M3 note is recorded in
+[`docs/research-note-m3.md`](research-note-m3.md). Its pwnkit artifact is now
+treated as historical only: after syncing pwnkit main, the run was traced to a
+stale ignored source-checkout `dist/pwnkit.js` bundle that still contained the
+removed Codex MCP live runner. Do not use that artifact to claim current pwnkit
+behavior, pinned-session handling, or same-session failure. Rerun the pwnkit
+comparison with a fresh pwnkit build before interpreting current pwnkit evidence.
+The same note also records the scripted action-trace artifact that reaches
+`controlled_reality_entered` without claiming autonomous agent behavior.
 
 To generate the internal M3 uniqueness report from the pwnkit and scripted
 action-trace artifacts:
