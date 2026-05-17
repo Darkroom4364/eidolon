@@ -91,7 +91,7 @@ resolve_pwnkit_command() {
       exit 2
     fi
     validate_pwnkit_node_entry "$PWNKIT_NODE_ENTRY"
-    PWNKIT_COMMAND=(node "$PWNKIT_NODE_ENTRY")
+    set_pwnkit_node_command "$PWNKIT_NODE_ENTRY" "PWNKIT_NODE_ENTRY"
     return
   fi
 
@@ -101,22 +101,25 @@ resolve_pwnkit_command() {
       exit 2
     fi
     PWNKIT_COMMAND=("$PWNKIT_BIN")
+    PWNKIT_COMMAND_SOURCE="PWNKIT_BIN"
     return
   fi
 
   if [[ -f "$HOME/Projects/pwnkit/dist/pwnkit.js" ]]; then
     validate_pwnkit_node_entry "$HOME/Projects/pwnkit/dist/pwnkit.js"
-    PWNKIT_COMMAND=(node "$HOME/Projects/pwnkit/dist/pwnkit.js")
+    set_pwnkit_node_command "$HOME/Projects/pwnkit/dist/pwnkit.js" "default_source_checkout"
     return
   fi
 
   if command -v pwnkit >/dev/null 2>&1; then
     PWNKIT_COMMAND=(pwnkit)
+    PWNKIT_COMMAND_SOURCE="PATH:pwnkit"
     return
   fi
 
   if command -v pwnkit-cli >/dev/null 2>&1; then
     PWNKIT_COMMAND=(pwnkit-cli)
+    PWNKIT_COMMAND_SOURCE="PATH:pwnkit-cli"
     return
   fi
 
@@ -148,9 +151,26 @@ mtime_seconds() {
   stat -c %Y "$path"
 }
 
-validate_pwnkit_node_entry() {
+pwnkit_repo_dir_for_entry() {
   local entry="$1"
   local entry_dir
+  local repo_dir
+
+  entry_dir="$(cd "$(dirname "$entry")" && pwd -P)"
+  if [[ "$(basename "$entry_dir")" != "dist" || "$(basename "$entry")" != "pwnkit.js" ]]; then
+    return 1
+  fi
+
+  repo_dir="$(cd "$entry_dir/.." && pwd -P)"
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return 1
+  fi
+
+  printf '%s\n' "$repo_dir"
+}
+
+validate_pwnkit_node_entry() {
+  local entry="$1"
   local repo_dir
   local head_time
   local dist_time
@@ -159,13 +179,7 @@ validate_pwnkit_node_entry() {
     return
   fi
 
-  entry_dir="$(cd "$(dirname "$entry")" && pwd -P)"
-  if [[ "$(basename "$entry_dir")" != "dist" || "$(basename "$entry")" != "pwnkit.js" ]]; then
-    return
-  fi
-
-  repo_dir="$(cd "$entry_dir/.." && pwd -P)"
-  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  if ! repo_dir="$(pwnkit_repo_dir_for_entry "$entry")"; then
     return
   fi
 
@@ -184,6 +198,114 @@ validate_pwnkit_node_entry() {
     echo "       or set EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1 to bypass." >&2
     exit 2
   fi
+}
+
+set_pwnkit_node_command() {
+  local entry="$1"
+  local source="$2"
+
+  PWNKIT_COMMAND=(node "$entry")
+  PWNKIT_COMMAND_SOURCE="$source"
+  PWNKIT_ENTRY_PATH="$entry"
+}
+
+json_bool() {
+  if truthy "$1"; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+write_runner_metadata() {
+  local metadata_file="$ARTIFACT_DIR/pwnkit-runner-metadata.json"
+  local pwnkit_command_quoted
+  local pwnkit_entry_mtime=""
+  local pwnkit_repo_dir=""
+  local pwnkit_git_head=""
+  local pwnkit_git_head_time=""
+  local allow_stale_dist
+  local pin_session
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "error: jq is required to write pwnkit runner metadata" >&2
+    exit 2
+  fi
+
+  printf -v pwnkit_command_quoted '%q ' "${PWNKIT_COMMAND[@]}"
+  pwnkit_command_quoted="${pwnkit_command_quoted% }"
+  if [[ -n "${PWNKIT_ENTRY_PATH:-}" && -f "$PWNKIT_ENTRY_PATH" ]]; then
+    pwnkit_entry_mtime="$(mtime_seconds "$PWNKIT_ENTRY_PATH")"
+    if pwnkit_repo_dir="$(pwnkit_repo_dir_for_entry "$PWNKIT_ENTRY_PATH")"; then
+      pwnkit_git_head="$(git -C "$pwnkit_repo_dir" rev-parse HEAD 2>/dev/null || true)"
+      pwnkit_git_head_time="$(git -C "$pwnkit_repo_dir" log -1 --format=%ct 2>/dev/null || true)"
+    else
+      pwnkit_repo_dir=""
+    fi
+  fi
+
+  allow_stale_dist="$(json_bool "$EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST")"
+  pin_session="$(json_bool "$EIDOLON_M3_PIN_SESSION")"
+
+  jq -n \
+    --arg created_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg mode "$MODE" \
+    --arg target_url "$TARGET_URL" \
+    --arg proxy_url "$PROXY_URL" \
+    --arg pwnkit_depth "$PWNKIT_DEPTH" \
+    --arg pwnkit_mode "$PWNKIT_MODE" \
+    --arg pwnkit_runtime "$PWNKIT_RUNTIME" \
+    --arg pwnkit_rate_limit "$PWNKIT_RATE_LIMIT" \
+    --arg pwnkit_feature_codex_live_targets "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" \
+    --arg pwnkit_command "$pwnkit_command_quoted" \
+    --arg pwnkit_command_source "${PWNKIT_COMMAND_SOURCE:-unknown}" \
+    --arg pwnkit_entry_path "${PWNKIT_ENTRY_PATH:-}" \
+    --arg pwnkit_entry_mtime "$pwnkit_entry_mtime" \
+    --arg pwnkit_repo_dir "$pwnkit_repo_dir" \
+    --arg pwnkit_git_head "$pwnkit_git_head" \
+    --arg pwnkit_git_head_time "$pwnkit_git_head_time" \
+    --argjson allow_stale_dist "$allow_stale_dist" \
+    --argjson pin_session "$pin_session" \
+    '{
+      schema_version: 1,
+      run_kind: "m3_pwnkit_codex_runner",
+      created_at: $created_at,
+      mode: $mode,
+      urls: {
+        target: $target_url,
+        proxy: $proxy_url
+      },
+      pwnkit: {
+        depth: $pwnkit_depth,
+        mode: $pwnkit_mode,
+        runtime: $pwnkit_runtime,
+        rate_limit: $pwnkit_rate_limit,
+        feature_codex_live_targets: (
+          if $pwnkit_feature_codex_live_targets == "" then null
+          else $pwnkit_feature_codex_live_targets
+          end
+        ),
+        command: $pwnkit_command,
+        command_source: $pwnkit_command_source,
+        entry_path: (if $pwnkit_entry_path == "" then null else $pwnkit_entry_path end),
+        entry_mtime_seconds: (
+          if $pwnkit_entry_mtime == "" then null
+          else ($pwnkit_entry_mtime | tonumber)
+          end
+        ),
+        repo_dir: (if $pwnkit_repo_dir == "" then null else $pwnkit_repo_dir end),
+        git_head: (if $pwnkit_git_head == "" then null else $pwnkit_git_head end),
+        git_head_time_seconds: (
+          if $pwnkit_git_head_time == "" then null
+          else ($pwnkit_git_head_time | tonumber)
+          end
+        ),
+        stale_dist_guard_bypassed: $allow_stale_dist
+      },
+      eidolon: {
+        pinned_session_enabled: $pin_session
+      }
+    }' > "$metadata_file"
 }
 
 new_session_id() {
@@ -323,7 +445,10 @@ main() {
   fi
 
   declare -a PWNKIT_COMMAND
+  PWNKIT_COMMAND_SOURCE="unknown"
+  PWNKIT_ENTRY_PATH=""
   resolve_pwnkit_command
+  write_runner_metadata
 
   case "$MODE" in
     all)

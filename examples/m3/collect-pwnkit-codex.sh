@@ -317,6 +317,11 @@ proxy_summary() {
 direct_summary="$(run_summary direct)"
 eidolon_summary="$(run_summary eidolon)"
 proxy_events="$(proxy_summary)"
+runner_metadata='{}'
+RUNNER_METADATA_FILE="$ARTIFACT_DIR/pwnkit-runner-metadata.json"
+if [[ -s "$RUNNER_METADATA_FILE" ]]; then
+  runner_metadata="$(cat "$RUNNER_METADATA_FILE")"
+fi
 PINNED_SESSION_ID=""
 PINNED_SESSION_FILE="$ARTIFACT_DIR/pinned-eidolon-session-id.txt"
 if [[ -s "$PINNED_SESSION_FILE" ]]; then
@@ -329,6 +334,7 @@ jq -n \
   --argjson direct "$direct_summary" \
   --argjson eidolon "$eidolon_summary" \
   --argjson proxy "$proxy_events" \
+  --argjson runner "$runner_metadata" \
   'def unique_paths($run): ($run.requested_paths | map(.path) | unique);
    def path_without_query($path): (($path // "") | sub("\\?.*$"; ""));
    def bait_matrix($exposures; $actions):
@@ -505,6 +511,7 @@ jq -n \
     run_kind: "m3_pwnkit_codex_comparison",
     boundary: "owned_loopback_lab",
     artifact_dir: $artifact_dir,
+    runner: $runner,
     runs: {
       direct: $direct,
       eidolon: $eidolon
