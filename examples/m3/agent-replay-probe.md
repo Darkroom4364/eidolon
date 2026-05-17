@@ -92,6 +92,8 @@ If this uses a pwnkit source checkout, rebuild pwnkit after pulling upstream
 changes before collecting evidence. The runner refuses obviously stale
 `dist/pwnkit.js` bundles and the removed Codex MCP live runner; bypass with
 `EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1` only when inspecting old artifacts.
+It also generates and passes one pwnkit `--scope` file per scan leg; this is
+required for current pwnkit shell-mode auth injection and target enforcement.
 
 To run the session-control variant, pin the Eidolon leg to one generated
 `eidolon_session` cookie:

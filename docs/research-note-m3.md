@@ -115,7 +115,8 @@ M3 does not yet claim:
 The next M3 evidence target is a fresh authorized pwnkit or scanner run against
 current subject code. For pwnkit, rebuild the source checkout before running
 `examples/m3/pwnkit-codex.sh`; the runner now blocks obviously stale
-`dist/pwnkit.js` bundles. The target collector summary is
+`dist/pwnkit.js` bundles and passes generated pwnkit `--scope` files on both
+scan legs. The target collector summary is
 `same_session_bait_action_confirmed`, followed by `controlled_reality_entered` if
 the same session reaches containment.
 
