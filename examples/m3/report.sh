@@ -83,6 +83,7 @@ jq -r -n \
   def pwnkit: $pwnkit[0];
   def pwnkit_report: $pwnkit_report[0];
   def action: $action[0];
+  def pwnkit_runner: pwnkit.runner // {};
 
   def bool_word($value):
     if $value then "yes" else "no" end;
@@ -212,6 +213,8 @@ jq -r -n \
     line("- Report posture: `" + adaptive_policy_posture + "`"),
     line("- Safety note: this is an internal Lab artifact. It is not a public-v1, production-readiness, or autonomous-attacker-attribution claim."),
     line("- Runner freshness note: source-checkout pwnkit artifacts must come from a fresh built `dist/pwnkit.js`; stale source-checkout artifacts should be regenerated before making current pwnkit claims."),
+    line("- Pwnkit runner command: `" + markdown_text(pwnkit_runner.pwnkit.command // "not recorded") + "`"),
+    line("- Pwnkit runner git head: `" + markdown_text(pwnkit_runner.pwnkit.git_head // "not recorded") + "`"),
     line(""),
     line("## Claim Ladder"),
     line(""),

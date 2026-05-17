@@ -251,7 +251,9 @@ upstream changes:
 `examples/m3/pwnkit-codex.sh` refuses obviously stale source-checkout
 `dist/pwnkit.js` bundles, including bundles that still contain the removed Codex
 MCP live runner. `EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1` exists only for debugging
-old artifacts.
+old artifacts. Each run writes `$ART/pwnkit-runner-metadata.json` with the
+resolved command, runtime settings, source-checkout git head, and dist mtime; the
+collector copies this into `pwnkit-summary.json` under `runner`.
 
 For a session-control replay probe, set `EIDOLON_M3_PIN_SESSION=1` on the
 pwnkit command. The runner gives only the Eidolon leg one generated
