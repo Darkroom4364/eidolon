@@ -211,6 +211,7 @@ jq -r -n \
     line("- Scripted action artifact: `" + $action_artifact_dir + "`"),
     line("- Report posture: `" + adaptive_policy_posture + "`"),
     line("- Safety note: this is an internal Lab artifact. It is not a public-v1, production-readiness, or autonomous-attacker-attribution claim."),
+    line("- Runner freshness note: source-checkout pwnkit artifacts must come from a fresh built `dist/pwnkit.js`; stale source-checkout artifacts should be regenerated before making current pwnkit claims."),
     line(""),
     line("## Claim Ladder"),
     line(""),
