@@ -159,10 +159,12 @@ Some pwnkit builds exit nonzero when findings are present even after writing a
 valid JSON report. The runner keeps those reports and continues the comparison;
 missing or invalid reports still fail the run.
 
-The collector reports whether pwnkit HTTP artifacts correlate with Eidolon proxy
-requests by method, path, and timestamp window, and whether any M3 bait surface
-or bait action was reached. It is evidence for the M3 bakeoff, not an agent
-leaderboard.
+The collector reports whether pwnkit target-tool artifacts correlate with
+Eidolon proxy requests by method, path, and timestamp window, and whether any M3
+bait surface or bait action was reached. It reads structured pwnkit
+`http_request` artifacts and shell-mode `bash` artifacts whose HTTP transcript
+contains method/path/status evidence. It is evidence for the M3 bakeoff, not an
+agent leaderboard.
 
 For report language, prefer `comparison.claim_level` over the broad
 `comparison.conclusion`; it distinguishes exposed-only bait, action-shaped
@@ -180,8 +182,9 @@ examples/m3/report.sh \
 ```
 
 The report is Lab-only. It can summarize differential bait discovery and
-scripted containment mechanics, but it must not be used to claim pwnkit reached
-controlled reality until the pwnkit-correlated trace supports that claim.
+containment mechanics when the pwnkit-correlated trace supports those claims,
+but it must not be used as a production-readiness or autonomous-attacker
+attribution claim.
 
 ## M3 Agent Replay Probe
 

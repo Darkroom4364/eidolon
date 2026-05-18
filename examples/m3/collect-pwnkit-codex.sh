@@ -97,6 +97,18 @@ run_summary() {
        and json_extract(payload, '$.request.url') is not null
      order by timestamp;")"
 
+  local bash_http_outputs
+  bash_http_outputs="$(sqlite_json "$db_file" \
+    "select
+       timestamp as timestamp_ms,
+       json_extract(payload, '$.output') as output
+     from pipeline_events
+     where eventType = 'tool_artifact'
+       and json_extract(payload, '$.tool') = 'bash'
+       and json_extract(payload, '$.output') is not null
+       and json_extract(payload, '$.output') like '%HTTP/1.1%'
+     order by timestamp;")"
+
   local event_count
   local tool_artifacts
   event_count="$(sqlite_scalar "$db_file" "select count(*) from pipeline_events;")"
@@ -108,9 +120,68 @@ run_summary() {
     --argjson report "$report_json" \
     --argjson tool_counts "$tool_counts" \
     --argjson http_requests "$http_requests" \
+    --argjson bash_http_outputs "$bash_http_outputs" \
     --argjson event_count "$event_count" \
     --argjson tool_artifacts "$tool_artifacts" \
-    '{
+    'def path_from_url:
+       (.url // "")
+       | sub("^https?://[^/]+"; "")
+       | if . == "" then "/" else . end;
+     def maybe_capture($value; $pattern):
+       ([ $value | capture($pattern) ] | first // null);
+     def bash_output_requests:
+       [
+         $bash_http_outputs[] as $artifact
+         | (($artifact.output // "") | split("==== ")[] | select(length > 0))
+         | (split("\n")) as $lines
+         | {
+             label: ($lines[0] | sub("[ =]+$"; "")),
+             body: ($lines[1:] | join("\n"))
+           } as $block
+         | select($block.label != "")
+         | maybe_capture(
+             $block.label;
+             "^(?<method>GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD) (?<path>/[^ ]+)"
+           ) as $explicit
+         | maybe_capture($block.label; "^(?<path>/[^ ]+)") as $implicit_get
+         | maybe_capture(
+             $block.body;
+             "\"path\"[[:space:]]*:[[:space:]]*\"(?<path>[^\"]+)\""
+           ) as $body_path
+         | maybe_capture($block.body; "HTTP/1\\.1 (?<status>[0-9]{3})") as $http_status
+         | ($explicit.path // $implicit_get.path // $body_path.path) as $path
+         | select($path != null)
+         | {
+             timestamp_ms: $artifact.timestamp_ms,
+             method: (
+               $explicit.method // (
+                 if ($implicit_get.path // null) != null then
+                   "GET"
+                 elif (
+                   (($body_path.path // "") == "/api/v2/import/reconcile")
+                   and ($block.body | contains("\"write_committed\":false"))
+                 ) then
+                   "POST"
+                 else
+                   null
+                 end
+               )
+             ),
+             url: null,
+             path: $path,
+             status: (($http_status.status // null) | if . == null then null else tonumber end),
+             source: "bash_http_output",
+             evidence_label: $block.label
+           }
+       ];
+     def structured_http_requests:
+       $http_requests
+       | map(. + {
+           path: path_from_url,
+           source: "http_request",
+           evidence_label: null
+         });
+     {
       label: $label,
       artifact_status: $artifact_status,
       target: ($report.target // null),
@@ -121,17 +192,12 @@ run_summary() {
       pwnkit_events: {
         pipeline_events: $event_count,
         tool_artifacts: $tool_artifacts,
-        tool_counts: $tool_counts
+        tool_counts: $tool_counts,
+        bash_http_output_requests: (bash_output_requests | length)
       },
       requested_paths: (
-        $http_requests
-        | map(. + {
-            path: (
-              (.url // "")
-              | sub("^https?://[^/]+"; "")
-              | if . == "" then "/" else . end
-            )
-          })
+        (structured_http_requests + bash_output_requests)
+        | unique_by(.timestamp_ms, .method, .path, .source, (.evidence_label // ""))
       )
     }'
 }

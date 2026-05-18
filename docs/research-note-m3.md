@@ -28,9 +28,15 @@ Fresh current-pwnkit scoped pinned-session run:
 - `pinned_session.cookie_preserved`: `true`
 - `pinned_session.proxy_request_count`: `75`
 - strict pwnkit-correlated `comparison.claim_level`:
-  `bait_exposed_without_action`
+  `controlled_reality_entered`
 - strict pwnkit-correlated bait exposures: `6`
-- strict pwnkit-correlated bait actions: `0`
+- strict pwnkit-correlated bait actions: `1`
+- strict pwnkit-correlated same-session confirmed bait actions: `1`
+- strict pwnkit-correlated controlled-reality entries: `4`
+- strict collector note: pwnkit persisted the action as a `bash` tool artifact
+  containing an HTTP transcript block for `POST /api/v2/import/reconcile`; the
+  collector now parses that transcript and still requires the proxy method,
+  path, session, and timestamp join.
 - same-run proxy-trace `claim_level`: `controlled_reality_entered`
 - same-run proxy-trace bait exposures: `14`
 - same-run proxy-trace bait actions: `2`
@@ -104,17 +110,16 @@ Fresh scripted action-trace run:
 The fresh current-pwnkit artifact supersedes the stale-runner interpretation for
 current pwnkit behavior. With a fresh source checkout build, direct ChatGPT Codex
 runtime, generated pwnkit scope files, and pinned-session auth, pwnkit interacted
-with the protected target through Eidolon and reached owned bait surfaces while
-the direct target stayed quiet. The strict pwnkit-correlated collector supports
-only `bait_exposed_without_action`: it can correlate pwnkit target-tool artifacts
-to bait exposures, but not to the later bait-shaped action.
+with the protected target through Eidolon, reached owned bait surfaces, replayed
+one bait-shaped `POST /api/v2/import/reconcile` action, preserved the pinned
+session, and entered controlled reality. The direct target stayed quiet.
 
-The same artifact's proxy trace is stronger. It records a same-session
-`bait_action_observed` for `openapi_reconcile_trace`, a policy transition into
-controlled reality, and subsequent controlled-reality entries for the pinned
-session. That is valid authorized proxy-trace evidence, but it is not yet a
-strict pwnkit-correlated action claim because the pwnkit DB evidence does not map
-the shell-mode action cleanly back to the proxy request.
+The strict pwnkit-correlated collector now supports this stronger claim because
+current pwnkit persisted the action in a `bash` tool artifact containing HTTP
+transcript output. The collector extracts method/path/status evidence from that
+pwnkit artifact, then applies the existing proxy-side method, path, timestamp,
+session, exposure-id, and controlled-reality joins. Proxy-only actions without a
+matching pwnkit artifact still do not upgrade the strict claim.
 
 The stale artifact did not support the stronger same-session or containment
 claims. Because the pwnkit bundle was stale, the recorded
@@ -135,17 +140,16 @@ produced.
 
 M3 does not yet claim:
 
-- pwnkit-correlated same-session action proof from the fresh run
-- pwnkit-correlated controlled-reality entry from the fresh run
+- differential pwnkit findings from the fresh run
 - production readiness
 - safety outside the owned loopback Lab
 
 ## Remaining M3 Work
 
-The next evidence target is closing the correlation gap between pwnkit's
-shell-mode action evidence and the proxy trace. The fresh run shows the stronger
-same-session controlled-reality path in proxy events, but the pwnkit-specific
-collector remains at `bait_exposed_without_action`.
+The immediate correlation gap is closed for the current pwnkit artifact. The
+next evidence target is a fresh rerun with this collector on mainline code and a
+larger sample of pwnkit runs to see whether the strict controlled-reality claim
+is stable across current pwnkit behavior rather than a single successful trace.
 
 Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
 rules, then collect the resulting proxy trace with
