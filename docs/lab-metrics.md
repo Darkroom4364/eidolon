@@ -256,6 +256,10 @@ resolved command, runtime settings, source-checkout git head, dist mtime, and
 generated pwnkit scope files; the collector copies this into
 `pwnkit-summary.json` under `runner`.
 
+The runner captures pwnkit stdout as `$ART/pwnkit-<leg>.stdout.log` and writes a
+normalized JSON-only report to `$ART/pwnkit-<leg>.json`. This preserves current
+pwnkit cost footers for audit while keeping collector input strict JSON.
+
 The runner now writes `$ART/pwnkit-eidolon-scope.json` and
 `$ART/pwnkit-direct-scope.json`, then passes the matching file with `--scope` on
 each scan leg. Current pwnkit shell-mode auth injection is intentionally scoped:
