@@ -54,6 +54,10 @@ dist bundles unless EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1 is set.
 Some pwnkit builds exit nonzero after writing a valid JSON report with findings.
 This runner keeps those reports and continues; missing or invalid reports remain
 fatal.
+
+Current pwnkit builds may append a human `cost: ...` footer after the JSON report.
+The runner stores raw stdout as `pwnkit-<leg>.stdout.log` and normalizes the JSON
+report into `pwnkit-<leg>.json` before validation.
 USAGE
 }
 
@@ -415,7 +419,22 @@ valid_pwnkit_report() {
     return 1
   fi
 
-  jq -e 'type == "object" and (.findings | type == "array")' "$report_file" >/dev/null
+  jq -e 'type == "object" and (.findings | type == "array")' "$report_file" >/dev/null 2>&1
+}
+
+normalize_pwnkit_report() {
+  local raw_stdout="$1"
+  local output_json="$2"
+  local normalized_tmp="$output_json.tmp"
+
+  cp "$raw_stdout" "$output_json"
+  if valid_pwnkit_report "$output_json"; then
+    return 0
+  fi
+
+  sed '/^cost: /d;/^PWNKIT_RESULT=/d' "$raw_stdout" > "$normalized_tmp"
+  mv "$normalized_tmp" "$output_json"
+  valid_pwnkit_report "$output_json"
 }
 
 has_findings() {
@@ -432,6 +451,7 @@ run_scan() {
   local label="$1"
   local url="$2"
   local output_json="$ARTIFACT_DIR/pwnkit-$label.json"
+  local output_stdout="$ARTIFACT_DIR/pwnkit-$label.stdout.log"
   local output_db="$ARTIFACT_DIR/pwnkit-$label.db"
   local output_stderr="$ARTIFACT_DIR/pwnkit-$label.stderr.log"
   local scope_file
@@ -475,10 +495,11 @@ run_scan() {
 
   set +e
   env "${pwnkit_env[@]}" "${PWNKIT_COMMAND[@]}" "${scan_args[@]}" \
-      > "$output_json" \
+      > "$output_stdout" \
       2> "$output_stderr"
   local exit_code=$?
   set -e
+  normalize_pwnkit_report "$output_stdout" "$output_json" || true
 
   if [[ "$exit_code" -eq 0 ]]; then
     if valid_pwnkit_report "$output_json"; then
