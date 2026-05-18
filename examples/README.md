@@ -134,6 +134,12 @@ at `~/Projects/pwnkit/dist/pwnkit.js`:
 PWNKIT_NODE_ENTRY=/path/to/pwnkit/dist/pwnkit.js examples/m3/pwnkit-codex.sh all "$ART"
 ```
 
+The runner generates one pwnkit `--scope` file per scan leg:
+`$ART/pwnkit-eidolon-scope.json` for the proxy target and
+`$ART/pwnkit-direct-scope.json` for the direct target. This is part of the
+evidence contract for current pwnkit because shell-mode credential injection is
+scope-aware.
+
 To test whether an observed replay can preserve one Eidolon Lab session without
 seeding any bait markers, pin the Eidolon leg to a generated session cookie:
 
