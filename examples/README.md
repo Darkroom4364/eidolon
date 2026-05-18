@@ -140,6 +140,9 @@ The runner generates one pwnkit `--scope` file per scan leg:
 evidence contract for current pwnkit because shell-mode credential injection is
 scope-aware.
 
+Raw pwnkit stdout is kept as `$ART/pwnkit-<leg>.stdout.log`; the collector reads
+the normalized JSON-only `$ART/pwnkit-<leg>.json` files.
+
 To test whether an observed replay can preserve one Eidolon Lab session without
 seeding any bait markers, pin the Eidolon leg to a generated session cookie:
 
