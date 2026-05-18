@@ -282,12 +282,14 @@ cookie was part of the agent evidence stream. A run with
 not preserve the session cookie on observed proxy requests.
 
 The collector consumes pwnkit SQLite `tool_artifact` events and Eidolon proxy
-JSONL events. It treats target interaction as observed only when a pwnkit HTTP
-artifact matches an Eidolon proxy request by method, path, and timestamp window.
-A `bait_not_reached` conclusion therefore means pwnkit had correlated
-interaction with the protected target through Eidolon, but did not request any
-owned M3 bait surface. If that correlation is absent, the conclusion is
-`no_target_interaction` and the run is not evidence for bait discoverability.
+JSONL events. It treats target interaction as observed only when pwnkit evidence
+matches an Eidolon proxy request by method, path, and timestamp window. The
+pwnkit evidence can be a structured `http_request` artifact or a `bash` artifact
+whose HTTP transcript exposes method/path/status. A `bait_not_reached`
+conclusion therefore means pwnkit had correlated interaction with the protected
+target through Eidolon, but did not request any owned M3 bait surface. If that
+correlation is absent, the conclusion is `no_target_interaction` and the run is
+not evidence for bait discoverability.
 
 The summary separates the strength of the pwnkit-correlated bait evidence.
 `comparison.conclusion` keeps the broad runner outcome, while
@@ -307,14 +309,11 @@ same-session rate. These rates are computed from `comparison.correlated_bait_eve
 not from unrelated proxy traffic that may share the artifact directory.
 
 The current post-merge M3 note is recorded in
-[`docs/research-note-m3.md`](research-note-m3.md). Its pwnkit artifact is now
-treated as historical only: after syncing pwnkit main, the run was traced to a
-stale ignored source-checkout `dist/pwnkit.js` bundle that still contained the
-removed Codex MCP live runner. Do not use that artifact to claim current pwnkit
-behavior, pinned-session handling, or same-session failure. Rerun the pwnkit
-comparison with a fresh pwnkit build before interpreting current pwnkit evidence.
-The same note also records the scripted action-trace artifact that reaches
-`controlled_reality_entered` without claiming autonomous agent behavior.
+[`docs/research-note-m3.md`](research-note-m3.md). It records a fresh current
+pwnkit run plus a strict collector pass that extracts the pwnkit shell-mode HTTP
+transcript and correlates one same-session bait action into
+`controlled_reality_entered`. Older stale-runner artifacts remain historical
+only and must not be used to claim current pwnkit behavior.
 
 To generate the internal M3 uniqueness report from the pwnkit and scripted
 action-trace artifacts:
