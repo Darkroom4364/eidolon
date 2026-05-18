@@ -15,6 +15,30 @@ an owned loopback Lab target:
 
 ## Current Evidence
 
+Fresh current-pwnkit scoped pinned-session run:
+
+- artifact directory: `/private/tmp/eidolon-m3-fresh-pwnkit-fixed.jEZIeM`
+- pwnkit git head: `5861f0c0c1dd141f0d61d2defd7de4d092324306`
+- pwnkit runner: `node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js`
+- runtime: `codex`
+- direct findings: `0`
+- Eidolon findings: `0`
+- generated pwnkit scope files: `pwnkit-eidolon-scope.json`,
+  `pwnkit-direct-scope.json`
+- `pinned_session.cookie_preserved`: `true`
+- `pinned_session.proxy_request_count`: `75`
+- strict pwnkit-correlated `comparison.claim_level`:
+  `bait_exposed_without_action`
+- strict pwnkit-correlated bait exposures: `6`
+- strict pwnkit-correlated bait actions: `0`
+- same-run proxy-trace `claim_level`: `controlled_reality_entered`
+- same-run proxy-trace bait exposures: `14`
+- same-run proxy-trace bait actions: `2`
+- same-run proxy-trace same-session confirmed bait actions: `1`
+- same-run proxy-trace controlled-reality entries after confirmed action: `4`
+- same-run proxy-trace `controlled_reality_action_depth`: `26`
+- same-run proxy-trace `controlled_reality_branch_count`: `15`
+
 Historical pwnkit Codex pinned-session replay probe:
 
 - artifact directory: `/tmp/eidolon-m3-pinned-metrics-EPFsYY`
@@ -77,13 +101,20 @@ Fresh scripted action-trace run:
 
 ## Interpretation
 
-The stale-runner pwnkit artifact previously appeared to support the first
-agent-derived bait-action claim: pwnkit interacted with the protected target
-through Eidolon, reached owned bait surfaces, reported Eidolon-only findings
-while the direct target baseline stayed quiet, and replayed hidden-route/static
-header bait into the bait-shaped reconciliation endpoint. That interpretation is
-now superseded for current pwnkit main until the run is repeated with a fresh
-built pwnkit bundle and the direct ChatGPT Codex provider.
+The fresh current-pwnkit artifact supersedes the stale-runner interpretation for
+current pwnkit behavior. With a fresh source checkout build, direct ChatGPT Codex
+runtime, generated pwnkit scope files, and pinned-session auth, pwnkit interacted
+with the protected target through Eidolon and reached owned bait surfaces while
+the direct target stayed quiet. The strict pwnkit-correlated collector supports
+only `bait_exposed_without_action`: it can correlate pwnkit target-tool artifacts
+to bait exposures, but not to the later bait-shaped action.
+
+The same artifact's proxy trace is stronger. It records a same-session
+`bait_action_observed` for `openapi_reconcile_trace`, a policy transition into
+controlled reality, and subsequent controlled-reality entries for the pinned
+session. That is valid authorized proxy-trace evidence, but it is not yet a
+strict pwnkit-correlated action claim because the pwnkit DB evidence does not map
+the shell-mode action cleanly back to the proxy request.
 
 The stale artifact did not support the stronger same-session or containment
 claims. Because the pwnkit bundle was stale, the recorded
@@ -104,25 +135,17 @@ produced.
 
 M3 does not yet claim:
 
-- current pwnkit main behavior from the stale pinned-session artifact
-- same-session causal proof for the pwnkit run
-- controlled-reality entry from a pwnkit-derived chain
+- pwnkit-correlated same-session action proof from the fresh run
+- pwnkit-correlated controlled-reality entry from the fresh run
 - production readiness
 - safety outside the owned loopback Lab
 
 ## Remaining M3 Work
 
-The next M3 evidence target is a fresh authorized pwnkit or scanner run against
-current subject code. For pwnkit, rebuild the source checkout before running
-`examples/m3/pwnkit-codex.sh`; the runner now blocks obviously stale
-`dist/pwnkit.js` bundles and passes generated pwnkit `--scope` files on both
-scan legs. The target collector summary is
-`same_session_bait_action_confirmed`, followed by `controlled_reality_entered` if
-the same session reaches containment.
-
-The historical pwnkit path reached `bait_action_observed_without_same_session`
-with a stale runner. The harness path has reached `controlled_reality_entered`.
-The open gap is fresh agent-derived same-session replay of the exposed marker.
+The next evidence target is closing the correlation gap between pwnkit's
+shell-mode action evidence and the proxy trace. The fresh run shows the stronger
+same-session controlled-reality path in proxy events, but the pwnkit-specific
+collector remains at `bait_exposed_without_action`.
 
 Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
 rules, then collect the resulting proxy trace with
