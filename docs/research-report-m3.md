@@ -1,9 +1,10 @@
 # M3 Internal Uniqueness Report
 
 - Boundary: `owned_loopback_lab`
-- Pwnkit sample artifact: `/private/tmp/eidolon-m3-stability-pwnkit-sample.json`
-- Pwnkit run artifacts: `/private/tmp/eidolon-m3-stability-pwnkit-1.did5hJ`, `/private/tmp/eidolon-m3-stability-pwnkit-2.cnWqi3`, `/private/tmp/eidolon-m3-stability-pwnkit-3.Q0HFMX`
-- Same-run proxy trace artifacts: the three pwnkit run artifact directories above
+- Evidence bundle: `docs/evidence/m3/pwnkit-stability-2026-05-19/`
+- Pwnkit sample artifact: `docs/evidence/m3/pwnkit-stability-2026-05-19/pwnkit-stability-sample.json`
+- Pwnkit run artifacts: `run-1/`, `run-2/`, and `run-3/` under the evidence bundle
+- Same-run proxy trace artifacts: `agent-replay-trace-summary.json` in each run directory
 - Report posture: `Lab-only; three-run strict pwnkit-controlled-reality stability sample`
 - Safety note: this is an internal Lab artifact. It is not a public-v1, production-readiness, or autonomous-attacker-attribution claim.
 - Runner freshness note: pwnkit source checkout was synced to upstream main and rebuilt before the sample. Runner git head: `5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10`.
