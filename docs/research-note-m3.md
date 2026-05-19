@@ -15,21 +15,22 @@ an owned loopback Lab target:
 
 ## Current Evidence
 
-Fresh current-pwnkit scoped pinned-session run:
+Post-merge current-pwnkit scoped pinned-session run:
 
-- artifact directory: `/private/tmp/eidolon-m3-fresh-pwnkit-fixed.jEZIeM`
+- artifact directory: `/private/tmp/eidolon-m3-post-merge-pwnkit-access.LOIXvq`
 - pwnkit git head: `5861f0c0c1dd141f0d61d2defd7de4d092324306`
 - pwnkit runner: `node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js`
 - runtime: `codex`
+- auth path: `PWNKIT_CHATGPT_ACCESS_TOKEN`
 - direct findings: `0`
 - Eidolon findings: `0`
 - generated pwnkit scope files: `pwnkit-eidolon-scope.json`,
   `pwnkit-direct-scope.json`
 - `pinned_session.cookie_preserved`: `true`
-- `pinned_session.proxy_request_count`: `75`
+- `pinned_session.proxy_request_count`: `72`
 - strict pwnkit-correlated `comparison.claim_level`:
   `controlled_reality_entered`
-- strict pwnkit-correlated bait exposures: `6`
+- strict pwnkit-correlated bait exposures: `7`
 - strict pwnkit-correlated bait actions: `1`
 - strict pwnkit-correlated same-session confirmed bait actions: `1`
 - strict pwnkit-correlated controlled-reality entries: `4`
@@ -38,11 +39,13 @@ Fresh current-pwnkit scoped pinned-session run:
   collector now parses that transcript and still requires the proxy method,
   path, session, and timestamp join.
 - same-run proxy-trace `claim_level`: `controlled_reality_entered`
-- same-run proxy-trace bait exposures: `14`
-- same-run proxy-trace bait actions: `2`
+- same-run proxy-trace bait exposures: `7`
+- same-run proxy-trace bait actions: `1`
 - same-run proxy-trace same-session confirmed bait actions: `1`
 - same-run proxy-trace controlled-reality entries after confirmed action: `4`
-- same-run proxy-trace `controlled_reality_action_depth`: `26`
+- same-run proxy-trace `time_to_first_bait_action_seconds`: `13`
+- same-run proxy-trace `real_surface_requests_after_containment`: `0`
+- same-run proxy-trace `controlled_reality_action_depth`: `20`
 - same-run proxy-trace `controlled_reality_branch_count`: `15`
 
 Historical pwnkit Codex pinned-session replay probe:
@@ -107,12 +110,14 @@ Fresh scripted action-trace run:
 
 ## Interpretation
 
-The fresh current-pwnkit artifact supersedes the stale-runner interpretation for
-current pwnkit behavior. With a fresh source checkout build, direct ChatGPT Codex
-runtime, generated pwnkit scope files, and pinned-session auth, pwnkit interacted
-with the protected target through Eidolon, reached owned bait surfaces, replayed
-one bait-shaped `POST /api/v2/import/reconcile` action, preserved the pinned
-session, and entered controlled reality. The direct target stayed quiet.
+The post-merge current-pwnkit artifact supersedes the stale-runner
+interpretation for current pwnkit behavior and independently reproduces the
+strict correlation fix from the prior artifact. With a fresh source checkout
+build, direct ChatGPT Codex runtime, generated pwnkit scope files, and
+pinned-session auth, pwnkit interacted with the protected target through
+Eidolon, reached owned bait surfaces, replayed one bait-shaped
+`POST /api/v2/import/reconcile` action, preserved the pinned session, and
+entered controlled reality. The direct target stayed quiet.
 
 The strict pwnkit-correlated collector now supports this stronger claim because
 current pwnkit persisted the action in a `bash` tool artifact containing HTTP
@@ -146,10 +151,12 @@ M3 does not yet claim:
 
 ## Remaining M3 Work
 
-The immediate correlation gap is closed for the current pwnkit artifact. The
-next evidence target is a fresh rerun with this collector on mainline code and a
-larger sample of pwnkit runs to see whether the strict controlled-reality claim
-is stable across current pwnkit behavior rather than a single successful trace.
+The immediate correlation gap is closed and reproduced on post-merge mainline
+code. The next evidence target is a larger sample of current pwnkit runs to see
+whether the strict controlled-reality claim is stable across repeated scans. A
+separate operational note from the rerun: local refresh-token auth can fail after
+rotation, while forwarding the current Codex access token allowed the run to
+complete.
 
 Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
 rules, then collect the resulting proxy trace with
