@@ -17,11 +17,12 @@ an owned loopback Lab target:
 
 Three-run current-pwnkit scoped pinned-session stability sample:
 
-- sample artifact: `/private/tmp/eidolon-m3-stability-pwnkit-sample.json`
-- run artifacts:
-  `/private/tmp/eidolon-m3-stability-pwnkit-1.did5hJ`,
-  `/private/tmp/eidolon-m3-stability-pwnkit-2.cnWqi3`,
-  `/private/tmp/eidolon-m3-stability-pwnkit-3.Q0HFMX`
+- committed evidence bundle:
+  `docs/evidence/m3/pwnkit-stability-2026-05-19/`
+- sample artifact:
+  `docs/evidence/m3/pwnkit-stability-2026-05-19/pwnkit-stability-sample.json`
+- run artifacts: `run-1/`, `run-2/`, and `run-3/` under the committed
+  evidence bundle
 - pwnkit git head: `5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10`
 - pwnkit runner: `node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js`
 - runtime: `codex`
