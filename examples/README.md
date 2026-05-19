@@ -171,6 +171,18 @@ For report language, prefer `comparison.claim_level` over the broad
 follow-up, same-session confirmation, and controlled-reality entry for
 pwnkit-correlated proxy events.
 
+To summarize repeated current-pwnkit runs, collect each run into a separate
+artifact directory, produce each `pwnkit-summary.json`, then aggregate them:
+
+```sh
+examples/m3/collect-pwnkit-sample.sh "$ART1" "$ART2" "$ART3" \
+  > /tmp/eidolon-m3-pwnkit-sample.json
+```
+
+The sample report keeps one row per artifact and emits strict stability gates.
+Use `strict_stability.ready_for_stability_claim` only for repeated-run Lab
+stability language; single successful traces remain single-trace evidence.
+
 To render the internal M3 uniqueness report from a pwnkit artifact and a
 scripted action-trace artifact:
 
