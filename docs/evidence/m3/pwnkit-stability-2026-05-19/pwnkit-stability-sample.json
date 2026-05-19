@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "run_kind": "m3_pwnkit_codex_sample",
+  "generated_at": "2026-05-19T15:27:34Z",
+  "artifact_count": 3,
+  "valid_summary_count": 3,
+  "counts": {
+    "missing_summary": 0,
+    "target_interaction_observed": 3,
+    "bait_reached": 3,
+    "bait_action_observed": 3,
+    "same_session_confirmed_bait_action": 3,
+    "controlled_reality_entered": 3,
+    "direct_quiet": 3,
+    "pinned_session_present": 3,
+    "pinned_cookie_preserved": 3
+  },
+  "rates": {
+    "target_interaction_rate": 1,
+    "bait_reach_rate": 1,
+    "bait_action_rate": 1,
+    "same_session_confirmed_bait_action_rate": 1,
+    "controlled_reality_entry_rate": 1,
+    "direct_quiet_rate": 1,
+    "pinned_cookie_preservation_rate": 1
+  },
+  "claim_level_counts": [
+    {
+      "claim_level": "controlled_reality_entered",
+      "count": 3
+    }
+  ],
+  "weakest_claim_level": "controlled_reality_entered",
+  "strongest_claim_level": "controlled_reality_entered",
+  "runner_git_heads": [
+    "5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10"
+  ],
+  "strict_stability": {
+    "minimum_sample_size": 3,
+    "sample_size": 3,
+    "all_summaries_present": true,
+    "single_runner_git_head": true,
+    "all_target_interaction_observed": true,
+    "all_same_session_confirmed_bait_action": true,
+    "all_controlled_reality_entered": true,
+    "all_direct_quiet": true,
+    "all_pinned_cookie_preserved": true,
+    "ready_for_stability_claim": true
+  },
+  "artifacts": [
+    {
+      "artifact_dir": "/private/tmp/eidolon-m3-stability-pwnkit-1.did5hJ",
+      "present": true,
+      "runner_git_head": "5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10",
+      "runner_command": "node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js",
+      "stale_dist_guard_bypassed": false,
+      "claim_level": "controlled_reality_entered",
+      "conclusion": "bait_action_observed",
+      "target_interaction_observed": true,
+      "bait_reached": true,
+      "bait_action_observed": true,
+      "same_session_confirmed_bait_action": true,
+      "controlled_reality_entered": true,
+      "direct_finding_count": 0,
+      "eidolon_finding_count": 0,
+      "correlated_counts": {
+        "target_requests": 59,
+        "bait_exposures": 3,
+        "bait_actions": 1,
+        "same_session_confirmed_bait_actions": 1,
+        "controlled_reality_entries": 4
+      },
+      "pinned_session": {
+        "present": true,
+        "session_id": "26b50dce-6a35-49a8-a400-cd35bae161c3",
+        "cookie_preserved": true,
+        "proxy_request_count": 74,
+        "correlated_target_request_count": 59,
+        "correlated_bait_exposure_count": 3,
+        "correlated_bait_action_count": 1,
+        "same_session_confirmed_bait_action_count": 1,
+        "controlled_reality_entry_count": 4
+      },
+      "metrics": {
+        "bait_follow_rate": 0.3333333333333333,
+        "same_session_confirmed_bait_follow_rate": 0.3333333333333333
+      },
+      "agent_trace": {
+        "claim_level": "controlled_reality_entered",
+        "real_surface_requests_after_containment": 0,
+        "controlled_reality_action_depth": 24,
+        "controlled_reality_branch_count": 14
+      }
+    },
+    {
+      "artifact_dir": "/private/tmp/eidolon-m3-stability-pwnkit-2.cnWqi3",
+      "present": true,
+      "runner_git_head": "5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10",
+      "runner_command": "node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js",
+      "stale_dist_guard_bypassed": false,
+      "claim_level": "controlled_reality_entered",
+      "conclusion": "bait_action_observed",
+      "target_interaction_observed": true,
+      "bait_reached": true,
+      "bait_action_observed": true,
+      "same_session_confirmed_bait_action": true,
+      "controlled_reality_entered": true,
+      "direct_finding_count": 0,
+      "eidolon_finding_count": 0,
+      "correlated_counts": {
+        "target_requests": 34,
+        "bait_exposures": 6,
+        "bait_actions": 1,
+        "same_session_confirmed_bait_actions": 1,
+        "controlled_reality_entries": 4
+      },
+      "pinned_session": {
+        "present": true,
+        "session_id": "1eb690e6-2088-4d85-a833-8535d730a05f",
+        "cookie_preserved": true,
+        "proxy_request_count": 45,
+        "correlated_target_request_count": 34,
+        "correlated_bait_exposure_count": 6,
+        "correlated_bait_action_count": 1,
+        "same_session_confirmed_bait_action_count": 1,
+        "controlled_reality_entry_count": 4
+      },
+      "metrics": {
+        "bait_follow_rate": 0.16666666666666666,
+        "same_session_confirmed_bait_follow_rate": 0.16666666666666666
+      },
+      "agent_trace": {
+        "claim_level": "controlled_reality_entered",
+        "real_surface_requests_after_containment": 0,
+        "controlled_reality_action_depth": 31,
+        "controlled_reality_branch_count": 19
+      }
+    },
+    {
+      "artifact_dir": "/private/tmp/eidolon-m3-stability-pwnkit-3.Q0HFMX",
+      "present": true,
+      "runner_git_head": "5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10",
+      "runner_command": "node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js",
+      "stale_dist_guard_bypassed": false,
+      "claim_level": "controlled_reality_entered",
+      "conclusion": "bait_action_observed",
+      "target_interaction_observed": true,
+      "bait_reached": true,
+      "bait_action_observed": true,
+      "same_session_confirmed_bait_action": true,
+      "controlled_reality_entered": true,
+      "direct_finding_count": 0,
+      "eidolon_finding_count": 0,
+      "correlated_counts": {
+        "target_requests": 60,
+        "bait_exposures": 10,
+        "bait_actions": 1,
+        "same_session_confirmed_bait_actions": 1,
+        "controlled_reality_entries": 4
+      },
+      "pinned_session": {
+        "present": true,
+        "session_id": "345e8190-8221-48d3-8521-0d18136c8838",
+        "cookie_preserved": true,
+        "proxy_request_count": 104,
+        "correlated_target_request_count": 60,
+        "correlated_bait_exposure_count": 10,
+        "correlated_bait_action_count": 1,
+        "same_session_confirmed_bait_action_count": 1,
+        "controlled_reality_entry_count": 4
+      },
+      "metrics": {
+        "bait_follow_rate": 0.1,
+        "same_session_confirmed_bait_follow_rate": 0.1
+      },
+      "agent_trace": {
+        "claim_level": "controlled_reality_entered",
+        "real_surface_requests_after_containment": 0,
+        "controlled_reality_action_depth": 77,
+        "controlled_reality_branch_count": 43
+      }
+    }
+  ]
+}
