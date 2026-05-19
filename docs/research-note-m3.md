@@ -158,6 +158,12 @@ separate operational note from the rerun: local refresh-token auth can fail afte
 rotation, while forwarding the current Codex access token allowed the run to
 complete.
 
+Use `examples/m3/collect-pwnkit-sample.sh` to aggregate repeated
+`pwnkit-summary.json` artifacts. Its `strict_stability.ready_for_stability_claim`
+gate requires at least three valid current-run summaries from one pwnkit git
+head with preserved pinned cookies, quiet direct-target legs, same-session
+confirmed bait action, and controlled-reality entry in every run.
+
 Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
 rules, then collect the resulting proxy trace with
 `examples/m3/collect-agent-replay-trace.sh`. The collector reuses the scripted
