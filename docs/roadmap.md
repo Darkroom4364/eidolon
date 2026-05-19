@@ -196,22 +196,29 @@ Current status:
 - historical pwnkit Codex exposure artifact collected; see
   `docs/research-note-m3.md`
 - that pwnkit artifact was later traced to a stale ignored source-checkout
-  `dist/pwnkit.js`; current pwnkit main requires a fresh rerun
+  `dist/pwnkit.js`; it no longer supports current-pwnkit claims
 - the stale pwnkit run produced owned bait findings and replayed
   hidden-route/static-header bait into a bait-shaped action, but it no longer
   supports current pwnkit claims
 - the stale pinned-session probe recorded `pinned_session.proxy_request_count: 0`;
   do not interpret that as current pwnkit cookie behavior
 - scripted proxy trace reaches `controlled_reality_entered`; see `docs/research-report-m3.md`
-- fresh pwnkit-derived same-session confirmation and controlled-reality entry
-  remain open evidence targets
+- current-pwnkit three-run stability evidence is archived at
+  `docs/evidence/m3/pwnkit-stability-2026-05-19/`
+- strict pwnkit-correlated same-session confirmation, pinned-session
+  preservation, and controlled-reality entry now pass in `3/3` current-pwnkit
+  runs, with `strict_stability.ready_for_stability_claim: true`
+- differential pwnkit findings remain open: current-pwnkit reached bait and
+  containment reliably, but still produced `0` Eidolon findings versus `0`
+  direct-target findings in the archived sample
 
 Issues:
 
 1. Run Eidolon MVP bakeoff against baselines
 2. Produce internal uniqueness report with metrics table - initial report exists in `docs/research-report-m3.md`
 3. Identify bait classes that actually influence agent plans - initial class decisions are in the internal report
-4. Decide go/no-go criteria for adaptive bait policy - current posture is no-go for automation until same-session agent marker replay is observed
+4. Investigate why current pwnkit produces no differential findings despite stable bait interaction and containment
+5. Decide go/no-go criteria for adaptive bait policy - current posture is no-go for automation until broader samples show stable class signal beyond the current `open_api` action path
 
 ## M4 Edge/CDN Integration
 
