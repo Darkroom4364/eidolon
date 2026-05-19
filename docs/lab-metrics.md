@@ -315,6 +315,26 @@ transcript and correlates one same-session bait action into
 `controlled_reality_entered`. Older stale-runner artifacts remain historical
 only and must not be used to claim current pwnkit behavior.
 
+To aggregate repeated current-pwnkit runs, collect each run into its own
+artifact directory, run `collect-pwnkit-codex.sh` for each one, then summarize
+the sample:
+
+```sh
+examples/m3/collect-pwnkit-sample.sh \
+  /tmp/eidolon-m3-pwnkit-run-1 \
+  /tmp/eidolon-m3-pwnkit-run-2 \
+  /tmp/eidolon-m3-pwnkit-run-3 \
+  > /tmp/eidolon-m3-pwnkit-sample.json
+```
+
+The sample summary reports per-run claim levels, runner git heads, pinned-cookie
+preservation, direct-target quietness, and strict pass rates. Treat
+`strict_stability.ready_for_stability_claim: true` as the minimum gate before
+describing current-pwnkit behavior as stable across repeated Lab scans; it
+requires at least three valid summaries from one runner git head, all with
+target interaction, same-session confirmed bait action, controlled-reality
+entry, preserved pinned cookies, and quiet direct-target runs.
+
 To generate the internal M3 uniqueness report from the pwnkit and scripted
 action-trace artifacts:
 
