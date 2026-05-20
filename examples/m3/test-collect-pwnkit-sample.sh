@@ -68,6 +68,14 @@ write_summary() {
       runner: {
         pwnkit: {
           git_head: $git_head,
+          package_version: "9.8.7",
+          git_dirty: false,
+          origin_main: {
+            head: $git_head,
+            ahead: 0,
+            behind: 0,
+            in_sync: true
+          },
           command: "node /tmp/pwnkit/dist/pwnkit.js",
           stale_dist_guard_bypassed: false
         }
@@ -166,6 +174,15 @@ write_summary() {
     }' > "$dir/pwnkit-summary.json"
 }
 
+mutate_summary() {
+  local dir="$1"
+  local filter="$2"
+  local tmp="$dir/pwnkit-summary.json.tmp"
+
+  jq "$filter" "$dir/pwnkit-summary.json" > "$tmp"
+  mv "$tmp" "$dir/pwnkit-summary.json"
+}
+
 test_mixed_sample_counts_claims_and_missing_dirs() {
   local controlled
   local same_session
@@ -215,11 +232,16 @@ test_stability_claim_requires_three_matching_successes() {
   jq -e '
     .valid_summary_count == 3
     and .runner_git_heads == ["head-a"]
+    and .runner_package_versions == ["9.8.7"]
+    and .source_checkout.all_runners_clean == true
+    and .source_checkout.all_runners_origin_main_synced == true
     and .rates.controlled_reality_entry_rate == 1
     and .strict_stability.all_summaries_present == true
     and .strict_stability.single_runner_git_head == true
     and .strict_stability.all_direct_quiet == true
     and .strict_stability.all_pinned_cookie_preserved == true
+    and .strict_stability.all_runners_clean == true
+    and .strict_stability.all_runners_origin_main_synced == true
     and .strict_stability.ready_for_stability_claim == true
   ' "$output" >/dev/null
 }
@@ -245,6 +267,37 @@ test_stability_rejects_mixed_runner_heads_or_direct_findings() {
     .strict_stability.single_runner_git_head == false
     and .counts.direct_quiet == 2
     and .strict_stability.all_direct_quiet == false
+    and .strict_stability.ready_for_stability_claim == false
+  ' "$output" >/dev/null
+}
+
+test_stability_rejects_dirty_or_unsynced_runner() {
+  local first
+  local second
+  local third
+  local output
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" controlled_reality_entered head-a 0 true 3
+  write_summary "$second" controlled_reality_entered head-a 0 true 3
+  write_summary "$third" controlled_reality_entered head-a 0 true 3
+  mutate_summary "$first" '.runner.pwnkit.git_dirty = true'
+  mutate_summary "$second" '.runner.pwnkit.origin_main.in_sync = false
+    | .runner.pwnkit.origin_main.behind = 2'
+
+  output="$first/sample-dirty.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .source_checkout.dirty_runner_count == 1
+    and .source_checkout.origin_main_drifted_count == 1
+    and .source_checkout.all_runners_clean == false
+    and .source_checkout.all_runners_origin_main_synced == false
+    and .strict_stability.all_runners_clean == false
+    and .strict_stability.all_runners_origin_main_synced == false
     and .strict_stability.ready_for_stability_claim == false
   ' "$output" >/dev/null
 }
@@ -282,6 +335,7 @@ test_differential_finding_diagnostics_count_open_gap() {
 test_mixed_sample_counts_claims_and_missing_dirs
 test_stability_claim_requires_three_matching_successes
 test_stability_rejects_mixed_runner_heads_or_direct_findings
+test_stability_rejects_dirty_or_unsynced_runner
 test_differential_finding_diagnostics_count_open_gap
 
 printf 'collect-pwnkit-sample fixture tests passed\n'

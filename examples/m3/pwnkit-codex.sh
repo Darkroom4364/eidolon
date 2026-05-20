@@ -281,7 +281,15 @@ write_runner_metadata() {
   local pwnkit_entry_mtime=""
   local pwnkit_repo_dir=""
   local pwnkit_git_head=""
+  local pwnkit_git_head_short=""
   local pwnkit_git_head_time=""
+  local pwnkit_package_version=""
+  local pwnkit_git_dirty=""
+  local pwnkit_origin_main_head=""
+  local pwnkit_origin_main_head_short=""
+  local pwnkit_origin_main_ahead=""
+  local pwnkit_origin_main_behind=""
+  local origin_relation=""
   local allow_stale_dist
   local pin_session
 
@@ -293,7 +301,26 @@ write_runner_metadata() {
     pwnkit_entry_mtime="$(mtime_seconds "$PWNKIT_ENTRY_PATH")"
     if pwnkit_repo_dir="$(pwnkit_repo_dir_for_entry "$PWNKIT_ENTRY_PATH")"; then
       pwnkit_git_head="$(git -C "$pwnkit_repo_dir" rev-parse HEAD 2>/dev/null || true)"
+      if [[ -n "$pwnkit_git_head" ]]; then
+        pwnkit_git_head_short="${pwnkit_git_head:0:12}"
+      fi
       pwnkit_git_head_time="$(git -C "$pwnkit_repo_dir" log -1 --format=%ct 2>/dev/null || true)"
+      if [[ -f "$pwnkit_repo_dir/package.json" ]]; then
+        pwnkit_package_version="$(jq -r '.version // empty' "$pwnkit_repo_dir/package.json" 2>/dev/null || true)"
+      fi
+      pwnkit_git_dirty=false
+      if [[ -n "$(git -C "$pwnkit_repo_dir" status --porcelain 2>/dev/null)" ]]; then
+        pwnkit_git_dirty=true
+      fi
+      pwnkit_origin_main_head="$(git -C "$pwnkit_repo_dir" rev-parse refs/remotes/origin/main 2>/dev/null || true)"
+      if [[ -n "$pwnkit_origin_main_head" ]]; then
+        pwnkit_origin_main_head_short="${pwnkit_origin_main_head:0:12}"
+        origin_relation="$(git -C "$pwnkit_repo_dir" rev-list --left-right --count HEAD...refs/remotes/origin/main 2>/dev/null || true)"
+        if [[ "$origin_relation" =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+          pwnkit_origin_main_ahead="${BASH_REMATCH[1]}"
+          pwnkit_origin_main_behind="${BASH_REMATCH[2]}"
+        fi
+      fi
     else
       pwnkit_repo_dir=""
     fi
@@ -317,8 +344,15 @@ write_runner_metadata() {
     --arg pwnkit_entry_path "${PWNKIT_ENTRY_PATH:-}" \
     --arg pwnkit_entry_mtime "$pwnkit_entry_mtime" \
     --arg pwnkit_repo_dir "$pwnkit_repo_dir" \
+    --arg pwnkit_package_version "$pwnkit_package_version" \
     --arg pwnkit_git_head "$pwnkit_git_head" \
+    --arg pwnkit_git_head_short "$pwnkit_git_head_short" \
     --arg pwnkit_git_head_time "$pwnkit_git_head_time" \
+    --arg pwnkit_git_dirty "$pwnkit_git_dirty" \
+    --arg pwnkit_origin_main_head "$pwnkit_origin_main_head" \
+    --arg pwnkit_origin_main_head_short "$pwnkit_origin_main_head_short" \
+    --arg pwnkit_origin_main_ahead "$pwnkit_origin_main_ahead" \
+    --arg pwnkit_origin_main_behind "$pwnkit_origin_main_behind" \
     --arg pwnkit_eidolon_scope_file "$PWNKIT_EIDOLON_SCOPE_FILE" \
     --arg pwnkit_direct_scope_file "$PWNKIT_DIRECT_SCOPE_FILE" \
     --slurpfile pwnkit_eidolon_scope "$PWNKIT_EIDOLON_SCOPE_FILE" \
@@ -353,12 +387,47 @@ write_runner_metadata() {
           end
         ),
         repo_dir: (if $pwnkit_repo_dir == "" then null else $pwnkit_repo_dir end),
+        package_version: (
+          if $pwnkit_package_version == "" then null else $pwnkit_package_version end
+        ),
         git_head: (if $pwnkit_git_head == "" then null else $pwnkit_git_head end),
+        git_head_short: (
+          if $pwnkit_git_head_short == "" then null else $pwnkit_git_head_short end
+        ),
         git_head_time_seconds: (
           if $pwnkit_git_head_time == "" then null
           else ($pwnkit_git_head_time | tonumber)
           end
         ),
+        git_dirty: (
+          if $pwnkit_git_dirty == "" then null else ($pwnkit_git_dirty == "true") end
+        ),
+        origin_main: {
+          head: (
+            if $pwnkit_origin_main_head == "" then null else $pwnkit_origin_main_head end
+          ),
+          head_short: (
+            if $pwnkit_origin_main_head_short == "" then null else $pwnkit_origin_main_head_short end
+          ),
+          ahead: (
+            if $pwnkit_origin_main_ahead == "" then null
+            else ($pwnkit_origin_main_ahead | tonumber)
+            end
+          ),
+          behind: (
+            if $pwnkit_origin_main_behind == "" then null
+            else ($pwnkit_origin_main_behind | tonumber)
+            end
+          ),
+          in_sync: (
+            if $pwnkit_origin_main_ahead == "" or $pwnkit_origin_main_behind == "" then
+              null
+            else
+              (($pwnkit_origin_main_ahead | tonumber) == 0
+                and ($pwnkit_origin_main_behind | tonumber) == 0)
+            end
+          )
+        },
         stale_dist_guard_bypassed: $allow_stale_dist,
         scopes: {
           eidolon: {
