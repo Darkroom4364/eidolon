@@ -120,6 +120,7 @@ cargo run -p eidolon-proxy -- \
   --listen-addr 127.0.0.1:8080 \
   --upstream http://127.0.0.1:9001 \
   --event-log /tmp/eidolon-events.jsonl \
+  --debug-log /tmp/eidolon-debug.jsonl \
   --intervention-control /tmp/eidolon-interventions.txt \
   --policy-state /tmp/eidolon-policy-state.json
 ```
@@ -305,9 +306,11 @@ against a proxy whose event log is written into the same artifact directory:
 ```sh
 ART=/tmp/eidolon-m3-scripted-action-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ART"
+mkdir -p "$ART/private"
 
 # Start eidolon-proxy separately with:
 #   --event-log "$ART/proxy-events.jsonl"
+#   --debug-log "$ART/private/eidolon-debug.jsonl"
 #   --intervention-control "$ART/interventions.txt"
 #   --policy-state "$ART/policy-state.json"
 

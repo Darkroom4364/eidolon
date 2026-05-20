@@ -7,7 +7,7 @@ use std::{
     process::ExitCode,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use eidolon_bait::{docs_for_bait, BaitRegistry};
@@ -21,6 +21,7 @@ use eidolon_proxy::{
         DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
         MAX_TARPIT_DELAY,
     },
+    debug_log::FileDebugLogWriter,
     event_log::FileEventLogWriter,
     policy::{self, InterventionMode},
     policy_store::PolicyStateStore,
@@ -30,7 +31,7 @@ use eidolon_proxy::{
         SurfaceController, SurfaceHeader, SurfaceRequestMeta, SurfaceResponse, SurfaceResponseMeta,
     },
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
@@ -65,6 +66,10 @@ fn main() -> ExitCode {
             println!("listen_addr: {}", config.listen_addr);
             println!("upstream: {}", config.upstream);
             println!("event_log: {}", config.event_log_path.display());
+            match &config.debug_log_path {
+                Some(path) => println!("debug_log: {}", path.display()),
+                None => println!("debug_log: disabled"),
+            }
             println!(
                 "intervention_control: {}",
                 config.intervention_control_path.display()
@@ -97,6 +102,7 @@ struct ProxyConfig {
     listen_addr: SocketAddr,
     upstream: UpstreamTarget,
     event_log_path: PathBuf,
+    debug_log_path: Option<PathBuf>,
     intervention_control_path: PathBuf,
     policy_state_path: PathBuf,
     controlled_reality_config: ControlledRealityConfig,
@@ -151,6 +157,14 @@ impl CliAction {
                         &mut builder.event_log_path,
                         flag,
                         parse_event_log_path(&value)?,
+                    )?;
+                }
+                "--debug-log" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.debug_log_path,
+                        flag,
+                        parse_debug_log_path(&value)?,
                     )?;
                 }
                 "--intervention-control" => {
@@ -213,6 +227,7 @@ struct ConfigBuilder {
     listen_addr: Option<SocketAddr>,
     upstream: Option<UpstreamTarget>,
     event_log_path: Option<PathBuf>,
+    debug_log_path: Option<PathBuf>,
     intervention_control_path: Option<PathBuf>,
     policy_state_path: Option<PathBuf>,
     controlled_reality_max_depth: Option<u32>,
@@ -235,6 +250,7 @@ impl ConfigBuilder {
                 Some(value) => value,
                 None => parse_event_log_path(DEFAULT_EVENT_LOG)?,
             },
+            debug_log_path: self.debug_log_path,
             intervention_control_path: match self.intervention_control_path {
                 Some(value) => value,
                 None => parse_control_path(DEFAULT_INTERVENTION_CONTROL)?,
@@ -495,6 +511,10 @@ fn parse_event_log_path(raw: &str) -> Result<PathBuf, ConfigError> {
     parse_file_path(raw, "event log")
 }
 
+fn parse_debug_log_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    parse_file_path(raw, "debug log")
+}
+
 fn parse_control_path(raw: &str) -> Result<PathBuf, ConfigError> {
     parse_file_path(raw, "intervention control")
 }
@@ -557,11 +577,16 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     println!("forwarding normal traffic to {}", config.upstream);
 
     let bait_registry = Arc::new(BaitRegistry::m3_catalog());
+    let debug_log = match &config.debug_log_path {
+        Some(path) => Some(Arc::new(Mutex::new(FileDebugLogWriter::open(path)?))),
+        None => None,
+    };
     let runtime = ProxyRuntime {
         upstream: config.upstream,
         event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
             &config.event_log_path,
         )?)),
+        debug_log,
         intervention_control_path: config.intervention_control_path,
         policy_store: Arc::new(Mutex::new(PolicyStateStore::open(
             &config.policy_state_path,
@@ -572,6 +597,21 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         bait_registry,
         bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
     };
+    write_debug(
+        &runtime,
+        "proxy_started",
+        None,
+        json!({
+            "listen_addr": listener.local_addr()?.to_string(),
+            "upstream": runtime.upstream.to_string(),
+            "controlled_reality": {
+                "max_depth": runtime.controlled_reality_config.max_action_depth,
+                "tarpit_ms": runtime.controlled_reality_config.tarpit_delay.as_millis(),
+                "retry_after_seconds": runtime.controlled_reality_config.retry_after_seconds,
+            },
+            "debug_log_visibility": "server_side_only",
+        }),
+    )?;
 
     for stream in listener.incoming() {
         match stream {
@@ -594,6 +634,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
 struct ProxyRuntime {
     upstream: UpstreamTarget,
     event_log: Arc<Mutex<FileEventLogWriter>>,
+    debug_log: Option<Arc<Mutex<FileDebugLogWriter>>>,
     intervention_control_path: PathBuf,
     policy_store: Arc<Mutex<PolicyStateStore>>,
     controlled_reality_config: ControlledRealityConfig,
@@ -836,7 +877,16 @@ fn is_success_status(status: u16) -> bool {
 }
 
 fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io::Result<()> {
+    let client_peer = client_stream.peer_addr().ok().map(|addr| addr.to_string());
     let Some(request) = read_http_request(&mut client_stream)? else {
+        write_debug(
+            runtime,
+            "connection_closed_without_request",
+            None,
+            json!({
+                "client_peer": client_peer,
+            }),
+        )?;
         return Ok(());
     };
 
@@ -845,12 +895,43 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let path = normalized_event_path(&request)?;
     let surface_request = surface_request_meta(&request, &path);
     let policy_state = policy_state_for_session(runtime, session.session_id)?;
+    write_debug(
+        runtime,
+        "request_received",
+        Some(session.session_id),
+        json!({
+            "client_peer": client_peer,
+            "method": request.method.as_str(),
+            "target_form": debug_target_form(&request.target),
+            "path": debug_path(&path),
+            "query_present": debug_query_present(&path),
+            "http_version": request.version.as_str(),
+            "body_len": request.body.len(),
+            "header_count": request.headers.len(),
+            "safe_headers": safe_header_observations(&request.headers),
+            "session_source": debug_session_source(session.source),
+            "policy_state": policy_state,
+            "intervention_mode": debug_intervention_mode(intervention_mode),
+        }),
+    )?;
 
     if !intervention_mode.interventions_enabled() {
         if let Some(response) = runtime
             .controlled_reality
             .fail_closed_response(&surface_request)
         {
+            write_debug(
+                runtime,
+                "interventions_disabled_fail_closed",
+                Some(session.session_id),
+                json!({
+                    "method": request.method.as_str(),
+                    "path": debug_path(&surface_request.path),
+                    "query_present": surface_request.query.is_some(),
+                    "response_status": response.status,
+                    "response_body_len": response.body.len(),
+                }),
+            )?;
             let decision = policy::PolicyDecision::new(
                 policy_state,
                 RoutingDecision::EidolonOwned,
@@ -908,6 +989,18 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     );
     let surface_requested_intervention =
         !matches!(&surface_action, SurfaceAction::ProtectedUpstream);
+    write_debug(
+        runtime,
+        "surface_action_selected",
+        Some(session.session_id),
+        json!({
+            "policy_state": decision.policy_state,
+            "policy_routing_decision": decision.routing_decision,
+            "policy_reason": decision.reason.as_str(),
+            "surface_action": debug_surface_action(&surface_action),
+            "surface_requested_intervention": surface_requested_intervention,
+        }),
+    )?;
 
     if intervention_mode.interventions_enabled()
         && matches!(&surface_action, SurfaceAction::ProtectedUpstream)
@@ -934,11 +1027,34 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 &request.method,
                 &surface_request.path,
             )?;
+            write_debug(
+                runtime,
+                "bait_action_match",
+                Some(session.session_id),
+                json!({
+                    "bait_id": &action_match.bait.id,
+                    "method": request.method.as_str(),
+                    "path": debug_path(&surface_request.path),
+                    "query_present": surface_request.query.is_some(),
+                    "matched_prior_exposure": action_exposure_id.is_some(),
+                    "exposure_id": &action_exposure_id,
+                }),
+            )?;
 
             let mut response = if let Some(transition) =
                 policy::transition_after_correlated_bait_action(decision.policy_state)
                     .filter(|_| action_exposure_id.is_some())
             {
+                write_debug(
+                    runtime,
+                    "policy_transition_selected",
+                    Some(session.session_id),
+                    json!({
+                        "from": transition.from,
+                        "to": transition.to,
+                        "reason": transition.reason.as_str(),
+                    }),
+                )?;
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
@@ -973,6 +1089,20 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     &effective_decision,
                     response.status,
                 ),
+            )?;
+            write_debug(
+                runtime,
+                "response_served",
+                Some(session.session_id),
+                json!({
+                    "route": "bait_action_direct",
+                    "decision": {
+                        "policy_state": effective_decision.policy_state,
+                        "routing_decision": effective_decision.routing_decision,
+                        "reason": effective_decision.reason.as_str(),
+                    },
+                    "response": debug_response_fields(&response),
+                }),
             )?;
 
             client_stream.write_all(&response.to_http_bytes())?;
@@ -1021,6 +1151,20 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             &runtime.event_log,
             &policy::response_audit_event(session.session_id, &effective_decision, response.status),
         )?;
+        write_debug(
+            runtime,
+            "response_served",
+            Some(session.session_id),
+            json!({
+                "route": "direct_surface",
+                "decision": {
+                    "policy_state": effective_decision.policy_state,
+                    "routing_decision": effective_decision.routing_decision,
+                    "reason": effective_decision.reason.as_str(),
+                },
+                "response": debug_response_fields(&response),
+            }),
+        )?;
 
         client_stream.write_all(&response.to_http_bytes())?;
         return client_stream.flush();
@@ -1043,16 +1187,53 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     }
 
     let upstream_request = request.to_upstream_bytes(&runtime.upstream)?;
+    write_debug(
+        runtime,
+        "upstream_request_forwarding",
+        Some(session.session_id),
+        json!({
+            "method": request.method.as_str(),
+            "path": debug_path(&path),
+            "query_present": debug_query_present(&path),
+            "connect_addr": runtime.upstream.connect_addr.as_str(),
+            "request_bytes": upstream_request.len(),
+        }),
+    )?;
     let mut upstream_stream = TcpStream::connect(&runtime.upstream.connect_addr)?;
     upstream_stream.write_all(&upstream_request)?;
     upstream_stream.flush()?;
 
     let mut response = read_http_response(&mut upstream_stream)?;
+    write_debug(
+        runtime,
+        "upstream_response_received",
+        Some(session.session_id),
+        json!({
+            "status": response.status,
+            "body_len": response.body.len(),
+            "header_count": response.headers.len(),
+            "surface_requested_intervention": surface_requested_intervention,
+        }),
+    )?;
     let mut pending_bait_exposure = None;
     if let SurfaceAction::RewrittenUpstream { plan } = surface_action {
         let meta = surface_response_meta(&response, &path);
         if is_success_status(response.status) {
             let outcome = rewrite_response_body(&meta, &response.body, &plan);
+            write_debug(
+                runtime,
+                "surface_rewrite_evaluated",
+                Some(session.session_id),
+                json!({
+                    "plan": debug_rewrite_plan(&plan),
+                    "disposition": debug_rewrite_disposition(outcome.disposition()),
+                    "refusal": outcome.refusal().map(ToString::to_string),
+                    "original_body_len": response.body.len(),
+                    "output_body_len": outcome.body().len(),
+                    "surface_path": debug_path(&path),
+                    "query_present": debug_query_present(&path),
+                }),
+            )?;
             if outcome.is_rewritten() {
                 effective_decision = policy::PolicyDecision::new(
                     decision.policy_state,
@@ -1080,6 +1261,16 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             }
             response.body = outcome.into_body();
         } else {
+            write_debug(
+                runtime,
+                "surface_rewrite_skipped",
+                Some(session.session_id),
+                json!({
+                    "reason": "non_success_upstream_response",
+                    "status": response.status,
+                    "plan": debug_rewrite_plan(&plan),
+                }),
+            )?;
             effective_decision = policy::PolicyDecision::new(
                 decision.policy_state,
                 RoutingDecision::ProtectedUpstream,
@@ -1101,6 +1292,20 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     write_event(
         &runtime.event_log,
         &policy::response_audit_event(session.session_id, &effective_decision, response.status),
+    )?;
+    write_debug(
+        runtime,
+        "response_served",
+        Some(session.session_id),
+        json!({
+            "route": "upstream",
+            "decision": {
+                "policy_state": effective_decision.policy_state,
+                "routing_decision": effective_decision.routing_decision,
+                "reason": effective_decision.reason.as_str(),
+            },
+            "response": debug_response_fields(&response),
+        }),
     )?;
 
     client_stream.write_all(&response.to_http_bytes())?;
@@ -1125,6 +1330,19 @@ fn write_reality_escape_attempt_if_needed(
     {
         return Ok(());
     }
+
+    write_debug(
+        runtime,
+        "reality_escape_attempt",
+        Some(session.session_id),
+        json!({
+            "method": request.method.as_str(),
+            "path": debug_path(&surface_request.path),
+            "query_present": surface_request.query.is_some(),
+            "policy_state": decision.policy_state,
+            "routing_decision": decision.routing_decision,
+        }),
+    )?;
 
     write_event(
         &runtime.event_log,
@@ -1180,6 +1398,20 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
         &runtime.event_log,
         &policy::response_audit_event(session.session_id, decision, response.status),
     )?;
+    write_debug(
+        runtime,
+        "response_served",
+        Some(session.session_id),
+        json!({
+            "route": "direct_response",
+            "decision": {
+                "policy_state": decision.policy_state,
+                "routing_decision": decision.routing_decision,
+                "reason": decision.reason.as_str(),
+            },
+            "response": debug_response_fields(&response),
+        }),
+    )?;
 
     client_stream.write_all(&response.to_http_bytes())?;
     client_stream.flush()
@@ -1230,7 +1462,7 @@ fn controlled_reality_action(
         if !tarpit_delay.is_zero() {
             thread::sleep(tarpit_delay);
         }
-        return Ok(SurfaceAction::RateLimited {
+        let action = SurfaceAction::RateLimited {
             reason: format!(
                 "controlled reality action depth {depth} exceeded limit {depth_limit}; tarpit delay {}ms",
                 tarpit_delay.as_millis()
@@ -1238,7 +1470,19 @@ fn controlled_reality_action(
             response: rate_limited_response(
                 runtime.controlled_reality_config.retry_after_seconds,
             ),
-        });
+        };
+        write_debug(
+            runtime,
+            "controlled_reality_action_selected",
+            Some(session_id),
+            json!({
+                "depth": depth,
+                "depth_limit": depth_limit,
+                "tarpit_ms": tarpit_delay.as_millis(),
+                "action": debug_surface_action(&action),
+            }),
+        )?;
+        return Ok(action);
     }
 
     let mut action = runtime.controlled_reality.decide(request, depth);
@@ -1247,6 +1491,16 @@ fn controlled_reality_action(
             *reason = default_reason;
         }
     }
+    write_debug(
+        runtime,
+        "controlled_reality_action_selected",
+        Some(session_id),
+        json!({
+            "depth": depth,
+            "depth_limit": depth_limit,
+            "action": debug_surface_action(&action),
+        }),
+    )?;
 
     Ok(action)
 }
@@ -1290,6 +1544,7 @@ fn write_bait_exposed_event(
     surface: impl Into<String>,
 ) -> io::Result<ExposureId> {
     let exposure_id = ExposureId(format!("exp-{}", SessionId::new().0));
+    let surface = surface.into();
     let mut exposures = runtime
         .bait_exposures
         .lock()
@@ -1304,12 +1559,25 @@ fn write_bait_exposed_event(
             EventKind::BaitExposed {
                 bait_id: bait.id.clone(),
                 exposure_id: exposure_id.clone(),
-                surface: surface.into(),
+                surface: surface.clone(),
             },
         ),
     )?;
 
     exposures.record_exposure(session.session_id, bait.id.clone(), exposure_id.clone());
+    write_debug(
+        runtime,
+        "bait_exposed",
+        Some(session.session_id),
+        json!({
+            "bait_id": &bait.id,
+            "bait_class": bait.bait_class,
+            "surface": debug_path(&bait.surface),
+            "requested_surface": debug_path(&surface),
+            "exposure_id": &exposure_id,
+            "stored_exposure_count": exposures.exposures.len(),
+        }),
+    )?;
     Ok(exposure_id)
 }
 
@@ -1342,6 +1610,20 @@ fn write_bait_action_observed_event(
                 path: path.to_string(),
             },
         ),
+    )?;
+
+    write_debug(
+        runtime,
+        "bait_action_observed",
+        Some(session.session_id),
+        json!({
+            "bait_id": &bait.id,
+            "method": method,
+            "path": debug_path(path),
+            "query_present": debug_query_present(path),
+            "matched_prior_exposure": exposure_id.is_some(),
+            "exposure_id": &exposure_id,
+        }),
     )?;
 
     Ok(exposure_id)
@@ -1566,6 +1848,143 @@ fn write_event(log: &Arc<Mutex<FileEventLogWriter>>, event: &Event) -> io::Resul
         .lock()
         .map_err(|_| io::Error::other("event log lock poisoned"))?;
     log.write_event(event)
+}
+
+fn write_debug(
+    runtime: &ProxyRuntime,
+    event: &str,
+    session_id: Option<SessionId>,
+    fields: Value,
+) -> io::Result<()> {
+    let Some(log) = &runtime.debug_log else {
+        return Ok(());
+    };
+
+    let observed_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let record = json!({
+        "schema_version": 1,
+        "run_kind": "eidolon_proxy_debug",
+        "observed_at_unix_ms": observed_at_unix_ms,
+        "event": event,
+        "session_id": session_id,
+        "fields": fields,
+    });
+
+    let mut log = log
+        .lock()
+        .map_err(|_| io::Error::other("debug log lock poisoned"))?;
+    log.write_record(&record)
+}
+
+fn debug_path(target: &str) -> String {
+    let query_index = target.find('?');
+    let fragment_index = target.find('#');
+    let end = match (query_index, fragment_index) {
+        (Some(query), Some(fragment)) => query.min(fragment),
+        (Some(query), None) => query,
+        (None, Some(fragment)) => fragment,
+        (None, None) => target.len(),
+    };
+
+    target[..end].to_string()
+}
+
+fn debug_query_present(target: &str) -> bool {
+    target.contains('?')
+}
+
+fn debug_target_form(target: &str) -> &'static str {
+    if target.starts_with('/') {
+        "origin_form"
+    } else if target.starts_with("http://") {
+        "absolute_http_form"
+    } else if target == "*" {
+        "asterisk_form"
+    } else {
+        "unknown"
+    }
+}
+
+fn debug_session_source(source: session::SessionSource) -> &'static str {
+    match source {
+        session::SessionSource::Cookie => "cookie",
+        session::SessionSource::Generated => "generated",
+    }
+}
+
+fn debug_intervention_mode(mode: InterventionMode) -> &'static str {
+    match mode {
+        InterventionMode::Enabled => "enabled",
+        InterventionMode::Disabled => "disabled",
+    }
+}
+
+fn debug_response_fields(response: &HttpResponse) -> Value {
+    json!({
+        "status": response.status,
+        "body_len": response.body.len(),
+        "header_count": response.headers.len(),
+        "set_cookie": response
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case(session::SET_COOKIE_HEADER_NAME)),
+    })
+}
+
+fn debug_surface_action(action: &SurfaceAction) -> Value {
+    match action {
+        SurfaceAction::ProtectedUpstream => json!({
+            "type": "protected_upstream",
+        }),
+        SurfaceAction::RewrittenUpstream { plan } => json!({
+            "type": "rewritten_upstream",
+            "plan": debug_rewrite_plan(plan),
+        }),
+        SurfaceAction::EidolonOwned { response } => json!({
+            "type": "eidolon_owned",
+            "response_status": response.status,
+            "response_body_len": response.body.len(),
+            "response_header_count": response.headers.len(),
+        }),
+        SurfaceAction::ControlledReality { reason, response } => json!({
+            "type": "controlled_reality",
+            "reason": reason,
+            "response_status": response.status,
+            "response_body_len": response.body.len(),
+            "response_header_count": response.headers.len(),
+        }),
+        SurfaceAction::RateLimited { reason, response } => json!({
+            "type": "rate_limited",
+            "reason": reason,
+            "response_status": response.status,
+            "response_body_len": response.body.len(),
+            "response_header_count": response.headers.len(),
+        }),
+    }
+}
+
+fn debug_rewrite_plan(plan: &RewritePlan) -> &'static str {
+    match &plan.operation {
+        Some(operation) if operation.is_empty() => "empty",
+        Some(eidolon_proxy::surface::RewriteOperation::Html(_)) => "html",
+        Some(eidolon_proxy::surface::RewriteOperation::RobotsTxt(_)) => "robots_txt",
+        Some(eidolon_proxy::surface::RewriteOperation::OpenApiPaths(_)) => "openapi_paths",
+        Some(eidolon_proxy::surface::RewriteOperation::JsonFields(_)) => "json_fields",
+        None => "none",
+    }
+}
+
+fn debug_rewrite_disposition(
+    disposition: eidolon_proxy::surface::RewriteDisposition,
+) -> &'static str {
+    match disposition {
+        eidolon_proxy::surface::RewriteDisposition::Unchanged => "unchanged",
+        eidolon_proxy::surface::RewriteDisposition::Rewritten => "rewritten",
+        eidolon_proxy::surface::RewriteDisposition::Refused => "refused",
+    }
 }
 
 fn intervention_mode_from_control_file(path: &Path) -> InterventionMode {
@@ -2140,6 +2559,8 @@ Options:
   --listen-addr <ADDR>  Loopback socket address to listen on [default: {DEFAULT_LISTEN_ADDR}]
   --upstream <URL>      Loopback HTTP upstream target URL [default: {DEFAULT_UPSTREAM}]
   --event-log <PATH>    JSONL event log file path [default: {DEFAULT_EVENT_LOG}]
+  --debug-log <PATH>    Optional server-side JSONL debug log path. Records sanitized
+                         internal decisions only; never emits debug data to HTTP clients
   --intervention-control <PATH>
                          Optional control file; write `disabled` to force protected forwarding
                          [default: {DEFAULT_INTERVENTION_CONTROL}]
@@ -2156,7 +2577,7 @@ Options:
   -h, --help            Show this help text
 
 Example:
-  cargo run -p eidolon-proxy -- --listen-addr 127.0.0.1:8080 --upstream http://127.0.0.1:9001 --event-log /tmp/eidolon-events.jsonl --intervention-control /tmp/eidolon-interventions.txt --policy-state /tmp/eidolon-policy-state.json --controlled-reality-max-depth 4 --controlled-reality-tarpit-ms {default_tarpit_ms} --controlled-reality-retry-after-seconds {DEFAULT_RETRY_AFTER_SECONDS}
+  cargo run -p eidolon-proxy -- --listen-addr 127.0.0.1:8080 --upstream http://127.0.0.1:9001 --event-log /tmp/eidolon-events.jsonl --debug-log /tmp/eidolon-debug.jsonl --intervention-control /tmp/eidolon-interventions.txt --policy-state /tmp/eidolon-policy-state.json --controlled-reality-max-depth 4 --controlled-reality-tarpit-ms {default_tarpit_ms} --controlled-reality-retry-after-seconds {DEFAULT_RETRY_AFTER_SECONDS}
 "
 ,
         default_tarpit_ms = DEFAULT_TARPIT_DELAY.as_millis(),
@@ -2244,6 +2665,7 @@ mod tests {
             event_log: Arc::new(Mutex::new(
                 FileEventLogWriter::open(event_log_path).expect("event log should open"),
             )),
+            debug_log: None,
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
             controlled_reality_config: ControlledRealityConfig::default(),
@@ -2265,6 +2687,7 @@ mod tests {
             event_log: Arc::new(Mutex::new(
                 FileEventLogWriter::open(event_log_path).expect("event log should open"),
             )),
+            debug_log: None,
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
             controlled_reality_config: ControlledRealityConfig::default(),
@@ -2449,6 +2872,21 @@ mod tests {
             .collect()
     }
 
+    fn debug_values(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .expect("debug log should read")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("debug line should be json"))
+            .collect()
+    }
+
+    fn first_debug_event(path: &Path, event_type: &str) -> Value {
+        debug_values(path)
+            .into_iter()
+            .find(|event| event["event"].as_str() == Some(event_type))
+            .unwrap_or_else(|| panic!("missing debug event `{event_type}`"))
+    }
+
     fn events_of_type(path: &Path, event_type: &str) -> Vec<Value> {
         event_values(path)
             .into_iter()
@@ -2522,6 +2960,7 @@ mod tests {
         );
         assert_eq!(config.upstream.to_string(), DEFAULT_UPSTREAM);
         assert_eq!(config.event_log_path, PathBuf::from(DEFAULT_EVENT_LOG));
+        assert_eq!(config.debug_log_path, None);
         assert_eq!(
             config.intervention_control_path,
             PathBuf::from(DEFAULT_INTERVENTION_CONTROL)
@@ -2545,6 +2984,8 @@ mod tests {
             "http://localhost:9101/",
             "--event-log",
             "/tmp/eidolon-proxy-test.jsonl",
+            "--debug-log",
+            "/tmp/eidolon-debug-test.jsonl",
             "--intervention-control",
             "/tmp/eidolon-interventions-test.txt",
             "--policy-state",
@@ -2565,6 +3006,10 @@ mod tests {
         assert_eq!(
             config.event_log_path,
             PathBuf::from("/tmp/eidolon-proxy-test.jsonl")
+        );
+        assert_eq!(
+            config.debug_log_path,
+            Some(PathBuf::from("/tmp/eidolon-debug-test.jsonl"))
         );
         assert_eq!(
             config.intervention_control_path,
@@ -2686,12 +3131,19 @@ mod tests {
     fn rejects_invalid_event_log_paths() {
         assert_error_contains(&["--event-log", ""], "cannot be empty");
         assert_error_contains(&["--event-log", "/tmp"], "must be a file path");
+        assert_error_contains(&["--debug-log", ""], "cannot be empty");
+        assert_error_contains(&["--debug-log", "/tmp"], "must be a file path");
 
         let missing_parent =
             env::temp_dir().join(format!("eidolon-missing-parent-{}", std::process::id()));
         let missing_path = missing_parent.join("events.jsonl");
         assert_error_contains(
             &["--event-log", missing_path.to_str().unwrap()],
+            "parent directory does not exist",
+        );
+        let missing_debug_path = missing_parent.join("debug.jsonl");
+        assert_error_contains(
+            &["--debug-log", missing_debug_path.to_str().unwrap()],
             "parent directory does not exist",
         );
     }
@@ -2977,6 +3429,62 @@ mod tests {
         assert_eq!(response.body, b"owned surface\n");
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+    }
+
+    #[test]
+    fn runtime_debug_log_records_sanitized_server_side_lifecycle() {
+        let event_log_path = unique_temp_path("debug-owned-events.jsonl");
+        let debug_log_path = unique_temp_path("debug-owned-debug.jsonl");
+        let mut runtime = test_runtime(
+            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            &event_log_path,
+            unique_temp_path("debug-owned-control.txt"),
+            SurfaceAction::EidolonOwned {
+                response: SurfaceResponse::new(
+                    202,
+                    vec![SurfaceHeader::new("Content-Type", "text/plain")],
+                    "owned surface\n",
+                ),
+            },
+        );
+        runtime.debug_log = Some(Arc::new(Mutex::new(
+            FileDebugLogWriter::open(&debug_log_path).expect("debug log should open"),
+        )));
+
+        let request = b"POST /docs/legacy-import?token=secret-value HTTP/1.1\r\nHost: proxy.local\r\nAuthorization: Bearer secret-value\r\nContent-Length: 7\r\n\r\npayload";
+        let response_bytes = run_runtime_request(runtime, request);
+        let response = String::from_utf8(response_bytes).expect("response should be utf8");
+
+        assert!(!response.contains("eidolon_proxy_debug"));
+        assert!(!response.contains("secret-value"));
+        assert!(!response.contains("payload"));
+
+        let raw_debug_log = fs::read_to_string(&debug_log_path).expect("debug log should read");
+        assert!(!raw_debug_log.contains("secret-value"));
+        assert!(!raw_debug_log.contains("Bearer"));
+        assert!(!raw_debug_log.contains("payload"));
+
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(request_debug["run_kind"], "eidolon_proxy_debug");
+        assert_eq!(request_debug["fields"]["method"], "POST");
+        assert_eq!(request_debug["fields"]["path"], "/docs/legacy-import");
+        assert_eq!(request_debug["fields"]["query_present"], true);
+        assert_eq!(request_debug["fields"]["body_len"], 7);
+        assert_eq!(
+            request_debug["fields"]["safe_headers"][1]["name"],
+            "authorization"
+        );
+        assert_eq!(request_debug["fields"]["safe_headers"][1]["present"], true);
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+
+        let response_debug = first_debug_event(&debug_log_path, "response_served");
+        assert_eq!(response_debug["fields"]["route"], "direct_surface");
+        assert_eq!(response_debug["fields"]["response"]["status"], 202);
     }
 
     #[test]
@@ -3844,6 +4352,13 @@ mod tests {
             .iter()
             .any(|header| header.name == "authorization" && header.present));
         assert!(!observed.iter().any(|header| header.name == "secret"));
+    }
+
+    #[test]
+    fn debug_path_strips_query_and_fragment_values() {
+        assert_eq!(debug_path("/docs?token=secret"), "/docs");
+        assert_eq!(debug_path("/docs#secret-fragment"), "/docs");
+        assert_eq!(debug_path("/docs#secret-fragment?token=secret"), "/docs");
     }
 
     #[test]

@@ -196,9 +196,11 @@ same run:
 ```sh
 ART=/tmp/eidolon-m3-scripted-action-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ART"
+mkdir -p "$ART/private"
 
 # Start eidolon-proxy separately with:
 #   --event-log "$ART/proxy-events.jsonl"
+#   --debug-log "$ART/private/eidolon-debug.jsonl"
 #   --intervention-control "$ART/interventions.txt"
 #   --policy-state "$ART/policy-state.json"
 
@@ -222,15 +224,25 @@ using one artifact directory for the proxy event log:
 ```sh
 ART=/tmp/eidolon-m3-pwnkit-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ART"
+mkdir -p "$ART/private"
 ```
 
 Start `eidolon-proxy` with:
 
 ```sh
 --event-log "$ART/proxy-events.jsonl"
+--debug-log "$ART/private/eidolon-debug.jsonl"
 --intervention-control "$ART/interventions.txt"
 --policy-state "$ART/policy-state.json"
 ```
+
+The debug log is a server-side JSONL stream for operator inspection only. It
+records sanitized proxy internals such as request lifecycle, policy state,
+surface decisions, bait exposure/action handling, rewrite outcomes, upstream
+forwarding, and response status. It intentionally omits request/response bodies,
+header values, and query strings, and the proxy never reflects it into HTTP
+responses, pwnkit scope files, pwnkit auth files, or normalized pwnkit reports.
+Keep it outside any served target directory and do not pass its path to pwnkit.
 
 Then run the pwnkit scans and collector:
 

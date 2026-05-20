@@ -26,7 +26,7 @@ Use a fresh artifact directory and start the demo target plus Eidolon proxy:
 
 ```sh
 ART=/tmp/eidolon-m3-agent-replay-$(date +%Y%m%d-%H%M%S)
-mkdir -p "$ART"
+mkdir -p "$ART/private"
 ```
 
 Start the target in one shell:
@@ -42,6 +42,7 @@ cargo run -p eidolon-proxy -- \
   --listen-addr 127.0.0.1:8080 \
   --upstream http://127.0.0.1:9001 \
   --event-log "$ART/proxy-events.jsonl" \
+  --debug-log "$ART/private/eidolon-debug.jsonl" \
   --intervention-control "$ART/interventions.txt" \
   --policy-state "$ART/policy-state.json"
 ```

@@ -117,9 +117,11 @@ against both the defended proxy and direct target:
 ```sh
 ART=/tmp/eidolon-m3-pwnkit-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ART"
+mkdir -p "$ART/private"
 
 # Start eidolon-proxy separately with:
 #   --event-log "$ART/proxy-events.jsonl"
+#   --debug-log "$ART/private/eidolon-debug.jsonl"
 #   --intervention-control "$ART/interventions.txt"
 #   --policy-state "$ART/policy-state.json"
 
@@ -142,6 +144,9 @@ scope-aware.
 
 Raw pwnkit stdout is kept as `$ART/pwnkit-<leg>.stdout.log`; the collector reads
 the normalized JSON-only `$ART/pwnkit-<leg>.json` files.
+`$ART/private/eidolon-debug.jsonl`, when enabled, is a server-side operator log
+only. It records sanitized Eidolon decisions and never appears in HTTP responses,
+pwnkit scope files, auth files, or normalized pwnkit reports.
 When the runner uses a pwnkit source checkout, `$ART/pwnkit-runner-metadata.json`
 also records the pwnkit package version, git head, dirty-worktree state, and the
 local `origin/main` ahead/behind relation. Treat `origin_main.in_sync == true`
