@@ -51,6 +51,16 @@ The wrapper creates one artifact directory per run, keeps each proxy debug log
 under `run-*/private/eidolon-debug.jsonl`, and writes the aggregate to
 `pwnkit-stability-sample.json`.
 
+When archiving a completed sample, use the evidence packager:
+
+```sh
+examples/m3/package-pwnkit-sample.sh \
+  /tmp/eidolon-m3-pwnkit-sample \
+  docs/evidence/m3/pwnkit-sample-YYYY-MM-DD
+```
+
+Review the generated README and redacted JSON before committing the bundle.
+
 ## Collector Diagnostics
 
 `examples/m3/collect-pwnkit-codex.sh` emits finding diagnostics under each run:
@@ -103,6 +113,6 @@ Use the diagnostics to classify the gap before changing bait text or behavior:
 - If only target interaction is observed, focus on route discovery and bait
   placement before tuning finding language.
 
-Do not use raw pwnkit DBs, auth JSON, stdout/stderr logs, raw query values, or
-request bodies in committed evidence bundles. Archive only redacted summaries
-and checksums.
+Do not use raw pwnkit DBs, auth JSON, stdout/stderr logs, private debug logs,
+raw query values, or request bodies in committed evidence bundles. Archive only
+redacted summaries and checksums.

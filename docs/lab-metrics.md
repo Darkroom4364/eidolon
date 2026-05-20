@@ -361,6 +361,20 @@ The wrapper writes the aggregate to
 already-collected runs manually, pass their artifact directories to
 `examples/m3/collect-pwnkit-sample.sh`.
 
+To prepare a commit-safe evidence bundle from a completed sample, package it
+through the redaction helper:
+
+```sh
+examples/m3/package-pwnkit-sample.sh \
+  /tmp/eidolon-m3-pwnkit-sample \
+  docs/evidence/m3/pwnkit-sample-YYYY-MM-DD
+```
+
+The packager writes redacted per-run summaries, sanitized trace summaries, a
+sample aggregate, a README, and `SHA256SUMS`. It intentionally omits raw pwnkit
+databases, auth files, stdout/stderr logs, full proxy event logs, and private
+Eidolon debug logs.
+
 The sample summary reports per-run claim levels, runner git heads, pwnkit
 package versions, source-checkout freshness, pinned-cookie preservation,
 direct-target quietness, and strict pass rates. Treat
