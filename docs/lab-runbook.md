@@ -328,11 +328,12 @@ agent bait-following.
 
 ## M3 Agent Replay Probe
 
-The open M3 gap is agent-derived marker replay. Use the blind probe brief in
-`examples/m3/agent-replay-probe.md` when running an authorized local agent or
-scanner subject. The subject should see only the loopback target, objective, and
-safety bounds; do not seed it with known bait IDs, header names, marker values,
-prior M3 reports, or source-code bait catalog details.
+The strict current-pwnkit same-session replay and controlled-reality gap is now
+closed for the archived three-run Lab sample. Use the blind probe brief in
+`examples/m3/agent-replay-probe.md` for future authorized local agents, later
+pwnkit heads, or scanner subjects. The subject should see only the loopback
+target, objective, and safety bounds; do not seed it with known bait IDs, header
+names, marker values, prior M3 reports, or source-code bait catalog details.
 
 After the subject finishes, collect the proxy trace from the same artifact
 directory:

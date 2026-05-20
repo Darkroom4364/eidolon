@@ -180,11 +180,13 @@ pwnkit also honors `429 Retry-After` with a conservative floor, so
 post-containment runs can take substantially longer as the seeded worklist
 grows.
 
-Use `examples/m3/collect-pwnkit-sample.sh` for future repeated
-`pwnkit-summary.json` artifacts. Its `strict_stability.ready_for_stability_claim`
-gate requires at least three valid current-run summaries from one pwnkit git
-head with preserved pinned cookies, quiet direct-target legs, same-session
-confirmed bait action, and controlled-reality entry in every run.
+Use `examples/m3/run-pwnkit-sample.sh` for future repeated current-pwnkit
+samples from a synced source checkout. It writes one collected artifact
+directory per run and aggregates them with `collect-pwnkit-sample.sh`. The
+resulting `strict_stability.ready_for_stability_claim` gate requires at least
+three valid current-run summaries from one pwnkit git head with preserved pinned
+cookies, quiet direct-target legs, same-session confirmed bait action, and
+controlled-reality entry in every run.
 
 Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
 rules, then collect the resulting proxy trace with

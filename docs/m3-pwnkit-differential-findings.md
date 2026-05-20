@@ -41,6 +41,16 @@ Before collecting a new sample:
 6. Keep the proxy event log, policy state, and intervention control files inside
    the same artifact directory.
 
+For the standard repeated-run path, use:
+
+```sh
+examples/m3/run-pwnkit-sample.sh 3 /tmp/eidolon-m3-pwnkit-sample
+```
+
+The wrapper creates one artifact directory per run, keeps each proxy debug log
+under `run-*/private/eidolon-debug.jsonl`, and writes the aggregate to
+`pwnkit-stability-sample.json`.
+
 ## Collector Diagnostics
 
 `examples/m3/collect-pwnkit-codex.sh` emits finding diagnostics under each run:
