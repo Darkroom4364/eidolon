@@ -142,6 +142,11 @@ scope-aware.
 
 Raw pwnkit stdout is kept as `$ART/pwnkit-<leg>.stdout.log`; the collector reads
 the normalized JSON-only `$ART/pwnkit-<leg>.json` files.
+When the runner uses a pwnkit source checkout, `$ART/pwnkit-runner-metadata.json`
+also records the pwnkit package version, git head, dirty-worktree state, and the
+local `origin/main` ahead/behind relation. Treat `origin_main.in_sync == true`
+and `git_dirty == false` as part of the evidence contract for current-main
+claims.
 
 To test whether an observed replay can preserve one Eidolon Lab session without
 seeding any bait markers, pin the Eidolon leg to a generated session cookie:

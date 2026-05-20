@@ -15,6 +15,16 @@ Use this only for owned loopback Lab runs against the demo target and Eidolon
 proxy. It is not a production-readiness, autonomous-attacker-attribution, or
 offensive benchmark claim.
 
+## Current pwnkit Drift Note
+
+The archived stability sample used pwnkit head
+`5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10`. A local review of pwnkit main on
+2026-05-20 found head `4a8587f7321af622b58f7a57f21f9acd694dc10f` /
+`v0.11.1`, with live-scan prompt changes that move web scans away from flag
+extraction and toward real audit evidence. Treat that as a behavior-relevant
+drift: rerun before tuning bait semantics or making new current-pwnkit
+finding-gap claims.
+
 ## Pre-Run Checklist
 
 Before collecting a new sample:
@@ -22,10 +32,13 @@ Before collecting a new sample:
 1. Sync pwnkit to upstream main and rebuild its dist bundle.
 2. Confirm `examples/m3/pwnkit-codex.sh` records the pwnkit git head in
    `pwnkit-runner-metadata.json`.
-3. Run direct and Eidolon legs with generated pwnkit scope files.
-4. Use `EIDOLON_M3_PIN_SESSION=1` for the Eidolon leg when testing same-session
+3. Confirm `runner.pwnkit.origin_main.in_sync` is `true` and
+   `runner.pwnkit.git_dirty` is `false` in the collected summary before making
+   current-pwnkit claims.
+4. Run direct and Eidolon legs with generated pwnkit scope files.
+5. Use `EIDOLON_M3_PIN_SESSION=1` for the Eidolon leg when testing same-session
    replay.
-5. Keep the proxy event log, policy state, and intervention control files inside
+6. Keep the proxy event log, policy state, and intervention control files inside
    the same artifact directory.
 
 ## Collector Diagnostics
