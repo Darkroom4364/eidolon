@@ -221,9 +221,64 @@ test_proxy_only_action_stays_exposure_only() {
   assert_claim "$dir" "bait_exposed_without_action"
 }
 
+test_finding_diagnostics_are_shape_only() {
+  local dir
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  cat > "$dir/pwnkit-eidolon.json" <<'JSON'
+{
+  "findings": [
+    {
+      "id": "finding-1",
+      "title": "do-not-emit-title",
+      "description": "do-not-emit-description",
+      "severity": "high",
+      "category": "exposure",
+      "confidence": "medium",
+      "evidence": {
+        "request": "do-not-emit-request",
+        "analysis": "do-not-emit-analysis"
+      }
+    }
+  ]
+}
+JSON
+
+  "$COLLECTOR" "$dir" > "$dir/summary.json"
+
+  jq -e '
+    .runs.eidolon.finding_count == 1
+    and .runs.eidolon.finding_diagnostics.severity_counts == [{value: "high", count: 1}]
+    and .runs.eidolon.finding_diagnostics.category_counts == [{value: "exposure", count: 1}]
+    and .runs.eidolon.finding_diagnostics.confidence_counts == [{value: "medium", count: 1}]
+    and .runs.eidolon.finding_diagnostics.evidence_presence.request_evidence == 1
+    and (.runs.eidolon.finding_diagnostics | tostring | contains("do-not-emit") | not)
+  ' "$dir/summary.json" >/dev/null
+}
+
+test_finding_gap_marks_controlled_reality_without_findings() {
+  local dir
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  seed_exposure "$dir" "session-a" "exp-1"
+  insert_bash_http_artifact "$dir" "bash-reconcile" 1767225603000
+  append_request_seen "$dir" "session-a" "2026-01-01T00:00:03Z" POST /api/v2/import/reconcile eidolon_owned
+  append_bait_action "$dir" "session-a" "2026-01-01T00:00:04Z" "exp-1"
+  append_controlled_reality "$dir" "session-a" "2026-01-01T00:00:05Z"
+
+  assert_claim "$dir" "controlled_reality_entered"
+  jq -e '
+    .comparison.finding_gap.eidolon_controlled_reality_without_findings == true
+    and .comparison.finding_gap.next_question == "why_controlled_reality_chain_was_not_promoted_to_finding"
+    and .runs.eidolon.target_evidence_diagnostics.observed_request_evidence_without_findings == true
+  ' "$dir/summary.json" >/dev/null
+}
+
 test_exposure_only
 test_bash_http_output_upgrades_confirmed_action
 test_wrong_session_action_does_not_confirm
 test_proxy_only_action_stays_exposure_only
+test_finding_diagnostics_are_shape_only
+test_finding_gap_marks_controlled_reality_without_findings
 
 printf 'collect-pwnkit-codex fixture tests passed\n'

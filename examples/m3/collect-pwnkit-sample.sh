@@ -109,6 +109,37 @@ done | jq -s '
         controlled_reality_entered: (.comparison.controlled_reality_entered // false),
         direct_finding_count: (.runs.direct.finding_count // 0),
         eidolon_finding_count: (.runs.eidolon.finding_count // 0),
+        finding_diagnostics: {
+          direct: (.runs.direct.finding_diagnostics // null),
+          eidolon: (.runs.eidolon.finding_diagnostics // null)
+        },
+        finding_gap: (
+          .comparison.finding_gap // {
+            direct_finding_count: (.runs.direct.finding_count // 0),
+            eidolon_finding_count: (.runs.eidolon.finding_count // 0),
+            differential_finding_count: (
+              (.runs.eidolon.finding_count // 0) - (.runs.direct.finding_count // 0)
+            ),
+            positive_differential_findings: (
+              (.runs.eidolon.finding_count // 0) > (.runs.direct.finding_count // 0)
+            ),
+            direct_quiet: ((.runs.direct.finding_count // 0) == 0),
+            eidolon_has_findings: ((.runs.eidolon.finding_count // 0) > 0),
+            eidolon_observed_target_evidence_without_findings: false,
+            eidolon_bait_reached_without_findings: (
+              (.runs.eidolon.finding_count // 0) == 0 and (.comparison.bait_reached // false)
+            ),
+            eidolon_bait_action_without_findings: (
+              (.runs.eidolon.finding_count // 0) == 0
+              and (.comparison.bait_action_observed // false)
+            ),
+            eidolon_controlled_reality_without_findings: (
+              (.runs.eidolon.finding_count // 0) == 0
+              and (.comparison.controlled_reality_entered // false)
+            ),
+            next_question: null
+          }
+        ),
         correlated_counts: {
           target_requests: ((.comparison.correlated_target_requests // []) | length),
           bait_exposures: (
@@ -188,6 +219,18 @@ done | jq -s '
     as $controlled_count
   | ($present | map(select((.direct_finding_count // 0) == 0)) | length)
     as $direct_quiet_count
+  | ($present | map(select((.direct_finding_count // 0) > 0)) | length)
+    as $direct_findings_count
+  | ($present | map(select((.eidolon_finding_count // 0) > 0)) | length)
+    as $eidolon_findings_count
+  | ($present | map(select(.finding_gap.positive_differential_findings)) | length)
+    as $positive_differential_count
+  | ($present | map(select(.finding_gap.eidolon_bait_reached_without_findings)) | length)
+    as $bait_reached_without_findings_count
+  | ($present | map(select(.finding_gap.eidolon_bait_action_without_findings)) | length)
+    as $bait_action_without_findings_count
+  | ($present | map(select(.finding_gap.eidolon_controlled_reality_without_findings)) | length)
+    as $controlled_without_findings_count
   | ($present | map(select(.pinned_session.present)) | length) as $pinned_count
   | ($present | map(select(.pinned_session.cookie_preserved)) | length)
     as $pinned_cookie_count
@@ -208,6 +251,12 @@ done | jq -s '
         same_session_confirmed_bait_action: $same_session_count,
         controlled_reality_entered: $controlled_count,
         direct_quiet: $direct_quiet_count,
+        direct_findings: $direct_findings_count,
+        eidolon_findings: $eidolon_findings_count,
+        positive_differential_findings: $positive_differential_count,
+        bait_reached_without_eidolon_findings: $bait_reached_without_findings_count,
+        bait_action_without_eidolon_findings: $bait_action_without_findings_count,
+        controlled_reality_without_eidolon_findings: $controlled_without_findings_count,
         pinned_session_present: $pinned_count,
         pinned_cookie_preserved: $pinned_cookie_count
       },
@@ -220,6 +269,10 @@ done | jq -s '
         ),
         controlled_reality_entry_rate: rate($controlled_count; $valid_count),
         direct_quiet_rate: rate($direct_quiet_count; $valid_count),
+        eidolon_finding_rate: rate($eidolon_findings_count; $valid_count),
+        positive_differential_finding_rate: (
+          rate($positive_differential_count; $valid_count)
+        ),
         pinned_cookie_preservation_rate: rate($pinned_cookie_count; $valid_count)
       },
       claim_level_counts: (
@@ -234,6 +287,31 @@ done | jq -s '
         $ranked_claims | max_by(.rank) | .claim_level // "missing"
       ),
       runner_git_heads: $runner_heads,
+      differential_findings: {
+        minimum_sample_size: 3,
+        sample_size: $valid_count,
+        direct_finding_run_count: $direct_findings_count,
+        eidolon_finding_run_count: $eidolon_findings_count,
+        positive_differential_run_count: $positive_differential_count,
+        bait_reached_without_eidolon_finding_run_count: $bait_reached_without_findings_count,
+        bait_action_without_eidolon_finding_run_count: $bait_action_without_findings_count,
+        controlled_reality_without_eidolon_finding_run_count: $controlled_without_findings_count,
+        all_direct_quiet: (
+          $valid_count > 0 and all($present[]; (.direct_finding_count // 0) == 0)
+        ),
+        ready_for_differential_finding_claim: (
+          $valid_count >= 3
+          and $valid_count == $artifact_count
+          and all($present[]; (.direct_finding_count // 0) == 0)
+          and all($present[]; .finding_gap.positive_differential_findings)
+        ),
+        next_questions: (
+          $present
+          | map(.finding_gap.next_question // null)
+          | map(select(. != null))
+          | unique
+        )
+      },
       strict_stability: {
         minimum_sample_size: 3,
         sample_size: $valid_count,

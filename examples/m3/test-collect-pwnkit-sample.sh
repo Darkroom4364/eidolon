@@ -17,6 +17,7 @@ write_summary() {
   local direct_findings="$4"
   local pinned_cookie_preserved="$5"
   local controlled_entries="$6"
+  local eidolon_findings="${7:-0}"
 
   local bait_reached=false
   local bait_action=false
@@ -54,6 +55,7 @@ write_summary() {
     --arg claim_level "$claim_level" \
     --arg git_head "$git_head" \
     --argjson direct_findings "$direct_findings" \
+    --argjson eidolon_findings "$eidolon_findings" \
     --argjson bait_reached "$bait_reached" \
     --argjson bait_action "$bait_action" \
     --argjson same_session "$same_session" \
@@ -71,8 +73,14 @@ write_summary() {
         }
       },
       runs: {
-        direct: {finding_count: $direct_findings},
-        eidolon: {finding_count: 0}
+        direct: {
+          finding_count: $direct_findings,
+          finding_diagnostics: {count: $direct_findings}
+        },
+        eidolon: {
+          finding_count: $eidolon_findings,
+          finding_diagnostics: {count: $eidolon_findings}
+        }
       },
       comparison: {
         claim_level: $claim_level,
@@ -89,6 +97,39 @@ write_summary() {
         bait_action_observed: $bait_action,
         same_session_confirmed_bait_action: $same_session,
         controlled_reality_entered: $controlled,
+        finding_gap: {
+          direct_finding_count: $direct_findings,
+          eidolon_finding_count: $eidolon_findings,
+          differential_finding_count: ($eidolon_findings - $direct_findings),
+          positive_differential_findings: ($eidolon_findings > $direct_findings),
+          direct_quiet: ($direct_findings == 0),
+          eidolon_has_findings: ($eidolon_findings > 0),
+          eidolon_observed_target_evidence_without_findings: (
+            $eidolon_findings == 0 and $claim_level != "no_target_interaction"
+          ),
+          eidolon_bait_reached_without_findings: (
+            $eidolon_findings == 0 and $bait_reached
+          ),
+          eidolon_bait_action_without_findings: (
+            $eidolon_findings == 0 and $bait_action
+          ),
+          eidolon_controlled_reality_without_findings: (
+            $eidolon_findings == 0 and $controlled
+          ),
+          next_question: (
+            if $eidolon_findings > $direct_findings then
+              "differential_finding_observed"
+            elif $controlled then
+              "why_controlled_reality_chain_was_not_promoted_to_finding"
+            elif $bait_action then
+              "why_bait_action_was_not_promoted_to_finding"
+            elif $bait_reached then
+              "why_bait_exposure_was_not_promoted_to_finding_or_action"
+            else
+              null
+            end
+          )
+        },
         correlated_target_requests: (
           if $claim_level == "no_target_interaction" then [] else [{path: "/openapi.json"}] end
         ),
@@ -208,8 +249,39 @@ test_stability_rejects_mixed_runner_heads_or_direct_findings() {
   ' "$output" >/dev/null
 }
 
+test_differential_finding_diagnostics_count_open_gap() {
+  local first
+  local second
+  local third
+  local output
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" controlled_reality_entered head-a 0 true 3
+  write_summary "$second" controlled_reality_entered head-a 0 true 4
+  write_summary "$third" controlled_reality_entered head-a 0 true 5 2
+
+  output="$first/sample.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .counts.eidolon_findings == 1
+    and .counts.positive_differential_findings == 1
+    and .counts.controlled_reality_without_eidolon_findings == 2
+    and .rates.positive_differential_finding_rate == (1 / 3)
+    and .differential_findings.positive_differential_run_count == 1
+    and .differential_findings.controlled_reality_without_eidolon_finding_run_count == 2
+    and .differential_findings.ready_for_differential_finding_claim == false
+    and (.differential_findings.next_questions | index("why_controlled_reality_chain_was_not_promoted_to_finding"))
+    and (.differential_findings.next_questions | index("differential_finding_observed"))
+  ' "$output" >/dev/null
+}
+
 test_mixed_sample_counts_claims_and_missing_dirs
 test_stability_claim_requires_three_matching_successes
 test_stability_rejects_mixed_runner_heads_or_direct_findings
+test_differential_finding_diagnostics_count_open_gap
 
 printf 'collect-pwnkit-sample fixture tests passed\n'
