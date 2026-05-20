@@ -181,13 +181,102 @@ run_summary() {
            source: "http_request",
            evidence_label: null
          });
+     def all_requested_paths:
+       (structured_http_requests + bash_output_requests)
+       | unique_by(.timestamp_ms, .method, .path, .source, (.evidence_label // ""));
+     def findings: ($report.findings // []);
+     def finding_count: (findings | length);
+     def normalized_value:
+       if . == null then null
+       elif type == "string" then (if length == 0 then null else . end)
+       elif type == "number" or type == "boolean" then tostring
+       else null
+       end;
+     def first_present($finding; $fields):
+       reduce $fields[] as $field (null; . // ($finding[$field] // null));
+     def count_by($values):
+       $values
+       | map(select(. != null and . != ""))
+       | sort
+       | group_by(.)
+       | map({value: .[0], count: length});
+     def field_presence($fields):
+       $fields
+       | map(. as $field | {
+           field: $field,
+           count: (findings | map(select(has($field))) | length)
+         })
+       | map(select(.count > 0));
+     def finding_diagnostics:
+       {
+         count: finding_count,
+         severity_counts: count_by(
+           findings
+           | map(first_present(.; ["severity", "risk", "impact", "level"]) | normalized_value)
+         ),
+         category_counts: count_by(
+           findings
+           | map(first_present(.; ["category", "type", "kind", "class", "issueType"]) | normalized_value)
+         ),
+         confidence_counts: count_by(
+           findings
+           | map(first_present(.; ["confidence", "confidenceLevel"]) | normalized_value)
+         ),
+         field_presence: field_presence([
+           "id",
+           "title",
+           "severity",
+           "risk",
+           "impact",
+           "level",
+           "category",
+           "type",
+           "kind",
+           "class",
+           "issueType",
+           "confidence",
+           "confidenceLevel",
+           "evidence",
+           "request",
+           "url",
+           "endpoint"
+         ]),
+         evidence_presence: {
+           evidence_object: (findings | map(select((.evidence // null) != null)) | length),
+           request_evidence: (
+             findings
+             | map(select(
+                 (.evidence.request // null) != null
+                 or (.request // null) != null
+                 or (.url // null) != null
+                 or (.endpoint // null) != null
+               ))
+             | length
+           ),
+           analysis_text: (
+             findings
+             | map(select((.evidence.analysis // null) != null or (.analysis // null) != null))
+             | length
+           )
+         }
+       };
+     def target_evidence_diagnostics:
+       {
+         request_artifact_count: (all_requested_paths | length),
+         http_request_artifact_count: (structured_http_requests | length),
+         bash_http_output_request_count: (bash_output_requests | length),
+         observed_request_evidence_without_findings: (
+           finding_count == 0 and ((all_requested_paths | length) > 0)
+         )
+       };
      {
       label: $label,
       artifact_status: $artifact_status,
       target: ($report.target // null),
       scan_depth: ($report.scanDepth // null),
       duration_ms: ($report.durationMs // null),
-      finding_count: (($report.findings // []) | length),
+      finding_count: finding_count,
+      finding_diagnostics: finding_diagnostics,
       warnings: ($report.warnings // []),
       pwnkit_events: {
         pipeline_events: $event_count,
@@ -195,10 +284,8 @@ run_summary() {
         tool_counts: $tool_counts,
         bash_http_output_requests: (bash_output_requests | length)
       },
-      requested_paths: (
-        (structured_http_requests + bash_output_requests)
-        | unique_by(.timestamp_ms, .method, .path, .source, (.evidence_label // ""))
-      )
+      target_evidence_diagnostics: target_evidence_diagnostics,
+      requested_paths: all_requested_paths
     }'
 }
 
@@ -572,6 +659,45 @@ jq -n \
      else
        "bait_not_reached"
      end;
+   def finding_gap:
+     ($direct.finding_count // 0) as $direct_findings
+     | ($eidolon.finding_count // 0) as $eidolon_findings
+     | {
+         direct_finding_count: $direct_findings,
+         eidolon_finding_count: $eidolon_findings,
+         differential_finding_count: ($eidolon_findings - $direct_findings),
+         positive_differential_findings: ($eidolon_findings > $direct_findings),
+         direct_quiet: ($direct_findings == 0),
+         eidolon_has_findings: ($eidolon_findings > 0),
+         eidolon_observed_target_evidence_without_findings: (
+           $eidolon.target_evidence_diagnostics.observed_request_evidence_without_findings // false
+         ),
+         eidolon_bait_reached_without_findings: (
+           $eidolon_findings == 0
+           and (((correlated_bait_exposures | length) + (correlated_bait_actions | length)) > 0)
+         ),
+         eidolon_bait_action_without_findings: (
+           $eidolon_findings == 0 and ((correlated_bait_actions | length) > 0)
+         ),
+         eidolon_controlled_reality_without_findings: (
+           $eidolon_findings == 0 and ((correlated_controlled_reality_entries | length) > 0)
+         ),
+         next_question: (
+           if $eidolon_findings > $direct_findings then
+             "differential_finding_observed"
+           elif ((correlated_controlled_reality_entries | length) > 0) then
+             "why_controlled_reality_chain_was_not_promoted_to_finding"
+           elif ((correlated_bait_actions | length) > 0) then
+             "why_bait_action_was_not_promoted_to_finding"
+           elif ((correlated_bait_exposures | length) > 0) then
+             "why_bait_exposure_was_not_promoted_to_finding_or_action"
+           elif (target_observed) then
+             "why_target_interaction_did_not_reach_bait"
+           else
+             "why_no_correlated_target_interaction_was_observed"
+           end
+         )
+       };
    {
     schema_version: 1,
     run_kind: "m3_pwnkit_codex_comparison",
@@ -603,7 +729,8 @@ jq -n \
       same_session_confirmed_bait_action: ((correlated_confirmed_bait_actions | length) > 0),
       controlled_reality_entered: ((correlated_controlled_reality_entries | length) > 0),
       claim_level: claim_level,
-      conclusion: status
+      conclusion: status,
+      finding_gap: finding_gap
     },
     metrics: {
       bait_follow_rate: (
@@ -630,6 +757,8 @@ jq -n \
       "bait_follow_rate counts bait-shaped actions whether or not the action preserved the original exposure session.",
       "same_session_confirmed_bait_follow_rate counts only bait actions whose exposure_id matches a prior bait exposure in the same session.",
       "Controlled-reality depth metrics are null here; derive them from Eidolon trace evidence for final M3 reporting.",
+      "finding_diagnostics intentionally keeps only counts, coarse classifications, and field presence; it omits finding titles, descriptions, raw evidence, request bodies, raw URLs, and analysis text.",
+      "comparison.finding_gap records whether pwnkit observed target or bait evidence that was not promoted to a pwnkit finding.",
       "When emitted, a bait_not_reached conclusion means the agent interacted with the protected target through Eidolon but did not touch any owned bait surface."
     ]
   }'

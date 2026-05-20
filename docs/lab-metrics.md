@@ -260,6 +260,21 @@ The runner captures pwnkit stdout as `$ART/pwnkit-<leg>.stdout.log` and writes a
 normalized JSON-only report to `$ART/pwnkit-<leg>.json`. This preserves current
 pwnkit cost footers for audit while keeping collector input strict JSON.
 
+The collector emits shape-only finding diagnostics for differential-finding
+work. These diagnostics count finding severities, categories, confidence labels,
+field presence, and evidence presence, but intentionally omit finding titles,
+descriptions, raw evidence, request bodies, raw URLs, and analysis text. Use
+`comparison.finding_gap` to distinguish:
+
+- pwnkit reported more Eidolon findings than direct-target findings
+- pwnkit observed target evidence but reported no Eidolon findings
+- pwnkit reached bait, replayed a bait-shaped action, or entered controlled
+  reality without reporting an Eidolon finding
+
+The corresponding sample-level fields live under `differential_findings`. See
+[`m3-pwnkit-differential-findings.md`](m3-pwnkit-differential-findings.md) for
+the investigation checklist and interpretation rules.
+
 The runner now writes `$ART/pwnkit-eidolon-scope.json` and
 `$ART/pwnkit-direct-scope.json`, then passes the matching file with `--scope` on
 each scan leg. Current pwnkit shell-mode auth injection is intentionally scoped:
