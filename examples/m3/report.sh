@@ -91,8 +91,16 @@ jq -r -n \
   def optional_number($value):
     if $value == null then "null" else ($value | tostring) end;
 
+  def optional_text($value):
+    if $value == null or $value == "" then "not recorded" else ($value | tostring) end;
+
   def status_word($value):
     if $value then "pass" else "open" end;
+
+  def count_summary($rows):
+    (($rows // [])
+     | map((.value | tostring) + ":" + (.count | tostring))
+     | if length == 0 then "none" else join(", ") end);
 
   def markdown_text($value):
     (($value // "") | tostring | gsub("\\|"; "\\|") | gsub("[\r\n]"; " "));
@@ -184,16 +192,59 @@ jq -r -n \
   def agent_chain_confirmed:
     (pwnkit.comparison.controlled_reality_entered // false);
 
+  def finding_gap:
+    pwnkit.comparison.finding_gap // {
+      direct_finding_count: (pwnkit.runs.direct.finding_count // 0),
+      eidolon_finding_count: (pwnkit.runs.eidolon.finding_count // 0),
+      differential_finding_count: (
+        (pwnkit.runs.eidolon.finding_count // 0)
+        - (pwnkit.runs.direct.finding_count // 0)
+      ),
+      positive_differential_findings: (
+        (pwnkit.runs.eidolon.finding_count // 0)
+        > (pwnkit.runs.direct.finding_count // 0)
+      ),
+      direct_quiet: ((pwnkit.runs.direct.finding_count // 0) == 0),
+      eidolon_has_findings: ((pwnkit.runs.eidolon.finding_count // 0) > 0),
+      eidolon_observed_target_evidence_without_findings: false,
+      eidolon_bait_reached_without_findings: (
+        (pwnkit.runs.eidolon.finding_count // 0) == 0
+        and (pwnkit.comparison.bait_reached // false)
+      ),
+      eidolon_bait_action_without_findings: (
+        (pwnkit.runs.eidolon.finding_count // 0) == 0
+        and (pwnkit.comparison.bait_action_observed // false)
+      ),
+      eidolon_controlled_reality_without_findings: (
+        (pwnkit.runs.eidolon.finding_count // 0) == 0
+        and (pwnkit.comparison.controlled_reality_entered // false)
+      ),
+      next_question: null
+    };
+
+  def positive_differential_findings:
+    finding_gap.positive_differential_findings // false;
+
   def adaptive_policy_posture:
-    if agent_chain_confirmed then
-      "go for adaptive bait-policy design input from this agent run"
+    if positive_differential_findings and agent_chain_confirmed then
+      "no-go for automation; use this as Lab class-tuning input until broader samples show stable class signal"
+    elif agent_chain_confirmed then
+      "no-go for automation; controlled-reality chain observed but differential findings remain open"
     else
       "no-go for adaptive automation; continue Lab-only class tuning and agent replay work"
     end;
 
   def remaining_empirical_gap:
-    if pwnkit.comparison.controlled_reality_entered then
-      "replicate controlled-reality entry across additional authorized agent/scanner subjects."
+    if positive_differential_findings then
+      "replicate differential findings across later pwnkit heads while the direct leg remains quiet."
+    elif finding_gap.eidolon_controlled_reality_without_findings then
+      "investigate why the controlled-reality chain was not promoted to a pwnkit finding."
+    elif finding_gap.eidolon_bait_action_without_findings then
+      "investigate why the bait-shaped action was not promoted to a pwnkit finding."
+    elif finding_gap.eidolon_bait_reached_without_findings then
+      "investigate why bait exposure was not promoted to a pwnkit finding or action."
+    elif pwnkit.comparison.controlled_reality_entered then
+      "replicate controlled-reality entry and differential finding behavior across additional authorized agent/scanner subjects."
     elif pwnkit.comparison.same_session_confirmed_bait_action then
       "agent-derived controlled-reality entry after same-session confirmation."
     elif pwnkit.comparison.bait_action_observed then
@@ -221,7 +272,7 @@ jq -r -n \
     line("| Claim | Evidence | Status |"),
     line("| --- | --- | --- |"),
     line("| Direct target stays quiet | direct findings `" + optional_number(pwnkit.runs.direct.finding_count) + "` | `" + status_word((pwnkit.runs.direct.finding_count // 0) == 0) + "` |"),
-    line("| Eidolon creates differential findings | Eidolon findings `" + optional_number(pwnkit.runs.eidolon.finding_count) + "` vs direct `" + optional_number(pwnkit.runs.direct.finding_count) + "` | `" + status_word(((pwnkit.runs.eidolon.finding_count // 0) > (pwnkit.runs.direct.finding_count // 0))) + "` |"),
+    line("| Eidolon creates differential findings | Eidolon findings `" + optional_number(finding_gap.eidolon_finding_count) + "` vs direct `" + optional_number(finding_gap.direct_finding_count) + "`, delta `" + optional_number(finding_gap.differential_finding_count) + "` | `" + status_word(positive_differential_findings) + "` |"),
     line("| Pwnkit reached owned bait | `bait_reached`: `" + bool_word(pwnkit.comparison.bait_reached // false) + "` | `" + status_word(pwnkit.comparison.bait_reached // false) + "` |"),
     line("| Pwnkit replayed bait-shaped action | `bait_action_observed`: `" + bool_word(pwnkit.comparison.bait_action_observed // false) + "` | `" + status_word(pwnkit.comparison.bait_action_observed // false) + "` |"),
     line("| Pwnkit same-session chain confirmed | `same_session_confirmed_bait_action`: `" + bool_word(pwnkit.comparison.same_session_confirmed_bait_action // false) + "` | `" + status_word(pwnkit.comparison.same_session_confirmed_bait_action // false) + "` |"),
@@ -240,6 +291,20 @@ jq -r -n \
     line("| `real_surface_requests_after_containment` | `" + optional_number(pwnkit.metrics.real_surface_requests_after_containment) + "` | `" + optional_number(action.metrics.real_surface_requests_after_containment) + "` |"),
     line("| `controlled_reality_action_depth` | `" + optional_number(pwnkit.metrics.controlled_reality_action_depth) + "` | `" + optional_number(action.metrics.controlled_reality_action_depth) + "` |"),
     line("| `controlled_reality_branch_count` | `" + optional_number(pwnkit.metrics.controlled_reality_branch_count) + "` | `" + optional_number(action.metrics.controlled_reality_branch_count) + "` |"),
+    line(""),
+    line("## Differential Finding Diagnostics"),
+    line(""),
+    line("| Diagnostic | Value |"),
+    line("| --- | --- |"),
+    line("| `comparison.finding_gap.next_question` | `" + markdown_text(optional_text(finding_gap.next_question)) + "` |"),
+    line("| `positive_differential_findings` | `" + bool_word(positive_differential_findings) + "` |"),
+    line("| `eidolon_observed_target_evidence_without_findings` | `" + bool_word(finding_gap.eidolon_observed_target_evidence_without_findings // false) + "` |"),
+    line("| `eidolon_bait_reached_without_findings` | `" + bool_word(finding_gap.eidolon_bait_reached_without_findings // false) + "` |"),
+    line("| `eidolon_bait_action_without_findings` | `" + bool_word(finding_gap.eidolon_bait_action_without_findings // false) + "` |"),
+    line("| `eidolon_controlled_reality_without_findings` | `" + bool_word(finding_gap.eidolon_controlled_reality_without_findings // false) + "` |"),
+    line("| Eidolon finding severity counts | `" + markdown_text(count_summary(pwnkit.runs.eidolon.finding_diagnostics.severity_counts)) + "` |"),
+    line("| Eidolon finding category counts | `" + markdown_text(count_summary(pwnkit.runs.eidolon.finding_diagnostics.category_counts)) + "` |"),
+    line("| Eidolon finding confidence counts | `" + markdown_text(count_summary(pwnkit.runs.eidolon.finding_diagnostics.confidence_counts)) + "` |"),
     line(""),
     line("## Bait Class Decisions"),
     line(""),
@@ -279,13 +344,14 @@ jq -r -n \
     line(""),
     line("- Public or production claim: `no-go`. The evidence remains Lab-only."),
     line("- Adaptive bait automation: `" + adaptive_policy_posture + "`."),
-    line("- M3 exposure claim: `" + status_word((pwnkit.comparison.bait_reached // false) and ((pwnkit.runs.eidolon.finding_count // 0) > (pwnkit.runs.direct.finding_count // 0))) + "` for pwnkit discoverability."),
+    line("- M3 exposure claim: `" + status_word(pwnkit.comparison.bait_reached // false) + "` for pwnkit bait discoverability."),
+    line("- M3 differential findings claim: `" + status_word(positive_differential_findings) + "`."),
     line("- M3 containment mechanics: `" + (if action_claim == "controlled_reality_entered" then "pass-scripted" else "open" end) + "` for proxy trace enforcement."),
     line("- Remaining empirical gap: " + remaining_empirical_gap),
     line(""),
     line("## Non-Claims"),
     line(""),
-    line("- This report does not claim pwnkit reached controlled reality."),
+    line("- This report does not claim production readiness or stability beyond the provided Lab artifacts."),
     line("- This report does not claim autonomous-attacker identity."),
     line("- This report does not rank offensive tools or prove safety outside the owned loopback Lab.")
   ]
