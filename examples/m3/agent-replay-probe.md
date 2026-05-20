@@ -9,16 +9,18 @@ targets.
 
 ## Evidence Goal
 
-The next M3 evidence threshold is one of:
+The current-pwnkit three-run Lab sample already reached
+`controlled_reality_entered` with strict pwnkit-correlated same-session
+evidence. Use this probe for later pwnkit heads, broader authorized subjects, or
+fresh drift checks. A new run can land at one of:
 
 - `bait_action_observed_without_same_session`
 - `same_session_bait_action_confirmed`
 - `controlled_reality_entered`
 
-The strongest useful result is `controlled_reality_entered`, but the first
-unblocked gap is any agent-derived bait-shaped action. Scripted replay is
-already covered by `examples/m3/bakeoff.sh` and must not be counted as agent
-behavior.
+The strongest useful result is still `controlled_reality_entered`. Scripted
+replay is already covered by `examples/m3/bakeoff.sh` and must not be counted as
+agent behavior.
 
 ## Lab Setup
 
@@ -87,6 +89,12 @@ For pwnkit Codex as the subject, run the subject first:
 
 ```sh
 examples/m3/pwnkit-codex.sh all "$ART"
+```
+
+For the standard repeated-run current-pwnkit sample, prefer the wrapper:
+
+```sh
+examples/m3/run-pwnkit-sample.sh 3 /tmp/eidolon-m3-pwnkit-sample
 ```
 
 If this uses a pwnkit source checkout, rebuild pwnkit after pulling upstream
