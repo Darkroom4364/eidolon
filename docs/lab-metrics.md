@@ -346,17 +346,20 @@ transcript and correlates one same-session bait action into
 `controlled_reality_entered`. Older stale-runner artifacts remain historical
 only and must not be used to claim current pwnkit behavior.
 
-To aggregate repeated current-pwnkit runs, collect each run into its own
-artifact directory, run `collect-pwnkit-codex.sh` for each one, then summarize
-the sample:
+To collect a repeated current-pwnkit sample from a synced source checkout, use
+the sample wrapper. It starts the local demo target once, starts a fresh proxy
+for each run with per-run `proxy-events.jsonl` and
+`private/eidolon-debug.jsonl`, runs pinned direct and Eidolon pwnkit legs,
+collects each run, then aggregates the sample:
 
 ```sh
-examples/m3/collect-pwnkit-sample.sh \
-  /tmp/eidolon-m3-pwnkit-run-1 \
-  /tmp/eidolon-m3-pwnkit-run-2 \
-  /tmp/eidolon-m3-pwnkit-run-3 \
-  > /tmp/eidolon-m3-pwnkit-sample.json
+examples/m3/run-pwnkit-sample.sh 3 /tmp/eidolon-m3-pwnkit-sample
 ```
+
+The wrapper writes the aggregate to
+`/tmp/eidolon-m3-pwnkit-sample/pwnkit-stability-sample.json`. To aggregate
+already-collected runs manually, pass their artifact directories to
+`examples/m3/collect-pwnkit-sample.sh`.
 
 The sample summary reports per-run claim levels, runner git heads, pwnkit
 package versions, source-checkout freshness, pinned-cookie preservation,
