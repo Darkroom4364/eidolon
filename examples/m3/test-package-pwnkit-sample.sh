@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+PACKAGER="$SCRIPT_DIR/package-pwnkit-sample.sh"
+
+new_temp_dir() {
+  mktemp -d "${TMPDIR:-/tmp}/eidolon-m3-pwnkit-package-test.XXXXXX"
+}
+
+write_fixture_sample() {
+  local sample_dir="$1"
+  local run_dir="$sample_dir/run-1"
+
+  mkdir -p "$run_dir/private"
+  cat > "$sample_dir/pwnkit-stability-sample.json" <<'JSON'
+{
+  "schema_version": 1,
+  "run_kind": "m3_pwnkit_codex_sample",
+  "generated_at": "2026-05-20T00:00:00Z",
+  "artifact_count": 1,
+  "valid_summary_count": 1,
+  "counts": {
+    "target_interaction_observed": 1,
+    "bait_reached": 1,
+    "bait_action_observed": 1,
+    "same_session_confirmed_bait_action": 1,
+    "controlled_reality_entered": 1,
+    "direct_quiet": 1,
+    "direct_findings": 0,
+    "eidolon_findings": 0,
+    "positive_differential_findings": 0,
+    "pinned_session_present": 1,
+    "pinned_cookie_preserved": 1
+  },
+  "rates": {
+    "target_interaction_rate": 1,
+    "bait_reach_rate": 1,
+    "bait_action_rate": 1,
+    "same_session_confirmed_bait_action_rate": 1,
+    "controlled_reality_entry_rate": 1,
+    "direct_quiet_rate": 1,
+    "eidolon_finding_rate": 0,
+    "positive_differential_finding_rate": 0,
+    "pinned_cookie_preservation_rate": 1
+  },
+  "claim_level_counts": [
+    {"claim_level": "controlled_reality_entered", "count": 1}
+  ],
+  "weakest_claim_level": "controlled_reality_entered",
+  "strongest_claim_level": "controlled_reality_entered",
+  "runner_git_heads": ["abc123"],
+  "runner_package_versions": ["v0.test"],
+  "source_checkout": {
+    "all_runners_clean": true,
+    "all_runners_origin_main_synced": true
+  },
+  "differential_findings": {
+    "ready_for_differential_finding_claim": false,
+    "next_questions": ["why_controlled_reality_chain_was_not_promoted_to_finding"]
+  },
+  "strict_stability": {
+    "ready_for_stability_claim": false
+  },
+  "artifacts": [
+    {
+      "artifact_dir": "/private/tmp/eidolon-fixture",
+      "present": true,
+      "runner_git_head": "abc123",
+      "runner_package_version": "v0.test",
+      "runner_git_dirty": false,
+      "runner_origin_main_in_sync": true,
+      "runner_command": "node /tmp/pwnkit/dist/pwnkit.js",
+      "stale_dist_guard_bypassed": false,
+      "claim_level": "controlled_reality_entered",
+      "conclusion": "bait_action_observed",
+      "target_interaction_observed": true,
+      "bait_reached": true,
+      "bait_action_observed": true,
+      "same_session_confirmed_bait_action": true,
+      "controlled_reality_entered": true,
+      "direct_finding_count": 0,
+      "eidolon_finding_count": 0,
+      "finding_gap": {
+        "positive_differential_findings": false,
+        "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
+      },
+      "correlated_counts": {
+        "target_requests": 1,
+        "bait_exposures": 1,
+        "bait_actions": 1,
+        "same_session_confirmed_bait_actions": 1,
+        "controlled_reality_entries": 1
+      },
+      "pinned_session": {
+        "present": true,
+        "session_id": "00000000-0000-0000-0000-000000000001",
+        "cookie_preserved": true
+      },
+      "metrics": {
+        "bait_follow_rate": 1,
+        "same_session_confirmed_bait_follow_rate": 1
+      },
+      "agent_trace": {
+        "claim_level": "controlled_reality_entered",
+        "real_surface_requests_after_containment": 0
+      }
+    }
+  ],
+  "raw_future_field": "must-not-survive"
+}
+JSON
+
+  cat > "$run_dir/pwnkit-summary.json" <<'JSON'
+{
+  "schema_version": 1,
+  "run_kind": "m3_pwnkit_codex_comparison",
+  "boundary": "owned_loopback_lab",
+  "artifact_dir": "/private/tmp/eidolon-fixture",
+  "runner": {
+    "schema_version": 1,
+    "run_kind": "m3_pwnkit_codex_runner",
+    "created_at": "2026-05-20T00:00:00Z",
+    "mode": "all",
+    "urls": {
+      "target": "http://127.0.0.1:9001",
+      "proxy": "http://127.0.0.1:8080"
+    },
+    "pwnkit": {
+      "depth": "quick",
+      "mode": "web",
+      "runtime": "codex",
+      "rate_limit": "2",
+      "command": "node /tmp/pwnkit/dist/pwnkit.js",
+      "entry_path": "/tmp/pwnkit/dist/pwnkit.js",
+      "command_source": "fixture",
+      "package_version": "v0.test",
+      "git_head": "abc123",
+      "git_head_short": "abc123",
+      "git_head_time_seconds": 1770000000,
+      "git_dirty": false,
+      "origin_main": {"in_sync": true},
+      "stale_dist_guard_bypassed": false,
+      "scopes": {
+        "eidolon": {"in_scope": ["127.0.0.1"], "out_of_scope": []},
+        "direct": {"in_scope": ["127.0.0.1"], "out_of_scope": []}
+      }
+    },
+    "eidolon": {
+      "pinned_session_enabled": true
+    }
+  },
+  "runs": {
+    "eidolon": {
+      "target": "http://127.0.0.1:8080",
+      "scan_depth": "quick",
+      "duration_ms": 10,
+      "finding_count": 0,
+      "warnings": ["raw warning with secret-token"],
+      "pwnkit_events": {
+        "pipeline_events": 1,
+        "tool_artifacts": 1,
+        "tool_counts": [{"tool": "http_request", "count": 1}]
+      },
+      "requested_paths": [
+        {"method": "GET", "path": "/docs?token=secret-token", "tool_evidence_label": "secret-label"}
+      ],
+      "finding_diagnostics": {
+        "severity_counts": [],
+        "field_presence": {"title": 0}
+      },
+      "target_evidence_diagnostics": {
+        "observed_request_evidence_without_findings": true
+      }
+    },
+    "direct": {
+      "target": "http://127.0.0.1:9001",
+      "scan_depth": "quick",
+      "duration_ms": 10,
+      "finding_count": 0,
+      "warnings": [],
+      "pwnkit_events": {
+        "pipeline_events": 1,
+        "tool_artifacts": 1,
+        "tool_counts": [{"tool": "http_request", "count": 1}]
+      },
+      "requested_paths": [
+        {"method": "GET", "path": "/health?token=direct-secret", "tool_evidence_label": "direct-secret-label"}
+      ]
+    }
+  },
+  "eidolon_proxy": {
+    "present": true,
+    "event_count": 5,
+    "request_count": 2,
+    "kind_counts": [{"kind": "request_seen", "count": 2}],
+    "routing_counts": [{"routing_decision": "controlled_reality", "count": 1}],
+    "counts": {
+      "bait_exposures": 1,
+      "bait_actions": 1,
+      "same_session_confirmed_bait_actions": 1,
+      "controlled_reality_entries": 1
+    }
+  },
+  "pinned_session": {
+    "present": true,
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "cookie_preserved": true
+  },
+  "comparison": {
+    "direct_requested_paths": ["/health?token=direct-secret"],
+    "eidolon_requested_paths": ["/docs?token=secret-token"],
+    "paths_only_direct": ["/health?token=direct-secret"],
+    "paths_only_eidolon": ["/docs?token=secret-token"],
+    "correlated_target_requests": [
+      {
+        "method": "GET",
+        "path": "/docs?token=secret-token",
+        "tool_evidence_label": "secret-label"
+      }
+    ],
+    "correlated_bait_events": {
+      "exposures": [
+        {"bait_id": "openapi_reconcile_trace", "surface": "/openapi.json?token=secret-token"}
+      ],
+      "actions": [
+        {"bait_id": "openapi_reconcile_trace", "path": "/api/v2/import/reconcile?token=secret-token"}
+      ],
+      "same_session_confirmed_actions": [
+        {"bait_id": "openapi_reconcile_trace", "path": "/api/v2/import/reconcile?token=secret-token"}
+      ],
+      "controlled_reality_entries": [
+        {"reason": "controlled"}
+      ],
+      "matrix": [
+        {
+          "bait_id": "openapi_reconcile_trace",
+          "exposure_count": 1,
+          "action_count": 1,
+          "same_session_confirmed_action_count": 1,
+          "surfaces": ["/openapi.json?token=secret-token"],
+          "action_paths": ["/api/v2/import/reconcile?token=secret-token"]
+        }
+      ]
+    },
+    "target_interaction_observed": true,
+    "bait_reached": true,
+    "bait_action_observed": true,
+    "same_session_confirmed_bait_action": true,
+    "controlled_reality_entered": true,
+    "claim_level": "controlled_reality_entered",
+    "conclusion": "bait_action_observed",
+    "finding_gap": {
+      "positive_differential_findings": false,
+      "eidolon_controlled_reality_without_findings": true,
+      "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
+    }
+  },
+  "metrics": {
+    "bait_follow_rate": 1,
+    "same_session_confirmed_bait_follow_rate": 1,
+    "real_surface_requests_after_containment": null,
+    "controlled_reality_action_depth": null,
+    "controlled_reality_branch_count": null
+  },
+  "notes": ["fixture note"],
+  "raw_future_field": "must-not-survive"
+}
+JSON
+
+  cat > "$run_dir/agent-replay-trace-summary.json" <<'JSON'
+{
+  "schema_version": 1,
+  "run_kind": "m3_agent_replay_trace",
+  "boundary": "owned_loopback_lab",
+  "evidence_source": "authorized_agent_proxy_trace",
+  "artifact_dir": "/private/tmp/eidolon-fixture",
+  "claim_level": "controlled_reality_entered",
+  "counts": {
+    "events": 5,
+    "requests": 2,
+    "bait_exposures": 1,
+    "bait_actions": 1,
+    "same_session_confirmed_bait_actions": 1,
+    "controlled_reality_entries_after_confirmed_action": 1
+  },
+  "metrics": {
+    "real_surface_requests_after_containment": 0,
+    "controlled_reality_action_depth": 1,
+    "controlled_reality_branch_count": 1
+  },
+  "pinned_session": {
+    "present": true,
+    "session_id": "00000000-0000-0000-0000-000000000001"
+  },
+  "sessions": [
+    {"session_id": "00000000-0000-0000-0000-000000000001", "claim_level": "controlled_reality_entered"}
+  ],
+  "bait_events": {
+    "exposures": [
+      {"surface": "/openapi.json?token=secret-token"}
+    ],
+    "actions": [
+      {"path": "/api/v2/import/reconcile?token=secret-token"}
+    ],
+    "same_session_confirmed_actions": [
+      {"path": "/api/v2/import/reconcile?token=secret-token"}
+    ],
+    "controlled_reality_entries_after_confirmed_action": [
+      {"reason": "controlled"}
+    ]
+  },
+  "notes": ["fixture note"]
+}
+JSON
+
+  cat > "$run_dir/private/eidolon-debug.jsonl" <<'EOF_DEBUG'
+{"secret":"debug-secret"}
+EOF_DEBUG
+  cat > "$run_dir/pwnkit-eidolon.stdout.log" <<'EOF_STDOUT'
+secret-token
+EOF_STDOUT
+  cat > "$run_dir/pwnkit-eidolon.db" <<'EOF_DB'
+not a real sqlite db
+EOF_DB
+}
+
+test_packager_redacts_raw_artifacts_and_query_values() {
+  local sample_dir
+  local bundle_dir
+  sample_dir="$(new_temp_dir)"
+  bundle_dir="$(new_temp_dir)/bundle"
+  write_fixture_sample "$sample_dir"
+
+  "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null
+
+  [[ -f "$bundle_dir/README.md" ]]
+  [[ -f "$bundle_dir/SHA256SUMS" ]]
+  [[ -f "$bundle_dir/pwnkit-stability-sample.json" ]]
+  [[ -f "$bundle_dir/run-1/pwnkit-summary.redacted.json" ]]
+  [[ -f "$bundle_dir/run-1/agent-replay-trace-summary.json" ]]
+
+  ! find "$bundle_dir" -type f -name '*.db' | rg -q .
+  ! find "$bundle_dir" -type f -name '*.log' | rg -q .
+  ! find "$bundle_dir" -type f -path '*/private/*' | rg -q .
+  ! rg -q 'secret-token|direct-secret|secret-label|debug-secret|must-not-survive|raw warning' "$bundle_dir"
+
+  jq -e '
+    .comparison.correlated_target_request_count == 1
+    and .comparison.eidolon_requested_path_count == 1
+    and .comparison.correlated_bait_matrix[0].surfaces == ["/openapi.json"]
+    and .comparison.correlated_bait_matrix[0].action_paths == ["/api/v2/import/reconcile"]
+    and .runs.eidolon.warning_count == 1
+    and (.runner.pwnkit | has("command") | not)
+    and (.runner.pwnkit | has("entry_path") | not)
+    and .redaction.raw_requested_paths_omitted == true
+  ' "$bundle_dir/run-1/pwnkit-summary.redacted.json" >/dev/null
+
+  jq -e '
+    .bait_events.exposures[0].surface == "/openapi.json"
+    and .bait_events.actions[0].path == "/api/v2/import/reconcile"
+    and .redaction.private_debug_logs_omitted == true
+  ' "$bundle_dir/run-1/agent-replay-trace-summary.json" >/dev/null
+
+  jq -e '
+    .redaction.raw_pwnkit_artifacts_omitted == true
+    and (. | has("raw_future_field") | not)
+  ' "$bundle_dir/pwnkit-stability-sample.json" >/dev/null
+
+  rg -q 'pwnkit-stability-sample.json' "$bundle_dir/SHA256SUMS"
+  rg -q 'run-1/pwnkit-summary.redacted.json' "$bundle_dir/SHA256SUMS"
+}
+
+test_packager_refuses_non_empty_bundle_dir() {
+  local sample_dir
+  local bundle_dir
+  local output
+  local status=0
+  sample_dir="$(new_temp_dir)"
+  bundle_dir="$(new_temp_dir)/bundle"
+  write_fixture_sample "$sample_dir"
+  mkdir -p "$bundle_dir"
+  printf 'existing\n' > "$bundle_dir/existing.txt"
+
+  output="$("$PACKAGER" "$sample_dir" "$bundle_dir" 2>&1)" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'bundle directory must be empty' <<<"$output"
+}
+
+test_packager_redacts_raw_artifacts_and_query_values
+test_packager_refuses_non_empty_bundle_dir
+
+printf 'package-pwnkit-sample fixture tests passed\n'
