@@ -196,9 +196,11 @@ same run:
 ```sh
 ART=/tmp/eidolon-m3-scripted-action-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ART"
+mkdir -p "$ART/private"
 
 # Start eidolon-proxy separately with:
 #   --event-log "$ART/proxy-events.jsonl"
+#   --debug-log "$ART/private/eidolon-debug.jsonl"
 #   --intervention-control "$ART/interventions.txt"
 #   --policy-state "$ART/policy-state.json"
 
@@ -222,15 +224,25 @@ using one artifact directory for the proxy event log:
 ```sh
 ART=/tmp/eidolon-m3-pwnkit-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$ART"
+mkdir -p "$ART/private"
 ```
 
 Start `eidolon-proxy` with:
 
 ```sh
 --event-log "$ART/proxy-events.jsonl"
+--debug-log "$ART/private/eidolon-debug.jsonl"
 --intervention-control "$ART/interventions.txt"
 --policy-state "$ART/policy-state.json"
 ```
+
+The debug log is a server-side JSONL stream for operator inspection only. It
+records sanitized proxy internals such as request lifecycle, policy state,
+surface decisions, bait exposure/action handling, rewrite outcomes, upstream
+forwarding, and response status. It intentionally omits request/response bodies,
+header values, and query strings, and the proxy never reflects it into HTTP
+responses, pwnkit scope files, pwnkit auth files, or normalized pwnkit reports.
+Keep it outside any served target directory and do not pass its path to pwnkit.
 
 Then run the pwnkit scans and collector:
 
@@ -252,9 +264,13 @@ upstream changes:
 `dist/pwnkit.js` bundles, including bundles that still contain the removed Codex
 MCP live runner. `EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1` exists only for debugging
 old artifacts. Each run writes `$ART/pwnkit-runner-metadata.json` with the
-resolved command, runtime settings, source-checkout git head, dist mtime, and
+resolved command, runtime settings, source-checkout package version, git head,
+dirty-worktree state, local `origin/main` ahead/behind counts, dist mtime, and
 generated pwnkit scope files; the collector copies this into
-`pwnkit-summary.json` under `runner`.
+`pwnkit-summary.json` under `runner`. For current-behavior claims against a
+moving pwnkit mainline, prefer artifacts where
+`runner.pwnkit.origin_main.in_sync` is `true` and
+`runner.pwnkit.git_dirty` is `false`.
 
 The runner captures pwnkit stdout as `$ART/pwnkit-<leg>.stdout.log` and writes a
 normalized JSON-only report to `$ART/pwnkit-<leg>.json`. This preserves current
@@ -342,13 +358,15 @@ examples/m3/collect-pwnkit-sample.sh \
   > /tmp/eidolon-m3-pwnkit-sample.json
 ```
 
-The sample summary reports per-run claim levels, runner git heads, pinned-cookie
-preservation, direct-target quietness, and strict pass rates. Treat
+The sample summary reports per-run claim levels, runner git heads, pwnkit
+package versions, source-checkout freshness, pinned-cookie preservation,
+direct-target quietness, and strict pass rates. Treat
 `strict_stability.ready_for_stability_claim: true` as the minimum gate before
 describing current-pwnkit behavior as stable across repeated Lab scans; it
-requires at least three valid summaries from one runner git head, all with
-target interaction, same-session confirmed bait action, controlled-reality
-entry, preserved pinned cookies, and quiet direct-target runs.
+requires at least three valid summaries from one runner git head, all with clean
+source-checkout metadata synced with local `origin/main`, target interaction,
+same-session confirmed bait action, controlled-reality entry, preserved pinned
+cookies, and quiet direct-target runs.
 
 To generate the internal M3 uniqueness report from the pwnkit and scripted
 action-trace artifacts:
