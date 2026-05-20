@@ -90,6 +90,22 @@ done | jq -s '
         artifact_dir,
         present: true,
         runner_git_head: (.runner.pwnkit.git_head // null),
+        runner_package_version: (.runner.pwnkit.package_version // null),
+        runner_git_dirty: (
+          if (.runner.pwnkit | has("git_dirty")) then
+            .runner.pwnkit.git_dirty
+          else
+            null
+          end
+        ),
+        runner_origin_main: (.runner.pwnkit.origin_main // null),
+        runner_origin_main_in_sync: (
+          if ((.runner.pwnkit.origin_main // {}) | has("in_sync")) then
+            .runner.pwnkit.origin_main.in_sync
+          else
+            null
+          end
+        ),
         runner_command: (.runner.pwnkit.command // null),
         stale_dist_guard_bypassed: (
           if (.runner.pwnkit | has("stale_dist_guard_bypassed")) then
@@ -235,6 +251,19 @@ done | jq -s '
   | ($present | map(select(.pinned_session.cookie_preserved)) | length)
     as $pinned_cookie_count
   | ($present | map(.runner_git_head // "unknown") | unique) as $runner_heads
+  | ($present | map(.runner_package_version // "unknown") | unique) as $runner_versions
+  | ($present | map(select(.runner_git_dirty == false)) | length)
+    as $clean_runner_count
+  | ($present | map(select(.runner_git_dirty == true)) | length)
+    as $dirty_runner_count
+  | ($present | map(select(.runner_git_dirty == null)) | length)
+    as $unknown_dirty_runner_count
+  | ($present | map(select(.runner_origin_main_in_sync == true)) | length)
+    as $origin_synced_count
+  | ($present | map(select(.runner_origin_main_in_sync == false)) | length)
+    as $origin_drifted_count
+  | ($present | map(select(.runner_origin_main_in_sync == null)) | length)
+    as $unknown_origin_sync_count
   | ($present | map({claim_level, rank: claim_rank(.claim_level)}))
     as $ranked_claims
   | {
@@ -287,6 +316,21 @@ done | jq -s '
         $ranked_claims | max_by(.rank) | .claim_level // "missing"
       ),
       runner_git_heads: $runner_heads,
+      runner_package_versions: $runner_versions,
+      source_checkout: {
+        clean_runner_count: $clean_runner_count,
+        dirty_runner_count: $dirty_runner_count,
+        unknown_dirty_runner_count: $unknown_dirty_runner_count,
+        origin_main_synced_count: $origin_synced_count,
+        origin_main_drifted_count: $origin_drifted_count,
+        unknown_origin_main_sync_count: $unknown_origin_sync_count,
+        all_runners_clean: (
+          $valid_count > 0 and all($present[]; .runner_git_dirty == false)
+        ),
+        all_runners_origin_main_synced: (
+          $valid_count > 0 and all($present[]; .runner_origin_main_in_sync == true)
+        )
+      },
       differential_findings: {
         minimum_sample_size: 3,
         sample_size: $valid_count,
@@ -334,10 +378,18 @@ done | jq -s '
           $valid_count > 0
           and all($present[]; .pinned_session.present and .pinned_session.cookie_preserved)
         ),
+        all_runners_clean: (
+          $valid_count > 0 and all($present[]; .runner_git_dirty == false)
+        ),
+        all_runners_origin_main_synced: (
+          $valid_count > 0 and all($present[]; .runner_origin_main_in_sync == true)
+        ),
         ready_for_stability_claim: (
           $valid_count >= 3
           and $valid_count == $artifact_count
           and ($runner_heads | length) == 1
+          and all($present[]; .runner_git_dirty == false)
+          and all($present[]; .runner_origin_main_in_sync == true)
           and all($present[]; .target_interaction_observed)
           and all($present[]; .same_session_confirmed_bait_action)
           and all($present[]; .controlled_reality_entered)
