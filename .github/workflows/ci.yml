@@ -71,6 +71,7 @@ jobs:
           examples/m3/test-collect-pwnkit-sample.sh
           examples/m3/test-collect-pwnkit-promotion-matrix.sh
           examples/m3/test-package-pwnkit-sample.sh
+          examples/m3/test-package-pwnkit-promotion-matrix.sh
           examples/m3/test-report.sh
 
       - name: Verify archived M3 evidence checksums

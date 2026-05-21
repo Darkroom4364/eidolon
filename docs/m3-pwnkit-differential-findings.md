@@ -77,6 +77,17 @@ the optional lab-only bait profile declared by each manifest row. It writes
 actual `promoted_finding` runs from `behavior_only` controlled-reality runs and
 lower-signal discovery/action outcomes.
 
+When archiving a completed matrix, use the matrix evidence packager:
+
+```sh
+examples/m3/package-pwnkit-promotion-matrix.sh \
+  /tmp/eidolon-m3-pwnkit-promotion-matrix \
+  docs/evidence/m3/pwnkit-promotion-matrix-YYYY-MM-DD
+```
+
+Review the generated README, redacted matrix summary, per-variant redacted
+sample bundles, and checksums before committing the bundle.
+
 ## Collector Diagnostics
 
 `examples/m3/collect-pwnkit-codex.sh` emits finding diagnostics under each run:
