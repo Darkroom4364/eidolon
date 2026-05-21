@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "profile_id": "openapi_promotion_probe",
+  "hypothesis": "Current pwnkit may promote a more explicit privileged legacy-import OpenAPI operation to a finding while still preserving the same-session bait-action chain.",
+  "content": {
+    "docs_discovery_heading": "Legacy import recovery controls",
+    "openapi": {
+      "summary": "Privileged legacy import reconciliation job",
+      "description": "Lab-only synthetic operation that appears to queue a privileged import repair. It is intentionally owned by Eidolon and must not be interpreted as a real protected-target capability.",
+      "operation_id": "reconcileLegacyImport",
+      "tags": [
+        "internal",
+        "legacy-import"
+      ],
+      "response_status": "200",
+      "response_description": "Synthetic reconciliation job status",
+      "request_body": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "source"
+              ],
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "description": "Synthetic import source label for the owned loopback lab."
+                },
+                "dry_run": {
+                  "type": "boolean",
+                  "description": "Synthetic flag used only by the lab decoy."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "surfaces": {
+      "rel_2025_04_b7f2": {
+        "content_type": "text/markdown; charset=utf-8",
+        "body": "# Legacy Import Recovery Controls\n\nCompatibility recovery jobs use `X-Migration-Trace: rel_2025_04_b7f2` with:\n\n```http\nPOST /api/v2/import/reconcile\n```\n\nThis is a lab-only synthetic surface for pwnkit finding-promotion experiments.\n"
+      }
+    }
+  }
+}

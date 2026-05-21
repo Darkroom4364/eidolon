@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fmt, fs,
     io::{self, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
@@ -31,7 +31,8 @@ use eidolon_proxy::{
         SurfaceController, SurfaceHeader, SurfaceRequestMeta, SurfaceResponse, SurfaceResponseMeta,
     },
 };
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde_json::{json, Map, Value};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
@@ -39,7 +40,6 @@ const DEFAULT_EVENT_LOG: &str = "/tmp/eidolon-events.jsonl";
 const DEFAULT_INTERVENTION_CONTROL: &str = "/tmp/eidolon-interventions.txt";
 const DEFAULT_POLICY_STATE: &str = "/tmp/eidolon-policy-state.json";
 const DOCS_DISCOVERY_TARGET: &str = "/docs";
-const LEGACY_IMPORT_OPENAPI_TARGET: &str = "/openapi.json";
 const LEGACY_IMPORT_OPENAPI_QUERY: &str = "eidolon_surface=legacy-import";
 const DEFAULT_HTTP_PORT: u16 = 80;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -69,6 +69,10 @@ fn main() -> ExitCode {
             match &config.debug_log_path {
                 Some(path) => println!("debug_log: {}", path.display()),
                 None => println!("debug_log: disabled"),
+            }
+            match &config.bait_profile_path {
+                Some(path) => println!("bait_profile: {}", path.display()),
+                None => println!("bait_profile: default"),
             }
             println!(
                 "intervention_control: {}",
@@ -103,6 +107,7 @@ struct ProxyConfig {
     upstream: UpstreamTarget,
     event_log_path: PathBuf,
     debug_log_path: Option<PathBuf>,
+    bait_profile_path: Option<PathBuf>,
     intervention_control_path: PathBuf,
     policy_state_path: PathBuf,
     controlled_reality_config: ControlledRealityConfig,
@@ -167,6 +172,14 @@ impl CliAction {
                         parse_debug_log_path(&value)?,
                     )?;
                 }
+                "--bait-profile" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.bait_profile_path,
+                        flag,
+                        parse_bait_profile_path(&value)?,
+                    )?;
+                }
                 "--intervention-control" => {
                     let value = option_value(flag, inline_value, &mut args)?;
                     set_once(
@@ -228,6 +241,7 @@ struct ConfigBuilder {
     upstream: Option<UpstreamTarget>,
     event_log_path: Option<PathBuf>,
     debug_log_path: Option<PathBuf>,
+    bait_profile_path: Option<PathBuf>,
     intervention_control_path: Option<PathBuf>,
     policy_state_path: Option<PathBuf>,
     controlled_reality_max_depth: Option<u32>,
@@ -251,6 +265,7 @@ impl ConfigBuilder {
                 None => parse_event_log_path(DEFAULT_EVENT_LOG)?,
             },
             debug_log_path: self.debug_log_path,
+            bait_profile_path: self.bait_profile_path,
             intervention_control_path: match self.intervention_control_path {
                 Some(value) => value,
                 None => parse_control_path(DEFAULT_INTERVENTION_CONTROL)?,
@@ -515,6 +530,18 @@ fn parse_debug_log_path(raw: &str) -> Result<PathBuf, ConfigError> {
     parse_file_path(raw, "debug log")
 }
 
+fn parse_bait_profile_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = parse_file_path(raw, "bait profile")?;
+    if !path.is_file() {
+        return Err(ConfigError::new(format!(
+            "bait profile path must be an existing file: `{}`",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
 fn parse_control_path(raw: &str) -> Result<PathBuf, ConfigError> {
     parse_file_path(raw, "intervention control")
 }
@@ -576,7 +603,13 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     );
     println!("forwarding normal traffic to {}", config.upstream);
 
-    let bait_registry = Arc::new(BaitRegistry::m3_catalog());
+    let loaded_bait_profile = match &config.bait_profile_path {
+        Some(path) => load_bait_profile(path).map_err(|error| invalid_data(error.to_string()))?,
+        None => default_loaded_bait_profile(),
+    };
+    let bait_profile_debug = bait_profile_debug_value(&loaded_bait_profile.metadata);
+    let bait_registry = Arc::new(loaded_bait_profile.registry);
+    let bait_content = loaded_bait_profile.content;
     let debug_log = match &config.debug_log_path {
         Some(path) => Some(Arc::new(Mutex::new(FileDebugLogWriter::open(path)?))),
         None => None,
@@ -593,7 +626,10 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         )?)),
         controlled_reality_config: config.controlled_reality_config,
         controlled_reality: Arc::new(ControlledRealityResponder),
-        surface_controller: Arc::new(M1DemoSurfaceController::new(Arc::clone(&bait_registry))),
+        surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
+            Arc::clone(&bait_registry),
+            bait_content,
+        )),
         bait_registry,
         bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
     };
@@ -609,6 +645,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 "tarpit_ms": runtime.controlled_reality_config.tarpit_delay.as_millis(),
                 "retry_after_seconds": runtime.controlled_reality_config.retry_after_seconds,
             },
+            "bait_profile": bait_profile_debug,
             "debug_log_visibility": "server_side_only",
         }),
     )?;
@@ -670,13 +707,325 @@ impl BaitExposureStore {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaitProfileMetadata {
+    profile_id: String,
+    hypothesis: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedBaitProfile {
+    registry: BaitRegistry,
+    content: BaitContentOverrides,
+    metadata: Option<BaitProfileMetadata>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct BaitContentOverrides {
+    docs_discovery_heading: Option<String>,
+    openapi: OpenApiOperationOverride,
+    surfaces: HashMap<String, SurfaceContentOverride>,
+}
+
+impl BaitContentOverrides {
+    fn surface_for(&self, bait: &Bait) -> Option<&SurfaceContentOverride> {
+        self.surfaces.get(&bait.id.0)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_optional_non_empty(
+            "content.docs_discovery_heading",
+            self.docs_discovery_heading.as_deref(),
+        )?;
+        self.openapi.validate()?;
+
+        for (bait_id, surface) in &self.surfaces {
+            validate_non_empty("content.surfaces bait id", bait_id)?;
+            surface.validate(bait_id)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct OpenApiOperationOverride {
+    summary: Option<String>,
+    description: Option<String>,
+    operation_id: Option<String>,
+    tags: Vec<String>,
+    response_status: Option<String>,
+    response_description: Option<String>,
+    request_body: Option<Value>,
+    path_item: Option<Value>,
+}
+
+impl OpenApiOperationOverride {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_optional_non_empty("content.openapi.summary", self.summary.as_deref())?;
+        validate_optional_non_empty("content.openapi.description", self.description.as_deref())?;
+        validate_optional_non_empty("content.openapi.operation_id", self.operation_id.as_deref())?;
+        validate_optional_non_empty(
+            "content.openapi.response_status",
+            self.response_status.as_deref(),
+        )?;
+        validate_optional_non_empty(
+            "content.openapi.response_description",
+            self.response_description.as_deref(),
+        )?;
+
+        for tag in &self.tags {
+            validate_non_empty("content.openapi.tags", tag)?;
+        }
+
+        if let Some(path_item) = &self.path_item {
+            if !path_item.is_object() {
+                return Err(ConfigError::new(
+                    "content.openapi.path_item must be a JSON object",
+                ));
+            }
+        }
+
+        if let Some(request_body) = &self.request_body {
+            if !request_body.is_object() {
+                return Err(ConfigError::new(
+                    "content.openapi.request_body must be a JSON object",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SurfaceContentOverride {
+    #[serde(default)]
+    status: Option<u16>,
+    #[serde(default)]
+    content_type: Option<String>,
+    body: String,
+}
+
+impl SurfaceContentOverride {
+    fn validate(&self, bait_id: &str) -> Result<(), ConfigError> {
+        if matches!(self.status, Some(status) if !(100..600).contains(&status)) {
+            return Err(ConfigError::new(format!(
+                "content.surfaces.{bait_id}.status must be an HTTP status code"
+            )));
+        }
+        validate_optional_non_empty(
+            &format!("content.surfaces.{bait_id}.content_type"),
+            self.content_type.as_deref(),
+        )?;
+        validate_non_empty(&format!("content.surfaces.{bait_id}.body"), &self.body)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBaitProfile {
+    schema_version: u16,
+    profile_id: String,
+    #[serde(default)]
+    hypothesis: Option<String>,
+    #[serde(default)]
+    baits: Option<Vec<Bait>>,
+    #[serde(default)]
+    content: BaitContentOverrides,
+}
+
+fn default_loaded_bait_profile() -> LoadedBaitProfile {
+    LoadedBaitProfile {
+        registry: BaitRegistry::m3_catalog(),
+        content: BaitContentOverrides::default(),
+        metadata: None,
+    }
+}
+
+fn load_bait_profile(path: &Path) -> Result<LoadedBaitProfile, ConfigError> {
+    let raw = fs::read_to_string(path).map_err(|error| {
+        ConfigError::new(format!(
+            "failed to read bait profile `{}`: {error}",
+            path.display()
+        ))
+    })?;
+
+    let profile: RawBaitProfile = serde_json::from_str(&raw).map_err(|error| {
+        ConfigError::new(format!(
+            "failed to parse bait profile `{}`: {error}",
+            path.display()
+        ))
+    })?;
+
+    profile.into_loaded()
+}
+
+impl RawBaitProfile {
+    fn into_loaded(self) -> Result<LoadedBaitProfile, ConfigError> {
+        if self.schema_version != 1 {
+            return Err(ConfigError::new(format!(
+                "bait profile schema_version must be 1, got {}",
+                self.schema_version
+            )));
+        }
+        validate_non_empty("profile_id", &self.profile_id)?;
+        validate_optional_non_empty("hypothesis", self.hypothesis.as_deref())?;
+        self.content.validate()?;
+
+        let registry = match self.baits {
+            Some(baits) => registry_from_profile_baits(baits)?,
+            None => BaitRegistry::m3_catalog(),
+        };
+        ensure_surface_overrides_reference_baits(&self.content, &registry)?;
+
+        Ok(LoadedBaitProfile {
+            registry,
+            content: self.content,
+            metadata: Some(BaitProfileMetadata {
+                profile_id: self.profile_id,
+                hypothesis: self.hypothesis,
+            }),
+        })
+    }
+}
+
+fn registry_from_profile_baits(baits: Vec<Bait>) -> Result<BaitRegistry, ConfigError> {
+    if baits.is_empty() {
+        return Err(ConfigError::new("bait profile baits must not be empty"));
+    }
+
+    let mut ids = HashSet::new();
+    let mut surfaces = HashSet::new();
+    let mut actions = HashSet::new();
+    let mut registry = BaitRegistry::new();
+
+    for bait in baits {
+        validate_bait(&bait)?;
+
+        if !ids.insert(bait.id.0.clone()) {
+            return Err(ConfigError::new(format!(
+                "duplicate bait id `{}` in bait profile",
+                bait.id.0
+            )));
+        }
+        if !surfaces.insert(bait.surface.clone()) {
+            return Err(ConfigError::new(format!(
+                "duplicate bait surface `{}` in bait profile",
+                bait.surface
+            )));
+        }
+
+        let action_key = (
+            bait.expected_action.method.to_ascii_uppercase(),
+            bait.expected_action.path.clone(),
+        );
+        if !actions.insert(action_key) {
+            return Err(ConfigError::new(format!(
+                "duplicate bait action `{} {}` in bait profile",
+                bait.expected_action.method, bait.expected_action.path
+            )));
+        }
+
+        registry.add(bait);
+    }
+
+    Ok(registry)
+}
+
+fn validate_bait(bait: &Bait) -> Result<(), ConfigError> {
+    validate_non_empty("bait.id", &bait.id.0)?;
+    validate_path("bait.surface", &bait.surface)?;
+    validate_non_empty("bait.expected_action.method", &bait.expected_action.method)?;
+    validate_path("bait.expected_action.path", &bait.expected_action.path)?;
+    validate_optional_non_empty(
+        "bait.expected_action.header_name",
+        bait.expected_action.header_name.as_deref(),
+    )?;
+    validate_optional_non_empty(
+        "bait.expected_action.header_value",
+        bait.expected_action.header_value.as_deref(),
+    )?;
+
+    if bait.expected_action.header_value.is_some() && bait.expected_action.header_name.is_none() {
+        return Err(ConfigError::new(
+            "bait expected action cannot require a header value without naming the header",
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_surface_overrides_reference_baits(
+    content: &BaitContentOverrides,
+    registry: &BaitRegistry,
+) -> Result<(), ConfigError> {
+    for bait_id in content.surfaces.keys() {
+        if !registry.baits().iter().any(|bait| bait.id.0 == *bait_id) {
+            return Err(ConfigError::new(format!(
+                "content.surfaces references unknown bait id `{bait_id}`"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_non_empty(label: &str, value: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        Err(ConfigError::new(format!("{label} cannot be empty")))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_optional_non_empty(label: &str, value: Option<&str>) -> Result<(), ConfigError> {
+    if let Some(value) = value {
+        validate_non_empty(label, value)?;
+    }
+
+    Ok(())
+}
+
+fn validate_path(label: &str, value: &str) -> Result<(), ConfigError> {
+    validate_non_empty(label, value)?;
+    if !value.starts_with('/') {
+        return Err(ConfigError::new(format!("{label} must start with `/`")));
+    }
+
+    Ok(())
+}
+
+fn bait_profile_debug_value(metadata: &Option<BaitProfileMetadata>) -> Value {
+    match metadata {
+        Some(metadata) => json!({
+            "profile_id": metadata.profile_id,
+            "hypothesis": metadata.hypothesis,
+        }),
+        None => json!({
+            "profile_id": "default_m3_catalog",
+            "hypothesis": null,
+        }),
+    }
+}
+
 struct M1DemoSurfaceController {
     bait_registry: Arc<BaitRegistry>,
+    content: BaitContentOverrides,
 }
 
 impl M1DemoSurfaceController {
-    fn new(bait_registry: Arc<BaitRegistry>) -> Self {
-        Self { bait_registry }
+    fn with_content_overrides(
+        bait_registry: Arc<BaitRegistry>,
+        content: BaitContentOverrides,
+    ) -> Self {
+        Self {
+            bait_registry,
+            content,
+        }
     }
 
     fn bait_for_class(&self, bait_class: BaitClass) -> Option<&Bait> {
@@ -690,7 +1039,7 @@ impl SurfaceController for M1DemoSurfaceController {
             if let Some(bait) = self.bait_registry.bait_for_surface(&request.path) {
                 if bait.bait_class != BaitClass::OpenApi {
                     return SurfaceAction::EidolonOwned {
-                        response: bait_surface_response(bait),
+                        response: bait_surface_response(bait, &self.content),
                     };
                 }
             }
@@ -700,19 +1049,20 @@ impl SurfaceController for M1DemoSurfaceController {
             return SurfaceAction::RewrittenUpstream {
                 plan: RewritePlan::html(HtmlInsertion::new(m3_docs_discovery_html(
                     &self.bait_registry,
+                    &self.content,
                 ))),
             };
         }
 
-        if is_openapi_discovery_request(request) {
-            let Some(bait) = self.bait_for_class(BaitClass::OpenApi) else {
+        if let Some(bait) = self.bait_for_class(BaitClass::OpenApi) {
+            if !is_openapi_discovery_request(request, bait) {
                 return SurfaceAction::ProtectedUpstream;
-            };
+            }
 
             return SurfaceAction::RewrittenUpstream {
                 plan: RewritePlan::openapi_paths(vec![openapi_path_insertion_for_bait(
                     bait,
-                    "Legacy import reconciliation compatibility hook",
+                    &self.content.openapi,
                 )]),
             };
         }
@@ -721,21 +1071,26 @@ impl SurfaceController for M1DemoSurfaceController {
     }
 }
 
-fn is_openapi_discovery_request(request: &SurfaceRequestMeta) -> bool {
+fn is_openapi_discovery_request(request: &SurfaceRequestMeta, bait: &Bait) -> bool {
     request.method == "GET"
-        && request.path == LEGACY_IMPORT_OPENAPI_TARGET
+        && request.path == bait.surface
         && matches!(
             request.query.as_deref(),
             None | Some(LEGACY_IMPORT_OPENAPI_QUERY)
         )
 }
 
-fn m3_docs_discovery_html(bait_registry: &BaitRegistry) -> String {
-    let mut html = String::from(
+fn m3_docs_discovery_html(bait_registry: &BaitRegistry, content: &BaitContentOverrides) -> String {
+    let heading = content
+        .docs_discovery_heading
+        .as_deref()
+        .unwrap_or("Legacy import compatibility");
+    let mut html = format!(
         r#"
     <section data-eidolon-discovery="m3-legacy-import">
-      <h2>Legacy import compatibility</h2>
+      <h2>{}</h2>
 "#,
+        html_escape(heading)
     );
 
     for bait in bait_registry
@@ -778,7 +1133,21 @@ fn html_escape(value: &str) -> String {
     escaped
 }
 
-fn bait_surface_response(bait: &Bait) -> SurfaceResponse {
+fn bait_surface_response(bait: &Bait, content: &BaitContentOverrides) -> SurfaceResponse {
+    if let Some(override_content) = content.surface_for(bait) {
+        return SurfaceResponse::new(
+            override_content.status.unwrap_or(200),
+            vec![SurfaceHeader::new(
+                "Content-Type",
+                override_content
+                    .content_type
+                    .as_deref()
+                    .unwrap_or_else(|| default_surface_content_type(bait.bait_class)),
+            )],
+            override_content.body.clone(),
+        );
+    }
+
     match bait.bait_class {
         BaitClass::Docs => SurfaceResponse::new(
             200,
@@ -824,6 +1193,13 @@ fn bait_surface_response(bait: &Bait) -> SurfaceResponse {
     }
 }
 
+fn default_surface_content_type(bait_class: BaitClass) -> &'static str {
+    match bait_class {
+        BaitClass::JsDiscoveredRoute => "application/javascript; charset=utf-8",
+        _ => "text/markdown; charset=utf-8",
+    }
+}
+
 fn action_markdown(title: &str, description: &str, bait: &Bait) -> String {
     let action = &bait.expected_action;
     let header_name = action.header_name.as_deref().unwrap_or("X-Migration-Trace");
@@ -846,29 +1222,66 @@ fn javascript_for_bait(bait: &Bait) -> String {
     )
 }
 
-fn openapi_path_insertion_for_bait(bait: &Bait, summary: &str) -> OpenApiPathInsertion {
+fn openapi_path_insertion_for_bait(
+    bait: &Bait,
+    openapi: &OpenApiOperationOverride,
+) -> OpenApiPathInsertion {
+    if let Some(path_item) = &openapi.path_item {
+        return OpenApiPathInsertion::new(bait.expected_action.path.clone(), path_item.clone());
+    }
+
     let action = &bait.expected_action;
     let header_name = action.header_name.as_deref().unwrap_or("X-Migration-Trace");
     let header_value = action.header_value.as_deref().unwrap_or(&bait.id.0);
+    let summary = openapi
+        .summary
+        .as_deref()
+        .unwrap_or("Legacy import reconciliation compatibility hook");
+    let response_status = openapi.response_status.as_deref().unwrap_or("202");
+    let response_description = openapi
+        .response_description
+        .as_deref()
+        .unwrap_or("Compatibility import reconciliation queued");
+    let mut operation = Map::new();
+
+    operation.insert("summary".to_string(), json!(summary));
+    if let Some(description) = &openapi.description {
+        operation.insert("description".to_string(), json!(description));
+    }
+    if let Some(operation_id) = &openapi.operation_id {
+        operation.insert("operationId".to_string(), json!(operation_id));
+    }
+    if !openapi.tags.is_empty() {
+        operation.insert("tags".to_string(), json!(openapi.tags));
+    }
+    operation.insert(
+        "parameters".to_string(),
+        json!([
+            {
+                "name": header_name,
+                "in": "header",
+                "required": true,
+                "schema": { "type": "string", "example": header_value }
+            }
+        ]),
+    );
+    if let Some(request_body) = &openapi.request_body {
+        operation.insert("requestBody".to_string(), request_body.clone());
+    }
+
+    let mut responses = Map::new();
+    responses.insert(
+        response_status.to_string(),
+        json!({ "description": response_description }),
+    );
+    operation.insert("responses".to_string(), Value::Object(responses));
 
     OpenApiPathInsertion::new(
         action.path.clone(),
-        json!({
-            "post": {
-                "summary": summary,
-                "parameters": [
-                    {
-                        "name": header_name,
-                        "in": "header",
-                        "required": true,
-                        "schema": { "type": "string", "example": header_value }
-                    }
-                ],
-                "responses": {
-                    "202": { "description": "Compatibility import reconciliation queued" }
-                }
-            }
-        }),
+        Value::Object(Map::from_iter([(
+            action.method.to_ascii_lowercase(),
+            Value::Object(operation),
+        )])),
     )
 }
 
@@ -1240,8 +1653,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     RoutingDecision::RewrittenUpstream,
                     "surface controller rewrote upstream response",
                 );
-                if is_openapi_discovery_request(&surface_request) {
-                    if let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::OpenApi) {
+                if let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::OpenApi) {
+                    if is_openapi_discovery_request(&surface_request, bait) {
                         pending_bait_exposure =
                             Some((bait.clone(), surface_request.target.clone()));
                     }
@@ -2561,6 +2974,8 @@ Options:
   --event-log <PATH>    JSONL event log file path [default: {DEFAULT_EVENT_LOG}]
   --debug-log <PATH>    Optional server-side JSONL debug log path. Records sanitized
                          internal decisions only; never emits debug data to HTTP clients
+  --bait-profile <PATH> Lab-only JSON bait profile for M3 promotion experiments.
+                         Defaults to the built-in M3 catalog
   --intervention-control <PATH>
                          Optional control file; write `disabled` to force protected forwarding
                          [default: {DEFAULT_INTERVENTION_CONTROL}]
@@ -2639,6 +3054,12 @@ mod tests {
         ))
     }
 
+    fn write_bait_profile(contents: &str) -> PathBuf {
+        let path = unique_temp_path("bait-profile.json");
+        fs::write(&path, contents).expect("bait profile should write");
+        path
+    }
+
     fn test_runtime(
         upstream: UpstreamTarget,
         event_log_path: &Path,
@@ -2692,10 +3113,78 @@ mod tests {
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
-            surface_controller: Arc::new(M1DemoSurfaceController::new(Arc::clone(&bait_registry))),
+            surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
+                Arc::clone(&bait_registry),
+                BaitContentOverrides::default(),
+            )),
             bait_registry,
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
         }
+    }
+
+    fn test_runtime_with_bait_profile(
+        upstream: UpstreamTarget,
+        event_log_path: &Path,
+        intervention_control_path: PathBuf,
+        loaded_profile: LoadedBaitProfile,
+    ) -> ProxyRuntime {
+        let bait_registry = Arc::new(loaded_profile.registry);
+        ProxyRuntime {
+            upstream,
+            event_log: Arc::new(Mutex::new(
+                FileEventLogWriter::open(event_log_path).expect("event log should open"),
+            )),
+            debug_log: None,
+            intervention_control_path,
+            policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            controlled_reality_config: ControlledRealityConfig::default(),
+            controlled_reality: Arc::new(ControlledRealityResponder),
+            surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
+                Arc::clone(&bait_registry),
+                loaded_profile.content,
+            )),
+            bait_registry,
+            bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+        }
+    }
+
+    fn promotion_profile_json() -> &'static str {
+        r##"{
+          "schema_version": 1,
+          "profile_id": "openapi_promotion_probe",
+          "hypothesis": "current pwnkit may promote an explicit privileged migration operation to a finding",
+          "content": {
+            "docs_discovery_heading": "Legacy import recovery controls",
+            "openapi": {
+              "summary": "Privileged legacy import reconciliation job",
+              "description": "Lab-only synthetic operation that appears to queue a privileged import repair.",
+              "operation_id": "reconcileLegacyImport",
+              "tags": ["internal", "legacy-import"],
+              "response_status": "200",
+              "response_description": "Synthetic reconciliation job status",
+              "request_body": {
+                "required": true,
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "required": ["source"],
+                      "properties": {
+                        "source": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "surfaces": {
+              "rel_2025_04_b7f2": {
+                "content_type": "text/markdown; charset=utf-8",
+                "body": "# Variant Legacy Import Notes\n\nUse `X-Migration-Trace: rel_2025_04_b7f2` with `POST /api/v2/import/reconcile` for lab-only import recovery.\n"
+              }
+            }
+          }
+        }"##
     }
 
     fn set_runtime_policy_state(runtime: &ProxyRuntime, cookie: &str, policy_state: PolicyState) {
@@ -2961,6 +3450,7 @@ mod tests {
         assert_eq!(config.upstream.to_string(), DEFAULT_UPSTREAM);
         assert_eq!(config.event_log_path, PathBuf::from(DEFAULT_EVENT_LOG));
         assert_eq!(config.debug_log_path, None);
+        assert_eq!(config.bait_profile_path, None);
         assert_eq!(
             config.intervention_control_path,
             PathBuf::from(DEFAULT_INTERVENTION_CONTROL)
@@ -2977,6 +3467,9 @@ mod tests {
 
     #[test]
     fn parses_explicit_flags() {
+        let bait_profile_path = unique_temp_path("bait-profile.json");
+        fs::write(&bait_profile_path, "{}").expect("bait profile placeholder should write");
+
         let config = run_config(&[
             "--listen-addr",
             "127.0.0.1:8181",
@@ -2986,6 +3479,8 @@ mod tests {
             "/tmp/eidolon-proxy-test.jsonl",
             "--debug-log",
             "/tmp/eidolon-debug-test.jsonl",
+            "--bait-profile",
+            bait_profile_path.to_str().unwrap(),
             "--intervention-control",
             "/tmp/eidolon-interventions-test.txt",
             "--policy-state",
@@ -3011,6 +3506,7 @@ mod tests {
             config.debug_log_path,
             Some(PathBuf::from("/tmp/eidolon-debug-test.jsonl"))
         );
+        assert_eq!(config.bait_profile_path, Some(bait_profile_path));
         assert_eq!(
             config.intervention_control_path,
             PathBuf::from("/tmp/eidolon-interventions-test.txt")
@@ -3133,6 +3629,8 @@ mod tests {
         assert_error_contains(&["--event-log", "/tmp"], "must be a file path");
         assert_error_contains(&["--debug-log", ""], "cannot be empty");
         assert_error_contains(&["--debug-log", "/tmp"], "must be a file path");
+        assert_error_contains(&["--bait-profile", ""], "cannot be empty");
+        assert_error_contains(&["--bait-profile", "/tmp"], "must be a file path");
 
         let missing_parent =
             env::temp_dir().join(format!("eidolon-missing-parent-{}", std::process::id()));
@@ -3146,6 +3644,17 @@ mod tests {
             &["--debug-log", missing_debug_path.to_str().unwrap()],
             "parent directory does not exist",
         );
+        let missing_profile_path = missing_parent.join("bait-profile.json");
+        assert_error_contains(
+            &["--bait-profile", missing_profile_path.to_str().unwrap()],
+            "parent directory does not exist",
+        );
+
+        let missing_profile_file = unique_temp_path("missing-bait-profile.json");
+        assert_error_contains(
+            &["--bait-profile", missing_profile_file.to_str().unwrap()],
+            "must be an existing file",
+        );
     }
 
     #[test]
@@ -3156,6 +3665,134 @@ mod tests {
         assert_eq!(
             config.intervention_control_path,
             PathBuf::from("/tmp/eidolon-control.txt")
+        );
+    }
+
+    #[test]
+    fn loads_bait_profile_content_overrides_against_default_catalog() {
+        let path = write_bait_profile(promotion_profile_json());
+        let loaded = load_bait_profile(&path).expect("bait profile should load");
+
+        assert_eq!(
+            loaded
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.profile_id.as_str()),
+            Some("openapi_promotion_probe")
+        );
+        assert_eq!(
+            loaded.registry.baits().len(),
+            BaitRegistry::m3_catalog().baits().len()
+        );
+        assert_eq!(
+            loaded.content.docs_discovery_heading.as_deref(),
+            Some("Legacy import recovery controls")
+        );
+        assert_eq!(
+            loaded.content.openapi.summary.as_deref(),
+            Some("Privileged legacy import reconciliation job")
+        );
+        assert!(loaded.content.surfaces.contains_key("rel_2025_04_b7f2"));
+    }
+
+    #[test]
+    fn committed_openapi_promotion_profile_loads() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/m3/bait-profiles/openapi-promotion-probe.json");
+        let loaded = load_bait_profile(&path).expect("committed profile should load");
+
+        assert_eq!(
+            loaded
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.profile_id.as_str()),
+            Some("openapi_promotion_probe")
+        );
+        assert_eq!(
+            loaded.content.openapi.operation_id.as_deref(),
+            Some("reconcileLegacyImport")
+        );
+    }
+
+    #[test]
+    fn bait_profile_rejects_surface_override_for_unknown_bait() {
+        let path = write_bait_profile(
+            r#"{
+              "schema_version": 1,
+              "profile_id": "bad_surface_override",
+              "content": {
+                "surfaces": {
+                  "unknown_bait": {
+                    "body": "not linked to a configured bait"
+                  }
+                }
+              }
+            }"#,
+        );
+
+        let error = load_bait_profile(&path).expect_err("unknown surface override should fail");
+        assert!(error
+            .to_string()
+            .contains("content.surfaces references unknown bait id"));
+    }
+
+    #[test]
+    fn runtime_bait_profile_customizes_surface_content_and_openapi_rewrite() {
+        let path = write_bait_profile(promotion_profile_json());
+        let loaded = load_bait_profile(&path).expect("bait profile should load");
+        let event_log_path = unique_temp_path("profile-surface-events.jsonl");
+        let runtime = test_runtime_with_bait_profile(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("profile-surface-control.txt"),
+            loaded.clone(),
+        );
+
+        let surface_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request("/docs/legacy-import"),
+        ));
+        let body = String::from_utf8(surface_response.body).expect("body should be utf8");
+
+        assert_eq!(surface_response.status, 200);
+        assert!(body.contains("Variant Legacy Import Notes"));
+        assert_event_routing(&event_log_path, "policy_decision", "eidolon_owned");
+
+        let openapi_event_log_path = unique_temp_path("profile-openapi-events.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, upstream_handle) = spawn_upstream(json_response(original));
+        let openapi_runtime = test_runtime_with_bait_profile(
+            upstream,
+            &openapi_event_log_path,
+            unique_temp_path("profile-openapi-control.txt"),
+            loaded,
+        );
+
+        let openapi_response = parse_downstream_response(&run_runtime_request(
+            openapi_runtime,
+            &get_request("/openapi.json"),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        let rewritten: Value = serde_json::from_slice(&openapi_response.body).unwrap();
+        let operation = &rewritten["paths"]["/api/v2/import/reconcile"]["post"];
+
+        assert_eq!(
+            operation["summary"].as_str(),
+            Some("Privileged legacy import reconciliation job")
+        );
+        assert_eq!(
+            operation["operationId"].as_str(),
+            Some("reconcileLegacyImport")
+        );
+        assert_eq!(
+            operation["responses"]["200"]["description"].as_str(),
+            Some("Synthetic reconciliation job status")
+        );
+        assert!(operation["requestBody"].is_object());
+        assert_event_routing(
+            &openapi_event_log_path,
+            "policy_decision",
+            "rewritten_upstream",
         );
     }
 
