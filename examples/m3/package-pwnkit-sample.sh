@@ -140,6 +140,7 @@ redact_sample_summary() {
           finding_diagnostics,
           pwnkit_events,
           target_evidence_diagnostics,
+          agent_error_diagnostics,
           eidolon_proxy: (.eidolon_proxy | clean_sample_proxy),
           target_correlation_diagnostics,
           finding_gap,
@@ -153,6 +154,7 @@ redact_sample_summary() {
         raw_run_summaries_omitted: true,
         raw_requested_paths_omitted: true,
         raw_tool_evidence_labels_omitted: true,
+        raw_agent_error_text_omitted: true,
         raw_pwnkit_artifacts_omitted: true,
         raw_proxy_events_omitted: true,
         private_debug_logs_omitted: true
@@ -189,7 +191,8 @@ redact_pwnkit_summary() {
         warning_count: (($run.warnings // []) | length),
         pwnkit_events: ($run.pwnkit_events // null),
         finding_diagnostics: ($run.finding_diagnostics // null),
-        target_evidence_diagnostics: ($run.target_evidence_diagnostics // null)
+        target_evidence_diagnostics: ($run.target_evidence_diagnostics // null),
+        agent_error_diagnostics: ($run.agent_error_diagnostics // null)
       };
     {
       schema_version,
@@ -261,6 +264,7 @@ redact_pwnkit_summary() {
         raw_requested_paths_omitted: true,
         raw_correlated_target_requests_omitted: true,
         raw_correlated_bait_events_omitted: true,
+        raw_agent_error_text_omitted: true,
         raw_tool_evidence_labels_omitted: true,
         warning_text_omitted: true,
         query_values_omitted: true
@@ -360,6 +364,7 @@ write_readme() {
     printf -- '- raw stdout and stderr logs\n'
     printf -- '- full proxy JSONL event logs\n'
     printf -- '- private Eidolon debug logs\n'
+    printf -- '- raw pwnkit agent error text\n'
     printf -- '- raw requested-path arrays and tool evidence labels from pwnkit summaries\n\n'
     printf 'Redacted summaries preserve runner freshness metadata, finding counts, shape-only finding diagnostics, no-signal diagnostics, claim-level booleans, correlated evidence counts, bait matrix counts, pinned-session metrics, proxy count summaries, and M3 notes.\n\n'
     printf '## Result\n\n'
