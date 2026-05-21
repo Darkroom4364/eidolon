@@ -36,13 +36,15 @@ This bundle intentionally omits raw artifacts:
 - pwnkit auth JSON files
 - raw stdout and stderr logs
 - full proxy JSONL event logs
+- private Eidolon debug logs
 - raw requested-path arrays and tool evidence labels from pwnkit summaries
 
 The redacted pwnkit summaries preserve runner metadata, finding counts,
-claim-level booleans, correlated evidence counts, bait matrix counts, pinned
-session metrics, proxy count summaries, and M3 notes. Raw path arrays were not
-committed because they can contain synthetic secret-shaped query values from the
-lab target.
+claim-level booleans, shape-only finding diagnostics, correlated evidence
+counts, bait matrix counts, pinned session metrics, proxy count summaries, and
+M3 notes. Raw path arrays were not committed because they can contain synthetic
+secret-shaped query values from the lab target. Each JSON summary now carries an
+explicit `redaction` block matching the commit-safe evidence packaging policy.
 
 ## Result
 
