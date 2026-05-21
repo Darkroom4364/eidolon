@@ -68,6 +68,36 @@ redact_sample_summary() {
   local output="$2"
 
   jq '
+    def safe_path:
+      if type == "string" then split("?")[0] | split("#")[0] else . end;
+    def clean_no_signal_diagnostics:
+      if . == null then
+        null
+      else
+        . + {
+          proxy_path_counts: [
+            (.proxy_path_counts // [])[] |
+            {
+              path: ((.path // .value) | safe_path),
+              count
+            }
+          ]
+        }
+      end;
+    def clean_sample_proxy:
+      if . == null then
+        null
+      else
+        . + {
+          request_path_counts: [
+            (.request_path_counts // [])[] |
+            {
+              value: ((.value // .path) | safe_path),
+              count
+            }
+          ]
+        }
+      end;
     {
       schema_version,
       run_kind,
@@ -82,6 +112,7 @@ redact_sample_summary() {
       runner_git_heads,
       runner_package_versions,
       source_checkout,
+      no_signal_diagnostics: (.no_signal_diagnostics | clean_no_signal_diagnostics),
       differential_findings,
       strict_stability,
       artifacts: [
@@ -107,6 +138,10 @@ redact_sample_summary() {
           direct_finding_count,
           eidolon_finding_count,
           finding_diagnostics,
+          pwnkit_events,
+          target_evidence_diagnostics,
+          eidolon_proxy: (.eidolon_proxy | clean_sample_proxy),
+          target_correlation_diagnostics,
           finding_gap,
           correlated_counts,
           pinned_session,
@@ -216,6 +251,7 @@ redact_pwnkit_summary() {
           controlled_reality_entries: ((.comparison.correlated_bait_events.controlled_reality_entries // []) | length)
         },
         correlated_bait_matrix: ((.comparison.correlated_bait_events.matrix // []) | clean_matrix),
+        target_correlation_diagnostics: .comparison.target_correlation_diagnostics,
         finding_gap: .comparison.finding_gap
       },
       metrics,
@@ -325,7 +361,7 @@ write_readme() {
     printf -- '- full proxy JSONL event logs\n'
     printf -- '- private Eidolon debug logs\n'
     printf -- '- raw requested-path arrays and tool evidence labels from pwnkit summaries\n\n'
-    printf 'Redacted summaries preserve runner freshness metadata, finding counts, shape-only finding diagnostics, claim-level booleans, correlated evidence counts, bait matrix counts, pinned-session metrics, proxy count summaries, and M3 notes.\n\n'
+    printf 'Redacted summaries preserve runner freshness metadata, finding counts, shape-only finding diagnostics, no-signal diagnostics, claim-level booleans, correlated evidence counts, bait matrix counts, pinned-session metrics, proxy count summaries, and M3 notes.\n\n'
     printf '## Result\n\n'
     printf -- '- valid summaries: `%s`\n' "$valid_count"
     printf -- '- claim levels: %s\n' "${claim_counts:-unknown}"
