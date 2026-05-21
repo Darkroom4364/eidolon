@@ -14,6 +14,8 @@ EIDOLON_M3_BAIT_PROFILE="${EIDOLON_M3_BAIT_PROFILE:-}"
 
 TARGET_PID=""
 PROXY_PID=""
+TARGET_BIN="$REPO_ROOT/target/debug/eidolon-demo-target"
+PROXY_BIN="$REPO_ROOT/target/debug/eidolon-proxy"
 
 usage() {
   cat <<'USAGE'
@@ -212,15 +214,19 @@ write_dry_run_plan() {
   echo "dry-run sample plan: $plan_file"
 }
 
+build_lab_binaries() {
+  (
+    cd "$REPO_ROOT"
+    cargo build -p eidolon-demo-target -p eidolon-proxy
+  )
+}
+
 start_target() {
   local target_addr="$1"
   local log_file="$SAMPLE_DIR/private/demo-target.log"
 
   mkdir -p "$SAMPLE_DIR/private"
-  (
-    cd "$REPO_ROOT"
-    EIDOLON_LAB_TARGET_ADDR="$target_addr" cargo run -p eidolon-demo-target
-  ) > "$log_file" 2>&1 &
+  EIDOLON_LAB_TARGET_ADDR="$target_addr" "$TARGET_BIN" > "$log_file" 2>&1 &
   TARGET_PID="$!"
   wait_for_http "eidolon-demo-target" "$TARGET_URL/health" "$TARGET_PID" "$log_file"
 }
@@ -246,10 +252,7 @@ start_proxy() {
   )
 
   mkdir -p "$run_dir/private"
-  (
-    cd "$REPO_ROOT"
-    cargo run -p eidolon-proxy -- "${proxy_args[@]}"
-  ) > "$log_file" 2>&1 &
+  "$PROXY_BIN" "${proxy_args[@]}" > "$log_file" 2>&1 &
   PROXY_PID="$!"
   wait_for_http "eidolon-proxy" "$PROXY_URL/health" "$PROXY_PID" "$log_file"
 }
@@ -305,6 +308,7 @@ main() {
   mkdir -p "$SAMPLE_DIR/private"
   trap cleanup EXIT INT TERM
 
+  build_lab_binaries
   start_target "$target_addr"
 
   local run_dirs=()
