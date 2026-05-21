@@ -25,6 +25,20 @@ extraction and toward real audit evidence. Treat that as a behavior-relevant
 drift: rerun before tuning bait semantics or making new current-pwnkit
 finding-gap claims.
 
+A follow-up promotion matrix was collected on 2026-05-21 against pwnkit head
+`4a8587f7321af622b58f7a57f21f9acd694dc10f` / `v0.11.1` and archived under
+`docs/evidence/m3/pwnkit-promotion-matrix-2026-05-21`. Both matrix variants
+classified as `no_signal`: direct and Eidolon legs were quiet, pwnkit emitted
+zero request/tool artifacts, and Eidolon saw only uncorrelated proxy requests
+for `/health`, `/readme.html`, `/wp-includes/version.php`, and
+`/wp-login.php`. Treat the active open question as runner/current-pwnkit signal
+loss before tuning bait semantics:
+
+```text
+Why does current pwnkit produce no persisted request artifacts while the
+Eidolon proxy still sees uncorrelated loopback requests?
+```
+
 ## Pre-Run Checklist
 
 Before collecting a new sample:
@@ -99,6 +113,7 @@ sample bundles, and checksums before committing the bundle.
 - `runs.<leg>.finding_diagnostics.field_presence`
 - `runs.<leg>.finding_diagnostics.evidence_presence`
 - `runs.<leg>.target_evidence_diagnostics`
+- `comparison.target_correlation_diagnostics`
 
 These fields are intentionally shape-only. They preserve counts, coarse labels,
 and field presence, but omit finding titles, descriptions, raw evidence, request
@@ -123,6 +138,7 @@ The comparison-level field `comparison.finding_gap` is the main diagnostic:
 - `counts.bait_reached_without_eidolon_findings`
 - `counts.bait_action_without_eidolon_findings`
 - `counts.controlled_reality_without_eidolon_findings`
+- `no_signal_diagnostics`
 - `differential_findings`
 
 `examples/m3/collect-pwnkit-promotion-matrix.sh` wraps those sample-level
@@ -130,6 +146,7 @@ signals per manifest variant and adds:
 
 - `observation_class`
 - `observation_class_counts`
+- `no_signal_diagnostics`
 - `ready_for_differential_finding_claim_variants`
 - `ready_for_stability_claim_variants`
 
@@ -147,6 +164,12 @@ Use the diagnostics to classify the gap before changing bait text or behavior:
   the surface was discoverable, but not finding-shaped enough.
 - If only target interaction is observed, focus on route discovery and bait
   placement before tuning finding language.
+- If `observation_class` is `no_signal`, inspect
+  `no_signal_diagnostics.likely_cause` before changing bait content. A likely
+  cause of
+  `eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts`
+  points at runner/current-pwnkit instrumentation or cookie reuse, not bait
+  semantics.
 
 Do not use raw pwnkit DBs, auth JSON, stdout/stderr logs, private debug logs,
 raw query values, or request bodies in committed evidence bundles. Archive only
