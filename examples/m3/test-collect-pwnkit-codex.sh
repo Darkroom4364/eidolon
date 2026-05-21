@@ -51,6 +51,27 @@ insert_tool_artifact() {
   "
 }
 
+insert_agent_error() {
+  local dir="$1"
+  local id="$2"
+  local timestamp_ms="$3"
+  local stage="$4"
+  local role="$5"
+  local error_text="$6"
+  local payload
+  local escaped_payload
+
+  payload="$(jq -cn --arg error "$error_text" --argjson turn 1 '{turn:$turn,error:$error}')"
+  escaped_payload="$(sql_quote "$payload")"
+
+  sqlite3 "$dir/pwnkit-eidolon.db" "
+    insert into pipeline_events
+      (id, scanId, stage, eventType, findingId, agentRole, payload, timestamp)
+    values
+      ('$id', 'scan-1', '$stage', 'agent_error', null, '$role', '$escaped_payload', $timestamp_ms);
+  "
+}
+
 insert_http_artifact() {
   local dir="$1"
   local id="$2"
@@ -242,6 +263,37 @@ test_no_signal_diagnostics_classify_proxy_without_pwnkit_artifacts() {
   ' "$dir/summary.json" >/dev/null
 }
 
+test_no_signal_diagnostics_classify_agent_auth_errors() {
+  local dir
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  append_request_seen "$dir" "session-b" "2026-01-01T00:00:00Z" GET /wp-login.php protected_upstream
+  insert_agent_error \
+    "$dir" \
+    "err-refresh" \
+    1767225600000 \
+    attack \
+    attack \
+    "ChatGPT (Codex backend) API error: token refresh failed: 401 invalid_request_error sensitive-refresh-detail"
+
+  assert_claim "$dir" "no_target_interaction"
+  jq -e '
+    .runs.eidolon.agent_error_diagnostics.count == 1
+    and .runs.eidolon.agent_error_diagnostics.stage_counts == [
+      {stage: "attack", agentRole: "attack", count: 1}
+    ]
+    and .runs.eidolon.agent_error_diagnostics.class_counts == [
+      {error_class: "codex_token_refresh_failed", count: 1}
+    ]
+    and .runs.eidolon.agent_error_diagnostics.has_codex_token_refresh_failure == true
+    and .comparison.target_correlation_diagnostics.pwnkit_eidolon_agent_error_count == 1
+    and .comparison.target_correlation_diagnostics.likely_cause == "pwnkit_codex_token_refresh_failure_prevented_request_artifacts"
+    and (.comparison.target_correlation_diagnostics.next_questions | index("refresh_pwnkit_codex_auth_before_rerun"))
+    and (.comparison.target_correlation_diagnostics.next_questions | index("rerun_matrix_after_agent_error_free_scan"))
+    and (. | tostring | contains("sensitive-refresh-detail") | not)
+  ' "$dir/summary.json" >/dev/null
+}
+
 test_finding_diagnostics_are_shape_only() {
   local dir
   dir="$(new_artifact)"
@@ -300,6 +352,7 @@ test_bash_http_output_upgrades_confirmed_action
 test_wrong_session_action_does_not_confirm
 test_proxy_only_action_stays_exposure_only
 test_no_signal_diagnostics_classify_proxy_without_pwnkit_artifacts
+test_no_signal_diagnostics_classify_agent_auth_errors
 test_finding_diagnostics_are_shape_only
 test_finding_gap_marks_controlled_reality_without_findings
 
