@@ -1,0 +1,393 @@
+{
+  "schema_version": 1,
+  "run_kind": "m3_pwnkit_promotion_matrix",
+  "generated_at": "2026-05-21T19:29:05Z",
+  "boundary": "owned_loopback_lab",
+  "variant_count": 2,
+  "observed_variant_count": 2,
+  "observation_class_counts": [
+    {
+      "observation_class": "no_signal",
+      "count": 2
+    }
+  ],
+  "no_signal_diagnostics": {
+    "variant_count": 2,
+    "likely_cause_counts": [
+      {
+        "likely_cause": "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts",
+        "count": 2
+      }
+    ],
+    "variants": [
+      {
+        "variant_id": "default_m3_catalog",
+        "likely_cause": "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts",
+        "next_questions": [
+          "why_pwnkit_emitted_no_request_artifacts",
+          "which_runner_or_probe_generated_uncorrelated_proxy_requests",
+          "why_pinned_session_cookie_was_not_reused_by_pwnkit"
+        ],
+        "totals": {
+          "direct_pwnkit_tool_artifacts": 0,
+          "eidolon_pwnkit_tool_artifacts": 0,
+          "direct_pwnkit_request_artifacts": 0,
+          "eidolon_pwnkit_request_artifacts": 0,
+          "eidolon_proxy_requests": 12,
+          "correlated_target_requests": 0,
+          "uncorrelated_eidolon_proxy_requests": 12
+        },
+        "proxy_path_counts": [
+          {
+            "path": "/health",
+            "count": 3
+          },
+          {
+            "path": "/readme.html",
+            "count": 3
+          },
+          {
+            "path": "/wp-includes/version.php",
+            "count": 3
+          },
+          {
+            "path": "/wp-login.php",
+            "count": 3
+          }
+        ]
+      },
+      {
+        "variant_id": "openapi_promotion_probe",
+        "likely_cause": "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts",
+        "next_questions": [
+          "why_pwnkit_emitted_no_request_artifacts",
+          "which_runner_or_probe_generated_uncorrelated_proxy_requests",
+          "why_pinned_session_cookie_was_not_reused_by_pwnkit"
+        ],
+        "totals": {
+          "direct_pwnkit_tool_artifacts": 0,
+          "eidolon_pwnkit_tool_artifacts": 0,
+          "direct_pwnkit_request_artifacts": 0,
+          "eidolon_pwnkit_request_artifacts": 0,
+          "eidolon_proxy_requests": 12,
+          "correlated_target_requests": 0,
+          "uncorrelated_eidolon_proxy_requests": 12
+        },
+        "proxy_path_counts": [
+          {
+            "path": "/health",
+            "count": 3
+          },
+          {
+            "path": "/readme.html",
+            "count": 3
+          },
+          {
+            "path": "/wp-includes/version.php",
+            "count": 3
+          },
+          {
+            "path": "/wp-login.php",
+            "count": 3
+          }
+        ]
+      }
+    ]
+  },
+  "ready_for_differential_finding_claim_variants": [],
+  "ready_for_stability_claim_variants": [],
+  "variants": [
+    {
+      "variant_id": "default_m3_catalog",
+      "bait_profile": null,
+      "hypothesis": "The built-in M3 catalog remains the baseline: pwnkit follows the OpenAPI bait into controlled reality but does not emit a finding.",
+      "knobs": [],
+      "expected_observation": "behavior_only",
+      "present": true,
+      "missing_reason": null,
+      "observation_class": "no_signal",
+      "variant_bundle_dir": "variants/default_m3_catalog",
+      "sample_generated_at": "2026-05-21T19:28:52Z",
+      "sample_run_kind": "m3_pwnkit_codex_sample",
+      "artifact_count": 3,
+      "valid_summary_count": 3,
+      "counts": {
+        "missing_summary": 0,
+        "target_interaction_observed": 0,
+        "bait_reached": 0,
+        "bait_action_observed": 0,
+        "same_session_confirmed_bait_action": 0,
+        "controlled_reality_entered": 0,
+        "direct_quiet": 3,
+        "direct_findings": 0,
+        "eidolon_findings": 0,
+        "positive_differential_findings": 0,
+        "bait_reached_without_eidolon_findings": 0,
+        "bait_action_without_eidolon_findings": 0,
+        "controlled_reality_without_eidolon_findings": 0,
+        "pinned_session_present": 3,
+        "pinned_cookie_preserved": 0
+      },
+      "rates": {
+        "target_interaction_rate": 0,
+        "bait_reach_rate": 0,
+        "bait_action_rate": 0,
+        "same_session_confirmed_bait_action_rate": 0,
+        "controlled_reality_entry_rate": 0,
+        "direct_quiet_rate": 1,
+        "eidolon_finding_rate": 0,
+        "positive_differential_finding_rate": 0,
+        "pinned_cookie_preservation_rate": 0
+      },
+      "claim_level_counts": [
+        {
+          "claim_level": "no_target_interaction",
+          "count": 3
+        }
+      ],
+      "weakest_claim_level": "no_target_interaction",
+      "strongest_claim_level": "no_target_interaction",
+      "runner_git_heads": [
+        "4a8587f7321af622b58f7a57f21f9acd694dc10f"
+      ],
+      "runner_package_versions": [
+        "0.11.1"
+      ],
+      "source_checkout": {
+        "clean_runner_count": 3,
+        "dirty_runner_count": 0,
+        "unknown_dirty_runner_count": 0,
+        "origin_main_synced_count": 3,
+        "origin_main_drifted_count": 0,
+        "unknown_origin_main_sync_count": 0,
+        "all_runners_clean": true,
+        "all_runners_origin_main_synced": true
+      },
+      "no_signal_diagnostics": {
+        "sample_size": 3,
+        "no_target_interaction_run_count": 3,
+        "all_runs_no_target_interaction": true,
+        "runs_with_eidolon_pwnkit_request_artifacts": 0,
+        "runs_with_eidolon_proxy_requests": 3,
+        "runs_with_proxy_requests_but_no_pwnkit_request_artifacts": 3,
+        "runs_with_pinned_session_but_no_cookie_preservation": 3,
+        "totals": {
+          "direct_pwnkit_tool_artifacts": 0,
+          "eidolon_pwnkit_tool_artifacts": 0,
+          "direct_pwnkit_request_artifacts": 0,
+          "eidolon_pwnkit_request_artifacts": 0,
+          "eidolon_proxy_requests": 12,
+          "correlated_target_requests": 0,
+          "uncorrelated_eidolon_proxy_requests": 12
+        },
+        "proxy_path_counts": [
+          {
+            "path": "/health",
+            "count": 3
+          },
+          {
+            "path": "/readme.html",
+            "count": 3
+          },
+          {
+            "path": "/wp-includes/version.php",
+            "count": 3
+          },
+          {
+            "path": "/wp-login.php",
+            "count": 3
+          }
+        ],
+        "likely_cause": "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts",
+        "next_questions": [
+          "why_pwnkit_emitted_no_request_artifacts",
+          "which_runner_or_probe_generated_uncorrelated_proxy_requests",
+          "why_pinned_session_cookie_was_not_reused_by_pwnkit"
+        ]
+      },
+      "differential_findings": {
+        "minimum_sample_size": 3,
+        "sample_size": 3,
+        "direct_finding_run_count": 0,
+        "eidolon_finding_run_count": 0,
+        "positive_differential_run_count": 0,
+        "bait_reached_without_eidolon_finding_run_count": 0,
+        "bait_action_without_eidolon_finding_run_count": 0,
+        "controlled_reality_without_eidolon_finding_run_count": 0,
+        "all_direct_quiet": true,
+        "ready_for_differential_finding_claim": false,
+        "next_questions": [
+          "why_no_correlated_target_interaction_was_observed"
+        ]
+      },
+      "strict_stability": {
+        "minimum_sample_size": 3,
+        "sample_size": 3,
+        "all_summaries_present": true,
+        "single_runner_git_head": true,
+        "all_target_interaction_observed": false,
+        "all_same_session_confirmed_bait_action": false,
+        "all_controlled_reality_entered": false,
+        "all_direct_quiet": true,
+        "all_pinned_cookie_preserved": false,
+        "all_runners_clean": true,
+        "all_runners_origin_main_synced": true,
+        "ready_for_stability_claim": false
+      }
+    },
+    {
+      "variant_id": "openapi_promotion_probe",
+      "bait_profile": "examples/m3/bait-profiles/openapi-promotion-probe.json",
+      "hypothesis": "More explicit privileged-operation wording, operationId, tags, request body, and response description may change pwnkit finding diagnostics.",
+      "knobs": [
+        "openapi.summary",
+        "openapi.description",
+        "openapi.operation_id",
+        "openapi.tags",
+        "openapi.request_body",
+        "openapi.response_description",
+        "docs_surface.body"
+      ],
+      "expected_observation": "diagnostic_delta_or_promoted_finding",
+      "present": true,
+      "missing_reason": null,
+      "observation_class": "no_signal",
+      "variant_bundle_dir": "variants/openapi_promotion_probe",
+      "sample_generated_at": "2026-05-21T19:28:59Z",
+      "sample_run_kind": "m3_pwnkit_codex_sample",
+      "artifact_count": 3,
+      "valid_summary_count": 3,
+      "counts": {
+        "missing_summary": 0,
+        "target_interaction_observed": 0,
+        "bait_reached": 0,
+        "bait_action_observed": 0,
+        "same_session_confirmed_bait_action": 0,
+        "controlled_reality_entered": 0,
+        "direct_quiet": 3,
+        "direct_findings": 0,
+        "eidolon_findings": 0,
+        "positive_differential_findings": 0,
+        "bait_reached_without_eidolon_findings": 0,
+        "bait_action_without_eidolon_findings": 0,
+        "controlled_reality_without_eidolon_findings": 0,
+        "pinned_session_present": 3,
+        "pinned_cookie_preserved": 0
+      },
+      "rates": {
+        "target_interaction_rate": 0,
+        "bait_reach_rate": 0,
+        "bait_action_rate": 0,
+        "same_session_confirmed_bait_action_rate": 0,
+        "controlled_reality_entry_rate": 0,
+        "direct_quiet_rate": 1,
+        "eidolon_finding_rate": 0,
+        "positive_differential_finding_rate": 0,
+        "pinned_cookie_preservation_rate": 0
+      },
+      "claim_level_counts": [
+        {
+          "claim_level": "no_target_interaction",
+          "count": 3
+        }
+      ],
+      "weakest_claim_level": "no_target_interaction",
+      "strongest_claim_level": "no_target_interaction",
+      "runner_git_heads": [
+        "4a8587f7321af622b58f7a57f21f9acd694dc10f"
+      ],
+      "runner_package_versions": [
+        "0.11.1"
+      ],
+      "source_checkout": {
+        "clean_runner_count": 3,
+        "dirty_runner_count": 0,
+        "unknown_dirty_runner_count": 0,
+        "origin_main_synced_count": 3,
+        "origin_main_drifted_count": 0,
+        "unknown_origin_main_sync_count": 0,
+        "all_runners_clean": true,
+        "all_runners_origin_main_synced": true
+      },
+      "no_signal_diagnostics": {
+        "sample_size": 3,
+        "no_target_interaction_run_count": 3,
+        "all_runs_no_target_interaction": true,
+        "runs_with_eidolon_pwnkit_request_artifacts": 0,
+        "runs_with_eidolon_proxy_requests": 3,
+        "runs_with_proxy_requests_but_no_pwnkit_request_artifacts": 3,
+        "runs_with_pinned_session_but_no_cookie_preservation": 3,
+        "totals": {
+          "direct_pwnkit_tool_artifacts": 0,
+          "eidolon_pwnkit_tool_artifacts": 0,
+          "direct_pwnkit_request_artifacts": 0,
+          "eidolon_pwnkit_request_artifacts": 0,
+          "eidolon_proxy_requests": 12,
+          "correlated_target_requests": 0,
+          "uncorrelated_eidolon_proxy_requests": 12
+        },
+        "proxy_path_counts": [
+          {
+            "path": "/health",
+            "count": 3
+          },
+          {
+            "path": "/readme.html",
+            "count": 3
+          },
+          {
+            "path": "/wp-includes/version.php",
+            "count": 3
+          },
+          {
+            "path": "/wp-login.php",
+            "count": 3
+          }
+        ],
+        "likely_cause": "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts",
+        "next_questions": [
+          "why_pwnkit_emitted_no_request_artifacts",
+          "which_runner_or_probe_generated_uncorrelated_proxy_requests",
+          "why_pinned_session_cookie_was_not_reused_by_pwnkit"
+        ]
+      },
+      "differential_findings": {
+        "minimum_sample_size": 3,
+        "sample_size": 3,
+        "direct_finding_run_count": 0,
+        "eidolon_finding_run_count": 0,
+        "positive_differential_run_count": 0,
+        "bait_reached_without_eidolon_finding_run_count": 0,
+        "bait_action_without_eidolon_finding_run_count": 0,
+        "controlled_reality_without_eidolon_finding_run_count": 0,
+        "all_direct_quiet": true,
+        "ready_for_differential_finding_claim": false,
+        "next_questions": [
+          "why_no_correlated_target_interaction_was_observed"
+        ]
+      },
+      "strict_stability": {
+        "minimum_sample_size": 3,
+        "sample_size": 3,
+        "all_summaries_present": true,
+        "single_runner_git_head": true,
+        "all_target_interaction_observed": false,
+        "all_same_session_confirmed_bait_action": false,
+        "all_controlled_reality_entered": false,
+        "all_direct_quiet": true,
+        "all_pinned_cookie_preserved": false,
+        "all_runners_clean": true,
+        "all_runners_origin_main_synced": true,
+        "ready_for_stability_claim": false
+      }
+    }
+  ],
+  "redaction": {
+    "source_matrix_dir_omitted": true,
+    "source_variant_sample_dirs_omitted": true,
+    "raw_run_summaries_omitted": true,
+    "raw_pwnkit_artifacts_omitted": true,
+    "raw_proxy_events_omitted": true,
+    "private_debug_logs_omitted": true
+  }
+}
