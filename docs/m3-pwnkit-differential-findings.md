@@ -61,6 +61,22 @@ examples/m3/package-pwnkit-sample.sh \
 
 Review the generated README and redacted JSON before committing the bundle.
 
+For the promotion investigation, run the seed bait-profile matrix after the
+standard sample path is healthy:
+
+```sh
+EIDOLON_M3_PROMOTION_RUNS=3 \
+  examples/m3/run-pwnkit-promotion-matrix.sh \
+  examples/m3/bait-promotion-variants.json \
+  /tmp/eidolon-m3-pwnkit-promotion-matrix
+```
+
+The matrix wrapper keeps the same direct/Eidolon runner shape and varies only
+the optional lab-only bait profile declared by each manifest row. It writes
+`pwnkit-promotion-matrix.json`, whose per-variant `observation_class` separates
+actual `promoted_finding` runs from `behavior_only` controlled-reality runs and
+lower-signal discovery/action outcomes.
+
 ## Collector Diagnostics
 
 `examples/m3/collect-pwnkit-codex.sh` emits finding diagnostics under each run:
@@ -97,6 +113,14 @@ The comparison-level field `comparison.finding_gap` is the main diagnostic:
 - `counts.bait_action_without_eidolon_findings`
 - `counts.controlled_reality_without_eidolon_findings`
 - `differential_findings`
+
+`examples/m3/collect-pwnkit-promotion-matrix.sh` wraps those sample-level
+signals per manifest variant and adds:
+
+- `observation_class`
+- `observation_class_counts`
+- `ready_for_differential_finding_claim_variants`
+- `ready_for_stability_claim_variants`
 
 ## Interpretation
 

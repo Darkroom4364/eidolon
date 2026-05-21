@@ -383,9 +383,35 @@ EIDOLON_M3_BAIT_PROFILE=examples/m3/bait-profiles/openapi-promotion-probe.json \
   examples/m3/run-pwnkit-sample.sh 3 /tmp/eidolon-m3-pwnkit-promotion-openapi
 ```
 
-`examples/m3/bait-promotion-variants.json` is the seed matrix manifest for the
-later runner. Each row names a profile, hypothesis, changed knobs, and expected
-observation class without changing the direct-target leg.
+To run the full seed matrix, use the promotion matrix wrapper:
+
+```sh
+examples/m3/run-pwnkit-promotion-matrix.sh \
+  examples/m3/bait-promotion-variants.json \
+  /tmp/eidolon-m3-pwnkit-promotion-matrix
+```
+
+The wrapper runs `examples/m3/run-pwnkit-sample.sh` once per manifest variant,
+varying only `EIDOLON_M3_BAIT_PROFILE`, then writes
+`pwnkit-promotion-matrix.json`. The summary classifies each variant as
+`promoted_finding`, `behavior_only`, `bait_reached_only`, or another observation
+class from the same shape-only sample counters. Use
+`EIDOLON_M3_PROMOTION_RUNS=3` when collecting evidence for a stability claim;
+the default is `1` so exploratory profile tuning does not accidentally launch a
+long matrix.
+
+To aggregate already-collected variant samples manually:
+
+```sh
+examples/m3/collect-pwnkit-promotion-matrix.sh \
+  examples/m3/bait-promotion-variants.json \
+  /tmp/eidolon-m3-pwnkit-promotion-matrix \
+  > /tmp/eidolon-m3-pwnkit-promotion-matrix/pwnkit-promotion-matrix.json
+```
+
+`examples/m3/bait-promotion-variants.json` is the seed matrix manifest. Each row
+names a profile, hypothesis, changed knobs, and expected observation class
+without changing the direct-target leg.
 
 The sample summary reports per-run claim levels, runner git heads, pwnkit
 package versions, source-checkout freshness, pinned-cookie preservation,
