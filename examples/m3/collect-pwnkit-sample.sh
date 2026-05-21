@@ -90,11 +90,22 @@ done | jq -s '
     | group_by(.value)
     | map({($key_name): .[0].value, count: (map(.count) | add)});
 
-  def no_signal_likely_cause($valid_count; $no_target_count; $request_artifacts; $proxy_requests):
+  def no_signal_likely_cause(
+    $valid_count;
+    $no_target_count;
+    $request_artifacts;
+    $proxy_requests;
+    $agent_errors;
+    $token_refresh_failures
+  ):
     if $valid_count == 0 then
       "no_valid_summaries"
     elif $no_target_count < $valid_count then
       null
+    elif $request_artifacts == 0 and $token_refresh_failures > 0 then
+      "pwnkit_codex_token_refresh_failure_prevented_request_artifacts"
+    elif $request_artifacts == 0 and $agent_errors > 0 then
+      "pwnkit_agent_errors_prevented_request_artifacts"
     elif $request_artifacts == 0 and $proxy_requests == 0 then
       "no_pwnkit_request_artifacts_and_no_proxy_requests"
     elif $request_artifacts == 0 and $proxy_requests > 0 then
@@ -105,8 +116,24 @@ done | jq -s '
       "pwnkit_request_artifacts_and_proxy_requests_did_not_correlate"
     end;
 
-  def no_signal_next_questions($request_artifacts; $proxy_requests; $pinned_without_cookie_count):
-    if $request_artifacts == 0 and $proxy_requests > 0 then
+  def no_signal_next_questions(
+    $request_artifacts;
+    $proxy_requests;
+    $pinned_without_cookie_count;
+    $agent_errors;
+    $token_refresh_failures
+  ):
+    if $request_artifacts == 0 and $token_refresh_failures > 0 then
+      [
+        "refresh_pwnkit_codex_auth_before_rerun",
+        "rerun_matrix_after_agent_error_free_scan"
+      ]
+    elif $request_artifacts == 0 and $agent_errors > 0 then
+      [
+        "inspect_sanitized_pwnkit_agent_error_classes",
+        "rerun_matrix_after_agent_error_free_scan"
+      ]
+    elif $request_artifacts == 0 and $proxy_requests > 0 then
       ([
         "why_pwnkit_emitted_no_request_artifacts",
         "which_runner_or_probe_generated_uncorrelated_proxy_requests"
@@ -194,6 +221,10 @@ done | jq -s '
           direct: (.runs.direct.target_evidence_diagnostics // null),
           eidolon: (.runs.eidolon.target_evidence_diagnostics // null)
         },
+        agent_error_diagnostics: {
+          direct: (.runs.direct.agent_error_diagnostics // null),
+          eidolon: (.runs.eidolon.agent_error_diagnostics // null)
+        },
         eidolon_proxy: {
           present: (.eidolon_proxy.present // false),
           request_count: (.eidolon_proxy.request_count // 0),
@@ -219,9 +250,21 @@ done | jq -s '
             | (.eidolon_proxy.request_count // 0) as $proxy_requests
             | ((.comparison.correlated_target_requests // []) | length)
               as $correlated_requests
+            | (.runs.eidolon.agent_error_diagnostics.count // 0) as $agent_errors
+            | (
+                if (.runs.eidolon.agent_error_diagnostics.has_codex_token_refresh_failure // false) then
+                  1
+                else
+                  0
+                end
+              ) as $token_refresh_failures
             | {
                 pwnkit_eidolon_tool_artifact_count: $tool_artifacts,
                 pwnkit_eidolon_request_artifact_count: $request_artifacts,
+                pwnkit_eidolon_agent_error_count: $agent_errors,
+                pwnkit_eidolon_agent_error_classes: (
+                  .runs.eidolon.agent_error_diagnostics.class_counts // []
+                ),
                 eidolon_proxy_request_count: $proxy_requests,
                 correlated_target_request_count: $correlated_requests,
                 uncorrelated_proxy_request_count: (
@@ -235,7 +278,14 @@ done | jq -s '
                   if $correlated_requests > 0 then
                     "correlated_target_interaction_observed"
                   else
-                    no_signal_likely_cause(1; 1; $request_artifacts; $proxy_requests)
+                    no_signal_likely_cause(
+                      1;
+                      1;
+                      $request_artifacts;
+                      $proxy_requests;
+                      $agent_errors;
+                      $token_refresh_failures
+                    )
                   end
                 ),
                 next_questions: (
@@ -249,7 +299,9 @@ done | jq -s '
                         1
                       else
                         0
-                      end
+                      end;
+                      $agent_errors;
+                      $token_refresh_failures
                     )
                   end
                 )
@@ -398,6 +450,10 @@ done | jq -s '
     as $direct_tool_artifact_total
   | ($present | map(.pwnkit_events.eidolon.tool_artifacts // 0) | add // 0)
     as $eidolon_tool_artifact_total
+  | ($present | map(.agent_error_diagnostics.direct.count // 0) | add // 0)
+    as $direct_agent_error_total
+  | ($present | map(.agent_error_diagnostics.eidolon.count // 0) | add // 0)
+    as $eidolon_agent_error_total
   | ($present | map(.target_evidence_diagnostics.direct.request_artifact_count // 0) | add // 0)
     as $direct_request_artifact_total
   | (
@@ -446,10 +502,31 @@ done | jq -s '
     ) as $runs_with_proxy_requests_but_no_pwnkit_request_artifacts
   | (
       $present
+      | map(select((.agent_error_diagnostics.eidolon.count // 0) > 0))
+      | length
+    ) as $runs_with_eidolon_agent_errors
+  | (
+      $present
+      | map(
+          select(
+            .agent_error_diagnostics.eidolon.has_codex_token_refresh_failure // false
+          )
+        )
+      | length
+    ) as $runs_with_eidolon_codex_token_refresh_failure
+  | (
+      $present
       | map(select(.pinned_session.present and (.pinned_session.cookie_preserved | not)))
       | length
     ) as $pinned_without_cookie_count
   | ($present | map(.eidolon_proxy.request_path_counts[]?)) as $proxy_path_entries
+  | (
+      $present
+      | map(.agent_error_diagnostics.eidolon.class_counts[]? | {
+          value: .error_class,
+          count
+        })
+    ) as $eidolon_agent_error_class_entries
   | {
       schema_version: 1,
       run_kind: "m3_pwnkit_codex_sample",
@@ -526,10 +603,16 @@ done | jq -s '
         runs_with_proxy_requests_but_no_pwnkit_request_artifacts: (
           $runs_with_proxy_requests_but_no_pwnkit_request_artifacts
         ),
+        runs_with_eidolon_agent_errors: $runs_with_eidolon_agent_errors,
+        runs_with_eidolon_codex_token_refresh_failure: (
+          $runs_with_eidolon_codex_token_refresh_failure
+        ),
         runs_with_pinned_session_but_no_cookie_preservation: $pinned_without_cookie_count,
         totals: {
           direct_pwnkit_tool_artifacts: $direct_tool_artifact_total,
           eidolon_pwnkit_tool_artifacts: $eidolon_tool_artifact_total,
+          direct_pwnkit_agent_errors: $direct_agent_error_total,
+          eidolon_pwnkit_agent_errors: $eidolon_agent_error_total,
           direct_pwnkit_request_artifacts: $direct_request_artifact_total,
           eidolon_pwnkit_request_artifacts: $eidolon_request_artifact_total,
           eidolon_proxy_requests: $eidolon_proxy_request_total,
@@ -543,18 +626,26 @@ done | jq -s '
           )
         },
         proxy_path_counts: merge_value_counts($proxy_path_entries; "path"),
+        eidolon_agent_error_class_counts: merge_value_counts(
+          $eidolon_agent_error_class_entries;
+          "error_class"
+        ),
         likely_cause: no_signal_likely_cause(
           $valid_count;
           $no_target_count;
           $eidolon_request_artifact_total;
-          $eidolon_proxy_request_total
+          $eidolon_proxy_request_total;
+          $eidolon_agent_error_total;
+          $runs_with_eidolon_codex_token_refresh_failure
         ),
         next_questions: (
           if $valid_count > 0 and $no_target_count == $valid_count then
             no_signal_next_questions(
               $eidolon_request_artifact_total;
               $eidolon_proxy_request_total;
-              $pinned_without_cookie_count
+              $pinned_without_cookie_count;
+              $eidolon_agent_error_total;
+              $runs_with_eidolon_codex_token_refresh_failure
             )
           else
             []

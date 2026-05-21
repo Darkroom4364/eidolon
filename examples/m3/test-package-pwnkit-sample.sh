@@ -61,8 +61,14 @@ write_fixture_sample() {
     "all_runs_no_target_interaction": false,
     "totals": {
       "eidolon_proxy_requests": 1,
-      "correlated_target_requests": 1
+      "correlated_target_requests": 1,
+      "eidolon_pwnkit_agent_errors": 1
     },
+    "runs_with_eidolon_agent_errors": 1,
+    "runs_with_eidolon_codex_token_refresh_failure": 0,
+    "eidolon_agent_error_class_counts": [
+      {"error_class": "codex_backend_api_error", "count": 1}
+    ],
     "proxy_path_counts": [
       {"path": "/docs?token=secret-token", "count": 1}
     ],
@@ -102,6 +108,26 @@ write_fixture_sample() {
       "target_evidence_diagnostics": {
         "eidolon": {"request_artifact_count": 1},
         "direct": {"request_artifact_count": 1}
+      },
+      "agent_error_diagnostics": {
+        "eidolon": {
+          "count": 1,
+          "stage_counts": [{"stage": "attack", "agentRole": "attack", "count": 1}],
+          "class_counts": [{"error_class": "codex_backend_api_error", "count": 1}],
+          "has_agent_error": true,
+          "has_codex_token_refresh_failure": false,
+          "has_codex_authentication_failure": false,
+          "has_codex_backend_api_error": true
+        },
+        "direct": {
+          "count": 0,
+          "stage_counts": [],
+          "class_counts": [],
+          "has_agent_error": false,
+          "has_codex_token_refresh_failure": false,
+          "has_codex_authentication_failure": false,
+          "has_codex_backend_api_error": false
+        }
       },
       "eidolon_proxy": {
         "request_count": 1,
@@ -204,6 +230,15 @@ JSON
       },
       "target_evidence_diagnostics": {
         "observed_request_evidence_without_findings": true
+      },
+      "agent_error_diagnostics": {
+        "count": 1,
+        "stage_counts": [{"stage": "attack", "agentRole": "attack", "count": 1}],
+        "class_counts": [{"error_class": "codex_backend_api_error", "count": 1}],
+        "has_agent_error": true,
+        "has_codex_token_refresh_failure": false,
+        "has_codex_authentication_failure": false,
+        "has_codex_backend_api_error": true
       }
     },
     "direct": {
@@ -216,6 +251,15 @@ JSON
         "pipeline_events": 1,
         "tool_artifacts": 1,
         "tool_counts": [{"tool": "http_request", "count": 1}]
+      },
+      "agent_error_diagnostics": {
+        "count": 0,
+        "stage_counts": [],
+        "class_counts": [],
+        "has_agent_error": false,
+        "has_codex_token_refresh_failure": false,
+        "has_codex_authentication_failure": false,
+        "has_codex_backend_api_error": false
       },
       "requested_paths": [
         {"method": "GET", "path": "/health?token=direct-secret", "tool_evidence_label": "direct-secret-label"}
@@ -390,6 +434,10 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .comparison.correlated_bait_matrix[0].action_paths == ["/api/v2/import/reconcile"]
     and .comparison.target_correlation_diagnostics.correlated_target_request_count == 1
     and .runs.eidolon.warning_count == 1
+    and .runs.eidolon.agent_error_diagnostics.class_counts == [
+      {error_class: "codex_backend_api_error", count: 1}
+    ]
+    and .redaction.raw_agent_error_text_omitted == true
     and (.runner.pwnkit | has("command") | not)
     and (.runner.pwnkit | has("entry_path") | not)
     and .redaction.raw_requested_paths_omitted == true
@@ -404,6 +452,10 @@ test_packager_redacts_raw_artifacts_and_query_values() {
   jq -e '
     .redaction.raw_pwnkit_artifacts_omitted == true
     and .no_signal_diagnostics.proxy_path_counts == [{path: "/docs", count: 1}]
+    and .no_signal_diagnostics.eidolon_agent_error_class_counts == [
+      {error_class: "codex_backend_api_error", count: 1}
+    ]
+    and .artifacts[0].agent_error_diagnostics.eidolon.count == 1
     and .artifacts[0].eidolon_proxy.request_path_counts == [{value: "/docs", count: 1}]
     and .artifacts[0].target_correlation_diagnostics.correlated_target_request_count == 1
     and (. | has("raw_future_field") | not)

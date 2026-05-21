@@ -109,6 +109,38 @@ run_summary() {
        and json_extract(payload, '$.output') like '%HTTP/1.1%'
      order by timestamp;")"
 
+  local agent_errors
+  agent_errors="$(sqlite_json "$db_file" \
+    "with classified as (
+       select
+         coalesce(stage, 'unknown') as stage,
+         coalesce(agentRole, 'unknown') as agent_role,
+         case
+           when lower(coalesce(json_extract(payload, '$.error'), '')) like '%refresh token%'
+             or lower(coalesce(json_extract(payload, '$.error'), '')) like '%token refresh failed%'
+             then 'codex_token_refresh_failed'
+           when lower(coalesce(json_extract(payload, '$.error'), '')) like '%401%'
+             or lower(coalesce(json_extract(payload, '$.error'), '')) like '%invalid_request_error%'
+             or lower(coalesce(json_extract(payload, '$.error'), '')) like '%authentication%'
+             then 'codex_authentication_failed'
+           when lower(coalesce(json_extract(payload, '$.error'), '')) like '%chatgpt (codex backend) api error%'
+             then 'codex_backend_api_error'
+           when lower(coalesce(json_extract(payload, '$.error'), '')) like '%api error%'
+             then 'agent_api_error'
+           else 'pwnkit_agent_error'
+         end as error_class
+       from pipeline_events
+       where eventType = 'agent_error'
+     )
+     select
+       stage,
+       agent_role as agentRole,
+       error_class,
+       count(*) as count
+     from classified
+     group by stage, agent_role, error_class
+     order by stage, agent_role, error_class;")"
+
   local event_count
   local tool_artifacts
   event_count="$(sqlite_scalar "$db_file" "select count(*) from pipeline_events;")"
@@ -121,6 +153,7 @@ run_summary() {
     --argjson tool_counts "$tool_counts" \
     --argjson http_requests "$http_requests" \
     --argjson bash_http_outputs "$bash_http_outputs" \
+    --argjson agent_errors "$agent_errors" \
     --argjson event_count "$event_count" \
     --argjson tool_artifacts "$tool_artifacts" \
     'def path_from_url:
@@ -269,6 +302,46 @@ run_summary() {
            finding_count == 0 and ((all_requested_paths | length) > 0)
          )
        };
+     def agent_error_diagnostics:
+       ($agent_errors // []) as $errors
+       | {
+           count: ($errors | map(.count) | add // 0),
+           stage_counts: (
+             $errors
+             | sort_by(.stage, .agentRole)
+             | group_by([.stage, .agentRole])
+             | map({
+                 stage: .[0].stage,
+                 agentRole: .[0].agentRole,
+                 count: (map(.count) | add)
+               })
+           ),
+           class_counts: (
+             $errors
+             | sort_by(.error_class)
+             | group_by(.error_class)
+             | map({
+                 error_class: .[0].error_class,
+                 count: (map(.count) | add)
+               })
+           ),
+           has_agent_error: (($errors | map(.count) | add // 0) > 0),
+           has_codex_token_refresh_failure: any(
+             $errors[];
+             .error_class == "codex_token_refresh_failed"
+           ),
+           has_codex_authentication_failure: any(
+             $errors[];
+             .error_class == "codex_token_refresh_failed"
+             or .error_class == "codex_authentication_failed"
+           ),
+           has_codex_backend_api_error: any(
+             $errors[];
+             .error_class == "codex_backend_api_error"
+             or .error_class == "codex_token_refresh_failed"
+             or .error_class == "codex_authentication_failed"
+           )
+         };
      {
       label: $label,
       artifact_status: $artifact_status,
@@ -282,8 +355,10 @@ run_summary() {
         pipeline_events: $event_count,
         tool_artifacts: $tool_artifacts,
         tool_counts: $tool_counts,
-        bash_http_output_requests: (bash_output_requests | length)
+        bash_http_output_requests: (bash_output_requests | length),
+        agent_errors: (agent_error_diagnostics.count)
       },
+      agent_error_diagnostics: agent_error_diagnostics,
       target_evidence_diagnostics: target_evidence_diagnostics,
       requested_paths: all_requested_paths
     }'
@@ -702,11 +777,18 @@ jq -n \
      ($eidolon.target_evidence_diagnostics.request_artifact_count // 0)
        as $pwnkit_request_artifacts
      | ($eidolon.pwnkit_events.tool_artifacts // 0) as $pwnkit_tool_artifacts
+     | ($eidolon.agent_error_diagnostics.count // 0) as $pwnkit_agent_errors
+     | ($eidolon.agent_error_diagnostics.has_codex_token_refresh_failure // false)
+       as $has_token_refresh_failure
      | (($proxy.request_paths // []) | length) as $proxy_requests
      | (correlated_target_requests | length) as $correlated_requests
      | {
          pwnkit_eidolon_tool_artifact_count: $pwnkit_tool_artifacts,
          pwnkit_eidolon_request_artifact_count: $pwnkit_request_artifacts,
+         pwnkit_eidolon_agent_error_count: $pwnkit_agent_errors,
+         pwnkit_eidolon_agent_error_classes: (
+           $eidolon.agent_error_diagnostics.class_counts // []
+         ),
          eidolon_proxy_request_count: $proxy_requests,
          correlated_target_request_count: $correlated_requests,
          uncorrelated_proxy_request_count: (
@@ -719,6 +801,10 @@ jq -n \
          likely_cause: (
            if $correlated_requests > 0 then
              "correlated_target_interaction_observed"
+           elif $pwnkit_request_artifacts == 0 and $has_token_refresh_failure then
+             "pwnkit_codex_token_refresh_failure_prevented_request_artifacts"
+           elif $pwnkit_request_artifacts == 0 and $pwnkit_agent_errors > 0 then
+             "pwnkit_agent_errors_prevented_request_artifacts"
            elif $pwnkit_request_artifacts == 0 and $proxy_requests == 0 then
              "no_pwnkit_request_artifacts_and_no_proxy_requests"
            elif $pwnkit_request_artifacts == 0 and $proxy_requests > 0 then
@@ -732,6 +818,16 @@ jq -n \
          next_questions: (
            if $correlated_requests > 0 then
              []
+           elif $pwnkit_request_artifacts == 0 and $has_token_refresh_failure then
+             [
+               "refresh_pwnkit_codex_auth_before_rerun",
+               "rerun_matrix_after_agent_error_free_scan"
+             ]
+           elif $pwnkit_request_artifacts == 0 and $pwnkit_agent_errors > 0 then
+             [
+               "inspect_sanitized_pwnkit_agent_error_classes",
+               "rerun_matrix_after_agent_error_free_scan"
+             ]
            elif $pwnkit_request_artifacts == 0 and $proxy_requests > 0 then
              ([
                "why_pwnkit_emitted_no_request_artifacts",
@@ -822,6 +918,7 @@ jq -n \
       "same_session_confirmed_bait_follow_rate counts only bait actions whose exposure_id matches a prior bait exposure in the same session.",
       "Controlled-reality depth metrics are null here; derive them from Eidolon trace evidence for final M3 reporting.",
       "finding_diagnostics intentionally keeps only counts, coarse classifications, and field presence; it omits finding titles, descriptions, raw evidence, request bodies, raw URLs, and analysis text.",
+      "agent_error_diagnostics intentionally keeps only counts and coarse error classes; it omits raw pwnkit agent error text.",
       "comparison.finding_gap records whether pwnkit observed target or bait evidence that was not promoted to a pwnkit finding.",
       "When emitted, a bait_not_reached conclusion means the agent interacted with the protected target through Eidolon but did not touch any owned bait surface."
     ]

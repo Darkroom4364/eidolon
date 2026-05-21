@@ -322,6 +322,14 @@ target through Eidolon, but did not request any owned M3 bait surface. If that
 correlation is absent, the conclusion is `no_target_interaction` and the run is
 not evidence for bait discoverability.
 
+The collector also emits `runs.<leg>.agent_error_diagnostics` from pwnkit
+`agent_error` events. This is sanitized runtime telemetry: counts,
+stage/agent-role counts, coarse error classes, and booleans for Codex auth or
+token-refresh failures. It does not include raw pwnkit error strings. In
+`no_signal` runs, a `pwnkit_codex_token_refresh_failure_prevented_request_artifacts`
+or `pwnkit_agent_errors_prevented_request_artifacts` likely cause must be
+cleared with an agent-error-free rerun before interpreting bait behavior.
+
 The summary separates the strength of the pwnkit-correlated bait evidence.
 `comparison.conclusion` keeps the broad runner outcome, while
 `comparison.claim_level` states the strongest supported claim:

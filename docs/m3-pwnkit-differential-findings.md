@@ -32,11 +32,14 @@ classified as `no_signal`: direct and Eidolon legs were quiet, pwnkit emitted
 zero request/tool artifacts, and Eidolon saw only uncorrelated proxy requests
 for `/health`, `/readme.html`, `/wp-includes/version.php`, and
 `/wp-login.php`. Treat the active open question as runner/current-pwnkit signal
-loss before tuning bait semantics:
+loss before tuning bait semantics. A post-archive inspection of the pwnkit
+SQLite events also found sanitized `agent_error` evidence consistent with a
+Codex token-refresh failure, so a rerun must first clear pwnkit agent runtime
+errors:
 
 ```text
-Why does current pwnkit produce no persisted request artifacts while the
-Eidolon proxy still sees uncorrelated loopback requests?
+Can current pwnkit produce an agent-error-free run with persisted request
+artifacts, and only then does it still fail to correlate through Eidolon?
 ```
 
 ## Pre-Run Checklist
@@ -113,11 +116,12 @@ sample bundles, and checksums before committing the bundle.
 - `runs.<leg>.finding_diagnostics.field_presence`
 - `runs.<leg>.finding_diagnostics.evidence_presence`
 - `runs.<leg>.target_evidence_diagnostics`
+- `runs.<leg>.agent_error_diagnostics`
 - `comparison.target_correlation_diagnostics`
 
 These fields are intentionally shape-only. They preserve counts, coarse labels,
 and field presence, but omit finding titles, descriptions, raw evidence, request
-bodies, raw URLs, and analysis text.
+bodies, raw URLs, analysis text, and raw pwnkit agent error text.
 
 The comparison-level field `comparison.finding_gap` is the main diagnostic:
 
@@ -165,8 +169,12 @@ Use the diagnostics to classify the gap before changing bait text or behavior:
 - If only target interaction is observed, focus on route discovery and bait
   placement before tuning finding language.
 - If `observation_class` is `no_signal`, inspect
-  `no_signal_diagnostics.likely_cause` before changing bait content. A likely
-  cause of
+  `no_signal_diagnostics.likely_cause` before changing bait content.
+  `pwnkit_codex_token_refresh_failure_prevented_request_artifacts` means refresh
+  pwnkit Codex auth and rerun before drawing current-pwnkit behavior
+  conclusions. A likely cause of `pwnkit_agent_errors_prevented_request_artifacts`
+  means inspect the sanitized agent error classes and rerun after an
+  agent-error-free scan. A likely cause of
   `eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts`
   points at runner/current-pwnkit instrumentation or cookie reuse, not bait
   semantics.

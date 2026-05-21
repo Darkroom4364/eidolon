@@ -28,7 +28,8 @@ Outputs:
   <bundle-dir>/SHA256SUMS
 
 The bundle intentionally omits raw pwnkit DBs, auth JSON, stdout/stderr logs,
-full proxy event logs, and private Eidolon debug logs from every variant.
+full proxy event logs, raw pwnkit agent error text, and private Eidolon debug
+logs from every variant.
 USAGE
 }
 
@@ -180,6 +181,7 @@ redact_matrix_summary() {
         source_variant_sample_dirs_omitted: true,
         raw_run_summaries_omitted: true,
         raw_pwnkit_artifacts_omitted: true,
+        raw_agent_error_text_omitted: true,
         raw_proxy_events_omitted: true,
         private_debug_logs_omitted: true
       }
@@ -260,6 +262,7 @@ write_readme() {
     printf -- '- raw stdout and stderr logs\n'
     printf -- '- full proxy JSONL event logs\n'
     printf -- '- private Eidolon debug logs\n'
+    printf -- '- raw pwnkit agent error text\n'
     printf -- '- raw requested-path arrays and tool evidence labels from pwnkit summaries\n\n'
     printf 'The matrix summary omits source sample directory paths and points observed variants at their redacted bundle directories.\n\n'
     printf '## Result\n\n'
