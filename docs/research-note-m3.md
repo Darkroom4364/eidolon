@@ -188,6 +188,11 @@ three valid current-run summaries from one pwnkit git head with preserved pinned
 cookies, quiet direct-target legs, same-session confirmed bait action, and
 controlled-reality entry in every run.
 
+Use `examples/m3/package-pwnkit-sample.sh` before committing future sample
+evidence. It emits a README, checksums, the sample aggregate, redacted pwnkit
+summaries, and sanitized trace summaries while omitting raw pwnkit artifacts,
+full proxy logs, auth files, stdout/stderr logs, and private debug logs.
+
 Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
 rules, then collect the resulting proxy trace with
 `examples/m3/collect-agent-replay-trace.sh`. The collector reuses the scripted
