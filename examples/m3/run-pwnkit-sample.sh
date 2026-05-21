@@ -11,6 +11,7 @@ PROXY_URL="${EIDOLON_LAB_PROXY_URL:-http://127.0.0.1:8080}"
 EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-1}"
 EIDOLON_M3_SAMPLE_DRY_RUN="${EIDOLON_M3_SAMPLE_DRY_RUN:-0}"
 EIDOLON_M3_BAIT_PROFILE="${EIDOLON_M3_BAIT_PROFILE:-}"
+EIDOLON_M3_ALLOW_AGENT_ERRORS="${EIDOLON_M3_ALLOW_AGENT_ERRORS:-0}"
 
 TARGET_PID=""
 PROXY_PID=""
@@ -33,6 +34,9 @@ Environment:
   EIDOLON_M3_SAMPLE_DIR        Sample root if [sample-dir] is omitted.
   EIDOLON_M3_PIN_SESSION       Pin one Eidolon session cookie. Defaults to 1.
   EIDOLON_M3_BAIT_PROFILE      Optional lab-only proxy bait profile JSON.
+  EIDOLON_M3_ALLOW_AGENT_ERRORS
+                                If true, continue when pwnkit emits agent_error
+                                events. Defaults to 0.
   EIDOLON_M3_SAMPLE_DRY_RUN    If true, create the planned directory layout only.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to pwnkit-codex.sh.
 
@@ -207,6 +211,7 @@ write_dry_run_plan() {
     printf 'proxy_addr=%s\n' "$proxy_addr"
     printf 'pin_session=%s\n' "$EIDOLON_M3_PIN_SESSION"
     printf 'bait_profile=%s\n' "${EIDOLON_M3_BAIT_PROFILE:-default}"
+    printf 'allow_agent_errors=%s\n' "$EIDOLON_M3_ALLOW_AGENT_ERRORS"
     printf 'debug_log=run-*/private/eidolon-debug.jsonl\n'
     printf 'sample_summary=pwnkit-stability-sample.json\n'
   } > "$plan_file"
@@ -273,6 +278,7 @@ run_one_sample() {
   "$SCRIPT_DIR/collect-pwnkit-codex.sh" "$run_dir" > "$run_dir/pwnkit-summary.json"
   "$SCRIPT_DIR/collect-agent-replay-trace.sh" "$run_dir" \
     > "$run_dir/agent-replay-trace-summary.json"
+  "$SCRIPT_DIR/check-pwnkit-summary-health.sh" "$run_dir/pwnkit-summary.json"
   stop_pid "$PROXY_PID"
   PROXY_PID=""
 }
