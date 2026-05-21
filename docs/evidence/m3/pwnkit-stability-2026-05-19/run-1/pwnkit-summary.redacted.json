@@ -243,6 +243,9 @@
   "redaction": {
     "raw_requested_paths_omitted": true,
     "raw_tool_evidence_labels_omitted": true,
-    "query_values_omitted": true
+    "query_values_omitted": true,
+    "raw_correlated_target_requests_omitted": true,
+    "raw_correlated_bait_events_omitted": true,
+    "warning_text_omitted": true
   }
 }
