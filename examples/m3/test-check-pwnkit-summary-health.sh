@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+CHECKER="$SCRIPT_DIR/check-pwnkit-summary-health.sh"
+
+new_temp_dir() {
+  mktemp -d "${TMPDIR:-/tmp}/eidolon-m3-summary-health-test.XXXXXX"
+}
+
+write_summary() {
+  local path="$1"
+  local direct_count="$2"
+  local eidolon_count="$3"
+  local eidolon_class="${4:-codex_token_refresh_failed}"
+
+  jq -n \
+    --argjson direct_count "$direct_count" \
+    --argjson eidolon_count "$eidolon_count" \
+    --arg eidolon_class "$eidolon_class" \
+    '{
+      schema_version: 1,
+      run_kind: "m3_pwnkit_codex_comparison",
+      raw_agent_error_fixture: "sensitive-refresh-detail",
+      runs: {
+        direct: {
+          agent_error_diagnostics: {
+            count: $direct_count,
+            class_counts: (
+              if $direct_count > 0 then
+                [{error_class: "agent_api_error", count: $direct_count}]
+              else
+                []
+              end
+            )
+          }
+        },
+        eidolon: {
+          agent_error_diagnostics: {
+            count: $eidolon_count,
+            class_counts: (
+              if $eidolon_count > 0 then
+                [{error_class: $eidolon_class, count: $eidolon_count}]
+              else
+                []
+              end
+            )
+          }
+        }
+      }
+    }' > "$path"
+}
+
+test_accepts_clean_summary() {
+  local dir
+  dir="$(new_temp_dir)"
+  write_summary "$dir/pwnkit-summary.json" 0 0
+
+  "$CHECKER" "$dir/pwnkit-summary.json"
+}
+
+test_rejects_agent_error_summary_with_sanitized_output() {
+  local dir
+  local output
+  local status=0
+  dir="$(new_temp_dir)"
+  write_summary "$dir/pwnkit-summary.json" 0 2 codex_token_refresh_failed
+
+  output="$("$CHECKER" "$dir/pwnkit-summary.json" 2>&1)" || status="$?"
+
+  [[ "$status" -eq 1 ]]
+  rg -q 'pwnkit agent errors detected' <<<"$output"
+  rg -q 'eidolon: count=2 classes=codex_token_refresh_failed=2' <<<"$output"
+  ! rg -q 'sensitive-refresh-detail' <<<"$output"
+}
+
+test_allows_agent_errors_when_explicitly_requested() {
+  local dir
+  dir="$(new_temp_dir)"
+  write_summary "$dir/pwnkit-summary.json" 1 1
+
+  EIDOLON_M3_ALLOW_AGENT_ERRORS=1 "$CHECKER" "$dir/pwnkit-summary.json"
+}
+
+test_rejects_missing_summary() {
+  local output
+  local status=0
+
+  output="$("$CHECKER" "$(new_temp_dir)/missing.json" 2>&1)" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'pwnkit summary not found' <<<"$output"
+}
+
+test_accepts_clean_summary
+test_rejects_agent_error_summary_with_sanitized_output
+test_allows_agent_errors_when_explicitly_requested
+test_rejects_missing_summary
+
+printf 'check-pwnkit-summary-health fixture tests passed\n'

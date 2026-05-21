@@ -328,7 +328,10 @@ stage/agent-role counts, coarse error classes, and booleans for Codex auth or
 token-refresh failures. It does not include raw pwnkit error strings. In
 `no_signal` runs, a `pwnkit_codex_token_refresh_failure_prevented_request_artifacts`
 or `pwnkit_agent_errors_prevented_request_artifacts` likely cause must be
-cleared with an agent-error-free rerun before interpreting bait behavior.
+cleared with an agent-error-free rerun before interpreting bait behavior. The
+sample runner enforces this by default after each collected run. Set
+`EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only when intentionally preserving diagnostic
+no-signal artifacts.
 
 The summary separates the strength of the pwnkit-correlated bait evidence.
 `comparison.conclusion` keeps the broad runner outcome, while
