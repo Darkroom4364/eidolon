@@ -77,6 +77,63 @@ done | jq -s '
   def rate($numerator; $denominator):
     if $denominator == 0 then null else ($numerator / $denominator) end;
 
+  def count_values($values):
+    $values
+    | map(select(. != null and . != ""))
+    | sort
+    | group_by(.)
+    | map({value: .[0], count: length});
+
+  def merge_value_counts($entries; $key_name):
+    $entries
+    | sort_by(.value)
+    | group_by(.value)
+    | map({($key_name): .[0].value, count: (map(.count) | add)});
+
+  def no_signal_likely_cause($valid_count; $no_target_count; $request_artifacts; $proxy_requests):
+    if $valid_count == 0 then
+      "no_valid_summaries"
+    elif $no_target_count < $valid_count then
+      null
+    elif $request_artifacts == 0 and $proxy_requests == 0 then
+      "no_pwnkit_request_artifacts_and_no_proxy_requests"
+    elif $request_artifacts == 0 and $proxy_requests > 0 then
+      "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts"
+    elif $request_artifacts > 0 and $proxy_requests == 0 then
+      "pwnkit_emitted_request_artifacts_but_eidolon_proxy_saw_no_requests"
+    else
+      "pwnkit_request_artifacts_and_proxy_requests_did_not_correlate"
+    end;
+
+  def no_signal_next_questions($request_artifacts; $proxy_requests; $pinned_without_cookie_count):
+    if $request_artifacts == 0 and $proxy_requests > 0 then
+      ([
+        "why_pwnkit_emitted_no_request_artifacts",
+        "which_runner_or_probe_generated_uncorrelated_proxy_requests"
+      ] + (
+        if $pinned_without_cookie_count > 0 then
+          ["why_pinned_session_cookie_was_not_reused_by_pwnkit"]
+        else
+          []
+        end
+      ))
+    elif $request_artifacts == 0 then
+      [
+        "why_pwnkit_emitted_no_request_artifacts",
+        "whether_updated_pwnkit_changed_tool_artifact_persistence"
+      ]
+    elif $proxy_requests == 0 then
+      [
+        "why_eidolon_proxy_saw_no_requests",
+        "whether_pwnkit_bypassed_the_proxy_target"
+      ]
+    else
+      [
+        "whether_timestamp_or_path_correlation_window_is_too_strict",
+        "whether_pwnkit_request_artifacts_match_proxy_request_shape"
+      ]
+    end;
+
   def summarize_run:
     if .missing then
       {
@@ -129,6 +186,76 @@ done | jq -s '
           direct: (.runs.direct.finding_diagnostics // null),
           eidolon: (.runs.eidolon.finding_diagnostics // null)
         },
+        pwnkit_events: {
+          direct: (.runs.direct.pwnkit_events // null),
+          eidolon: (.runs.eidolon.pwnkit_events // null)
+        },
+        target_evidence_diagnostics: {
+          direct: (.runs.direct.target_evidence_diagnostics // null),
+          eidolon: (.runs.eidolon.target_evidence_diagnostics // null)
+        },
+        eidolon_proxy: {
+          present: (.eidolon_proxy.present // false),
+          request_count: (.eidolon_proxy.request_count // 0),
+          protected_upstream_request_count: (
+            .eidolon_proxy.counts.protected_upstream_requests // 0
+          ),
+          bait_exposure_count: (.eidolon_proxy.counts.bait_exposures // 0),
+          bait_action_count: (.eidolon_proxy.counts.bait_actions // 0),
+          controlled_reality_entry_count: (
+            .eidolon_proxy.counts.controlled_reality_entries // 0
+          ),
+          kind_counts: (.eidolon_proxy.kind_counts // []),
+          routing_counts: (.eidolon_proxy.routing_counts // []),
+          request_path_counts: count_values(
+            (.eidolon_proxy.request_paths // []) | map(.path // null)
+          )
+        },
+        target_correlation_diagnostics: (
+          .comparison.target_correlation_diagnostics // (
+            (.runs.eidolon.pwnkit_events.tool_artifacts // 0) as $tool_artifacts
+            | (.runs.eidolon.target_evidence_diagnostics.request_artifact_count // 0)
+              as $request_artifacts
+            | (.eidolon_proxy.request_count // 0) as $proxy_requests
+            | ((.comparison.correlated_target_requests // []) | length)
+              as $correlated_requests
+            | {
+                pwnkit_eidolon_tool_artifact_count: $tool_artifacts,
+                pwnkit_eidolon_request_artifact_count: $request_artifacts,
+                eidolon_proxy_request_count: $proxy_requests,
+                correlated_target_request_count: $correlated_requests,
+                uncorrelated_proxy_request_count: (
+                  if $proxy_requests > $correlated_requests then
+                    $proxy_requests - $correlated_requests
+                  else
+                    0
+                  end
+                ),
+                likely_cause: (
+                  if $correlated_requests > 0 then
+                    "correlated_target_interaction_observed"
+                  else
+                    no_signal_likely_cause(1; 1; $request_artifacts; $proxy_requests)
+                  end
+                ),
+                next_questions: (
+                  if $correlated_requests > 0 then
+                    []
+                  else
+                    no_signal_next_questions(
+                      $request_artifacts;
+                      $proxy_requests;
+                      if .pinned_session.present and (.pinned_session.cookie_preserved | not) then
+                        1
+                      else
+                        0
+                      end
+                    )
+                  end
+                )
+              }
+          )
+        ),
         finding_gap: (
           .comparison.finding_gap // {
             direct_finding_count: (.runs.direct.finding_count // 0),
@@ -266,6 +393,63 @@ done | jq -s '
     as $unknown_origin_sync_count
   | ($present | map({claim_level, rank: claim_rank(.claim_level)}))
     as $ranked_claims
+  | ($valid_count - $target_count) as $no_target_count
+  | ($present | map(.pwnkit_events.direct.tool_artifacts // 0) | add // 0)
+    as $direct_tool_artifact_total
+  | ($present | map(.pwnkit_events.eidolon.tool_artifacts // 0) | add // 0)
+    as $eidolon_tool_artifact_total
+  | ($present | map(.target_evidence_diagnostics.direct.request_artifact_count // 0) | add // 0)
+    as $direct_request_artifact_total
+  | (
+      $present
+      | map(
+          .target_evidence_diagnostics.eidolon.request_artifact_count
+          // .target_correlation_diagnostics.pwnkit_eidolon_request_artifact_count
+          // 0
+        )
+      | add // 0
+    ) as $eidolon_request_artifact_total
+  | ($present | map(.eidolon_proxy.request_count // 0) | add // 0)
+    as $eidolon_proxy_request_total
+  | ($present | map(.correlated_counts.target_requests // 0) | add // 0)
+    as $correlated_target_request_total
+  | (
+      $present
+      | map(
+          select(
+            (
+              .target_evidence_diagnostics.eidolon.request_artifact_count
+              // .target_correlation_diagnostics.pwnkit_eidolon_request_artifact_count
+              // 0
+            ) > 0
+          )
+        )
+      | length
+    ) as $runs_with_eidolon_request_artifacts
+  | ($present | map(select((.eidolon_proxy.request_count // 0) > 0)) | length)
+    as $runs_with_eidolon_proxy_requests
+  | (
+      $present
+      | map(
+          select(
+            (.eidolon_proxy.request_count // 0) > 0
+            and (
+              (
+                .target_evidence_diagnostics.eidolon.request_artifact_count
+                // .target_correlation_diagnostics.pwnkit_eidolon_request_artifact_count
+                // 0
+              ) == 0
+            )
+          )
+        )
+      | length
+    ) as $runs_with_proxy_requests_but_no_pwnkit_request_artifacts
+  | (
+      $present
+      | map(select(.pinned_session.present and (.pinned_session.cookie_preserved | not)))
+      | length
+    ) as $pinned_without_cookie_count
+  | ($present | map(.eidolon_proxy.request_path_counts[]?)) as $proxy_path_entries
   | {
       schema_version: 1,
       run_kind: "m3_pwnkit_codex_sample",
@@ -329,6 +513,52 @@ done | jq -s '
         ),
         all_runners_origin_main_synced: (
           $valid_count > 0 and all($present[]; .runner_origin_main_in_sync == true)
+        )
+      },
+      no_signal_diagnostics: {
+        sample_size: $valid_count,
+        no_target_interaction_run_count: $no_target_count,
+        all_runs_no_target_interaction: (
+          $valid_count > 0 and $no_target_count == $valid_count
+        ),
+        runs_with_eidolon_pwnkit_request_artifacts: $runs_with_eidolon_request_artifacts,
+        runs_with_eidolon_proxy_requests: $runs_with_eidolon_proxy_requests,
+        runs_with_proxy_requests_but_no_pwnkit_request_artifacts: (
+          $runs_with_proxy_requests_but_no_pwnkit_request_artifacts
+        ),
+        runs_with_pinned_session_but_no_cookie_preservation: $pinned_without_cookie_count,
+        totals: {
+          direct_pwnkit_tool_artifacts: $direct_tool_artifact_total,
+          eidolon_pwnkit_tool_artifacts: $eidolon_tool_artifact_total,
+          direct_pwnkit_request_artifacts: $direct_request_artifact_total,
+          eidolon_pwnkit_request_artifacts: $eidolon_request_artifact_total,
+          eidolon_proxy_requests: $eidolon_proxy_request_total,
+          correlated_target_requests: $correlated_target_request_total,
+          uncorrelated_eidolon_proxy_requests: (
+            if $eidolon_proxy_request_total > $correlated_target_request_total then
+              $eidolon_proxy_request_total - $correlated_target_request_total
+            else
+              0
+            end
+          )
+        },
+        proxy_path_counts: merge_value_counts($proxy_path_entries; "path"),
+        likely_cause: no_signal_likely_cause(
+          $valid_count;
+          $no_target_count;
+          $eidolon_request_artifact_total;
+          $eidolon_proxy_request_total
+        ),
+        next_questions: (
+          if $valid_count > 0 and $no_target_count == $valid_count then
+            no_signal_next_questions(
+              $eidolon_request_artifact_total;
+              $eidolon_proxy_request_total;
+              $pinned_without_cookie_count
+            )
+          else
+            []
+          end
         )
       },
       differential_findings: {

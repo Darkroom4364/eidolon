@@ -55,6 +55,20 @@ write_fixture_sample() {
     "all_runners_clean": true,
     "all_runners_origin_main_synced": true
   },
+  "no_signal_diagnostics": {
+    "sample_size": 1,
+    "no_target_interaction_run_count": 0,
+    "all_runs_no_target_interaction": false,
+    "totals": {
+      "eidolon_proxy_requests": 1,
+      "correlated_target_requests": 1
+    },
+    "proxy_path_counts": [
+      {"path": "/docs?token=secret-token", "count": 1}
+    ],
+    "likely_cause": null,
+    "next_questions": []
+  },
   "differential_findings": {
     "ready_for_differential_finding_claim": false,
     "next_questions": ["why_controlled_reality_chain_was_not_promoted_to_finding"]
@@ -81,6 +95,25 @@ write_fixture_sample() {
       "controlled_reality_entered": true,
       "direct_finding_count": 0,
       "eidolon_finding_count": 0,
+      "pwnkit_events": {
+        "eidolon": {"tool_artifacts": 1},
+        "direct": {"tool_artifacts": 1}
+      },
+      "target_evidence_diagnostics": {
+        "eidolon": {"request_artifact_count": 1},
+        "direct": {"request_artifact_count": 1}
+      },
+      "eidolon_proxy": {
+        "request_count": 1,
+        "request_path_counts": [
+          {"value": "/docs?token=secret-token", "count": 1}
+        ]
+      },
+      "target_correlation_diagnostics": {
+        "pwnkit_eidolon_request_artifact_count": 1,
+        "eidolon_proxy_request_count": 1,
+        "correlated_target_request_count": 1
+      },
       "finding_gap": {
         "positive_differential_findings": false,
         "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
@@ -250,6 +283,11 @@ JSON
     "controlled_reality_entered": true,
     "claim_level": "controlled_reality_entered",
     "conclusion": "bait_action_observed",
+    "target_correlation_diagnostics": {
+      "pwnkit_eidolon_request_artifact_count": 1,
+      "eidolon_proxy_request_count": 2,
+      "correlated_target_request_count": 1
+    },
     "finding_gap": {
       "positive_differential_findings": false,
       "eidolon_controlled_reality_without_findings": true,
@@ -350,6 +388,7 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .comparison.eidolon_requested_path_count == 1
     and .comparison.correlated_bait_matrix[0].surfaces == ["/openapi.json"]
     and .comparison.correlated_bait_matrix[0].action_paths == ["/api/v2/import/reconcile"]
+    and .comparison.target_correlation_diagnostics.correlated_target_request_count == 1
     and .runs.eidolon.warning_count == 1
     and (.runner.pwnkit | has("command") | not)
     and (.runner.pwnkit | has("entry_path") | not)
@@ -364,6 +403,9 @@ test_packager_redacts_raw_artifacts_and_query_values() {
 
   jq -e '
     .redaction.raw_pwnkit_artifacts_omitted == true
+    and .no_signal_diagnostics.proxy_path_counts == [{path: "/docs", count: 1}]
+    and .artifacts[0].eidolon_proxy.request_path_counts == [{value: "/docs", count: 1}]
+    and .artifacts[0].target_correlation_diagnostics.correlated_target_request_count == 1
     and (. | has("raw_future_field") | not)
   ' "$bundle_dir/pwnkit-stability-sample.json" >/dev/null
 

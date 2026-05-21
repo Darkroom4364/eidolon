@@ -95,6 +95,44 @@ redact_matrix_summary() {
       else
         .
       end;
+    def safe_path:
+      if type == "string" then split("?")[0] | split("#")[0] else . end;
+    def clean_no_signal_diagnostics:
+      if . == null then
+        null
+      else
+        (if has("proxy_path_counts") then
+          . + {
+            proxy_path_counts: [
+              (.proxy_path_counts // [])[] |
+              {
+                path: ((.path // .value) | safe_path),
+                count
+              }
+            ]
+          }
+        else
+          .
+        end)
+        | if has("variants") then
+            . + {
+              variants: [
+                (.variants // [])[] |
+                . + {
+                  proxy_path_counts: [
+                    (.proxy_path_counts // [])[] |
+                    {
+                      path: ((.path // .value) | safe_path),
+                      count
+                    }
+                  ]
+                }
+              ]
+            }
+          else
+            .
+          end
+      end;
     {
       schema_version,
       run_kind,
@@ -103,6 +141,7 @@ redact_matrix_summary() {
       variant_count,
       observed_variant_count,
       observation_class_counts,
+      no_signal_diagnostics: (.no_signal_diagnostics | clean_no_signal_diagnostics),
       ready_for_differential_finding_claim_variants,
       ready_for_stability_claim_variants,
       variants: [
@@ -131,6 +170,7 @@ redact_matrix_summary() {
           runner_git_heads,
           runner_package_versions,
           source_checkout,
+          no_signal_diagnostics: (.no_signal_diagnostics | clean_no_signal_diagnostics),
           differential_findings,
           strict_stability
         }
