@@ -195,6 +195,19 @@ keeps one row per artifact and emits strict stability gates.
 Use `strict_stability.ready_for_stability_claim` only for repeated-run Lab
 stability language; single successful traces remain single-trace evidence.
 
+For finding-promotion experiments, pass a lab-only bait profile through the
+sample runner:
+
+```sh
+EIDOLON_M3_BAIT_PROFILE=examples/m3/bait-profiles/openapi-promotion-probe.json \
+  examples/m3/run-pwnkit-sample.sh 3 /tmp/eidolon-m3-pwnkit-promotion-openapi
+```
+
+The seed promotion manifest is
+[`m3/bait-promotion-variants.json`](m3/bait-promotion-variants.json). Profiles
+change only owned bait surfaces and OpenAPI insertions; ordinary traffic still
+uses the protected upstream path.
+
 To prepare a sample for committing under `docs/evidence/m3/`, package only the
 redacted evidence:
 
