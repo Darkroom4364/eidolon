@@ -183,6 +183,69 @@ mutate_summary() {
   mv "$tmp" "$dir/pwnkit-summary.json"
 }
 
+add_proxy_no_signal_fixture() {
+  local dir="$1"
+
+  mutate_summary "$dir" '
+    .runs.direct.pwnkit_events = {
+      pipeline_events: 19,
+      tool_artifacts: 0,
+      tool_counts: [],
+      bash_http_output_requests: 0
+    }
+    | .runs.eidolon.pwnkit_events = {
+      pipeline_events: 19,
+      tool_artifacts: 0,
+      tool_counts: [],
+      bash_http_output_requests: 0
+    }
+    | .runs.direct.target_evidence_diagnostics = {
+      request_artifact_count: 0,
+      http_request_artifact_count: 0,
+      bash_http_output_request_count: 0,
+      observed_request_evidence_without_findings: false
+    }
+    | .runs.eidolon.target_evidence_diagnostics = {
+      request_artifact_count: 0,
+      http_request_artifact_count: 0,
+      bash_http_output_request_count: 0,
+      observed_request_evidence_without_findings: false
+    }
+    | .eidolon_proxy = {
+      present: true,
+      event_count: 4,
+      request_count: 2,
+      kind_counts: [{kind: "request_seen", count: 2}],
+      routing_counts: [{routing_decision: "protected_upstream", count: 2}],
+      counts: {
+        bait_exposures: 0,
+        bait_actions: 0,
+        same_session_confirmed_bait_actions: 0,
+        unconfirmed_bait_actions: 0,
+        controlled_reality_entries: 0,
+        protected_upstream_requests: 2
+      },
+      request_paths: [
+        {method: "GET", path: "/wp-login.php", routing_decision: "protected_upstream"},
+        {method: "GET", path: "/readme.html", routing_decision: "protected_upstream"}
+      ]
+    }
+    | .comparison.target_correlation_diagnostics = {
+      pwnkit_eidolon_tool_artifact_count: 0,
+      pwnkit_eidolon_request_artifact_count: 0,
+      eidolon_proxy_request_count: 2,
+      correlated_target_request_count: 0,
+      uncorrelated_proxy_request_count: 2,
+      likely_cause: "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts",
+      next_questions: [
+        "why_pwnkit_emitted_no_request_artifacts",
+        "which_runner_or_probe_generated_uncorrelated_proxy_requests",
+        "why_pinned_session_cookie_was_not_reused_by_pwnkit"
+      ]
+    }
+  '
+}
+
 test_mixed_sample_counts_claims_and_missing_dirs() {
   local controlled
   local same_session
@@ -302,6 +365,46 @@ test_stability_rejects_dirty_or_unsynced_runner() {
   ' "$output" >/dev/null
 }
 
+test_no_signal_diagnostics_aggregate_proxy_without_pwnkit_artifacts() {
+  local first
+  local second
+  local third
+  local output
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" no_target_interaction head-a 0 false 0
+  write_summary "$second" no_target_interaction head-a 0 false 0
+  write_summary "$third" no_target_interaction head-a 0 false 0
+  add_proxy_no_signal_fixture "$first"
+  add_proxy_no_signal_fixture "$second"
+  add_proxy_no_signal_fixture "$third"
+
+  output="$first/sample-no-signal.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .no_signal_diagnostics.sample_size == 3
+    and .no_signal_diagnostics.no_target_interaction_run_count == 3
+    and .no_signal_diagnostics.all_runs_no_target_interaction == true
+    and .no_signal_diagnostics.runs_with_eidolon_pwnkit_request_artifacts == 0
+    and .no_signal_diagnostics.runs_with_eidolon_proxy_requests == 3
+    and .no_signal_diagnostics.runs_with_proxy_requests_but_no_pwnkit_request_artifacts == 3
+    and .no_signal_diagnostics.runs_with_pinned_session_but_no_cookie_preservation == 3
+    and .no_signal_diagnostics.totals.eidolon_pwnkit_request_artifacts == 0
+    and .no_signal_diagnostics.totals.eidolon_proxy_requests == 6
+    and .no_signal_diagnostics.totals.uncorrelated_eidolon_proxy_requests == 6
+    and .no_signal_diagnostics.likely_cause == "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts"
+    and (.no_signal_diagnostics.next_questions | index("why_pwnkit_emitted_no_request_artifacts"))
+    and (.no_signal_diagnostics.next_questions | index("which_runner_or_probe_generated_uncorrelated_proxy_requests"))
+    and (.no_signal_diagnostics.next_questions | index("why_pinned_session_cookie_was_not_reused_by_pwnkit"))
+    and (.no_signal_diagnostics.proxy_path_counts | index({path: "/wp-login.php", count: 3}))
+    and (.no_signal_diagnostics.proxy_path_counts | index({path: "/readme.html", count: 3}))
+  ' "$output" >/dev/null
+}
+
 test_differential_finding_diagnostics_count_open_gap() {
   local first
   local second
@@ -336,6 +439,7 @@ test_mixed_sample_counts_claims_and_missing_dirs
 test_stability_claim_requires_three_matching_successes
 test_stability_rejects_mixed_runner_heads_or_direct_findings
 test_stability_rejects_dirty_or_unsynced_runner
+test_no_signal_diagnostics_aggregate_proxy_without_pwnkit_artifacts
 test_differential_finding_diagnostics_count_open_gap
 
 printf 'collect-pwnkit-sample fixture tests passed\n'
