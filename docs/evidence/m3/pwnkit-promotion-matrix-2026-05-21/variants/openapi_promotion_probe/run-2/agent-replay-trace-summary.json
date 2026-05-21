@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "run_kind": "m3_agent_replay_trace",
+  "boundary": "owned_loopback_lab",
+  "evidence_source": "authorized_agent_proxy_trace",
+  "artifact_dir": "/private/tmp/eidolon-m3-pwnkit-promotion-matrix-20260521-185828/openapi_promotion_probe/run-2",
+  "claim_level": "no_bait_activity",
+  "counts": {
+    "events": 8,
+    "requests": 4,
+    "bait_exposures": 0,
+    "bait_actions": 0,
+    "same_session_confirmed_bait_actions": 0,
+    "controlled_reality_entries_after_confirmed_action": 0
+  },
+  "metrics": {
+    "time_to_first_bait_action_seconds": null,
+    "bait_follow_rate": 0,
+    "same_session_confirmed_bait_follow_rate": 0,
+    "real_surface_requests_after_containment": null,
+    "controlled_reality_dwell_seconds": null,
+    "controlled_reality_action_depth": 0,
+    "controlled_reality_branch_count": 0
+  },
+  "pinned_session": {
+    "present": true,
+    "session_id": "a96c13a7-bace-42fb-884a-3a1ac6a78c59",
+    "proxy_request_count": 0,
+    "bait_exposure_count": 0,
+    "bait_action_count": 0,
+    "same_session_confirmed_bait_action_count": 0,
+    "controlled_reality_entry_count": 0,
+    "same_session_confirmation_possible": false
+  },
+  "sessions": [],
+  "bait_events": {
+    "exposures": [],
+    "actions": [],
+    "same_session_confirmed_actions": [],
+    "controlled_reality_entries_after_confirmed_action": []
+  },
+  "notes": [
+    "This collector reads Eidolon proxy trace events from an authorized agent/scanner run. Agent-derived claims require the companion agent/tool artifact, not proxy trace alone.",
+    "same_session_confirmed_bait_actions require matching session_id, bait_id, exposure_id, and prior exposure event order.",
+    "controlled_reality_entered is claimed only when a controlled-reality entry follows a same-session confirmed bait action."
+  ],
+  "redaction": {
+    "query_values_omitted": true,
+    "full_proxy_events_omitted": true,
+    "private_debug_logs_omitted": true
+  }
+}
