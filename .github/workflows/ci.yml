@@ -34,3 +34,44 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets
+
+  m3-fixtures:
+    name: M3 fixtures
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep sqlite3
+
+      - name: Validate M3 JSON fixtures
+        run: |
+          jq empty \
+            examples/m3/bait-promotion-variants.json \
+            examples/m3/bait-profiles/*.json
+
+      - name: Check M3 shell syntax
+        run: bash -n examples/m3/*.sh
+
+      - name: Run M3 fixture tests
+        run: |
+          examples/m3/test-run-pwnkit-sample.sh
+          examples/m3/test-pwnkit-codex.sh
+          examples/m3/test-collect-pwnkit-codex.sh
+          examples/m3/test-collect-pwnkit-sample.sh
+          examples/m3/test-package-pwnkit-sample.sh
+          examples/m3/test-report.sh
+
+      - name: Verify archived M3 evidence checksums
+        run: |
+          cd docs/evidence/m3/pwnkit-stability-2026-05-19
+          sha256sum -c SHA256SUMS
