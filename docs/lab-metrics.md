@@ -375,6 +375,18 @@ sample aggregate, a README, and `SHA256SUMS`. It intentionally omits raw pwnkit
 databases, auth files, stdout/stderr logs, full proxy event logs, and private
 Eidolon debug logs.
 
+For the finding-promotion investigation, keep the runner shape identical and
+vary only owned bait surfaces with a lab-only profile:
+
+```sh
+EIDOLON_M3_BAIT_PROFILE=examples/m3/bait-profiles/openapi-promotion-probe.json \
+  examples/m3/run-pwnkit-sample.sh 3 /tmp/eidolon-m3-pwnkit-promotion-openapi
+```
+
+`examples/m3/bait-promotion-variants.json` is the seed matrix manifest for the
+later runner. Each row names a profile, hypothesis, changed knobs, and expected
+observation class without changing the direct-target leg.
+
 The sample summary reports per-run claim levels, runner git heads, pwnkit
 package versions, source-checkout freshness, pinned-cookie preservation,
 direct-target quietness, and strict pass rates. Treat

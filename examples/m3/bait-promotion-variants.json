@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "run_kind": "m3_pwnkit_promotion_matrix_manifest",
+  "boundary": "owned_loopback_lab",
+  "variants": [
+    {
+      "variant_id": "default_m3_catalog",
+      "bait_profile": null,
+      "hypothesis": "The built-in M3 catalog remains the baseline: pwnkit follows the OpenAPI bait into controlled reality but does not emit a finding.",
+      "knobs": [],
+      "expected_observation": "behavior_only"
+    },
+    {
+      "variant_id": "openapi_promotion_probe",
+      "bait_profile": "examples/m3/bait-profiles/openapi-promotion-probe.json",
+      "hypothesis": "More explicit privileged-operation wording, operationId, tags, request body, and response description may change pwnkit finding diagnostics.",
+      "knobs": [
+        "openapi.summary",
+        "openapi.description",
+        "openapi.operation_id",
+        "openapi.tags",
+        "openapi.request_body",
+        "openapi.response_description",
+        "docs_surface.body"
+      ],
+      "expected_observation": "diagnostic_delta_or_promoted_finding"
+    }
+  ]
+}
