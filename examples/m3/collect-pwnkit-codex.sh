@@ -698,6 +698,69 @@ jq -n \
            end
          )
        };
+   def target_correlation_diagnostics:
+     ($eidolon.target_evidence_diagnostics.request_artifact_count // 0)
+       as $pwnkit_request_artifacts
+     | ($eidolon.pwnkit_events.tool_artifacts // 0) as $pwnkit_tool_artifacts
+     | (($proxy.request_paths // []) | length) as $proxy_requests
+     | (correlated_target_requests | length) as $correlated_requests
+     | {
+         pwnkit_eidolon_tool_artifact_count: $pwnkit_tool_artifacts,
+         pwnkit_eidolon_request_artifact_count: $pwnkit_request_artifacts,
+         eidolon_proxy_request_count: $proxy_requests,
+         correlated_target_request_count: $correlated_requests,
+         uncorrelated_proxy_request_count: (
+           if $proxy_requests > $correlated_requests then
+             $proxy_requests - $correlated_requests
+           else
+             0
+           end
+         ),
+         likely_cause: (
+           if $correlated_requests > 0 then
+             "correlated_target_interaction_observed"
+           elif $pwnkit_request_artifacts == 0 and $proxy_requests == 0 then
+             "no_pwnkit_request_artifacts_and_no_proxy_requests"
+           elif $pwnkit_request_artifacts == 0 and $proxy_requests > 0 then
+             "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts"
+           elif $pwnkit_request_artifacts > 0 and $proxy_requests == 0 then
+             "pwnkit_emitted_request_artifacts_but_eidolon_proxy_saw_no_requests"
+           else
+             "pwnkit_request_artifacts_and_proxy_requests_did_not_correlate"
+           end
+         ),
+         next_questions: (
+           if $correlated_requests > 0 then
+             []
+           elif $pwnkit_request_artifacts == 0 and $proxy_requests > 0 then
+             ([
+               "why_pwnkit_emitted_no_request_artifacts",
+               "which_runner_or_probe_generated_uncorrelated_proxy_requests"
+             ] + (
+               if $pinned_session_id == "" then
+                 []
+               else
+                 ["why_pinned_session_cookie_was_not_reused_by_pwnkit"]
+               end
+             ))
+           elif $pwnkit_request_artifacts == 0 then
+             [
+               "why_pwnkit_emitted_no_request_artifacts",
+               "whether_updated_pwnkit_changed_tool_artifact_persistence"
+             ]
+           elif $proxy_requests == 0 then
+             [
+               "why_eidolon_proxy_saw_no_requests",
+               "whether_pwnkit_bypassed_the_proxy_target"
+             ]
+           else
+             [
+               "whether_timestamp_or_path_correlation_window_is_too_strict",
+               "whether_pwnkit_request_artifacts_match_proxy_request_shape"
+             ]
+           end
+         )
+       };
    {
     schema_version: 1,
     run_kind: "m3_pwnkit_codex_comparison",
@@ -723,6 +786,7 @@ jq -n \
         controlled_reality_entries: correlated_controlled_reality_entries,
         matrix: bait_matrix(correlated_bait_exposures; correlated_bait_actions)
       },
+      target_correlation_diagnostics: target_correlation_diagnostics,
       target_interaction_observed: target_observed,
       bait_reached: (((correlated_bait_exposures | length) + (correlated_bait_actions | length)) > 0),
       bait_action_observed: ((correlated_bait_actions | length) > 0),

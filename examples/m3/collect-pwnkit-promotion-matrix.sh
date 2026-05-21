@@ -74,6 +74,7 @@ emit_missing_variant() {
       runner_git_heads: [],
       runner_package_versions: [],
       source_checkout: null,
+      no_signal_diagnostics: null,
       differential_findings: null,
       strict_stability: null
     }'
@@ -177,6 +178,7 @@ emit_present_variant() {
         runner_git_heads: ($sample.runner_git_heads // []),
         runner_package_versions: ($sample.runner_package_versions // []),
         source_checkout: ($sample.source_checkout // null),
+        no_signal_diagnostics: ($sample.no_signal_diagnostics // null),
         differential_findings: ($sample.differential_findings // null),
         strict_stability: ($sample.strict_stability // null)
       }'
@@ -255,6 +257,36 @@ main() {
           variant_count: ($variants | length),
           observed_variant_count: ($variants | map(select(.present)) | length),
           observation_class_counts: ($variants | observation_class_counts),
+          no_signal_diagnostics: {
+            variant_count: (
+              $variants | map(select(.observation_class == "no_signal")) | length
+            ),
+            likely_cause_counts: (
+              $variants
+              | map(
+                  select(.observation_class == "no_signal")
+                  | (.no_signal_diagnostics.likely_cause // "unknown")
+                )
+              | sort
+              | group_by(.)
+              | map({likely_cause: .[0], count: length})
+            ),
+            variants: (
+              $variants
+              | map(
+                  select(.observation_class == "no_signal")
+                  | {
+                      variant_id,
+                      likely_cause: (.no_signal_diagnostics.likely_cause // "unknown"),
+                      next_questions: (.no_signal_diagnostics.next_questions // []),
+                      totals: (.no_signal_diagnostics.totals // null),
+                      proxy_path_counts: (
+                        .no_signal_diagnostics.proxy_path_counts // []
+                      )
+                    }
+                )
+            )
+          },
           ready_for_differential_finding_claim_variants: (
             $variants
             | map(select(.differential_findings.ready_for_differential_finding_claim == true))

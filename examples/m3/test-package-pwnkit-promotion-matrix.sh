@@ -104,6 +104,23 @@ write_variant_sample() {
         all_runners_clean: true,
         all_runners_origin_main_synced: true
       },
+      no_signal_diagnostics: {
+        sample_size: 1,
+        no_target_interaction_run_count: 0,
+        all_runs_no_target_interaction: false,
+        totals: {
+          eidolon_proxy_requests: 1,
+          correlated_target_requests: 1
+        },
+        proxy_path_counts: [
+          {
+            path: "/docs?token=secret-token",
+            count: 1
+          }
+        ],
+        likely_cause: null,
+        next_questions: []
+      },
       differential_findings: {
         ready_for_differential_finding_claim: $positive_differential,
         direct_finding_run_count: 0,
@@ -366,8 +383,10 @@ test_packager_redacts_matrix_and_variant_artifacts() {
   jq -e '
     .run_kind == "m3_pwnkit_promotion_matrix"
     and .redaction.source_variant_sample_dirs_omitted == true
+    and .no_signal_diagnostics.variant_count == 0
     and (.variants[] | select(.variant_id == "default_m3_catalog") | .sample_dir | not)
     and (.variants[] | select(.variant_id == "default_m3_catalog") | .variant_bundle_dir == "variants/default_m3_catalog")
+    and (.variants[] | select(.variant_id == "default_m3_catalog") | .no_signal_diagnostics.proxy_path_counts == [{path: "/docs", count: 1}])
     and (.variants[] | select(.variant_id == "promoted_probe") | .observation_class == "promoted_finding")
     and (.ready_for_differential_finding_claim_variants == ["promoted_probe"])
   ' "$bundle_dir/pwnkit-promotion-matrix.json" >/dev/null

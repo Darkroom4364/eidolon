@@ -221,6 +221,27 @@ test_proxy_only_action_stays_exposure_only() {
   assert_claim "$dir" "bait_exposed_without_action"
 }
 
+test_no_signal_diagnostics_classify_proxy_without_pwnkit_artifacts() {
+  local dir
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  append_request_seen "$dir" "session-b" "2026-01-01T00:00:00Z" GET /wp-login.php protected_upstream
+  append_request_seen "$dir" "session-c" "2026-01-01T00:00:01Z" GET /readme.html protected_upstream
+
+  assert_claim "$dir" "no_target_interaction"
+  jq -e '
+    .comparison.target_correlation_diagnostics.pwnkit_eidolon_tool_artifact_count == 0
+    and .comparison.target_correlation_diagnostics.pwnkit_eidolon_request_artifact_count == 0
+    and .comparison.target_correlation_diagnostics.eidolon_proxy_request_count == 2
+    and .comparison.target_correlation_diagnostics.correlated_target_request_count == 0
+    and .comparison.target_correlation_diagnostics.uncorrelated_proxy_request_count == 2
+    and .comparison.target_correlation_diagnostics.likely_cause == "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts"
+    and (.comparison.target_correlation_diagnostics.next_questions | index("why_pwnkit_emitted_no_request_artifacts"))
+    and (.comparison.target_correlation_diagnostics.next_questions | index("which_runner_or_probe_generated_uncorrelated_proxy_requests"))
+    and (.comparison.target_correlation_diagnostics.next_questions | index("why_pinned_session_cookie_was_not_reused_by_pwnkit"))
+  ' "$dir/summary.json" >/dev/null
+}
+
 test_finding_diagnostics_are_shape_only() {
   local dir
   dir="$(new_artifact)"
@@ -278,6 +299,7 @@ test_exposure_only
 test_bash_http_output_upgrades_confirmed_action
 test_wrong_session_action_does_not_confirm
 test_proxy_only_action_stays_exposure_only
+test_no_signal_diagnostics_classify_proxy_without_pwnkit_artifacts
 test_finding_diagnostics_are_shape_only
 test_finding_gap_marks_controlled_reality_without_findings
 
