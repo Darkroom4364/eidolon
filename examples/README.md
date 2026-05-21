@@ -195,6 +195,18 @@ keeps one row per artifact and emits strict stability gates.
 Use `strict_stability.ready_for_stability_claim` only for repeated-run Lab
 stability language; single successful traces remain single-trace evidence.
 
+To prepare a sample for committing under `docs/evidence/m3/`, package only the
+redacted evidence:
+
+```sh
+examples/m3/package-pwnkit-sample.sh \
+  /tmp/eidolon-m3-pwnkit-sample \
+  docs/evidence/m3/pwnkit-sample-YYYY-MM-DD
+```
+
+The package helper omits raw pwnkit DBs, auth files, stdout/stderr logs, full
+proxy event logs, and private debug logs.
+
 To render the internal M3 uniqueness report from a pwnkit artifact and a
 scripted action-trace artifact:
 
@@ -212,9 +224,11 @@ attribution claim.
 
 ## M3 Agent Replay Probe
 
-The remaining M3 evidence gap is agent-derived replay of a discovered bait
-marker. Use [m3/agent-replay-probe.md](m3/agent-replay-probe.md) for the blind
-prompt and contamination rules.
+Strict current-pwnkit same-session replay and controlled-reality entry are
+covered by the archived three-run Lab sample. Use
+[m3/agent-replay-probe.md](m3/agent-replay-probe.md) for later pwnkit heads,
+broader authorized local subjects, and drift checks that need the blind prompt
+and contamination rules.
 
 After an authorized loopback subject finishes, collect its proxy trace:
 
