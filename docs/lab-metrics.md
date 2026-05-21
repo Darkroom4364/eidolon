@@ -413,6 +413,20 @@ examples/m3/collect-pwnkit-promotion-matrix.sh \
 names a profile, hypothesis, changed knobs, and expected observation class
 without changing the direct-target leg.
 
+To prepare a commit-safe evidence bundle from a completed promotion matrix,
+package it through the matrix redaction helper:
+
+```sh
+examples/m3/package-pwnkit-promotion-matrix.sh \
+  /tmp/eidolon-m3-pwnkit-promotion-matrix \
+  docs/evidence/m3/pwnkit-promotion-matrix-YYYY-MM-DD
+```
+
+The packager reuses the sample packager for each observed variant, writes a
+redacted matrix aggregate, copies the manifest, and emits `SHA256SUMS`. It
+omits raw pwnkit databases, auth files, stdout/stderr logs, full proxy events,
+and private Eidolon debug logs from every variant.
+
 The sample summary reports per-run claim levels, runner git heads, pwnkit
 package versions, source-checkout freshness, pinned-cookie preservation,
 direct-target quietness, and strict pass rates. Treat
