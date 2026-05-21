@@ -10,6 +10,7 @@ TARGET_URL="${EIDOLON_LAB_TARGET_URL:-http://127.0.0.1:9001}"
 PROXY_URL="${EIDOLON_LAB_PROXY_URL:-http://127.0.0.1:8080}"
 EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-1}"
 EIDOLON_M3_SAMPLE_DRY_RUN="${EIDOLON_M3_SAMPLE_DRY_RUN:-0}"
+EIDOLON_M3_BAIT_PROFILE="${EIDOLON_M3_BAIT_PROFILE:-}"
 
 TARGET_PID=""
 PROXY_PID=""
@@ -29,6 +30,7 @@ Environment:
   EIDOLON_M3_SAMPLE_RUNS       Run count if [run-count] is omitted. Defaults to 3.
   EIDOLON_M3_SAMPLE_DIR        Sample root if [sample-dir] is omitted.
   EIDOLON_M3_PIN_SESSION       Pin one Eidolon session cookie. Defaults to 1.
+  EIDOLON_M3_BAIT_PROFILE      Optional lab-only proxy bait profile JSON.
   EIDOLON_M3_SAMPLE_DRY_RUN    If true, create the planned directory layout only.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to pwnkit-codex.sh.
 
@@ -202,6 +204,7 @@ write_dry_run_plan() {
     printf 'target_addr=%s\n' "$target_addr"
     printf 'proxy_addr=%s\n' "$proxy_addr"
     printf 'pin_session=%s\n' "$EIDOLON_M3_PIN_SESSION"
+    printf 'bait_profile=%s\n' "${EIDOLON_M3_BAIT_PROFILE:-default}"
     printf 'debug_log=run-*/private/eidolon-debug.jsonl\n'
     printf 'sample_summary=pwnkit-stability-sample.json\n'
   } > "$plan_file"
@@ -226,6 +229,11 @@ start_proxy() {
   local proxy_addr="$1"
   local run_dir="$2"
   local log_file="$run_dir/private/eidolon-proxy.log"
+  local bait_profile_args=()
+
+  if [[ -n "$EIDOLON_M3_BAIT_PROFILE" ]]; then
+    bait_profile_args=(--bait-profile "$EIDOLON_M3_BAIT_PROFILE")
+  fi
 
   mkdir -p "$run_dir/private"
   (
@@ -235,6 +243,7 @@ start_proxy() {
       --upstream "$TARGET_URL" \
       --event-log "$run_dir/proxy-events.jsonl" \
       --debug-log "$run_dir/private/eidolon-debug.jsonl" \
+      "${bait_profile_args[@]}" \
       --intervention-control "$run_dir/interventions.txt" \
       --policy-state "$run_dir/policy-state.json"
   ) > "$log_file" 2>&1 &
@@ -271,6 +280,10 @@ main() {
   require_positive_integer "run-count" "$RUN_COUNT"
   require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
   require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
+  if [[ -n "$EIDOLON_M3_BAIT_PROFILE" && ! -f "$EIDOLON_M3_BAIT_PROFILE" ]]; then
+    echo "error: EIDOLON_M3_BAIT_PROFILE must point to an existing file: $EIDOLON_M3_BAIT_PROFILE" >&2
+    exit 2
+  fi
 
   local target_addr
   local proxy_addr
