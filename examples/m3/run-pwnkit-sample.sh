@@ -229,23 +229,26 @@ start_proxy() {
   local proxy_addr="$1"
   local run_dir="$2"
   local log_file="$run_dir/private/eidolon-proxy.log"
-  local bait_profile_args=()
+  local proxy_args=(
+    --listen-addr "$proxy_addr"
+    --upstream "$TARGET_URL"
+    --event-log "$run_dir/proxy-events.jsonl"
+    --debug-log "$run_dir/private/eidolon-debug.jsonl"
+  )
 
   if [[ -n "$EIDOLON_M3_BAIT_PROFILE" ]]; then
-    bait_profile_args=(--bait-profile "$EIDOLON_M3_BAIT_PROFILE")
+    proxy_args+=(--bait-profile "$EIDOLON_M3_BAIT_PROFILE")
   fi
+
+  proxy_args+=(
+    --intervention-control "$run_dir/interventions.txt"
+    --policy-state "$run_dir/policy-state.json"
+  )
 
   mkdir -p "$run_dir/private"
   (
     cd "$REPO_ROOT"
-    cargo run -p eidolon-proxy -- \
-      --listen-addr "$proxy_addr" \
-      --upstream "$TARGET_URL" \
-      --event-log "$run_dir/proxy-events.jsonl" \
-      --debug-log "$run_dir/private/eidolon-debug.jsonl" \
-      "${bait_profile_args[@]}" \
-      --intervention-control "$run_dir/interventions.txt" \
-      --policy-state "$run_dir/policy-state.json"
+    cargo run -p eidolon-proxy -- "${proxy_args[@]}"
   ) > "$log_file" 2>&1 &
   PROXY_PID="$!"
   wait_for_http "eidolon-proxy" "$PROXY_URL/health" "$PROXY_PID" "$log_file"
