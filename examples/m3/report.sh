@@ -105,6 +105,14 @@ jq -r -n \
   def markdown_text($value):
     (($value // "") | tostring | gsub("\\|"; "\\|") | gsub("[\r\n]"; " "));
 
+  def report_path($value):
+    ($value // "not recorded") as $path
+    | if ($path | startswith("/")) then
+        "<artifact-path-omitted>"
+      else
+        $path
+      end;
+
   def bait_class($bait_id):
     {
       rel_2025_04_b7f2: "docs",
@@ -259,12 +267,13 @@ jq -r -n \
     line("# M3 Internal Uniqueness Report"),
     line(""),
     line("- Boundary: `" + (pwnkit.boundary // action.boundary // "unknown") + "`"),
-    line("- Pwnkit artifact: `" + $pwnkit_artifact_dir + "`"),
-    line("- Scripted action artifact: `" + $action_artifact_dir + "`"),
+    line("- Pwnkit artifact: `" + markdown_text(report_path($pwnkit_artifact_dir)) + "`"),
+    line("- Scripted action artifact: `" + markdown_text(report_path($action_artifact_dir)) + "`"),
     line("- Report posture: `" + adaptive_policy_posture + "`"),
     line("- Safety note: this is an internal Lab artifact. It is not a public-v1, production-readiness, or autonomous-attacker-attribution claim."),
     line("- Runner freshness note: source-checkout pwnkit artifacts must come from a fresh built `dist/pwnkit.js`; stale source-checkout artifacts should be regenerated before making current pwnkit claims."),
-    line("- Pwnkit runner command: `" + markdown_text(pwnkit_runner.pwnkit.command // "not recorded") + "`"),
+    line("- Pwnkit runner command source: `" + markdown_text(pwnkit_runner.pwnkit.command_source // "not recorded") + "`"),
+    line("- Pwnkit runner command path: `omitted from report`"),
     line("- Pwnkit runner git head: `" + markdown_text(pwnkit_runner.pwnkit.git_head // "not recorded") + "`"),
     line(""),
     line("## Claim Ladder"),
