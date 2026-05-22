@@ -339,6 +339,13 @@ sample runner enforces this by default after each collected run. Set
 `EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only when intentionally preserving diagnostic
 no-signal artifacts.
 
+The sample runner and sample evidence packager also run
+`examples/m3/check-pwnkit-sample-health.sh` against the aggregated
+`pwnkit-stability-sample.json`. This catches manually aggregated samples that
+contain pwnkit `agent_error` events before they are treated as M3 evidence. Use
+`EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only when packaging an explicitly diagnostic
+artifact whose sanitized agent-error classes are part of the investigation.
+
 The summary separates the strength of the pwnkit-correlated bait evidence.
 `comparison.conclusion` keeps the broad runner outcome, while
 `comparison.claim_level` states the strongest supported claim:
