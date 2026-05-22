@@ -66,6 +66,7 @@ jobs:
         run: |
           examples/m3/test-run-pwnkit-sample.sh
           examples/m3/test-run-pwnkit-promotion-matrix.sh
+          examples/m3/test-check-pwnkit-summary-health.sh
           examples/m3/test-pwnkit-codex.sh
           examples/m3/test-collect-pwnkit-codex.sh
           examples/m3/test-collect-pwnkit-sample.sh
