@@ -2,7 +2,7 @@
   "schema_version": 1,
   "run_kind": "m3_pwnkit_codex_comparison",
   "boundary": "owned_loopback_lab",
-  "source_artifact_dir": "/private/tmp/eidolon-m3-pwnkit-promotion-matrix-20260521-185828/default_m3_catalog/run-1",
+  "source_artifact_dir": "<source-artifact-path-omitted>",
   "runner": {
     "schema_version": 1,
     "run_kind": "m3_pwnkit_codex_runner",
@@ -33,14 +33,12 @@
       "stale_dist_guard_bypassed": false,
       "scopes": {
         "eidolon": {
-          "path": "/private/tmp/eidolon-m3-pwnkit-promotion-matrix-20260521-185828/default_m3_catalog/run-1/pwnkit-eidolon-scope.json",
           "in_scope": [
             "127.0.0.1"
           ],
           "out_of_scope": []
         },
         "direct": {
-          "path": "/private/tmp/eidolon-m3-pwnkit-promotion-matrix-20260521-185828/default_m3_catalog/run-1/pwnkit-direct-scope.json",
           "in_scope": [
             "127.0.0.1"
           ],
@@ -217,6 +215,9 @@
     "raw_correlated_bait_events_omitted": true,
     "raw_tool_evidence_labels_omitted": true,
     "warning_text_omitted": true,
-    "query_values_omitted": true
+    "query_values_omitted": true,
+    "source_artifact_path_omitted": true,
+    "runner_command_paths_omitted": true,
+    "pwnkit_scope_paths_omitted": true
   }
 }

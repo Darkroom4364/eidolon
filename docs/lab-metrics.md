@@ -390,7 +390,8 @@ examples/m3/package-pwnkit-sample.sh \
 The packager writes redacted per-run summaries, sanitized trace summaries, a
 sample aggregate, a README, and `SHA256SUMS`. It intentionally omits raw pwnkit
 databases, auth files, stdout/stderr logs, full proxy event logs, and private
-Eidolon debug logs.
+Eidolon debug logs. It also omits local source artifact paths, pwnkit runner
+command paths, and generated scope-file paths from committed bundles.
 
 For the finding-promotion investigation, keep the runner shape identical and
 vary only owned bait surfaces with a lab-only profile:
@@ -442,7 +443,8 @@ examples/m3/package-pwnkit-promotion-matrix.sh \
 The packager reuses the sample packager for each observed variant, writes a
 redacted matrix aggregate, copies the manifest, and emits `SHA256SUMS`. It
 omits raw pwnkit databases, auth files, stdout/stderr logs, full proxy events,
-and private Eidolon debug logs from every variant.
+private Eidolon debug logs, local artifact paths, runner command paths, and
+scope-file paths from every variant.
 
 The sample summary reports per-run claim levels, runner git heads, pwnkit
 package versions, source-checkout freshness, pinned-cookie preservation,
