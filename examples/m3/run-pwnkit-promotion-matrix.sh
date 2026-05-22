@@ -25,6 +25,8 @@ Environment:
   EIDOLON_LAB_TARGET_URL         Passed through to run-pwnkit-sample.sh.
   EIDOLON_LAB_PROXY_URL          Passed through to run-pwnkit-sample.sh.
   EIDOLON_M3_ALLOW_AGENT_ERRORS  Passed through to run-pwnkit-sample.sh.
+  EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE
+                                  Passed through to run-pwnkit-sample.sh.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN   Passed through to pwnkit-codex.sh.
 
 Use only against the owned loopback Lab target. Sync and rebuild pwnkit before
