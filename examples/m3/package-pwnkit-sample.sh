@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
 SAMPLE_DIR="${1:-}"
 BUNDLE_DIR="${2:-}"
 
@@ -424,6 +426,7 @@ main() {
   fi
 
   ensure_empty_bundle_dir
+  "$SCRIPT_DIR/check-pwnkit-sample-health.sh" "$sample_summary"
   redact_sample_summary "$sample_summary" "$BUNDLE_DIR/pwnkit-stability-sample.json"
 
   local found_run=false
