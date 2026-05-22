@@ -471,7 +471,8 @@ class-level keep/revise/kill guidance. It also surfaces
 `comparison.finding_gap` so the report distinguishes bait interaction and
 controlled-reality entry from actual differential pwnkit findings. It preserves
 the distinction between pwnkit exposure evidence and scripted-only containment
-mechanics.
+mechanics. Absolute artifact paths and local pwnkit runner command paths are
+omitted from generated report output.
 
 ## Interpretation Guardrail
 
