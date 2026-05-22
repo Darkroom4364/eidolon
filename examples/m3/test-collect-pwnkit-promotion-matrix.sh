@@ -246,6 +246,14 @@ test_collects_variant_observation_classes() {
     .run_kind == "m3_pwnkit_promotion_matrix"
     and .variant_count == 3
     and .observed_variant_count == 2
+    and .matrix_health.missing_variant_count == 1
+    and .matrix_health.all_variants_observed == false
+    and .matrix_health.total_pwnkit_agent_errors == 0
+    and .matrix_health.all_observed_samples_agent_error_free == true
+    and .matrix_health.all_observed_source_checkouts_clean == true
+    and .matrix_health.all_observed_source_checkouts_synced == true
+    and .matrix_health.ready_for_matrix_interpretation == false
+    and .matrix_health.runner_git_heads == ["abc123"]
     and (.ready_for_differential_finding_claim_variants == ["promoted_probe"])
     and (.ready_for_stability_claim_variants == ["default_m3_catalog", "promoted_probe"])
   ' "$output" >/dev/null
@@ -308,6 +316,10 @@ test_collects_no_signal_diagnostics() {
 
   jq -e '
     .no_signal_diagnostics.variant_count == 1
+    and .matrix_health.missing_variant_count == 0
+    and .matrix_health.all_variants_observed == true
+    and .matrix_health.total_pwnkit_agent_errors == 0
+    and .matrix_health.ready_for_matrix_interpretation == true
     and .no_signal_diagnostics.likely_cause_counts == [
       {
         likely_cause: "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts",
@@ -325,6 +337,58 @@ test_collects_no_signal_diagnostics() {
     | .observation_class == "no_signal"
       and .no_signal_diagnostics.likely_cause == "eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts"
       and .no_signal_diagnostics.totals.uncorrelated_eidolon_proxy_requests == 6
+  ' "$output" >/dev/null
+}
+
+test_collects_matrix_health_agent_error_and_source_drift() {
+  local temp_dir
+  local manifest
+  local matrix_dir
+  local output
+
+  temp_dir="$(new_temp_dir)"
+  manifest="$temp_dir/manifest.json"
+  matrix_dir="$temp_dir/matrix"
+  output="$temp_dir/summary.json"
+
+  jq -n '{
+    schema_version: 1,
+    run_kind: "m3_pwnkit_promotion_matrix_manifest",
+    boundary: "owned_loopback_lab",
+    variants: [
+      {
+        variant_id: "diagnostic_probe",
+        bait_profile: null,
+        hypothesis: "agent health diagnostic",
+        knobs: [],
+        expected_observation: "diagnostic_no_signal"
+      }
+    ]
+  }' > "$manifest"
+
+  mkdir -p "$matrix_dir/diagnostic_probe"
+  write_no_signal_sample "$matrix_dir/diagnostic_probe/pwnkit-stability-sample.json"
+  jq '
+    .no_signal_diagnostics.totals.eidolon_pwnkit_agent_errors = 2
+    | .source_checkout.all_runners_clean = false
+    | .source_checkout.all_runners_origin_main_synced = false
+  ' "$matrix_dir/diagnostic_probe/pwnkit-stability-sample.json" \
+    > "$matrix_dir/diagnostic_probe/pwnkit-stability-sample.tmp"
+  mv "$matrix_dir/diagnostic_probe/pwnkit-stability-sample.tmp" \
+    "$matrix_dir/diagnostic_probe/pwnkit-stability-sample.json"
+
+  "$COLLECTOR" "$manifest" "$matrix_dir" > "$output"
+
+  jq -e '
+    .matrix_health.missing_variant_count == 0
+    and .matrix_health.all_variants_observed == true
+    and .matrix_health.total_pwnkit_agent_errors == 2
+    and .matrix_health.all_observed_samples_agent_error_free == false
+    and .matrix_health.source_checkout_clean_variant_count == 0
+    and .matrix_health.source_checkout_synced_variant_count == 0
+    and .matrix_health.all_observed_source_checkouts_clean == false
+    and .matrix_health.all_observed_source_checkouts_synced == false
+    and .matrix_health.ready_for_matrix_interpretation == false
   ' "$output" >/dev/null
 }
 
@@ -361,6 +425,7 @@ test_rejects_invalid_variant_id() {
 test_help_mentions_matrix_summary
 test_collects_variant_observation_classes
 test_collects_no_signal_diagnostics
+test_collects_matrix_health_agent_error_and_source_drift
 test_rejects_invalid_variant_id
 
 printf 'collect-pwnkit-promotion-matrix fixture tests passed\n'
