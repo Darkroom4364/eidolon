@@ -2,7 +2,7 @@
   "schema_version": 1,
   "run_kind": "m3_pwnkit_codex_comparison",
   "boundary": "owned_loopback_lab",
-  "source_artifact_dir": "/private/tmp/eidolon-m3-stability-pwnkit-2.cnWqi3",
+  "source_artifact_dir": "<source-artifact-path-omitted>",
   "runner": {
     "schema_version": 1,
     "run_kind": "m3_pwnkit_codex_runner",
@@ -276,6 +276,9 @@
     "query_values_omitted": true,
     "raw_correlated_target_requests_omitted": true,
     "raw_correlated_bait_events_omitted": true,
-    "warning_text_omitted": true
+    "warning_text_omitted": true,
+    "source_artifact_path_omitted": true,
+    "runner_command_paths_omitted": true,
+    "pwnkit_scope_paths_omitted": true
   }
 }

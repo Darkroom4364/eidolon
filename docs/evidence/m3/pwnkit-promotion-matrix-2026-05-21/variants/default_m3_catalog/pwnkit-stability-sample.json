@@ -129,7 +129,7 @@
   },
   "artifacts": [
     {
-      "artifact_dir": "/private/tmp/eidolon-m3-pwnkit-promotion-matrix-20260521-185828/default_m3_catalog/run-1",
+      "artifact_dir": "<source-artifact-path-omitted>",
       "present": true,
       "missing_reason": null,
       "runner_git_head": "4a8587f7321af622b58f7a57f21f9acd694dc10f",
@@ -143,7 +143,6 @@
         "in_sync": true
       },
       "runner_origin_main_in_sync": true,
-      "runner_command": "node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js",
       "stale_dist_guard_bypassed": false,
       "claim_level": "no_target_interaction",
       "conclusion": "no_target_interaction",
@@ -306,7 +305,7 @@
       }
     },
     {
-      "artifact_dir": "/private/tmp/eidolon-m3-pwnkit-promotion-matrix-20260521-185828/default_m3_catalog/run-2",
+      "artifact_dir": "<source-artifact-path-omitted>",
       "present": true,
       "missing_reason": null,
       "runner_git_head": "4a8587f7321af622b58f7a57f21f9acd694dc10f",
@@ -320,7 +319,6 @@
         "in_sync": true
       },
       "runner_origin_main_in_sync": true,
-      "runner_command": "node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js",
       "stale_dist_guard_bypassed": false,
       "claim_level": "no_target_interaction",
       "conclusion": "no_target_interaction",
@@ -483,7 +481,7 @@
       }
     },
     {
-      "artifact_dir": "/private/tmp/eidolon-m3-pwnkit-promotion-matrix-20260521-185828/default_m3_catalog/run-3",
+      "artifact_dir": "<source-artifact-path-omitted>",
       "present": true,
       "missing_reason": null,
       "runner_git_head": "4a8587f7321af622b58f7a57f21f9acd694dc10f",
@@ -497,7 +495,6 @@
         "in_sync": true
       },
       "runner_origin_main_in_sync": true,
-      "runner_command": "node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js",
       "stale_dist_guard_bypassed": false,
       "claim_level": "no_target_interaction",
       "conclusion": "no_target_interaction",
@@ -666,6 +663,8 @@
     "raw_tool_evidence_labels_omitted": true,
     "raw_pwnkit_artifacts_omitted": true,
     "raw_proxy_events_omitted": true,
-    "private_debug_logs_omitted": true
+    "private_debug_logs_omitted": true,
+    "source_artifact_paths_omitted": true,
+    "runner_command_paths_omitted": true
   }
 }

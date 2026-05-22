@@ -201,10 +201,12 @@ write_variant_sample() {
         stale_dist_guard_bypassed: false,
         scopes: {
           eidolon: {
+            path: "/private/tmp/eidolon-secret-source/pwnkit-eidolon-scope.json",
             in_scope: ["127.0.0.1"],
             out_of_scope: []
           },
           direct: {
+            path: "/private/tmp/eidolon-secret-source/pwnkit-direct-scope.json",
             in_scope: ["127.0.0.1"],
             out_of_scope: []
           }
@@ -379,6 +381,7 @@ test_packager_redacts_matrix_and_variant_artifacts() {
   ! find "$bundle_dir" -type f -name '*.log' | rg -q .
   ! find "$bundle_dir" -type f -path '*/private/*' | rg -q .
   ! rg -q 'secret-token|direct-secret|secret-label|private-debug-secret|must-not-survive|raw warning' "$bundle_dir"
+  ! rg -q '/private/tmp|/tmp/pwnkit|node /tmp|eidolon-secret-source' "$bundle_dir"
 
   jq -e '
     .run_kind == "m3_pwnkit_promotion_matrix"
@@ -398,7 +401,10 @@ test_packager_redacts_matrix_and_variant_artifacts() {
   ' "$bundle_dir/bait-promotion-variants.json" >/dev/null
 
   jq -e '
-    .comparison.correlated_bait_matrix[0].surfaces == ["/openapi.json"]
+    .source_artifact_dir == "<source-artifact-path-omitted>"
+    and (.runner.pwnkit.scopes.eidolon | has("path") | not)
+    and (.runner.pwnkit.scopes.direct | has("path") | not)
+    and .comparison.correlated_bait_matrix[0].surfaces == ["/openapi.json"]
     and .comparison.correlated_bait_matrix[0].action_paths == ["/api/v2/import/reconcile"]
     and .runs.eidolon.warning_count == 1
   ' "$bundle_dir/variants/default_m3_catalog/run-1/pwnkit-summary.redacted.json" >/dev/null
