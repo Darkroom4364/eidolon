@@ -357,6 +357,20 @@ write_fixture_matrix() {
     > "$matrix_dir/pwnkit-promotion-matrix.json"
 }
 
+mark_fixture_matrix_unhealthy() {
+  local matrix_dir="$1"
+  local matrix_file="$matrix_dir/pwnkit-promotion-matrix.json"
+  local tmp_file="$matrix_file.tmp"
+
+  jq '
+    .matrix_health.ready_for_matrix_interpretation = false
+    | .matrix_health.total_pwnkit_agent_errors = 1
+    | .matrix_health.all_observed_samples_agent_error_free = false
+    | .no_signal_diagnostics.variant_count = 1
+  ' "$matrix_file" > "$tmp_file"
+  mv "$tmp_file" "$matrix_file"
+}
+
 test_packager_redacts_matrix_and_variant_artifacts() {
   local matrix_dir
   local bundle_dir
@@ -416,6 +430,46 @@ test_packager_redacts_matrix_and_variant_artifacts() {
   rg -q 'variants/promoted_probe/run-1/agent-replay-trace-summary.json' "$bundle_dir/SHA256SUMS"
 }
 
+test_packager_rejects_unhealthy_matrix_by_default() {
+  local matrix_dir
+  local bundle_dir
+  local output
+  local status=0
+  matrix_dir="$(new_temp_dir)"
+  bundle_dir="$(new_temp_dir)/bundle"
+  write_fixture_matrix "$matrix_dir"
+  mark_fixture_matrix_unhealthy "$matrix_dir"
+
+  output="$("$PACKAGER" "$matrix_dir" "$bundle_dir" 2>&1)" || status="$?"
+
+  [[ "$status" -eq 1 ]]
+  rg -q 'matrix.*health|not ready|ready_for_matrix_interpretation' <<<"$output"
+  [[ ! -f "$bundle_dir/pwnkit-promotion-matrix.json" ]]
+}
+
+test_packager_allows_unhealthy_matrix_with_diagnostic_bypass() {
+  local matrix_dir
+  local bundle_dir
+  matrix_dir="$(new_temp_dir)"
+  bundle_dir="$(new_temp_dir)/bundle"
+  write_fixture_matrix "$matrix_dir"
+  mark_fixture_matrix_unhealthy "$matrix_dir"
+
+  EIDOLON_M3_ALLOW_UNHEALTHY_PROMOTION_MATRIX=1 "$PACKAGER" "$matrix_dir" "$bundle_dir" >/dev/null
+
+  [[ -f "$bundle_dir/pwnkit-promotion-matrix.json" ]]
+  [[ -f "$bundle_dir/variants/promoted_probe/run-1/pwnkit-summary.redacted.json" ]]
+  ! rg -q 'secret-token|direct-secret|secret-label|private-debug-secret|must-not-survive|raw warning' "$bundle_dir"
+  ! rg -q '/private/tmp|/tmp/pwnkit|node /tmp|eidolon-secret-source' "$bundle_dir"
+
+  jq -e '
+    .matrix_health.ready_for_matrix_interpretation == false
+    and .matrix_health.total_pwnkit_agent_errors == 1
+    and .redaction.raw_agent_error_text_omitted == true
+    and (.variants[] | select(.variant_id == "promoted_probe") | .variant_bundle_dir == "variants/promoted_probe")
+  ' "$bundle_dir/pwnkit-promotion-matrix.json" >/dev/null
+}
+
 test_packager_refuses_non_empty_bundle_dir() {
   local matrix_dir
   local bundle_dir
@@ -446,6 +500,19 @@ test_packager_rejects_invalid_summary_variant_id() {
     schema_version: 1,
     run_kind: "m3_pwnkit_promotion_matrix",
     boundary: "owned_loopback_lab",
+    matrix_health: {
+      ready_for_matrix_interpretation: true,
+      all_variants_observed: true,
+      all_observed_samples_agent_error_free: true,
+      all_observed_source_checkouts_clean: true,
+      all_observed_source_checkouts_synced: true,
+      missing_variant_count: 0,
+      total_pwnkit_agent_errors: 0,
+      source_checkout_clean_variant_count: 1,
+      source_checkout_synced_variant_count: 1,
+      runner_git_heads: ["abc123"],
+      runner_package_versions: ["0.11.1"]
+    },
     variants: [
       {
         variant_id: "../bad",
@@ -461,6 +528,8 @@ test_packager_rejects_invalid_summary_variant_id() {
 }
 
 test_packager_redacts_matrix_and_variant_artifacts
+test_packager_rejects_unhealthy_matrix_by_default
+test_packager_allows_unhealthy_matrix_with_diagnostic_bypass
 test_packager_refuses_non_empty_bundle_dir
 test_packager_rejects_invalid_summary_variant_id
 
