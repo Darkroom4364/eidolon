@@ -56,6 +56,7 @@ JSON
   "runner": {
     "pwnkit": {
       "command": "node /tmp/pwnkit/dist/pwnkit.js",
+      "command_source": "fixture_source_checkout",
       "git_head": "fixture-head"
     }
   },
@@ -142,10 +143,15 @@ test_report_keeps_adaptive_automation_no_go_without_differential_findings() {
   rg -q 'Report posture: `no-go for automation; controlled-reality chain observed but differential findings remain open`' "$output"
   rg -q '\| `comparison.finding_gap.next_question` \| `why_controlled_reality_chain_was_not_promoted_to_finding` \|' "$output"
   rg -q '\| `eidolon_controlled_reality_without_findings` \| `yes` \|' "$output"
+  rg -q -- '- Pwnkit artifact: `<artifact-path-omitted>`' "$output"
+  rg -q -- '- Scripted action artifact: `<artifact-path-omitted>`' "$output"
+  rg -q -- '- Pwnkit runner command source: `fixture_source_checkout`' "$output"
+  rg -q -- '- Pwnkit runner command path: `omitted from report`' "$output"
   rg -q -- '- M3 exposure claim: `pass` for pwnkit bait discoverability\.' "$output"
   rg -q -- '- M3 differential findings claim: `open`\.' "$output"
   rg -q -- '- Remaining empirical gap: investigate why the controlled-reality chain was not promoted to a pwnkit finding\.' "$output"
   ! rg -q 'go for adaptive bait-policy design input' "$output"
+  ! rg -q '/tmp/pwnkit|eidolon-m3-report-test' "$output"
 }
 
 test_report_keeps_adaptive_automation_no_go_without_differential_findings
