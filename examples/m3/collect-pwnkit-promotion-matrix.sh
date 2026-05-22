@@ -246,7 +246,12 @@ main() {
         | group_by(.observation_class)
         | map({observation_class: .[0].observation_class, count: length});
 
+      def agent_error_total($variant):
+        ($variant.no_signal_diagnostics.totals.direct_pwnkit_agent_errors // 0)
+        + ($variant.no_signal_diagnostics.totals.eidolon_pwnkit_agent_errors // 0);
+
       . as $variants
+      | ($variants | map(select(.present))) as $observed
       | {
           schema_version: 1,
           run_kind: "m3_pwnkit_promotion_matrix",
@@ -255,8 +260,51 @@ main() {
           manifest_path: $manifest_path,
           matrix_dir: $matrix_dir,
           variant_count: ($variants | length),
-          observed_variant_count: ($variants | map(select(.present)) | length),
+          observed_variant_count: ($observed | length),
           observation_class_counts: ($variants | observation_class_counts),
+          matrix_health: {
+            missing_variant_count: ($variants | map(select(.present | not)) | length),
+            all_variants_observed: (
+              ($variants | length) > 0
+              and ($observed | length) == ($variants | length)
+            ),
+            total_pwnkit_agent_errors: (
+              $observed | map(agent_error_total(.)) | add // 0
+            ),
+            all_observed_samples_agent_error_free: (
+              ($observed | length) > 0
+              and all($observed[]; agent_error_total(.) == 0)
+            ),
+            source_checkout_clean_variant_count: (
+              $observed
+              | map(select(.source_checkout.all_runners_clean == true))
+              | length
+            ),
+            source_checkout_synced_variant_count: (
+              $observed
+              | map(select(.source_checkout.all_runners_origin_main_synced == true))
+              | length
+            ),
+            all_observed_source_checkouts_clean: (
+              ($observed | length) > 0
+              and all($observed[]; .source_checkout.all_runners_clean == true)
+            ),
+            all_observed_source_checkouts_synced: (
+              ($observed | length) > 0
+              and all($observed[]; .source_checkout.all_runners_origin_main_synced == true)
+            ),
+            runner_git_heads: ($observed | map(.runner_git_heads[]?) | unique),
+            runner_package_versions: (
+              $observed | map(.runner_package_versions[]?) | unique
+            ),
+            ready_for_matrix_interpretation: (
+              ($variants | length) > 0
+              and ($observed | length) == ($variants | length)
+              and all($observed[]; agent_error_total(.) == 0)
+              and all($observed[]; .source_checkout.all_runners_clean == true)
+              and all($observed[]; .source_checkout.all_runners_origin_main_synced == true)
+            )
+          },
           no_signal_diagnostics: {
             variant_count: (
               $variants | map(select(.observation_class == "no_signal")) | length
