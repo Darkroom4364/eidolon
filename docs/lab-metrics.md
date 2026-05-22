@@ -425,6 +425,13 @@ class from the same shape-only sample counters. Use
 the default is `1` so exploratory profile tuning does not accidentally launch a
 long matrix.
 
+The matrix summary also includes `matrix_health`, which aggregates missing
+variants, pwnkit `agent_error` counts, source-checkout cleanliness/sync status,
+runner heads, and package versions. Treat
+`matrix_health.ready_for_matrix_interpretation: true` as the minimum health gate
+before interpreting a promotion matrix. For `no_signal` matrices, still inspect
+`no_signal_diagnostics.likely_cause` before tuning bait semantics.
+
 To aggregate already-collected variant samples manually:
 
 ```sh
