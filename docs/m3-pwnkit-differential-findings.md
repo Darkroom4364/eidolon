@@ -55,7 +55,10 @@ Before collecting a new sample:
 4. Run direct and Eidolon legs with generated pwnkit scope files.
 5. Use `EIDOLON_M3_PIN_SESSION=1` for the Eidolon leg when testing same-session
    replay.
-6. Keep the proxy event log, policy state, and intervention control files inside
+6. Keep `EIDOLON_M3_ALLOW_AGENT_ERRORS=0` for evidence collection so the sample
+   runner fails after any pwnkit `agent_error` event. Use
+   `EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only for diagnostic no-signal preservation.
+7. Keep the proxy event log, policy state, and intervention control files inside
    the same artifact directory.
 
 For the standard repeated-run path, use:
