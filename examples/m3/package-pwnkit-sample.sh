@@ -68,6 +68,7 @@ redact_sample_summary() {
   local output="$2"
 
   jq '
+    def omitted_source_path: "<source-artifact-path-omitted>";
     def safe_path:
       if type == "string" then split("?")[0] | split("#")[0] else . end;
     def clean_no_signal_diagnostics:
@@ -118,7 +119,7 @@ redact_sample_summary() {
       artifacts: [
         (.artifacts // [])[] |
         {
-          artifact_dir,
+          artifact_dir: omitted_source_path,
           present,
           missing_reason,
           runner_git_head,
@@ -126,7 +127,6 @@ redact_sample_summary() {
           runner_git_dirty,
           runner_origin_main,
           runner_origin_main_in_sync,
-          runner_command,
           stale_dist_guard_bypassed,
           claim_level,
           conclusion,
@@ -157,7 +157,9 @@ redact_sample_summary() {
         raw_agent_error_text_omitted: true,
         raw_pwnkit_artifacts_omitted: true,
         raw_proxy_events_omitted: true,
-        private_debug_logs_omitted: true
+        private_debug_logs_omitted: true,
+        source_artifact_paths_omitted: true,
+        runner_command_paths_omitted: true
       }
     }
   ' "$input" > "$output"
@@ -168,8 +170,15 @@ redact_pwnkit_summary() {
   local output="$2"
 
   jq '
+    def omitted_source_path: "<source-artifact-path-omitted>";
     def safe_path:
       if type == "string" then split("?")[0] | split("#")[0] else . end;
+    def clean_scopes:
+      if type == "object" then
+        with_entries(.value |= (if type == "object" then del(.path) else . end))
+      else
+        .
+      end;
     def clean_matrix:
       [
         (. // [])[] |
@@ -198,7 +207,7 @@ redact_pwnkit_summary() {
       schema_version,
       run_kind,
       boundary,
-      source_artifact_dir: (.artifact_dir // .source_artifact_dir),
+      source_artifact_dir: omitted_source_path,
       runner: {
         schema_version: .runner.schema_version,
         run_kind: .runner.run_kind,
@@ -218,7 +227,7 @@ redact_pwnkit_summary() {
           git_dirty: .runner.pwnkit.git_dirty,
           origin_main: .runner.pwnkit.origin_main,
           stale_dist_guard_bypassed: .runner.pwnkit.stale_dist_guard_bypassed,
-          scopes: .runner.pwnkit.scopes
+          scopes: (.runner.pwnkit.scopes | clean_scopes)
         },
         eidolon: .runner.eidolon
       },
@@ -267,7 +276,10 @@ redact_pwnkit_summary() {
         raw_agent_error_text_omitted: true,
         raw_tool_evidence_labels_omitted: true,
         warning_text_omitted: true,
-        query_values_omitted: true
+        query_values_omitted: true,
+        source_artifact_path_omitted: true,
+        runner_command_paths_omitted: true,
+        pwnkit_scope_paths_omitted: true
       }
     }
   ' "$input" > "$output"
@@ -278,6 +290,7 @@ redact_agent_trace() {
   local output="$2"
 
   jq '
+    def omitted_source_path: "<source-artifact-path-omitted>";
     def safe_path:
       if type == "string" then split("?")[0] | split("#")[0] else . end;
     def redact_event_path:
@@ -291,7 +304,7 @@ redact_agent_trace() {
         run_kind: $root.run_kind,
         boundary: $root.boundary,
         evidence_source: $root.evidence_source,
-        artifact_dir: $root.artifact_dir,
+        artifact_dir: omitted_source_path,
         claim_level: $root.claim_level,
         counts: $root.counts,
         metrics: $root.metrics,
@@ -311,7 +324,8 @@ redact_agent_trace() {
         redaction: {
           query_values_omitted: true,
           full_proxy_events_omitted: true,
-          private_debug_logs_omitted: true
+          private_debug_logs_omitted: true,
+          source_artifact_path_omitted: true
         }
       }
   ' "$input" > "$output"
@@ -331,7 +345,6 @@ write_readme() {
   local direct_counts
   local eidolon_counts
   local claim_counts
-  local source_dir
 
   collected_on="$(date -u +%F)"
   valid_count="$(sample_value '.valid_summary_count')"
@@ -341,14 +354,13 @@ write_readme() {
   direct_counts="$(jq -r '[(.artifacts // [])[] | (.direct_finding_count // 0)] | join("/")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   eidolon_counts="$(jq -r '[(.artifacts // [])[] | (.eidolon_finding_count // 0)] | join("/")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   claim_counts="$(jq -r '(.claim_level_counts // []) | map("`" + .claim_level + "`: `" + (.count|tostring) + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
-  source_dir="$(cd "$SAMPLE_DIR" && pwd -P)"
 
   {
     printf '# M3 pwnkit Sample Evidence\n\n'
     printf 'Lab-only evidence bundle packaged on %s.\n\n' "$collected_on"
     printf '## Scope\n\n'
     printf -- '- Boundary: owned loopback lab.\n'
-    printf -- '- Source sample directory: `%s`.\n' "$source_dir"
+    printf -- '- Source sample directory: omitted from the committed bundle.\n'
     printf -- '- pwnkit runner head(s): %s.\n' "${heads:-unknown}"
     printf -- '- pwnkit package version(s): %s.\n' "${versions:-unknown}"
     printf -- '- Session control: pinned Eidolon session cookie when enabled by the sample runner.\n\n'

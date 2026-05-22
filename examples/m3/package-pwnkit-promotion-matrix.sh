@@ -228,7 +228,6 @@ matrix_value() {
 
 write_readme() {
   local collected_on
-  local source_dir
   local variant_count
   local observed_count
   local class_counts
@@ -236,7 +235,6 @@ write_readme() {
   local stability_variants
 
   collected_on="$(date -u +%F)"
-  source_dir="$(cd "$MATRIX_DIR" && pwd -P)"
   variant_count="$(matrix_value '.variant_count')"
   observed_count="$(matrix_value '.observed_variant_count')"
   class_counts="$(jq -r '(.observation_class_counts // []) | map("`" + .observation_class + "`: `" + (.count|tostring) + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-promotion-matrix.json")"
@@ -248,7 +246,7 @@ write_readme() {
     printf 'Lab-only evidence bundle packaged on %s.\n\n' "$collected_on"
     printf '## Scope\n\n'
     printf -- '- Boundary: owned loopback lab.\n'
-    printf -- '- Source matrix directory: `%s`.\n' "$source_dir"
+    printf -- '- Source matrix directory: omitted from the committed bundle.\n'
     printf -- '- Matrix variants: `%s` total, `%s` observed.\n\n' "$variant_count" "$observed_count"
     printf '## Contents\n\n'
     printf -- '- `bait-promotion-variants.json`: matrix manifest used for the run.\n'

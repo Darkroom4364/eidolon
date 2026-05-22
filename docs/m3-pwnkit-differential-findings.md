@@ -84,6 +84,9 @@ examples/m3/package-pwnkit-sample.sh \
 ```
 
 Review the generated README and redacted JSON before committing the bundle.
+Committed bundles must not contain local source artifact directories, pwnkit
+runner command paths, generated scope-file paths, raw pwnkit artifacts, or
+private debug logs.
 
 For the promotion investigation, run the seed bait-profile matrix after the
 standard sample path is healthy:

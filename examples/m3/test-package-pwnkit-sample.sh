@@ -201,8 +201,16 @@ JSON
       "origin_main": {"in_sync": true},
       "stale_dist_guard_bypassed": false,
       "scopes": {
-        "eidolon": {"in_scope": ["127.0.0.1"], "out_of_scope": []},
-        "direct": {"in_scope": ["127.0.0.1"], "out_of_scope": []}
+        "eidolon": {
+          "path": "/private/tmp/eidolon-fixture/pwnkit-eidolon-scope.json",
+          "in_scope": ["127.0.0.1"],
+          "out_of_scope": []
+        },
+        "direct": {
+          "path": "/private/tmp/eidolon-fixture/pwnkit-direct-scope.json",
+          "in_scope": ["127.0.0.1"],
+          "out_of_scope": []
+        }
       }
     },
     "eidolon": {
@@ -426,9 +434,11 @@ test_packager_redacts_raw_artifacts_and_query_values() {
   ! find "$bundle_dir" -type f -name '*.log' | rg -q .
   ! find "$bundle_dir" -type f -path '*/private/*' | rg -q .
   ! rg -q 'secret-token|direct-secret|secret-label|debug-secret|must-not-survive|raw warning' "$bundle_dir"
+  ! rg -q '/private/tmp|/tmp/pwnkit|node /tmp|eidolon-fixture' "$bundle_dir"
 
   jq -e '
-    .comparison.correlated_target_request_count == 1
+    .source_artifact_dir == "<source-artifact-path-omitted>"
+    and .comparison.correlated_target_request_count == 1
     and .comparison.eidolon_requested_path_count == 1
     and .comparison.correlated_bait_matrix[0].surfaces == ["/openapi.json"]
     and .comparison.correlated_bait_matrix[0].action_paths == ["/api/v2/import/reconcile"]
@@ -440,22 +450,33 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .redaction.raw_agent_error_text_omitted == true
     and (.runner.pwnkit | has("command") | not)
     and (.runner.pwnkit | has("entry_path") | not)
+    and (.runner.pwnkit.scopes.eidolon | has("path") | not)
+    and (.runner.pwnkit.scopes.direct | has("path") | not)
+    and .redaction.source_artifact_path_omitted == true
+    and .redaction.runner_command_paths_omitted == true
+    and .redaction.pwnkit_scope_paths_omitted == true
     and .redaction.raw_requested_paths_omitted == true
   ' "$bundle_dir/run-1/pwnkit-summary.redacted.json" >/dev/null
 
   jq -e '
-    .bait_events.exposures[0].surface == "/openapi.json"
+    .artifact_dir == "<source-artifact-path-omitted>"
+    and .bait_events.exposures[0].surface == "/openapi.json"
     and .bait_events.actions[0].path == "/api/v2/import/reconcile"
     and .redaction.private_debug_logs_omitted == true
+    and .redaction.source_artifact_path_omitted == true
   ' "$bundle_dir/run-1/agent-replay-trace-summary.json" >/dev/null
 
   jq -e '
     .redaction.raw_pwnkit_artifacts_omitted == true
+    and .redaction.source_artifact_paths_omitted == true
+    and .redaction.runner_command_paths_omitted == true
     and .no_signal_diagnostics.proxy_path_counts == [{path: "/docs", count: 1}]
     and .no_signal_diagnostics.eidolon_agent_error_class_counts == [
       {error_class: "codex_backend_api_error", count: 1}
     ]
     and .artifacts[0].agent_error_diagnostics.eidolon.count == 1
+    and .artifacts[0].artifact_dir == "<source-artifact-path-omitted>"
+    and (.artifacts[0] | has("runner_command") | not)
     and .artifacts[0].eidolon_proxy.request_path_counts == [{value: "/docs", count: 1}]
     and .artifacts[0].target_correlation_diagnostics.correlated_target_request_count == 1
     and (. | has("raw_future_field") | not)
