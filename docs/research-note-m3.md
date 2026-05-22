@@ -24,9 +24,11 @@ Three-run current-pwnkit scoped pinned-session stability sample:
 - run artifacts: `run-1/`, `run-2/`, and `run-3/` under the committed
   evidence bundle
 - pwnkit git head: `5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10`
-- pwnkit runner: `node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js`
+- pwnkit runner: source-checkout `dist/pwnkit.js`; local checkout path omitted
 - runtime: `codex`
 - auth path: `PWNKIT_CHATGPT_ACCESS_TOKEN`
+- local temp artifact paths: omitted from this note; committed evidence lives
+  under `docs/evidence/m3/`
 - valid summaries: `3`
 - `strict_stability.ready_for_stability_claim`: `true`
 - direct findings: `0` in all three runs
@@ -58,7 +60,7 @@ Three-run current-pwnkit scoped pinned-session stability sample:
 
 Prior single current-pwnkit scoped pinned-session run:
 
-- artifact directory: `/private/tmp/eidolon-m3-post-merge-pwnkit-access.LOIXvq`
+- local artifact path: omitted from this note
 - pwnkit git head: `5861f0c0c1dd141f0d61d2defd7de4d092324306`
 - `comparison.claim_level`: `controlled_reality_entered`
 - direct findings: `0`
@@ -67,7 +69,7 @@ Prior single current-pwnkit scoped pinned-session run:
 
 Historical pwnkit Codex pinned-session replay probe:
 
-- artifact directory: `/tmp/eidolon-m3-pinned-metrics-EPFsYY`
+- local artifact path: omitted from this note
 - validity: `stale-runner artifact; current pwnkit rerun required`
 - direct findings: `0`
 - Eidolon findings: `4`
@@ -111,7 +113,7 @@ The Eidolon-side findings were:
 
 Fresh scripted action-trace run:
 
-- artifact directory: `/tmp/eidolon-m3-scripted-action-VGXkkh`
+- local artifact path: omitted from this note
 - proxy events: `65`
 - scripted events: `15`
 - `claim_level`: `controlled_reality_entered`
