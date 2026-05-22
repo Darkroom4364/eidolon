@@ -422,7 +422,7 @@ test_packager_redacts_raw_artifacts_and_query_values() {
   bundle_dir="$(new_temp_dir)/bundle"
   write_fixture_sample "$sample_dir"
 
-  "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null
+  EIDOLON_M3_ALLOW_AGENT_ERRORS=1 "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null
 
   [[ -f "$bundle_dir/README.md" ]]
   [[ -f "$bundle_dir/SHA256SUMS" ]]
@@ -503,7 +503,25 @@ test_packager_refuses_non_empty_bundle_dir() {
   rg -q 'bundle directory must be empty' <<<"$output"
 }
 
+test_packager_rejects_agent_error_sample_by_default() {
+  local sample_dir
+  local bundle_dir
+  local output
+  local status=0
+  sample_dir="$(new_temp_dir)"
+  bundle_dir="$(new_temp_dir)/bundle"
+  write_fixture_sample "$sample_dir"
+
+  output="$("$PACKAGER" "$sample_dir" "$bundle_dir" 2>&1)" || status="$?"
+
+  [[ "$status" -eq 1 ]]
+  rg -q 'pwnkit agent errors detected in sample' <<<"$output"
+  rg -q 'eidolon classes=codex_backend_api_error=1' <<<"$output"
+  ! rg -q 'secret-token|debug-secret|raw warning' <<<"$output"
+}
+
 test_packager_redacts_raw_artifacts_and_query_values
 test_packager_refuses_non_empty_bundle_dir
+test_packager_rejects_agent_error_sample_by_default
 
 printf 'package-pwnkit-sample fixture tests passed\n'
