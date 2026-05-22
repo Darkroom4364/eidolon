@@ -432,6 +432,14 @@ runner heads, and package versions. Treat
 before interpreting a promotion matrix. For `no_signal` matrices, still inspect
 `no_signal_diagnostics.likely_cause` before tuning bait semantics.
 
+The matrix evidence packager enforces the same health gate by default through
+`examples/m3/check-pwnkit-promotion-matrix-health.sh`. A matrix whose
+`matrix_health.ready_for_matrix_interpretation` value is not `true` is not a
+commit-ready evidence bundle. Set
+`EIDOLON_M3_ALLOW_UNHEALTHY_PROMOTION_MATRIX=1` only to preserve a diagnostic
+bundle for debugging failed collection, agent runtime errors, missing variants,
+or source-checkout drift.
+
 To aggregate already-collected variant samples manually:
 
 ```sh
@@ -458,7 +466,10 @@ The packager reuses the sample packager for each observed variant, writes a
 redacted matrix aggregate, copies the manifest, and emits `SHA256SUMS`. It
 omits raw pwnkit databases, auth files, stdout/stderr logs, full proxy events,
 private Eidolon debug logs, local artifact paths, runner command paths, and
-scope-file paths from every variant.
+scope-file paths from every variant. By default, it fails before writing the
+bundle unless `matrix_health.ready_for_matrix_interpretation` is `true`; the
+`EIDOLON_M3_ALLOW_UNHEALTHY_PROMOTION_MATRIX=1` bypass is for diagnostic
+packaging only and must not be used to support promotion-matrix conclusions.
 
 The sample summary reports per-run claim levels, runner git heads, pwnkit
 package versions, source-checkout freshness, pinned-cookie preservation,
