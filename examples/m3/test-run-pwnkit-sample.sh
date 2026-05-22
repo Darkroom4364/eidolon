@@ -12,6 +12,7 @@ test_help_mentions_sample_summary() {
   "$RUNNER" --help | rg -q 'pwnkit-stability-sample\.json'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_BAIT_PROFILE'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_ALLOW_AGENT_ERRORS'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE'
 }
 
 test_rejects_invalid_run_count() {
@@ -51,6 +52,7 @@ test_dry_run_creates_private_layout() {
   rg -q '^pin_session=1$' "$sample_dir/sample-plan.txt"
   rg -q '^bait_profile=default$' "$sample_dir/sample-plan.txt"
   rg -q '^allow_agent_errors=0$' "$sample_dir/sample-plan.txt"
+  rg -q '^allow_unfresh_pwnkit_source=0$' "$sample_dir/sample-plan.txt"
   rg -q '^debug_log=run-\*/private/eidolon-debug\.jsonl$' "$sample_dir/sample-plan.txt"
 }
 
@@ -63,6 +65,17 @@ test_dry_run_records_agent_error_override() {
     "$RUNNER" 1 "$sample_dir" >/dev/null
 
   rg -q '^allow_agent_errors=1$' "$sample_dir/sample-plan.txt"
+}
+
+test_dry_run_records_unfresh_source_override() {
+  local sample_dir
+  sample_dir="$(new_temp_dir)"
+
+  EIDOLON_M3_SAMPLE_DRY_RUN=1 \
+    EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=1 \
+    "$RUNNER" 1 "$sample_dir" >/dev/null
+
+  rg -q '^allow_unfresh_pwnkit_source=1$' "$sample_dir/sample-plan.txt"
 }
 
 test_dry_run_records_bait_profile() {
@@ -111,6 +124,7 @@ test_rejects_invalid_run_count
 test_rejects_urls_with_query_values
 test_dry_run_creates_private_layout
 test_dry_run_records_agent_error_override
+test_dry_run_records_unfresh_source_override
 test_dry_run_records_bait_profile
 test_rejects_missing_bait_profile
 test_dry_run_accepts_localhost_urls

@@ -12,6 +12,7 @@ EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-1}"
 EIDOLON_M3_SAMPLE_DRY_RUN="${EIDOLON_M3_SAMPLE_DRY_RUN:-0}"
 EIDOLON_M3_BAIT_PROFILE="${EIDOLON_M3_BAIT_PROFILE:-}"
 EIDOLON_M3_ALLOW_AGENT_ERRORS="${EIDOLON_M3_ALLOW_AGENT_ERRORS:-0}"
+EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE="${EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE:-0}"
 
 TARGET_PID=""
 PROXY_PID=""
@@ -37,6 +38,10 @@ Environment:
   EIDOLON_M3_ALLOW_AGENT_ERRORS
                                 If true, continue when pwnkit emits agent_error
                                 events. Defaults to 0.
+  EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE
+                                If true, continue when a pwnkit source checkout
+                                is dirty or not synced to origin/main. Defaults
+                                to 0.
   EIDOLON_M3_SAMPLE_DRY_RUN    If true, create the planned directory layout only.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to pwnkit-codex.sh.
 
@@ -212,6 +217,7 @@ write_dry_run_plan() {
     printf 'pin_session=%s\n' "$EIDOLON_M3_PIN_SESSION"
     printf 'bait_profile=%s\n' "${EIDOLON_M3_BAIT_PROFILE:-default}"
     printf 'allow_agent_errors=%s\n' "$EIDOLON_M3_ALLOW_AGENT_ERRORS"
+    printf 'allow_unfresh_pwnkit_source=%s\n' "$EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE"
     printf 'debug_log=run-*/private/eidolon-debug.jsonl\n'
     printf 'sample_summary=pwnkit-stability-sample.json\n'
   } > "$plan_file"
@@ -262,6 +268,19 @@ start_proxy() {
   wait_for_http "eidolon-proxy" "$PROXY_URL/health" "$PROXY_PID" "$log_file"
 }
 
+run_pwnkit_preflight() {
+  local preflight_dir="$SAMPLE_DIR/private/pwnkit-preflight"
+
+  mkdir -p "$preflight_dir"
+  EIDOLON_LAB_TARGET_URL="$TARGET_URL" \
+    EIDOLON_LAB_PROXY_URL="$PROXY_URL" \
+    EIDOLON_M3_PIN_SESSION="$EIDOLON_M3_PIN_SESSION" \
+    "$SCRIPT_DIR/pwnkit-codex.sh" preflight "$preflight_dir" >/dev/null
+  EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE="$EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE" \
+    "$SCRIPT_DIR/check-pwnkit-runner-freshness.sh" \
+    "$preflight_dir/pwnkit-runner-metadata.json"
+}
+
 run_one_sample() {
   local run_index="$1"
   local proxy_addr="$2"
@@ -278,7 +297,8 @@ run_one_sample() {
   "$SCRIPT_DIR/collect-pwnkit-codex.sh" "$run_dir" > "$run_dir/pwnkit-summary.json"
   "$SCRIPT_DIR/collect-agent-replay-trace.sh" "$run_dir" \
     > "$run_dir/agent-replay-trace-summary.json"
-  "$SCRIPT_DIR/check-pwnkit-summary-health.sh" "$run_dir/pwnkit-summary.json"
+  EIDOLON_M3_ALLOW_AGENT_ERRORS="$EIDOLON_M3_ALLOW_AGENT_ERRORS" \
+    "$SCRIPT_DIR/check-pwnkit-summary-health.sh" "$run_dir/pwnkit-summary.json"
   stop_pid "$PROXY_PID"
   PROXY_PID=""
 }
@@ -314,6 +334,7 @@ main() {
   mkdir -p "$SAMPLE_DIR/private"
   trap cleanup EXIT INT TERM
 
+  run_pwnkit_preflight
   build_lab_binaries
   start_target "$target_addr"
 
