@@ -27,6 +27,11 @@ Outputs:
   <bundle-dir>/variants/<variant-id>/...
   <bundle-dir>/SHA256SUMS
 
+Environment:
+  EIDOLON_M3_ALLOW_UNHEALTHY_PROMOTION_MATRIX
+    If set to 1, allow packaging matrices whose matrix_health gate is not ready.
+    Use only for diagnostic bundles, not commit-ready M3 evidence claims.
+
 The bundle intentionally omits raw pwnkit DBs, auth JSON, stdout/stderr logs,
 full proxy event logs, raw pwnkit agent error text, and private Eidolon debug
 logs from every variant.
@@ -83,6 +88,16 @@ validate_matrix_summary() {
     and .boundary == "owned_loopback_lab"
     and (.variants | type == "array")
   ' "$MATRIX_SUMMARY" >/dev/null || fail "invalid matrix summary: $MATRIX_SUMMARY"
+}
+
+check_matrix_health() {
+  local checker="$SCRIPT_DIR/check-pwnkit-promotion-matrix-health.sh"
+
+  if [[ ! -x "$checker" ]]; then
+    fail "promotion matrix health checker is not executable: $checker"
+  fi
+
+  "$checker" "$MATRIX_SUMMARY"
 }
 
 redact_matrix_summary() {
@@ -324,6 +339,7 @@ main() {
   fi
 
   validate_matrix_summary
+  check_matrix_health
   ensure_empty_bundle_dir
   redact_manifest "$MATRIX_MANIFEST" "$BUNDLE_DIR/bait-promotion-variants.json"
   redact_matrix_summary "$MATRIX_SUMMARY" "$BUNDLE_DIR/pwnkit-promotion-matrix.json"
