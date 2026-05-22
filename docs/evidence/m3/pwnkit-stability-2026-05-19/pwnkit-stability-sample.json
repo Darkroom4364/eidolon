@@ -49,10 +49,9 @@
   },
   "artifacts": [
     {
-      "artifact_dir": "/private/tmp/eidolon-m3-stability-pwnkit-1.did5hJ",
+      "artifact_dir": "<source-artifact-path-omitted>",
       "present": true,
       "runner_git_head": "5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10",
-      "runner_command": "node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js",
       "stale_dist_guard_bypassed": false,
       "claim_level": "controlled_reality_entered",
       "conclusion": "bait_action_observed",
@@ -93,10 +92,9 @@
       }
     },
     {
-      "artifact_dir": "/private/tmp/eidolon-m3-stability-pwnkit-2.cnWqi3",
+      "artifact_dir": "<source-artifact-path-omitted>",
       "present": true,
       "runner_git_head": "5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10",
-      "runner_command": "node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js",
       "stale_dist_guard_bypassed": false,
       "claim_level": "controlled_reality_entered",
       "conclusion": "bait_action_observed",
@@ -137,10 +135,9 @@
       }
     },
     {
-      "artifact_dir": "/private/tmp/eidolon-m3-stability-pwnkit-3.Q0HFMX",
+      "artifact_dir": "<source-artifact-path-omitted>",
       "present": true,
       "runner_git_head": "5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10",
-      "runner_command": "node /Users/darkroom/Projects/pwnkit/dist/pwnkit.js",
       "stale_dist_guard_bypassed": false,
       "claim_level": "controlled_reality_entered",
       "conclusion": "bait_action_observed",
@@ -187,6 +184,8 @@
     "raw_tool_evidence_labels_omitted": true,
     "raw_pwnkit_artifacts_omitted": true,
     "raw_proxy_events_omitted": true,
-    "private_debug_logs_omitted": true
+    "private_debug_logs_omitted": true,
+    "source_artifact_paths_omitted": true,
+    "runner_command_paths_omitted": true
   }
 }

@@ -5,7 +5,7 @@ Lab-only evidence bundle packaged on 2026-05-21.
 ## Scope
 
 - Boundary: owned loopback lab.
-- Source matrix directory: `/private/tmp/eidolon-m3-pwnkit-promotion-matrix-20260521-185828`.
+- Source matrix directory: omitted from the committed bundle.
 - Matrix variants: `2` total, `2` observed.
 
 ## Contents

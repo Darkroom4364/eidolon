@@ -5,7 +5,7 @@ Lab-only evidence bundle packaged on 2026-05-21.
 ## Scope
 
 - Boundary: owned loopback lab.
-- Source sample directory: `/private/tmp/eidolon-m3-pwnkit-promotion-matrix-20260521-185828/openapi_promotion_probe`.
+- Source sample directory: omitted from the committed bundle.
 - pwnkit runner head(s): `4a8587f7321af622b58f7a57f21f9acd694dc10f`.
 - pwnkit package version(s): `0.11.1`.
 - Session control: pinned Eidolon session cookie when enabled by the sample runner.

@@ -22,11 +22,7 @@ Lab-only evidence bundle for the M3 current-pwnkit stability sample collected on
 - `run-*/agent-replay-trace-summary.json`: proxy-trace summary for each run.
 - `SHA256SUMS`: checksums for the committed evidence files.
 
-The source artifact directories were:
-
-- `/private/tmp/eidolon-m3-stability-pwnkit-1.did5hJ`
-- `/private/tmp/eidolon-m3-stability-pwnkit-2.cnWqi3`
-- `/private/tmp/eidolon-m3-stability-pwnkit-3.Q0HFMX`
+Source artifact directory paths are omitted from the committed bundle.
 
 ## Redaction
 
