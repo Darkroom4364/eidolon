@@ -142,6 +142,7 @@ redact_matrix_summary() {
       variant_count,
       observed_variant_count,
       observation_class_counts,
+      matrix_health,
       no_signal_diagnostics: (.no_signal_diagnostics | clean_no_signal_diagnostics),
       ready_for_differential_finding_claim_variants,
       ready_for_stability_claim_variants,

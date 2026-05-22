@@ -387,6 +387,8 @@ test_packager_redacts_matrix_and_variant_artifacts() {
     .run_kind == "m3_pwnkit_promotion_matrix"
     and .redaction.source_variant_sample_dirs_omitted == true
     and .redaction.raw_agent_error_text_omitted == true
+    and .matrix_health.ready_for_matrix_interpretation == true
+    and .matrix_health.total_pwnkit_agent_errors == 0
     and .no_signal_diagnostics.variant_count == 0
     and (.variants[] | select(.variant_id == "default_m3_catalog") | .sample_dir | not)
     and (.variants[] | select(.variant_id == "default_m3_catalog") | .variant_bundle_dir == "variants/default_m3_catalog")
