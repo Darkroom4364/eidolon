@@ -272,6 +272,12 @@ moving pwnkit mainline, prefer artifacts where
 `runner.pwnkit.origin_main.in_sync` is `true` and
 `runner.pwnkit.git_dirty` is `false`.
 
+The repeated sample runner executes `examples/m3/pwnkit-codex.sh preflight`
+before starting the Lab target. Preflight writes only pwnkit scopes and
+`pwnkit-runner-metadata.json`, then `check-pwnkit-runner-freshness.sh` fails
+dirty or unsynced source-checkout runs before any scan. Set
+`EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=1` only for diagnostic preservation.
+
 The runner captures pwnkit stdout as `$ART/pwnkit-<leg>.stdout.log` and writes a
 normalized JSON-only report to `$ART/pwnkit-<leg>.json`. This preserves current
 pwnkit cost footers for audit while keeping collector input strict JSON.

@@ -49,16 +49,20 @@ Before collecting a new sample:
 1. Sync pwnkit to upstream main and rebuild its dist bundle.
 2. Confirm `examples/m3/pwnkit-codex.sh` records the pwnkit git head in
    `pwnkit-runner-metadata.json`.
-3. Confirm `runner.pwnkit.origin_main.in_sync` is `true` and
+3. Keep `EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=0` so
+   `run-pwnkit-sample.sh` preflights pwnkit source-checkout freshness before
+   starting the Lab target. Use `EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=1` only
+   for diagnostic artifact preservation.
+4. Confirm `runner.pwnkit.origin_main.in_sync` is `true` and
    `runner.pwnkit.git_dirty` is `false` in the collected summary before making
    current-pwnkit claims.
-4. Run direct and Eidolon legs with generated pwnkit scope files.
-5. Use `EIDOLON_M3_PIN_SESSION=1` for the Eidolon leg when testing same-session
+5. Run direct and Eidolon legs with generated pwnkit scope files.
+6. Use `EIDOLON_M3_PIN_SESSION=1` for the Eidolon leg when testing same-session
    replay.
-6. Keep `EIDOLON_M3_ALLOW_AGENT_ERRORS=0` for evidence collection so the sample
+7. Keep `EIDOLON_M3_ALLOW_AGENT_ERRORS=0` for evidence collection so the sample
    runner fails after any pwnkit `agent_error` event. Use
    `EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only for diagnostic no-signal preservation.
-7. Keep the proxy event log, policy state, and intervention control files inside
+8. Keep the proxy event log, policy state, and intervention control files inside
    the same artifact directory.
 
 For the standard repeated-run path, use:

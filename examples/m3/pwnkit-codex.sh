@@ -16,10 +16,11 @@ EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST="${EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST:-0}"
 
 usage() {
   cat <<'USAGE'
-Usage: examples/m3/pwnkit-codex.sh [all|eidolon|direct] [artifact-dir]
+Usage: examples/m3/pwnkit-codex.sh [all|eidolon|direct|preflight] [artifact-dir]
 
 Runs an authorized local pwnkit Codex scan against the Eidolon proxy and/or the
-direct demo target. The demo target and proxy must already be running.
+direct demo target. The demo target and proxy must already be running unless
+MODE is preflight.
 
 Environment:
   EIDOLON_LAB_TARGET_URL    Direct demo target URL. Defaults to http://127.0.0.1:9001.
@@ -58,6 +59,9 @@ fatal.
 Current pwnkit builds may append a human `cost: ...` footer after the JSON report.
 The runner stores raw stdout as `pwnkit-<leg>.stdout.log` and normalizes the JSON
 report into `pwnkit-<leg>.json` before validation.
+
+The preflight mode validates local runner plumbing, writes scope files and
+`pwnkit-runner-metadata.json`, and exits before running pwnkit scans.
 USAGE
 }
 
@@ -625,6 +629,9 @@ main() {
   write_runner_metadata
 
   case "$MODE" in
+    preflight)
+      echo "m3 pwnkit preflight: $ARTIFACT_DIR" >&2
+      ;;
     all)
       run_scan "eidolon" "$PROXY_URL"
       run_scan "direct" "$TARGET_URL"

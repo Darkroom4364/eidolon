@@ -105,8 +105,35 @@ test_source_checkout_metadata_records_dirty_worktree() {
   jq -e '.pwnkit.git_dirty == true' "$artifact/pwnkit-runner-metadata.json" >/dev/null
 }
 
+test_preflight_writes_metadata_and_scopes_without_scan() {
+  local repo
+  local artifact
+  repo="$(new_temp_dir)"
+  artifact="$(new_temp_dir)"
+  init_fake_pwnkit_checkout "$repo"
+
+  EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
+    "$RUNNER" preflight "$artifact" >/dev/null
+
+  [[ -f "$artifact/pwnkit-runner-metadata.json" ]]
+  [[ -f "$artifact/pwnkit-eidolon-scope.json" ]]
+  [[ -f "$artifact/pwnkit-direct-scope.json" ]]
+  [[ ! -f "$artifact/pwnkit-direct.json" ]]
+  [[ ! -f "$artifact/pwnkit-eidolon.json" ]]
+  jq -e '
+    .mode == "preflight"
+    and .pwnkit.command_source == "PWNKIT_NODE_ENTRY"
+    and .pwnkit.origin_main.in_sync == true
+    and .pwnkit.scopes.eidolon.in_scope == ["127.0.0.1"]
+    and .pwnkit.scopes.direct.in_scope == ["127.0.0.1"]
+  ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+}
+
 test_source_checkout_metadata_records_version_and_origin_sync
 test_source_checkout_metadata_records_origin_drift
 test_source_checkout_metadata_records_dirty_worktree
+test_preflight_writes_metadata_and_scopes_without_scan
 
 printf 'pwnkit-codex runner fixture tests passed\n'
