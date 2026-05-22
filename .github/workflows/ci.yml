@@ -67,6 +67,7 @@ jobs:
           examples/m3/test-run-pwnkit-sample.sh
           examples/m3/test-run-pwnkit-promotion-matrix.sh
           examples/m3/test-check-pwnkit-summary-health.sh
+          examples/m3/test-check-pwnkit-sample-health.sh
           examples/m3/test-check-pwnkit-runner-freshness.sh
           examples/m3/test-pwnkit-codex.sh
           examples/m3/test-collect-pwnkit-codex.sh

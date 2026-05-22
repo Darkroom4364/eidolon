@@ -346,6 +346,9 @@ main() {
 
   "$SCRIPT_DIR/collect-pwnkit-sample.sh" "${run_dirs[@]}" \
     > "$SAMPLE_DIR/pwnkit-stability-sample.json"
+  EIDOLON_M3_ALLOW_AGENT_ERRORS="$EIDOLON_M3_ALLOW_AGENT_ERRORS" \
+    "$SCRIPT_DIR/check-pwnkit-sample-health.sh" \
+    "$SAMPLE_DIR/pwnkit-stability-sample.json"
 
   echo "m3 pwnkit sample summary: $SAMPLE_DIR/pwnkit-stability-sample.json"
 }
