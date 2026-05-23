@@ -7,6 +7,15 @@ use std::{
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9001";
 const ADDR_ENV: &str = "EIDOLON_LAB_TARGET_ADDR";
+const SECURITY_HEADERS: &[(&str, &str)] = &[
+    (
+        "Content-Security-Policy",
+        "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    ),
+    ("X-Frame-Options", "DENY"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+];
 
 fn main() -> io::Result<()> {
     let addr = env::var(ADDR_ENV).unwrap_or_else(|_| DEFAULT_ADDR.to_string());
@@ -131,15 +140,22 @@ impl Response {
     }
 
     fn to_http_bytes(&self) -> Vec<u8> {
-        format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            self.status,
-            self.reason,
-            self.content_type,
+        let mut response = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n",
+            self.status, self.reason, self.content_type,
+        );
+        for (name, value) in SECURITY_HEADERS {
+            response.push_str(name);
+            response.push_str(": ");
+            response.push_str(value);
+            response.push_str("\r\n");
+        }
+        response.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             self.body.len(),
-            self.body
-        )
-        .into_bytes()
+            self.body,
+        ));
+        response.into_bytes()
     }
 }
 
@@ -352,6 +368,20 @@ mod tests {
         let response = route_request("POST", "/api/v1/imports");
         assert_eq!(response.status, 202);
         assert!(response.body.contains(r#""writes":"none""#));
+    }
+
+    #[test]
+    fn responses_include_browser_hardening_headers() {
+        let response = route_request("GET", "/docs");
+        let bytes = response.to_http_bytes();
+        let raw = String::from_utf8(bytes).expect("response should be utf8");
+
+        assert!(raw.contains(
+            "Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n"
+        ));
+        assert!(raw.contains("X-Frame-Options: DENY\r\n"));
+        assert!(raw.contains("X-Content-Type-Options: nosniff\r\n"));
+        assert!(raw.contains("Referrer-Policy: no-referrer\r\n"));
     }
 
     #[test]
