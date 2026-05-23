@@ -42,6 +42,20 @@ Can current pwnkit produce an agent-error-free run with persisted request
 artifacts, and only then does it still fail to correlate through Eidolon?
 ```
 
+A post-auth rerun against synced pwnkit `v0.12.0` / head
+`53f64d479d6c3b256a99f9adb2ae22896ea4c3cc` moved past the refresh-token
+failure: the runner loaded a fresh Codex access token, pwnkit persisted request
+artifacts, replayed the OpenAPI bait action in the same Eidolon session, and
+entered controlled reality. The strict sample was still not archive-ready
+because pwnkit emitted an `agent_error` consistent with a Codex backend timeout.
+Treat the active open question as:
+
+```text
+Can current pwnkit produce an agent-error-free v0.12.x run with the same
+controlled-reality chain, and if so, why is that chain still not promoted to a
+pwnkit finding?
+```
+
 ## Pre-Run Checklist
 
 Before collecting a new sample:
@@ -182,9 +196,11 @@ Use the diagnostics to classify the gap before changing bait text or behavior:
   `no_signal_diagnostics.likely_cause` before changing bait content.
   `pwnkit_codex_token_refresh_failure_prevented_request_artifacts` means refresh
   pwnkit Codex auth and rerun before drawing current-pwnkit behavior
-  conclusions. A likely cause of `pwnkit_agent_errors_prevented_request_artifacts`
-  means inspect the sanitized agent error classes and rerun after an
-  agent-error-free scan. A likely cause of
+  conclusions. `pwnkit_codex_backend_timeout_prevented_request_artifacts` means
+  rerun after the backend timeout clears before tuning bait semantics. A likely
+  cause of `pwnkit_agent_errors_prevented_request_artifacts` means inspect the
+  sanitized agent error classes and rerun after an agent-error-free scan. A
+  likely cause of
   `eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts`
   points at runner/current-pwnkit instrumentation or cookie reuse, not bait
   semantics.

@@ -123,8 +123,17 @@ run_summary() {
              or lower(coalesce(json_extract(payload, '$.error'), '')) like '%invalid_request_error%'
              or lower(coalesce(json_extract(payload, '$.error'), '')) like '%authentication%'
              then 'codex_authentication_failed'
+           when lower(coalesce(json_extract(payload, '$.error'), '')) like '%codex backend%'
+             and (
+               lower(coalesce(json_extract(payload, '$.error'), '')) like '%timed out%'
+               or lower(coalesce(json_extract(payload, '$.error'), '')) like '%timeout%'
+             )
+             then 'codex_backend_timeout'
            when lower(coalesce(json_extract(payload, '$.error'), '')) like '%chatgpt (codex backend) api error%'
              then 'codex_backend_api_error'
+           when lower(coalesce(json_extract(payload, '$.error'), '')) like '%api request timed out%'
+             or lower(coalesce(json_extract(payload, '$.error'), '')) like '%api timeout%'
+             then 'agent_api_timeout'
            when lower(coalesce(json_extract(payload, '$.error'), '')) like '%api error%'
              then 'agent_api_error'
            else 'pwnkit_agent_error'
@@ -338,8 +347,13 @@ run_summary() {
            has_codex_backend_api_error: any(
              $errors[];
              .error_class == "codex_backend_api_error"
+             or .error_class == "codex_backend_timeout"
              or .error_class == "codex_token_refresh_failed"
              or .error_class == "codex_authentication_failed"
+           ),
+           has_codex_backend_timeout: any(
+             $errors[];
+             .error_class == "codex_backend_timeout"
            )
          };
      {
@@ -780,6 +794,8 @@ jq -n \
      | ($eidolon.agent_error_diagnostics.count // 0) as $pwnkit_agent_errors
      | ($eidolon.agent_error_diagnostics.has_codex_token_refresh_failure // false)
        as $has_token_refresh_failure
+     | ($eidolon.agent_error_diagnostics.has_codex_backend_timeout // false)
+       as $has_codex_backend_timeout
      | (($proxy.request_paths // []) | length) as $proxy_requests
      | (correlated_target_requests | length) as $correlated_requests
      | {
@@ -803,6 +819,8 @@ jq -n \
              "correlated_target_interaction_observed"
            elif $pwnkit_request_artifacts == 0 and $has_token_refresh_failure then
              "pwnkit_codex_token_refresh_failure_prevented_request_artifacts"
+           elif $pwnkit_request_artifacts == 0 and $has_codex_backend_timeout then
+             "pwnkit_codex_backend_timeout_prevented_request_artifacts"
            elif $pwnkit_request_artifacts == 0 and $pwnkit_agent_errors > 0 then
              "pwnkit_agent_errors_prevented_request_artifacts"
            elif $pwnkit_request_artifacts == 0 and $proxy_requests == 0 then
@@ -821,6 +839,11 @@ jq -n \
            elif $pwnkit_request_artifacts == 0 and $has_token_refresh_failure then
              [
                "refresh_pwnkit_codex_auth_before_rerun",
+               "rerun_matrix_after_agent_error_free_scan"
+             ]
+           elif $pwnkit_request_artifacts == 0 and $has_codex_backend_timeout then
+             [
+               "rerun_after_codex_backend_timeout",
                "rerun_matrix_after_agent_error_free_scan"
              ]
            elif $pwnkit_request_artifacts == 0 and $pwnkit_agent_errors > 0 then
