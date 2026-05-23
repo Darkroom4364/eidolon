@@ -1949,7 +1949,7 @@ fn write_reality_escape_attempt_if_needed(
             session.session_id,
             decision.policy_state,
             request.method.clone(),
-            surface_request.path.clone(),
+            redacted_event_target(&surface_request.path),
             decision.routing_decision,
             "controlled session requested a path outside the configured controlled-reality branch",
         ),
@@ -2158,7 +2158,7 @@ fn write_bait_exposed_event(
             EventKind::BaitExposed {
                 bait_id: bait.id.clone(),
                 exposure_id: exposure_id.clone(),
-                surface: surface.clone(),
+                surface: redacted_event_target(&surface),
             },
         ),
     )?;
@@ -2206,7 +2206,7 @@ fn write_bait_action_observed_event(
                 bait_id: bait.id.clone(),
                 exposure_id: exposure_id.clone(),
                 method: method.to_string(),
-                path: path.to_string(),
+                path: redacted_event_target(path),
             },
         ),
     )?;
@@ -2361,7 +2361,7 @@ fn request_seen_event(
         decision.policy_state,
         EventKind::RequestSeen {
             method: request.method.clone(),
-            path: path.to_string(),
+            path: redacted_event_target(path),
             safe_headers: safe_header_observations(&request.headers),
             routing_decision: decision.routing_decision,
         },
@@ -2490,6 +2490,49 @@ fn debug_path(target: &str) -> String {
     };
 
     target[..end].to_string()
+}
+
+fn redacted_event_target(target: &str) -> String {
+    let (target_without_fragment, fragment_present) = target
+        .split_once('#')
+        .map_or((target, false), |(target, _)| (target, true));
+    let (path, query) = target_without_fragment
+        .split_once('?')
+        .map_or((target_without_fragment, None), |(path, query)| {
+            (path, Some(query))
+        });
+
+    let mut redacted = path.to_string();
+    if let Some(query) = query {
+        redacted.push('?');
+        redacted.push_str(&redacted_event_query(query));
+    }
+    if fragment_present {
+        redacted.push_str("#<redacted>");
+    }
+
+    redacted
+}
+
+fn redacted_event_query(query: &str) -> String {
+    let redacted_pairs: Vec<String> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+            if key.is_empty() {
+                "<redacted>".to_string()
+            } else {
+                format!("{key}=<redacted>")
+            }
+        })
+        .collect();
+
+    if redacted_pairs.is_empty() {
+        "<redacted>".to_string()
+    } else {
+        redacted_pairs.join("&")
+    }
 }
 
 fn debug_query_present(target: &str) -> bool {
@@ -4753,6 +4796,13 @@ mod tests {
         assert!(!raw_debug_log.contains("Bearer"));
         assert!(!raw_debug_log.contains("payload"));
 
+        let raw_event_log = fs::read_to_string(&event_log_path).expect("event log should read");
+        assert!(!raw_event_log.contains("secret-value"));
+        assert_eq!(
+            first_event_of_type(&event_log_path, "request_seen")["kind"]["path"],
+            "/docs/legacy-import?token=<redacted>"
+        );
+
         let request_debug = first_debug_event(&debug_log_path, "request_received");
         assert_eq!(request_debug["run_kind"], "eidolon_proxy_debug");
         assert_eq!(request_debug["fields"]["method"], "POST");
@@ -4837,7 +4887,7 @@ mod tests {
         assert_eq!(exposure["kind"]["bait_id"], "openapi_reconcile_trace");
         assert_eq!(
             exposure["kind"]["surface"],
-            "/openapi.json?eidolon_surface=legacy-import"
+            "/openapi.json?eidolon_surface=<redacted>"
         );
     }
 
@@ -5707,6 +5757,20 @@ mod tests {
         assert_eq!(debug_path("/docs?token=secret"), "/docs");
         assert_eq!(debug_path("/docs#secret-fragment"), "/docs");
         assert_eq!(debug_path("/docs#secret-fragment?token=secret"), "/docs");
+    }
+
+    #[test]
+    fn event_target_redacts_query_values_and_fragments() {
+        assert_eq!(
+            redacted_event_target("/docs?token=secret&mode=debug#secret-fragment"),
+            "/docs?token=<redacted>&mode=<redacted>#<redacted>"
+        );
+        assert_eq!(
+            redacted_event_target("/docs?flag&=secret"),
+            "/docs?flag=<redacted>&<redacted>"
+        );
+        assert_eq!(redacted_event_target("/docs?"), "/docs?<redacted>");
+        assert_eq!(redacted_event_target("/docs"), "/docs");
     }
 
     #[test]
