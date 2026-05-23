@@ -10,6 +10,18 @@ new_temp_dir() {
   mktemp -d "${TMPDIR:-/tmp}/eidolon-m3-pwnkit-runner-test.XXXXXX"
 }
 
+make_access_token() {
+  local exp="$1"
+
+  node -e '
+    const exp = Number(process.argv[1]);
+    const encode = (value) => Buffer
+      .from(JSON.stringify(value))
+      .toString("base64url");
+    process.stdout.write(`${encode({ alg: "none", typ: "JWT" })}.${encode({ exp })}.signature`);
+  ' "$exp"
+}
+
 init_fake_pwnkit_checkout() {
   local repo="$1"
 
@@ -133,19 +145,29 @@ test_preflight_writes_metadata_and_scopes_without_scan() {
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
 }
 
-test_auto_loads_codex_refresh_token_from_auth_file_without_recording_secret() {
+test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret() {
   local repo
   local artifact
   local auth_file
+  local access_token
   repo="$(new_temp_dir)"
   artifact="$(new_temp_dir)"
   auth_file="$artifact/codex-auth.json"
+  access_token="$(make_access_token "$(( $(date -u '+%s') + 3600 ))")"
   init_fake_pwnkit_checkout "$repo"
 
   cat > "$repo/dist/pwnkit.js" <<'JS'
 #!/usr/bin/env node
-if (process.env.PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN !== "fixture-refresh-token") {
-  console.error("missing pwnkit refresh token");
+if (process.env.PWNKIT_CHATGPT_ACCESS_TOKEN !== process.env.EXPECTED_ACCESS_TOKEN) {
+  console.error("missing pwnkit access token");
+  process.exit(7);
+}
+if (process.env.PWNKIT_CHATGPT_ACCOUNT_ID !== "fixture-account-id") {
+  console.error("missing pwnkit account id");
+  process.exit(7);
+}
+if (process.env.PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN) {
+  console.error("refresh token should not be passed when access token is usable");
   process.exit(7);
 }
 console.log(JSON.stringify({ findings: [] }));
@@ -158,26 +180,127 @@ JS
   git -C "$repo" update-ref refs/remotes/origin/main HEAD
   touch "$repo/dist/pwnkit.js"
 
-  printf '{"tokens":{"refresh_token":"fixture-refresh-token"}}\n' > "$auth_file"
+  jq -n \
+    --arg access_token "$access_token" \
+    --arg refresh_token "fixture-refresh-token" \
+    --arg account_id "fixture-account-id" \
+    '{tokens: {
+      access_token: $access_token,
+      refresh_token: $refresh_token,
+      account_id: $account_id
+    }}' > "$auth_file"
 
-  EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+  env \
+    -u PWNKIT_CHATGPT_ACCESS_TOKEN \
+    -u PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
     EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
     EIDOLON_M3_CODEX_AUTH_FILE="$auth_file" \
+    EXPECTED_ACCESS_TOKEN="$access_token" \
+    PWNKIT_CHATGPT_ACCOUNT_ID=stale-account-id \
     PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
     "$RUNNER" direct "$artifact" >/dev/null
 
   jq -e '
-    .pwnkit.codex_auth.source == "codex_auth_file"
-    and .pwnkit.codex_auth.auto_loaded_refresh_token == true
+    .pwnkit.codex_auth.source == "codex_auth_file_access_token"
+    and .pwnkit.codex_auth.auto_loaded_access_token == true
+    and .pwnkit.codex_auth.auto_loaded_refresh_token == false
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-runner-metadata.json"
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.json"
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.stderr.log"
+  ! rg -q 'fixture-account-id' "$artifact/pwnkit-runner-metadata.json"
+  ! rg -q 'fixture-account-id' "$artifact/pwnkit-direct.json"
+  ! rg -q 'fixture-account-id' "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q 'fixture-account-id' "$artifact/pwnkit-direct.stderr.log"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-runner-metadata.json"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.json"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.stderr.log"
   ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-runner-metadata.json"
   ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.json"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.stderr.log"
+}
+
+test_auto_loads_codex_refresh_token_from_auth_file_without_usable_access_token() {
+  local repo
+  local artifact
+  local auth_file
+  local access_token
+  repo="$(new_temp_dir)"
+  artifact="$(new_temp_dir)"
+  auth_file="$artifact/codex-auth.json"
+  access_token="$(make_access_token "$(( $(date -u '+%s') - 3600 ))")"
+  init_fake_pwnkit_checkout "$repo"
+
+  cat > "$repo/dist/pwnkit.js" <<'JS'
+#!/usr/bin/env node
+if (process.env.PWNKIT_CHATGPT_ACCESS_TOKEN) {
+  console.error("access token should not be passed when it is unusable");
+  process.exit(7);
+}
+if (process.env.PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN !== "fixture-refresh-token") {
+  console.error("missing pwnkit refresh token");
+  process.exit(7);
+}
+if (Object.prototype.hasOwnProperty.call(process.env, "PWNKIT_CHATGPT_ACCOUNT_ID")) {
+  console.error("stale account id should not be passed with refresh fallback");
+  process.exit(7);
+}
+console.log(JSON.stringify({ findings: [] }));
+JS
+  chmod +x "$repo/dist/pwnkit.js"
+  git -C "$repo" add dist/pwnkit.js
+  GIT_AUTHOR_DATE="2026-01-04T00:00:00Z" \
+    GIT_COMMITTER_DATE="2026-01-04T00:00:00Z" \
+    git -C "$repo" commit -q -m "require codex refresh fallback env"
+  git -C "$repo" update-ref refs/remotes/origin/main HEAD
+  touch "$repo/dist/pwnkit.js"
+
+  jq -n \
+    --arg access_token "$access_token" \
+    --arg refresh_token "fixture-refresh-token" \
+    '{tokens: {
+      access_token: $access_token,
+      refresh_token: $refresh_token
+    }}' > "$auth_file"
+
+  env \
+    -u PWNKIT_CHATGPT_ACCESS_TOKEN \
+    -u PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    EIDOLON_M3_CODEX_AUTH_FILE="$auth_file" \
+    PWNKIT_CHATGPT_ACCOUNT_ID=stale-account-id \
+    PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
+    "$RUNNER" direct "$artifact" >/dev/null
+
+  jq -e '
+    .pwnkit.codex_auth.source == "codex_auth_file_refresh_token"
+    and .pwnkit.codex_auth.auto_loaded_access_token == false
+    and .pwnkit.codex_auth.auto_loaded_refresh_token == true
+  ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-runner-metadata.json"
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.json"
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.stderr.log"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-runner-metadata.json"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.json"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.stderr.log"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-runner-metadata.json"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.json"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.stderr.log"
 }
 
 test_source_checkout_metadata_records_version_and_origin_sync
 test_source_checkout_metadata_records_origin_drift
 test_source_checkout_metadata_records_dirty_worktree
 test_preflight_writes_metadata_and_scopes_without_scan
-test_auto_loads_codex_refresh_token_from_auth_file_without_recording_secret
+test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret
+test_auto_loads_codex_refresh_token_from_auth_file_without_usable_access_token
 
 printf 'pwnkit-codex runner fixture tests passed\n'
