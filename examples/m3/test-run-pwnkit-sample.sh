@@ -13,6 +13,7 @@ test_help_mentions_sample_summary() {
   "$RUNNER" --help | rg -q 'EIDOLON_M3_BAIT_PROFILE'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_ALLOW_AGENT_ERRORS'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_CODEX_AUTH_FILE'
 }
 
 test_rejects_invalid_run_count() {

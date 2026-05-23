@@ -43,6 +43,8 @@ Environment:
                                 is dirty or not synced to origin/main. Defaults
                                 to 0.
   EIDOLON_M3_SAMPLE_DRY_RUN    If true, create the planned directory layout only.
+  EIDOLON_M3_CODEX_AUTH_FILE   Optional Codex auth JSON path passed through to
+                                pwnkit-codex.sh. Defaults to ~/.codex/auth.json.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to pwnkit-codex.sh.
 
 Use only against the owned loopback Lab target. Sync and rebuild pwnkit before
