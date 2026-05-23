@@ -10,6 +10,7 @@ PWNKIT_MODE="${PWNKIT_MODE:-web}"
 PWNKIT_RUNTIME="${PWNKIT_RUNTIME:-codex}"
 PWNKIT_RATE_LIMIT="${PWNKIT_RATE_LIMIT:-2}"
 PWNKIT_FEATURE_CODEX_LIVE_TARGETS="${PWNKIT_FEATURE_CODEX_LIVE_TARGETS:-}"
+EIDOLON_M3_CODEX_AUTH_FILE="${EIDOLON_M3_CODEX_AUTH_FILE:-$HOME/.codex/auth.json}"
 EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-0}"
 EIDOLON_M3_SESSION_ID="${EIDOLON_M3_SESSION_ID:-}"
 EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST="${EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST:-0}"
@@ -36,6 +37,12 @@ Environment:
                             Optional legacy pwnkit feature flag. Not set by
                             default; current pwnkit Codex live scans use the
                             direct ChatGPT Codex provider.
+  EIDOLON_M3_CODEX_AUTH_FILE
+                            Optional Codex auth JSON path. Defaults to
+                            ~/.codex/auth.json. When PWNKIT_RUNTIME=codex and
+                            PWNKIT_CHATGPT_* token env is unset, the runner
+                            passes tokens.refresh_token from this file only to
+                            the pwnkit subprocess.
   EIDOLON_M3_PIN_SESSION    If true, pass one fixed eidolon_session cookie to
                             the Eidolon leg. Defaults to 0.
   EIDOLON_M3_SESSION_ID     Optional UUID for EIDOLON_M3_PIN_SESSION.
@@ -246,6 +253,46 @@ json_bool() {
   fi
 }
 
+resolve_pwnkit_codex_auth() {
+  local refresh_token
+
+  PWNKIT_CODEX_AUTH_SOURCE="not_codex"
+  PWNKIT_CODEX_OAUTH_REFRESH_TOKEN=""
+
+  if [[ "$PWNKIT_RUNTIME" != "codex" ]]; then
+    return
+  fi
+
+  if [[ -n "${PWNKIT_CHATGPT_ACCESS_TOKEN:-}" ]]; then
+    PWNKIT_CODEX_AUTH_SOURCE="access_token_env"
+    return
+  fi
+
+  if [[ -n "${PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN:-}" ]]; then
+    PWNKIT_CODEX_AUTH_SOURCE="refresh_token_env"
+    return
+  fi
+
+  if [[ ! -f "$EIDOLON_M3_CODEX_AUTH_FILE" ]]; then
+    PWNKIT_CODEX_AUTH_SOURCE="unset"
+    return
+  fi
+
+  refresh_token="$(
+    jq -er '
+      (.tokens.refresh_token // .refresh_token // empty)
+      | select(type == "string" and length > 0)
+    ' "$EIDOLON_M3_CODEX_AUTH_FILE" 2>/dev/null || true
+  )"
+
+  if [[ -n "$refresh_token" ]]; then
+    PWNKIT_CODEX_AUTH_SOURCE="codex_auth_file"
+    PWNKIT_CODEX_OAUTH_REFRESH_TOKEN="$refresh_token"
+  else
+    PWNKIT_CODEX_AUTH_SOURCE="unset"
+  fi
+}
+
 require_jq() {
   local context="$1"
 
@@ -357,6 +404,7 @@ write_runner_metadata() {
     --arg pwnkit_origin_main_head_short "$pwnkit_origin_main_head_short" \
     --arg pwnkit_origin_main_ahead "$pwnkit_origin_main_ahead" \
     --arg pwnkit_origin_main_behind "$pwnkit_origin_main_behind" \
+    --arg pwnkit_codex_auth_source "$PWNKIT_CODEX_AUTH_SOURCE" \
     --arg pwnkit_eidolon_scope_file "$PWNKIT_EIDOLON_SCOPE_FILE" \
     --arg pwnkit_direct_scope_file "$PWNKIT_DIRECT_SCOPE_FILE" \
     --slurpfile pwnkit_eidolon_scope "$PWNKIT_EIDOLON_SCOPE_FILE" \
@@ -431,6 +479,10 @@ write_runner_metadata() {
                 and ($pwnkit_origin_main_behind | tonumber) == 0)
             end
           )
+        },
+        codex_auth: {
+          source: $pwnkit_codex_auth_source,
+          auto_loaded_refresh_token: ($pwnkit_codex_auth_source == "codex_auth_file")
         },
         stale_dist_guard_bypassed: $allow_stale_dist,
         scopes: {
@@ -562,6 +614,11 @@ run_scan() {
   local -a pwnkit_env=(
     PWNKIT_NO_UPDATE_CHECK=1
   )
+  if [[ "$PWNKIT_CODEX_AUTH_SOURCE" == "codex_auth_file" ]]; then
+    pwnkit_env+=(
+      PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN="$PWNKIT_CODEX_OAUTH_REFRESH_TOKEN"
+    )
+  fi
   if [[ -n "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" ]]; then
     pwnkit_env+=(PWNKIT_FEATURE_CODEX_LIVE_TARGETS="$PWNKIT_FEATURE_CODEX_LIVE_TARGETS")
   fi
@@ -623,9 +680,12 @@ main() {
   declare -a PWNKIT_COMMAND
   PWNKIT_COMMAND_SOURCE="unknown"
   PWNKIT_ENTRY_PATH=""
+  PWNKIT_CODEX_AUTH_SOURCE="not_codex"
+  PWNKIT_CODEX_OAUTH_REFRESH_TOKEN=""
   resolve_pwnkit_command
   PWNKIT_EIDOLON_SCOPE_FILE="$(write_pwnkit_scope_file "eidolon" "$PROXY_URL")"
   PWNKIT_DIRECT_SCOPE_FILE="$(write_pwnkit_scope_file "direct" "$TARGET_URL")"
+  resolve_pwnkit_codex_auth
   write_runner_metadata
 
   case "$MODE" in
