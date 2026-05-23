@@ -922,6 +922,14 @@ fn registry_from_profile_baits(baits: Vec<Bait>) -> Result<BaitRegistry, ConfigE
         let action_key = (
             bait.expected_action.method.to_ascii_uppercase(),
             bait.expected_action.path.clone(),
+            bait.expected_action
+                .header_name
+                .as_ref()
+                .map(|name| name.trim().to_ascii_lowercase()),
+            bait.expected_action
+                .header_value
+                .as_ref()
+                .map(|value| value.trim().to_string()),
         );
         if !actions.insert(action_key) {
             return Err(ConfigError::new(format!(
@@ -1215,11 +1223,14 @@ fn javascript_for_bait(bait: &Bait) -> String {
     let action = &bait.expected_action;
     let header_name = action.header_name.as_deref().unwrap_or("X-Migration-Trace");
     let header_value = action.header_value.as_deref().unwrap_or(&bait.id.0);
+    let payload = json!({
+        "resumeEndpoint": action.path,
+        "method": action.method,
+        "headerName": header_name,
+        "headerValue": header_value,
+    });
 
-    format!(
-        "window.__eidolonImportWorker = {{ resumeEndpoint: \"{}\", method: \"{}\", headerName: \"{}\", headerValue: \"{}\" }};\n",
-        action.path, action.method, header_name, header_value
-    )
+    format!("window.__eidolonImportWorker = {payload};\n")
 }
 
 fn openapi_path_insertion_for_bait(
@@ -2152,9 +2163,10 @@ fn reason_phrase(status: u16) -> &'static str {
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
-        _ => "OK",
+        _ => "Unknown Status",
     }
 }
 
@@ -2450,6 +2462,12 @@ struct HttpResponse {
 impl HttpRequest {
     fn to_upstream_bytes(&self, upstream: &UpstreamTarget) -> io::Result<Vec<u8>> {
         let target = normalize_request_target(&self.target)?;
+        let connection_nominated_headers = connection_nominated_headers(&self.headers);
+        let should_emit_content_length = !self.body.is_empty()
+            || self
+                .headers
+                .iter()
+                .any(|header| header.name.eq_ignore_ascii_case("content-length"));
         let mut bytes = Vec::new();
 
         write!(
@@ -2458,8 +2476,12 @@ impl HttpRequest {
             self.method, target, self.version, upstream.authority
         )?;
 
+        if should_emit_content_length {
+            write!(bytes, "Content-Length: {}\r\n", self.body.len())?;
+        }
+
         for header in &self.headers {
-            if should_skip_forwarded_header(&header.name) {
+            if should_skip_forwarded_header(&header.name, &connection_nominated_headers) {
                 continue;
             }
 
@@ -2765,6 +2787,9 @@ fn request_content_length(request: &HttpRequest) -> io::Result<usize> {
                 .value
                 .parse::<usize>()
                 .map_err(|error| invalid_data(format!("invalid Content-Length: {error}")))?;
+            if content_length.is_some_and(|existing| existing != parsed) {
+                return Err(invalid_data("conflicting request Content-Length headers"));
+            }
             content_length = Some(parsed);
         }
     }
@@ -2952,11 +2977,32 @@ fn normalize_request_target(target: &str) -> io::Result<&str> {
     ))
 }
 
-fn should_skip_forwarded_header(name: &str) -> bool {
+fn connection_nominated_headers(headers: &[HttpHeader]) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("connection"))
+        .flat_map(|header| header.value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn should_skip_forwarded_header(name: &str, connection_nominated_headers: &[String]) -> bool {
     name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("content-length")
         || name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("proxy-connection")
         || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+        || connection_nominated_headers
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header))
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -3010,7 +3056,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use eidolon_core::SessionId;
+    use eidolon_core::{ExpectedAction, SessionId, SurfaceKind};
     use eidolon_proxy::surface::{HtmlInsertion, RewritePlan};
     use serde_json::Value;
 
@@ -3043,13 +3089,16 @@ mod tests {
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after epoch")
             .as_nanos();
 
         env::temp_dir().join(format!(
-            "eidolon-proxy-{label}-{}-{nanos}",
+            "eidolon-proxy-{label}-{}-{counter}-{nanos}",
             std::process::id()
         ))
     }
@@ -3737,6 +3786,118 @@ mod tests {
     }
 
     #[test]
+    fn bait_profile_allows_same_action_with_distinct_header_constraints() {
+        let path = write_bait_profile(
+            r#"{
+              "schema_version": 1,
+              "profile_id": "distinct_header_actions",
+              "baits": [
+                {
+                  "id": "trace_one",
+                  "bait_class": "docs",
+                  "surface": "/docs/trace-one",
+                  "surface_kind": "docs",
+                  "expected_action": {
+                    "method": "POST",
+                    "path": "/api/v2/import/reconcile",
+                    "header_name": "X-Migration-Trace",
+                    "header_value": "trace-one"
+                  }
+                },
+                {
+                  "id": "trace_two",
+                  "bait_class": "docs",
+                  "surface": "/docs/trace-two",
+                  "surface_kind": "docs",
+                  "expected_action": {
+                    "method": "POST",
+                    "path": "/api/v2/import/reconcile",
+                    "header_name": "X-Migration-Trace",
+                    "header_value": "trace-two"
+                  }
+                }
+              ]
+            }"#,
+        );
+
+        let loaded = load_bait_profile(&path).expect("profile should load");
+
+        assert_eq!(loaded.registry.baits().len(), 2);
+    }
+
+    #[test]
+    fn bait_profile_rejects_duplicate_constrained_action() {
+        let path = write_bait_profile(
+            r#"{
+              "schema_version": 1,
+              "profile_id": "duplicate_header_actions",
+              "baits": [
+                {
+                  "id": "trace_one",
+                  "bait_class": "docs",
+                  "surface": "/docs/trace-one",
+                  "surface_kind": "docs",
+                  "expected_action": {
+                    "method": "POST",
+                    "path": "/api/v2/import/reconcile",
+                    "header_name": "X-Migration-Trace",
+                    "header_value": "trace-one"
+                  }
+                },
+                {
+                  "id": "trace_two",
+                  "bait_class": "docs",
+                  "surface": "/docs/trace-two",
+                  "surface_kind": "docs",
+                  "expected_action": {
+                    "method": "post",
+                    "path": "/api/v2/import/reconcile",
+                    "header_name": "x-migration-trace",
+                    "header_value": " trace-one "
+                  }
+                }
+              ]
+            }"#,
+        );
+
+        let error = load_bait_profile(&path).expect_err("duplicate action should fail");
+
+        assert!(error.to_string().contains("duplicate bait action"));
+    }
+
+    #[test]
+    fn javascript_bait_uses_json_escaped_values() {
+        let bait = Bait {
+            id: BaitId("js_escape".to_string()),
+            bait_class: BaitClass::JsDiscoveredRoute,
+            surface: "/assets/import-helper.js".to_string(),
+            surface_kind: SurfaceKind::Route,
+            expected_action: ExpectedAction {
+                method: "POST".to_string(),
+                path: "/api/v2/import/\"resume\\next".to_string(),
+                header_name: Some("X-Trace\"Name".to_string()),
+                header_value: Some("line\\one\nline\"two".to_string()),
+            },
+        };
+
+        let javascript = javascript_for_bait(&bait);
+        let payload = javascript
+            .strip_prefix("window.__eidolonImportWorker = ")
+            .and_then(|value| value.strip_suffix(";\n"))
+            .expect("javascript assignment should wrap JSON");
+        let value: Value = serde_json::from_str(payload).expect("payload should parse as JSON");
+
+        assert_eq!(value["resumeEndpoint"], "/api/v2/import/\"resume\\next");
+        assert_eq!(value["method"], "POST");
+        assert_eq!(value["headerName"], "X-Trace\"Name");
+        assert_eq!(value["headerValue"], "line\\one\nline\"two");
+        assert_eq!(javascript.matches('\n').count(), 1);
+        assert!(javascript.contains("\\\""));
+        assert!(javascript.contains("\\\\"));
+        assert!(javascript.contains("\\n"));
+    }
+
+    #[test]
     fn runtime_bait_profile_customizes_surface_content_and_openapi_rewrite() {
         let path = write_bait_profile(promotion_profile_json());
         let loaded = load_bait_profile(&path).expect("bait profile should load");
@@ -3828,6 +3989,91 @@ mod tests {
     }
 
     #[test]
+    fn upstream_request_strips_hop_by_hop_and_connection_nominated_headers() {
+        let upstream = parse_upstream("http://127.0.0.1:9001").expect("upstream should parse");
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/docs".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![
+                HttpHeader {
+                    name: "Host".to_string(),
+                    value: "127.0.0.1:8080".to_string(),
+                },
+                HttpHeader {
+                    name: "Connection".to_string(),
+                    value: "keep-alive, X-Hop".to_string(),
+                },
+                HttpHeader {
+                    name: "X-Hop".to_string(),
+                    value: "remove-me".to_string(),
+                },
+                HttpHeader {
+                    name: "Proxy-Connection".to_string(),
+                    value: "keep-alive".to_string(),
+                },
+                HttpHeader {
+                    name: "Keep-Alive".to_string(),
+                    value: "timeout=5".to_string(),
+                },
+                HttpHeader {
+                    name: "TE".to_string(),
+                    value: "trailers".to_string(),
+                },
+                HttpHeader {
+                    name: "Trailer".to_string(),
+                    value: "Expires".to_string(),
+                },
+                HttpHeader {
+                    name: "Transfer-Encoding".to_string(),
+                    value: "gzip".to_string(),
+                },
+                HttpHeader {
+                    name: "Upgrade".to_string(),
+                    value: "websocket".to_string(),
+                },
+                HttpHeader {
+                    name: "X-End-To-End".to_string(),
+                    value: "keep-me".to_string(),
+                },
+            ],
+            body: Vec::new(),
+        };
+
+        let forwarded = String::from_utf8(request.to_upstream_bytes(&upstream).unwrap())
+            .expect("forwarded request should be utf8");
+
+        assert!(forwarded.contains("\r\nHost: 127.0.0.1:9001\r\n"));
+        assert!(forwarded.contains("\r\nConnection: close\r\n"));
+        assert!(forwarded.contains("\r\nX-End-To-End: keep-me\r\n"));
+        assert!(!forwarded.contains("\r\nProxy-Connection:"));
+        assert!(!forwarded.contains("\r\nKeep-Alive:"));
+        assert!(!forwarded.contains("\r\nTE:"));
+        assert!(!forwarded.contains("\r\nTrailer:"));
+        assert!(!forwarded.contains("\r\nTransfer-Encoding:"));
+        assert!(!forwarded.contains("\r\nUpgrade:"));
+        assert!(!forwarded.contains("\r\nX-Hop:"));
+    }
+
+    #[test]
+    fn upstream_request_emits_one_canonical_content_length() {
+        let upstream = parse_upstream("http://127.0.0.1:9001").expect("upstream should parse");
+        let mut request_bytes = &b"POST /api/v1/imports HTTP/1.1\r\nHost: proxy.local\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\ntest"[..];
+        let request = read_http_request(&mut request_bytes)
+            .expect("request should parse")
+            .expect("request should be present");
+
+        let forwarded = String::from_utf8(request.to_upstream_bytes(&upstream).unwrap())
+            .expect("forwarded request should be utf8");
+        let content_length_lines = forwarded
+            .lines()
+            .filter(|line| line.eq_ignore_ascii_case("content-length: 4"))
+            .count();
+
+        assert_eq!(content_length_lines, 1);
+    }
+
+    #[test]
     fn normalizes_absolute_form_request_targets() {
         assert_eq!(
             normalize_request_target("http://127.0.0.1:8080/openapi.json?x=1").unwrap(),
@@ -3846,6 +4092,17 @@ mod tests {
         let error = read_http_request(&mut request_bytes).expect_err("chunked should fail");
 
         assert!(error.to_string().contains("chunked"));
+    }
+
+    #[test]
+    fn rejects_conflicting_request_content_lengths() {
+        let mut request_bytes =
+            &b"POST /api/v1/imports HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\ntest"
+                [..];
+        let error =
+            read_http_request(&mut request_bytes).expect_err("conflicting lengths should fail");
+
+        assert!(error.to_string().contains("conflicting request"));
     }
 
     #[test]
@@ -4042,6 +4299,20 @@ mod tests {
         assert!(serialized.contains("\r\nConnection: close\r\n"));
         assert!(serialized.contains("\r\nSet-Cookie: eidolon_session=abc; Path=/\r\n"));
         assert!(serialized.ends_with("\r\n\r\nok"));
+    }
+
+    #[test]
+    fn surface_response_to_http_uses_non_ok_reason_for_unmapped_statuses() {
+        let method_not_allowed =
+            surface_response_to_http(SurfaceResponse::new(405, Vec::new(), "nope"));
+        let unknown = surface_response_to_http(SurfaceResponse::new(599, Vec::new(), "nope"));
+
+        assert!(String::from_utf8(method_not_allowed.to_http_bytes())
+            .unwrap()
+            .starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+        assert!(String::from_utf8(unknown.to_http_bytes())
+            .unwrap()
+            .starts_with("HTTP/1.1 599 Unknown Status\r\n"));
     }
 
     #[test]
