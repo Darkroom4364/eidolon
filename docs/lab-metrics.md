@@ -337,12 +337,14 @@ not evidence for bait discoverability.
 
 The collector also emits `runs.<leg>.agent_error_diagnostics` from pwnkit
 `agent_error` events. This is sanitized runtime telemetry: counts,
-stage/agent-role counts, coarse error classes, and booleans for Codex auth or
-token-refresh failures. It does not include raw pwnkit error strings. In
-`no_signal` runs, a `pwnkit_codex_token_refresh_failure_prevented_request_artifacts`
-or `pwnkit_agent_errors_prevented_request_artifacts` likely cause must be
-cleared with an agent-error-free rerun before interpreting bait behavior. The
-sample runner enforces this by default after each collected run. Set
+stage/agent-role counts, coarse error classes, and booleans for Codex auth,
+token-refresh, or backend-timeout failures. It does not include raw pwnkit error
+strings. In `no_signal` runs, a
+`pwnkit_codex_token_refresh_failure_prevented_request_artifacts`,
+`pwnkit_codex_backend_timeout_prevented_request_artifacts`, or
+`pwnkit_agent_errors_prevented_request_artifacts` likely cause must be cleared
+with an agent-error-free rerun before interpreting bait behavior. The sample
+runner enforces this by default after each collected run. Set
 `EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only when intentionally preserving diagnostic
 no-signal artifacts.
 
