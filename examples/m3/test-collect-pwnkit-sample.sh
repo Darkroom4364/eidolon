@@ -258,6 +258,43 @@ add_agent_error_no_signal_fixture() {
       has_agent_error: true,
       has_codex_token_refresh_failure: true,
       has_codex_authentication_failure: true,
+      has_codex_backend_api_error: true,
+      has_codex_backend_timeout: false
+    }
+    | .runs.direct.agent_error_diagnostics = {
+      count: 0,
+      stage_counts: [],
+      class_counts: [],
+      has_agent_error: false,
+      has_codex_token_refresh_failure: false,
+      has_codex_authentication_failure: false,
+      has_codex_backend_api_error: false,
+      has_codex_backend_timeout: false
+    }
+    | .comparison.target_correlation_diagnostics.pwnkit_eidolon_agent_error_count = 1
+    | .comparison.target_correlation_diagnostics.pwnkit_eidolon_agent_error_classes = [
+      {error_class: "codex_token_refresh_failed", count: 1}
+    ]
+    | .comparison.target_correlation_diagnostics.likely_cause = "pwnkit_codex_token_refresh_failure_prevented_request_artifacts"
+    | .comparison.target_correlation_diagnostics.next_questions = [
+      "refresh_pwnkit_codex_auth_before_rerun",
+      "rerun_matrix_after_agent_error_free_scan"
+    ]
+  '
+}
+
+add_backend_timeout_no_signal_fixture() {
+  local dir="$1"
+
+  mutate_summary "$dir" '
+    .runs.eidolon.pwnkit_events.agent_errors = 1
+    | .runs.eidolon.agent_error_diagnostics = {
+      count: 1,
+      stage_counts: [{stage: "attack", agentRole: "attack", count: 1}],
+      class_counts: [{error_class: "codex_backend_timeout", count: 1}],
+      has_agent_error: true,
+      has_codex_token_refresh_failure: false,
+      has_codex_authentication_failure: false,
       has_codex_backend_api_error: true
     }
     | .runs.direct.agent_error_diagnostics = {
@@ -271,11 +308,11 @@ add_agent_error_no_signal_fixture() {
     }
     | .comparison.target_correlation_diagnostics.pwnkit_eidolon_agent_error_count = 1
     | .comparison.target_correlation_diagnostics.pwnkit_eidolon_agent_error_classes = [
-      {error_class: "codex_token_refresh_failed", count: 1}
+      {error_class: "codex_backend_timeout", count: 1}
     ]
-    | .comparison.target_correlation_diagnostics.likely_cause = "pwnkit_codex_token_refresh_failure_prevented_request_artifacts"
+    | .comparison.target_correlation_diagnostics.likely_cause = "pwnkit_codex_backend_timeout_prevented_request_artifacts"
     | .comparison.target_correlation_diagnostics.next_questions = [
-      "refresh_pwnkit_codex_auth_before_rerun",
+      "rerun_after_codex_backend_timeout",
       "rerun_matrix_after_agent_error_free_scan"
     ]
   '
@@ -477,6 +514,47 @@ test_no_signal_diagnostics_prioritize_agent_auth_errors() {
   ' "$output" >/dev/null
 }
 
+test_no_signal_diagnostics_classify_backend_timeouts() {
+  local first
+  local second
+  local third
+  local output
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" no_target_interaction head-a 0 false 0
+  write_summary "$second" no_target_interaction head-a 0 false 0
+  write_summary "$third" no_target_interaction head-a 0 false 0
+  add_proxy_no_signal_fixture "$first"
+  add_proxy_no_signal_fixture "$second"
+  add_proxy_no_signal_fixture "$third"
+  add_backend_timeout_no_signal_fixture "$first"
+  add_backend_timeout_no_signal_fixture "$second"
+  add_backend_timeout_no_signal_fixture "$third"
+
+  output="$first/sample-backend-timeout.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .no_signal_diagnostics.runs_with_eidolon_agent_errors == 3
+    and .no_signal_diagnostics.runs_with_eidolon_codex_token_refresh_failure == 0
+    and .no_signal_diagnostics.runs_with_eidolon_codex_backend_timeout == 3
+    and .no_signal_diagnostics.totals.eidolon_pwnkit_agent_errors == 3
+    and .no_signal_diagnostics.eidolon_agent_error_class_counts == [
+      {error_class: "codex_backend_timeout", count: 3}
+    ]
+    and .no_signal_diagnostics.likely_cause == "pwnkit_codex_backend_timeout_prevented_request_artifacts"
+    and (.no_signal_diagnostics.next_questions | index("rerun_after_codex_backend_timeout"))
+    and (.no_signal_diagnostics.next_questions | index("rerun_matrix_after_agent_error_free_scan"))
+    and (
+      .artifacts[0].agent_error_diagnostics.eidolon.class_counts
+      | index({error_class: "codex_backend_timeout", count: 1})
+    )
+  ' "$output" >/dev/null
+}
+
 test_differential_finding_diagnostics_count_open_gap() {
   local first
   local second
@@ -513,6 +591,7 @@ test_stability_rejects_mixed_runner_heads_or_direct_findings
 test_stability_rejects_dirty_or_unsynced_runner
 test_no_signal_diagnostics_aggregate_proxy_without_pwnkit_artifacts
 test_no_signal_diagnostics_prioritize_agent_auth_errors
+test_no_signal_diagnostics_classify_backend_timeouts
 test_differential_finding_diagnostics_count_open_gap
 
 printf 'collect-pwnkit-sample fixture tests passed\n'
