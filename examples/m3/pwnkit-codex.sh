@@ -41,8 +41,10 @@ Environment:
                             Optional Codex auth JSON path. Defaults to
                             ~/.codex/auth.json. When PWNKIT_RUNTIME=codex and
                             PWNKIT_CHATGPT_* token env is unset, the runner
-                            passes tokens.refresh_token from this file only to
-                            the pwnkit subprocess.
+                            passes a fresh tokens.access_token from this file
+                            only to the pwnkit subprocess, falling back to
+                            tokens.refresh_token when no usable access token
+                            exists.
   EIDOLON_M3_PIN_SESSION    If true, pass one fixed eidolon_session cookie to
                             the Eidolon leg. Defaults to 0.
   EIDOLON_M3_SESSION_ID     Optional UUID for EIDOLON_M3_PIN_SESSION.
@@ -254,9 +256,15 @@ json_bool() {
 }
 
 resolve_pwnkit_codex_auth() {
+  local access_token
+  local access_token_expires_at
+  local account_id
+  local now_seconds
   local refresh_token
 
   PWNKIT_CODEX_AUTH_SOURCE="not_codex"
+  PWNKIT_CODEX_ACCESS_TOKEN=""
+  PWNKIT_CODEX_ACCOUNT_ID=""
   PWNKIT_CODEX_OAUTH_REFRESH_TOKEN=""
 
   if [[ "$PWNKIT_RUNTIME" != "codex" ]]; then
@@ -278,6 +286,30 @@ resolve_pwnkit_codex_auth() {
     return
   fi
 
+  access_token="$(
+    jq -er '
+      (.tokens.access_token // .access_token // empty)
+      | select(type == "string" and length > 0)
+    ' "$EIDOLON_M3_CODEX_AUTH_FILE" 2>/dev/null || true
+  )"
+  if [[ -n "$access_token" ]]; then
+    access_token_expires_at="$(access_token_expiry_seconds "$access_token" || true)"
+    now_seconds="$(date -u '+%s')"
+    if [[ "$access_token_expires_at" =~ ^[0-9]+$ ]] \
+      && (( access_token_expires_at > now_seconds + 300 )); then
+      account_id="$(
+        jq -er '
+          (.tokens.account_id // .account_id // empty)
+          | select(type == "string" and length > 0)
+        ' "$EIDOLON_M3_CODEX_AUTH_FILE" 2>/dev/null || true
+      )"
+      PWNKIT_CODEX_AUTH_SOURCE="codex_auth_file_access_token"
+      PWNKIT_CODEX_ACCESS_TOKEN="$access_token"
+      PWNKIT_CODEX_ACCOUNT_ID="$account_id"
+      return
+    fi
+  fi
+
   refresh_token="$(
     jq -er '
       (.tokens.refresh_token // .refresh_token // empty)
@@ -286,11 +318,35 @@ resolve_pwnkit_codex_auth() {
   )"
 
   if [[ -n "$refresh_token" ]]; then
-    PWNKIT_CODEX_AUTH_SOURCE="codex_auth_file"
+    PWNKIT_CODEX_AUTH_SOURCE="codex_auth_file_refresh_token"
     PWNKIT_CODEX_OAUTH_REFRESH_TOKEN="$refresh_token"
   else
     PWNKIT_CODEX_AUTH_SOURCE="unset"
   fi
+}
+
+access_token_expiry_seconds() {
+  local access_token="$1"
+
+  if ! command -v node >/dev/null 2>&1; then
+    return 1
+  fi
+
+  printf '%s' "$access_token" | node -e '
+    const fs = require("fs");
+    const token = fs.readFileSync(0, "utf8").trim();
+    const payload = token.split(".")[1];
+    if (!payload) process.exit(1);
+    try {
+      const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+      if (typeof claims.exp !== "number" || !Number.isFinite(claims.exp)) {
+        process.exit(1);
+      }
+      process.stdout.write(String(Math.floor(claims.exp)));
+    } catch {
+      process.exit(1);
+    }
+  '
 }
 
 require_jq() {
@@ -482,7 +538,12 @@ write_runner_metadata() {
         },
         codex_auth: {
           source: $pwnkit_codex_auth_source,
-          auto_loaded_refresh_token: ($pwnkit_codex_auth_source == "codex_auth_file")
+          auto_loaded_access_token: (
+            $pwnkit_codex_auth_source == "codex_auth_file_access_token"
+          ),
+          auto_loaded_refresh_token: (
+            $pwnkit_codex_auth_source == "codex_auth_file_refresh_token"
+          )
         },
         stale_dist_guard_bypassed: $allow_stale_dist,
         scopes: {
@@ -614,11 +675,19 @@ run_scan() {
   local -a pwnkit_env=(
     PWNKIT_NO_UPDATE_CHECK=1
   )
-  if [[ "$PWNKIT_CODEX_AUTH_SOURCE" == "codex_auth_file" ]]; then
-    pwnkit_env+=(
-      PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN="$PWNKIT_CODEX_OAUTH_REFRESH_TOKEN"
-    )
-  fi
+  case "$PWNKIT_CODEX_AUTH_SOURCE" in
+    codex_auth_file_access_token)
+      pwnkit_env+=(PWNKIT_CHATGPT_ACCESS_TOKEN="$PWNKIT_CODEX_ACCESS_TOKEN")
+      if [[ -n "$PWNKIT_CODEX_ACCOUNT_ID" ]]; then
+        pwnkit_env+=(PWNKIT_CHATGPT_ACCOUNT_ID="$PWNKIT_CODEX_ACCOUNT_ID")
+      fi
+      ;;
+    codex_auth_file_refresh_token)
+      pwnkit_env+=(
+        PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN="$PWNKIT_CODEX_OAUTH_REFRESH_TOKEN"
+      )
+      ;;
+  esac
   if [[ -n "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" ]]; then
     pwnkit_env+=(PWNKIT_FEATURE_CODEX_LIVE_TARGETS="$PWNKIT_FEATURE_CODEX_LIVE_TARGETS")
   fi
@@ -681,6 +750,8 @@ main() {
   PWNKIT_COMMAND_SOURCE="unknown"
   PWNKIT_ENTRY_PATH=""
   PWNKIT_CODEX_AUTH_SOURCE="not_codex"
+  PWNKIT_CODEX_ACCESS_TOKEN=""
+  PWNKIT_CODEX_ACCOUNT_ID=""
   PWNKIT_CODEX_OAUTH_REFRESH_TOKEN=""
   resolve_pwnkit_command
   PWNKIT_EIDOLON_SCOPE_FILE="$(write_pwnkit_scope_file "eidolon" "$PROXY_URL")"

@@ -255,11 +255,13 @@ Current pwnkit main routes `--runtime codex` through the direct ChatGPT Codex
 provider. The runner no longer sets the removed legacy Codex-live feature flag by
 default. For live Codex scans, pwnkit now requires ChatGPT Codex provider auth:
 set `PWNKIT_CHATGPT_ACCESS_TOKEN` or `PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN`, or
-let `examples/m3/pwnkit-codex.sh` load `tokens.refresh_token` from
-`~/.codex/auth.json` after `codex login`. The runner passes an auto-loaded
-refresh token only to the pwnkit subprocess and records only the coarse auth
-source in metadata. When running from a pwnkit source checkout, rebuild after
-pulling upstream changes:
+let `examples/m3/pwnkit-codex.sh` load auth from `~/.codex/auth.json` after
+`codex login`. The runner prefers a fresh `tokens.access_token` from the auth
+file and falls back to `tokens.refresh_token` only when no usable access token
+exists. Auto-loaded tokens are passed only to the pwnkit subprocess; metadata
+records only coarse auth source and token-kind booleans, never token values.
+When running from a pwnkit source checkout, rebuild after pulling upstream
+changes:
 
 ```sh
 (cd ~/Projects/pwnkit && pnpm run build)
