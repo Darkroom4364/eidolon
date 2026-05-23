@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fmt, fs,
     io::{self, Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, Mutex},
@@ -45,6 +45,9 @@ const DEFAULT_HTTP_PORT: u16 = 80;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BAIT_EXPOSURES: usize = 4096;
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const SAFE_HEADER_NAMES: &[&str] = &[
     "accept",
     "authorization",
@@ -593,6 +596,45 @@ fn connect_addr(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
+}
+
+fn configure_stream_timeouts(
+    stream: &TcpStream,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    stream.set_read_timeout(Some(read_timeout))?;
+    stream.set_write_timeout(Some(write_timeout))?;
+    Ok(())
+}
+
+fn configure_client_stream(stream: &TcpStream) -> io::Result<()> {
+    configure_stream_timeouts(stream, CLIENT_IO_TIMEOUT, CLIENT_IO_TIMEOUT)
+}
+
+fn configure_upstream_stream(stream: &TcpStream) -> io::Result<()> {
+    configure_stream_timeouts(stream, UPSTREAM_IO_TIMEOUT, UPSTREAM_IO_TIMEOUT)
+}
+
+fn connect_upstream(upstream: &UpstreamTarget) -> io::Result<TcpStream> {
+    let mut last_error = None;
+
+    for addr in upstream.connect_addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, UPSTREAM_CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                configure_upstream_stream(&stream)?;
+                return Ok(stream);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        invalid_data(format!(
+            "upstream target `{}` resolved to no socket addresses",
+            upstream.connect_addr
+        ))
+    }))
 }
 
 fn run_proxy(config: ProxyConfig) -> io::Result<()> {
@@ -1301,6 +1343,8 @@ fn is_success_status(status: u16) -> bool {
 }
 
 fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io::Result<()> {
+    configure_client_stream(&client_stream)?;
+
     let client_peer = client_stream.peer_addr().ok().map(|addr| addr.to_string());
     let Some(request) = read_http_request(&mut client_stream)? else {
         write_debug(
@@ -1623,7 +1667,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "request_bytes": upstream_request.len(),
         }),
     )?;
-    let mut upstream_stream = TcpStream::connect(&runtime.upstream.connect_addr)?;
+    let mut upstream_stream = connect_upstream(&runtime.upstream)?;
     upstream_stream.write_all(&upstream_request)?;
     upstream_stream.flush()?;
 
@@ -3597,6 +3641,38 @@ mod tests {
         assert_eq!(config.upstream.to_string(), "http://127.0.0.1");
         assert_eq!(config.upstream.authority, "127.0.0.1");
         assert_eq!(config.upstream.connect_addr, "127.0.0.1:80");
+    }
+
+    #[test]
+    fn stream_timeout_helpers_set_client_and_upstream_deadlines() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let client = TcpStream::connect(addr).expect("client should connect");
+        let (server, _) = listener.accept().expect("listener should accept");
+
+        configure_client_stream(&server).expect("client stream deadlines should set");
+        configure_upstream_stream(&client).expect("upstream stream deadlines should set");
+
+        assert_eq!(server.read_timeout().unwrap(), Some(CLIENT_IO_TIMEOUT));
+        assert_eq!(server.write_timeout().unwrap(), Some(CLIENT_IO_TIMEOUT));
+        assert_eq!(client.read_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
+        assert_eq!(client.write_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
+    }
+
+    #[test]
+    fn connect_upstream_returns_stream_with_deadlines() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("upstream should bind");
+        let addr = listener.local_addr().expect("upstream should have address");
+        let upstream =
+            parse_upstream(&format!("http://{addr}")).expect("upstream target should parse");
+        let handle = thread::spawn(move || listener.accept().expect("upstream should accept").0);
+
+        let stream = connect_upstream(&upstream).expect("upstream should connect");
+        let accepted = handle.join().expect("upstream accept should join");
+
+        assert_eq!(stream.read_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
+        assert_eq!(stream.write_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
+        drop(accepted);
     }
 
     #[test]
