@@ -56,6 +56,14 @@ controlled-reality chain, and if so, why is that chain still not promoted to a
 pwnkit finding?
 ```
 
+A follow-up one-run diagnostic after adding browser hardening headers to the
+benign demo target answered the first half for pwnkit `v0.12.0` /
+`53f64d479d6c3b256a99f9adb2ae22896ea4c3cc`: the direct leg returned to
+0 findings, both legs were agent-error-free, the Eidolon leg preserved the
+pinned session, and the correlated chain still reached controlled reality with
+0 Eidolon findings. Treat this as a local diagnostic, not archived evidence.
+The next archive-worthy step is a fresh 3-run strict sample on current pwnkit.
+
 ## Pre-Run Checklist
 
 Before collecting a new sample:
