@@ -16,6 +16,13 @@ impl FileEventLogWriter {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
 
+        #[cfg(unix)]
+        {
+            use std::{fs, os::unix::fs::PermissionsExt};
+
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+
         Ok(Self::new(BufWriter::new(file)))
     }
 }
@@ -49,7 +56,25 @@ mod tests {
     };
     use serde_json::Value;
 
-    use super::EventLogWriter;
+    use super::{EventLogWriter, FileEventLogWriter};
+
+    #[cfg(unix)]
+    fn unique_temp_path(label: &str) -> std::path::PathBuf {
+        use std::{
+            env,
+            time::{SystemTime, UNIX_EPOCH},
+        };
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+
+        env::temp_dir().join(format!(
+            "eidolon-event-log-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
 
     fn request_event(method: &str, path: &str) -> Event {
         Event::new(
@@ -139,6 +164,25 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(error.to_string(), "sink closed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_event_log_open_sets_owner_only_permissions() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        let path = unique_temp_path("owner-only.jsonl");
+        let _writer = FileEventLogWriter::open(&path).expect("event log should open");
+
+        let mode = fs::metadata(&path)
+            .expect("event log metadata should read")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600);
+
+        fs::remove_file(path).expect("event log should remove");
     }
 
     struct FailingSink;
