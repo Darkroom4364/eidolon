@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fmt, fs,
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -16,7 +16,7 @@ use std::{
 use eidolon_bait::{docs_for_bait, BaitRegistry};
 use eidolon_core::{
     Bait, BaitClass, BaitId, Event, EventKind, EventSource, ExposureId, PolicyState,
-    RoutingDecision, SafeHeaderObservation, SessionId,
+    RoutingDecision, SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
 };
 use eidolon_proxy::{
     controlled_reality::{
@@ -716,6 +716,8 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         Some(path) => Some(Arc::new(Mutex::new(FileDebugLogWriter::open(path)?))),
         None => None,
     };
+    let bait_exposures = BaitExposureStore::from_event_log(&config.event_log_path)?;
+    let restored_bait_exposure_count = bait_exposures.len();
     let runtime = ProxyRuntime {
         upstream: config.upstream,
         event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
@@ -733,7 +735,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
             bait_content,
         )),
         bait_registry,
-        bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+        bait_exposures: Arc::new(Mutex::new(bait_exposures)),
     };
     write_debug(
         &runtime,
@@ -748,6 +750,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 "retry_after_seconds": runtime.controlled_reality_config.retry_after_seconds,
             },
             "bait_profile": bait_profile_debug,
+            "restored_bait_exposure_count": restored_bait_exposure_count,
             "debug_log_visibility": "server_side_only",
         }),
     )?;
@@ -796,6 +799,68 @@ struct BaitExposureStore {
 }
 
 impl BaitExposureStore {
+    fn from_event_log(path: &Path) -> io::Result<Self> {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+
+        Self::from_event_log_reader(BufReader::new(file))
+    }
+
+    fn from_event_log_reader(reader: impl BufRead) -> io::Result<Self> {
+        let mut store = Self::default();
+
+        for (line_index, line) in reader.lines().enumerate() {
+            let line_number = line_index + 1;
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let value: Value = serde_json::from_str(&line).map_err(|error| {
+                invalid_data(format!(
+                    "could not rebuild bait exposure store from event log line {line_number}: {error}"
+                ))
+            })?;
+            let schema_version = value
+                .get("schema_version")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    invalid_data(format!(
+                        "could not rebuild bait exposure store from event log line {line_number}: missing schema_version"
+                    ))
+                })?;
+            if schema_version != u64::from(EVENT_SCHEMA_VERSION) {
+                return Err(invalid_data(format!(
+                    "could not rebuild bait exposure store from event log line {line_number}: unsupported schema_version {schema_version}; expected {EVENT_SCHEMA_VERSION}"
+                )));
+            }
+
+            let event: Event = serde_json::from_value(value).map_err(|error| {
+                invalid_data(format!(
+                    "could not rebuild bait exposure store from event log line {line_number}: {error}"
+                ))
+            })?;
+
+            if let EventKind::BaitExposed {
+                bait_id,
+                exposure_id,
+                ..
+            } = event.kind
+            {
+                store.record_exposure(event.session_id, bait_id, exposure_id);
+            }
+        }
+
+        Ok(store)
+    }
+
+    fn len(&self) -> usize {
+        self.exposures.len()
+    }
+
     fn record_exposure(&mut self, session_id: SessionId, bait_id: BaitId, exposure_id: ExposureId) {
         let key = (session_id, bait_id);
         if self.exposures.insert(key.clone(), exposure_id).is_some() {
@@ -3160,7 +3225,7 @@ Example:
 mod tests {
     use super::*;
     use std::{
-        io::{Read, Write},
+        io::{Cursor, Read, Write},
         net::{Shutdown, TcpListener},
         thread::JoinHandle,
         time::{SystemTime, UNIX_EPOCH},
@@ -3261,6 +3326,20 @@ mod tests {
         event_log_path: &Path,
         intervention_control_path: PathBuf,
     ) -> ProxyRuntime {
+        test_runtime_with_m1_controller_and_bait_exposures(
+            upstream,
+            event_log_path,
+            intervention_control_path,
+            BaitExposureStore::default(),
+        )
+    }
+
+    fn test_runtime_with_m1_controller_and_bait_exposures(
+        upstream: UpstreamTarget,
+        event_log_path: &Path,
+        intervention_control_path: PathBuf,
+        bait_exposures: BaitExposureStore,
+    ) -> ProxyRuntime {
         let bait_registry = Arc::new(BaitRegistry::m3_catalog());
         ProxyRuntime {
             upstream,
@@ -3277,7 +3356,7 @@ mod tests {
                 BaitContentOverrides::default(),
             )),
             bait_registry,
-            bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+            bait_exposures: Arc::new(Mutex::new(bait_exposures)),
         }
     }
 
@@ -4462,6 +4541,123 @@ mod tests {
     }
 
     #[test]
+    fn bait_exposure_store_starts_empty_when_event_log_is_missing() {
+        let path = unique_temp_path("missing-exposure-events.jsonl");
+
+        let store = BaitExposureStore::from_event_log(&path).expect("missing log should rebuild");
+
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn bait_exposure_store_rebuilds_latest_exposures_from_event_log() {
+        let session_id = SessionId::new();
+        let bait_id = BaitId("replay-bait".to_string());
+        let other_bait_id = BaitId("other-bait".to_string());
+        let old_exposure_id = ExposureId("old-exposure".to_string());
+        let new_exposure_id = ExposureId("new-exposure".to_string());
+        let other_exposure_id = ExposureId("other-exposure".to_string());
+        let events = [
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs".to_string(),
+                    safe_headers: Vec::new(),
+                    routing_decision: RoutingDecision::ProtectedUpstream,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id: bait_id.clone(),
+                    exposure_id: old_exposure_id,
+                    surface: "/docs".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id: other_bait_id.clone(),
+                    exposure_id: other_exposure_id.clone(),
+                    surface: "/openapi.json".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id: bait_id.clone(),
+                    exposure_id: new_exposure_id.clone(),
+                    surface: "/docs".to_string(),
+                },
+            ),
+        ];
+        let jsonl = events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("event should serialize"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let store = BaitExposureStore::from_event_log_reader(Cursor::new(format!("{jsonl}\n")))
+            .expect("event log should rebuild");
+
+        assert_eq!(store.len(), 2);
+        assert_eq!(
+            store.exposure_for_action(session_id, &bait_id),
+            Some(new_exposure_id)
+        );
+        assert_eq!(
+            store.exposure_for_action(session_id, &other_bait_id),
+            Some(other_exposure_id)
+        );
+    }
+
+    #[test]
+    fn bait_exposure_store_rebuild_rejects_malformed_event_log_line() {
+        let error = BaitExposureStore::from_event_log_reader(Cursor::new("{not json}\n"))
+            .expect_err("malformed log should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("could not rebuild bait exposure store from event log line 1"));
+    }
+
+    #[test]
+    fn bait_exposure_store_rebuild_rejects_unsupported_event_schema() {
+        let mut value = serde_json::to_value(Event::new(
+            SessionId::new(),
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId("schema-bait".to_string()),
+                exposure_id: ExposureId("schema-exposure".to_string()),
+                surface: "/docs".to_string(),
+            },
+        ))
+        .expect("event should serialize");
+        value["schema_version"] = Value::from(u64::from(EVENT_SCHEMA_VERSION) + 1);
+        let line = serde_json::to_string(&value).expect("event value should serialize");
+
+        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!("{line}\n")))
+            .expect_err("unsupported schema should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains(&format!(
+            "unsupported schema_version {}; expected {EVENT_SCHEMA_VERSION}",
+            EVENT_SCHEMA_VERSION + 1
+        )));
+    }
+
+    #[test]
     fn serializes_http_response_after_header_update() {
         let mut response = HttpResponse {
             version: "HTTP/1.1".to_string(),
@@ -4970,6 +5166,65 @@ mod tests {
         assert_eq!(
             events[action_index + 1]["kind"]["type"].as_str(),
             Some("policy_changed")
+        );
+    }
+
+    #[test]
+    fn runtime_correlates_bait_action_after_exposure_store_rebuild() {
+        let event_log_path = unique_temp_path("rehydrated-bait-action-events.jsonl");
+        let session_id = SessionId::new();
+        let cookie = format!("eidolon_session={}", session_id.0);
+        let bait = BaitRegistry::m3_catalog()
+            .bait_for_class(BaitClass::Docs)
+            .expect("docs bait should exist")
+            .clone();
+        let restored_exposure_id = ExposureId("restored-exposure".to_string());
+
+        {
+            let mut event_log =
+                FileEventLogWriter::open(&event_log_path).expect("event log should open");
+            event_log
+                .write_event(&Event::new(
+                    session_id,
+                    EventSource::SurfaceController,
+                    PolicyState::Observe,
+                    EventKind::BaitExposed {
+                        bait_id: bait.id.clone(),
+                        exposure_id: restored_exposure_id.clone(),
+                        surface: bait.surface.clone(),
+                    },
+                ))
+                .expect("bait exposure event should write");
+        }
+
+        let restored_exposures = BaitExposureStore::from_event_log(&event_log_path)
+            .expect("bait exposure store should rebuild");
+        let runtime = test_runtime_with_m1_controller_and_bait_exposures(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("rehydrated-bait-action-control.txt"),
+            restored_exposures,
+        );
+        let header_name = bait.expected_action.header_name.as_deref().unwrap();
+        let header_value = bait.expected_action.header_value.as_deref().unwrap();
+
+        let action_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                &bait.expected_action.path,
+                &cookie,
+                &[(header_name, header_value)],
+            ),
+        ));
+
+        assert_eq!(action_response.status, 202);
+        let action = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(action["session_id"], session_id.0.to_string());
+        assert_eq!(action["kind"]["bait_id"], bait.id.0);
+        assert_eq!(action["kind"]["exposure_id"], restored_exposure_id.0);
+        assert_eq!(
+            first_event_of_type(&event_log_path, "policy_changed")["kind"]["to"],
+            "controlled_reality"
         );
     }
 
