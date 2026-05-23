@@ -5,7 +5,10 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -45,6 +48,7 @@ const DEFAULT_HTTP_PORT: u16 = 80;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BAIT_EXPOSURES: usize = 4096;
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -637,6 +641,62 @@ fn connect_upstream(upstream: &UpstreamTarget) -> io::Result<TcpStream> {
     }))
 }
 
+#[derive(Clone)]
+struct ConnectionLimiter {
+    active: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+impl ConnectionLimiter {
+    fn new(limit: usize) -> Self {
+        assert!(limit > 0, "connection limit must be positive");
+
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    fn try_acquire(&self) -> Option<ConnectionPermit> {
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active >= self.limit {
+                return None;
+            }
+
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ConnectionPermit {
+                        active: Arc::clone(&self.active),
+                    });
+                }
+                Err(current) => active = current,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn active_for_test(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+struct ConnectionPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "connection permit underflow");
+    }
+}
+
 fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     let listener = TcpListener::bind(config.listen_addr)?;
     println!(
@@ -692,15 +752,21 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         }),
     )?;
 
+    let connection_limiter = ConnectionLimiter::new(MAX_CONCURRENT_CONNECTIONS);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let runtime = runtime.clone();
-                thread::spawn(move || {
-                    if let Err(error) = handle_connection(stream, &runtime) {
-                        eprintln!("proxy connection error: {error}");
-                    }
-                });
+                if let Some(permit) = connection_limiter.try_acquire() {
+                    let runtime = runtime.clone();
+                    thread::spawn(move || {
+                        let _permit = permit;
+                        if let Err(error) = handle_connection(stream, &runtime) {
+                            eprintln!("proxy connection error: {error}");
+                        }
+                    });
+                } else {
+                    eprintln!("proxy connection rejected: concurrent connection limit reached");
+                }
             }
             Err(error) => eprintln!("proxy accept error: {error}"),
         }
@@ -3673,6 +3739,49 @@ mod tests {
         assert_eq!(stream.read_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
         assert_eq!(stream.write_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
         drop(accepted);
+    }
+
+    #[test]
+    fn connection_limiter_allows_exact_capacity_and_releases_on_drop() {
+        let limiter = ConnectionLimiter::new(2);
+        let first = limiter.try_acquire().expect("first permit should acquire");
+        let second = limiter.try_acquire().expect("second permit should acquire");
+
+        assert_eq!(limiter.active_for_test(), 2);
+        assert!(limiter.try_acquire().is_none());
+
+        drop(first);
+
+        let third = limiter
+            .try_acquire()
+            .expect("capacity should return after drop");
+        assert_eq!(limiter.active_for_test(), 2);
+
+        drop(second);
+        drop(third);
+        assert_eq!(limiter.active_for_test(), 0);
+    }
+
+    #[test]
+    fn connection_limiter_releases_when_worker_panics() {
+        let limiter = ConnectionLimiter::new(1);
+        let worker_limiter = limiter.clone();
+        let handle = thread::spawn(move || {
+            let _permit = worker_limiter
+                .try_acquire()
+                .expect("worker permit should acquire");
+            panic!("simulated worker panic");
+        });
+
+        assert!(handle.join().is_err());
+        assert_eq!(limiter.active_for_test(), 0);
+        assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "connection limit must be positive")]
+    fn connection_limiter_rejects_zero_limit() {
+        let _ = ConnectionLimiter::new(0);
     }
 
     #[test]
