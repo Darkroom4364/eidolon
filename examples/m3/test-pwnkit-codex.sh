@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RUNNER="$SCRIPT_DIR/pwnkit-codex.sh"
+EIDOLON_M3_TEST_EMPTY_AUTH="$(mktemp "${TMPDIR:-/tmp}/eidolon-m3-empty-codex-auth.XXXXXX")"
+export EIDOLON_M3_CODEX_AUTH_FILE="$EIDOLON_M3_TEST_EMPTY_AUTH"
 
 new_temp_dir() {
   mktemp -d "${TMPDIR:-/tmp}/eidolon-m3-pwnkit-runner-test.XXXXXX"
@@ -131,9 +133,51 @@ test_preflight_writes_metadata_and_scopes_without_scan() {
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
 }
 
+test_auto_loads_codex_refresh_token_from_auth_file_without_recording_secret() {
+  local repo
+  local artifact
+  local auth_file
+  repo="$(new_temp_dir)"
+  artifact="$(new_temp_dir)"
+  auth_file="$artifact/codex-auth.json"
+  init_fake_pwnkit_checkout "$repo"
+
+  cat > "$repo/dist/pwnkit.js" <<'JS'
+#!/usr/bin/env node
+if (process.env.PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN !== "fixture-refresh-token") {
+  console.error("missing pwnkit refresh token");
+  process.exit(7);
+}
+console.log(JSON.stringify({ findings: [] }));
+JS
+  chmod +x "$repo/dist/pwnkit.js"
+  git -C "$repo" add dist/pwnkit.js
+  GIT_AUTHOR_DATE="2026-01-03T00:00:00Z" \
+    GIT_COMMITTER_DATE="2026-01-03T00:00:00Z" \
+    git -C "$repo" commit -q -m "require codex auth env"
+  git -C "$repo" update-ref refs/remotes/origin/main HEAD
+  touch "$repo/dist/pwnkit.js"
+
+  printf '{"tokens":{"refresh_token":"fixture-refresh-token"}}\n' > "$auth_file"
+
+  EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    EIDOLON_M3_CODEX_AUTH_FILE="$auth_file" \
+    PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
+    "$RUNNER" direct "$artifact" >/dev/null
+
+  jq -e '
+    .pwnkit.codex_auth.source == "codex_auth_file"
+    and .pwnkit.codex_auth.auto_loaded_refresh_token == true
+  ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-runner-metadata.json"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.json"
+}
+
 test_source_checkout_metadata_records_version_and_origin_sync
 test_source_checkout_metadata_records_origin_drift
 test_source_checkout_metadata_records_dirty_worktree
 test_preflight_writes_metadata_and_scopes_without_scan
+test_auto_loads_codex_refresh_token_from_auth_file_without_recording_secret
 
 printf 'pwnkit-codex runner fixture tests passed\n'
