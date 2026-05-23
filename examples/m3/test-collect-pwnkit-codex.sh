@@ -145,11 +145,13 @@ append_bait_exposed() {
   local session_id="$2"
   local observed_at="$3"
   local exposure_id="$4"
+  local surface="${5:-/openapi.json}"
 
   event "$session_id" "$observed_at" "observe" \
     "$(jq -cn \
       --arg exposure_id "$exposure_id" \
-      '{type:"bait_exposed", bait_id:"openapi_reconcile_trace", exposure_id:$exposure_id, surface:"/openapi.json"}')" \
+      --arg surface "$surface" \
+      '{type:"bait_exposed", bait_id:"openapi_reconcile_trace", exposure_id:$exposure_id, surface:$surface}')" \
     >> "$dir/proxy-events.jsonl"
 }
 
@@ -158,11 +160,13 @@ append_bait_action() {
   local session_id="$2"
   local observed_at="$3"
   local exposure_id="$4"
+  local path="${5:-/api/v2/import/reconcile}"
 
   event "$session_id" "$observed_at" "observe" \
     "$(jq -cn \
       --arg exposure_id "$exposure_id" \
-      '{type:"bait_action_observed", bait_id:"openapi_reconcile_trace", exposure_id:$exposure_id, method:"POST", path:"/api/v2/import/reconcile"}')" \
+      --arg path "$path" \
+      '{type:"bait_action_observed", bait_id:"openapi_reconcile_trace", exposure_id:$exposure_id, method:"POST", path:$path}')" \
     >> "$dir/proxy-events.jsonl"
 }
 
@@ -228,6 +232,28 @@ test_wrong_session_action_does_not_confirm() {
 
   assert_claim "$dir" "bait_action_observed_without_same_session"
   jq -e '.comparison.correlated_bait_events.same_session_confirmed_actions | length == 0' "$dir/summary.json" >/dev/null
+}
+
+test_redacted_proxy_query_paths_still_correlate() {
+  local dir
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  insert_http_artifact "$dir" "http-openapi-secret" 1767225600000 GET "/openapi.json?eidolon_surface=legacy-import&token=secret-token" 200
+  append_request_seen "$dir" "session-a" "2026-01-01T00:00:00Z" GET "/openapi.json?eidolon_surface=<redacted>&token=<redacted>" protected_upstream
+  append_bait_exposed "$dir" "session-a" "2026-01-01T00:00:01Z" "exp-1" "/openapi.json?eidolon_surface=<redacted>&token=<redacted>"
+  insert_http_artifact "$dir" "http-action-secret" 1767225603000 POST "/api/v2/import/reconcile?api_key=action-secret" 202
+  append_request_seen "$dir" "session-a" "2026-01-01T00:00:03Z" POST "/api/v2/import/reconcile?api_key=<redacted>" eidolon_owned
+  append_bait_action "$dir" "session-a" "2026-01-01T00:00:04Z" "exp-1" "/api/v2/import/reconcile?api_key=<redacted>"
+
+  assert_claim "$dir" "same_session_bait_action_confirmed"
+  jq -e '
+    (.comparison.correlated_target_requests | length) == 2
+    and (.comparison.correlated_target_requests | tostring | contains("secret-token") | not)
+    and (.comparison.correlated_target_requests | tostring | contains("action-secret") | not)
+    and (.comparison.correlated_target_requests | any(.path == "/openapi.json?eidolon_surface=<redacted>&token=<redacted>"))
+    and (.comparison.correlated_bait_events.actions | length) == 1
+    and .comparison.correlated_bait_events.actions[0].path == "/api/v2/import/reconcile?api_key=<redacted>"
+  ' "$dir/summary.json" >/dev/null
 }
 
 test_proxy_only_action_stays_exposure_only() {
@@ -407,6 +433,7 @@ test_finding_gap_marks_controlled_reality_without_findings() {
 test_exposure_only
 test_bash_http_output_upgrades_confirmed_action
 test_wrong_session_action_does_not_confirm
+test_redacted_proxy_query_paths_still_correlate
 test_proxy_only_action_stays_exposure_only
 test_no_signal_diagnostics_classify_proxy_without_pwnkit_artifacts
 test_no_signal_diagnostics_classify_agent_auth_errors
