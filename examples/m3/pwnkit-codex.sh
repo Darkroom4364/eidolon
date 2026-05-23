@@ -677,12 +677,14 @@ run_scan() {
   )
   case "$PWNKIT_CODEX_AUTH_SOURCE" in
     codex_auth_file_access_token)
+      pwnkit_env=(-u PWNKIT_CHATGPT_ACCOUNT_ID "${pwnkit_env[@]}")
       pwnkit_env+=(PWNKIT_CHATGPT_ACCESS_TOKEN="$PWNKIT_CODEX_ACCESS_TOKEN")
       if [[ -n "$PWNKIT_CODEX_ACCOUNT_ID" ]]; then
         pwnkit_env+=(PWNKIT_CHATGPT_ACCOUNT_ID="$PWNKIT_CODEX_ACCOUNT_ID")
       fi
       ;;
     codex_auth_file_refresh_token)
+      pwnkit_env=(-u PWNKIT_CHATGPT_ACCOUNT_ID "${pwnkit_env[@]}")
       pwnkit_env+=(
         PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN="$PWNKIT_CODEX_OAUTH_REFRESH_TOKEN"
       )

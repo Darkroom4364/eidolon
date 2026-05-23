@@ -190,10 +190,14 @@ JS
       account_id: $account_id
     }}' > "$auth_file"
 
-  EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+  env \
+    -u PWNKIT_CHATGPT_ACCESS_TOKEN \
+    -u PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
     EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
     EIDOLON_M3_CODEX_AUTH_FILE="$auth_file" \
     EXPECTED_ACCESS_TOKEN="$access_token" \
+    PWNKIT_CHATGPT_ACCOUNT_ID=stale-account-id \
     PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
     "$RUNNER" direct "$artifact" >/dev/null
 
@@ -204,10 +208,20 @@ JS
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
   ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-runner-metadata.json"
   ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.json"
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.stderr.log"
   ! rg -q 'fixture-account-id' "$artifact/pwnkit-runner-metadata.json"
   ! rg -q 'fixture-account-id' "$artifact/pwnkit-direct.json"
+  ! rg -q 'fixture-account-id' "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q 'fixture-account-id' "$artifact/pwnkit-direct.stderr.log"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-runner-metadata.json"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.json"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.stderr.log"
   ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-runner-metadata.json"
   ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.json"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.stderr.log"
 }
 
 test_auto_loads_codex_refresh_token_from_auth_file_without_usable_access_token() {
@@ -231,6 +245,10 @@ if (process.env.PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN !== "fixture-refresh-token") 
   console.error("missing pwnkit refresh token");
   process.exit(7);
 }
+if (Object.prototype.hasOwnProperty.call(process.env, "PWNKIT_CHATGPT_ACCOUNT_ID")) {
+  console.error("stale account id should not be passed with refresh fallback");
+  process.exit(7);
+}
 console.log(JSON.stringify({ findings: [] }));
 JS
   chmod +x "$repo/dist/pwnkit.js"
@@ -249,9 +267,13 @@ JS
       refresh_token: $refresh_token
     }}' > "$auth_file"
 
-  EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+  env \
+    -u PWNKIT_CHATGPT_ACCESS_TOKEN \
+    -u PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
     EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
     EIDOLON_M3_CODEX_AUTH_FILE="$auth_file" \
+    PWNKIT_CHATGPT_ACCOUNT_ID=stale-account-id \
     PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
     "$RUNNER" direct "$artifact" >/dev/null
 
@@ -262,8 +284,16 @@ JS
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
   ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-runner-metadata.json"
   ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.json"
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q --fixed-strings "$access_token" "$artifact/pwnkit-direct.stderr.log"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-runner-metadata.json"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.json"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q 'stale-account-id' "$artifact/pwnkit-direct.stderr.log"
   ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-runner-metadata.json"
   ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.json"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.stdout.log"
+  ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.stderr.log"
 }
 
 test_source_checkout_metadata_records_version_and_origin_sync
