@@ -59,8 +59,8 @@ jobs:
             examples/m3/bait-promotion-variants.json \
             examples/m3/bait-profiles/*.json
 
-      - name: Check M3 shell syntax
-        run: bash -n examples/m3/*.sh
+      - name: Check example shell syntax
+        run: bash -n examples/lib/*.sh examples/m3/*.sh examples/baselines/*.sh examples/metrics/*.sh
 
       - name: Run M3 fixture tests
         run: |
@@ -70,6 +70,7 @@ jobs:
           examples/m3/test-check-pwnkit-sample-health.sh
           examples/m3/test-check-pwnkit-promotion-matrix-health.sh
           examples/m3/test-check-pwnkit-runner-freshness.sh
+          examples/m3/test-shell-harness-safety.sh
           examples/m3/test-pwnkit-codex.sh
           examples/m3/test-collect-pwnkit-codex.sh
           examples/m3/test-collect-pwnkit-sample.sh

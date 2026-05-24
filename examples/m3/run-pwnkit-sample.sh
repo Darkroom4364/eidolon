@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
+source "$SCRIPT_DIR/../lib/local-lab.sh"
 
 RUN_COUNT="${1:-${EIDOLON_M3_SAMPLE_RUNS:-3}}"
 SAMPLE_DIR="${2:-${EIDOLON_M3_SAMPLE_DIR:-/tmp/eidolon-m3-pwnkit-sample-$(date +%Y%m%d-%H%M%S)}}"
@@ -84,77 +85,6 @@ require_positive_integer() {
   if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
     fail "$name must be a positive integer, got: $value"
   fi
-}
-
-url_authority() {
-  local name="$1"
-  local url="$2"
-  local rest
-
-  if [[ "$url" != http://* ]]; then
-    fail "$name must be an http loopback URL, got: $url"
-  fi
-
-  rest="${url#http://}"
-  if [[ "$rest" == */* || "$rest" == *\?* || "$rest" == *#* ]]; then
-    fail "$name must not include a path, query, or fragment, got: $url"
-  fi
-
-  printf '%s' "$rest"
-}
-
-require_loopback_url() {
-  local name="$1"
-  local url="$2"
-  local authority
-  local host
-
-  authority="$(url_authority "$name" "$url")"
-  if [[ "$authority" == \[*\]* ]]; then
-    host="${authority%%]*}"
-    host="${host#[}"
-  else
-    host="${authority%%:*}"
-  fi
-
-  if [[ "$host" == "localhost" || "$host" == "::1" || "$host" =~ ^127(\.[0-9]{1,3}){3}$ ]]; then
-    return
-  fi
-
-  fail "$name must be an http loopback URL, got: $url"
-}
-
-listen_addr_for_url() {
-  local name="$1"
-  local url="$2"
-  local authority
-  local host
-  local port
-
-  authority="$(url_authority "$name" "$url")"
-  if [[ "$authority" == \[*\]* ]]; then
-    if [[ "$authority" != \[*\]:* ]]; then
-      fail "$name must include an explicit port, got: $url"
-    fi
-
-    host="${authority%%]*}"
-    host="${host#[}"
-    port="${authority##*:}"
-    printf '[%s]:%s' "$host" "$port"
-    return
-  fi
-
-  if [[ "$authority" != *:* ]]; then
-    fail "$name must include an explicit port, got: $url"
-  fi
-
-  host="${authority%%:*}"
-  port="${authority##*:}"
-  if [[ "$host" == "localhost" ]]; then
-    host="127.0.0.1"
-  fi
-
-  printf '%s:%s' "$host" "$port"
 }
 
 stop_pid() {
@@ -312,8 +242,8 @@ main() {
   fi
 
   require_positive_integer "run-count" "$RUN_COUNT"
-  require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
-  require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
+  eidolon_lab_require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
+  eidolon_lab_require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
   if [[ -n "$EIDOLON_M3_BAIT_PROFILE" && ! -f "$EIDOLON_M3_BAIT_PROFILE" ]]; then
     echo "error: EIDOLON_M3_BAIT_PROFILE must point to an existing file: $EIDOLON_M3_BAIT_PROFILE" >&2
     exit 2
@@ -321,8 +251,8 @@ main() {
 
   local target_addr
   local proxy_addr
-  target_addr="$(listen_addr_for_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL")"
-  proxy_addr="$(listen_addr_for_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL")"
+  target_addr="$(eidolon_lab_listen_addr_for_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL")"
+  proxy_addr="$(eidolon_lab_listen_addr_for_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL")"
 
   if truthy "$EIDOLON_M3_SAMPLE_DRY_RUN"; then
     write_dry_run_plan "$target_addr" "$proxy_addr"
