@@ -578,7 +578,25 @@ jq -n \
   --argjson proxy "$proxy_events" \
   --argjson runner "$runner_metadata" \
   'def unique_paths($run): ($run.requested_paths | map(.path) | unique);
-   def path_without_query($path): (($path // "") | sub("\\?.*$"; ""));
+   def target_without_fragment($target): (($target // "") | sub("#.*$"; ""));
+   def path_without_query($path): (target_without_fragment($path) | sub("\\?.*$"; ""));
+   def redacted_query($query):
+     ($query
+      | split("&")
+      | map(
+          select(length > 0)
+          | (split("=")[0]) as $key
+          | if $key == "" then "<redacted>" else "\($key)=<redacted>" end
+        )) as $pairs
+     | if ($pairs | length) == 0 then "<redacted>" else ($pairs | join("&")) end;
+   def redacted_target($target):
+     target_without_fragment($target) as $without_fragment
+     | ($without_fragment | sub("\\?.*$"; "")) as $path
+     | ($without_fragment
+        | if contains("?") then sub("^[^?]*\\?"; "") else null end) as $query
+     | $path
+       + (if $query == null then "" else "?" + redacted_query($query) end)
+       + (if (($target // "") | contains("#")) then "#<redacted>" else "" end);
    def bait_matrix($exposures; $actions):
      ([ $exposures[].bait_id, $actions[].bait_id ] | unique) as $ids
      | [
@@ -610,7 +628,7 @@ jq -n \
        ($eidolon.requested_paths // [])[] as $pwnkit
        | ($proxy.request_paths // [])[] as $proxy_request
        | select(($pwnkit.method // "") == ($proxy_request.method // ""))
-       | select(($pwnkit.path // "") == ($proxy_request.path // ""))
+       | select(redacted_target($pwnkit.path) == redacted_target($proxy_request.path))
        | select(($pwnkit.timestamp_ms // null) != null)
        | select(($proxy_request.observed_at_ms // null) != null)
        | select(
@@ -618,7 +636,7 @@ jq -n \
          )
        | {
            method: $pwnkit.method,
-           path: $pwnkit.path,
+           path: redacted_target($pwnkit.path),
            pwnkit_timestamp_ms: $pwnkit.timestamp_ms,
            proxy_observed_at: $proxy_request.observed_at,
            proxy_session_id: $proxy_request.session_id,
@@ -634,7 +652,7 @@ jq -n \
            any(
              correlated_target_requests[];
              .proxy_session_id == $exposure.session_id
-             and path_without_query(.path) == ($exposure.surface // "")
+             and path_without_query(.path) == path_without_query($exposure.surface)
              and ((.proxy_event_index // -1) <= ($exposure.event_index // -1))
            )
          )
@@ -648,7 +666,7 @@ jq -n \
              correlated_target_requests[];
              .proxy_session_id == $action.session_id
              and .method == $action.method
-             and .path == $action.path
+             and redacted_target(.path) == redacted_target($action.path)
              and ((.proxy_event_index // -1) <= ($action.event_index // -1))
            )
          )
