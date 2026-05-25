@@ -269,17 +269,18 @@ done | jq -s '
               ) as $token_refresh_failures
             | (
                 if (
-                  (.runs.eidolon.agent_error_diagnostics.has_codex_backend_timeout // false)
+                  (.runs.eidolon.agent_error_diagnostics.has_codex_backend_api_error // false)
                   or any(
                     .runs.eidolon.agent_error_diagnostics.class_counts[]?;
                     .error_class == "codex_backend_timeout"
+                    or .error_class == "codex_backend_api_error"
                   )
                 ) then
                   1
                 else
                   0
                 end
-              ) as $backend_timeouts
+              ) as $backend_errors
             | {
                 pwnkit_eidolon_tool_artifact_count: $tool_artifacts,
                 pwnkit_eidolon_request_artifact_count: $request_artifacts,
@@ -307,7 +308,7 @@ done | jq -s '
                       $proxy_requests;
                       $agent_errors;
                       $token_refresh_failures;
-                      $backend_timeouts
+                      $backend_errors
                     )
                   end
                 ),
@@ -325,7 +326,7 @@ done | jq -s '
                       end;
                       $agent_errors;
                       $token_refresh_failures;
-                      $backend_timeouts
+                      $backend_errors
                     )
                   end
                 )
@@ -553,6 +554,20 @@ done | jq -s '
     ) as $runs_with_eidolon_codex_backend_timeout
   | (
       $present
+      | map(
+          select(
+            (.agent_error_diagnostics.eidolon.has_codex_backend_api_error // false)
+            or any(
+              .agent_error_diagnostics.eidolon.class_counts[]?;
+              .error_class == "codex_backend_timeout"
+              or .error_class == "codex_backend_api_error"
+            )
+          )
+        )
+      | length
+    ) as $runs_with_eidolon_codex_backend_error
+  | (
+      $present
       | map(select(.pinned_session.present and (.pinned_session.cookie_preserved | not)))
       | length
     ) as $pinned_without_cookie_count
@@ -647,6 +662,9 @@ done | jq -s '
         runs_with_eidolon_codex_backend_timeout: (
           $runs_with_eidolon_codex_backend_timeout
         ),
+        runs_with_eidolon_codex_backend_error: (
+          $runs_with_eidolon_codex_backend_error
+        ),
         runs_with_pinned_session_but_no_cookie_preservation: $pinned_without_cookie_count,
         totals: {
           direct_pwnkit_tool_artifacts: $direct_tool_artifact_total,
@@ -677,7 +695,7 @@ done | jq -s '
           $eidolon_proxy_request_total;
           $eidolon_agent_error_total;
           $runs_with_eidolon_codex_token_refresh_failure;
-          $runs_with_eidolon_codex_backend_timeout
+          $runs_with_eidolon_codex_backend_error
         ),
         next_questions: (
           if $valid_count > 0 and $no_target_count == $valid_count then
@@ -687,7 +705,7 @@ done | jq -s '
               $pinned_without_cookie_count;
               $eidolon_agent_error_total;
               $runs_with_eidolon_codex_token_refresh_failure;
-              $runs_with_eidolon_codex_backend_timeout
+              $runs_with_eidolon_codex_backend_error
             )
           else
             []
