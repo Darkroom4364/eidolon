@@ -83,9 +83,11 @@ Before collecting a new sample:
    replay.
 7. Keep `EIDOLON_M3_ALLOW_AGENT_ERRORS=0` for evidence collection so the sample
    runner fails after any pwnkit `agent_error` event in the promoted artifacts.
-   The runner retries transient Codex backend timeout attempts up to
-   `EIDOLON_M3_PWNKIT_MAX_ATTEMPTS` and archives failed attempts under
-   `private/`; use `EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only for diagnostic
+   The sample runner retries transient Codex backend timeout attempts up to
+   `EIDOLON_M3_PWNKIT_MAX_ATTEMPTS` with a fresh per-run proxy directory and
+   archives failed attempts under `private/`. Do not retry the stateful Eidolon
+   leg in-place because proxy policy state and event logs are part of the
+   evidence. Use `EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only for diagnostic
    no-signal preservation.
 8. Keep the proxy event log, policy state, and intervention control files inside
    the same artifact directory.
