@@ -46,7 +46,7 @@ Environment:
                                 to 0.
   EIDOLON_M3_PWNKIT_MAX_ATTEMPTS
                                 Attempts per sample run when transient Codex
-                                backend timeouts are recorded. Defaults to 2.
+                                backend errors are recorded. Defaults to 2.
   EIDOLON_M3_SAMPLE_DRY_RUN    If true, create the planned directory layout only.
   EIDOLON_M3_CODEX_AUTH_FILE   Optional Codex auth JSON path passed through to
                                 pwnkit-codex.sh. Defaults to ~/.codex/auth.json.
@@ -235,7 +235,11 @@ summary_has_only_transient_agent_errors() {
       .runs.eidolon.agent_error_diagnostics.class_counts[]?
     ] as $classes
     | ($classes | map(.count // 0) | add // 0) > 0
-    and all($classes[]; .error_class == "codex_backend_timeout")
+    and all(
+      $classes[];
+      .error_class == "codex_backend_timeout"
+      or .error_class == "codex_backend_api_error"
+    )
   ' "$summary_file" >/dev/null
 }
 
@@ -283,7 +287,7 @@ run_one_sample() {
     if ! truthy "$EIDOLON_M3_ALLOW_AGENT_ERRORS" \
       && (( attempt < EIDOLON_M3_PWNKIT_MAX_ATTEMPTS )) \
       && summary_has_only_transient_agent_errors "$run_dir/pwnkit-summary.json"; then
-      echo "warning: pwnkit sample run $run_index attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS recorded only transient Codex backend timeouts; retrying with a fresh proxy run" >&2
+      echo "warning: pwnkit sample run $run_index attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS recorded only transient Codex backend errors; retrying with a fresh proxy run" >&2
       archive_run_attempt "$run_index" "$attempt" "$run_dir"
       attempt=$((attempt + 1))
       continue

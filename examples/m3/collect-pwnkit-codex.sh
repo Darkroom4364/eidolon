@@ -812,8 +812,8 @@ jq -n \
      | ($eidolon.agent_error_diagnostics.count // 0) as $pwnkit_agent_errors
      | ($eidolon.agent_error_diagnostics.has_codex_token_refresh_failure // false)
        as $has_token_refresh_failure
-     | ($eidolon.agent_error_diagnostics.has_codex_backend_timeout // false)
-       as $has_codex_backend_timeout
+     | ($eidolon.agent_error_diagnostics.has_codex_backend_api_error // false)
+       as $has_codex_backend_error
      | (($proxy.request_paths // []) | length) as $proxy_requests
      | (correlated_target_requests | length) as $correlated_requests
      | {
@@ -837,7 +837,7 @@ jq -n \
              "correlated_target_interaction_observed"
            elif $pwnkit_request_artifacts == 0 and $has_token_refresh_failure then
              "pwnkit_codex_token_refresh_failure_prevented_request_artifacts"
-           elif $pwnkit_request_artifacts == 0 and $has_codex_backend_timeout then
+           elif $pwnkit_request_artifacts == 0 and $has_codex_backend_error then
              "pwnkit_codex_backend_timeout_prevented_request_artifacts"
            elif $pwnkit_request_artifacts == 0 and $pwnkit_agent_errors > 0 then
              "pwnkit_agent_errors_prevented_request_artifacts"
@@ -859,7 +859,7 @@ jq -n \
                "refresh_pwnkit_codex_auth_before_rerun",
                "rerun_matrix_after_agent_error_free_scan"
              ]
-           elif $pwnkit_request_artifacts == 0 and $has_codex_backend_timeout then
+           elif $pwnkit_request_artifacts == 0 and $has_codex_backend_error then
              [
                "rerun_after_codex_backend_timeout",
                "rerun_matrix_after_agent_error_free_scan"
