@@ -72,6 +72,7 @@ jobs:
           examples/m3/test-check-pwnkit-runner-freshness.sh
           examples/m3/test-shell-harness-safety.sh
           examples/m3/test-pwnkit-codex.sh
+          examples/m3/test-collect-action-trace.sh
           examples/m3/test-collect-pwnkit-codex.sh
           examples/m3/test-collect-pwnkit-sample.sh
           examples/m3/test-collect-pwnkit-promotion-matrix.sh
