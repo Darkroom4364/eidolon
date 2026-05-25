@@ -47,7 +47,8 @@ A post-auth rerun against synced pwnkit `v0.12.0` / head
 failure: the runner loaded a fresh Codex access token, pwnkit persisted request
 artifacts, replayed the OpenAPI bait action in the same Eidolon session, and
 entered controlled reality. The strict sample was still not archive-ready
-because pwnkit emitted an `agent_error` consistent with a Codex backend timeout.
+because pwnkit emitted an `agent_error` consistent with a transient Codex
+backend error, such as a timeout or transport/API failure.
 Treat the active open question as:
 
 ```text
@@ -83,7 +84,8 @@ Before collecting a new sample:
    replay.
 7. Keep `EIDOLON_M3_ALLOW_AGENT_ERRORS=0` for evidence collection so the sample
    runner fails after any pwnkit `agent_error` event in the promoted artifacts.
-   The sample runner retries transient Codex backend timeout attempts up to
+   The sample runner retries transient Codex backend-error attempts, including
+   timeouts and transport/API failures, up to
    `EIDOLON_M3_PWNKIT_MAX_ATTEMPTS` with a fresh per-run proxy directory and
    archives failed attempts under `private/`. Do not retry the stateful Eidolon
    leg in-place because proxy policy state and event logs are part of the
@@ -210,9 +212,10 @@ Use the diagnostics to classify the gap before changing bait text or behavior:
   `pwnkit_codex_token_refresh_failure_prevented_request_artifacts` means refresh
   pwnkit Codex auth and rerun before drawing current-pwnkit behavior
   conclusions. `pwnkit_codex_backend_timeout_prevented_request_artifacts` means
-  rerun after the backend timeout clears before tuning bait semantics. A likely
-  cause of `pwnkit_agent_errors_prevented_request_artifacts` means inspect the
-  sanitized agent error classes and rerun after an agent-error-free scan. A
+  rerun after the transient Codex backend condition clears, including timeouts
+  and transport/API failures, before tuning bait semantics. A likely cause of
+  `pwnkit_agent_errors_prevented_request_artifacts` means inspect the sanitized
+  agent error classes and rerun after an agent-error-free scan. A
   likely cause of
   `eidolon_proxy_saw_uncorrelated_requests_but_pwnkit_emitted_no_request_artifacts`
   points at runner/current-pwnkit instrumentation or cookie reuse, not bait
