@@ -23,301 +23,179 @@ if [[ "$INPUT" != "/dev/stdin" && ! -f "$INPUT" ]]; then
   exit 2
 fi
 
-awk '
-  function str_field(line, name, marker, rest) {
-    marker = "\"" name "\":\""
-    if (index(line, marker) == 0) {
-      return ""
-    }
-    rest = substr(line, index(line, marker) + length(marker))
-    sub(/".*/, "", rest)
-    return rest
-  }
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: required command not found: jq" >&2
+  exit 2
+fi
 
-  function num_field(line, name, marker, rest) {
-    marker = "\"" name "\":"
-    if (index(line, marker) == 0) {
-      return ""
-    }
-    rest = substr(line, index(line, marker) + length(marker))
-    sub(/[,}].*/, "", rest)
-    return rest
-  }
+jq -s '
+  def ordered_unique:
+    reduce .[] as $item ([]; if index($item) then . else . + [$item] end);
 
-  function bool_field(line, name, marker, rest) {
-    marker = "\"" name "\":"
-    if (index(line, marker) == 0) {
-      return 0
-    }
-    rest = substr(line, index(line, marker) + length(marker))
-    return substr(rest, 1, 4) == "true"
-  }
+  def json_key:
+    gsub("-"; "_");
 
-  function json_key(value, key) {
-    key = value
-    gsub(/-/, "_", key)
-    return key
-  }
+  def bool($name):
+    .[$name] == true;
 
-  function remember_mode(mode) {
-    if (!(mode in seen_mode)) {
-      seen_mode[mode] = 1
-      mode_order[++mode_count] = mode
-    }
-  }
+  def num($name):
+    .[$name] // 0 | if type == "number" then . else tonumber? // 0 end;
 
-  function remember_class(mode, bait_class, combined) {
-    combined = mode SUBSEP bait_class
-    if (!(combined in seen_class)) {
-      seen_class[combined] = 1
-      class_count[mode] += 1
-      class_order[mode, class_count[mode]] = bait_class
-    }
-  }
+  def status_bucket:
+    if bool("request_sent") and num("status") >= 200 and num("status") < 300 then
+      "successful"
+    elif bool("blocked") then
+      "blocked"
+    elif bool("request_sent") then
+      "failed"
+    else
+      "skipped"
+    end;
 
-  function confidence_score(mode, actions, exposures) {
-    if (actions == 0 || exposures == 0) {
-      return 0
-    }
-    if (mode == "eidolon-mvp") {
-      return 85
-    }
-    if (mode == "static-token" || mode == "static-honeypot") {
-      return 50
-    }
-    return 0
-  }
+  def count_bucket($items; $bucket):
+    [$items[] | select(status_bucket == $bucket)] | length;
 
-  function optional_first_action(mode, key, prefix) {
-    if (prefix == "mode") {
-      if (mode in first_exposure_seconds && mode in first_action_seconds) {
-        printf "        \"time_to_first_bait_action_seconds\": %.6f,\n", first_action_seconds[mode] - first_exposure_seconds[mode]
-      } else {
-        printf "        \"time_to_first_bait_action_seconds\": null,\n"
-      }
-    } else {
-      key = prefix
-      if (key in first_class_exposure_seconds && key in first_class_action_seconds) {
-        printf "            \"time_to_first_bait_action_seconds\": %.6f,\n", first_class_action_seconds[key] - first_class_exposure_seconds[key]
-      } else {
-        printf "            \"time_to_first_bait_action_seconds\": null,\n"
-      }
-    }
-  }
+  def round6:
+    . * 1000000 | round / 1000000;
 
-  BEGIN {
-    total = 0
-    mode_count = 0
-    runner_kind = ""
-  }
+  def confidence_score($mode; $actions; $exposures):
+    if $actions == 0 or $exposures == 0 then
+      0
+    elif $mode == "eidolon-mvp" then
+      85
+    elif $mode == "static-token" or $mode == "static-honeypot" then
+      50
+    else
+      0
+    end;
 
-  {
-    total += 1
-    mode = str_field($0, "defense_mode")
-    bait_class = str_field($0, "bait_class")
-    step = str_field($0, "step")
+  def bait_action_delta($items):
+    ([$items[] | select(bool("bait_exposed")) | num("elapsed_seconds")][0]) as $first_exposure
+    | ([$items[] | select(bool("bait_action")) | num("elapsed_seconds")][0]) as $first_action
+    | if $first_exposure == null or $first_action == null then
+        null
+      else
+        ($first_action - $first_exposure | round6)
+      end;
 
-    if (mode == "" || bait_class == "") {
-      invalid += 1
-      next
-    }
+  def protected_after_decision($items):
+    [
+      $items[]
+      | select(
+          bool("after_decision")
+          and bool("real_surface")
+          and bool("protected_upstream_reached")
+        )
+    ] | length;
 
-    current_runner = str_field($0, "runner_kind")
-    if (runner_kind == "" && current_runner != "") {
-      runner_kind = current_runner
-    }
-
-    remember_mode(mode)
-    remember_class(mode, bait_class)
-
-    key = mode SUBSEP bait_class
-    status = num_field($0, "status") + 0
-    elapsed = num_field($0, "elapsed_seconds") + 0
-
-    event_count[mode] += 1
-    class_event_count[key] += 1
-
-    if (step == "exposure") {
-      scenario_count[mode] += 1
-      class_scenario_count[key] += 1
-    }
-
-    request_sent = bool_field($0, "request_sent")
-    if (request_sent) {
-      request_count[mode] += 1
-      class_request_count[key] += 1
-    }
-
-    if (request_sent && status >= 200 && status < 300) {
-      successful[mode] += 1
-      class_successful[key] += 1
-    } else if (bool_field($0, "blocked")) {
-      blocked[mode] += 1
-      class_blocked[key] += 1
-    } else if (request_sent) {
-      failed[mode] += 1
-      class_failed[key] += 1
-    } else {
-      skipped[mode] += 1
-      class_skipped[key] += 1
-    }
-
-    if (bool_field($0, "bait_exposed")) {
-      bait_exposures[mode] += 1
-      class_bait_exposures[key] += 1
-      if (!(mode in first_exposure_seconds)) {
-        first_exposure_seconds[mode] = elapsed
-      }
-      if (!(key in first_class_exposure_seconds)) {
-        first_class_exposure_seconds[key] = elapsed
-      }
-    }
-
-    if (bool_field($0, "bait_action")) {
-      bait_actions[mode] += 1
-      class_bait_actions[key] += 1
-      if (!(mode in first_action_seconds)) {
-        first_action_seconds[mode] = elapsed
-      }
-      if (!(key in first_class_action_seconds)) {
-        first_class_action_seconds[key] = elapsed
-      }
-    }
-
-    if (bool_field($0, "false_positive")) {
-      false_positives[mode] += 1
-      class_false_positives[key] += 1
-    }
-
-    if (bool_field($0, "after_decision") && bool_field($0, "real_surface") && bool_field($0, "protected_upstream_reached")) {
-      protected_after_decision[mode] += 1
-      class_protected_after_decision[key] += 1
-    }
-  }
-
-  END {
-    if (total == 0 || mode_count == 0) {
-      print "error: no M3 bakeoff events provided" > "/dev/stderr"
-      exit 2
-    }
-
-    if (invalid > 0) {
-      print "error: M3 bakeoff events missing defense_mode or bait_class" > "/dev/stderr"
-      exit 2
-    }
-
-    printf "{\n"
-    printf "  \"schema_version\": 0,\n"
-    printf "  \"run_kind\": \"m3_bakeoff_comparison\",\n"
-    printf "  \"boundary\": \"owned_loopback_lab\",\n"
-    runner_output = runner_kind
-    if (runner_output == "") {
-      runner_output = "unknown"
-    }
-    printf "  \"runner_kind\": \"%s\",\n", runner_output
-    printf "  \"defense_modes\": {\n"
-
-    for (i = 1; i <= mode_count; i += 1) {
-      mode = mode_order[i]
-      mode_key = json_key(mode)
-      exposure_count = bait_exposures[mode] + 0
-      action_count = bait_actions[mode] + 0
-      scenarios = scenario_count[mode] + 0
-      bait_follow_rate = exposure_count > 0 ? action_count / exposure_count : 0
-      false_positive_rate = scenarios > 0 ? (false_positives[mode] + 0) / scenarios : 0
-      score = confidence_score(mode, action_count, exposure_count)
-
-      printf "    \"%s\": {\n", mode_key
-      printf "      \"source_mode\": \"%s\",\n", mode
-      printf "      \"event_count\": %d,\n", event_count[mode] + 0
-      printf "      \"request_count\": %d,\n", request_count[mode] + 0
-      printf "      \"status_counts\": {\n"
-      printf "        \"successful\": %d,\n", successful[mode] + 0
-      printf "        \"failed\": %d,\n", failed[mode] + 0
-      printf "        \"blocked\": %d,\n", blocked[mode] + 0
-      printf "        \"skipped\": %d\n", skipped[mode] + 0
-      printf "      },\n"
-      printf "      \"counts\": {\n"
-      printf "        \"bait_exposures\": %d,\n", exposure_count
-      printf "        \"bait_actions\": %d,\n", action_count
-      printf "        \"protected_upstream_after_decision\": %d\n", protected_after_decision[mode] + 0
-      printf "      },\n"
-      printf "      \"metrics\": {\n"
-      optional_first_action(mode, "", "mode")
-      printf "        \"bait_follow_rate\": %.6f,\n", bait_follow_rate
-      printf "        \"false_positive_rate\": %.6f,\n", false_positive_rate
-      printf "        \"trace_confidence_score\": %d,\n", score
-      if (action_count > 0 || blocked[mode] > 0) {
-        printf "        \"real_surface_requests_after_containment\": %d,\n", protected_after_decision[mode] + 0
-      } else {
-        printf "        \"real_surface_requests_after_containment\": null,\n"
-      }
-      if (mode == "eidolon-mvp" && action_count > 0) {
-        printf "        \"controlled_reality_dwell_seconds\": 0.000000,\n"
-      } else {
-        printf "        \"controlled_reality_dwell_seconds\": null,\n"
-      }
-      controlled_depth = 0
-      controlled_branches = 0
-      if (mode == "eidolon-mvp") {
-        controlled_depth = action_count
-        if (action_count > 0) {
-          controlled_branches = 1
+  def class_summary($items; $mode; $bait_class):
+    ($items | map(select(.bait_class == $bait_class))) as $class_items
+    | ($class_items | map(select(bool("bait_exposed"))) | length) as $exposures
+    | ($class_items | map(select(bool("bait_action"))) | length) as $actions
+    | ($class_items | map(select(.step == "exposure")) | length) as $scenarios
+    | ($class_items | map(select(bool("false_positive"))) | length) as $false_positives
+    | (protected_after_decision($class_items)) as $protected
+    | {
+        event_count: ($class_items | length),
+        counts: {
+          bait_exposures: $exposures,
+          bait_actions: $actions,
+          protected_upstream_after_decision: $protected
+        },
+        metrics: {
+          time_to_first_bait_action_seconds: bait_action_delta($class_items),
+          bait_follow_rate: (if $exposures > 0 then $actions / $exposures | round6 else 0 end),
+          false_positive_rate: (if $scenarios > 0 then $false_positives / $scenarios | round6 else 0 end),
+          trace_confidence_score: confidence_score($mode; $actions; $exposures),
+          real_surface_requests_after_containment: (
+            if $actions > 0 or count_bucket($class_items; "blocked") > 0 then
+              $protected
+            else
+              null
+            end
+          )
         }
-      }
-      printf "        \"controlled_reality_action_depth\": %d,\n", controlled_depth
-      printf "        \"controlled_reality_branch_count\": %d\n", controlled_branches
-      printf "      },\n"
-      printf "      \"bait_classes\": {\n"
+      };
 
-      for (j = 1; j <= class_count[mode]; j += 1) {
-        bait_class = class_order[mode, j]
-        key = mode SUBSEP bait_class
-        class_exposures = class_bait_exposures[key] + 0
-        class_actions = class_bait_actions[key] + 0
-        class_scenarios = class_scenario_count[key] + 0
-        class_follow_rate = class_exposures > 0 ? class_actions / class_exposures : 0
-        class_false_positive_rate = class_scenarios > 0 ? (class_false_positives[key] + 0) / class_scenarios : 0
+  def mode_summary($events; $mode):
+    ($events | map(select(.defense_mode == $mode))) as $items
+    | ($items | map(select(bool("request_sent"))) | length) as $requests
+    | ($items | map(select(bool("bait_exposed"))) | length) as $exposures
+    | ($items | map(select(bool("bait_action"))) | length) as $actions
+    | ($items | map(select(.step == "exposure")) | length) as $scenarios
+    | ($items | map(select(bool("false_positive"))) | length) as $false_positives
+    | (protected_after_decision($items)) as $protected
+    | ($items | map(.bait_class) | ordered_unique) as $classes
+    | {
+        source_mode: $mode,
+        event_count: ($items | length),
+        request_count: $requests,
+        status_counts: {
+          successful: count_bucket($items; "successful"),
+          failed: count_bucket($items; "failed"),
+          blocked: count_bucket($items; "blocked"),
+          skipped: count_bucket($items; "skipped")
+        },
+        counts: {
+          bait_exposures: $exposures,
+          bait_actions: $actions,
+          protected_upstream_after_decision: $protected
+        },
+        metrics: {
+          time_to_first_bait_action_seconds: bait_action_delta($items),
+          bait_follow_rate: (if $exposures > 0 then $actions / $exposures | round6 else 0 end),
+          false_positive_rate: (if $scenarios > 0 then $false_positives / $scenarios | round6 else 0 end),
+          trace_confidence_score: confidence_score($mode; $actions; $exposures),
+          real_surface_requests_after_containment: (
+            if $actions > 0 or count_bucket($items; "blocked") > 0 then
+              $protected
+            else
+              null
+            end
+          ),
+          controlled_reality_dwell_seconds: (
+            if $mode == "eidolon-mvp" and $actions > 0 then 0 else null end
+          ),
+          controlled_reality_action_depth: (
+            if $mode == "eidolon-mvp" then $actions else 0 end
+          ),
+          controlled_reality_branch_count: (
+            if $mode == "eidolon-mvp" and $actions > 0 then 1 else 0 end
+          )
+        },
+        bait_classes: (
+          reduce $classes[] as $bait_class ({};
+            . + {($bait_class): class_summary($items; $mode; $bait_class)}
+          )
+        )
+      };
 
-        printf "        \"%s\": {\n", bait_class
-        printf "          \"event_count\": %d,\n", class_event_count[key] + 0
-        printf "          \"counts\": {\n"
-        printf "            \"bait_exposures\": %d,\n", class_exposures
-        printf "            \"bait_actions\": %d,\n", class_actions
-        printf "            \"protected_upstream_after_decision\": %d\n", class_protected_after_decision[key] + 0
-        printf "          },\n"
-        printf "          \"metrics\": {\n"
-        optional_first_action(mode, "", key)
-        printf "            \"bait_follow_rate\": %.6f,\n", class_follow_rate
-        printf "            \"false_positive_rate\": %.6f,\n", class_false_positive_rate
-        printf "            \"trace_confidence_score\": %d,\n", confidence_score(mode, class_actions, class_exposures)
-        if (class_actions > 0 || class_blocked[key] > 0) {
-          printf "            \"real_surface_requests_after_containment\": %d\n", class_protected_after_decision[key] + 0
-        } else {
-          printf "            \"real_surface_requests_after_containment\": null\n"
-        }
-        printf "          }\n"
-
-        if (j < class_count[mode]) {
-          printf "        },\n"
-        } else {
-          printf "        }\n"
-        }
-      }
-
-      printf "      }\n"
-      if (i < mode_count) {
-        printf "    },\n"
-      } else {
-        printf "    }\n"
-      }
-    }
-
-    printf "  },\n"
-    printf "  \"notes\": [\n"
-    printf "    \"M3 scripted bakeoff summaries compare boundary behavior across the same owned Lab target and five bait classes.\",\n"
-    printf "    \"This artifact is runner plumbing; final M3 uniqueness claims require authorized agentic/scanner runs and proxy trace artifacts.\"\n"
-    printf "  ]\n"
-    printf "}\n"
-  }
+  . as $events
+  | if length == 0 then
+      "error: no M3 bakeoff events provided" | halt_error(2)
+    elif any(.[]; ((.defense_mode // "") == "" or (.bait_class // "") == "")) then
+      "error: M3 bakeoff events missing defense_mode or bait_class" | halt_error(2)
+    else
+      ($events | map(.defense_mode) | ordered_unique) as $modes
+      | if ($modes | length) == 0 then
+          "error: no M3 bakeoff events provided" | halt_error(2)
+        else
+          ($events | [ .[] | (.runner_kind // "") | select(. != "") ][0] // "unknown") as $runner_kind
+          | {
+              schema_version: 0,
+              run_kind: "m3_bakeoff_comparison",
+              boundary: "owned_loopback_lab",
+              runner_kind: $runner_kind,
+              defense_modes: (
+                reduce $modes[] as $mode ({};
+                  . + {($mode | json_key): mode_summary($events; $mode)}
+                )
+              ),
+              notes: [
+                "M3 scripted bakeoff summaries compare boundary behavior across the same owned Lab target and five bait classes.",
+                "This artifact is runner plumbing; final M3 uniqueness claims require authorized agentic/scanner runs and proxy trace artifacts."
+              ]
+            }
+        end
+    end
 ' "$INPUT"
