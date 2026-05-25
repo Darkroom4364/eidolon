@@ -380,6 +380,85 @@ SH
   ! rg -q 'sensitive-detail' "$artifact/pwnkit-direct.stderr.log"
 }
 
+test_does_not_retry_stateful_eidolon_transient_timeout_in_place() {
+  local artifact
+  local fake_pwnkit
+  local attempt_file
+  artifact="$(new_temp_dir)"
+  fake_pwnkit="$artifact/fake-pwnkit"
+  attempt_file="$artifact/attempt-count.txt"
+
+  cat > "$fake_pwnkit" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+db_path=""
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --db-path)
+      db_path="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$db_path" ]]; then
+  echo "missing --db-path" >&2
+  exit 2
+fi
+
+attempt=1
+if [[ -f "$FIXTURE_ATTEMPT_FILE" ]]; then
+  attempt="$(( $(cat "$FIXTURE_ATTEMPT_FILE") + 1 ))"
+fi
+printf '%s\n' "$attempt" > "$FIXTURE_ATTEMPT_FILE"
+
+sqlite3 "$db_path" '
+  create table pipeline_events (
+    id text primary key,
+    scanId text not null,
+    stage text not null,
+    eventType text not null,
+    findingId text,
+    agentRole text,
+    payload text not null default "{}",
+    timestamp integer not null
+  );
+'
+
+payload="$(jq -cn --arg error "ChatGPT (Codex backend) API request timed out sensitive-detail" "{error:\$error}")"
+escaped_payload="$(printf '%s' "$payload" | sed "s/'/''/g")"
+sqlite3 "$db_path" "
+  insert into pipeline_events
+    (id, scanId, stage, eventType, findingId, agentRole, payload, timestamp)
+  values
+    ('agent-timeout', 'scan-1', 'discovery', 'agent_error', null, 'discovery', '$escaped_payload', 1);
+"
+
+printf '{"findings":[]}\n'
+SH
+  chmod +x "$fake_pwnkit"
+
+  EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    EIDOLON_M3_PWNKIT_MAX_ATTEMPTS=2 \
+    FIXTURE_ATTEMPT_FILE="$attempt_file" \
+    PWNKIT_BIN="$fake_pwnkit" \
+    "$RUNNER" eidolon "$artifact" >/dev/null
+
+  [[ "$(cat "$attempt_file")" == "1" ]]
+  [[ ! -e "$artifact/private/pwnkit-eidolon-attempt-1" ]]
+  [[ "$(sqlite3 "$artifact/pwnkit-eidolon.db" "select count(*) from pipeline_events where eventType = 'agent_error';")" == "1" ]]
+  jq -e '.findings == []' "$artifact/pwnkit-eidolon.json" >/dev/null
+  ! rg -q 'sensitive-detail' "$artifact/pwnkit-runner-metadata.json"
+  ! rg -q 'sensitive-detail' "$artifact/pwnkit-eidolon.json"
+  ! rg -q 'sensitive-detail' "$artifact/pwnkit-eidolon.stdout.log"
+  ! rg -q 'sensitive-detail' "$artifact/pwnkit-eidolon.stderr.log"
+}
+
 test_source_checkout_metadata_records_version_and_origin_sync
 test_source_checkout_metadata_records_origin_drift
 test_source_checkout_metadata_records_dirty_worktree
@@ -387,5 +466,6 @@ test_preflight_writes_metadata_and_scopes_without_scan
 test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret
 test_auto_loads_codex_refresh_token_from_auth_file_without_usable_access_token
 test_retries_transient_codex_backend_timeout_attempt
+test_does_not_retry_stateful_eidolon_transient_timeout_in_place
 
 printf 'pwnkit-codex runner fixture tests passed\n'

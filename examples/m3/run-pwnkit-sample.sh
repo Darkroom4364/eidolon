@@ -45,7 +45,7 @@ Environment:
                                 is dirty or not synced to origin/main. Defaults
                                 to 0.
   EIDOLON_M3_PWNKIT_MAX_ATTEMPTS
-                                Attempts per pwnkit leg when transient Codex
+                                Attempts per sample run when transient Codex
                                 backend timeouts are recorded. Defaults to 2.
   EIDOLON_M3_SAMPLE_DRY_RUN    If true, create the planned directory layout only.
   EIDOLON_M3_CODEX_AUTH_FILE   Optional Codex auth JSON path passed through to
@@ -99,8 +99,13 @@ stop_pid() {
   fi
 }
 
-cleanup() {
+stop_proxy() {
   stop_pid "$PROXY_PID"
+  PROXY_PID=""
+}
+
+cleanup() {
+  stop_proxy
   stop_pid "$TARGET_PID"
 }
 
@@ -219,27 +224,73 @@ run_pwnkit_preflight() {
     "$preflight_dir/pwnkit-runner-metadata.json"
 }
 
+summary_has_only_transient_agent_errors() {
+  local summary_file="$1"
+
+  [[ -f "$summary_file" ]] || return 1
+
+  jq -e '
+    [
+      .runs.direct.agent_error_diagnostics.class_counts[]?,
+      .runs.eidolon.agent_error_diagnostics.class_counts[]?
+    ] as $classes
+    | ($classes | map(.count // 0) | add // 0) > 0
+    and all($classes[]; .error_class == "codex_backend_timeout")
+  ' "$summary_file" >/dev/null
+}
+
+archive_run_attempt() {
+  local run_index="$1"
+  local attempt="$2"
+  local run_dir="$3"
+  local archive_dir="$SAMPLE_DIR/private/run-$run_index-attempt-$attempt"
+
+  mkdir -p "$SAMPLE_DIR/private"
+  mv "$run_dir" "$archive_dir"
+  echo "m3 pwnkit sample archived failed run $run_index attempt $attempt -> $archive_dir" >&2
+}
+
 run_one_sample() {
   local run_index="$1"
   local proxy_addr="$2"
   local run_dir="$SAMPLE_DIR/run-$run_index"
+  local attempt=1
 
-  mkdir -p "$run_dir/private"
-  echo "m3 pwnkit sample run $run_index/$RUN_COUNT -> $run_dir" >&2
+  while :; do
+    mkdir -p "$run_dir/private"
+    echo "m3 pwnkit sample run $run_index/$RUN_COUNT attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS -> $run_dir" >&2
 
-  start_proxy "$proxy_addr" "$run_dir"
-  EIDOLON_LAB_TARGET_URL="$TARGET_URL" \
-    EIDOLON_LAB_PROXY_URL="$PROXY_URL" \
-    EIDOLON_M3_PIN_SESSION="$EIDOLON_M3_PIN_SESSION" \
-    EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
-    "$SCRIPT_DIR/pwnkit-codex.sh" all "$run_dir"
-  "$SCRIPT_DIR/collect-pwnkit-codex.sh" "$run_dir" > "$run_dir/pwnkit-summary.json"
-  "$SCRIPT_DIR/collect-agent-replay-trace.sh" "$run_dir" \
-    > "$run_dir/agent-replay-trace-summary.json"
-  EIDOLON_M3_ALLOW_AGENT_ERRORS="$EIDOLON_M3_ALLOW_AGENT_ERRORS" \
-    "$SCRIPT_DIR/check-pwnkit-summary-health.sh" "$run_dir/pwnkit-summary.json"
-  stop_pid "$PROXY_PID"
-  PROXY_PID=""
+    start_proxy "$proxy_addr" "$run_dir"
+    EIDOLON_LAB_TARGET_URL="$TARGET_URL" \
+      EIDOLON_LAB_PROXY_URL="$PROXY_URL" \
+      EIDOLON_M3_PIN_SESSION="$EIDOLON_M3_PIN_SESSION" \
+      EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
+      "$SCRIPT_DIR/pwnkit-codex.sh" all "$run_dir"
+    "$SCRIPT_DIR/collect-pwnkit-codex.sh" "$run_dir" > "$run_dir/pwnkit-summary.json"
+    "$SCRIPT_DIR/collect-agent-replay-trace.sh" "$run_dir" \
+      > "$run_dir/agent-replay-trace-summary.json"
+
+    local health_status=0
+    EIDOLON_M3_ALLOW_AGENT_ERRORS="$EIDOLON_M3_ALLOW_AGENT_ERRORS" \
+      "$SCRIPT_DIR/check-pwnkit-summary-health.sh" "$run_dir/pwnkit-summary.json" \
+      || health_status="$?"
+
+    stop_proxy
+    if [[ "$health_status" -eq 0 ]]; then
+      return 0
+    fi
+
+    if ! truthy "$EIDOLON_M3_ALLOW_AGENT_ERRORS" \
+      && (( attempt < EIDOLON_M3_PWNKIT_MAX_ATTEMPTS )) \
+      && summary_has_only_transient_agent_errors "$run_dir/pwnkit-summary.json"; then
+      echo "warning: pwnkit sample run $run_index attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS recorded only transient Codex backend timeouts; retrying with a fresh proxy run" >&2
+      archive_run_attempt "$run_index" "$attempt" "$run_dir"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    return "$health_status"
+  done
 }
 
 main() {
