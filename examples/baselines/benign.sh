@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$SCRIPT_DIR/../lib/local-lab.sh"
+
 MODE="${1:-all}"
 BASE_URL="${EIDOLON_LAB_BASE_URL:-${EIDOLON_LAB_TARGET_URL:-http://127.0.0.1:9001}}"
 BASE_URL="${BASE_URL%/}"
@@ -19,43 +22,18 @@ The URL must be loopback. Public or third-party targets are rejected.
 USAGE
 }
 
-require_loopback_url() {
-  if [[ "$BASE_URL" != http://* ]]; then
-    echo "error: EIDOLON_LAB_BASE_URL must be an http loopback URL, got: $BASE_URL" >&2
-    exit 2
-  fi
-
-  local rest="${BASE_URL#http://}"
-  if [[ "$rest" == */* ]]; then
-    echo "error: EIDOLON_LAB_BASE_URL must not include a path, got: $BASE_URL" >&2
-    exit 2
-  fi
-
-  local authority="$rest"
-  local host
-  if [[ "$authority" == \[*\]* ]]; then
-    host="${authority%%]*}"
-    host="${host#[}"
-  else
-    host="${authority%%:*}"
-  fi
-
-  if [[ "$host" == "localhost" || "$host" == "::1" || "$host" =~ ^127(\.[0-9]{1,3}){3}$ ]]; then
-    return
-  fi
-
-  echo "error: EIDOLON_LAB_BASE_URL must be an http loopback URL, got: $BASE_URL" >&2
-  exit 2
-}
-
 json_line() {
   local mode="$1"
   local method="$2"
   local path="$3"
   local status="$4"
 
-  printf '{"mode":"%s","method":"%s","path":"%s","status":%s}\n' \
-    "$mode" "$method" "$path" "$status"
+  jq -cn \
+    --arg mode "$mode" \
+    --arg method "$method" \
+    --arg path "$path" \
+    --argjson status "$status" \
+    '{mode: $mode, method: $method, path: $path, status: $status}'
 }
 
 request() {
@@ -120,7 +98,8 @@ main() {
     exit 0
   fi
 
-  require_loopback_url
+  eidolon_lab_require_command jq
+  eidolon_lab_require_loopback_url "EIDOLON_LAB_BASE_URL" "$BASE_URL"
 
   case "$MODE" in
     all)
