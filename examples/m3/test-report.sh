@@ -144,7 +144,7 @@ test_report_keeps_adaptive_automation_no_go_without_differential_findings() {
   rg -q '\| `comparison.finding_gap.next_question` \| `why_controlled_reality_chain_was_not_promoted_to_finding` \|' "$output"
   rg -q '\| `eidolon_controlled_reality_without_findings` \| `yes` \|' "$output"
   rg -q -- '- Pwnkit artifact: `<artifact-path-omitted>`' "$output"
-  rg -q -- '- Scripted action artifact: `<artifact-path-omitted>`' "$output"
+  rg -q -- '- Trace artifact: `<artifact-path-omitted>`' "$output"
   rg -q -- '- Pwnkit runner command source: `fixture_source_checkout`' "$output"
   rg -q -- '- Pwnkit runner command path: `omitted from report`' "$output"
   rg -q -- '- M3 exposure claim: `pass` for pwnkit bait discoverability\.' "$output"
@@ -154,6 +154,38 @@ test_report_keeps_adaptive_automation_no_go_without_differential_findings() {
   ! rg -q '/tmp/pwnkit|eidolon-m3-report-test' "$output"
 }
 
+test_report_accepts_redacted_summary_and_agent_trace_without_raw_pwnkit_report() {
+  local pwnkit_dir
+  local action_dir
+  local output
+  local tmp_summary
+
+  pwnkit_dir="$(new_artifact)"
+  action_dir="$(new_artifact)"
+  output="$pwnkit_dir/report.md"
+  tmp_summary="$pwnkit_dir/summary.tmp"
+
+  write_controlled_reality_without_findings "$pwnkit_dir"
+  write_action_trace "$action_dir"
+
+  jq '
+    .comparison.correlated_bait_matrix = .comparison.correlated_bait_events.matrix
+    | del(.comparison.correlated_bait_events)
+  ' "$pwnkit_dir/pwnkit-summary.json" > "$tmp_summary"
+  mv "$tmp_summary" "$pwnkit_dir/pwnkit-summary.redacted.json"
+  rm "$pwnkit_dir/pwnkit-summary.json"
+  rm "$pwnkit_dir/pwnkit-eidolon.json"
+  mv "$action_dir/action-trace-summary.json" "$action_dir/agent-replay-trace-summary.json"
+
+  "$REPORT" --pwnkit-artifact "$pwnkit_dir" --action-artifact "$action_dir" > "$output"
+
+  rg -q 'Report posture: `no-go for automation; controlled-reality chain observed but differential findings remain open`' "$output"
+  rg -q '\| `open_api` \| `openapi_reconcile_trace` \| `/openapi.json` \| 2 \| 0 \| 1 \| 1 \| keep: agent replay observed \|' "$output"
+  rg -q -- '- Trace artifact: `<artifact-path-omitted>`' "$output"
+  ! rg -q 'eidolon-m3-report-test' "$output"
+}
+
 test_report_keeps_adaptive_automation_no_go_without_differential_findings
+test_report_accepts_redacted_summary_and_agent_trace_without_raw_pwnkit_report
 
 printf 'm3 report fixture tests passed\n'
