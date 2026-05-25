@@ -12,6 +12,7 @@ PWNKIT_DEPTH="${PWNKIT_DEPTH:-quick}"
 PWNKIT_MODE="${PWNKIT_MODE:-web}"
 PWNKIT_RUNTIME="${PWNKIT_RUNTIME:-codex}"
 PWNKIT_RATE_LIMIT="${PWNKIT_RATE_LIMIT:-2}"
+EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="${EIDOLON_M3_PWNKIT_MAX_ATTEMPTS:-2}"
 PWNKIT_FEATURE_CODEX_LIVE_TARGETS="${PWNKIT_FEATURE_CODEX_LIVE_TARGETS:-}"
 EIDOLON_M3_CODEX_AUTH_FILE="${EIDOLON_M3_CODEX_AUTH_FILE:-$HOME/.codex/auth.json}"
 EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-0}"
@@ -36,6 +37,9 @@ Environment:
   PWNKIT_MODE               pwnkit mode. Defaults to web.
   PWNKIT_RUNTIME            pwnkit runtime. Defaults to codex.
   PWNKIT_RATE_LIMIT         pwnkit --rate-limit value. Defaults to 2.
+  EIDOLON_M3_PWNKIT_MAX_ATTEMPTS
+                            Attempts per pwnkit leg when a transient Codex
+                            backend timeout is recorded. Defaults to 2.
   PWNKIT_FEATURE_CODEX_LIVE_TARGETS
                             Optional legacy pwnkit feature flag. Not set by
                             default; current pwnkit Codex live scans use the
@@ -207,6 +211,16 @@ json_bool() {
     printf 'true'
   else
     printf 'false'
+  fi
+}
+
+require_positive_integer() {
+  local name="$1"
+  local value="$2"
+
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: $name must be a positive integer, got: $value" >&2
+    exit 2
   fi
 }
 
@@ -400,6 +414,7 @@ write_runner_metadata() {
     --arg pwnkit_mode "$PWNKIT_MODE" \
     --arg pwnkit_runtime "$PWNKIT_RUNTIME" \
     --arg pwnkit_rate_limit "$PWNKIT_RATE_LIMIT" \
+    --argjson pwnkit_max_attempts "$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
     --arg pwnkit_feature_codex_live_targets "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" \
     --arg pwnkit_command "$pwnkit_command_quoted" \
     --arg pwnkit_command_source "${PWNKIT_COMMAND_SOURCE:-unknown}" \
@@ -436,6 +451,7 @@ write_runner_metadata() {
         mode: $pwnkit_mode,
         runtime: $pwnkit_runtime,
         rate_limit: $pwnkit_rate_limit,
+        max_attempts: $pwnkit_max_attempts,
         feature_codex_live_targets: (
           if $pwnkit_feature_codex_live_targets == "" then null
           else $pwnkit_feature_codex_live_targets
@@ -588,6 +604,65 @@ finding_count() {
   jq -r '(.findings // []) | length' "$report_file"
 }
 
+pwnkit_db_scalar() {
+  local db_file="$1"
+  local query="$2"
+
+  if [[ ! -f "$db_file" ]] || ! command -v sqlite3 >/dev/null 2>&1; then
+    printf '0'
+    return
+  fi
+
+  sqlite3 "$db_file" "$query" 2>/dev/null || printf '0'
+}
+
+pwnkit_agent_error_count() {
+  local db_file="$1"
+
+  pwnkit_db_scalar "$db_file" \
+    "select count(*) from pipeline_events where eventType = 'agent_error';"
+}
+
+pwnkit_transient_agent_error_count() {
+  local db_file="$1"
+
+  pwnkit_db_scalar "$db_file" \
+    "select count(*) from pipeline_events
+     where eventType = 'agent_error'
+       and (
+         lower(coalesce(json_extract(payload, '$.error'), '')) like '%codex backend%'
+         and (
+           lower(coalesce(json_extract(payload, '$.error'), '')) like '%timed out%'
+           or lower(coalesce(json_extract(payload, '$.error'), '')) like '%timeout%'
+         )
+       );"
+}
+
+stderr_has_transient_agent_error() {
+  local stderr_file="$1"
+
+  [[ -f "$stderr_file" ]] \
+    && grep -Eiq 'codex backend.*(timed out|timeout)' "$stderr_file"
+}
+
+archive_scan_attempt() {
+  local label="$1"
+  local attempt="$2"
+  local output_json="$3"
+  local output_stdout="$4"
+  local output_db="$5"
+  local output_stderr="$6"
+  local attempt_dir="$ARTIFACT_DIR/private/pwnkit-$label-attempt-$attempt"
+  local artifact
+
+  mkdir -p "$attempt_dir"
+  for artifact in "$output_json" "$output_stdout" "$output_db" "$output_stderr"; do
+    if [[ -e "$artifact" ]]; then
+      mv "$artifact" "$attempt_dir/"
+    fi
+  done
+}
+
 run_scan() {
   local label="$1"
   local url="$2"
@@ -595,6 +670,8 @@ run_scan() {
   local output_stdout="$ARTIFACT_DIR/pwnkit-$label.stdout.log"
   local output_db="$ARTIFACT_DIR/pwnkit-$label.db"
   local output_stderr="$ARTIFACT_DIR/pwnkit-$label.stderr.log"
+  local attempt=1
+  local exit_code=0
   local scope_file
   local -a scan_args=(
     scan
@@ -649,13 +726,44 @@ run_scan() {
     pwnkit_env+=(PWNKIT_FEATURE_CODEX_LIVE_TARGETS="$PWNKIT_FEATURE_CODEX_LIVE_TARGETS")
   fi
 
-  set +e
-  env "${pwnkit_env[@]}" "${PWNKIT_COMMAND[@]}" "${scan_args[@]}" \
-      > "$output_stdout" \
-      2> "$output_stderr"
-  local exit_code=$?
-  set -e
-  normalize_pwnkit_report "$output_stdout" "$output_json" || true
+  while :; do
+    set +e
+    env "${pwnkit_env[@]}" "${PWNKIT_COMMAND[@]}" "${scan_args[@]}" \
+        > "$output_stdout" \
+        2> "$output_stderr"
+    exit_code=$?
+    set -e
+    normalize_pwnkit_report "$output_stdout" "$output_json" || true
+
+    local transient_error_count
+    local agent_error_count
+    transient_error_count="$(pwnkit_transient_agent_error_count "$output_db")"
+    agent_error_count="$(pwnkit_agent_error_count "$output_db")"
+    if [[ "$transient_error_count" -eq 0 ]] \
+      && [[ "$exit_code" -ne 0 ]] \
+      && stderr_has_transient_agent_error "$output_stderr"; then
+      transient_error_count=1
+    fi
+
+    if [[ "$transient_error_count" -gt 0 ]] \
+      && (( attempt < EIDOLON_M3_PWNKIT_MAX_ATTEMPTS )); then
+      echo "warning: pwnkit $label attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS recorded transient Codex backend timeout; retrying with failed artifacts archived under private/" >&2
+      archive_scan_attempt \
+        "$label" \
+        "$attempt" \
+        "$output_json" \
+        "$output_stdout" \
+        "$output_db" \
+        "$output_stderr"
+      attempt=$((attempt + 1))
+      continue
+    fi
+
+    if [[ "$agent_error_count" -gt 0 ]]; then
+      echo "warning: pwnkit $label completed with sanitized agent_error count=$agent_error_count" >&2
+    fi
+    break
+  done
 
   if [[ "$exit_code" -eq 0 ]]; then
     if valid_pwnkit_report "$output_json"; then
@@ -692,6 +800,9 @@ main() {
 
   eidolon_lab_require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
   eidolon_lab_require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
+  require_positive_integer \
+    "EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
+    "$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS"
   mkdir -p "$ARTIFACT_DIR"
   printf '%s\n' "$ARTIFACT_DIR" > "$ARTIFACT_DIR/artifact-dir.txt"
 
