@@ -11,6 +11,23 @@
       "count": 2
     }
   ],
+  "matrix_health": {
+    "missing_variant_count": 0,
+    "all_variants_observed": true,
+    "total_pwnkit_agent_errors": 0,
+    "all_observed_samples_agent_error_free": true,
+    "source_checkout_clean_variant_count": 2,
+    "source_checkout_synced_variant_count": 2,
+    "all_observed_source_checkouts_clean": true,
+    "all_observed_source_checkouts_synced": true,
+    "runner_git_heads": [
+      "4a8587f7321af622b58f7a57f21f9acd694dc10f"
+    ],
+    "runner_package_versions": [
+      "0.11.1"
+    ],
+    "ready_for_matrix_interpretation": true
+  },
   "no_signal_diagnostics": {
     "variant_count": 2,
     "likely_cause_counts": [
