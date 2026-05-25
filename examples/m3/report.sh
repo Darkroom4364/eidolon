@@ -9,9 +9,11 @@ usage() {
 Usage: examples/m3/report.sh --pwnkit-artifact <dir> --action-artifact <dir>
 
 Emits an internal M3 uniqueness report as Markdown. The pwnkit artifact
-directory must contain pwnkit-summary.json and pwnkit-eidolon.json. The action
-artifact directory must contain action-trace-summary.json from
-examples/m3/collect-action-trace.sh.
+directory must contain pwnkit-summary.json or pwnkit-summary.redacted.json.
+pwnkit-eidolon.json is optional; when omitted, per-bait finding text matching is
+skipped. The action artifact directory must contain action-trace-summary.json
+from examples/m3/collect-action-trace.sh or agent-replay-trace-summary.json from
+examples/m3/collect-agent-replay-trace.sh.
 
 Environment fallbacks:
   PWNKIT_ARTIFACT_DIR   Directory containing pwnkit-summary.json.
@@ -64,10 +66,21 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 PWNKIT_SUMMARY="$PWNKIT_ARTIFACT_DIR/pwnkit-summary.json"
-PWNKIT_REPORT="$PWNKIT_ARTIFACT_DIR/pwnkit-eidolon.json"
-ACTION_TRACE="$ACTION_ARTIFACT_DIR/action-trace-summary.json"
+if [[ ! -s "$PWNKIT_SUMMARY" && -s "$PWNKIT_ARTIFACT_DIR/pwnkit-summary.redacted.json" ]]; then
+  PWNKIT_SUMMARY="$PWNKIT_ARTIFACT_DIR/pwnkit-summary.redacted.json"
+fi
 
-for required_file in "$PWNKIT_SUMMARY" "$PWNKIT_REPORT" "$ACTION_TRACE"; do
+PWNKIT_REPORT="$PWNKIT_ARTIFACT_DIR/pwnkit-eidolon.json"
+if [[ ! -s "$PWNKIT_REPORT" ]]; then
+  PWNKIT_REPORT="/dev/null"
+fi
+
+ACTION_TRACE="$ACTION_ARTIFACT_DIR/action-trace-summary.json"
+if [[ ! -s "$ACTION_TRACE" && -s "$ACTION_ARTIFACT_DIR/agent-replay-trace-summary.json" ]]; then
+  ACTION_TRACE="$ACTION_ARTIFACT_DIR/agent-replay-trace-summary.json"
+fi
+
+for required_file in "$PWNKIT_SUMMARY" "$ACTION_TRACE"; do
   if [[ ! -s "$required_file" ]]; then
     echo "error: required artifact is missing or empty: $required_file" >&2
     exit 2
@@ -81,7 +94,7 @@ jq -r -n \
   --arg pwnkit_artifact_dir "$PWNKIT_ARTIFACT_DIR" \
   --arg action_artifact_dir "$ACTION_ARTIFACT_DIR" '
   def pwnkit: $pwnkit[0];
-  def pwnkit_report: $pwnkit_report[0];
+  def pwnkit_report: ($pwnkit_report[0] // {findings: []});
   def action: $action[0];
   def pwnkit_runner: pwnkit.runner // {};
 
@@ -192,7 +205,9 @@ jq -r -n \
     end;
 
   def pwnkit_matrix:
-    pwnkit.comparison.correlated_bait_events.matrix // [];
+    pwnkit.comparison.correlated_bait_events.matrix
+    // pwnkit.comparison.correlated_bait_matrix
+    // [];
 
   def action_claim:
     action.claim_level // "missing";
@@ -268,7 +283,7 @@ jq -r -n \
     line(""),
     line("- Boundary: `" + (pwnkit.boundary // action.boundary // "unknown") + "`"),
     line("- Pwnkit artifact: `" + markdown_text(report_path($pwnkit_artifact_dir)) + "`"),
-    line("- Scripted action artifact: `" + markdown_text(report_path($action_artifact_dir)) + "`"),
+    line("- Trace artifact: `" + markdown_text(report_path($action_artifact_dir)) + "`"),
     line("- Report posture: `" + adaptive_policy_posture + "`"),
     line("- Safety note: this is an internal Lab artifact. It is not a public-v1, production-readiness, or autonomous-attacker-attribution claim."),
     line("- Runner freshness note: source-checkout pwnkit artifacts must come from a fresh built `dist/pwnkit.js`; stale source-checkout artifacts should be regenerated before making current pwnkit claims."),
@@ -287,11 +302,11 @@ jq -r -n \
     line("| Pwnkit same-session chain confirmed | `same_session_confirmed_bait_action`: `" + bool_word(pwnkit.comparison.same_session_confirmed_bait_action // false) + "` | `" + status_word(pwnkit.comparison.same_session_confirmed_bait_action // false) + "` |"),
     line("| Pwnkit preserved pinned session | `pinned_session.cookie_preserved`: `" + bool_word(pwnkit.pinned_session.cookie_preserved // false) + "`, requests `" + optional_number(pwnkit.pinned_session.proxy_request_count) + "` | `" + status_word(pwnkit.pinned_session.cookie_preserved // false) + "` |"),
     line("| Pwnkit chain reached controlled reality | `controlled_reality_entered`: `" + bool_word(pwnkit.comparison.controlled_reality_entered // false) + "` | `" + status_word(pwnkit.comparison.controlled_reality_entered // false) + "` |"),
-    line("| Scripted trace proves containment mechanics | action trace `" + action_claim + "`, confirmed actions `" + optional_number(action.counts.same_session_confirmed_bait_actions) + "` | `" + (if action_claim == "controlled_reality_entered" then "scripted-pass" else "open" end) + "` |"),
+    line("| Trace confirms containment mechanics | trace `" + action_claim + "`, confirmed actions `" + optional_number(action.counts.same_session_confirmed_bait_actions) + "` | `" + (if action_claim == "controlled_reality_entered" then "trace-pass" else "open" end) + "` |"),
     line(""),
     line("## Metrics"),
     line(""),
-    line("| Metric | Pwnkit | Scripted action trace |"),
+    line("| Metric | Pwnkit | Trace artifact |"),
     line("| --- | --- | --- |"),
     line("| `claim_level` | `" + (pwnkit.comparison.claim_level // "missing") + "` | `" + action_claim + "` |"),
     line("| `bait_follow_rate` | `" + optional_number(pwnkit.metrics.bait_follow_rate) + "` | `" + optional_number(action.metrics.bait_follow_rate) + "` |"),
@@ -355,7 +370,7 @@ jq -r -n \
     line("- Adaptive bait automation: `" + adaptive_policy_posture + "`."),
     line("- M3 exposure claim: `" + status_word(pwnkit.comparison.bait_reached // false) + "` for pwnkit bait discoverability."),
     line("- M3 differential findings claim: `" + status_word(positive_differential_findings) + "`."),
-    line("- M3 containment mechanics: `" + (if action_claim == "controlled_reality_entered" then "pass-scripted" else "open" end) + "` for proxy trace enforcement."),
+    line("- M3 containment mechanics: `" + (if action_claim == "controlled_reality_entered" then "pass-trace" else "open" end) + "` for proxy trace enforcement."),
     line("- Remaining empirical gap: " + remaining_empirical_gap),
     line(""),
     line("## Non-Claims"),
