@@ -101,10 +101,52 @@ test_bakeoff_jsonl_escapes_runner_kind() {
   ' "$output" >/dev/null
 }
 
+test_bakeoff_collector_preserves_escaped_runner_kind() {
+  local temp_dir
+  local input
+  local summary
+  local runner_kind='scripted "probe" \ path'
+  temp_dir="$(new_temp_dir)"
+  input="$temp_dir/bakeoff.jsonl"
+  summary="$temp_dir/summary.json"
+
+  jq -cn --arg runner_kind "$runner_kind" '{
+    schema_version: 0,
+    run_kind: "m3_bakeoff",
+    defense_mode: "eidolon-mvp",
+    runner_kind: $runner_kind,
+    base_url_kind: "proxy",
+    bait_class: "legacy-import",
+    step: "exposure",
+    method: "GET",
+    path: "/docs",
+    status: 200,
+    request_sent: true,
+    bait_exposed: true,
+    bait_action: false,
+    blocked: false,
+    real_surface: false,
+    after_decision: false,
+    protected_upstream_reached: false,
+    false_positive: false,
+    elapsed_seconds: 1
+  }' > "$input"
+
+  "$SCRIPT_DIR/collect-bakeoff.sh" "$input" > "$summary"
+
+  jq -e --arg runner_kind "$runner_kind" '
+    .runner_kind == $runner_kind
+    and .defense_modes.eidolon_mvp.source_mode == "eidolon-mvp"
+    and .defense_modes.eidolon_mvp.counts.bait_exposures == 1
+    and .defense_modes.eidolon_mvp.bait_classes["legacy-import"].event_count == 1
+  ' "$summary" >/dev/null
+}
+
 test_baseline_rejects_query_base_url
 test_pwnkit_runner_rejects_query_base_url
 test_benign_jsonl_is_valid_with_stubbed_curl
 test_defense_jsonl_is_valid_with_stubbed_curl
 test_bakeoff_jsonl_escapes_runner_kind
+test_bakeoff_collector_preserves_escaped_runner_kind
 
 printf 'shell harness safety fixture tests passed\n'
