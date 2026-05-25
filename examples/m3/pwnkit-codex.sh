@@ -39,7 +39,7 @@ Environment:
   PWNKIT_RATE_LIMIT         pwnkit --rate-limit value. Defaults to 2.
   EIDOLON_M3_PWNKIT_MAX_ATTEMPTS
                             Attempts for stateless pwnkit legs when a transient
-                            Codex backend timeout is recorded. Defaults to 2.
+                            Codex backend error is recorded. Defaults to 2.
                             Stateful Eidolon legs are not retried in-place.
   PWNKIT_FEATURE_CODEX_LIVE_TARGETS
                             Optional legacy pwnkit feature flag. Not set by
@@ -628,14 +628,22 @@ pwnkit_transient_agent_error_count() {
   local db_file="$1"
 
   pwnkit_db_scalar "$db_file" \
-    "select count(*) from pipeline_events
-     where eventType = 'agent_error'
+    "with agent_errors as (
+       select lower(coalesce(json_extract(payload, '$.error'), '')) as error
+       from pipeline_events
+       where eventType = 'agent_error'
+     )
+     select count(*) from agent_errors
+     where error not like '%refresh token%'
+       and error not like '%token refresh failed%'
+       and error not like '%401%'
+       and error not like '%invalid_request_error%'
+       and error not like '%authentication%'
+       and error like '%codex backend%'
        and (
-         lower(coalesce(json_extract(payload, '$.error'), '')) like '%codex backend%'
-         and (
-           lower(coalesce(json_extract(payload, '$.error'), '')) like '%timed out%'
-           or lower(coalesce(json_extract(payload, '$.error'), '')) like '%timeout%'
-         )
+         error like '%timed out%'
+         or error like '%timeout%'
+         or error like '%api error%'
        );"
 }
 
@@ -643,7 +651,8 @@ stderr_has_transient_agent_error() {
   local stderr_file="$1"
 
   [[ -f "$stderr_file" ]] \
-    && grep -Eiq 'codex backend.*(timed out|timeout)' "$stderr_file"
+    && grep -Eiq 'codex backend.*((timed out|timeout)|api error)' "$stderr_file" \
+    && ! grep -Eiq '(refresh token|token refresh failed|401|invalid_request_error|authentication)' "$stderr_file"
 }
 
 archive_scan_attempt() {
@@ -762,7 +771,7 @@ run_scan() {
     if scan_can_retry_in_place "$label" \
       && [[ "$transient_error_count" -gt 0 ]] \
       && (( attempt < EIDOLON_M3_PWNKIT_MAX_ATTEMPTS )); then
-      echo "warning: pwnkit $label attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS recorded transient Codex backend timeout; retrying with failed artifacts archived under private/" >&2
+      echo "warning: pwnkit $label attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS recorded transient Codex backend error; retrying with failed artifacts archived under private/" >&2
       archive_scan_attempt \
         "$label" \
         "$attempt" \
