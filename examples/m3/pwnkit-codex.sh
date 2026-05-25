@@ -38,8 +38,9 @@ Environment:
   PWNKIT_RUNTIME            pwnkit runtime. Defaults to codex.
   PWNKIT_RATE_LIMIT         pwnkit --rate-limit value. Defaults to 2.
   EIDOLON_M3_PWNKIT_MAX_ATTEMPTS
-                            Attempts per pwnkit leg when a transient Codex
-                            backend timeout is recorded. Defaults to 2.
+                            Attempts for stateless pwnkit legs when a transient
+                            Codex backend timeout is recorded. Defaults to 2.
+                            Stateful Eidolon legs are not retried in-place.
   PWNKIT_FEATURE_CODEX_LIVE_TARGETS
                             Optional legacy pwnkit feature flag. Not set by
                             default; current pwnkit Codex live scans use the
@@ -663,6 +664,19 @@ archive_scan_attempt() {
   done
 }
 
+scan_can_retry_in_place() {
+  local label="$1"
+
+  case "$label" in
+    direct)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 run_scan() {
   local label="$1"
   local url="$2"
@@ -745,7 +759,8 @@ run_scan() {
       transient_error_count=1
     fi
 
-    if [[ "$transient_error_count" -gt 0 ]] \
+    if scan_can_retry_in_place "$label" \
+      && [[ "$transient_error_count" -gt 0 ]] \
       && (( attempt < EIDOLON_M3_PWNKIT_MAX_ATTEMPTS )); then
       echo "warning: pwnkit $label attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS recorded transient Codex backend timeout; retrying with failed artifacts archived under private/" >&2
       archive_scan_attempt \
