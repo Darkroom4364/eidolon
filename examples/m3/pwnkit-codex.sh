@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$SCRIPT_DIR/../lib/local-lab.sh"
+
 MODE="${1:-all}"
 ARTIFACT_DIR="${2:-${EIDOLON_M3_ARTIFACT_DIR:-/tmp/eidolon-m3-pwnkit-$(date +%Y%m%d-%H%M%S)}}"
 TARGET_URL="${EIDOLON_LAB_TARGET_URL:-http://127.0.0.1:9001}"
@@ -72,54 +75,6 @@ report into `pwnkit-<leg>.json` before validation.
 The preflight mode validates local runner plumbing, writes scope files and
 `pwnkit-runner-metadata.json`, and exits before running pwnkit scans.
 USAGE
-}
-
-require_loopback_url() {
-  local name="$1"
-  local url="$2"
-
-  if [[ "$url" != http://* ]]; then
-    echo "error: $name must be an http loopback URL, got: $url" >&2
-    exit 2
-  fi
-
-  local rest="${url#http://}"
-  if [[ "$rest" == */* ]]; then
-    echo "error: $name must not include a path, got: $url" >&2
-    exit 2
-  fi
-
-  local authority="$rest"
-  local host
-  if [[ "$authority" == \[*\]* ]]; then
-    host="${authority%%]*}"
-    host="${host#[}"
-  else
-    host="${authority%%:*}"
-  fi
-
-  if [[ "$host" == "localhost" || "$host" == "::1" || "$host" =~ ^127(\.[0-9]{1,3}){3}$ ]]; then
-    return
-  fi
-
-  echo "error: $name must be an http loopback URL, got: $url" >&2
-  exit 2
-}
-
-loopback_host_for_url() {
-  local url="$1"
-  local rest="${url#http://}"
-  local authority="$rest"
-  local host
-
-  if [[ "$authority" == \[*\]* ]]; then
-    host="${authority%%]*}"
-    host="${host#[}"
-  else
-    host="${authority%%:*}"
-  fi
-
-  printf '%s' "$host"
 }
 
 resolve_pwnkit_command() {
@@ -365,7 +320,7 @@ write_pwnkit_scope_file() {
   local host
   local bracketed_host=""
 
-  host="$(loopback_host_for_url "$url")"
+  host="$(eidolon_lab_loopback_host_for_url "$label target URL" "$url")"
   if [[ "$host" == *:* ]]; then
     bracketed_host="[$host]"
   fi
@@ -735,8 +690,8 @@ main() {
     exit 0
   fi
 
-  require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
-  require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
+  eidolon_lab_require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
+  eidolon_lab_require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
   mkdir -p "$ARTIFACT_DIR"
   printf '%s\n' "$ARTIFACT_DIR" > "$ARTIFACT_DIR/artifact-dir.txt"
 

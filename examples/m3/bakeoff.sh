@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$SCRIPT_DIR/../lib/local-lab.sh"
+
 MODE="${1:-all}"
 TARGET_URL="${EIDOLON_LAB_TARGET_URL:-http://127.0.0.1:9001}"
 PROXY_URL="${EIDOLON_LAB_PROXY_URL:-http://127.0.0.1:8080}"
@@ -25,38 +28,6 @@ behavior, not agent capability or offensive solve rate.
 USAGE
 }
 
-require_loopback_url() {
-  local name="$1"
-  local url="$2"
-
-  if [[ "$url" != http://* ]]; then
-    echo "error: $name must be an http loopback URL, got: $url" >&2
-    exit 2
-  fi
-
-  local rest="${url#http://}"
-  if [[ "$rest" == */* ]]; then
-    echo "error: $name must not include a path, got: $url" >&2
-    exit 2
-  fi
-
-  local authority="$rest"
-  local host
-  if [[ "$authority" == \[*\]* ]]; then
-    host="${authority%%]*}"
-    host="${host#[}"
-  else
-    host="${authority%%:*}"
-  fi
-
-  if [[ "$host" == "localhost" || "$host" == "::1" || "$host" =~ ^127(\.[0-9]{1,3}){3}$ ]]; then
-    return
-  fi
-
-  echo "error: $name must be an http loopback URL, got: $url" >&2
-  exit 2
-}
-
 json_line() {
   local defense_mode="$1"
   local base_url_kind="$2"
@@ -74,24 +45,45 @@ json_line() {
   local protected_upstream_reached="${14}"
   local false_positive="${15}"
 
-  printf '{"schema_version":0,"run_kind":"m3_bakeoff","defense_mode":"%s","runner_kind":"%s","base_url_kind":"%s","bait_class":"%s","step":"%s","method":"%s","path":"%s","status":%s,"request_sent":%s,"bait_exposed":%s,"bait_action":%s,"blocked":%s,"real_surface":%s,"after_decision":%s,"protected_upstream_reached":%s,"false_positive":%s,"elapsed_seconds":%s}\n' \
-    "$defense_mode" \
-    "$RUNNER_KIND" \
-    "$base_url_kind" \
-    "$bait_class" \
-    "$step" \
-    "$method" \
-    "$path" \
-    "$status" \
-    "$request_sent" \
-    "$bait_exposed" \
-    "$bait_action" \
-    "$blocked" \
-    "$real_surface" \
-    "$after_decision" \
-    "$protected_upstream_reached" \
-    "$false_positive" \
-    "$SECONDS"
+  jq -cn \
+    --arg defense_mode "$defense_mode" \
+    --arg runner_kind "$RUNNER_KIND" \
+    --arg base_url_kind "$base_url_kind" \
+    --arg bait_class "$bait_class" \
+    --arg step "$step" \
+    --arg method "$method" \
+    --arg path "$path" \
+    --argjson status "$status" \
+    --argjson request_sent "$request_sent" \
+    --argjson bait_exposed "$bait_exposed" \
+    --argjson bait_action "$bait_action" \
+    --argjson blocked "$blocked" \
+    --argjson real_surface "$real_surface" \
+    --argjson after_decision "$after_decision" \
+    --argjson protected_upstream_reached "$protected_upstream_reached" \
+    --argjson false_positive "$false_positive" \
+    --argjson elapsed_seconds "$SECONDS" \
+    '{
+      schema_version: 0,
+      run_kind: "m3_bakeoff",
+      defense_mode: $defense_mode,
+      runner_kind: $runner_kind,
+      base_url_kind: $base_url_kind,
+      bait_class: $bait_class,
+      step: $step,
+      method: $method,
+      path: $path,
+      status: $status,
+      request_sent: $request_sent,
+      bait_exposed: $bait_exposed,
+      bait_action: $bait_action,
+      blocked: $blocked,
+      real_surface: $real_surface,
+      after_decision: $after_decision,
+      protected_upstream_reached: $protected_upstream_reached,
+      false_positive: $false_positive,
+      elapsed_seconds: $elapsed_seconds
+    }'
 }
 
 curl_get() {
@@ -229,8 +221,9 @@ main() {
     exit 0
   fi
 
-  require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
-  require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
+  eidolon_lab_require_command jq
+  eidolon_lab_require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
+  eidolon_lab_require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
 
   case "$MODE" in
     all)
