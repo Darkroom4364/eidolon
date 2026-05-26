@@ -353,6 +353,32 @@
       "eidolon_bait_action_without_findings": false,
       "eidolon_controlled_reality_without_findings": false,
       "next_question": "differential_finding_observed"
+    },
+    "strict_correlation_gap": {
+      "proxy_confirmed_action_count": 1,
+      "strict_correlated_action_count": 1,
+      "strict_confirmed_action_count": 0,
+      "unconfirmed_strict_action_count": 1,
+      "proxy_confirmed_action_not_strict_count": 1,
+      "matching_proxy_exposure_not_pwnkit_correlated_count": 1,
+      "unconfirmed_actions": [
+        {
+          "bait_id": "rel_2025_04_b7f2",
+          "action_path": "/api/v2/import/reconcile",
+          "has_exposure_id": true,
+          "matching_proxy_exposure_count": 1,
+          "matching_strict_exposure_count": 0,
+          "matching_proxy_exposure_surfaces": [
+            "/docs/legacy-import"
+          ],
+          "reason": "matching_proxy_exposure_not_pwnkit_correlated"
+        }
+      ],
+      "likely_cause": "matching_proxy_exposure_not_pwnkit_correlated",
+      "next_questions": [
+        "why_pwnkit_did_not_emit_request_artifact_for_exposure_surface",
+        "whether_exposure_surface_was_reached_by_non_pwnkit_tooling_or_unpersisted_output"
+      ]
     }
   },
   "metrics": {
@@ -385,6 +411,7 @@
     "finding_diagnostics intentionally keeps only counts, coarse classifications, and field presence; it omits finding titles, descriptions, raw evidence, request bodies, raw URLs, and analysis text.",
     "agent_error_diagnostics intentionally keeps only counts and coarse error classes; it omits raw pwnkit agent error text.",
     "comparison.finding_gap records whether pwnkit observed target or bait evidence that was not promoted to a pwnkit finding.",
+    "comparison.strict_correlation_gap explains why a proxy-confirmed bait action did not become a strict pwnkit-correlated same-session action.",
     "When emitted, a bait_not_reached conclusion means the agent interacted with the protected target through Eidolon but did not touch any owned bait surface."
   ],
   "redaction": {
