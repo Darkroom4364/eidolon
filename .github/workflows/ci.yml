@@ -9,7 +9,32 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  checks: read
+  contents: read
+
 jobs:
+  foxguard:
+    name: Foxguard
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Wait for Foxguard GitHub App check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FOXGUARD_APP_SLUG: ${{ vars.FOXGUARD_APP_SLUG || 'foxguard' }}
+          FOXGUARD_CHECK_NAME: ${{ vars.FOXGUARD_CHECK_NAME || '' }}
+          FOXGUARD_ACCEPTABLE_CONCLUSIONS: ${{ vars.FOXGUARD_ACCEPTABLE_CONCLUSIONS || 'success' }}
+          FOXGUARD_MAX_WAIT_SECONDS: ${{ vars.FOXGUARD_MAX_WAIT_SECONDS || '600' }}
+          FOXGUARD_POLL_SECONDS: ${{ vars.FOXGUARD_POLL_SECONDS || '15' }}
+          FOXGUARD_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          FOXGUARD_FALLBACK_SHA: ${{ github.sha }}
+        run: scripts/ci/wait-for-github-app-check.sh
+
   rust:
     name: Rust
     runs-on: ubuntu-latest
@@ -59,8 +84,8 @@ jobs:
             examples/m3/bait-promotion-variants.json \
             examples/m3/bait-profiles/*.json
 
-      - name: Check example shell syntax
-        run: bash -n examples/lib/*.sh examples/m3/*.sh examples/baselines/*.sh examples/metrics/*.sh
+      - name: Check shell syntax
+        run: bash -n scripts/ci/*.sh examples/lib/*.sh examples/m3/*.sh examples/baselines/*.sh examples/metrics/*.sh
 
       - name: Run M3 fixture tests
         run: |
