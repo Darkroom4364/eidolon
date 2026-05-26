@@ -59,6 +59,28 @@ runner_environment=kali_vm
 network_topology=same_vm_loopback
 ```
 
+## Preflight
+
+After the dry run looks correct, validate local VM plumbing before starting a
+full sample:
+
+```sh
+cd ~/Projects/eidolon
+
+PWNKIT_NODE_ENTRY="$HOME/Projects/pwnkit/dist/pwnkit.js" \
+  examples/m3/run-pwnkit-kali-vm.sh --preflight 3 /tmp/eidolon-m3-pwnkit-kali-vm
+```
+
+Preflight writes only generated scopes and runner metadata under:
+
+```text
+/tmp/eidolon-m3-pwnkit-kali-vm/private/kali-vm-preflight/
+```
+
+It checks the Kali wrapper contract, loopback URLs, required local tools, pwnkit
+entrypoint availability, generated scope files, and pwnkit source-checkout
+freshness metadata. It does not start the demo target, proxy, or pwnkit scans.
+
 ## Sample Run
 
 ```sh

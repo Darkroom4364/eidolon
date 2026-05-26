@@ -12,8 +12,10 @@ new_temp_dir() {
 test_help_mentions_vm_contract() {
   "$RUNNER" --help | rg -q 'Kali Linux VM'
   "$RUNNER" --help | rg -q 'OrbStack'
+  "$RUNNER" --help | rg -q -- '--preflight'
   "$RUNNER" --help | rg -q 'same_vm_loopback'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_KALI_VM_DRY_RUN'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_KALI_VM_PREFLIGHT'
 }
 
 test_rejects_non_kali_without_override() {
@@ -56,6 +58,45 @@ test_dry_run_records_vm_local_contract() {
   rg -q '^run_count=2$' "$sample_dir/sample-plan.txt"
   rg -q '^runner_environment=kali_vm$' "$sample_dir/sample-plan.txt"
   rg -q '^network_topology=same_vm_loopback$' "$sample_dir/sample-plan.txt"
+}
+
+test_preflight_writes_runner_metadata() {
+  local sample_dir
+  local output
+  sample_dir="$(new_temp_dir)"
+
+  output="$(
+    EIDOLON_M3_ALLOW_NON_KALI_VM=1 \
+      EIDOLON_M3_KALI_VM_DRY_RUN=1 \
+      EIDOLON_M3_PIN_SESSION=0 \
+      PWNKIT_BIN=true \
+      "$RUNNER" --preflight 2 "$sample_dir" 2>&1
+  )"
+
+  rg -q 'kali-vm preflight ok:' <<<"$output"
+  [[ -f "$sample_dir/private/kali-vm-preflight/pwnkit-runner-metadata.json" ]]
+  jq -e '
+    .mode == "preflight"
+    and .environment.runner_environment == "kali_vm"
+    and .environment.network_topology == "same_vm_loopback"
+    and .pwnkit.command_source == "PWNKIT_BIN"
+  ' "$sample_dir/private/kali-vm-preflight/pwnkit-runner-metadata.json" >/dev/null
+}
+
+test_preflight_requires_pwnkit_runner() {
+  local output
+  local status=0
+
+  output="$(
+    EIDOLON_M3_ALLOW_NON_KALI_VM=1 \
+      EIDOLON_M3_KALI_VM_DRY_RUN=1 \
+      EIDOLON_M3_PIN_SESSION=0 \
+      PWNKIT_NODE_ENTRY="$(new_temp_dir)/missing-pwnkit.js" \
+      "$RUNNER" --preflight 1 "$(new_temp_dir)" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'PWNKIT_NODE_ENTRY does not exist' <<<"$output"
 }
 
 test_rejects_non_vm_topology() {
@@ -124,6 +165,8 @@ test_help_mentions_vm_contract
 test_rejects_non_kali_without_override
 test_rejects_non_kali_override_without_dry_run
 test_dry_run_records_vm_local_contract
+test_preflight_writes_runner_metadata
+test_preflight_requires_pwnkit_runner
 test_rejects_non_vm_topology
 test_rejects_userinfo_loopback_smuggling
 test_rejects_repo_local_sample_dir
