@@ -15,6 +15,8 @@ EIDOLON_M3_BAIT_PROFILE="${EIDOLON_M3_BAIT_PROFILE:-}"
 EIDOLON_M3_ALLOW_AGENT_ERRORS="${EIDOLON_M3_ALLOW_AGENT_ERRORS:-0}"
 EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE="${EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE:-0}"
 EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="${EIDOLON_M3_PWNKIT_MAX_ATTEMPTS:-2}"
+EIDOLON_M3_RUNNER_ENVIRONMENT="${EIDOLON_M3_RUNNER_ENVIRONMENT:-auto}"
+EIDOLON_M3_NETWORK_TOPOLOGY="${EIDOLON_M3_NETWORK_TOPOLOGY:-same_host_loopback}"
 
 TARGET_PID=""
 PROXY_PID=""
@@ -50,6 +52,12 @@ Environment:
   EIDOLON_M3_SAMPLE_DRY_RUN    If true, create the planned directory layout only.
   EIDOLON_M3_CODEX_AUTH_FILE   Optional Codex auth JSON path passed through to
                                 pwnkit-codex.sh. Defaults to ~/.codex/auth.json.
+  EIDOLON_M3_RUNNER_ENVIRONMENT
+                                Runner environment label recorded in metadata.
+                                Defaults to auto; examples: host_mac, kali_vm,
+                                linux_host.
+  EIDOLON_M3_NETWORK_TOPOLOGY   Network topology label recorded in metadata.
+                                Defaults to same_host_loopback.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to pwnkit-codex.sh.
 
 Use only against the owned loopback Lab target. Sync and rebuild pwnkit before
@@ -160,6 +168,8 @@ write_dry_run_plan() {
     printf 'allow_agent_errors=%s\n' "$EIDOLON_M3_ALLOW_AGENT_ERRORS"
     printf 'allow_unfresh_pwnkit_source=%s\n' "$EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE"
     printf 'pwnkit_max_attempts=%s\n' "$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS"
+    printf 'runner_environment=%s\n' "$EIDOLON_M3_RUNNER_ENVIRONMENT"
+    printf 'network_topology=%s\n' "$EIDOLON_M3_NETWORK_TOPOLOGY"
     printf 'debug_log=run-*/private/eidolon-debug.jsonl\n'
     printf 'sample_summary=pwnkit-stability-sample.json\n'
   } > "$plan_file"
@@ -218,6 +228,8 @@ run_pwnkit_preflight() {
     EIDOLON_LAB_PROXY_URL="$PROXY_URL" \
     EIDOLON_M3_PIN_SESSION="$EIDOLON_M3_PIN_SESSION" \
     EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
+    EIDOLON_M3_RUNNER_ENVIRONMENT="$EIDOLON_M3_RUNNER_ENVIRONMENT" \
+    EIDOLON_M3_NETWORK_TOPOLOGY="$EIDOLON_M3_NETWORK_TOPOLOGY" \
     "$SCRIPT_DIR/pwnkit-codex.sh" preflight "$preflight_dir" >/dev/null
   EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE="$EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE" \
     "$SCRIPT_DIR/check-pwnkit-runner-freshness.sh" \
@@ -269,6 +281,8 @@ run_one_sample() {
       EIDOLON_LAB_PROXY_URL="$PROXY_URL" \
       EIDOLON_M3_PIN_SESSION="$EIDOLON_M3_PIN_SESSION" \
       EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
+      EIDOLON_M3_RUNNER_ENVIRONMENT="$EIDOLON_M3_RUNNER_ENVIRONMENT" \
+      EIDOLON_M3_NETWORK_TOPOLOGY="$EIDOLON_M3_NETWORK_TOPOLOGY" \
       "$SCRIPT_DIR/pwnkit-codex.sh" all "$run_dir"
     "$SCRIPT_DIR/collect-pwnkit-codex.sh" "$run_dir" > "$run_dir/pwnkit-summary.json"
     "$SCRIPT_DIR/collect-agent-replay-trace.sh" "$run_dir" \

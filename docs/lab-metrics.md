@@ -277,7 +277,11 @@ generated pwnkit scope files; the collector copies this into
 `pwnkit-summary.json` under `runner`. For current-behavior claims against a
 moving pwnkit mainline, prefer artifacts where
 `runner.pwnkit.origin_main.in_sync` is `true` and
-`runner.pwnkit.git_dirty` is `false`.
+`runner.pwnkit.git_dirty` is `false`. Reproducible historical runs may use an
+archived or private local pinned pwnkit fixture instead; runner metadata also
+records `runner.environment.runner_environment`,
+`runner.environment.network_topology`, and
+`runner.environment.tool_fingerprint`.
 
 The repeated sample runner executes `examples/m3/pwnkit-codex.sh preflight`
 before starting the Lab target. Preflight writes only pwnkit scopes and
@@ -299,6 +303,10 @@ descriptions, raw evidence, request bodies, raw URLs, and analysis text. Use
 - pwnkit observed target evidence but reported no Eidolon findings
 - pwnkit reached bait, replayed a bait-shaped action, or entered controlled
   reality without reporting an Eidolon finding
+
+The collector also keeps final JSON findings separate from DB-saved findings
+with `finding_reconciliation` and `finding_export_gap`, so export-path gaps do
+not get confused with scanner behavior.
 
 The corresponding sample-level fields live under `differential_findings`. See
 [`m3-pwnkit-differential-findings.md`](m3-pwnkit-differential-findings.md) for
@@ -400,6 +408,14 @@ The wrapper writes the aggregate to
 `/tmp/eidolon-m3-pwnkit-sample/pwnkit-stability-sample.json`. To aggregate
 already-collected runs manually, pass their artifact directories to
 `examples/m3/collect-pwnkit-sample.sh`.
+
+For VM-local Kali evidence, use
+[`../examples/m3/kali-vm-pwnkit.md`](../examples/m3/kali-vm-pwnkit.md) and run
+`examples/m3/run-pwnkit-kali-vm.sh` from inside the Kali VM. That wrapper
+delegates to the same sample runner, but enforces
+`runner_environment=kali_vm`, `network_topology=same_vm_loopback`, loopback
+target/proxy URLs, and a sample directory outside the Eidolon checkout. It does
+not create or manage an OrbStack machine.
 
 To prepare a commit-safe evidence bundle from a completed sample, package it
 through the redaction helper:

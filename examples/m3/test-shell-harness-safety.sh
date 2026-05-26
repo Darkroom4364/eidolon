@@ -46,6 +46,19 @@ test_pwnkit_runner_rejects_query_base_url() {
   rg -q 'must not include a path, query, or fragment' <<<"$output"
 }
 
+test_loopback_url_rejects_userinfo_authority() {
+  local output
+  local status=0
+
+  output="$(
+    EIDOLON_LAB_BASE_URL='http://localhost:pw@192.168.64.2:9101' \
+      "$REPO_ROOT/examples/baselines/benign.sh" curl-like 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'must not include userinfo' <<<"$output"
+}
+
 test_benign_jsonl_is_valid_with_stubbed_curl() {
   local temp_dir
   local output
@@ -144,6 +157,7 @@ test_bakeoff_collector_preserves_escaped_runner_kind() {
 
 test_baseline_rejects_query_base_url
 test_pwnkit_runner_rejects_query_base_url
+test_loopback_url_rejects_userinfo_authority
 test_benign_jsonl_is_valid_with_stubbed_curl
 test_defense_jsonl_is_valid_with_stubbed_curl
 test_bakeoff_jsonl_escapes_runner_kind
