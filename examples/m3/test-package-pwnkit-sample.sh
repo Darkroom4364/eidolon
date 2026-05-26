@@ -484,6 +484,7 @@ test_packager_redacts_raw_artifacts_and_query_values() {
 
   rg -q 'pwnkit-stability-sample.json' "$bundle_dir/SHA256SUMS"
   rg -q 'run-1/pwnkit-summary.redacted.json' "$bundle_dir/SHA256SUMS"
+  rg -q '`strict_stability.ready_for_stability_claim`: `false`' "$bundle_dir/README.md"
 }
 
 test_packager_refuses_non_empty_bundle_dir() {
