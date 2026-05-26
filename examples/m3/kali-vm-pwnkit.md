@@ -39,8 +39,14 @@ pnpm run build
 ```
 
 Keep the pwnkit checkout local to the VM. If the public upstream is no longer
-available, treat the local checkout as a pinned fixture and record the resulting
-runner metadata instead of claiming moving-main behavior.
+available, treat the local checkout as a pinned fixture instead of claiming
+moving-main behavior. Use a short non-secret fixture label, for example:
+
+```sh
+export EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private
+```
+
+Pinned fixtures must still be clean git checkouts with a recorded git head.
 
 ## Dry Run
 
@@ -68,6 +74,7 @@ full sample:
 cd ~/Projects/eidolon
 
 PWNKIT_NODE_ENTRY="$HOME/Projects/pwnkit/dist/pwnkit.js" \
+EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
   examples/m3/run-pwnkit-kali-vm.sh --preflight 3 /tmp/eidolon-m3-pwnkit-kali-vm
 ```
 
@@ -79,7 +86,9 @@ Preflight writes only generated scopes and runner metadata under:
 
 It checks the Kali wrapper contract, loopback URLs, required local tools, pwnkit
 entrypoint availability, generated scope files, and pwnkit source-checkout
-freshness metadata. It does not start the demo target, proxy, or pwnkit scans.
+freshness metadata. For archived/private local pwnkit, the fixture id lets a
+clean pinned checkout pass without origin/main freshness. It does not start the
+demo target, proxy, or pwnkit scans.
 
 ## Sample Run
 
@@ -87,6 +96,7 @@ freshness metadata. It does not start the demo target, proxy, or pwnkit scans.
 cd ~/Projects/eidolon
 
 PWNKIT_NODE_ENTRY="$HOME/Projects/pwnkit/dist/pwnkit.js" \
+EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
   examples/m3/run-pwnkit-kali-vm.sh 3 /tmp/eidolon-m3-pwnkit-kali-vm
 ```
 
@@ -115,6 +125,8 @@ For VM-local evidence, expect:
 
 - `runner_environments` includes only `kali_vm`
 - `runner_network_topologies` includes only `same_vm_loopback`
+- `runner_pwnkit_fixture_ids` records the pinned fixture id when upstream
+  origin/main freshness is not the evidence contract
 - `tool_fingerprint_summary` records Kali tool availability without command
   paths
 - `finding_reconciliation` distinguishes final JSON findings from DB-saved

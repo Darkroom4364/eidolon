@@ -101,6 +101,15 @@ redact_sample_summary() {
           ]
         }
       end;
+    def clean_fixture:
+      if . == null then
+        null
+      else
+        {
+          id: (.id // null),
+          pinned: (.pinned // false)
+        }
+      end;
     {
       schema_version,
       run_kind,
@@ -114,6 +123,7 @@ redact_sample_summary() {
       strongest_claim_level,
       runner_git_heads,
       runner_package_versions,
+      runner_pwnkit_fixture_ids,
       runner_environments,
       runner_network_topologies,
       tool_fingerprint_summary,
@@ -134,6 +144,8 @@ redact_sample_summary() {
           runner_git_dirty,
           runner_origin_main,
           runner_origin_main_in_sync,
+          runner_pwnkit_fixture: (.runner_pwnkit_fixture | clean_fixture),
+          runner_pwnkit_fixture_id,
           stale_dist_guard_bypassed,
           runner_environment,
           runner_environment_source,
@@ -255,6 +267,16 @@ redact_pwnkit_summary() {
           git_head_time_seconds: .runner.pwnkit.git_head_time_seconds,
           git_dirty: .runner.pwnkit.git_dirty,
           origin_main: .runner.pwnkit.origin_main,
+          fixture: (
+            if (.runner.pwnkit.fixture // null) == null then
+              null
+            else
+              {
+                id: (.runner.pwnkit.fixture.id // null),
+                pinned: (.runner.pwnkit.fixture.pinned // false)
+              }
+            end
+          ),
           stale_dist_guard_bypassed: .runner.pwnkit.stale_dist_guard_bypassed,
           scopes: (.runner.pwnkit.scopes | clean_scopes)
         },
@@ -374,6 +396,7 @@ write_readme() {
   local ready
   local heads
   local versions
+  local fixture_ids
   local environments
   local db_saved_counts
   local direct_counts
@@ -389,6 +412,7 @@ write_readme() {
   ready="$(sample_value '.strict_stability.ready_for_stability_claim')"
   heads="$(jq -r '(.runner_git_heads // []) | map("`" + . + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   versions="$(jq -r '(.runner_package_versions // []) | map("`" + . + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
+  fixture_ids="$(jq -r '(.runner_pwnkit_fixture_ids // []) | map("`" + . + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   environments="$(jq -r '(.runner_environments // []) | map("`" + . + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   db_saved_counts="$(jq -r '[.finding_reconciliation.direct_db_saved_finding_total // 0, .finding_reconciliation.eidolon_db_saved_finding_total // 0] | map(tostring) | join("/")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   direct_counts="$(jq -r '[(.artifacts // [])[] | (.direct_finding_count // 0)] | join("/")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
@@ -407,6 +431,7 @@ write_readme() {
     printf -- '- Source sample directory: omitted from the committed bundle.\n'
     printf -- '- pwnkit runner head(s): %s.\n' "${heads:-unknown}"
     printf -- '- pwnkit package version(s): %s.\n' "${versions:-unknown}"
+    printf -- '- pwnkit pinned fixture id(s): %s.\n' "${fixture_ids:-none}"
     printf -- '- runner environment(s): %s.\n' "${environments:-unknown}"
     printf -- '- Session control: pinned Eidolon session cookie when enabled by the sample runner.\n\n'
     printf '## Contents\n\n'

@@ -152,8 +152,9 @@ also records the pwnkit package version, git head, dirty-worktree state, and the
 local `origin/main` ahead/behind relation. It also records
 `runner.environment.runner_environment`, `network_topology`, and a sanitized tool
 fingerprint so archived or private local pwnkit fixtures can be interpreted
-later. Treat `origin_main.in_sync == true` and `git_dirty == false` as part of
-the evidence contract for current-main claims.
+later. Set `EIDOLON_M3_PWNKIT_FIXTURE_ID` for a clean pinned fixture; leave it
+unset and require `origin_main.in_sync == true` plus `git_dirty == false` for
+current-main claims.
 
 To test whether an observed replay can preserve one Eidolon Lab session without
 seeding any bait markers, pin the Eidolon leg to a generated session cookie:

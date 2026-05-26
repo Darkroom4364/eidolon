@@ -17,6 +17,7 @@ test_help_mentions_sample_summary() {
   "$RUNNER" --help | rg -q 'EIDOLON_M3_CODEX_AUTH_FILE'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_RUNNER_ENVIRONMENT'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_NETWORK_TOPOLOGY'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID'
 }
 
 test_rejects_invalid_run_count() {
@@ -60,6 +61,7 @@ test_dry_run_creates_private_layout() {
   rg -q '^pwnkit_max_attempts=2$' "$sample_dir/sample-plan.txt"
   rg -q '^runner_environment=auto$' "$sample_dir/sample-plan.txt"
   rg -q '^network_topology=same_host_loopback$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_fixture_id=none$' "$sample_dir/sample-plan.txt"
   rg -q '^debug_log=run-\*/private/eidolon-debug\.jsonl$' "$sample_dir/sample-plan.txt"
 }
 
@@ -111,6 +113,17 @@ test_dry_run_records_unfresh_source_override() {
   rg -q '^allow_unfresh_pwnkit_source=1$' "$sample_dir/sample-plan.txt"
 }
 
+test_dry_run_records_pwnkit_fixture_id() {
+  local sample_dir
+  sample_dir="$(new_temp_dir)"
+
+  EIDOLON_M3_SAMPLE_DRY_RUN=1 \
+    EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
+    "$RUNNER" 1 "$sample_dir" >/dev/null
+
+  rg -q '^pwnkit_fixture_id=pwnkit-v0\.12\.0-private$' "$sample_dir/sample-plan.txt"
+}
+
 test_dry_run_records_bait_profile() {
   local sample_dir
   local profile
@@ -160,6 +173,7 @@ test_dry_run_creates_private_layout
 test_dry_run_records_runner_environment_overrides
 test_dry_run_records_agent_error_override
 test_dry_run_records_unfresh_source_override
+test_dry_run_records_pwnkit_fixture_id
 test_dry_run_records_bait_profile
 test_rejects_missing_bait_profile
 test_dry_run_accepts_localhost_urls

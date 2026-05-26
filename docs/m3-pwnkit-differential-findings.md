@@ -89,8 +89,10 @@ Before collecting a new sample:
    `pwnkit-runner-metadata.json`.
 3. Keep `EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=0` so
    `run-pwnkit-sample.sh` preflights pwnkit source-checkout freshness before
-   starting the Lab target. Use `EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=1` only
-   for diagnostic artifact preservation.
+   starting the Lab target. Use `EIDOLON_M3_PWNKIT_FIXTURE_ID` only for a clean,
+   archived/private pinned pwnkit fixture; use
+   `EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=1` only for diagnostic artifact
+   preservation.
 4. Confirm `runner.pwnkit.origin_main.in_sync` is `true` and
    `runner.pwnkit.git_dirty` is `false` in the collected summary before making
    current-pwnkit claims.
