@@ -805,6 +805,126 @@ jq -n \
            end
          )
        };
+   def strict_correlation_gap:
+     correlated_bait_exposures as $strict_exposures
+     | correlated_bait_actions as $strict_actions
+     | correlated_confirmed_bait_actions as $strict_confirmed_actions
+     | (
+         ($proxy.bait_events.actions // [])
+         | map(select(.same_session_confirmed // false))
+       ) as $proxy_confirmed_actions
+     | [
+         $strict_actions[] as $action
+         | select(
+             any(
+               $strict_confirmed_actions[];
+               .event_index == $action.event_index
+             )
+             | not
+           )
+         | (
+             ($proxy.bait_events.exposures // [])
+             | map(
+                 select(
+                   .session_id == $action.session_id
+                   and .bait_id == $action.bait_id
+                   and .exposure_id == $action.exposure_id
+                   and ((.event_index // -1) < ($action.event_index // -1))
+                 )
+               )
+           ) as $proxy_matches
+         | (
+             $strict_exposures
+             | map(
+                 select(
+                   .session_id == $action.session_id
+                   and .bait_id == $action.bait_id
+                   and .exposure_id == $action.exposure_id
+                   and ((.event_index // -1) < ($action.event_index // -1))
+                 )
+               )
+           ) as $strict_matches
+         | {
+             bait_id: $action.bait_id,
+             action_path: redacted_target($action.path),
+             has_exposure_id: ($action.exposure_id != null),
+             matching_proxy_exposure_count: ($proxy_matches | length),
+             matching_strict_exposure_count: ($strict_matches | length),
+             matching_proxy_exposure_surfaces: (
+               $proxy_matches | map(path_without_query(.surface)) | unique
+             ),
+             reason: (
+               if $action.exposure_id == null then
+                 "action_missing_exposure_id"
+               elif ($proxy_matches | length) == 0 then
+                 "no_prior_proxy_exposure_matched_action"
+               elif ($strict_matches | length) == 0 then
+                 "matching_proxy_exposure_not_pwnkit_correlated"
+               else
+                 "unknown"
+               end
+             )
+           }
+       ] as $unconfirmed_actions
+     | (
+         $unconfirmed_actions
+         | map(select(.reason == "matching_proxy_exposure_not_pwnkit_correlated"))
+         | length
+       ) as $proxy_exposure_not_correlated_count
+     | (
+         $proxy_confirmed_actions
+         | map(
+             . as $proxy_action
+             | select(
+                 any(
+                   $strict_confirmed_actions[];
+                   .event_index == $proxy_action.event_index
+                 )
+                 | not
+               )
+           )
+         | length
+       ) as $proxy_confirmed_not_strict_count
+     | {
+         proxy_confirmed_action_count: ($proxy_confirmed_actions | length),
+         strict_correlated_action_count: ($strict_actions | length),
+         strict_confirmed_action_count: ($strict_confirmed_actions | length),
+         unconfirmed_strict_action_count: ($unconfirmed_actions | length),
+         proxy_confirmed_action_not_strict_count: $proxy_confirmed_not_strict_count,
+         matching_proxy_exposure_not_pwnkit_correlated_count: (
+           $proxy_exposure_not_correlated_count
+         ),
+         unconfirmed_actions: $unconfirmed_actions,
+         likely_cause: (
+           if ($unconfirmed_actions | length) == 0 then
+             null
+           elif $proxy_exposure_not_correlated_count > 0 then
+             "matching_proxy_exposure_not_pwnkit_correlated"
+           elif any($unconfirmed_actions[]; .reason == "action_missing_exposure_id") then
+             "action_missing_exposure_id"
+           elif any($unconfirmed_actions[]; .reason == "no_prior_proxy_exposure_matched_action") then
+             "no_prior_proxy_exposure_matched_action"
+           else
+             "unknown"
+           end
+         ),
+         next_questions: (
+           if ($unconfirmed_actions | length) == 0 then
+             []
+           elif $proxy_exposure_not_correlated_count > 0 then
+             [
+               "why_pwnkit_did_not_emit_request_artifact_for_exposure_surface",
+               "whether_exposure_surface_was_reached_by_non_pwnkit_tooling_or_unpersisted_output"
+             ]
+           elif any($unconfirmed_actions[]; .reason == "action_missing_exposure_id") then
+             ["why_action_request_lacked_exposure_id"]
+           elif any($unconfirmed_actions[]; .reason == "no_prior_proxy_exposure_matched_action") then
+             ["why_action_exposure_id_did_not_match_prior_proxy_exposure"]
+           else
+             ["inspect_strict_correlation_gap"]
+           end
+         )
+       };
    def target_correlation_diagnostics:
      ($eidolon.target_evidence_diagnostics.request_artifact_count // 0)
        as $pwnkit_request_artifacts
@@ -931,7 +1051,8 @@ jq -n \
       controlled_reality_entered: ((correlated_controlled_reality_entries | length) > 0),
       claim_level: claim_level,
       conclusion: status,
-      finding_gap: finding_gap
+      finding_gap: finding_gap,
+      strict_correlation_gap: strict_correlation_gap
     },
     metrics: {
       bait_follow_rate: (
@@ -961,6 +1082,7 @@ jq -n \
       "finding_diagnostics intentionally keeps only counts, coarse classifications, and field presence; it omits finding titles, descriptions, raw evidence, request bodies, raw URLs, and analysis text.",
       "agent_error_diagnostics intentionally keeps only counts and coarse error classes; it omits raw pwnkit agent error text.",
       "comparison.finding_gap records whether pwnkit observed target or bait evidence that was not promoted to a pwnkit finding.",
+      "comparison.strict_correlation_gap explains why a proxy-confirmed bait action did not become a strict pwnkit-correlated same-session action.",
       "When emitted, a bait_not_reached conclusion means the agent interacted with the protected target through Eidolon but did not touch any owned bait surface."
     ]
   }'

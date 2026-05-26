@@ -360,6 +360,7 @@ done | jq -s '
             next_question: null
           }
         ),
+        strict_correlation_gap: (.comparison.strict_correlation_gap // null),
         correlated_counts: {
           target_requests: ((.comparison.correlated_target_requests // []) | length),
           bait_exposures: (
@@ -644,6 +645,21 @@ done | jq -s '
       | map(select(.trace_gap.positive_differential_without_strict_controlled_reality))
       | length
     ) as $positive_without_strict_count
+  | (
+      $present
+      | map(
+          select(
+            .strict_correlation_gap.likely_cause
+            == "matching_proxy_exposure_not_pwnkit_correlated"
+          )
+        )
+      | length
+    ) as $matching_proxy_exposure_not_correlated_count
+  | (
+      $present
+      | map(.strict_correlation_gap.likely_cause // null)
+      | map(select(. != null))
+    ) as $strict_correlation_likely_causes
   | ($present | map(.eidolon_proxy.request_path_counts[]?)) as $proxy_path_entries
   | (
       $present
@@ -825,6 +841,13 @@ done | jq -s '
         ),
         positive_differential_without_strict_controlled_reality_run_count: (
           $positive_without_strict_count
+        ),
+        matching_proxy_exposure_not_pwnkit_correlated_run_count: (
+          $matching_proxy_exposure_not_correlated_count
+        ),
+        strict_correlation_gap_likely_causes: (
+          count_values($strict_correlation_likely_causes)
+          | map({likely_cause: .value, count})
         ),
         all_proxy_trace_contained: (
           $valid_count > 0
