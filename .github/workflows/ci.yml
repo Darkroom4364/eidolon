@@ -29,6 +29,7 @@ jobs:
           FOXGUARD_APP_SLUG: ${{ vars.FOXGUARD_APP_SLUG || 'foxguard' }}
           FOXGUARD_CHECK_NAME: ${{ vars.FOXGUARD_CHECK_NAME || '' }}
           FOXGUARD_ACCEPTABLE_CONCLUSIONS: ${{ vars.FOXGUARD_ACCEPTABLE_CONCLUSIONS || 'success' }}
+          FOXGUARD_REQUIRED: ${{ vars.FOXGUARD_REQUIRED || '0' }}
           FOXGUARD_MAX_WAIT_SECONDS: ${{ vars.FOXGUARD_MAX_WAIT_SECONDS || '600' }}
           FOXGUARD_POLL_SECONDS: ${{ vars.FOXGUARD_POLL_SECONDS || '15' }}
           FOXGUARD_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}

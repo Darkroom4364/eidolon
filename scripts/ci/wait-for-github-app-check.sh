@@ -4,6 +4,7 @@ set -euo pipefail
 APP_SLUG="${FOXGUARD_APP_SLUG:-foxguard}"
 CHECK_NAME="${FOXGUARD_CHECK_NAME:-}"
 ACCEPTABLE_CONCLUSIONS="${FOXGUARD_ACCEPTABLE_CONCLUSIONS:-success}"
+REQUIRED="${FOXGUARD_REQUIRED:-0}"
 MAX_WAIT_SECONDS="${FOXGUARD_MAX_WAIT_SECONDS:-600}"
 POLL_SECONDS="${FOXGUARD_POLL_SECONDS:-15}"
 REPOSITORY="${GITHUB_REPOSITORY:-}"
@@ -30,6 +31,19 @@ require_positive_integer() {
   if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
     fail "$name must be a positive integer, got: $value"
   fi
+}
+
+truthy() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    1|true|yes|on|required)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 candidate_shas() {
@@ -97,8 +111,11 @@ wait_for_foxguard() {
   local count
   local pending
   local failed
+  local found_any
 
   while (( SECONDS <= deadline )); do
+    found_any=0
+
     while IFS= read -r sha; do
       runs="$(foxguard_runs_json "$sha")"
       count="$(run_count "$runs")"
@@ -107,6 +124,7 @@ wait_for_foxguard() {
         echo "Foxguard check not found on $sha yet"
         continue
       fi
+      found_any=1
 
       pending="$(pending_count "$runs")"
       if (( pending > 0 )); then
@@ -125,8 +143,20 @@ wait_for_foxguard() {
       return 0
     done < <(candidate_shas)
 
+    if (( found_any == 0 )) && ! truthy "$REQUIRED"; then
+      echo "Foxguard check was not found; passing because FOXGUARD_REQUIRED is not enabled"
+      echo "Set FOXGUARD_REQUIRED=1 after the Foxguard GitHub App is installed and posting checks"
+      return 0
+    fi
+
     sleep "$POLL_SECONDS"
   done
+
+  if ! truthy "$REQUIRED"; then
+    echo "Foxguard check did not complete within ${MAX_WAIT_SECONDS}s; passing because FOXGUARD_REQUIRED is not enabled"
+    echo "Set FOXGUARD_REQUIRED=1 after the Foxguard GitHub App is installed and posting checks"
+    return 0
+  fi
 
   echo "Foxguard check did not complete within ${MAX_WAIT_SECONDS}s" >&2
   return 1
