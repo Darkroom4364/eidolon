@@ -64,6 +64,40 @@ sqlite_scalar() {
   fi
 }
 
+sqlite_table_exists() {
+  local db="$1"
+  local table="$2"
+
+  [[ -f "$db" ]] || return 1
+  [[ "$(sqlite3 "$db" \
+    "select count(*) from sqlite_master where type = 'table' and name = '$table';" \
+    2>/dev/null || printf '0')" == "1" ]]
+}
+
+sqlite_has_column() {
+  local db="$1"
+  local table="$2"
+  local column="$3"
+
+  [[ -f "$db" ]] || return 1
+  [[ "$(sqlite3 "$db" \
+    "select count(*) from pragma_table_info('$table') where name = '$column';" \
+    2>/dev/null || printf '0')" == "1" ]]
+}
+
+sqlite_column_expr() {
+  local db="$1"
+  local table="$2"
+  local column="$3"
+  local alias="$4"
+
+  if sqlite_has_column "$db" "$table" "$column"; then
+    printf 'cast("%s" as text) as "%s"' "$column" "$alias"
+  else
+    printf 'null as "%s"' "$alias"
+  fi
+}
+
 run_summary() {
   local label="$1"
   local report_file="$ARTIFACT_DIR/pwnkit-$label.json"
@@ -167,6 +201,21 @@ run_summary() {
   event_count="$(sqlite_scalar "$db_file" "select count(*) from pipeline_events;")"
   tool_artifacts="$(sqlite_scalar "$db_file" "select count(*) from pipeline_events where eventType = 'tool_artifact';")"
 
+  local db_findings="[]"
+  if sqlite_table_exists "$db_file" "findings"; then
+    local finding_select
+    finding_select="select
+       $(sqlite_column_expr "$db_file" "findings" "severity" "severity"),
+       $(sqlite_column_expr "$db_file" "findings" "category" "category"),
+       $(sqlite_column_expr "$db_file" "findings" "status" "status"),
+       $(sqlite_column_expr "$db_file" "findings" "triageStatus" "triage_status"),
+       $(sqlite_column_expr "$db_file" "findings" "workflowStatus" "workflow_status"),
+       $(sqlite_column_expr "$db_file" "findings" "timestamp" "timestamp")
+     from findings
+     order by rowid;"
+    db_findings="$(sqlite_json "$db_file" "$finding_select")"
+  fi
+
   jq -n \
     --arg label "$label" \
     --arg artifact_status "$status" \
@@ -178,6 +227,7 @@ run_summary() {
     --argjson agent_errors "$agent_errors" \
     --argjson event_count "$event_count" \
     --argjson tool_artifacts "$tool_artifacts" \
+    --argjson db_findings "$db_findings" \
     'def path_without_origin($url):
        ($url // "")
        | sub("^https?://[^/]+"; "")
@@ -256,6 +306,7 @@ run_summary() {
        | unique_by(.timestamp_ms, .start_path, (.depth // null), (.pages_visited // null));
      def findings: ($report.findings // []);
      def finding_count: (findings | length);
+     def db_findings: ($db_findings // []);
      def normalized_value:
        if . == null then null
        elif type == "string" then (if length == 0 then null else . end)
@@ -270,6 +321,52 @@ run_summary() {
        | sort
        | group_by(.)
        | map({value: .[0], count: length});
+     def rejected_finding_status($value):
+       (($value // "") | tostring | ascii_downcase) as $status
+       | (
+           $status == "false-positive"
+           or $status == "false_positive"
+           or $status == "suppressed"
+           or $status == "rejected"
+           or $status == "closed"
+         );
+     def db_active_findings:
+       db_findings
+       | map(
+           select(
+             (rejected_finding_status(.status) | not)
+             and (rejected_finding_status(.triage_status) | not)
+           )
+         );
+     def db_saved_finding_count: (db_findings | length);
+     def db_active_finding_count: (db_active_findings | length);
+     def positive_delta($left; $right):
+       if $left > $right then $left - $right else 0 end;
+     def finding_reconciliation:
+       {
+         final_json_finding_count: finding_count,
+         db_saved_finding_count: db_saved_finding_count,
+         db_active_finding_count: db_active_finding_count,
+         counts_match: (finding_count == db_saved_finding_count),
+         db_saved_findings_omitted_from_final_json: (
+           db_saved_finding_count > finding_count
+         ),
+         final_json_omitted_db_saved_finding_count: (
+           positive_delta(db_saved_finding_count; finding_count)
+         ),
+         final_json_exceeds_db_saved_finding_count: (
+           positive_delta(finding_count; db_saved_finding_count)
+         ),
+         db_status_counts: count_by(db_findings | map(.status | normalized_value)),
+         db_triage_status_counts: count_by(
+           db_findings | map(.triage_status | normalized_value)
+         ),
+         db_workflow_status_counts: count_by(
+           db_findings | map(.workflow_status | normalized_value)
+         ),
+         db_severity_counts: count_by(db_findings | map(.severity | normalized_value)),
+         db_category_counts: count_by(db_findings | map(.category | normalized_value))
+       };
      def field_presence($fields):
        $fields
        | map(. as $field | {
@@ -393,7 +490,11 @@ run_summary() {
       scan_depth: ($report.scanDepth // null),
       duration_ms: ($report.durationMs // null),
       finding_count: finding_count,
+      final_json_finding_count: finding_count,
+      db_saved_finding_count: db_saved_finding_count,
+      db_active_finding_count: db_active_finding_count,
       finding_diagnostics: finding_diagnostics,
+      finding_reconciliation: finding_reconciliation,
       warnings: ($report.warnings // []),
       pwnkit_events: {
         pipeline_events: $event_count,
@@ -850,6 +951,55 @@ jq -n \
            end
          )
        };
+   def run_final_json_finding_count($run):
+     $run.final_json_finding_count // $run.finding_count // 0;
+   def run_db_saved_finding_count($run):
+     $run.db_saved_finding_count // 0;
+   def run_db_active_finding_count($run):
+     $run.db_active_finding_count // 0;
+   def finding_export_gap:
+     (run_final_json_finding_count($direct)) as $direct_final
+     | (run_final_json_finding_count($eidolon)) as $eidolon_final
+     | (run_db_saved_finding_count($direct)) as $direct_db_saved
+     | (run_db_saved_finding_count($eidolon)) as $eidolon_db_saved
+     | (run_db_active_finding_count($direct)) as $direct_db_active
+     | (run_db_active_finding_count($eidolon)) as $eidolon_db_active
+     | ($direct_db_saved > $direct_final) as $direct_omitted
+     | ($eidolon_db_saved > $eidolon_final) as $eidolon_omitted
+     | {
+         direct_final_json_finding_count: $direct_final,
+         eidolon_final_json_finding_count: $eidolon_final,
+         direct_db_saved_finding_count: $direct_db_saved,
+         eidolon_db_saved_finding_count: $eidolon_db_saved,
+         direct_db_active_finding_count: $direct_db_active,
+         eidolon_db_active_finding_count: $eidolon_db_active,
+         direct_db_saved_findings_omitted_from_final_json: $direct_omitted,
+         eidolon_db_saved_findings_omitted_from_final_json: $eidolon_omitted,
+         any_db_saved_findings_omitted_from_final_json: (
+           $direct_omitted or $eidolon_omitted
+         ),
+         positive_eidolon_db_saved_finding_delta: (
+           $eidolon_db_saved > $direct_db_saved
+         ),
+         positive_eidolon_db_active_finding_delta: (
+           $eidolon_db_active > $direct_db_active
+         ),
+         final_json_counts_still_drive_finding_gap: true,
+         next_question: (
+           if $eidolon_omitted then
+             "why_db_saved_findings_were_omitted_from_final_json"
+           elif $direct_omitted then
+             "why_direct_db_saved_findings_were_omitted_from_final_json"
+           elif (
+             $eidolon_db_saved > $direct_db_saved
+             and $eidolon_final <= $direct_final
+           ) then
+             "why_db_saved_finding_delta_was_not_exported_to_final_json"
+           else
+             null
+           end
+         )
+       };
    def strict_correlation_gap:
      correlated_bait_exposures as $strict_exposures
      | correlated_bait_actions as $strict_actions
@@ -1140,6 +1290,7 @@ jq -n \
       claim_level: claim_level,
       conclusion: status,
       finding_gap: finding_gap,
+      finding_export_gap: finding_export_gap,
       strict_correlation_gap: strict_correlation_gap
     },
     metrics: {
@@ -1170,6 +1321,7 @@ jq -n \
       "finding_diagnostics intentionally keeps only counts, coarse classifications, and field presence; it omits finding titles, descriptions, raw evidence, request bodies, raw URLs, and analysis text.",
       "agent_error_diagnostics intentionally keeps only counts and coarse error classes; it omits raw pwnkit agent error text.",
       "comparison.finding_gap records whether pwnkit observed target or bait evidence that was not promoted to a pwnkit finding.",
+      "comparison.finding_export_gap compares final JSON findings with sanitized pwnkit DB-saved finding counts; final JSON counts still drive finding_gap.",
       "comparison.strict_correlation_gap explains why a proxy-confirmed bait action did not become a strict pwnkit-correlated same-session action.",
       "When emitted, a bait_not_reached conclusion means the agent interacted with the protected target through Eidolon but did not touch any owned bait surface."
     ]

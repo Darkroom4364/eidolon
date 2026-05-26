@@ -149,9 +149,11 @@ only. It records sanitized Eidolon decisions and never appears in HTTP responses
 pwnkit scope files, auth files, or normalized pwnkit reports.
 When the runner uses a pwnkit source checkout, `$ART/pwnkit-runner-metadata.json`
 also records the pwnkit package version, git head, dirty-worktree state, and the
-local `origin/main` ahead/behind relation. Treat `origin_main.in_sync == true`
-and `git_dirty == false` as part of the evidence contract for current-main
-claims.
+local `origin/main` ahead/behind relation. It also records
+`runner.environment.runner_environment`, `network_topology`, and a sanitized tool
+fingerprint so archived or private local pwnkit fixtures can be interpreted
+later. Treat `origin_main.in_sync == true` and `git_dirty == false` as part of
+the evidence contract for current-main claims.
 
 To test whether an observed replay can preserve one Eidolon Lab session without
 seeding any bait markers, pin the Eidolon leg to a generated session cookie:
@@ -173,8 +175,9 @@ The collector reports whether pwnkit target-tool artifacts correlate with
 Eidolon proxy requests by method, path, and timestamp window, and whether any M3
 bait surface or bait action was reached. It reads structured pwnkit
 `http_request` artifacts and shell-mode `bash` artifacts whose HTTP transcript
-contains method/path/status evidence. It is evidence for the M3 bakeoff, not an
-agent leaderboard.
+contains method/path/status evidence. It keeps final JSON findings separate from
+DB-saved finding rows with `finding_reconciliation` and `finding_export_gap`. It
+is evidence for the M3 bakeoff, not an agent leaderboard.
 
 For report language, prefer `comparison.claim_level` over the broad
 `comparison.conclusion`; it distinguishes exposed-only bait, action-shaped
@@ -194,6 +197,13 @@ logs, runs pinned direct and Eidolon pwnkit legs, collects each run, and writes
 keeps one row per artifact and emits strict stability gates.
 Use `strict_stability.ready_for_stability_claim` only for repeated-run Lab
 stability language; single successful traces remain single-trace evidence.
+
+For VM-local Kali evidence, use
+[`m3/kali-vm-pwnkit.md`](m3/kali-vm-pwnkit.md) and run
+`examples/m3/run-pwnkit-kali-vm.sh` from inside the Kali VM. The wrapper does
+not create or manage the VM; it enforces `runner_environment=kali_vm`,
+`network_topology=same_vm_loopback`, loopback target/proxy URLs, and an artifact
+directory outside the Eidolon checkout.
 
 For finding-promotion experiments, pass a lab-only bait profile through the
 sample runner:

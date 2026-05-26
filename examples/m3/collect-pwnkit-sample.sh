@@ -207,6 +207,13 @@ done | jq -s '
             null
           end
         ),
+        runner_environment: (.runner.environment.runner_environment // null),
+        runner_environment_source: (
+          .runner.environment.runner_environment_source // null
+        ),
+        runner_network_topology: (.runner.environment.network_topology // null),
+        runner_os: (.runner.environment.os // null),
+        runner_tool_fingerprint: (.runner.environment.tool_fingerprint // []),
         claim_level: (.comparison.claim_level // "missing"),
         conclusion: (.comparison.conclusion // "missing"),
         target_interaction_observed: (.comparison.target_interaction_observed // false),
@@ -218,9 +225,23 @@ done | jq -s '
         controlled_reality_entered: (.comparison.controlled_reality_entered // false),
         direct_finding_count: (.runs.direct.finding_count // 0),
         eidolon_finding_count: (.runs.eidolon.finding_count // 0),
+        direct_final_json_finding_count: (
+          .runs.direct.final_json_finding_count // .runs.direct.finding_count // 0
+        ),
+        eidolon_final_json_finding_count: (
+          .runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0
+        ),
+        direct_db_saved_finding_count: (.runs.direct.db_saved_finding_count // 0),
+        eidolon_db_saved_finding_count: (.runs.eidolon.db_saved_finding_count // 0),
+        direct_db_active_finding_count: (.runs.direct.db_active_finding_count // 0),
+        eidolon_db_active_finding_count: (.runs.eidolon.db_active_finding_count // 0),
         finding_diagnostics: {
           direct: (.runs.direct.finding_diagnostics // null),
           eidolon: (.runs.eidolon.finding_diagnostics // null)
+        },
+        finding_reconciliation: {
+          direct: (.runs.direct.finding_reconciliation // null),
+          eidolon: (.runs.eidolon.finding_reconciliation // null)
         },
         pwnkit_events: {
           direct: (.runs.direct.pwnkit_events // null),
@@ -357,6 +378,30 @@ done | jq -s '
               (.runs.eidolon.finding_count // 0) == 0
               and (.comparison.controlled_reality_entered // false)
             ),
+            next_question: null
+          }
+        ),
+        finding_export_gap: (
+          .comparison.finding_export_gap // {
+            direct_final_json_finding_count: (
+              .runs.direct.final_json_finding_count // .runs.direct.finding_count // 0
+            ),
+            eidolon_final_json_finding_count: (
+              .runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0
+            ),
+            direct_db_saved_finding_count: (.runs.direct.db_saved_finding_count // 0),
+            eidolon_db_saved_finding_count: (.runs.eidolon.db_saved_finding_count // 0),
+            direct_db_active_finding_count: (.runs.direct.db_active_finding_count // 0),
+            eidolon_db_active_finding_count: (.runs.eidolon.db_active_finding_count // 0),
+            direct_db_saved_findings_omitted_from_final_json: (
+              (.runs.direct.db_saved_finding_count // 0)
+              > (.runs.direct.final_json_finding_count // .runs.direct.finding_count // 0)
+            ),
+            eidolon_db_saved_findings_omitted_from_final_json: (
+              (.runs.eidolon.db_saved_finding_count // 0)
+              > (.runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0)
+            ),
+            final_json_counts_still_drive_finding_gap: true,
             next_question: null
           }
         ),
@@ -498,11 +543,62 @@ done | jq -s '
     as $bait_action_without_findings_count
   | ($present | map(select(.finding_gap.eidolon_controlled_reality_without_findings)) | length)
     as $controlled_without_findings_count
+  | ($present | map(.direct_final_json_finding_count // .direct_finding_count // 0) | add // 0)
+    as $direct_final_json_finding_total
+  | ($present | map(.eidolon_final_json_finding_count // .eidolon_finding_count // 0) | add // 0)
+    as $eidolon_final_json_finding_total
+  | ($present | map(.direct_db_saved_finding_count // 0) | add // 0)
+    as $direct_db_saved_finding_total
+  | ($present | map(.eidolon_db_saved_finding_count // 0) | add // 0)
+    as $eidolon_db_saved_finding_total
+  | ($present | map(.direct_db_active_finding_count // 0) | add // 0)
+    as $direct_db_active_finding_total
+  | ($present | map(.eidolon_db_active_finding_count // 0) | add // 0)
+    as $eidolon_db_active_finding_total
+  | (
+      $present
+      | map(select(.finding_export_gap.direct_db_saved_findings_omitted_from_final_json))
+      | length
+    ) as $direct_db_omitted_count
+  | (
+      $present
+      | map(select(.finding_export_gap.eidolon_db_saved_findings_omitted_from_final_json))
+      | length
+    ) as $eidolon_db_omitted_count
+  | (
+      $present
+      | map(select(.finding_export_gap.positive_eidolon_db_saved_finding_delta))
+      | length
+    ) as $positive_eidolon_db_saved_delta_count
+  | (
+      $present
+      | map(select(.finding_export_gap.positive_eidolon_db_active_finding_delta))
+      | length
+    ) as $positive_eidolon_db_active_delta_count
   | ($present | map(select(.pinned_session.present)) | length) as $pinned_count
   | ($present | map(select(.pinned_session.cookie_preserved)) | length)
     as $pinned_cookie_count
   | ($present | map(.runner_git_head // "unknown") | unique) as $runner_heads
   | ($present | map(.runner_package_version // "unknown") | unique) as $runner_versions
+  | ($present | map(.runner_environment // "unknown") | unique) as $runner_environments
+  | ($present | map(.runner_network_topology // "unknown") | unique)
+    as $runner_network_topologies
+  | (
+      $present
+      | map(.runner_tool_fingerprint[]? | {
+          name,
+          present: (.present // false),
+          version: (.version // null)
+        })
+      | sort_by(.name)
+      | group_by(.name)
+      | map({
+          name: .[0].name,
+          present_count: (map(select(.present == true)) | length),
+          missing_count: (map(select(.present != true)) | length),
+          versions: (map(.version // "unknown") | unique)
+        })
+    ) as $tool_fingerprint_summary
   | ($present | map(select(.runner_git_dirty == false)) | length)
     as $clean_runner_count
   | ($present | map(select(.runner_git_dirty == true)) | length)
@@ -729,6 +825,9 @@ done | jq -s '
       ),
       runner_git_heads: $runner_heads,
       runner_package_versions: $runner_versions,
+      runner_environments: $runner_environments,
+      runner_network_topologies: $runner_network_topologies,
+      tool_fingerprint_summary: $tool_fingerprint_summary,
       source_checkout: {
         clean_runner_count: $clean_runner_count,
         dirty_runner_count: $dirty_runner_count,
@@ -742,6 +841,27 @@ done | jq -s '
         all_runners_origin_main_synced: (
           $valid_count > 0 and all($present[]; .runner_origin_main_in_sync == true)
         )
+      },
+      finding_reconciliation: {
+        sample_size: $valid_count,
+        direct_final_json_finding_total: $direct_final_json_finding_total,
+        eidolon_final_json_finding_total: $eidolon_final_json_finding_total,
+        direct_db_saved_finding_total: $direct_db_saved_finding_total,
+        eidolon_db_saved_finding_total: $eidolon_db_saved_finding_total,
+        direct_db_active_finding_total: $direct_db_active_finding_total,
+        eidolon_db_active_finding_total: $eidolon_db_active_finding_total,
+        direct_db_saved_findings_omitted_run_count: $direct_db_omitted_count,
+        eidolon_db_saved_findings_omitted_run_count: $eidolon_db_omitted_count,
+        positive_eidolon_db_saved_finding_delta_run_count: (
+          $positive_eidolon_db_saved_delta_count
+        ),
+        positive_eidolon_db_active_finding_delta_run_count: (
+          $positive_eidolon_db_active_delta_count
+        ),
+        any_db_saved_findings_omitted_from_final_json: (
+          $direct_db_omitted_count > 0 or $eidolon_db_omitted_count > 0
+        ),
+        final_json_counts_still_drive_finding_claims: true
       },
       no_signal_diagnostics: {
         sample_size: $valid_count,
