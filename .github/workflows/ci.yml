@@ -90,23 +90,9 @@ jobs:
 
       - name: Run M3 fixture tests
         run: |
-          examples/m3/test-run-pwnkit-sample.sh
-          examples/m3/test-run-pwnkit-promotion-matrix.sh
-          examples/m3/test-check-pwnkit-summary-health.sh
-          examples/m3/test-check-pwnkit-sample-health.sh
-          examples/m3/test-check-pwnkit-promotion-matrix-health.sh
-          examples/m3/test-check-pwnkit-runner-freshness.sh
-          examples/m3/test-shell-harness-safety.sh
-          examples/m3/test-pwnkit-codex.sh
-          examples/m3/test-collect-action-trace.sh
-          examples/m3/test-collect-pwnkit-codex.sh
-          examples/m3/test-collect-pwnkit-sample.sh
-          examples/m3/test-collect-pwnkit-promotion-matrix.sh
-          examples/m3/test-package-pwnkit-sample.sh
-          examples/m3/test-package-pwnkit-promotion-matrix.sh
-          examples/m3/test-packaged-evidence-redaction.sh
-          examples/m3/test-research-doc-redaction.sh
-          examples/m3/test-report.sh
+          for test_script in examples/m3/test-*.sh; do
+            "$test_script"
+          done
 
       - name: Verify archived M3 evidence checksums
         run: |
