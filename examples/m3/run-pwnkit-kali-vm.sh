@@ -13,10 +13,11 @@ EIDOLON_M3_RUNNER_ENVIRONMENT="${EIDOLON_M3_RUNNER_ENVIRONMENT:-kali_vm}"
 EIDOLON_M3_NETWORK_TOPOLOGY="${EIDOLON_M3_NETWORK_TOPOLOGY:-same_vm_loopback}"
 EIDOLON_M3_KALI_VM_DRY_RUN="${EIDOLON_M3_KALI_VM_DRY_RUN:-0}"
 EIDOLON_M3_ALLOW_NON_KALI_VM="${EIDOLON_M3_ALLOW_NON_KALI_VM:-0}"
+EIDOLON_M3_KALI_VM_PREFLIGHT="${EIDOLON_M3_KALI_VM_PREFLIGHT:-0}"
 
 usage() {
   cat <<'USAGE'
-Usage: examples/m3/run-pwnkit-kali-vm.sh [run-count] [sample-dir]
+Usage: examples/m3/run-pwnkit-kali-vm.sh [--preflight] [run-count] [sample-dir]
 
 Runs the M3 pwnkit sample runner inside a Kali Linux VM, including OrbStack
 Kali machines, with target, proxy, and pwnkit all on VM-local loopback.
@@ -31,6 +32,7 @@ Environment:
   EIDOLON_M3_SAMPLE_RUNS       Run count if [run-count] is omitted. Defaults to 3.
   EIDOLON_M3_SAMPLE_DIR        Sample root if [sample-dir] is omitted.
   EIDOLON_M3_KALI_VM_DRY_RUN   If true, write the sample plan without running scans.
+  EIDOLON_M3_KALI_VM_PREFLIGHT If true, validate VM runner plumbing and exit.
   EIDOLON_M3_ALLOW_NON_KALI_VM Allow dry-run/planning outside Kali. Defaults to 0.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to run-pwnkit-sample.sh.
 
@@ -94,6 +96,14 @@ require_positive_integer() {
   fi
 }
 
+require_command() {
+  local command_name="$1"
+
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    fail "missing required tool: $command_name"
+  fi
+}
+
 require_vm_contract() {
   local on_kali=0
 
@@ -116,6 +126,32 @@ require_vm_contract() {
   if [[ "$on_kali" -eq 0 ]] && ! truthy "$EIDOLON_M3_KALI_VM_DRY_RUN"; then
     fail "EIDOLON_M3_ALLOW_NON_KALI_VM is only allowed with EIDOLON_M3_KALI_VM_DRY_RUN=1"
   fi
+}
+
+require_pwnkit_runner_available() {
+  if [[ -n "${PWNKIT_NODE_ENTRY:-}" ]]; then
+    if [[ ! -f "$PWNKIT_NODE_ENTRY" ]]; then
+      fail "PWNKIT_NODE_ENTRY does not exist: $PWNKIT_NODE_ENTRY"
+    fi
+    require_command node
+    return
+  fi
+
+  if [[ -n "${PWNKIT_BIN:-}" ]]; then
+    require_command "$PWNKIT_BIN"
+    return
+  fi
+
+  if [[ -f "$HOME/Projects/pwnkit/dist/pwnkit.js" ]]; then
+    require_command node
+    return
+  fi
+
+  if command -v pwnkit >/dev/null 2>&1 || command -v pwnkit-cli >/dev/null 2>&1; then
+    return
+  fi
+
+  fail "could not find pwnkit; set PWNKIT_NODE_ENTRY or PWNKIT_BIN"
 }
 
 canonicalize_path_allow_missing() {
@@ -159,10 +195,41 @@ require_sample_dir_outside_repo() {
   esac
 }
 
+run_preflight() {
+  local preflight_dir="$SAMPLE_DIR/private/kali-vm-preflight"
+
+  require_command cargo
+  require_command curl
+  require_command jq
+  require_command sqlite3
+  require_command git
+  require_pwnkit_runner_available
+
+  mkdir -p "$preflight_dir"
+  EIDOLON_LAB_TARGET_URL="$TARGET_URL" \
+    EIDOLON_LAB_PROXY_URL="$PROXY_URL" \
+    EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-1}" \
+    EIDOLON_M3_RUNNER_ENVIRONMENT="$EIDOLON_M3_RUNNER_ENVIRONMENT" \
+    EIDOLON_M3_NETWORK_TOPOLOGY="$EIDOLON_M3_NETWORK_TOPOLOGY" \
+    "$SCRIPT_DIR/pwnkit-codex.sh" preflight "$preflight_dir" >/dev/null
+  EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE="${EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE:-0}" \
+    "$SCRIPT_DIR/check-pwnkit-runner-freshness.sh" \
+    "$preflight_dir/pwnkit-runner-metadata.json"
+
+  echo "kali-vm preflight ok: $preflight_dir"
+}
+
 main() {
   if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
     exit 0
+  fi
+
+  if [[ "${1:-}" == "--preflight" ]]; then
+    EIDOLON_M3_KALI_VM_PREFLIGHT=1
+    shift
+    RUN_COUNT="${1:-${EIDOLON_M3_SAMPLE_RUNS:-3}}"
+    SAMPLE_DIR="${2:-${EIDOLON_M3_SAMPLE_DIR:-/tmp/eidolon-m3-pwnkit-kali-vm-$(date +%Y%m%d-%H%M%S)}}"
   fi
 
   require_positive_integer "run-count" "$RUN_COUNT"
@@ -178,6 +245,11 @@ main() {
 
   if truthy "$EIDOLON_M3_KALI_VM_DRY_RUN"; then
     export EIDOLON_M3_SAMPLE_DRY_RUN=1
+  fi
+
+  if truthy "$EIDOLON_M3_KALI_VM_PREFLIGHT"; then
+    run_preflight
+    exit 0
   fi
 
   "$SCRIPT_DIR/run-pwnkit-sample.sh" "$RUN_COUNT" "$SAMPLE_DIR"
