@@ -89,6 +89,23 @@ insert_http_artifact() {
   insert_tool_artifact "$dir" "$id" "$timestamp_ms" "$payload"
 }
 
+insert_crawl_artifact() {
+  local dir="$1"
+  local id="$2"
+  local timestamp_ms="$3"
+  local start_url="$4"
+  local depth="$5"
+  local pages_visited="$6"
+  local payload
+
+  payload="$(jq -cn \
+    --arg startUrl "$start_url" \
+    --argjson depth "$depth" \
+    --argjson pages_visited "$pages_visited" \
+    '{tool:"crawl", startUrl:$startUrl, depth:$depth, pagesVisited:$pages_visited}')"
+  insert_tool_artifact "$dir" "$id" "$timestamp_ms" "$payload"
+}
+
 insert_bash_http_artifact() {
   local dir="$1"
   local id="$2"
@@ -238,6 +255,7 @@ test_strict_gap_marks_proxy_exposure_not_pwnkit_correlated() {
   local dir
   dir="$(new_artifact)"
   init_artifact "$dir" "session-a"
+  insert_crawl_artifact "$dir" "crawl-docs" 1767225601000 "http://127.0.0.1:9102/docs?token=secret-token" 2 5
   insert_http_artifact "$dir" "http-action" 1767225603000 POST /api/v2/import/reconcile 202
   append_bait_exposed "$dir" "session-a" "2026-01-01T00:00:01Z" "exp-1" "/docs/legacy-import"
   append_request_seen "$dir" "session-a" "2026-01-01T00:00:03Z" POST /api/v2/import/reconcile eidolon_owned
@@ -248,6 +266,16 @@ test_strict_gap_marks_proxy_exposure_not_pwnkit_correlated() {
     .eidolon_proxy.counts.same_session_confirmed_bait_actions == 1
     and .comparison.correlated_bait_events.exposures == []
     and (.comparison.correlated_bait_events.actions | length == 1)
+    and .runs.eidolon.pwnkit_events.crawl_artifacts == [
+      {
+        timestamp_ms: 1767225601000,
+        start_path: "/docs",
+        depth: 2,
+        pages_visited: 5
+      }
+    ]
+    and .runs.eidolon.target_evidence_diagnostics.crawl_artifact_count == 1
+    and .runs.eidolon.target_evidence_diagnostics.crawl_start_paths == ["/docs"]
   ' "$dir/summary.json" >/dev/null
   jq -e '
     .comparison.strict_correlation_gap.proxy_confirmed_action_count == 1
@@ -255,13 +283,23 @@ test_strict_gap_marks_proxy_exposure_not_pwnkit_correlated() {
     and .comparison.strict_correlation_gap.strict_confirmed_action_count == 0
     and .comparison.strict_correlation_gap.proxy_confirmed_action_not_strict_count == 1
     and .comparison.strict_correlation_gap.matching_proxy_exposure_not_pwnkit_correlated_count == 1
+    and .comparison.strict_correlation_gap.crawl_artifact_count == 1
+    and .comparison.strict_correlation_gap.crawl_artifact_start_paths == ["/docs"]
+    and .comparison.strict_correlation_gap.matching_proxy_exposure_crawl_start_path_count == 1
+    and .comparison.strict_correlation_gap.matching_proxy_exposure_crawl_start_paths == ["/docs"]
+    and .comparison.strict_correlation_gap.likely_missing_artifact_class == "crawl_page_request_artifact"
     and .comparison.strict_correlation_gap.likely_cause == "matching_proxy_exposure_not_pwnkit_correlated"
     and (
       .comparison.strict_correlation_gap.next_questions
       | index("why_pwnkit_did_not_emit_request_artifact_for_exposure_surface")
     )
+    and (
+      .comparison.strict_correlation_gap.next_questions
+      | index("whether_pwnkit_crawl_persisted_per_page_request_artifacts")
+    )
     and .comparison.strict_correlation_gap.unconfirmed_actions[0].reason == "matching_proxy_exposure_not_pwnkit_correlated"
     and .comparison.strict_correlation_gap.unconfirmed_actions[0].matching_proxy_exposure_surfaces == ["/docs/legacy-import"]
+    and .comparison.strict_correlation_gap.unconfirmed_actions[0].matching_proxy_exposure_crawl_start_paths == ["/docs"]
   ' "$dir/summary.json" >/dev/null
 }
 
