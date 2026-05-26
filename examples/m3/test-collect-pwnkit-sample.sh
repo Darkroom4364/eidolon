@@ -174,6 +174,29 @@ write_summary() {
     }' > "$dir/pwnkit-summary.json"
 }
 
+write_agent_trace_summary() {
+  local dir="$1"
+  local claim_level="$2"
+  local real_surface_after_containment="$3"
+  local controlled_depth="$4"
+  local controlled_branch_count="$5"
+
+  jq -n \
+    --arg claim_level "$claim_level" \
+    --argjson real_surface_after_containment "$real_surface_after_containment" \
+    --argjson controlled_depth "$controlled_depth" \
+    --argjson controlled_branch_count "$controlled_branch_count" \
+    '{
+      schema_version: 1,
+      claim_level: $claim_level,
+      metrics: {
+        real_surface_requests_after_containment: $real_surface_after_containment,
+        controlled_reality_action_depth: $controlled_depth,
+        controlled_reality_branch_count: $controlled_branch_count
+      }
+    }' > "$dir/agent-replay-trace-summary.json"
+}
+
 mutate_summary() {
   local dir="$1"
   local filter="$2"
@@ -665,6 +688,65 @@ test_differential_finding_diagnostics_count_open_gap() {
   ' "$output" >/dev/null
 }
 
+test_evidence_gap_diagnostics_compare_strict_and_proxy_trace() {
+  local first
+  local second
+  local third
+  local output
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" bait_action_observed_without_same_session head-a 0 true 0 2
+  write_summary "$second" controlled_reality_entered head-a 0 true 4
+  write_summary "$third" controlled_reality_entered head-a 0 true 5
+  write_agent_trace_summary "$first" controlled_reality_entered 0 15 11
+  write_agent_trace_summary "$second" controlled_reality_entered 0 21 15
+  write_agent_trace_summary "$third" controlled_reality_entered 0 48 38
+
+  output="$first/sample-gap.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .evidence_gap_diagnostics.sample_size == 3
+    and .evidence_gap_diagnostics.proxy_trace_present_run_count == 3
+    and .evidence_gap_diagnostics.proxy_trace_controlled_reality_run_count == 3
+    and .evidence_gap_diagnostics.proxy_trace_real_surface_quiet_run_count == 3
+    and .evidence_gap_diagnostics.pwnkit_strict_controlled_reality_run_count == 2
+    and .evidence_gap_diagnostics.pwnkit_strict_same_session_run_count == 2
+    and .evidence_gap_diagnostics.proxy_trace_without_strict_controlled_reality_run_count == 1
+    and .evidence_gap_diagnostics.strict_controlled_reality_without_eidolon_finding_run_count == 2
+    and .evidence_gap_diagnostics.positive_differential_without_strict_controlled_reality_run_count == 1
+    and .evidence_gap_diagnostics.all_proxy_trace_contained == true
+    and .evidence_gap_diagnostics.all_strict_pwnkit_controlled_reality == false
+    and .evidence_gap_diagnostics.all_strict_controlled_reality_promoted_to_findings == false
+    and (
+      .evidence_gap_diagnostics.observed_gaps
+      | index("proxy_trace_controlled_reality_without_strict_pwnkit_correlation")
+    )
+    and (
+      .evidence_gap_diagnostics.observed_gaps
+      | index("strict_controlled_reality_without_eidolon_findings")
+    )
+    and (
+      .evidence_gap_diagnostics.observed_gaps
+      | index("positive_differential_findings_without_strict_controlled_reality")
+    )
+    and (
+      .evidence_gap_diagnostics.next_questions
+      | index("why_proxy_trace_containment_was_not_confirmed_by_strict_pwnkit_correlation")
+    )
+    and (
+      .evidence_gap_diagnostics.next_questions
+      | index("why_controlled_reality_chain_was_not_promoted_to_finding")
+    )
+    and .artifacts[0].trace_gap.proxy_trace_controlled_reality_without_strict_confirmation == true
+    and .artifacts[0].trace_gap.positive_differential_without_strict_controlled_reality == true
+    and .artifacts[1].trace_gap.strict_controlled_reality_without_eidolon_finding == true
+  ' "$output" >/dev/null
+}
+
 test_mixed_sample_counts_claims_and_missing_dirs
 test_stability_claim_requires_three_matching_successes
 test_stability_rejects_mixed_runner_heads_or_direct_findings
@@ -674,5 +756,6 @@ test_no_signal_diagnostics_prioritize_agent_auth_errors
 test_no_signal_diagnostics_classify_backend_timeouts
 test_no_signal_diagnostics_classify_backend_api_errors
 test_differential_finding_diagnostics_count_open_gap
+test_evidence_gap_diagnostics_compare_strict_and_proxy_trace
 
 printf 'collect-pwnkit-sample fixture tests passed\n'
