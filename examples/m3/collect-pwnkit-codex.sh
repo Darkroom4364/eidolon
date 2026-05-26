@@ -109,6 +109,18 @@ run_summary() {
        and json_extract(payload, '$.output') like '%HTTP/1.1%'
      order by timestamp;")"
 
+  local crawl_artifacts
+  crawl_artifacts="$(sqlite_json "$db_file" \
+    "select
+       timestamp as timestamp_ms,
+       json_extract(payload, '$.startUrl') as start_url,
+       json_extract(payload, '$.depth') as depth,
+       json_extract(payload, '$.pagesVisited') as pages_visited
+     from pipeline_events
+     where eventType = 'tool_artifact'
+       and json_extract(payload, '$.tool') = 'crawl'
+     order by timestamp;")"
+
   local agent_errors
   agent_errors="$(sqlite_json "$db_file" \
     "with classified as (
@@ -162,12 +174,19 @@ run_summary() {
     --argjson tool_counts "$tool_counts" \
     --argjson http_requests "$http_requests" \
     --argjson bash_http_outputs "$bash_http_outputs" \
+    --argjson crawl_artifacts "$crawl_artifacts" \
     --argjson agent_errors "$agent_errors" \
     --argjson event_count "$event_count" \
     --argjson tool_artifacts "$tool_artifacts" \
-    'def path_from_url:
-       (.url // "")
+    'def path_without_origin($url):
+       ($url // "")
        | sub("^https?://[^/]+"; "")
+       | if . == "" then "/" else . end;
+     def path_from_url: path_without_origin(.url);
+     def safe_path_from_url($url):
+       path_without_origin($url)
+       | split("#")[0]
+       | split("?")[0]
        | if . == "" then "/" else . end;
      def maybe_capture($value; $pattern):
        ([ $value | capture($pattern) ] | first // null);
@@ -226,6 +245,15 @@ run_summary() {
      def all_requested_paths:
        (structured_http_requests + bash_output_requests)
        | unique_by(.timestamp_ms, .method, .path, .source, (.evidence_label // ""));
+     def crawl_artifact_summaries:
+       $crawl_artifacts
+       | map({
+           timestamp_ms,
+           start_path: safe_path_from_url(.start_url),
+           depth: (.depth // null),
+           pages_visited: (.pages_visited // null)
+         })
+       | unique_by(.timestamp_ms, .start_path, (.depth // null), (.pages_visited // null));
      def findings: ($report.findings // []);
      def finding_count: (findings | length);
      def normalized_value:
@@ -307,6 +335,8 @@ run_summary() {
          request_artifact_count: (all_requested_paths | length),
          http_request_artifact_count: (structured_http_requests | length),
          bash_http_output_request_count: (bash_output_requests | length),
+         crawl_artifact_count: (crawl_artifact_summaries | length),
+         crawl_start_paths: (crawl_artifact_summaries | map(.start_path) | unique),
          observed_request_evidence_without_findings: (
            finding_count == 0 and ((all_requested_paths | length) > 0)
          )
@@ -370,6 +400,7 @@ run_summary() {
         tool_artifacts: $tool_artifacts,
         tool_counts: $tool_counts,
         bash_http_output_requests: (bash_output_requests | length),
+        crawl_artifacts: crawl_artifact_summaries,
         agent_errors: (agent_error_diagnostics.count)
       },
       agent_error_diagnostics: agent_error_diagnostics,
@@ -597,6 +628,20 @@ jq -n \
      | $path
        + (if $query == null then "" else "?" + redacted_query($query) end)
        + (if (($target // "") | contains("#")) then "#<redacted>" else "" end);
+   def crawl_artifact_start_paths:
+     ($eidolon.pwnkit_events.crawl_artifacts // [])
+     | map(.start_path // null)
+     | map(select(. != null and . != ""))
+     | unique;
+   def path_under_start($path; $start):
+     path_without_query($path) as $clean_path
+     | path_without_query($start) as $clean_start
+     | $clean_path == $clean_start
+       or (
+         $clean_start != ""
+         and $clean_start != "/"
+         and ($clean_path | startswith($clean_start + "/"))
+       );
    def bait_matrix($exposures; $actions):
      ([ $exposures[].bait_id, $actions[].bait_id ] | unique) as $ids
      | [
@@ -844,6 +889,15 @@ jq -n \
                  )
                )
            ) as $strict_matches
+         | (
+             [
+               $proxy_matches[] as $proxy_match
+               | crawl_artifact_start_paths[] as $crawl_start
+               | select(path_under_start($proxy_match.surface; $crawl_start))
+               | $crawl_start
+             ]
+             | unique
+           ) as $crawl_start_matches
          | {
              bait_id: $action.bait_id,
              action_path: redacted_target($action.path),
@@ -853,6 +907,7 @@ jq -n \
              matching_proxy_exposure_surfaces: (
                $proxy_matches | map(path_without_query(.surface)) | unique
              ),
+             matching_proxy_exposure_crawl_start_paths: $crawl_start_matches,
              reason: (
                if $action.exposure_id == null then
                  "action_missing_exposure_id"
@@ -871,6 +926,12 @@ jq -n \
          | map(select(.reason == "matching_proxy_exposure_not_pwnkit_correlated"))
          | length
        ) as $proxy_exposure_not_correlated_count
+     | (
+         $unconfirmed_actions
+         | map(.matching_proxy_exposure_crawl_start_paths // [])
+         | flatten
+         | unique
+       ) as $matching_proxy_exposure_crawl_start_paths
      | (
          $proxy_confirmed_actions
          | map(
@@ -894,6 +955,14 @@ jq -n \
          matching_proxy_exposure_not_pwnkit_correlated_count: (
            $proxy_exposure_not_correlated_count
          ),
+         crawl_artifact_count: (($eidolon.pwnkit_events.crawl_artifacts // []) | length),
+         crawl_artifact_start_paths: crawl_artifact_start_paths,
+         matching_proxy_exposure_crawl_start_path_count: (
+           $matching_proxy_exposure_crawl_start_paths | length
+         ),
+         matching_proxy_exposure_crawl_start_paths: (
+           $matching_proxy_exposure_crawl_start_paths
+         ),
          unconfirmed_actions: $unconfirmed_actions,
          likely_cause: (
            if ($unconfirmed_actions | length) == 0 then
@@ -908,6 +977,16 @@ jq -n \
              "unknown"
            end
          ),
+         likely_missing_artifact_class: (
+           if (
+             $proxy_exposure_not_correlated_count > 0
+             and (($matching_proxy_exposure_crawl_start_paths | length) > 0)
+           ) then
+             "crawl_page_request_artifact"
+           else
+             null
+           end
+         ),
          next_questions: (
            if ($unconfirmed_actions | length) == 0 then
              []
@@ -915,7 +994,16 @@ jq -n \
              [
                "why_pwnkit_did_not_emit_request_artifact_for_exposure_surface",
                "whether_exposure_surface_was_reached_by_non_pwnkit_tooling_or_unpersisted_output"
-             ]
+             ] + (
+               if ($matching_proxy_exposure_crawl_start_paths | length) > 0 then
+                 [
+                   "whether_pwnkit_crawl_persisted_per_page_request_artifacts",
+                   "whether_crawl_page_requests_should_count_as_strict_correlation"
+                 ]
+               else
+                 []
+               end
+             )
            elif any($unconfirmed_actions[]; .reason == "action_missing_exposure_id") then
              ["why_action_request_lacked_exposure_id"]
            elif any($unconfirmed_actions[]; .reason == "no_prior_proxy_exposure_matched_action") then

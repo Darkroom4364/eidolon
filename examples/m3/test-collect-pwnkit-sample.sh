@@ -717,11 +717,20 @@ test_evidence_gap_diagnostics_compare_strict_and_proxy_trace() {
           matching_proxy_exposure_count: 1,
           matching_strict_exposure_count: 0,
           matching_proxy_exposure_surfaces: ["/docs/legacy-import"],
+          matching_proxy_exposure_crawl_start_paths: ["/docs"],
           reason: "matching_proxy_exposure_not_pwnkit_correlated"
         }
       ],
+      crawl_artifact_count: 1,
+      crawl_artifact_start_paths: ["/docs"],
+      matching_proxy_exposure_crawl_start_path_count: 1,
+      matching_proxy_exposure_crawl_start_paths: ["/docs"],
       likely_cause: "matching_proxy_exposure_not_pwnkit_correlated",
-      next_questions: ["why_pwnkit_did_not_emit_request_artifact_for_exposure_surface"]
+      likely_missing_artifact_class: "crawl_page_request_artifact",
+      next_questions: [
+        "why_pwnkit_did_not_emit_request_artifact_for_exposure_surface",
+        "whether_pwnkit_crawl_persisted_per_page_request_artifacts"
+      ]
     }
   '
   write_agent_trace_summary "$first" controlled_reality_entered 0 15 11
@@ -742,6 +751,7 @@ test_evidence_gap_diagnostics_compare_strict_and_proxy_trace() {
     and .evidence_gap_diagnostics.strict_controlled_reality_without_eidolon_finding_run_count == 2
     and .evidence_gap_diagnostics.positive_differential_without_strict_controlled_reality_run_count == 1
     and .evidence_gap_diagnostics.matching_proxy_exposure_not_pwnkit_correlated_run_count == 1
+    and .evidence_gap_diagnostics.matching_proxy_exposure_crawl_start_path_run_count == 1
     and .evidence_gap_diagnostics.strict_correlation_gap_likely_causes == [
       {likely_cause: "matching_proxy_exposure_not_pwnkit_correlated", count: 1}
     ]
@@ -763,6 +773,10 @@ test_evidence_gap_diagnostics_compare_strict_and_proxy_trace() {
     and (
       .evidence_gap_diagnostics.next_questions
       | index("why_proxy_trace_containment_was_not_confirmed_by_strict_pwnkit_correlation")
+    )
+    and (
+      .evidence_gap_diagnostics.next_questions
+      | index("whether_pwnkit_crawl_persisted_per_page_request_artifacts")
     )
     and (
       .evidence_gap_diagnostics.next_questions
