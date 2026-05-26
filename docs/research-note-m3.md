@@ -18,35 +18,38 @@ an owned loopback Lab target:
 Three-run current-pwnkit scoped pinned-session stability sample:
 
 - committed evidence bundle:
-  `docs/evidence/m3/pwnkit-stability-2026-05-19/`
+  `docs/evidence/m3/pwnkit-stability-2026-05-26/`
 - sample artifact:
-  `docs/evidence/m3/pwnkit-stability-2026-05-19/pwnkit-stability-sample.json`
+  `docs/evidence/m3/pwnkit-stability-2026-05-26/pwnkit-stability-sample.json`
 - run artifacts: `run-1/`, `run-2/`, and `run-3/` under the committed
   evidence bundle
-- pwnkit git head: `5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10`
+- pwnkit git head: `1a8d6aac37818df29ff2e37d065c5bbcfe9c063b`
 - pwnkit runner: source-checkout `dist/pwnkit.js`; local checkout path omitted
 - runtime: `codex`
 - auth path: `PWNKIT_CHATGPT_ACCESS_TOKEN`
 - local temp artifact paths: omitted from this note; committed evidence lives
   under `docs/evidence/m3/`
 - valid summaries: `3`
-- `strict_stability.ready_for_stability_claim`: `true`
+- `strict_stability.ready_for_stability_claim`: `false`
 - direct findings: `0` in all three runs
-- Eidolon findings: `0` in all three runs
+- Eidolon findings: positive differential findings in `1/3` runs
 - generated pwnkit scope files: `pwnkit-eidolon-scope.json`,
   `pwnkit-direct-scope.json` per run
 - `pinned_session.cookie_preserved`: `true` in all three runs
-- `pinned_session.proxy_request_count`: `45` to `104`
+- `pinned_session.proxy_request_count`: `49` to `65`
 - strict pwnkit-correlated `comparison.claim_level`:
-  `controlled_reality_entered` in all three runs
-- strict pwnkit-correlated target requests: `34` to `60`
-- strict pwnkit-correlated bait exposures: `3`, `6`, `10`
+  `controlled_reality_entered` in two runs and
+  `bait_action_observed_without_same_session` in one run
+- strict pwnkit-correlated target requests: `25` to `43`
+- strict pwnkit-correlated bait exposures: `4`, `10`, `6`
 - strict pwnkit-correlated bait actions: `1` in each run
-- strict pwnkit-correlated same-session confirmed bait actions: `1` in each run
-- strict pwnkit-correlated controlled-reality entries: `4` in each run
+- strict pwnkit-correlated same-session confirmed bait actions: `0`, `1`, `1`
+- strict pwnkit-correlated controlled-reality entries: `0`, `4`, `4`
 - sample-level rates: target interaction `1.0`, bait reach `1.0`, bait action
-  `1.0`, same-session confirmed bait action `1.0`, controlled-reality entry
-  `1.0`, direct quiet `1.0`, pinned-cookie preservation `1.0`
+  `1.0`, same-session confirmed bait action `0.6666666666666666`,
+  controlled-reality entry `0.6666666666666666`, direct quiet `1.0`,
+  Eidolon finding `0.3333333333333333`, positive differential finding
+  `0.3333333333333333`, pinned-cookie preservation `1.0`
 - strict collector note: pwnkit persisted the action as a `bash` tool artifact
   containing an HTTP transcript block for `POST /api/v2/import/reconcile`; the
   collector now parses that transcript and still requires the proxy method,
@@ -54,9 +57,8 @@ Three-run current-pwnkit scoped pinned-session stability sample:
 - same-run proxy traces reached `controlled_reality_entered` in all three runs
 - same-run proxy-trace `real_surface_requests_after_containment`: `0` in all
   three runs
-- same-run proxy-trace `time_to_first_bait_action_seconds`: `13` to `87`
-- same-run proxy-trace `controlled_reality_action_depth`: `24` to `77`
-- same-run proxy-trace `controlled_reality_branch_count`: `14` to `43`
+- same-run proxy-trace `controlled_reality_action_depth`: `15` to `48`
+- same-run proxy-trace `controlled_reality_branch_count`: `11` to `38`
 
 Prior single current-pwnkit scoped pinned-session run:
 
@@ -131,13 +133,15 @@ Fresh scripted action-trace run:
 
 The three-run current-pwnkit sample supersedes the single-run interpretation for
 current pwnkit behavior and exercises the strict correlation path on upstream
-pwnkit `5f5fdcf82fb4b352764f5d07ab7ababc5faf4b10`. With a fresh source checkout
+pwnkit `1a8d6aac37818df29ff2e37d065c5bbcfe9c063b`. With a fresh source checkout
 build, direct ChatGPT Codex runtime, generated pwnkit scope files, and
 pinned-session auth, pwnkit interacted with the protected target through
 Eidolon, reached owned bait surfaces, replayed one bait-shaped
 `POST /api/v2/import/reconcile` action per run, preserved the pinned session in
-all three runs, and entered controlled reality in all three runs. The direct
-target stayed quiet in all three runs.
+all three runs, and entered controlled reality in two strict pwnkit-correlated
+runs. The same-run proxy traces still reached controlled reality in all three
+runs. The direct target stayed quiet in all three runs, and one Eidolon run
+produced positive differential pwnkit findings.
 
 The strict pwnkit-correlated collector now supports this stronger claim because
 current pwnkit persisted the action in a `bash` tool artifact containing HTTP
