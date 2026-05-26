@@ -66,6 +66,19 @@ write_summary() {
       schema_version: 1,
       run_kind: "m3_pwnkit_codex_comparison",
       runner: {
+        environment: {
+          runner_environment: "host_mac",
+          runner_environment_source: "auto_detect",
+          network_topology: "same_host_loopback",
+          os: {
+            kernel_name: "Darwin",
+            machine_arch: "arm64"
+          },
+          tool_fingerprint: [
+            {name: "bash", present: true, version: "GNU bash fixture"},
+            {name: "nmap", present: false, version: null}
+          ]
+        },
         pwnkit: {
           git_head: $git_head,
           package_version: "9.8.7",
@@ -83,11 +96,31 @@ write_summary() {
       runs: {
         direct: {
           finding_count: $direct_findings,
-          finding_diagnostics: {count: $direct_findings}
+          final_json_finding_count: $direct_findings,
+          db_saved_finding_count: $direct_findings,
+          db_active_finding_count: $direct_findings,
+          finding_diagnostics: {count: $direct_findings},
+          finding_reconciliation: {
+            final_json_finding_count: $direct_findings,
+            db_saved_finding_count: $direct_findings,
+            db_active_finding_count: $direct_findings,
+            counts_match: true,
+            db_saved_findings_omitted_from_final_json: false
+          }
         },
         eidolon: {
           finding_count: $eidolon_findings,
-          finding_diagnostics: {count: $eidolon_findings}
+          final_json_finding_count: $eidolon_findings,
+          db_saved_finding_count: $eidolon_findings,
+          db_active_finding_count: $eidolon_findings,
+          finding_diagnostics: {count: $eidolon_findings},
+          finding_reconciliation: {
+            final_json_finding_count: $eidolon_findings,
+            db_saved_finding_count: $eidolon_findings,
+            db_active_finding_count: $eidolon_findings,
+            counts_match: true,
+            db_saved_findings_omitted_from_final_json: false
+          }
         }
       },
       comparison: {
@@ -137,6 +170,25 @@ write_summary() {
               null
             end
           )
+        },
+        finding_export_gap: {
+          direct_final_json_finding_count: $direct_findings,
+          eidolon_final_json_finding_count: $eidolon_findings,
+          direct_db_saved_finding_count: $direct_findings,
+          eidolon_db_saved_finding_count: $eidolon_findings,
+          direct_db_active_finding_count: $direct_findings,
+          eidolon_db_active_finding_count: $eidolon_findings,
+          direct_db_saved_findings_omitted_from_final_json: false,
+          eidolon_db_saved_findings_omitted_from_final_json: false,
+          any_db_saved_findings_omitted_from_final_json: false,
+          positive_eidolon_db_saved_finding_delta: (
+            $eidolon_findings > $direct_findings
+          ),
+          positive_eidolon_db_active_finding_delta: (
+            $eidolon_findings > $direct_findings
+          ),
+          final_json_counts_still_drive_finding_gap: true,
+          next_question: null
         },
         correlated_target_requests: (
           if $claim_level == "no_target_interaction" then [] else [{path: "/openapi.json"}] end
@@ -428,8 +480,25 @@ test_stability_claim_requires_three_matching_successes() {
     .valid_summary_count == 3
     and .runner_git_heads == ["head-a"]
     and .runner_package_versions == ["9.8.7"]
+    and .runner_environments == ["host_mac"]
+    and .runner_network_topologies == ["same_host_loopback"]
+    and (
+      .tool_fingerprint_summary
+      | index({name: "bash", present_count: 3, missing_count: 0, versions: ["GNU bash fixture"]})
+    )
+    and (
+      .tool_fingerprint_summary
+      | index({name: "nmap", present_count: 0, missing_count: 3, versions: ["unknown"]})
+    )
     and .source_checkout.all_runners_clean == true
     and .source_checkout.all_runners_origin_main_synced == true
+    and .finding_reconciliation.direct_final_json_finding_total == 0
+    and .finding_reconciliation.eidolon_final_json_finding_total == 0
+    and .finding_reconciliation.direct_db_saved_finding_total == 0
+    and .finding_reconciliation.eidolon_db_saved_finding_total == 0
+    and .finding_reconciliation.final_json_counts_still_drive_finding_claims == true
+    and .artifacts[0].runner_environment == "host_mac"
+    and .artifacts[0].runner_tool_fingerprint[0].name == "bash"
     and .rates.controlled_reality_entry_rate == 1
     and .strict_stability.all_summaries_present == true
     and .strict_stability.single_runner_git_head == true
@@ -671,6 +740,21 @@ test_differential_finding_diagnostics_count_open_gap() {
   write_summary "$first" controlled_reality_entered head-a 0 true 3
   write_summary "$second" controlled_reality_entered head-a 0 true 4
   write_summary "$third" controlled_reality_entered head-a 0 true 5 2
+  mutate_summary "$first" '
+    .runs.eidolon.db_saved_finding_count = 1
+    | .runs.eidolon.db_active_finding_count = 1
+    | .runs.eidolon.finding_reconciliation.db_saved_finding_count = 1
+    | .runs.eidolon.finding_reconciliation.db_active_finding_count = 1
+    | .runs.eidolon.finding_reconciliation.counts_match = false
+    | .runs.eidolon.finding_reconciliation.db_saved_findings_omitted_from_final_json = true
+    | .comparison.finding_export_gap.eidolon_db_saved_finding_count = 1
+    | .comparison.finding_export_gap.eidolon_db_active_finding_count = 1
+    | .comparison.finding_export_gap.eidolon_db_saved_findings_omitted_from_final_json = true
+    | .comparison.finding_export_gap.any_db_saved_findings_omitted_from_final_json = true
+    | .comparison.finding_export_gap.positive_eidolon_db_saved_finding_delta = true
+    | .comparison.finding_export_gap.positive_eidolon_db_active_finding_delta = true
+    | .comparison.finding_export_gap.next_question = "why_db_saved_findings_were_omitted_from_final_json"
+  '
 
   output="$first/sample.json"
   "$COLLECTOR" "$first" "$second" "$third" > "$output"
@@ -683,6 +767,12 @@ test_differential_finding_diagnostics_count_open_gap() {
     and .differential_findings.positive_differential_run_count == 1
     and .differential_findings.controlled_reality_without_eidolon_finding_run_count == 2
     and .differential_findings.ready_for_differential_finding_claim == false
+    and .finding_reconciliation.eidolon_final_json_finding_total == 2
+    and .finding_reconciliation.eidolon_db_saved_finding_total == 3
+    and .finding_reconciliation.eidolon_db_saved_findings_omitted_run_count == 1
+    and .finding_reconciliation.positive_eidolon_db_saved_finding_delta_run_count == 2
+    and .finding_reconciliation.any_db_saved_findings_omitted_from_final_json == true
+    and .artifacts[0].finding_export_gap.eidolon_db_saved_findings_omitted_from_final_json == true
     and (.differential_findings.next_questions | index("why_controlled_reality_chain_was_not_promoted_to_finding"))
     and (.differential_findings.next_questions | index("differential_finding_observed"))
   ' "$output" >/dev/null

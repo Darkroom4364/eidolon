@@ -51,9 +51,30 @@ write_fixture_sample() {
   "strongest_claim_level": "controlled_reality_entered",
   "runner_git_heads": ["abc123"],
   "runner_package_versions": ["v0.test"],
+  "runner_environments": ["kali_vm"],
+  "runner_network_topologies": ["vm_loopback_forward"],
+  "tool_fingerprint_summary": [
+    {"name": "bash", "present_count": 1, "missing_count": 0, "versions": ["GNU bash fixture"]},
+    {"name": "nmap", "present_count": 0, "missing_count": 1, "versions": ["unknown"]}
+  ],
   "source_checkout": {
     "all_runners_clean": true,
     "all_runners_origin_main_synced": true
+  },
+  "finding_reconciliation": {
+    "sample_size": 1,
+    "direct_final_json_finding_total": 0,
+    "eidolon_final_json_finding_total": 0,
+    "direct_db_saved_finding_total": 0,
+    "eidolon_db_saved_finding_total": 1,
+    "direct_db_active_finding_total": 0,
+    "eidolon_db_active_finding_total": 1,
+    "direct_db_saved_findings_omitted_run_count": 0,
+    "eidolon_db_saved_findings_omitted_run_count": 1,
+    "positive_eidolon_db_saved_finding_delta_run_count": 1,
+    "positive_eidolon_db_active_finding_delta_run_count": 1,
+    "any_db_saved_findings_omitted_from_final_json": true,
+    "final_json_counts_still_drive_finding_claims": true
   },
   "no_signal_diagnostics": {
     "sample_size": 1,
@@ -108,6 +129,17 @@ write_fixture_sample() {
       "runner_origin_main_in_sync": true,
       "runner_command": "node /tmp/pwnkit/dist/pwnkit.js",
       "stale_dist_guard_bypassed": false,
+      "runner_environment": "kali_vm",
+      "runner_environment_source": "env_override",
+      "runner_network_topology": "vm_loopback_forward",
+      "runner_os": {
+        "kernel_name": "Linux",
+        "machine_arch": "x86_64"
+      },
+      "runner_tool_fingerprint": [
+        {"name": "bash", "present": true, "version": "GNU bash fixture"},
+        {"name": "nmap", "present": false, "version": null}
+      ],
       "claim_level": "controlled_reality_entered",
       "conclusion": "bait_action_observed",
       "target_interaction_observed": true,
@@ -117,6 +149,28 @@ write_fixture_sample() {
       "controlled_reality_entered": true,
       "direct_finding_count": 0,
       "eidolon_finding_count": 0,
+      "direct_final_json_finding_count": 0,
+      "eidolon_final_json_finding_count": 0,
+      "direct_db_saved_finding_count": 0,
+      "eidolon_db_saved_finding_count": 1,
+      "direct_db_active_finding_count": 0,
+      "eidolon_db_active_finding_count": 1,
+      "finding_reconciliation": {
+        "direct": {
+          "final_json_finding_count": 0,
+          "db_saved_finding_count": 0,
+          "db_active_finding_count": 0,
+          "counts_match": true,
+          "db_saved_findings_omitted_from_final_json": false
+        },
+        "eidolon": {
+          "final_json_finding_count": 0,
+          "db_saved_finding_count": 1,
+          "db_active_finding_count": 1,
+          "counts_match": false,
+          "db_saved_findings_omitted_from_final_json": true
+        }
+      },
       "pwnkit_events": {
         "eidolon": {
           "tool_artifacts": 1,
@@ -168,6 +222,21 @@ write_fixture_sample() {
       "finding_gap": {
         "positive_differential_findings": false,
         "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
+      },
+      "finding_export_gap": {
+        "direct_final_json_finding_count": 0,
+        "eidolon_final_json_finding_count": 0,
+        "direct_db_saved_finding_count": 0,
+        "eidolon_db_saved_finding_count": 1,
+        "direct_db_active_finding_count": 0,
+        "eidolon_db_active_finding_count": 1,
+        "direct_db_saved_findings_omitted_from_final_json": false,
+        "eidolon_db_saved_findings_omitted_from_final_json": true,
+        "any_db_saved_findings_omitted_from_final_json": true,
+        "positive_eidolon_db_saved_finding_delta": true,
+        "positive_eidolon_db_active_finding_delta": true,
+        "final_json_counts_still_drive_finding_gap": true,
+        "next_question": "why_db_saved_findings_were_omitted_from_final_json"
       },
       "strict_correlation_gap": {
         "proxy_confirmed_action_count": 1,
@@ -253,6 +322,19 @@ JSON
       "target": "http://127.0.0.1:9001",
       "proxy": "http://127.0.0.1:8080"
     },
+    "environment": {
+      "runner_environment": "kali_vm",
+      "runner_environment_source": "env_override",
+      "network_topology": "vm_loopback_forward",
+      "os": {
+        "kernel_name": "Linux",
+        "machine_arch": "x86_64"
+      },
+      "tool_fingerprint": [
+        {"name": "bash", "present": true, "version": "GNU bash fixture"},
+        {"name": "nmap", "present": false, "version": null}
+      ]
+    },
     "pwnkit": {
       "depth": "quick",
       "mode": "web",
@@ -291,6 +373,16 @@ JSON
       "scan_depth": "quick",
       "duration_ms": 10,
       "finding_count": 0,
+      "final_json_finding_count": 0,
+      "db_saved_finding_count": 1,
+      "db_active_finding_count": 1,
+      "finding_reconciliation": {
+        "final_json_finding_count": 0,
+        "db_saved_finding_count": 1,
+        "db_active_finding_count": 1,
+        "counts_match": false,
+        "db_saved_findings_omitted_from_final_json": true
+      },
       "warnings": ["raw warning with secret-token"],
       "pwnkit_events": {
         "pipeline_events": 1,
@@ -328,6 +420,16 @@ JSON
       "scan_depth": "quick",
       "duration_ms": 10,
       "finding_count": 0,
+      "final_json_finding_count": 0,
+      "db_saved_finding_count": 0,
+      "db_active_finding_count": 0,
+      "finding_reconciliation": {
+        "final_json_finding_count": 0,
+        "db_saved_finding_count": 0,
+        "db_active_finding_count": 0,
+        "counts_match": true,
+        "db_saved_findings_omitted_from_final_json": false
+      },
       "warnings": [],
       "pwnkit_events": {
         "pipeline_events": 1,
@@ -418,6 +520,21 @@ JSON
       "positive_differential_findings": false,
       "eidolon_controlled_reality_without_findings": true,
       "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
+    },
+    "finding_export_gap": {
+      "direct_final_json_finding_count": 0,
+      "eidolon_final_json_finding_count": 0,
+      "direct_db_saved_finding_count": 0,
+      "eidolon_db_saved_finding_count": 1,
+      "direct_db_active_finding_count": 0,
+      "eidolon_db_active_finding_count": 1,
+      "direct_db_saved_findings_omitted_from_final_json": false,
+      "eidolon_db_saved_findings_omitted_from_final_json": true,
+      "any_db_saved_findings_omitted_from_final_json": true,
+      "positive_eidolon_db_saved_finding_delta": true,
+      "positive_eidolon_db_active_finding_delta": true,
+      "final_json_counts_still_drive_finding_gap": true,
+      "next_question": "why_db_saved_findings_were_omitted_from_final_json"
     },
     "strict_correlation_gap": {
       "proxy_confirmed_action_count": 1,
@@ -552,11 +669,19 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .comparison.strict_correlation_gap.matching_proxy_exposure_crawl_start_paths == ["/docs"]
     and .comparison.strict_correlation_gap.unconfirmed_actions[0].action_path == "/api/v2/import/reconcile?token=<redacted>"
     and .runs.eidolon.warning_count == 1
+    and .runs.eidolon.final_json_finding_count == 0
+    and .runs.eidolon.db_saved_finding_count == 1
+    and .runs.eidolon.finding_reconciliation.db_saved_findings_omitted_from_final_json == true
+    and .comparison.finding_export_gap.eidolon_db_saved_findings_omitted_from_final_json == true
+    and .comparison.finding_export_gap.final_json_counts_still_drive_finding_gap == true
     and .runs.eidolon.pwnkit_events.crawl_artifacts[0].start_path == "/docs"
     and .runs.eidolon.target_evidence_diagnostics.crawl_start_paths == ["/docs"]
     and .runs.eidolon.agent_error_diagnostics.class_counts == [
       {error_class: "codex_backend_api_error", count: 1}
     ]
+    and .runner.environment.runner_environment == "kali_vm"
+    and .runner.environment.network_topology == "vm_loopback_forward"
+    and .runner.environment.tool_fingerprint[0].name == "bash"
     and .redaction.raw_agent_error_text_omitted == true
     and (.runner.pwnkit | has("command") | not)
     and (.runner.pwnkit | has("entry_path") | not)
@@ -584,6 +709,11 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .no_signal_diagnostics.eidolon_agent_error_class_counts == [
       {error_class: "codex_backend_api_error", count: 1}
     ]
+    and .runner_environments == ["kali_vm"]
+    and .runner_network_topologies == ["vm_loopback_forward"]
+    and .tool_fingerprint_summary[0].name == "bash"
+    and .finding_reconciliation.eidolon_db_saved_finding_total == 1
+    and .finding_reconciliation.any_db_saved_findings_omitted_from_final_json == true
     and .evidence_gap_diagnostics.observed_gaps == [
       "strict_controlled_reality_without_eidolon_findings"
     ]
@@ -591,6 +721,9 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .artifacts[0].agent_error_diagnostics.eidolon.count == 1
     and .artifacts[0].artifact_dir == "<source-artifact-path-omitted>"
     and (.artifacts[0] | has("runner_command") | not)
+    and .artifacts[0].runner_environment == "kali_vm"
+    and .artifacts[0].runner_tool_fingerprint[0].name == "bash"
+    and .artifacts[0].finding_export_gap.eidolon_db_saved_findings_omitted_from_final_json == true
     and .artifacts[0].eidolon_proxy.request_path_counts == [{value: "/docs", count: 1}]
     and .artifacts[0].target_correlation_diagnostics.correlated_target_request_count == 1
     and .artifacts[0].strict_correlation_gap.likely_cause == "matching_proxy_exposure_not_pwnkit_correlated"
@@ -606,6 +739,8 @@ test_packager_redacts_raw_artifacts_and_query_values() {
   rg -q 'pwnkit-stability-sample.json' "$bundle_dir/SHA256SUMS"
   rg -q 'run-1/pwnkit-summary.redacted.json' "$bundle_dir/SHA256SUMS"
   rg -q 'evidence gaps: `strict_controlled_reality_without_eidolon_findings`' "$bundle_dir/README.md"
+  rg -Fq 'runner environment(s): `kali_vm`' "$bundle_dir/README.md"
+  rg -q 'DB-saved findings direct/Eidolon: `0/1`' "$bundle_dir/README.md"
   rg -q '`strict_stability.ready_for_stability_claim`: `false`' "$bundle_dir/README.md"
 }
 

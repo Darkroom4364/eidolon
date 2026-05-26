@@ -26,6 +26,9 @@ eidolon_lab_url_authority() {
   if [[ "$rest" == */* || "$rest" == *\?* || "$rest" == *#* ]]; then
     eidolon_lab_fail "$name must not include a path, query, or fragment, got: $url"
   fi
+  if [[ "$rest" == *@* ]]; then
+    eidolon_lab_fail "$name must not include userinfo, got: $url"
+  fi
 
   printf '%s' "$rest"
 }

@@ -15,6 +15,8 @@ test_help_mentions_sample_summary() {
   "$RUNNER" --help | rg -q 'EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_MAX_ATTEMPTS'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_CODEX_AUTH_FILE'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_RUNNER_ENVIRONMENT'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_NETWORK_TOPOLOGY'
 }
 
 test_rejects_invalid_run_count() {
@@ -56,7 +58,22 @@ test_dry_run_creates_private_layout() {
   rg -q '^allow_agent_errors=0$' "$sample_dir/sample-plan.txt"
   rg -q '^allow_unfresh_pwnkit_source=0$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_max_attempts=2$' "$sample_dir/sample-plan.txt"
+  rg -q '^runner_environment=auto$' "$sample_dir/sample-plan.txt"
+  rg -q '^network_topology=same_host_loopback$' "$sample_dir/sample-plan.txt"
   rg -q '^debug_log=run-\*/private/eidolon-debug\.jsonl$' "$sample_dir/sample-plan.txt"
+}
+
+test_dry_run_records_runner_environment_overrides() {
+  local sample_dir
+  sample_dir="$(new_temp_dir)"
+
+  EIDOLON_M3_SAMPLE_DRY_RUN=1 \
+    EIDOLON_M3_RUNNER_ENVIRONMENT=kali_vm \
+    EIDOLON_M3_NETWORK_TOPOLOGY=vm_loopback_forward \
+    "$RUNNER" 1 "$sample_dir" >/dev/null
+
+  rg -q '^runner_environment=kali_vm$' "$sample_dir/sample-plan.txt"
+  rg -q '^network_topology=vm_loopback_forward$' "$sample_dir/sample-plan.txt"
 }
 
 test_rejects_invalid_pwnkit_max_attempts() {
@@ -140,6 +157,7 @@ test_rejects_invalid_run_count
 test_rejects_invalid_pwnkit_max_attempts
 test_rejects_urls_with_query_values
 test_dry_run_creates_private_layout
+test_dry_run_records_runner_environment_overrides
 test_dry_run_records_agent_error_override
 test_dry_run_records_unfresh_source_override
 test_dry_run_records_bait_profile
