@@ -37,6 +37,10 @@ Redacted summaries preserve runner freshness metadata, finding counts, shape-onl
 - claim levels: `bait_action_observed_without_same_session`: `1`, `controlled_reality_entered`: `2`
 - direct findings: `0/0/0`
 - Eidolon findings: `2/0/0`
+- proxy trace controlled-reality runs: `3`
+- strict pwnkit controlled-reality runs: `2`
+- strict controlled-reality runs without Eidolon findings: `2`
+- evidence gaps: `proxy_trace_controlled_reality_without_strict_pwnkit_correlation`, `strict_controlled_reality_without_eidolon_findings`, `positive_differential_findings_without_strict_controlled_reality`, `partial_positive_differential_findings`
 - `strict_stability.ready_for_stability_claim`: `false`
 
 This remains Lab-only evidence. It does not claim production readiness, autonomous-attacker identity, or stability beyond this sample on the recorded pwnkit head.

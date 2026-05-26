@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "run_kind": "m3_pwnkit_codex_sample",
-  "generated_at": "2026-05-26T07:26:11Z",
+  "generated_at": "2026-05-26T11:55:38Z",
   "artifact_count": 3,
   "valid_summary_count": 3,
   "counts": {
@@ -315,6 +315,30 @@
     "next_questions": [
       "differential_finding_observed",
       "why_controlled_reality_chain_was_not_promoted_to_finding"
+    ]
+  },
+  "evidence_gap_diagnostics": {
+    "sample_size": 3,
+    "proxy_trace_present_run_count": 3,
+    "proxy_trace_controlled_reality_run_count": 3,
+    "proxy_trace_real_surface_quiet_run_count": 3,
+    "pwnkit_strict_controlled_reality_run_count": 2,
+    "pwnkit_strict_same_session_run_count": 2,
+    "proxy_trace_without_strict_controlled_reality_run_count": 1,
+    "strict_controlled_reality_without_eidolon_finding_run_count": 2,
+    "positive_differential_without_strict_controlled_reality_run_count": 1,
+    "all_proxy_trace_contained": true,
+    "all_strict_pwnkit_controlled_reality": false,
+    "all_strict_controlled_reality_promoted_to_findings": false,
+    "observed_gaps": [
+      "proxy_trace_controlled_reality_without_strict_pwnkit_correlation",
+      "strict_controlled_reality_without_eidolon_findings",
+      "positive_differential_findings_without_strict_controlled_reality",
+      "partial_positive_differential_findings"
+    ],
+    "next_questions": [
+      "why_controlled_reality_chain_was_not_promoted_to_finding",
+      "why_proxy_trace_containment_was_not_confirmed_by_strict_pwnkit_correlation"
     ]
   },
   "strict_stability": {
@@ -798,6 +822,19 @@
         "real_surface_requests_after_containment": 0,
         "controlled_reality_action_depth": 15,
         "controlled_reality_branch_count": 11
+      },
+      "trace_gap": {
+        "proxy_trace_present": true,
+        "proxy_trace_claim_level": "controlled_reality_entered",
+        "proxy_trace_controlled_reality_entered": true,
+        "proxy_trace_real_surface_quiet": true,
+        "pwnkit_strict_claim_level": "bait_action_observed_without_same_session",
+        "pwnkit_strict_same_session_confirmed": false,
+        "pwnkit_strict_controlled_reality_entered": false,
+        "proxy_trace_controlled_reality_without_strict_confirmation": true,
+        "strict_controlled_reality_without_eidolon_finding": false,
+        "positive_differential_without_strict_controlled_reality": true,
+        "next_question": "why_proxy_trace_containment_was_not_confirmed_by_strict_pwnkit_correlation"
       }
     },
     {
@@ -1162,6 +1199,19 @@
         "real_surface_requests_after_containment": 0,
         "controlled_reality_action_depth": 21,
         "controlled_reality_branch_count": 15
+      },
+      "trace_gap": {
+        "proxy_trace_present": true,
+        "proxy_trace_claim_level": "controlled_reality_entered",
+        "proxy_trace_controlled_reality_entered": true,
+        "proxy_trace_real_surface_quiet": true,
+        "pwnkit_strict_claim_level": "controlled_reality_entered",
+        "pwnkit_strict_same_session_confirmed": true,
+        "pwnkit_strict_controlled_reality_entered": true,
+        "proxy_trace_controlled_reality_without_strict_confirmation": false,
+        "strict_controlled_reality_without_eidolon_finding": true,
+        "positive_differential_without_strict_controlled_reality": false,
+        "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
       }
     },
     {
@@ -1614,6 +1664,19 @@
         "real_surface_requests_after_containment": 0,
         "controlled_reality_action_depth": 48,
         "controlled_reality_branch_count": 38
+      },
+      "trace_gap": {
+        "proxy_trace_present": true,
+        "proxy_trace_claim_level": "controlled_reality_entered",
+        "proxy_trace_controlled_reality_entered": true,
+        "proxy_trace_real_surface_quiet": true,
+        "pwnkit_strict_claim_level": "controlled_reality_entered",
+        "pwnkit_strict_same_session_confirmed": true,
+        "pwnkit_strict_controlled_reality_entered": true,
+        "proxy_trace_controlled_reality_without_strict_confirmation": false,
+        "strict_controlled_reality_without_eidolon_finding": true,
+        "positive_differential_without_strict_controlled_reality": false,
+        "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
       }
     }
   ],
