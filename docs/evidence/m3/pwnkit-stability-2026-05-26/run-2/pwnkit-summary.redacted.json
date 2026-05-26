@@ -331,6 +331,17 @@
       "eidolon_bait_action_without_findings": true,
       "eidolon_controlled_reality_without_findings": true,
       "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
+    },
+    "strict_correlation_gap": {
+      "proxy_confirmed_action_count": 1,
+      "strict_correlated_action_count": 1,
+      "strict_confirmed_action_count": 1,
+      "unconfirmed_strict_action_count": 0,
+      "proxy_confirmed_action_not_strict_count": 0,
+      "matching_proxy_exposure_not_pwnkit_correlated_count": 0,
+      "unconfirmed_actions": [],
+      "likely_cause": null,
+      "next_questions": []
     }
   },
   "metrics": {
@@ -363,6 +374,7 @@
     "finding_diagnostics intentionally keeps only counts, coarse classifications, and field presence; it omits finding titles, descriptions, raw evidence, request bodies, raw URLs, and analysis text.",
     "agent_error_diagnostics intentionally keeps only counts and coarse error classes; it omits raw pwnkit agent error text.",
     "comparison.finding_gap records whether pwnkit observed target or bait evidence that was not promoted to a pwnkit finding.",
+    "comparison.strict_correlation_gap explains why a proxy-confirmed bait action did not become a strict pwnkit-correlated same-session action.",
     "When emitted, a bait_not_reached conclusion means the agent interacted with the protected target through Eidolon but did not touch any owned bait surface."
   ],
   "redaction": {
