@@ -372,6 +372,13 @@ Use `metrics.bait_follow_rate` for action-shaped follow-up rate and
 same-session rate. These rates are computed from `comparison.correlated_bait_events`,
 not from unrelated proxy traffic that may share the artifact directory.
 
+`comparison.strict_correlation_gap` explains why a bait-shaped action did not
+become a strict same-session confirmation. The most important current cause is
+`matching_proxy_exposure_not_pwnkit_correlated`: the proxy saw a prior matching
+exposure for the action, but pwnkit did not emit a request artifact that
+correlated to that exposure surface. In that case, inspect pwnkit artifact
+persistence or non-HTTP tool output before changing Eidolon bait behavior.
+
 The current post-merge M3 note is recorded in
 [`docs/research-note-m3.md`](research-note-m3.md). It records a fresh current
 pwnkit run plus a strict collector pass that extracts the pwnkit shell-mode HTTP

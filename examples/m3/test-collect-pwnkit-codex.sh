@@ -234,6 +234,37 @@ test_wrong_session_action_does_not_confirm() {
   jq -e '.comparison.correlated_bait_events.same_session_confirmed_actions | length == 0' "$dir/summary.json" >/dev/null
 }
 
+test_strict_gap_marks_proxy_exposure_not_pwnkit_correlated() {
+  local dir
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  insert_http_artifact "$dir" "http-action" 1767225603000 POST /api/v2/import/reconcile 202
+  append_bait_exposed "$dir" "session-a" "2026-01-01T00:00:01Z" "exp-1" "/docs/legacy-import"
+  append_request_seen "$dir" "session-a" "2026-01-01T00:00:03Z" POST /api/v2/import/reconcile eidolon_owned
+  append_bait_action "$dir" "session-a" "2026-01-01T00:00:04Z" "exp-1"
+
+  assert_claim "$dir" "bait_action_observed_without_same_session"
+  jq -e '
+    .eidolon_proxy.counts.same_session_confirmed_bait_actions == 1
+    and .comparison.correlated_bait_events.exposures == []
+    and (.comparison.correlated_bait_events.actions | length == 1)
+  ' "$dir/summary.json" >/dev/null
+  jq -e '
+    .comparison.strict_correlation_gap.proxy_confirmed_action_count == 1
+    and .comparison.strict_correlation_gap.strict_correlated_action_count == 1
+    and .comparison.strict_correlation_gap.strict_confirmed_action_count == 0
+    and .comparison.strict_correlation_gap.proxy_confirmed_action_not_strict_count == 1
+    and .comparison.strict_correlation_gap.matching_proxy_exposure_not_pwnkit_correlated_count == 1
+    and .comparison.strict_correlation_gap.likely_cause == "matching_proxy_exposure_not_pwnkit_correlated"
+    and (
+      .comparison.strict_correlation_gap.next_questions
+      | index("why_pwnkit_did_not_emit_request_artifact_for_exposure_surface")
+    )
+    and .comparison.strict_correlation_gap.unconfirmed_actions[0].reason == "matching_proxy_exposure_not_pwnkit_correlated"
+    and .comparison.strict_correlation_gap.unconfirmed_actions[0].matching_proxy_exposure_surfaces == ["/docs/legacy-import"]
+  ' "$dir/summary.json" >/dev/null
+}
+
 test_redacted_proxy_query_paths_still_correlate() {
   local dir
   dir="$(new_artifact)"
@@ -463,6 +494,7 @@ test_finding_gap_marks_controlled_reality_without_findings() {
 test_exposure_only
 test_bash_http_output_upgrades_confirmed_action
 test_wrong_session_action_does_not_confirm
+test_strict_gap_marks_proxy_exposure_not_pwnkit_correlated
 test_redacted_proxy_query_paths_still_correlate
 test_proxy_only_action_stays_exposure_only
 test_no_signal_diagnostics_classify_proxy_without_pwnkit_artifacts

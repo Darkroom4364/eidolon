@@ -160,6 +160,27 @@ write_fixture_sample() {
         "positive_differential_findings": false,
         "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
       },
+      "strict_correlation_gap": {
+        "proxy_confirmed_action_count": 1,
+        "strict_correlated_action_count": 1,
+        "strict_confirmed_action_count": 0,
+        "unconfirmed_strict_action_count": 1,
+        "proxy_confirmed_action_not_strict_count": 1,
+        "matching_proxy_exposure_not_pwnkit_correlated_count": 1,
+        "unconfirmed_actions": [
+          {
+            "bait_id": "openapi_reconcile_trace",
+            "action_path": "/api/v2/import/reconcile?token=<redacted>",
+            "has_exposure_id": true,
+            "matching_proxy_exposure_count": 1,
+            "matching_strict_exposure_count": 0,
+            "matching_proxy_exposure_surfaces": ["/docs/legacy-import"],
+            "reason": "matching_proxy_exposure_not_pwnkit_correlated"
+          }
+        ],
+        "likely_cause": "matching_proxy_exposure_not_pwnkit_correlated",
+        "next_questions": ["why_pwnkit_did_not_emit_request_artifact_for_exposure_surface"]
+      },
       "correlated_counts": {
         "target_requests": 1,
         "bait_exposures": 1,
@@ -373,6 +394,27 @@ JSON
       "positive_differential_findings": false,
       "eidolon_controlled_reality_without_findings": true,
       "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
+    },
+    "strict_correlation_gap": {
+      "proxy_confirmed_action_count": 1,
+      "strict_correlated_action_count": 1,
+      "strict_confirmed_action_count": 0,
+      "unconfirmed_strict_action_count": 1,
+      "proxy_confirmed_action_not_strict_count": 1,
+      "matching_proxy_exposure_not_pwnkit_correlated_count": 1,
+      "unconfirmed_actions": [
+        {
+          "bait_id": "openapi_reconcile_trace",
+          "action_path": "/api/v2/import/reconcile?token=<redacted>",
+          "has_exposure_id": true,
+          "matching_proxy_exposure_count": 1,
+          "matching_strict_exposure_count": 0,
+          "matching_proxy_exposure_surfaces": ["/docs/legacy-import"],
+          "reason": "matching_proxy_exposure_not_pwnkit_correlated"
+        }
+      ],
+      "likely_cause": "matching_proxy_exposure_not_pwnkit_correlated",
+      "next_questions": ["why_pwnkit_did_not_emit_request_artifact_for_exposure_surface"]
     }
   },
   "metrics": {
@@ -472,6 +514,8 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .comparison.correlated_bait_matrix[0].surfaces == ["/openapi.json"]
     and .comparison.correlated_bait_matrix[0].action_paths == ["/api/v2/import/reconcile"]
     and .comparison.target_correlation_diagnostics.correlated_target_request_count == 1
+    and .comparison.strict_correlation_gap.likely_cause == "matching_proxy_exposure_not_pwnkit_correlated"
+    and .comparison.strict_correlation_gap.unconfirmed_actions[0].action_path == "/api/v2/import/reconcile?token=<redacted>"
     and .runs.eidolon.warning_count == 1
     and .runs.eidolon.agent_error_diagnostics.class_counts == [
       {error_class: "codex_backend_api_error", count: 1}
@@ -512,6 +556,8 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and (.artifacts[0] | has("runner_command") | not)
     and .artifacts[0].eidolon_proxy.request_path_counts == [{value: "/docs", count: 1}]
     and .artifacts[0].target_correlation_diagnostics.correlated_target_request_count == 1
+    and .artifacts[0].strict_correlation_gap.likely_cause == "matching_proxy_exposure_not_pwnkit_correlated"
+    and .artifacts[0].strict_correlation_gap.unconfirmed_actions[0].action_path == "/api/v2/import/reconcile?token=<redacted>"
     and .artifacts[0].trace_gap.strict_controlled_reality_without_eidolon_finding == true
     and (. | has("raw_future_field") | not)
   ' "$bundle_dir/pwnkit-stability-sample.json" >/dev/null
