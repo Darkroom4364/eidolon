@@ -198,6 +198,8 @@ The comparison-level field `comparison.finding_gap` is the main diagnostic:
 - `counts.controlled_reality_without_eidolon_findings`
 - `no_signal_diagnostics`
 - `differential_findings`
+- `evidence_gap_diagnostics`
+- per-run `artifacts[].trace_gap`
 
 `examples/m3/collect-pwnkit-promotion-matrix.sh` wraps those sample-level
 signals per manifest variant and adds:
@@ -214,6 +216,10 @@ Use the diagnostics to classify the gap before changing bait text or behavior:
 
 - If `positive_differential_findings` is true, archive the sample and inspect
   which coarse finding categories changed.
+- If `evidence_gap_diagnostics.observed_gaps` includes
+  `proxy_trace_controlled_reality_without_strict_pwnkit_correlation`, focus on
+  whether pwnkit request artifacts preserved the exposure session, bait ID, and
+  exposure ID required for the stricter comparison claim.
 - If `eidolon_controlled_reality_without_findings` is true, pwnkit consumed and
   acted on controlled evidence but did not promote that chain to a finding.
 - If `eidolon_bait_action_without_findings` is true, focus on whether the action
