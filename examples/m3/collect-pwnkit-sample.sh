@@ -657,6 +657,16 @@ done | jq -s '
     ) as $matching_proxy_exposure_not_correlated_count
   | (
       $present
+      | map(
+          select(
+            (.strict_correlation_gap.matching_proxy_exposure_crawl_start_path_count // 0)
+            > 0
+          )
+        )
+      | length
+    ) as $matching_proxy_exposure_crawl_start_path_count
+  | (
+      $present
       | map(.strict_correlation_gap.likely_cause // null)
       | map(select(. != null))
     ) as $strict_correlation_likely_causes
@@ -845,6 +855,9 @@ done | jq -s '
         matching_proxy_exposure_not_pwnkit_correlated_run_count: (
           $matching_proxy_exposure_not_correlated_count
         ),
+        matching_proxy_exposure_crawl_start_path_run_count: (
+          $matching_proxy_exposure_crawl_start_path_count
+        ),
         strict_correlation_gap_likely_causes: (
           count_values($strict_correlation_likely_causes)
           | map({likely_cause: .value, count})
@@ -887,8 +900,10 @@ done | jq -s '
           | if ($gaps | length) == 0 then ["none"] else $gaps end
         ),
         next_questions: (
-          $present
-          | map(.trace_gap.next_question // null)
+          (
+            ($present | map(.trace_gap.next_question // null))
+            + ($present | map(.strict_correlation_gap.next_questions[]?))
+          )
           | map(select(. != null))
           | unique
         )

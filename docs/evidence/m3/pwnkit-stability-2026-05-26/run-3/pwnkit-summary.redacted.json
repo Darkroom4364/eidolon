@@ -75,6 +75,14 @@
           }
         ],
         "bash_http_output_requests": 3,
+        "crawl_artifacts": [
+          {
+            "timestamp_ms": 1779779606777,
+            "start_path": "/",
+            "depth": 2,
+            "pages_visited": 4
+          }
+        ],
         "agent_errors": 0
       },
       "finding_diagnostics": {
@@ -93,6 +101,10 @@
         "request_artifact_count": 23,
         "http_request_artifact_count": 20,
         "bash_http_output_request_count": 3,
+        "crawl_artifact_count": 1,
+        "crawl_start_paths": [
+          "/"
+        ],
         "observed_request_evidence_without_findings": true
       },
       "agent_error_diagnostics": {
@@ -130,6 +142,14 @@
           }
         ],
         "bash_http_output_requests": 2,
+        "crawl_artifacts": [
+          {
+            "timestamp_ms": 1779780190455,
+            "start_path": "/",
+            "depth": 2,
+            "pages_visited": 4
+          }
+        ],
         "agent_errors": 0
       },
       "finding_diagnostics": {
@@ -148,6 +168,10 @@
         "request_artifact_count": 47,
         "http_request_artifact_count": 45,
         "bash_http_output_request_count": 2,
+        "crawl_artifact_count": 1,
+        "crawl_start_paths": [
+          "/"
+        ],
         "observed_request_evidence_without_findings": true
       },
       "agent_error_diagnostics": {
@@ -339,8 +363,15 @@
       "unconfirmed_strict_action_count": 0,
       "proxy_confirmed_action_not_strict_count": 0,
       "matching_proxy_exposure_not_pwnkit_correlated_count": 0,
+      "crawl_artifact_count": 1,
+      "crawl_artifact_start_paths": [
+        "/"
+      ],
+      "matching_proxy_exposure_crawl_start_path_count": 0,
+      "matching_proxy_exposure_crawl_start_paths": [],
       "unconfirmed_actions": [],
       "likely_cause": null,
+      "likely_missing_artifact_class": null,
       "next_questions": []
     }
   },
