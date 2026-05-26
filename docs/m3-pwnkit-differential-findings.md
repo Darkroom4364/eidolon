@@ -190,6 +190,12 @@ The comparison-level field `comparison.finding_gap` is the main diagnostic:
   reality but emitted no Eidolon findings.
 - `next_question`: the next classification question for that run.
 
+`comparison.strict_correlation_gap` is the companion diagnostic for samples
+where proxy trace containment is stronger than the strict pwnkit-correlated
+claim. `matching_proxy_exposure_not_pwnkit_correlated` means the proxy saw a
+matching prior exposure for the action, but pwnkit did not persist request
+evidence that correlated to that exposure surface.
+
 `examples/m3/collect-pwnkit-sample.sh` aggregates those signals under:
 
 - `counts.positive_differential_findings`
@@ -200,6 +206,7 @@ The comparison-level field `comparison.finding_gap` is the main diagnostic:
 - `differential_findings`
 - `evidence_gap_diagnostics`
 - per-run `artifacts[].trace_gap`
+- per-run `artifacts[].strict_correlation_gap`
 
 `examples/m3/collect-pwnkit-promotion-matrix.sh` wraps those sample-level
 signals per manifest variant and adds:
@@ -220,6 +227,10 @@ Use the diagnostics to classify the gap before changing bait text or behavior:
   `proxy_trace_controlled_reality_without_strict_pwnkit_correlation`, focus on
   whether pwnkit request artifacts preserved the exposure session, bait ID, and
   exposure ID required for the stricter comparison claim.
+- If `strict_correlation_gap.likely_cause` is
+  `matching_proxy_exposure_not_pwnkit_correlated`, inspect whether pwnkit reached
+  the exposure surface through tooling whose output was not persisted as an HTTP
+  request artifact.
 - If `eidolon_controlled_reality_without_findings` is true, pwnkit consumed and
   acted on controlled evidence but did not promote that chain to a finding.
 - If `eidolon_bait_action_without_findings` is true, focus on whether the action

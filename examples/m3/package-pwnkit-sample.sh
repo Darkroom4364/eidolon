@@ -147,6 +147,7 @@ redact_sample_summary() {
           eidolon_proxy: (.eidolon_proxy | clean_sample_proxy),
           target_correlation_diagnostics,
           finding_gap,
+          strict_correlation_gap,
           correlated_counts,
           pinned_session,
           metrics,
@@ -268,7 +269,8 @@ redact_pwnkit_summary() {
         },
         correlated_bait_matrix: ((.comparison.correlated_bait_events.matrix // []) | clean_matrix),
         target_correlation_diagnostics: .comparison.target_correlation_diagnostics,
-        finding_gap: .comparison.finding_gap
+        finding_gap: .comparison.finding_gap,
+        strict_correlation_gap: .comparison.strict_correlation_gap
       },
       metrics,
       pinned_session,
