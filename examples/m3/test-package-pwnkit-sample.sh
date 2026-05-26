@@ -118,11 +118,20 @@ write_fixture_sample() {
       "direct_finding_count": 0,
       "eidolon_finding_count": 0,
       "pwnkit_events": {
-        "eidolon": {"tool_artifacts": 1},
+        "eidolon": {
+          "tool_artifacts": 1,
+          "crawl_artifacts": [
+            {"timestamp_ms": 1767225601000, "start_path": "/docs", "depth": 2, "pages_visited": 5}
+          ]
+        },
         "direct": {"tool_artifacts": 1}
       },
       "target_evidence_diagnostics": {
-        "eidolon": {"request_artifact_count": 1},
+        "eidolon": {
+          "request_artifact_count": 1,
+          "crawl_artifact_count": 1,
+          "crawl_start_paths": ["/docs"]
+        },
         "direct": {"request_artifact_count": 1}
       },
       "agent_error_diagnostics": {
@@ -175,11 +184,20 @@ write_fixture_sample() {
             "matching_proxy_exposure_count": 1,
             "matching_strict_exposure_count": 0,
             "matching_proxy_exposure_surfaces": ["/docs/legacy-import"],
+            "matching_proxy_exposure_crawl_start_paths": ["/docs"],
             "reason": "matching_proxy_exposure_not_pwnkit_correlated"
           }
         ],
+        "crawl_artifact_count": 1,
+        "crawl_artifact_start_paths": ["/docs"],
+        "matching_proxy_exposure_crawl_start_path_count": 1,
+        "matching_proxy_exposure_crawl_start_paths": ["/docs"],
         "likely_cause": "matching_proxy_exposure_not_pwnkit_correlated",
-        "next_questions": ["why_pwnkit_did_not_emit_request_artifact_for_exposure_surface"]
+        "likely_missing_artifact_class": "crawl_page_request_artifact",
+        "next_questions": [
+          "why_pwnkit_did_not_emit_request_artifact_for_exposure_surface",
+          "whether_pwnkit_crawl_persisted_per_page_request_artifacts"
+        ]
       },
       "correlated_counts": {
         "target_requests": 1,
@@ -277,7 +295,10 @@ JSON
       "pwnkit_events": {
         "pipeline_events": 1,
         "tool_artifacts": 1,
-        "tool_counts": [{"tool": "http_request", "count": 1}]
+        "tool_counts": [{"tool": "http_request", "count": 1}],
+        "crawl_artifacts": [
+          {"timestamp_ms": 1767225601000, "start_path": "/docs", "depth": 2, "pages_visited": 5}
+        ]
       },
       "requested_paths": [
         {"method": "GET", "path": "/docs?token=secret-token", "tool_evidence_label": "secret-label"}
@@ -287,6 +308,9 @@ JSON
         "field_presence": {"title": 0}
       },
       "target_evidence_diagnostics": {
+        "request_artifact_count": 1,
+        "crawl_artifact_count": 1,
+        "crawl_start_paths": ["/docs"],
         "observed_request_evidence_without_findings": true
       },
       "agent_error_diagnostics": {
@@ -410,11 +434,20 @@ JSON
           "matching_proxy_exposure_count": 1,
           "matching_strict_exposure_count": 0,
           "matching_proxy_exposure_surfaces": ["/docs/legacy-import"],
+          "matching_proxy_exposure_crawl_start_paths": ["/docs"],
           "reason": "matching_proxy_exposure_not_pwnkit_correlated"
         }
       ],
+      "crawl_artifact_count": 1,
+      "crawl_artifact_start_paths": ["/docs"],
+      "matching_proxy_exposure_crawl_start_path_count": 1,
+      "matching_proxy_exposure_crawl_start_paths": ["/docs"],
       "likely_cause": "matching_proxy_exposure_not_pwnkit_correlated",
-      "next_questions": ["why_pwnkit_did_not_emit_request_artifact_for_exposure_surface"]
+      "likely_missing_artifact_class": "crawl_page_request_artifact",
+      "next_questions": [
+        "why_pwnkit_did_not_emit_request_artifact_for_exposure_surface",
+        "whether_pwnkit_crawl_persisted_per_page_request_artifacts"
+      ]
     }
   },
   "metrics": {
@@ -515,8 +548,12 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .comparison.correlated_bait_matrix[0].action_paths == ["/api/v2/import/reconcile"]
     and .comparison.target_correlation_diagnostics.correlated_target_request_count == 1
     and .comparison.strict_correlation_gap.likely_cause == "matching_proxy_exposure_not_pwnkit_correlated"
+    and .comparison.strict_correlation_gap.likely_missing_artifact_class == "crawl_page_request_artifact"
+    and .comparison.strict_correlation_gap.matching_proxy_exposure_crawl_start_paths == ["/docs"]
     and .comparison.strict_correlation_gap.unconfirmed_actions[0].action_path == "/api/v2/import/reconcile?token=<redacted>"
     and .runs.eidolon.warning_count == 1
+    and .runs.eidolon.pwnkit_events.crawl_artifacts[0].start_path == "/docs"
+    and .runs.eidolon.target_evidence_diagnostics.crawl_start_paths == ["/docs"]
     and .runs.eidolon.agent_error_diagnostics.class_counts == [
       {error_class: "codex_backend_api_error", count: 1}
     ]
@@ -557,7 +594,11 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .artifacts[0].eidolon_proxy.request_path_counts == [{value: "/docs", count: 1}]
     and .artifacts[0].target_correlation_diagnostics.correlated_target_request_count == 1
     and .artifacts[0].strict_correlation_gap.likely_cause == "matching_proxy_exposure_not_pwnkit_correlated"
+    and .artifacts[0].strict_correlation_gap.likely_missing_artifact_class == "crawl_page_request_artifact"
+    and .artifacts[0].strict_correlation_gap.matching_proxy_exposure_crawl_start_paths == ["/docs"]
     and .artifacts[0].strict_correlation_gap.unconfirmed_actions[0].action_path == "/api/v2/import/reconcile?token=<redacted>"
+    and .artifacts[0].pwnkit_events.eidolon.crawl_artifacts[0].start_path == "/docs"
+    and .artifacts[0].target_evidence_diagnostics.eidolon.crawl_start_paths == ["/docs"]
     and .artifacts[0].trace_gap.strict_controlled_reality_without_eidolon_finding == true
     and (. | has("raw_future_field") | not)
   ' "$bundle_dir/pwnkit-stability-sample.json" >/dev/null
