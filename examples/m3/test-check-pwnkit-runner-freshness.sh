@@ -15,6 +15,7 @@ write_metadata() {
   local in_sync="$4"
   local ahead="$5"
   local behind="$6"
+  local fixture_id="${7:-}"
 
   jq -n \
     --arg repo_dir "$repo_dir" \
@@ -22,16 +23,22 @@ write_metadata() {
     --argjson in_sync "$in_sync" \
     --argjson ahead "$ahead" \
     --argjson behind "$behind" \
+    --arg fixture_id "$fixture_id" \
     '{
       schema_version: 1,
       run_kind: "m3_pwnkit_codex_runner",
       pwnkit: {
         repo_dir: (if $repo_dir == "" then null else $repo_dir end),
+        git_head: "fixture-head",
         git_dirty: $git_dirty,
         origin_main: {
           in_sync: $in_sync,
           ahead: $ahead,
           behind: $behind
+        },
+        fixture: {
+          id: (if $fixture_id == "" then null else $fixture_id end),
+          pinned: ($fixture_id != "")
         }
       }
     }' > "$path"
@@ -81,6 +88,62 @@ test_rejects_unsynced_source_checkout() {
   rg -q 'ahead=1 behind=2' <<<"$output"
 }
 
+test_accepts_clean_pinned_fixture_without_origin_sync() {
+  local dir
+  dir="$(new_temp_dir)"
+  write_metadata \
+    "$dir/pwnkit-runner-metadata.json" \
+    "/tmp/pwnkit" \
+    false \
+    false \
+    3 \
+    0 \
+    "pwnkit-v0.12.0-private"
+
+  "$CHECKER" "$dir/pwnkit-runner-metadata.json"
+}
+
+test_rejects_dirty_pinned_fixture() {
+  local dir
+  local output
+  local status=0
+  dir="$(new_temp_dir)"
+  write_metadata \
+    "$dir/pwnkit-runner-metadata.json" \
+    "/tmp/pwnkit" \
+    true \
+    false \
+    3 \
+    0 \
+    "pwnkit-v0.12.0-private"
+
+  output="$("$CHECKER" "$dir/pwnkit-runner-metadata.json" 2>&1)" || status="$?"
+
+  [[ "$status" -eq 1 ]]
+  rg -q 'git_dirty=true' <<<"$output"
+  rg -q 'pinned_fixture=true' <<<"$output"
+}
+
+test_rejects_unsafe_pinned_fixture_id() {
+  local dir
+  local output
+  local status=0
+  dir="$(new_temp_dir)"
+  write_metadata \
+    "$dir/pwnkit-runner-metadata.json" \
+    "/tmp/pwnkit" \
+    false \
+    false \
+    3 \
+    0 \
+    "/tmp/private-pwnkit"
+
+  output="$("$CHECKER" "$dir/pwnkit-runner-metadata.json" 2>&1)" || status="$?"
+
+  [[ "$status" -eq 1 ]]
+  rg -q 'pinned_fixture=true' <<<"$output"
+}
+
 test_allows_unfresh_source_when_explicitly_requested() {
   local dir
   dir="$(new_temp_dir)"
@@ -104,6 +167,9 @@ test_accepts_synced_clean_source_checkout
 test_accepts_non_source_runner_metadata
 test_rejects_dirty_source_checkout
 test_rejects_unsynced_source_checkout
+test_accepts_clean_pinned_fixture_without_origin_sync
+test_rejects_dirty_pinned_fixture
+test_rejects_unsafe_pinned_fixture_id
 test_allows_unfresh_source_when_explicitly_requested
 test_rejects_missing_metadata
 

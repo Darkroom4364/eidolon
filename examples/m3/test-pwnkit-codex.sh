@@ -111,6 +111,60 @@ test_source_checkout_metadata_records_origin_drift() {
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
 }
 
+test_source_checkout_metadata_records_pinned_fixture_id() {
+  local repo
+  local artifact
+  local previous_head
+  repo="$(new_temp_dir)"
+  artifact="$(new_temp_dir)"
+  init_fake_pwnkit_checkout "$repo"
+  previous_head="$(git -C "$repo" rev-parse HEAD)"
+
+  printf '\n// pinned fixture change\n' >> "$repo/dist/pwnkit.js"
+  git -C "$repo" add dist/pwnkit.js
+  GIT_AUTHOR_DATE="2026-01-03T00:00:00Z" \
+    GIT_COMMITTER_DATE="2026-01-03T00:00:00Z" \
+    git -C "$repo" commit -q -m "pinned fixture runner"
+  git -C "$repo" update-ref refs/remotes/origin/main "$previous_head"
+  touch "$repo/dist/pwnkit.js"
+
+  EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
+    PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
+    "$RUNNER" preflight "$artifact" >/dev/null
+
+  jq -e '
+    .pwnkit.origin_main.in_sync == false
+    and .pwnkit.fixture == {
+      id: "pwnkit-v0.12.0-private",
+      pinned: true
+    }
+  ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+}
+
+test_rejects_unsafe_pinned_fixture_id() {
+  local repo
+  local artifact
+  local output
+  local status=0
+  repo="$(new_temp_dir)"
+  artifact="$(new_temp_dir)"
+  init_fake_pwnkit_checkout "$repo"
+
+  output="$(
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+      EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+      EIDOLON_M3_PWNKIT_FIXTURE_ID="/tmp/private-pwnkit" \
+      PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
+      "$RUNNER" preflight "$artifact" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID must be 1-128 chars' <<<"$output"
+  ! rg -q '/tmp/private-pwnkit' <<<"$output"
+}
+
 test_source_checkout_metadata_records_dirty_worktree() {
   local repo
   local artifact
@@ -637,6 +691,8 @@ SH
 
 test_source_checkout_metadata_records_version_and_origin_sync
 test_source_checkout_metadata_records_origin_drift
+test_source_checkout_metadata_records_pinned_fixture_id
+test_rejects_unsafe_pinned_fixture_id
 test_source_checkout_metadata_records_dirty_worktree
 test_preflight_writes_metadata_and_scopes_without_scan
 test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret

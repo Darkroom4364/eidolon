@@ -14,6 +14,7 @@ EIDOLON_M3_NETWORK_TOPOLOGY="${EIDOLON_M3_NETWORK_TOPOLOGY:-same_vm_loopback}"
 EIDOLON_M3_KALI_VM_DRY_RUN="${EIDOLON_M3_KALI_VM_DRY_RUN:-0}"
 EIDOLON_M3_ALLOW_NON_KALI_VM="${EIDOLON_M3_ALLOW_NON_KALI_VM:-0}"
 EIDOLON_M3_KALI_VM_PREFLIGHT="${EIDOLON_M3_KALI_VM_PREFLIGHT:-0}"
+EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-}"
 
 usage() {
   cat <<'USAGE'
@@ -34,6 +35,8 @@ Environment:
   EIDOLON_M3_KALI_VM_DRY_RUN   If true, write the sample plan without running scans.
   EIDOLON_M3_KALI_VM_PREFLIGHT If true, validate VM runner plumbing and exit.
   EIDOLON_M3_ALLOW_NON_KALI_VM Allow dry-run/planning outside Kali. Defaults to 0.
+  EIDOLON_M3_PWNKIT_FIXTURE_ID Optional safe label for archived/private pinned
+                               pwnkit fixtures.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to run-pwnkit-sample.sh.
 
 The wrapper forces the evidence labels:
@@ -211,6 +214,7 @@ run_preflight() {
     EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-1}" \
     EIDOLON_M3_RUNNER_ENVIRONMENT="$EIDOLON_M3_RUNNER_ENVIRONMENT" \
     EIDOLON_M3_NETWORK_TOPOLOGY="$EIDOLON_M3_NETWORK_TOPOLOGY" \
+    EIDOLON_M3_PWNKIT_FIXTURE_ID="$EIDOLON_M3_PWNKIT_FIXTURE_ID" \
     "$SCRIPT_DIR/pwnkit-codex.sh" preflight "$preflight_dir" >/dev/null
   EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE="${EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE:-0}" \
     "$SCRIPT_DIR/check-pwnkit-runner-freshness.sh" \
@@ -242,6 +246,7 @@ main() {
   export EIDOLON_LAB_PROXY_URL="$PROXY_URL"
   export EIDOLON_M3_RUNNER_ENVIRONMENT
   export EIDOLON_M3_NETWORK_TOPOLOGY
+  export EIDOLON_M3_PWNKIT_FIXTURE_ID
 
   if truthy "$EIDOLON_M3_KALI_VM_DRY_RUN"; then
     export EIDOLON_M3_SAMPLE_DRY_RUN=1

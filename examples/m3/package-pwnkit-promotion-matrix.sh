@@ -186,6 +186,7 @@ redact_matrix_summary() {
           strongest_claim_level,
           runner_git_heads,
           runner_package_versions,
+          runner_pwnkit_fixture_ids,
           source_checkout,
           no_signal_diagnostics: (.no_signal_diagnostics | clean_no_signal_diagnostics),
           differential_findings,
