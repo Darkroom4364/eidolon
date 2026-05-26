@@ -701,6 +701,29 @@ test_evidence_gap_diagnostics_compare_strict_and_proxy_trace() {
   write_summary "$first" bait_action_observed_without_same_session head-a 0 true 0 2
   write_summary "$second" controlled_reality_entered head-a 0 true 4
   write_summary "$third" controlled_reality_entered head-a 0 true 5
+  mutate_summary "$first" '
+    .comparison.strict_correlation_gap = {
+      proxy_confirmed_action_count: 1,
+      strict_correlated_action_count: 1,
+      strict_confirmed_action_count: 0,
+      unconfirmed_strict_action_count: 1,
+      proxy_confirmed_action_not_strict_count: 1,
+      matching_proxy_exposure_not_pwnkit_correlated_count: 1,
+      unconfirmed_actions: [
+        {
+          bait_id: "openapi_reconcile_trace",
+          action_path: "/api/v2/import/reconcile",
+          has_exposure_id: true,
+          matching_proxy_exposure_count: 1,
+          matching_strict_exposure_count: 0,
+          matching_proxy_exposure_surfaces: ["/docs/legacy-import"],
+          reason: "matching_proxy_exposure_not_pwnkit_correlated"
+        }
+      ],
+      likely_cause: "matching_proxy_exposure_not_pwnkit_correlated",
+      next_questions: ["why_pwnkit_did_not_emit_request_artifact_for_exposure_surface"]
+    }
+  '
   write_agent_trace_summary "$first" controlled_reality_entered 0 15 11
   write_agent_trace_summary "$second" controlled_reality_entered 0 21 15
   write_agent_trace_summary "$third" controlled_reality_entered 0 48 38
@@ -718,6 +741,10 @@ test_evidence_gap_diagnostics_compare_strict_and_proxy_trace() {
     and .evidence_gap_diagnostics.proxy_trace_without_strict_controlled_reality_run_count == 1
     and .evidence_gap_diagnostics.strict_controlled_reality_without_eidolon_finding_run_count == 2
     and .evidence_gap_diagnostics.positive_differential_without_strict_controlled_reality_run_count == 1
+    and .evidence_gap_diagnostics.matching_proxy_exposure_not_pwnkit_correlated_run_count == 1
+    and .evidence_gap_diagnostics.strict_correlation_gap_likely_causes == [
+      {likely_cause: "matching_proxy_exposure_not_pwnkit_correlated", count: 1}
+    ]
     and .evidence_gap_diagnostics.all_proxy_trace_contained == true
     and .evidence_gap_diagnostics.all_strict_pwnkit_controlled_reality == false
     and .evidence_gap_diagnostics.all_strict_controlled_reality_promoted_to_findings == false
@@ -743,6 +770,7 @@ test_evidence_gap_diagnostics_compare_strict_and_proxy_trace() {
     )
     and .artifacts[0].trace_gap.proxy_trace_controlled_reality_without_strict_confirmation == true
     and .artifacts[0].trace_gap.positive_differential_without_strict_controlled_reality == true
+    and .artifacts[0].strict_correlation_gap.likely_cause == "matching_proxy_exposure_not_pwnkit_correlated"
     and .artifacts[1].trace_gap.strict_controlled_reality_without_eidolon_finding == true
   ' "$output" >/dev/null
 }
