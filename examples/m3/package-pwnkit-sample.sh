@@ -335,7 +335,8 @@ redact_agent_trace() {
 
 sample_value() {
   local filter="$1"
-  jq -r "$filter // \"unknown\"" "$BUNDLE_DIR/pwnkit-stability-sample.json"
+  jq -r "($filter) as \$value | if \$value == null then \"unknown\" else \$value end" \
+    "$BUNDLE_DIR/pwnkit-stability-sample.json"
 }
 
 write_readme() {

@@ -63,7 +63,22 @@ benign demo target answered the first half for pwnkit `v0.12.0` /
 0 findings, both legs were agent-error-free, the Eidolon leg preserved the
 pinned session, and the correlated chain still reached controlled reality with
 0 Eidolon findings. Treat this as a local diagnostic, not archived evidence.
-The next archive-worthy step is a fresh 3-run strict sample on current pwnkit.
+
+A fresh 3-run strict sample was archived on 2026-05-26 against synced pwnkit
+`v0.12.0` / head `1a8d6aac37818df29ff2e37d065c5bbcfe9c063b` under
+`docs/evidence/m3/pwnkit-stability-2026-05-26`. It was agent-error-free,
+kept direct target findings quiet in all runs, reached bait and replayed a
+bait-shaped action in all runs, preserved the pinned session in all runs, and
+produced positive differential Eidolon findings in one run. The strict
+same-session/controlled-reality chain held in two of three pwnkit-correlated
+runs, while same-run proxy traces reached controlled reality in all three.
+Treat the active open question as:
+
+```text
+Why does current pwnkit promote Eidolon evidence to findings in only one run,
+and why does one run lose strict same-session confirmation despite proxy-trace
+containment?
+```
 
 ## Pre-Run Checklist
 
