@@ -94,10 +94,14 @@ Before collecting a new sample:
 4. Confirm `runner.pwnkit.origin_main.in_sync` is `true` and
    `runner.pwnkit.git_dirty` is `false` in the collected summary before making
    current-pwnkit claims.
-5. Run direct and Eidolon legs with generated pwnkit scope files.
-6. Use `EIDOLON_M3_PIN_SESSION=1` for the Eidolon leg when testing same-session
+5. For VM-local Kali fixture runs, follow
+   [`../examples/m3/kali-vm-pwnkit.md`](../examples/m3/kali-vm-pwnkit.md) and
+   run `examples/m3/run-pwnkit-kali-vm.sh` from inside the VM so the evidence is
+   labeled `kali_vm` / `same_vm_loopback`.
+6. Run direct and Eidolon legs with generated pwnkit scope files.
+7. Use `EIDOLON_M3_PIN_SESSION=1` for the Eidolon leg when testing same-session
    replay.
-7. Keep `EIDOLON_M3_ALLOW_AGENT_ERRORS=0` for evidence collection so the sample
+8. Keep `EIDOLON_M3_ALLOW_AGENT_ERRORS=0` for evidence collection so the sample
    runner fails after any pwnkit `agent_error` event in the promoted artifacts.
    The sample runner retries transient Codex backend-error attempts, including
    timeouts and transport/API failures, up to
@@ -106,7 +110,7 @@ Before collecting a new sample:
    leg in-place because proxy policy state and event logs are part of the
    evidence. Use `EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only for diagnostic
    no-signal preservation.
-8. Keep the proxy event log, policy state, and intervention control files inside
+9. Keep the proxy event log, policy state, and intervention control files inside
    the same artifact directory.
 
 For the standard repeated-run path, use:

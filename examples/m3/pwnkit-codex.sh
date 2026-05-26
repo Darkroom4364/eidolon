@@ -18,6 +18,8 @@ EIDOLON_M3_CODEX_AUTH_FILE="${EIDOLON_M3_CODEX_AUTH_FILE:-$HOME/.codex/auth.json
 EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-0}"
 EIDOLON_M3_SESSION_ID="${EIDOLON_M3_SESSION_ID:-}"
 EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST="${EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST:-0}"
+EIDOLON_M3_RUNNER_ENVIRONMENT="${EIDOLON_M3_RUNNER_ENVIRONMENT:-auto}"
+EIDOLON_M3_NETWORK_TOPOLOGY="${EIDOLON_M3_NETWORK_TOPOLOGY:-same_host_loopback}"
 
 usage() {
   cat <<'USAGE'
@@ -59,6 +61,13 @@ Environment:
   EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST
                             If true, skip the source-checkout dist freshness
                             guard. Defaults to 0.
+  EIDOLON_M3_RUNNER_ENVIRONMENT
+                            Runner environment label for evidence metadata.
+                            Defaults to auto; examples: host_mac, kali_vm,
+                            linux_host.
+  EIDOLON_M3_NETWORK_TOPOLOGY
+                            Network topology label for evidence metadata.
+                            Defaults to same_host_loopback.
 
 The runner writes one pwnkit scope file per scan leg and always passes
 `--scope`. This keeps pwnkit's shell-mode auth injection active for the
@@ -215,6 +224,128 @@ json_bool() {
   fi
 }
 
+os_release_value() {
+  local key="$1"
+  local line
+
+  if [[ ! -f /etc/os-release ]]; then
+    return
+  fi
+
+  line="$(grep -E "^${key}=" /etc/os-release 2>/dev/null | sed -n '1p' || true)"
+  line="${line#*=}"
+  line="${line%\"}"
+  line="${line#\"}"
+  printf '%s' "$line"
+}
+
+detect_runner_environment() {
+  case "$(uname -s 2>/dev/null || true)" in
+    Darwin)
+      printf 'host_mac'
+      ;;
+    Linux)
+      if [[ "$(os_release_value ID)" == "kali" ]]; then
+        printf 'kali_vm'
+      else
+        printf 'linux_host'
+      fi
+      ;;
+    *)
+      printf 'unknown'
+      ;;
+  esac
+}
+
+runner_environment_value() {
+  if [[ "$EIDOLON_M3_RUNNER_ENVIRONMENT" == "auto" ]]; then
+    detect_runner_environment
+  else
+    printf '%s' "$EIDOLON_M3_RUNNER_ENVIRONMENT"
+  fi
+}
+
+runner_environment_source_value() {
+  if [[ "$EIDOLON_M3_RUNNER_ENVIRONMENT" == "auto" ]]; then
+    printf 'auto_detect'
+  else
+    printf 'env_override'
+  fi
+}
+
+tool_version() {
+  local tool="$1"
+  local output=""
+
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    return
+  fi
+
+  case "$tool" in
+    bash|curl|node|python3|sqlite3|cargo|nmap|sqlmap)
+      output="$("$tool" --version 2>&1 || true)"
+      ;;
+    jq)
+      output="$(jq --version 2>&1 || true)"
+      ;;
+    ffuf)
+      output="$(ffuf -V 2>&1 || ffuf --version 2>&1 || true)"
+      ;;
+    gobuster)
+      output="$(gobuster version 2>&1 || gobuster --version 2>&1 || true)"
+      ;;
+    nikto)
+      output="$(nikto -Version 2>&1 || nikto --version 2>&1 || true)"
+      ;;
+    *)
+      output="$("$tool" --version 2>&1 || true)"
+      ;;
+  esac
+
+  printf '%s' "$output" | sed -n '1p' | tr '\n' ' ' | cut -c1-200
+}
+
+tool_fingerprint_json() {
+  local tools=(
+    bash
+    curl
+    jq
+    node
+    python3
+    sqlite3
+    cargo
+    nmap
+    sqlmap
+    ffuf
+    gobuster
+    nikto
+  )
+  local name
+  local present
+  local version
+
+  {
+    for name in "${tools[@]}"; do
+      present=false
+      version=""
+      if command -v "$name" >/dev/null 2>&1; then
+        present=true
+        version="$(tool_version "$name")"
+      fi
+
+      jq -n \
+        --arg name "$name" \
+        --arg version "$version" \
+        --argjson present "$(json_bool "$present")" \
+        '{
+          name: $name,
+          present: $present,
+          version: (if $version == "" then null else $version end)
+        }'
+    done
+  } | jq -s '.'
+}
+
 require_positive_integer() {
   local name="$1"
   local value="$2"
@@ -369,6 +500,9 @@ write_runner_metadata() {
   local origin_relation=""
   local allow_stale_dist
   local pin_session
+  local runner_environment
+  local runner_environment_source
+  local tool_fingerprint
 
   require_jq "write pwnkit runner metadata"
 
@@ -405,6 +539,9 @@ write_runner_metadata() {
 
   allow_stale_dist="$(json_bool "$EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST")"
   pin_session="$(json_bool "$EIDOLON_M3_PIN_SESSION")"
+  runner_environment="$(runner_environment_value)"
+  runner_environment_source="$(runner_environment_source_value)"
+  tool_fingerprint="$(tool_fingerprint_json)"
 
   jq -n \
     --arg created_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
@@ -434,10 +571,20 @@ write_runner_metadata() {
     --arg pwnkit_codex_auth_source "$PWNKIT_CODEX_AUTH_SOURCE" \
     --arg pwnkit_eidolon_scope_file "$PWNKIT_EIDOLON_SCOPE_FILE" \
     --arg pwnkit_direct_scope_file "$PWNKIT_DIRECT_SCOPE_FILE" \
+    --arg runner_environment "$runner_environment" \
+    --arg runner_environment_source "$runner_environment_source" \
+    --arg network_topology "$EIDOLON_M3_NETWORK_TOPOLOGY" \
+    --arg kernel_name "$(uname -s 2>/dev/null || true)" \
+    --arg kernel_release "$(uname -r 2>/dev/null || true)" \
+    --arg kernel_version "$(uname -v 2>/dev/null || true)" \
+    --arg machine_arch "$(uname -m 2>/dev/null || true)" \
+    --arg os_release_id "$(os_release_value ID)" \
+    --arg os_release_version_id "$(os_release_value VERSION_ID)" \
     --slurpfile pwnkit_eidolon_scope "$PWNKIT_EIDOLON_SCOPE_FILE" \
     --slurpfile pwnkit_direct_scope "$PWNKIT_DIRECT_SCOPE_FILE" \
     --argjson allow_stale_dist "$allow_stale_dist" \
     --argjson pin_session "$pin_session" \
+    --argjson tool_fingerprint "$tool_fingerprint" \
     '{
       schema_version: 1,
       run_kind: "m3_pwnkit_codex_runner",
@@ -446,6 +593,22 @@ write_runner_metadata() {
       urls: {
         target: $target_url,
         proxy: $proxy_url
+      },
+      environment: {
+        runner_environment: $runner_environment,
+        runner_environment_source: $runner_environment_source,
+        network_topology: $network_topology,
+        os: {
+          kernel_name: (if $kernel_name == "" then null else $kernel_name end),
+          kernel_release: (if $kernel_release == "" then null else $kernel_release end),
+          kernel_version: (if $kernel_version == "" then null else $kernel_version end),
+          machine_arch: (if $machine_arch == "" then null else $machine_arch end),
+          os_release_id: (if $os_release_id == "" then null else $os_release_id end),
+          os_release_version_id: (
+            if $os_release_version_id == "" then null else $os_release_version_id end
+          )
+        },
+        tool_fingerprint: $tool_fingerprint
       },
       pwnkit: {
         depth: $pwnkit_depth,

@@ -69,6 +69,14 @@ test_source_checkout_metadata_records_version_and_origin_sync() {
     and .pwnkit.origin_main.ahead == 0
     and .pwnkit.origin_main.behind == 0
     and .pwnkit.origin_main.in_sync == true
+    and (.environment.runner_environment | type) == "string"
+    and .environment.runner_environment_source == "auto_detect"
+    and .environment.network_topology == "same_host_loopback"
+    and (.environment.os.kernel_name | type) == "string"
+    and any(
+      .environment.tool_fingerprint[];
+      .name == "jq" and .present == true and (.version | type) == "string"
+    )
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
   jq -e '.findings == []' "$artifact/pwnkit-direct.json" >/dev/null
 }
@@ -128,6 +136,8 @@ test_preflight_writes_metadata_and_scopes_without_scan() {
 
   EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
     EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    EIDOLON_M3_RUNNER_ENVIRONMENT=kali_vm \
+    EIDOLON_M3_NETWORK_TOPOLOGY=vm_loopback_forward \
     PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
     "$RUNNER" preflight "$artifact" >/dev/null
 
@@ -140,6 +150,10 @@ test_preflight_writes_metadata_and_scopes_without_scan() {
     .mode == "preflight"
     and .pwnkit.command_source == "PWNKIT_NODE_ENTRY"
     and .pwnkit.origin_main.in_sync == true
+    and .environment.runner_environment == "kali_vm"
+    and .environment.runner_environment_source == "env_override"
+    and .environment.network_topology == "vm_loopback_forward"
+    and any(.environment.tool_fingerprint[]; .name == "bash" and .present == true)
     and .pwnkit.scopes.eidolon.in_scope == ["127.0.0.1"]
     and .pwnkit.scopes.direct.in_scope == ["127.0.0.1"]
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null

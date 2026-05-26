@@ -114,7 +114,11 @@ redact_sample_summary() {
       strongest_claim_level,
       runner_git_heads,
       runner_package_versions,
+      runner_environments,
+      runner_network_topologies,
+      tool_fingerprint_summary,
       source_checkout,
+      finding_reconciliation,
       no_signal_diagnostics: (.no_signal_diagnostics | clean_no_signal_diagnostics),
       differential_findings,
       evidence_gap_diagnostics,
@@ -131,6 +135,11 @@ redact_sample_summary() {
           runner_origin_main,
           runner_origin_main_in_sync,
           stale_dist_guard_bypassed,
+          runner_environment,
+          runner_environment_source,
+          runner_network_topology,
+          runner_os,
+          runner_tool_fingerprint,
           claim_level,
           conclusion,
           target_interaction_observed,
@@ -140,13 +149,21 @@ redact_sample_summary() {
           controlled_reality_entered,
           direct_finding_count,
           eidolon_finding_count,
+          direct_final_json_finding_count,
+          eidolon_final_json_finding_count,
+          direct_db_saved_finding_count,
+          eidolon_db_saved_finding_count,
+          direct_db_active_finding_count,
+          eidolon_db_active_finding_count,
           finding_diagnostics,
+          finding_reconciliation,
           pwnkit_events,
           target_evidence_diagnostics,
           agent_error_diagnostics,
           eidolon_proxy: (.eidolon_proxy | clean_sample_proxy),
           target_correlation_diagnostics,
           finding_gap,
+          finding_export_gap,
           strict_correlation_gap,
           correlated_counts,
           pinned_session,
@@ -202,9 +219,15 @@ redact_pwnkit_summary() {
         scan_depth: $run.scan_depth,
         duration_ms: $run.duration_ms,
         finding_count: ($run.finding_count // 0),
+        final_json_finding_count: (
+          $run.final_json_finding_count // $run.finding_count // 0
+        ),
+        db_saved_finding_count: ($run.db_saved_finding_count // 0),
+        db_active_finding_count: ($run.db_active_finding_count // 0),
         warning_count: (($run.warnings // []) | length),
         pwnkit_events: ($run.pwnkit_events // null),
         finding_diagnostics: ($run.finding_diagnostics // null),
+        finding_reconciliation: ($run.finding_reconciliation // null),
         target_evidence_diagnostics: ($run.target_evidence_diagnostics // null),
         agent_error_diagnostics: ($run.agent_error_diagnostics // null)
       };
@@ -219,6 +242,7 @@ redact_pwnkit_summary() {
         created_at: .runner.created_at,
         mode: .runner.mode,
         urls: .runner.urls,
+        environment: .runner.environment,
         pwnkit: {
           depth: .runner.pwnkit.depth,
           mode: .runner.pwnkit.mode,
@@ -270,6 +294,7 @@ redact_pwnkit_summary() {
         correlated_bait_matrix: ((.comparison.correlated_bait_events.matrix // []) | clean_matrix),
         target_correlation_diagnostics: .comparison.target_correlation_diagnostics,
         finding_gap: .comparison.finding_gap,
+        finding_export_gap: .comparison.finding_export_gap,
         strict_correlation_gap: .comparison.strict_correlation_gap
       },
       metrics,
@@ -349,6 +374,8 @@ write_readme() {
   local ready
   local heads
   local versions
+  local environments
+  local db_saved_counts
   local direct_counts
   local eidolon_counts
   local claim_counts
@@ -362,6 +389,8 @@ write_readme() {
   ready="$(sample_value '.strict_stability.ready_for_stability_claim')"
   heads="$(jq -r '(.runner_git_heads // []) | map("`" + . + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   versions="$(jq -r '(.runner_package_versions // []) | map("`" + . + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
+  environments="$(jq -r '(.runner_environments // []) | map("`" + . + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
+  db_saved_counts="$(jq -r '[.finding_reconciliation.direct_db_saved_finding_total // 0, .finding_reconciliation.eidolon_db_saved_finding_total // 0] | map(tostring) | join("/")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   direct_counts="$(jq -r '[(.artifacts // [])[] | (.direct_finding_count // 0)] | join("/")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   eidolon_counts="$(jq -r '[(.artifacts // [])[] | (.eidolon_finding_count // 0)] | join("/")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   claim_counts="$(jq -r '(.claim_level_counts // []) | map("`" + .claim_level + "`: `" + (.count|tostring) + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
@@ -378,6 +407,7 @@ write_readme() {
     printf -- '- Source sample directory: omitted from the committed bundle.\n'
     printf -- '- pwnkit runner head(s): %s.\n' "${heads:-unknown}"
     printf -- '- pwnkit package version(s): %s.\n' "${versions:-unknown}"
+    printf -- '- runner environment(s): %s.\n' "${environments:-unknown}"
     printf -- '- Session control: pinned Eidolon session cookie when enabled by the sample runner.\n\n'
     printf '## Contents\n\n'
     printf -- '- `pwnkit-stability-sample.json`: sample-level aggregate from `examples/m3/collect-pwnkit-sample.sh`.\n'
@@ -393,12 +423,13 @@ write_readme() {
     printf -- '- private Eidolon debug logs\n'
     printf -- '- raw pwnkit agent error text\n'
     printf -- '- raw requested-path arrays and tool evidence labels from pwnkit summaries\n\n'
-    printf 'Redacted summaries preserve runner freshness metadata, finding counts, shape-only finding diagnostics, no-signal diagnostics, claim-level booleans, correlated evidence counts, bait matrix counts, pinned-session metrics, proxy count summaries, and M3 notes.\n\n'
+    printf 'Redacted summaries preserve runner freshness metadata, runner environment and tool fingerprints, final-vs-DB finding reconciliation, shape-only finding diagnostics, no-signal diagnostics, claim-level booleans, correlated evidence counts, bait matrix counts, pinned-session metrics, proxy count summaries, and M3 notes.\n\n'
     printf '## Result\n\n'
     printf -- '- valid summaries: `%s`\n' "$valid_count"
     printf -- '- claim levels: %s\n' "${claim_counts:-unknown}"
     printf -- '- direct findings: `%s`\n' "${direct_counts:-unknown}"
     printf -- '- Eidolon findings: `%s`\n' "${eidolon_counts:-unknown}"
+    printf -- '- DB-saved findings direct/Eidolon: `%s`\n' "${db_saved_counts:-unknown}"
     printf -- '- proxy trace controlled-reality runs: `%s`\n' "$proxy_trace_count"
     printf -- '- strict pwnkit controlled-reality runs: `%s`\n' "$strict_controlled_count"
     printf -- '- strict controlled-reality runs without Eidolon findings: `%s`\n' "$strict_without_findings_count"
