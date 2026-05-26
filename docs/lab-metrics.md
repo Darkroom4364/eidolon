@@ -490,6 +490,14 @@ source-checkout metadata synced with local `origin/main`, target interaction,
 same-session confirmed bait action, controlled-reality entry, preserved pinned
 cookies, and quiet direct-target runs.
 
+`evidence_gap_diagnostics` compares the strict pwnkit-correlated claim with the
+sanitized proxy trace summary for each run. It separates three different cases:
+proxy trace containment that did not become a strict pwnkit-controlled claim,
+strict controlled-reality chains that pwnkit did not promote to findings, and
+positive differential findings that appeared without strict controlled-reality
+confirmation. These fields are diagnostic only; they explain why a sample is
+partial without relaxing `strict_stability` or differential-finding gates.
+
 To generate the internal M3 uniqueness report from the pwnkit and scripted
 action-trace artifacts:
 
