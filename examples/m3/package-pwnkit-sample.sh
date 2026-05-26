@@ -117,6 +117,7 @@ redact_sample_summary() {
       source_checkout,
       no_signal_diagnostics: (.no_signal_diagnostics | clean_no_signal_diagnostics),
       differential_findings,
+      evidence_gap_diagnostics,
       strict_stability,
       artifacts: [
         (.artifacts // [])[] |
@@ -149,7 +150,8 @@ redact_sample_summary() {
           correlated_counts,
           pinned_session,
           metrics,
-          agent_trace
+          agent_trace,
+          trace_gap
         }
       ],
       redaction: {
@@ -348,6 +350,10 @@ write_readme() {
   local direct_counts
   local eidolon_counts
   local claim_counts
+  local observed_gaps
+  local proxy_trace_count
+  local strict_controlled_count
+  local strict_without_findings_count
 
   collected_on="$(date -u +%F)"
   valid_count="$(sample_value '.valid_summary_count')"
@@ -357,6 +363,10 @@ write_readme() {
   direct_counts="$(jq -r '[(.artifacts // [])[] | (.direct_finding_count // 0)] | join("/")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   eidolon_counts="$(jq -r '[(.artifacts // [])[] | (.eidolon_finding_count // 0)] | join("/")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
   claim_counts="$(jq -r '(.claim_level_counts // []) | map("`" + .claim_level + "`: `" + (.count|tostring) + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
+  observed_gaps="$(jq -r '(.evidence_gap_diagnostics.observed_gaps // []) | map("`" + . + "`") | join(", ")' "$BUNDLE_DIR/pwnkit-stability-sample.json")"
+  proxy_trace_count="$(sample_value '.evidence_gap_diagnostics.proxy_trace_controlled_reality_run_count')"
+  strict_controlled_count="$(sample_value '.evidence_gap_diagnostics.pwnkit_strict_controlled_reality_run_count')"
+  strict_without_findings_count="$(sample_value '.evidence_gap_diagnostics.strict_controlled_reality_without_eidolon_finding_run_count')"
 
   {
     printf '# M3 pwnkit Sample Evidence\n\n'
@@ -387,6 +397,10 @@ write_readme() {
     printf -- '- claim levels: %s\n' "${claim_counts:-unknown}"
     printf -- '- direct findings: `%s`\n' "${direct_counts:-unknown}"
     printf -- '- Eidolon findings: `%s`\n' "${eidolon_counts:-unknown}"
+    printf -- '- proxy trace controlled-reality runs: `%s`\n' "$proxy_trace_count"
+    printf -- '- strict pwnkit controlled-reality runs: `%s`\n' "$strict_controlled_count"
+    printf -- '- strict controlled-reality runs without Eidolon findings: `%s`\n' "$strict_without_findings_count"
+    printf -- '- evidence gaps: %s\n' "${observed_gaps:-unknown}"
     printf -- '- `strict_stability.ready_for_stability_claim`: `%s`\n\n' "$ready"
     printf 'This remains Lab-only evidence. It does not claim production readiness, autonomous-attacker identity, or stability beyond this sample on the recorded pwnkit head.\n'
   } > "$BUNDLE_DIR/README.md"

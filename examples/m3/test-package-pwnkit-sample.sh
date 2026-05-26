@@ -79,6 +79,22 @@ write_fixture_sample() {
     "ready_for_differential_finding_claim": false,
     "next_questions": ["why_controlled_reality_chain_was_not_promoted_to_finding"]
   },
+  "evidence_gap_diagnostics": {
+    "sample_size": 1,
+    "proxy_trace_present_run_count": 1,
+    "proxy_trace_controlled_reality_run_count": 1,
+    "proxy_trace_real_surface_quiet_run_count": 1,
+    "pwnkit_strict_controlled_reality_run_count": 1,
+    "pwnkit_strict_same_session_run_count": 1,
+    "proxy_trace_without_strict_controlled_reality_run_count": 0,
+    "strict_controlled_reality_without_eidolon_finding_run_count": 1,
+    "positive_differential_without_strict_controlled_reality_run_count": 0,
+    "all_proxy_trace_contained": true,
+    "all_strict_pwnkit_controlled_reality": true,
+    "all_strict_controlled_reality_promoted_to_findings": false,
+    "observed_gaps": ["strict_controlled_reality_without_eidolon_findings"],
+    "next_questions": ["why_controlled_reality_chain_was_not_promoted_to_finding"]
+  },
   "strict_stability": {
     "ready_for_stability_claim": false
   },
@@ -163,6 +179,19 @@ write_fixture_sample() {
       "agent_trace": {
         "claim_level": "controlled_reality_entered",
         "real_surface_requests_after_containment": 0
+      },
+      "trace_gap": {
+        "proxy_trace_present": true,
+        "proxy_trace_claim_level": "controlled_reality_entered",
+        "proxy_trace_controlled_reality_entered": true,
+        "proxy_trace_real_surface_quiet": true,
+        "pwnkit_strict_claim_level": "controlled_reality_entered",
+        "pwnkit_strict_same_session_confirmed": true,
+        "pwnkit_strict_controlled_reality_entered": true,
+        "proxy_trace_controlled_reality_without_strict_confirmation": false,
+        "strict_controlled_reality_without_eidolon_finding": true,
+        "positive_differential_without_strict_controlled_reality": false,
+        "next_question": "why_controlled_reality_chain_was_not_promoted_to_finding"
       }
     }
   ],
@@ -474,16 +503,22 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .no_signal_diagnostics.eidolon_agent_error_class_counts == [
       {error_class: "codex_backend_api_error", count: 1}
     ]
+    and .evidence_gap_diagnostics.observed_gaps == [
+      "strict_controlled_reality_without_eidolon_findings"
+    ]
+    and .evidence_gap_diagnostics.strict_controlled_reality_without_eidolon_finding_run_count == 1
     and .artifacts[0].agent_error_diagnostics.eidolon.count == 1
     and .artifacts[0].artifact_dir == "<source-artifact-path-omitted>"
     and (.artifacts[0] | has("runner_command") | not)
     and .artifacts[0].eidolon_proxy.request_path_counts == [{value: "/docs", count: 1}]
     and .artifacts[0].target_correlation_diagnostics.correlated_target_request_count == 1
+    and .artifacts[0].trace_gap.strict_controlled_reality_without_eidolon_finding == true
     and (. | has("raw_future_field") | not)
   ' "$bundle_dir/pwnkit-stability-sample.json" >/dev/null
 
   rg -q 'pwnkit-stability-sample.json' "$bundle_dir/SHA256SUMS"
   rg -q 'run-1/pwnkit-summary.redacted.json' "$bundle_dir/SHA256SUMS"
+  rg -q 'evidence gaps: `strict_controlled_reality_without_eidolon_findings`' "$bundle_dir/README.md"
   rg -q '`strict_stability.ready_for_stability_claim`: `false`' "$bundle_dir/README.md"
 }
 

@@ -422,6 +422,52 @@ done | jq -s '
               )
             }
           end
+        ),
+        trace_gap: (
+          (.agent_trace_summary.claim_level // null) as $trace_claim
+          | (.comparison.claim_level // "missing") as $strict_claim
+          | (.comparison.controlled_reality_entered // false) as $strict_controlled
+          | (.comparison.same_session_confirmed_bait_action // false) as $strict_same_session
+          | (.runs.eidolon.finding_count // 0) as $eidolon_findings
+          | (
+              (.agent_trace_summary.metrics.real_surface_requests_after_containment // null)
+            ) as $real_surface_after_containment
+          | ($trace_claim == "controlled_reality_entered") as $trace_controlled
+          | {
+              proxy_trace_present: (.agent_trace_summary != null),
+              proxy_trace_claim_level: $trace_claim,
+              proxy_trace_controlled_reality_entered: $trace_controlled,
+              proxy_trace_real_surface_quiet: (
+                $trace_controlled and $real_surface_after_containment == 0
+              ),
+              pwnkit_strict_claim_level: $strict_claim,
+              pwnkit_strict_same_session_confirmed: $strict_same_session,
+              pwnkit_strict_controlled_reality_entered: $strict_controlled,
+              proxy_trace_controlled_reality_without_strict_confirmation: (
+                $trace_controlled and ($strict_controlled | not)
+              ),
+              strict_controlled_reality_without_eidolon_finding: (
+                $strict_controlled and $eidolon_findings == 0
+              ),
+              positive_differential_without_strict_controlled_reality: (
+                ((.comparison.finding_gap.positive_differential_findings // false) == true)
+                and ($strict_controlled | not)
+              ),
+              next_question: (
+                if $trace_controlled and ($strict_controlled | not) then
+                  "why_proxy_trace_containment_was_not_confirmed_by_strict_pwnkit_correlation"
+                elif $strict_controlled and $eidolon_findings == 0 then
+                  "why_controlled_reality_chain_was_not_promoted_to_finding"
+                elif (
+                  ((.comparison.finding_gap.positive_differential_findings // false) == true)
+                  and ($strict_controlled | not)
+                ) then
+                  "why_findings_emerged_without_strict_controlled_reality_confirmation"
+                else
+                  null
+                end
+              )
+            }
         )
       }
     end;
@@ -571,6 +617,33 @@ done | jq -s '
       | map(select(.pinned_session.present and (.pinned_session.cookie_preserved | not)))
       | length
     ) as $pinned_without_cookie_count
+  | ($present | map(select(.trace_gap.proxy_trace_present)) | length)
+    as $proxy_trace_present_count
+  | (
+      $present
+      | map(select(.trace_gap.proxy_trace_controlled_reality_entered))
+      | length
+    ) as $proxy_trace_controlled_count
+  | (
+      $present
+      | map(select(.trace_gap.proxy_trace_real_surface_quiet))
+      | length
+    ) as $proxy_trace_quiet_count
+  | (
+      $present
+      | map(select(.trace_gap.proxy_trace_controlled_reality_without_strict_confirmation))
+      | length
+    ) as $proxy_trace_without_strict_count
+  | (
+      $present
+      | map(select(.trace_gap.strict_controlled_reality_without_eidolon_finding))
+      | length
+    ) as $strict_controlled_without_finding_count
+  | (
+      $present
+      | map(select(.trace_gap.positive_differential_without_strict_controlled_reality))
+      | length
+    ) as $positive_without_strict_count
   | ($present | map(.eidolon_proxy.request_path_counts[]?)) as $proxy_path_entries
   | (
       $present
@@ -733,6 +806,66 @@ done | jq -s '
         next_questions: (
           $present
           | map(.finding_gap.next_question // null)
+          | map(select(. != null))
+          | unique
+        )
+      },
+      evidence_gap_diagnostics: {
+        sample_size: $valid_count,
+        proxy_trace_present_run_count: $proxy_trace_present_count,
+        proxy_trace_controlled_reality_run_count: $proxy_trace_controlled_count,
+        proxy_trace_real_surface_quiet_run_count: $proxy_trace_quiet_count,
+        pwnkit_strict_controlled_reality_run_count: $controlled_count,
+        pwnkit_strict_same_session_run_count: $same_session_count,
+        proxy_trace_without_strict_controlled_reality_run_count: (
+          $proxy_trace_without_strict_count
+        ),
+        strict_controlled_reality_without_eidolon_finding_run_count: (
+          $strict_controlled_without_finding_count
+        ),
+        positive_differential_without_strict_controlled_reality_run_count: (
+          $positive_without_strict_count
+        ),
+        all_proxy_trace_contained: (
+          $valid_count > 0
+          and $proxy_trace_present_count == $valid_count
+          and $proxy_trace_controlled_count == $valid_count
+          and $proxy_trace_quiet_count == $valid_count
+        ),
+        all_strict_pwnkit_controlled_reality: (
+          $valid_count > 0 and $controlled_count == $valid_count
+        ),
+        all_strict_controlled_reality_promoted_to_findings: (
+          $controlled_count > 0 and $strict_controlled_without_finding_count == 0
+        ),
+        observed_gaps: (
+          [
+            if $proxy_trace_without_strict_count > 0 then
+              "proxy_trace_controlled_reality_without_strict_pwnkit_correlation"
+            else
+              empty
+            end,
+            if $strict_controlled_without_finding_count > 0 then
+              "strict_controlled_reality_without_eidolon_findings"
+            else
+              empty
+            end,
+            if $positive_without_strict_count > 0 then
+              "positive_differential_findings_without_strict_controlled_reality"
+            else
+              empty
+            end,
+            if $positive_differential_count > 0 and $positive_differential_count < $valid_count then
+              "partial_positive_differential_findings"
+            else
+              empty
+            end
+          ] as $gaps
+          | if ($gaps | length) == 0 then ["none"] else $gaps end
+        ),
+        next_questions: (
+          $present
+          | map(.trace_gap.next_question // null)
           | map(select(. != null))
           | unique
         )
