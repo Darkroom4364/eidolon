@@ -464,7 +464,7 @@ long matrix.
 
 The matrix summary also includes `matrix_health`, which aggregates missing
 variants, pwnkit `agent_error` counts, source-checkout cleanliness/sync status,
-runner heads, and package versions. Treat
+runner heads, package versions, and pinned fixture IDs. Treat
 `matrix_health.ready_for_matrix_interpretation: true` as the minimum health gate
 before interpreting a promotion matrix. For `no_signal` matrices, still inspect
 `no_signal_diagnostics.likely_cause` before tuning bait semantics.
