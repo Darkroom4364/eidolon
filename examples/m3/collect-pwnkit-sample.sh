@@ -199,6 +199,17 @@ done | jq -s '
             null
           end
         ),
+        runner_pwnkit_fixture: (
+          if (.runner.pwnkit.fixture // null) == null then
+            null
+          else
+            {
+              id: (.runner.pwnkit.fixture.id // null),
+              pinned: (.runner.pwnkit.fixture.pinned // false)
+            }
+          end
+        ),
+        runner_pwnkit_fixture_id: (.runner.pwnkit.fixture.id // null),
         runner_command: (.runner.pwnkit.command // null),
         stale_dist_guard_bypassed: (
           if (.runner.pwnkit | has("stale_dist_guard_bypassed")) then
@@ -580,6 +591,12 @@ done | jq -s '
     as $pinned_cookie_count
   | ($present | map(.runner_git_head // "unknown") | unique) as $runner_heads
   | ($present | map(.runner_package_version // "unknown") | unique) as $runner_versions
+  | (
+      $present
+      | map(.runner_pwnkit_fixture_id // null)
+      | map(select(. != null and . != ""))
+      | unique
+    ) as $runner_fixture_ids
   | ($present | map(.runner_environment // "unknown") | unique) as $runner_environments
   | ($present | map(.runner_network_topology // "unknown") | unique)
     as $runner_network_topologies
@@ -825,6 +842,7 @@ done | jq -s '
       ),
       runner_git_heads: $runner_heads,
       runner_package_versions: $runner_versions,
+      runner_pwnkit_fixture_ids: $runner_fixture_ids,
       runner_environments: $runner_environments,
       runner_network_topologies: $runner_network_topologies,
       tool_fingerprint_summary: $tool_fingerprint_summary,

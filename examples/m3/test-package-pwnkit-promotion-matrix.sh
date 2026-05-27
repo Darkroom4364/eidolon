@@ -100,6 +100,7 @@ write_variant_sample() {
       strongest_claim_level: "controlled_reality_entered",
       runner_git_heads: ["abc123"],
       runner_package_versions: ["0.11.1"],
+      runner_pwnkit_fixture_ids: ["pwnkit-v0.12.0-private"],
       source_checkout: {
         all_runners_clean: true,
         all_runners_origin_main_synced: true
@@ -403,9 +404,11 @@ test_packager_redacts_matrix_and_variant_artifacts() {
     and .redaction.raw_agent_error_text_omitted == true
     and .matrix_health.ready_for_matrix_interpretation == true
     and .matrix_health.total_pwnkit_agent_errors == 0
+    and .matrix_health.runner_pwnkit_fixture_ids == ["pwnkit-v0.12.0-private"]
     and .no_signal_diagnostics.variant_count == 0
     and (.variants[] | select(.variant_id == "default_m3_catalog") | .sample_dir | not)
     and (.variants[] | select(.variant_id == "default_m3_catalog") | .variant_bundle_dir == "variants/default_m3_catalog")
+    and (.variants[] | select(.variant_id == "default_m3_catalog") | .runner_pwnkit_fixture_ids == ["pwnkit-v0.12.0-private"])
     and (.variants[] | select(.variant_id == "default_m3_catalog") | .no_signal_diagnostics.proxy_path_counts == [{path: "/docs", count: 1}])
     and (.variants[] | select(.variant_id == "promoted_probe") | .observation_class == "promoted_finding")
     and (.ready_for_differential_finding_claim_variants == ["promoted_probe"])
@@ -511,7 +514,8 @@ test_packager_rejects_invalid_summary_variant_id() {
       source_checkout_clean_variant_count: 1,
       source_checkout_synced_variant_count: 1,
       runner_git_heads: ["abc123"],
-      runner_package_versions: ["0.11.1"]
+      runner_package_versions: ["0.11.1"],
+      runner_pwnkit_fixture_ids: ["pwnkit-v0.12.0-private"]
     },
     variants: [
       {

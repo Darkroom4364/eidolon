@@ -51,8 +51,9 @@ write_fixture_sample() {
   "strongest_claim_level": "controlled_reality_entered",
   "runner_git_heads": ["abc123"],
   "runner_package_versions": ["v0.test"],
+  "runner_pwnkit_fixture_ids": ["pwnkit-v0.12.0-private"],
   "runner_environments": ["kali_vm"],
-  "runner_network_topologies": ["vm_loopback_forward"],
+  "runner_network_topologies": ["same_vm_loopback"],
   "tool_fingerprint_summary": [
     {"name": "bash", "present_count": 1, "missing_count": 0, "versions": ["GNU bash fixture"]},
     {"name": "nmap", "present_count": 0, "missing_count": 1, "versions": ["unknown"]}
@@ -127,11 +128,16 @@ write_fixture_sample() {
       "runner_package_version": "v0.test",
       "runner_git_dirty": false,
       "runner_origin_main_in_sync": true,
+      "runner_pwnkit_fixture": {
+        "id": "pwnkit-v0.12.0-private",
+        "pinned": true
+      },
+      "runner_pwnkit_fixture_id": "pwnkit-v0.12.0-private",
       "runner_command": "node /tmp/pwnkit/dist/pwnkit.js",
       "stale_dist_guard_bypassed": false,
       "runner_environment": "kali_vm",
       "runner_environment_source": "env_override",
-      "runner_network_topology": "vm_loopback_forward",
+      "runner_network_topology": "same_vm_loopback",
       "runner_os": {
         "kernel_name": "Linux",
         "machine_arch": "x86_64"
@@ -325,7 +331,7 @@ JSON
     "environment": {
       "runner_environment": "kali_vm",
       "runner_environment_source": "env_override",
-      "network_topology": "vm_loopback_forward",
+      "network_topology": "same_vm_loopback",
       "os": {
         "kernel_name": "Linux",
         "machine_arch": "x86_64"
@@ -349,6 +355,10 @@ JSON
       "git_head_time_seconds": 1770000000,
       "git_dirty": false,
       "origin_main": {"in_sync": true},
+      "fixture": {
+        "id": "pwnkit-v0.12.0-private",
+        "pinned": true
+      },
       "stale_dist_guard_bypassed": false,
       "scopes": {
         "eidolon": {
@@ -680,8 +690,12 @@ test_packager_redacts_raw_artifacts_and_query_values() {
       {error_class: "codex_backend_api_error", count: 1}
     ]
     and .runner.environment.runner_environment == "kali_vm"
-    and .runner.environment.network_topology == "vm_loopback_forward"
+    and .runner.environment.network_topology == "same_vm_loopback"
     and .runner.environment.tool_fingerprint[0].name == "bash"
+    and .runner.pwnkit.fixture == {
+      id: "pwnkit-v0.12.0-private",
+      pinned: true
+    }
     and .redaction.raw_agent_error_text_omitted == true
     and (.runner.pwnkit | has("command") | not)
     and (.runner.pwnkit | has("entry_path") | not)
@@ -710,7 +724,8 @@ test_packager_redacts_raw_artifacts_and_query_values() {
       {error_class: "codex_backend_api_error", count: 1}
     ]
     and .runner_environments == ["kali_vm"]
-    and .runner_network_topologies == ["vm_loopback_forward"]
+    and .runner_pwnkit_fixture_ids == ["pwnkit-v0.12.0-private"]
+    and .runner_network_topologies == ["same_vm_loopback"]
     and .tool_fingerprint_summary[0].name == "bash"
     and .finding_reconciliation.eidolon_db_saved_finding_total == 1
     and .finding_reconciliation.any_db_saved_findings_omitted_from_final_json == true
@@ -722,6 +737,11 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .artifacts[0].artifact_dir == "<source-artifact-path-omitted>"
     and (.artifacts[0] | has("runner_command") | not)
     and .artifacts[0].runner_environment == "kali_vm"
+    and .artifacts[0].runner_pwnkit_fixture_id == "pwnkit-v0.12.0-private"
+    and .artifacts[0].runner_pwnkit_fixture == {
+      id: "pwnkit-v0.12.0-private",
+      pinned: true
+    }
     and .artifacts[0].runner_tool_fingerprint[0].name == "bash"
     and .artifacts[0].finding_export_gap.eidolon_db_saved_findings_omitted_from_final_json == true
     and .artifacts[0].eidolon_proxy.request_path_counts == [{value: "/docs", count: 1}]
@@ -740,6 +760,7 @@ test_packager_redacts_raw_artifacts_and_query_values() {
   rg -q 'run-1/pwnkit-summary.redacted.json' "$bundle_dir/SHA256SUMS"
   rg -q 'evidence gaps: `strict_controlled_reality_without_eidolon_findings`' "$bundle_dir/README.md"
   rg -Fq 'runner environment(s): `kali_vm`' "$bundle_dir/README.md"
+  rg -Fq 'pwnkit pinned fixture id(s): `pwnkit-v0.12.0-private`' "$bundle_dir/README.md"
   rg -q 'DB-saved findings direct/Eidolon: `0/1`' "$bundle_dir/README.md"
   rg -q '`strict_stability.ready_for_stability_claim`: `false`' "$bundle_dir/README.md"
 }

@@ -105,6 +105,7 @@ write_sample() {
       strongest_claim_level: "controlled_reality_entered",
       runner_git_heads: ["abc123"],
       runner_package_versions: ["0.11.1"],
+      runner_pwnkit_fixture_ids: ["pwnkit-v0.12.0-private"],
       source_checkout: {
         all_runners_clean: true,
         all_runners_origin_main_synced: true
@@ -170,6 +171,7 @@ write_no_signal_sample() {
     strongest_claim_level: "no_target_interaction",
     runner_git_heads: ["abc123"],
     runner_package_versions: ["0.11.1"],
+    runner_pwnkit_fixture_ids: ["pwnkit-v0.12.0-private"],
     source_checkout: {
       all_runners_clean: true,
       all_runners_origin_main_synced: true
@@ -254,6 +256,7 @@ test_collects_variant_observation_classes() {
     and .matrix_health.all_observed_source_checkouts_synced == true
     and .matrix_health.ready_for_matrix_interpretation == false
     and .matrix_health.runner_git_heads == ["abc123"]
+    and .matrix_health.runner_pwnkit_fixture_ids == ["pwnkit-v0.12.0-private"]
     and (.ready_for_differential_finding_claim_variants == ["promoted_probe"])
     and (.ready_for_stability_claim_variants == ["default_m3_catalog", "promoted_probe"])
   ' "$output" >/dev/null
