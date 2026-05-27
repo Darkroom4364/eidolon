@@ -480,6 +480,7 @@ test_stability_claim_requires_three_matching_successes() {
     .valid_summary_count == 3
     and .runner_git_heads == ["head-a"]
     and .runner_package_versions == ["9.8.7"]
+    and .runner_pwnkit_fixture_ids == []
     and .runner_environments == ["host_mac"]
     and .runner_network_topologies == ["same_host_loopback"]
     and (
@@ -498,6 +499,7 @@ test_stability_claim_requires_three_matching_successes() {
     and .finding_reconciliation.eidolon_db_saved_finding_total == 0
     and .finding_reconciliation.final_json_counts_still_drive_finding_claims == true
     and .artifacts[0].runner_environment == "host_mac"
+    and .artifacts[0].runner_pwnkit_fixture == null
     and .artifacts[0].runner_tool_fingerprint[0].name == "bash"
     and .rates.controlled_reality_entry_rate == 1
     and .strict_stability.all_summaries_present == true

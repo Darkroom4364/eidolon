@@ -9,7 +9,9 @@ usage() {
 Usage: examples/m3/check-pwnkit-runner-freshness.sh <pwnkit-runner-metadata.json>
 
 Fails closed when an M3 pwnkit source-checkout runner is dirty, missing
-origin/main freshness metadata, or not synced with origin/main.
+origin/main freshness metadata, or not synced with origin/main. Archived/private
+pinned fixtures may pass without origin/main sync only when the runner metadata
+contains a safe fixture id, a clean git worktree, and a recorded git head.
 
 Environment:
   EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE
@@ -73,12 +75,28 @@ if [[ "$fresh" == "true" ]]; then
   exit 0
 fi
 
+fixture_fresh="$(
+  jq -r '
+    def safe_fixture_id:
+      (.pwnkit.fixture.id // "")
+      | test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$");
+    (.pwnkit.git_dirty == false)
+    and ((.pwnkit.git_head // "") != "")
+    and (.pwnkit.fixture.pinned == true)
+    and safe_fixture_id
+  ' "$METADATA_FILE"
+)"
+
+if [[ "$fixture_fresh" == "true" ]]; then
+  exit 0
+fi
+
 echo "error: pwnkit source checkout is not fresh for M3 evidence: $METADATA_FILE" >&2
 jq -r '
   def present($value):
     if $value == null then "unknown" else ($value | tostring) end;
   .pwnkit
-  | "       repo_dir=\(.repo_dir // "unknown") git_dirty=\(present(.git_dirty)) origin_main.in_sync=\(present(.origin_main.in_sync)) ahead=\(present(.origin_main.ahead)) behind=\(present(.origin_main.behind))"
+  | "       repo_dir=\(.repo_dir // "unknown") git_dirty=\(present(.git_dirty)) origin_main.in_sync=\(present(.origin_main.in_sync)) ahead=\(present(.origin_main.ahead)) behind=\(present(.origin_main.behind)) pinned_fixture=\(present(.fixture.pinned))"
 ' "$METADATA_FILE" >&2
-echo "       sync pwnkit to origin/main and rebuild dist, or set EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=1 for diagnostics." >&2
+echo "       sync pwnkit to origin/main and rebuild dist, set EIDOLON_M3_PWNKIT_FIXTURE_ID for a clean archived/private pinned fixture, or set EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=1 for diagnostics." >&2
 exit 1

@@ -16,6 +16,7 @@ test_help_mentions_vm_contract() {
   "$RUNNER" --help | rg -q 'same_vm_loopback'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_KALI_VM_DRY_RUN'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_KALI_VM_PREFLIGHT'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID'
 }
 
 test_rejects_non_kali_without_override() {
@@ -52,12 +53,14 @@ test_dry_run_records_vm_local_contract() {
 
   EIDOLON_M3_ALLOW_NON_KALI_VM=1 \
     EIDOLON_M3_KALI_VM_DRY_RUN=1 \
+    EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
     "$RUNNER" 2 "$sample_dir" >/dev/null
 
   [[ -f "$sample_dir/sample-plan.txt" ]]
   rg -q '^run_count=2$' "$sample_dir/sample-plan.txt"
   rg -q '^runner_environment=kali_vm$' "$sample_dir/sample-plan.txt"
   rg -q '^network_topology=same_vm_loopback$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_fixture_id=pwnkit-v0\.12\.0-private$' "$sample_dir/sample-plan.txt"
 }
 
 test_preflight_writes_runner_metadata() {
@@ -69,6 +72,7 @@ test_preflight_writes_runner_metadata() {
     EIDOLON_M3_ALLOW_NON_KALI_VM=1 \
       EIDOLON_M3_KALI_VM_DRY_RUN=1 \
       EIDOLON_M3_PIN_SESSION=0 \
+      EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
       PWNKIT_BIN=true \
       "$RUNNER" --preflight 2 "$sample_dir" 2>&1
   )"
@@ -80,6 +84,10 @@ test_preflight_writes_runner_metadata() {
     and .environment.runner_environment == "kali_vm"
     and .environment.network_topology == "same_vm_loopback"
     and .pwnkit.command_source == "PWNKIT_BIN"
+    and .pwnkit.fixture == {
+      id: "pwnkit-v0.12.0-private",
+      pinned: true
+    }
   ' "$sample_dir/private/kali-vm-preflight/pwnkit-runner-metadata.json" >/dev/null
 }
 

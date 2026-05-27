@@ -20,6 +20,7 @@ EIDOLON_M3_SESSION_ID="${EIDOLON_M3_SESSION_ID:-}"
 EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST="${EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST:-0}"
 EIDOLON_M3_RUNNER_ENVIRONMENT="${EIDOLON_M3_RUNNER_ENVIRONMENT:-auto}"
 EIDOLON_M3_NETWORK_TOPOLOGY="${EIDOLON_M3_NETWORK_TOPOLOGY:-same_host_loopback}"
+EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-}"
 
 usage() {
   cat <<'USAGE'
@@ -68,6 +69,10 @@ Environment:
   EIDOLON_M3_NETWORK_TOPOLOGY
                             Network topology label for evidence metadata.
                             Defaults to same_host_loopback.
+  EIDOLON_M3_PWNKIT_FIXTURE_ID
+                            Optional safe label for archived/private pinned
+                            pwnkit fixtures. Current-main claims should leave
+                            this unset and require origin/main freshness.
 
 The runner writes one pwnkit scope file per scan leg and always passes
 `--scope`. This keeps pwnkit's shell-mode auth injection active for the
@@ -221,6 +226,17 @@ json_bool() {
     printf 'true'
   else
     printf 'false'
+  fi
+}
+
+validate_fixture_id() {
+  if [[ -z "$EIDOLON_M3_PWNKIT_FIXTURE_ID" ]]; then
+    return
+  fi
+
+  if [[ ! "$EIDOLON_M3_PWNKIT_FIXTURE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+    echo "error: EIDOLON_M3_PWNKIT_FIXTURE_ID must be 1-128 chars using only letters, numbers, '.', '_', ':', or '-'" >&2
+    exit 2
   fi
 }
 
@@ -568,6 +584,7 @@ write_runner_metadata() {
     --arg pwnkit_origin_main_head_short "$pwnkit_origin_main_head_short" \
     --arg pwnkit_origin_main_ahead "$pwnkit_origin_main_ahead" \
     --arg pwnkit_origin_main_behind "$pwnkit_origin_main_behind" \
+    --arg pwnkit_fixture_id "$EIDOLON_M3_PWNKIT_FIXTURE_ID" \
     --arg pwnkit_codex_auth_source "$PWNKIT_CODEX_AUTH_SOURCE" \
     --arg pwnkit_eidolon_scope_file "$PWNKIT_EIDOLON_SCOPE_FILE" \
     --arg pwnkit_direct_scope_file "$PWNKIT_DIRECT_SCOPE_FILE" \
@@ -670,6 +687,10 @@ write_runner_metadata() {
                 and ($pwnkit_origin_main_behind | tonumber) == 0)
             end
           )
+        },
+        fixture: {
+          id: (if $pwnkit_fixture_id == "" then null else $pwnkit_fixture_id end),
+          pinned: ($pwnkit_fixture_id != "")
         },
         codex_auth: {
           source: $pwnkit_codex_auth_source,
@@ -990,6 +1011,7 @@ main() {
   require_positive_integer \
     "EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
     "$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS"
+  validate_fixture_id
   mkdir -p "$ARTIFACT_DIR"
   printf '%s\n' "$ARTIFACT_DIR" > "$ARTIFACT_DIR/artifact-dir.txt"
 

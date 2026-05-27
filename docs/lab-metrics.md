@@ -278,16 +278,21 @@ generated pwnkit scope files; the collector copies this into
 moving pwnkit mainline, prefer artifacts where
 `runner.pwnkit.origin_main.in_sync` is `true` and
 `runner.pwnkit.git_dirty` is `false`. Reproducible historical runs may use an
-archived or private local pinned pwnkit fixture instead; runner metadata also
-records `runner.environment.runner_environment`,
+archived or private local pinned pwnkit fixture instead; set
+`EIDOLON_M3_PWNKIT_FIXTURE_ID` to a short non-secret label so runner metadata
+records `runner.pwnkit.fixture.id` and `runner.pwnkit.fixture.pinned: true`.
+Pinned fixtures still require a clean git worktree and recorded git head; they
+do not support current-main claims. Runner metadata also records
+`runner.environment.runner_environment`,
 `runner.environment.network_topology`, and
 `runner.environment.tool_fingerprint`.
 
 The repeated sample runner executes `examples/m3/pwnkit-codex.sh preflight`
 before starting the Lab target. Preflight writes only pwnkit scopes and
 `pwnkit-runner-metadata.json`, then `check-pwnkit-runner-freshness.sh` fails
-dirty or unsynced source-checkout runs before any scan. Set
-`EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=1` only for diagnostic preservation.
+dirty or unsynced source-checkout runs before any scan unless an explicit clean
+pinned fixture id is present. Set `EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=1`
+only for diagnostic preservation.
 
 The runner captures pwnkit stdout as `$ART/pwnkit-<leg>.stdout.log` and writes a
 normalized JSON-only report to `$ART/pwnkit-<leg>.json`. This preserves current

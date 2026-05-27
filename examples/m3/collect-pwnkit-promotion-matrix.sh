@@ -73,6 +73,7 @@ emit_missing_variant() {
       strongest_claim_level: "missing",
       runner_git_heads: [],
       runner_package_versions: [],
+      runner_pwnkit_fixture_ids: [],
       source_checkout: null,
       no_signal_diagnostics: null,
       differential_findings: null,
@@ -177,6 +178,7 @@ emit_present_variant() {
         strongest_claim_level: ($sample.strongest_claim_level // "missing"),
         runner_git_heads: ($sample.runner_git_heads // []),
         runner_package_versions: ($sample.runner_package_versions // []),
+        runner_pwnkit_fixture_ids: ($sample.runner_pwnkit_fixture_ids // []),
         source_checkout: ($sample.source_checkout // null),
         no_signal_diagnostics: ($sample.no_signal_diagnostics // null),
         differential_findings: ($sample.differential_findings // null),
@@ -296,6 +298,9 @@ main() {
             runner_git_heads: ($observed | map(.runner_git_heads[]?) | unique),
             runner_package_versions: (
               $observed | map(.runner_package_versions[]?) | unique
+            ),
+            runner_pwnkit_fixture_ids: (
+              $observed | map(.runner_pwnkit_fixture_ids[]?) | unique
             ),
             ready_for_matrix_interpretation: (
               ($variants | length) > 0
