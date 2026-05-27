@@ -157,6 +157,33 @@ insert_bash_http_artifact() {
   insert_tool_artifact "$dir" "$id" "$timestamp_ms" "$payload"
 }
 
+insert_large_bash_http_artifacts() {
+  local dir="$1"
+  local count="$2"
+  local sql_file="$dir/large-bash-http-artifacts.sql"
+  local filler
+  local payload
+  local escaped_payload
+
+  filler="$(printf '%2048s' '')"
+  filler="${filler// /x}"
+
+  printf 'begin;\n' > "$sql_file"
+  for ((index = 1; index <= count; index++)); do
+    payload="{\"tool\":\"bash\",\"output\":\"==== GET /bulk-$index ====\\nHTTP/1.1 200 OK\\n$filler\\n\"}"
+    escaped_payload="$(sql_quote "$payload")"
+    printf \
+      "insert into pipeline_events (id, scanId, stage, eventType, findingId, agentRole, payload, timestamp) values ('bulk-%04d', 'scan-1', 'attack', 'tool_artifact', null, null, '%s', 176722560%04d);\n" \
+      "$index" \
+      "$escaped_payload" \
+      "$index" \
+      >> "$sql_file"
+  done
+  printf 'commit;\n' >> "$sql_file"
+
+  sqlite3 "$dir/pwnkit-eidolon.db" < "$sql_file"
+}
+
 event() {
   local session_id="$1"
   local observed_at="$2"
@@ -586,6 +613,23 @@ test_finding_gap_marks_controlled_reality_without_findings() {
   ' "$dir/summary.json" >/dev/null
 }
 
+test_large_runner_artifacts_do_not_hit_shell_argument_limit() {
+  local dir
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  insert_large_bash_http_artifacts "$dir" 1200
+
+  "$COLLECTOR" "$dir" > "$dir/summary.json"
+
+  jq -e '
+    .runs.eidolon.pwnkit_events.pipeline_events == 1200
+    and .runs.eidolon.pwnkit_events.tool_artifacts == 1200
+    and .runs.eidolon.pwnkit_events.bash_http_output_requests == 1200
+    and .runs.eidolon.target_evidence_diagnostics.bash_http_output_request_count == 1200
+    and (.runs.eidolon.requested_paths | length) == 1200
+  ' "$dir/summary.json" >/dev/null
+}
+
 test_exposure_only
 test_bash_http_output_upgrades_confirmed_action
 test_wrong_session_action_does_not_confirm
@@ -599,5 +643,6 @@ test_no_signal_diagnostics_classify_codex_backend_api_errors
 test_no_signal_diagnostics_do_not_classify_generic_api_timeouts_as_codex
 test_finding_diagnostics_are_shape_only
 test_finding_gap_marks_controlled_reality_without_findings
+test_large_runner_artifacts_do_not_hit_shell_argument_limit
 
 printf 'collect-pwnkit-codex fixture tests passed\n'
