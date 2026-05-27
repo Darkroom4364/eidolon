@@ -50,6 +50,10 @@ write_matrix() {
         all_observed_source_checkouts_synced: $all_synced,
         runner_git_heads: ["abc123"],
         runner_package_versions: ["0.11.1"],
+        runner_pwnkit_fixture_ids: [
+          "pwnkit-v0.12.0-private",
+          "/private/tmp/pwnkit"
+        ],
         ready_for_matrix_interpretation: $ready
       },
       variants: [
@@ -93,6 +97,7 @@ test_rejects_unhealthy_matrix_with_sanitized_output() {
   rg -q 'matrix_health.total_pwnkit_agent_errors=2' <<<"$output"
   rg -q 'matrix_health.runner_git_heads=abc123' <<<"$output"
   rg -q 'matrix_health.runner_package_versions=0.11.1' <<<"$output"
+  rg -q 'matrix_health.runner_pwnkit_fixture_ids=pwnkit-v0.12.0-private,<redacted>' <<<"$output"
   ! rg -q '/private/tmp|secret-token|/docs|variant_bundle_dir|raw_pwnkit_fixture' <<<"$output"
 }
 

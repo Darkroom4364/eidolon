@@ -10,7 +10,7 @@ Usage: examples/m3/check-pwnkit-promotion-matrix-health.sh <pwnkit-promotion-mat
 
 Fails closed when an M3 pwnkit promotion matrix is not healthy enough to
 interpret. The check prints only sanitized aggregate matrix_health booleans,
-counts, runner git heads, and runner package versions.
+counts, runner git heads, runner package versions, and pinned fixture IDs.
 
 Environment:
   EIDOLON_M3_ALLOW_UNHEALTHY_PROMOTION_MATRIX
@@ -51,7 +51,8 @@ print_sanitized_matrix_health() {
       "       matrix_health.source_checkout_clean_variant_count=\(count_or_unknown($health.source_checkout_clean_variant_count))",
       "       matrix_health.source_checkout_synced_variant_count=\(count_or_unknown($health.source_checkout_synced_variant_count))",
       "       matrix_health.runner_git_heads=\((($health.runner_git_heads // []) | map(safe_token) | join(",")) // "")",
-      "       matrix_health.runner_package_versions=\((($health.runner_package_versions // []) | map(safe_token) | join(",")) // "")"
+      "       matrix_health.runner_package_versions=\((($health.runner_package_versions // []) | map(safe_token) | join(",")) // "")",
+      "       matrix_health.runner_pwnkit_fixture_ids=\((($health.runner_pwnkit_fixture_ids // []) | map(safe_token) | join(",")) // "")"
   ' "$MATRIX_FILE" >&2
 }
 
