@@ -1002,35 +1002,34 @@ run_scan() {
   scan_args+=(--verbose)
 
   echo "m3 pwnkit $label -> $url" >&2
-  local -a pwnkit_env=(
-    PWNKIT_NO_UPDATE_CHECK=1
-  )
-  case "$PWNKIT_CODEX_AUTH_SOURCE" in
-    codex_auth_file_access_token)
-      pwnkit_env=(-u PWNKIT_CHATGPT_ACCOUNT_ID "${pwnkit_env[@]}")
-      pwnkit_env+=(PWNKIT_CHATGPT_ACCESS_TOKEN="$PWNKIT_CODEX_ACCESS_TOKEN")
-      if [[ -n "$PWNKIT_CODEX_ACCOUNT_ID" ]]; then
-        pwnkit_env+=(PWNKIT_CHATGPT_ACCOUNT_ID="$PWNKIT_CODEX_ACCOUNT_ID")
-      fi
-      ;;
-    codex_auth_file_refresh_token)
-      pwnkit_env=(-u PWNKIT_CHATGPT_ACCOUNT_ID "${pwnkit_env[@]}")
-      pwnkit_env+=(
-        PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN="$PWNKIT_CODEX_OAUTH_REFRESH_TOKEN"
-      )
-      ;;
-  esac
-  if [[ -n "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" ]]; then
-    pwnkit_env+=(PWNKIT_FEATURE_CODEX_LIVE_TARGETS="$PWNKIT_FEATURE_CODEX_LIVE_TARGETS")
-  fi
 
   while :; do
     set +e
-    run_command_with_timeout \
-      "$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
-      "$output_stdout" \
-      "$output_stderr" \
-      env "${pwnkit_env[@]}" "${PWNKIT_COMMAND[@]}" "${scan_args[@]}"
+    (
+      export PWNKIT_NO_UPDATE_CHECK=1
+      case "$PWNKIT_CODEX_AUTH_SOURCE" in
+        codex_auth_file_access_token)
+          unset PWNKIT_CHATGPT_ACCOUNT_ID
+          export PWNKIT_CHATGPT_ACCESS_TOKEN="$PWNKIT_CODEX_ACCESS_TOKEN"
+          if [[ -n "$PWNKIT_CODEX_ACCOUNT_ID" ]]; then
+            export PWNKIT_CHATGPT_ACCOUNT_ID="$PWNKIT_CODEX_ACCOUNT_ID"
+          fi
+          ;;
+        codex_auth_file_refresh_token)
+          unset PWNKIT_CHATGPT_ACCOUNT_ID
+          export PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN="$PWNKIT_CODEX_OAUTH_REFRESH_TOKEN"
+          ;;
+      esac
+      if [[ -n "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" ]]; then
+        export PWNKIT_FEATURE_CODEX_LIVE_TARGETS
+      fi
+
+      run_command_with_timeout \
+        "$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
+        "$output_stdout" \
+        "$output_stderr" \
+        "${PWNKIT_COMMAND[@]}" "${scan_args[@]}"
+    )
     exit_code=$?
     set -e
     if [[ "$exit_code" -eq 124 ]]; then
