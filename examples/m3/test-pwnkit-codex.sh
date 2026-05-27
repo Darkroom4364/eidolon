@@ -397,6 +397,91 @@ JS
   ! rg -q 'fixture-refresh-token' "$artifact/pwnkit-direct.stderr.log"
 }
 
+test_auto_loaded_codex_access_token_stays_out_of_process_args() {
+  local artifact
+  local auth_file
+  local access_token
+  local fake_pwnkit
+  local ready_file
+  local runner_pid
+  local pwnkit_pid
+  local runner_stdout
+  local runner_stderr
+  local process_args
+  local timeout_pid
+  local status=0
+  artifact="$(new_temp_dir)"
+  auth_file="$artifact/codex-auth.json"
+  fake_pwnkit="$artifact/fake-pwnkit.js"
+  ready_file="$artifact/pwnkit-ready.pid"
+  runner_stdout="$artifact/runner.stdout"
+  runner_stderr="$artifact/runner.stderr"
+  access_token="$(make_access_token "$(( $(date -u '+%s') + 3600 ))")"
+
+  cat > "$fake_pwnkit" <<'JS'
+#!/usr/bin/env node
+const fs = require('fs');
+fs.writeFileSync(process.env.FIXTURE_READY_FILE, `${process.pid}\n`);
+setInterval(() => {}, 10000);
+JS
+  chmod +x "$fake_pwnkit"
+
+  jq -n \
+    --arg access_token "$access_token" \
+    --arg account_id "fixture-account-id" \
+    '{tokens: {
+      access_token: $access_token,
+      account_id: $account_id
+    }}' > "$auth_file"
+
+  env \
+    -u PWNKIT_CHATGPT_ACCESS_TOKEN \
+    -u PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    EIDOLON_M3_CODEX_AUTH_FILE="$auth_file" \
+    EIDOLON_M3_PWNKIT_MAX_ATTEMPTS=1 \
+    EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=30 \
+    FIXTURE_READY_FILE="$ready_file" \
+    PWNKIT_CHATGPT_ACCOUNT_ID=stale-account-id \
+    PWNKIT_BIN="$fake_pwnkit" \
+    "$RUNNER" direct "$artifact" >"$runner_stdout" 2>"$runner_stderr" &
+  runner_pid="$!"
+
+  for _ in {1..50}; do
+    if [[ -s "$ready_file" ]]; then
+      break
+    fi
+    if ! kill -0 "$runner_pid" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  [[ -s "$ready_file" ]]
+  pwnkit_pid="$(cat "$ready_file")"
+  timeout_pid="$(ps -o ppid= -p "$pwnkit_pid" 2>/dev/null | tr -d ' ' || true)"
+  process_args="$(
+    {
+      ps -o args= -p "$runner_pid"
+      ps -o args= -p "$pwnkit_pid"
+      if [[ -n "$timeout_pid" ]]; then
+        ps -o args= -p "$timeout_pid"
+      fi
+    } 2>/dev/null || true
+  )"
+  if rg -q --fixed-strings "$access_token" <<<"$process_args"; then
+    echo "auto-loaded access token appeared in process arguments" >&2
+    kill "$pwnkit_pid" >/dev/null 2>&1 || true
+    wait "$runner_pid" >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  kill "$pwnkit_pid" >/dev/null 2>&1 || true
+  wait "$runner_pid" >/dev/null 2>&1 || status="$?"
+  [[ "$status" -ne 0 ]]
+}
+
 test_auto_loads_codex_refresh_token_from_auth_file_without_usable_access_token() {
   local repo
   local artifact
@@ -802,6 +887,7 @@ test_rejects_invalid_pwnkit_timeout_seconds
 test_source_checkout_metadata_records_dirty_worktree
 test_preflight_writes_metadata_and_scopes_without_scan
 test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret
+test_auto_loaded_codex_access_token_stays_out_of_process_args
 test_auto_loads_codex_refresh_token_from_auth_file_without_usable_access_token
 test_retries_direct_wall_clock_timeout_attempt
 test_records_eidolon_wall_clock_timeout_without_in_place_retry
