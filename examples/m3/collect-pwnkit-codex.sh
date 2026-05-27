@@ -32,6 +32,24 @@ for tool in jq sqlite3; do
   fi
 done
 
+TMP_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/eidolon-m3-collect.XXXXXX")"
+cleanup() {
+  rm -rf "$TMP_WORK_DIR"
+}
+trap cleanup EXIT
+
+tmp_json_file() {
+  local name="$1"
+  printf '%s/%s.json' "$TMP_WORK_DIR" "$name"
+}
+
+write_json_file() {
+  local path="$1"
+  local json="$2"
+
+  printf '%s\n' "$json" > "$path"
+}
+
 sqlite_json() {
   local db="$1"
   local query="$2"
@@ -102,12 +120,18 @@ run_summary() {
   local label="$1"
   local report_file="$ARTIFACT_DIR/pwnkit-$label.json"
   local db_file="$ARTIFACT_DIR/pwnkit-$label.db"
-  local report_json='{}'
+  local report_json_file
   local status="missing"
 
-  if [[ -f "$report_file" ]]; then
-    report_json="$(cat "$report_file")"
+  report_json_file="$(tmp_json_file "$label-report")"
+  if [[ -s "$report_file" ]]; then
+    report_json_file="$report_file"
     status="present"
+  else
+    write_json_file "$report_json_file" '{}'
+    if [[ -f "$report_file" ]]; then
+      status="present"
+    fi
   fi
 
   local tool_counts
@@ -216,19 +240,45 @@ run_summary() {
     db_findings="$(sqlite_json "$db_file" "$finding_select")"
   fi
 
+  local tool_counts_file
+  local http_requests_file
+  local bash_http_outputs_file
+  local crawl_artifacts_file
+  local agent_errors_file
+  local db_findings_file
+  tool_counts_file="$(tmp_json_file "$label-tool-counts")"
+  http_requests_file="$(tmp_json_file "$label-http-requests")"
+  bash_http_outputs_file="$(tmp_json_file "$label-bash-http-outputs")"
+  crawl_artifacts_file="$(tmp_json_file "$label-crawl-artifacts")"
+  agent_errors_file="$(tmp_json_file "$label-agent-errors")"
+  db_findings_file="$(tmp_json_file "$label-db-findings")"
+  write_json_file "$tool_counts_file" "$tool_counts"
+  write_json_file "$http_requests_file" "$http_requests"
+  write_json_file "$bash_http_outputs_file" "$bash_http_outputs"
+  write_json_file "$crawl_artifacts_file" "$crawl_artifacts"
+  write_json_file "$agent_errors_file" "$agent_errors"
+  write_json_file "$db_findings_file" "$db_findings"
+
   jq -n \
     --arg label "$label" \
     --arg artifact_status "$status" \
-    --argjson report "$report_json" \
-    --argjson tool_counts "$tool_counts" \
-    --argjson http_requests "$http_requests" \
-    --argjson bash_http_outputs "$bash_http_outputs" \
-    --argjson crawl_artifacts "$crawl_artifacts" \
-    --argjson agent_errors "$agent_errors" \
     --argjson event_count "$event_count" \
     --argjson tool_artifacts "$tool_artifacts" \
-    --argjson db_findings "$db_findings" \
-    'def path_without_origin($url):
+    --slurpfile report_json "$report_json_file" \
+    --slurpfile tool_counts_json "$tool_counts_file" \
+    --slurpfile http_requests_json "$http_requests_file" \
+    --slurpfile bash_http_outputs_json "$bash_http_outputs_file" \
+    --slurpfile crawl_artifacts_json "$crawl_artifacts_file" \
+    --slurpfile agent_errors_json "$agent_errors_file" \
+    --slurpfile db_findings_json "$db_findings_file" \
+    '($report_json[0] // {}) as $report
+     | ($tool_counts_json[0] // []) as $tool_counts
+     | ($http_requests_json[0] // []) as $http_requests
+     | ($bash_http_outputs_json[0] // []) as $bash_http_outputs
+     | ($crawl_artifacts_json[0] // []) as $crawl_artifacts
+     | ($agent_errors_json[0] // []) as $agent_errors
+     | ($db_findings_json[0] // []) as $db_findings
+     | def path_without_origin($url):
        ($url // "")
        | sub("^https?://[^/]+"; "")
        | if . == "" then "/" else . end;
@@ -688,13 +738,18 @@ proxy_summary() {
   }' "$proxy_log"
 }
 
-direct_summary="$(run_summary direct)"
-eidolon_summary="$(run_summary eidolon)"
-proxy_events="$(proxy_summary)"
-runner_metadata='{}'
+direct_summary_file="$(tmp_json_file direct-summary)"
+eidolon_summary_file="$(tmp_json_file eidolon-summary)"
+proxy_events_file="$(tmp_json_file proxy-events)"
+runner_metadata_file="$(tmp_json_file runner-metadata)"
+run_summary direct > "$direct_summary_file"
+run_summary eidolon > "$eidolon_summary_file"
+proxy_summary > "$proxy_events_file"
 RUNNER_METADATA_FILE="$ARTIFACT_DIR/pwnkit-runner-metadata.json"
 if [[ -s "$RUNNER_METADATA_FILE" ]]; then
-  runner_metadata="$(cat "$RUNNER_METADATA_FILE")"
+  cp "$RUNNER_METADATA_FILE" "$runner_metadata_file"
+else
+  write_json_file "$runner_metadata_file" '{}'
 fi
 PINNED_SESSION_ID=""
 PINNED_SESSION_FILE="$ARTIFACT_DIR/pinned-eidolon-session-id.txt"
@@ -705,11 +760,15 @@ fi
 jq -n \
   --arg artifact_dir "$ARTIFACT_DIR" \
   --arg pinned_session_id "$PINNED_SESSION_ID" \
-  --argjson direct "$direct_summary" \
-  --argjson eidolon "$eidolon_summary" \
-  --argjson proxy "$proxy_events" \
-  --argjson runner "$runner_metadata" \
-  'def unique_paths($run): ($run.requested_paths | map(.path) | unique);
+  --slurpfile direct_json "$direct_summary_file" \
+  --slurpfile eidolon_json "$eidolon_summary_file" \
+  --slurpfile proxy_json "$proxy_events_file" \
+  --slurpfile runner_json "$runner_metadata_file" \
+  '($direct_json[0] // {}) as $direct
+   | ($eidolon_json[0] // {}) as $eidolon
+   | ($proxy_json[0] // {}) as $proxy
+   | ($runner_json[0] // {}) as $runner
+   | def unique_paths($run): ($run.requested_paths | map(.path) | unique);
    def target_without_fragment($target): (($target // "") | sub("#.*$"; ""));
    def path_without_query($path): (target_without_fragment($path) | sub("\\?.*$"; ""));
    def redacted_query($query):
