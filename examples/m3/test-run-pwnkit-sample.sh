@@ -18,6 +18,7 @@ test_help_mentions_sample_summary() {
   "$RUNNER" --help | rg -q 'EIDOLON_M3_RUNNER_ENVIRONMENT'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_NETWORK_TOPOLOGY'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS'
 }
 
 test_rejects_invalid_run_count() {
@@ -59,6 +60,7 @@ test_dry_run_creates_private_layout() {
   rg -q '^allow_agent_errors=0$' "$sample_dir/sample-plan.txt"
   rg -q '^allow_unfresh_pwnkit_source=0$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_max_attempts=2$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_timeout_seconds=900$' "$sample_dir/sample-plan.txt"
   rg -q '^runner_environment=auto$' "$sample_dir/sample-plan.txt"
   rg -q '^network_topology=same_host_loopback$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_fixture_id=none$' "$sample_dir/sample-plan.txt"
@@ -89,6 +91,19 @@ test_rejects_invalid_pwnkit_max_attempts() {
 
   [[ "$status" -eq 2 ]]
   rg -q 'EIDOLON_M3_PWNKIT_MAX_ATTEMPTS must be a positive integer' <<<"$output"
+}
+
+test_rejects_invalid_pwnkit_timeout_seconds() {
+  local output
+  local status=0
+
+  output="$(
+    EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=0 \
+      "$RUNNER" 1 "$(new_temp_dir)" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS must be a positive integer' <<<"$output"
 }
 
 test_dry_run_records_agent_error_override() {
@@ -168,6 +183,7 @@ test_dry_run_accepts_localhost_urls() {
 test_help_mentions_sample_summary
 test_rejects_invalid_run_count
 test_rejects_invalid_pwnkit_max_attempts
+test_rejects_invalid_pwnkit_timeout_seconds
 test_rejects_urls_with_query_values
 test_dry_run_creates_private_layout
 test_dry_run_records_runner_environment_overrides

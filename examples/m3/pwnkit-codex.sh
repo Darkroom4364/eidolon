@@ -13,6 +13,7 @@ PWNKIT_MODE="${PWNKIT_MODE:-web}"
 PWNKIT_RUNTIME="${PWNKIT_RUNTIME:-codex}"
 PWNKIT_RATE_LIMIT="${PWNKIT_RATE_LIMIT:-2}"
 EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="${EIDOLON_M3_PWNKIT_MAX_ATTEMPTS:-2}"
+EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS="${EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS:-900}"
 PWNKIT_FEATURE_CODEX_LIVE_TARGETS="${PWNKIT_FEATURE_CODEX_LIVE_TARGETS:-}"
 EIDOLON_M3_CODEX_AUTH_FILE="${EIDOLON_M3_CODEX_AUTH_FILE:-$HOME/.codex/auth.json}"
 EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-0}"
@@ -44,6 +45,9 @@ Environment:
                             Attempts for stateless pwnkit legs when a transient
                             Codex backend error is recorded. Defaults to 2.
                             Stateful Eidolon legs are not retried in-place.
+  EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS
+                            Wall-clock timeout for each pwnkit scan leg.
+                            Defaults to 900 seconds.
   PWNKIT_FEATURE_CODEX_LIVE_TARGETS
                             Optional legacy pwnkit feature flag. Not set by
                             default; current pwnkit Codex live scans use the
@@ -569,6 +573,7 @@ write_runner_metadata() {
     --arg pwnkit_runtime "$PWNKIT_RUNTIME" \
     --arg pwnkit_rate_limit "$PWNKIT_RATE_LIMIT" \
     --argjson pwnkit_max_attempts "$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
+    --argjson pwnkit_timeout_seconds "$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
     --arg pwnkit_feature_codex_live_targets "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" \
     --arg pwnkit_command "$pwnkit_command_quoted" \
     --arg pwnkit_command_source "${PWNKIT_COMMAND_SOURCE:-unknown}" \
@@ -633,6 +638,7 @@ write_runner_metadata() {
         runtime: $pwnkit_runtime,
         rate_limit: $pwnkit_rate_limit,
         max_attempts: $pwnkit_max_attempts,
+        timeout_seconds: $pwnkit_timeout_seconds,
         feature_codex_live_targets: (
           if $pwnkit_feature_codex_live_targets == "" then null
           else $pwnkit_feature_codex_live_targets
@@ -831,12 +837,97 @@ pwnkit_transient_agent_error_count() {
        );"
 }
 
+record_pwnkit_runner_agent_error() {
+  local db_file="$1"
+  local event_id="$2"
+  local error="$3"
+  local payload
+  local escaped_payload
+  local timestamp_ms
+
+  if ! command -v sqlite3 >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    return
+  fi
+
+  payload="$(
+    jq -cn \
+      --arg error "$error" \
+      --arg source "eidolon_m3_pwnkit_runner" \
+      '{error: $error, source: $source}'
+  )"
+  escaped_payload="$(printf '%s' "$payload" | sed "s/'/''/g")"
+  timestamp_ms="$(date +%s)000"
+
+  sqlite3 "$db_file" "
+    create table if not exists pipeline_events (
+      id text primary key,
+      scanId text not null,
+      stage text not null,
+      eventType text not null,
+      findingId text,
+      agentRole text,
+      payload text not null default '{}',
+      timestamp integer not null
+    );
+    insert or replace into pipeline_events
+      (id, scanId, stage, eventType, findingId, agentRole, payload, timestamp)
+    values
+      ('$event_id', 'eidolon-runner', 'runner', 'agent_error', null, 'runner', '$escaped_payload', $timestamp_ms);
+  " >/dev/null 2>&1 || true
+}
+
 stderr_has_transient_agent_error() {
   local stderr_file="$1"
 
   [[ -f "$stderr_file" ]] \
     && grep -Eiq 'codex backend.*((timed out|timeout)|api error)' "$stderr_file" \
     && ! grep -Eiq '(refresh token|token refresh failed|401|invalid_request_error|authentication)' "$stderr_file"
+}
+
+run_command_with_timeout() {
+  local timeout_seconds="$1"
+  local output_stdout="$2"
+  local output_stderr="$3"
+  shift 3
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$timeout_seconds" "$@" > "$output_stdout" 2> "$output_stderr"
+    local status="$?"
+    if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
+      return 124
+    fi
+    return "$status"
+  fi
+
+  local timeout_marker="$output_stderr.timeout"
+  local command_pid
+  local watcher_pid
+  local status
+
+  rm -f "$timeout_marker"
+  "$@" > "$output_stdout" 2> "$output_stderr" &
+  command_pid="$!"
+  (
+    sleep "$timeout_seconds"
+    if kill -0 "$command_pid" >/dev/null 2>&1; then
+      : > "$timeout_marker"
+      kill "$command_pid" >/dev/null 2>&1 || true
+      sleep 2
+      kill -KILL "$command_pid" >/dev/null 2>&1 || true
+    fi
+  ) &
+  watcher_pid="$!"
+
+  wait "$command_pid" 2>/dev/null
+  status="$?"
+  kill "$watcher_pid" >/dev/null 2>&1 || true
+  wait "$watcher_pid" >/dev/null 2>&1 || true
+
+  if [[ -f "$timeout_marker" ]]; then
+    status=124
+  fi
+  rm -f "$timeout_marker"
+  return "$status"
 }
 
 archive_scan_attempt() {
@@ -935,11 +1026,22 @@ run_scan() {
 
   while :; do
     set +e
-    env "${pwnkit_env[@]}" "${PWNKIT_COMMAND[@]}" "${scan_args[@]}" \
-        > "$output_stdout" \
-        2> "$output_stderr"
+    run_command_with_timeout \
+      "$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
+      "$output_stdout" \
+      "$output_stderr" \
+      env "${pwnkit_env[@]}" "${PWNKIT_COMMAND[@]}" "${scan_args[@]}"
     exit_code=$?
     set -e
+    if [[ "$exit_code" -eq 124 ]]; then
+      local timeout_error
+      timeout_error="ChatGPT (Codex backend) API request timed out after Eidolon runner wall-clock timeout ${EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS}s for pwnkit $label attempt $attempt"
+      printf 'warning: %s\n' "$timeout_error" >> "$output_stderr"
+      record_pwnkit_runner_agent_error \
+        "$output_db" \
+        "eidolon-runner-timeout-$label-$attempt" \
+        "$timeout_error"
+    fi
     normalize_pwnkit_report "$output_stdout" "$output_json" || true
 
     local transient_error_count
@@ -1011,6 +1113,9 @@ main() {
   require_positive_integer \
     "EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
     "$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS"
+  require_positive_integer \
+    "EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
+    "$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS"
   validate_fixture_id
   mkdir -p "$ARTIFACT_DIR"
   printf '%s\n' "$ARTIFACT_DIR" > "$ARTIFACT_DIR/artifact-dir.txt"

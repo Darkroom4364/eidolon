@@ -72,6 +72,7 @@ test_source_checkout_metadata_records_version_and_origin_sync() {
     and (.environment.runner_environment | type) == "string"
     and .environment.runner_environment_source == "auto_detect"
     and .environment.network_topology == "same_host_loopback"
+    and .pwnkit.timeout_seconds == 900
     and (.environment.os.kernel_name | type) == "string"
     and any(
       .environment.tool_fingerprint[];
@@ -165,6 +166,27 @@ test_rejects_unsafe_pinned_fixture_id() {
   ! rg -q '/tmp/private-pwnkit' <<<"$output"
 }
 
+test_rejects_invalid_pwnkit_timeout_seconds() {
+  local repo
+  local artifact
+  local output
+  local status=0
+  repo="$(new_temp_dir)"
+  artifact="$(new_temp_dir)"
+  init_fake_pwnkit_checkout "$repo"
+
+  output="$(
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+      EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+      EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=0 \
+      PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
+      "$RUNNER" preflight "$artifact" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS must be a positive integer' <<<"$output"
+}
+
 test_source_checkout_metadata_records_dirty_worktree() {
   local repo
   local artifact
@@ -179,6 +201,89 @@ test_source_checkout_metadata_records_dirty_worktree() {
     "$RUNNER" direct "$artifact" >/dev/null
 
   jq -e '.pwnkit.git_dirty == true' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+}
+
+test_retries_direct_wall_clock_timeout_attempt() {
+  local artifact
+  local fake_pwnkit
+  local attempt_file
+  artifact="$(new_temp_dir)"
+  fake_pwnkit="$artifact/fake-pwnkit.js"
+  attempt_file="$artifact/attempt-count.txt"
+
+  cat > "$fake_pwnkit" <<'JS'
+#!/usr/bin/env node
+const fs = require('fs');
+const attemptFile = process.env.FIXTURE_ATTEMPT_FILE;
+const previous = fs.existsSync(attemptFile)
+  ? Number(fs.readFileSync(attemptFile, 'utf8').trim() || '0')
+  : 0;
+const attempt = previous + 1;
+fs.writeFileSync(attemptFile, `${attempt}\n`);
+
+if (attempt === 1) {
+  setInterval(() => {}, 10000);
+} else {
+  process.stdout.write('{"findings":[]}\n');
+}
+JS
+  chmod +x "$fake_pwnkit"
+
+  EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    EIDOLON_M3_PWNKIT_MAX_ATTEMPTS=2 \
+    EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=1 \
+    FIXTURE_ATTEMPT_FILE="$attempt_file" \
+    PWNKIT_BIN="$fake_pwnkit" \
+    "$RUNNER" direct "$artifact" >/dev/null
+
+  [[ "$(cat "$attempt_file")" == "2" ]]
+  [[ -f "$artifact/private/pwnkit-direct-attempt-1/pwnkit-direct.db" ]]
+  [[ "$(sqlite3 "$artifact/private/pwnkit-direct-attempt-1/pwnkit-direct.db" "select count(*) from pipeline_events where eventType = 'agent_error';")" == "1" ]]
+  rg -q 'wall-clock timeout 1s' "$artifact/private/pwnkit-direct-attempt-1/pwnkit-direct.stderr.log"
+  jq -e '.findings == []' "$artifact/pwnkit-direct.json" >/dev/null
+  jq -e '.pwnkit.timeout_seconds == 1' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+}
+
+test_records_eidolon_wall_clock_timeout_without_in_place_retry() {
+  local artifact
+  local fake_pwnkit
+  local attempt_file
+  local output
+  local status=0
+  artifact="$(new_temp_dir)"
+  fake_pwnkit="$artifact/fake-pwnkit.js"
+  attempt_file="$artifact/attempt-count.txt"
+
+  cat > "$fake_pwnkit" <<'JS'
+#!/usr/bin/env node
+const fs = require('fs');
+const attemptFile = process.env.FIXTURE_ATTEMPT_FILE;
+const previous = fs.existsSync(attemptFile)
+  ? Number(fs.readFileSync(attemptFile, 'utf8').trim() || '0')
+  : 0;
+const attempt = previous + 1;
+fs.writeFileSync(attemptFile, `${attempt}\n`);
+setInterval(() => {}, 10000);
+JS
+  chmod +x "$fake_pwnkit"
+
+  output="$(
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+      EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+      EIDOLON_M3_PWNKIT_MAX_ATTEMPTS=2 \
+      EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=1 \
+      FIXTURE_ATTEMPT_FILE="$attempt_file" \
+      PWNKIT_BIN="$fake_pwnkit" \
+      "$RUNNER" eidolon "$artifact" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 124 ]]
+  [[ "$(cat "$attempt_file")" == "1" ]]
+  [[ ! -e "$artifact/private/pwnkit-eidolon-attempt-1" ]]
+  [[ "$(sqlite3 "$artifact/pwnkit-eidolon.db" "select count(*) from pipeline_events where eventType = 'agent_error';")" == "1" ]]
+  rg -q 'wall-clock timeout 1s' "$artifact/pwnkit-eidolon.stderr.log"
+  rg -q 'pwnkit eidolon exited 124 without a valid report' <<<"$output"
 }
 
 test_preflight_writes_metadata_and_scopes_without_scan() {
@@ -693,10 +798,13 @@ test_source_checkout_metadata_records_version_and_origin_sync
 test_source_checkout_metadata_records_origin_drift
 test_source_checkout_metadata_records_pinned_fixture_id
 test_rejects_unsafe_pinned_fixture_id
+test_rejects_invalid_pwnkit_timeout_seconds
 test_source_checkout_metadata_records_dirty_worktree
 test_preflight_writes_metadata_and_scopes_without_scan
 test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret
 test_auto_loads_codex_refresh_token_from_auth_file_without_usable_access_token
+test_retries_direct_wall_clock_timeout_attempt
+test_records_eidolon_wall_clock_timeout_without_in_place_retry
 test_retries_transient_codex_backend_timeout_attempt
 test_retries_transient_codex_backend_api_error_attempt
 test_does_not_retry_codex_backend_auth_error_attempt
