@@ -210,9 +210,17 @@ evidence that correlated to that exposure surface.
 - `counts.controlled_reality_without_eidolon_findings`
 - `no_signal_diagnostics`
 - `differential_findings`
+- `finding_reconciliation`
 - `evidence_gap_diagnostics`
+- `evidence_tracks` and `evidence_track_counts`
 - per-run `artifacts[].trace_gap`
 - per-run `artifacts[].strict_correlation_gap`
+
+The sample health check fails closed if a sample mixes `upstream_current`,
+`local_patched_pwnkit`, and `historical_stale` tracks, or if a positive
+differential-finding claim is present without final JSON finding support.
+DB-saved finding deltas remain diagnostics under `finding_reconciliation`; they
+do not by themselves support a final-output pwnkit finding claim.
 
 `examples/m3/collect-pwnkit-promotion-matrix.sh` wraps those sample-level
 signals per manifest variant and adds:
