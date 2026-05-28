@@ -15,6 +15,8 @@ EIDOLON_M3_KALI_VM_DRY_RUN="${EIDOLON_M3_KALI_VM_DRY_RUN:-0}"
 EIDOLON_M3_ALLOW_NON_KALI_VM="${EIDOLON_M3_ALLOW_NON_KALI_VM:-0}"
 EIDOLON_M3_KALI_VM_PREFLIGHT="${EIDOLON_M3_KALI_VM_PREFLIGHT:-0}"
 EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-}"
+EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="${EIDOLON_M3_PWNKIT_MAX_ATTEMPTS:-3}"
+EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS="${EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS:-1800}"
 
 usage() {
   cat <<'USAGE'
@@ -35,6 +37,12 @@ Environment:
   EIDOLON_M3_KALI_VM_DRY_RUN   If true, write the sample plan without running scans.
   EIDOLON_M3_KALI_VM_PREFLIGHT If true, validate VM runner plumbing and exit.
   EIDOLON_M3_ALLOW_NON_KALI_VM Allow dry-run/planning outside Kali. Defaults to 0.
+  EIDOLON_M3_PWNKIT_MAX_ATTEMPTS
+                               Attempts per sample run for transient Codex
+                               backend errors. Defaults to 3 for Kali VM.
+  EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS
+                               Wall-clock timeout for each pwnkit scan leg.
+                               Defaults to 1800 seconds for Kali VM.
   EIDOLON_M3_PWNKIT_FIXTURE_ID Optional safe label for archived/private pinned
                                pwnkit fixtures.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to run-pwnkit-sample.sh.
@@ -212,6 +220,8 @@ run_preflight() {
   EIDOLON_LAB_TARGET_URL="$TARGET_URL" \
     EIDOLON_LAB_PROXY_URL="$PROXY_URL" \
     EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-1}" \
+    EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
+    EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS="$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
     EIDOLON_M3_RUNNER_ENVIRONMENT="$EIDOLON_M3_RUNNER_ENVIRONMENT" \
     EIDOLON_M3_NETWORK_TOPOLOGY="$EIDOLON_M3_NETWORK_TOPOLOGY" \
     EIDOLON_M3_PWNKIT_FIXTURE_ID="$EIDOLON_M3_PWNKIT_FIXTURE_ID" \
@@ -247,6 +257,8 @@ main() {
   export EIDOLON_M3_RUNNER_ENVIRONMENT
   export EIDOLON_M3_NETWORK_TOPOLOGY
   export EIDOLON_M3_PWNKIT_FIXTURE_ID
+  export EIDOLON_M3_PWNKIT_MAX_ATTEMPTS
+  export EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS
 
   if truthy "$EIDOLON_M3_KALI_VM_DRY_RUN"; then
     export EIDOLON_M3_SAMPLE_DRY_RUN=1
