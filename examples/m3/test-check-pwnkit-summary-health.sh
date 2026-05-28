@@ -24,6 +24,7 @@ write_summary() {
       raw_agent_error_fixture: "sensitive-refresh-detail",
       runs: {
         direct: {
+          artifact_status: "present",
           agent_error_diagnostics: {
             count: $direct_count,
             class_counts: (
@@ -36,6 +37,7 @@ write_summary() {
           }
         },
         eidolon: {
+          artifact_status: "present",
           agent_error_diagnostics: {
             count: $eidolon_count,
             class_counts: (
@@ -82,6 +84,30 @@ test_allows_agent_errors_when_explicitly_requested() {
   EIDOLON_M3_ALLOW_AGENT_ERRORS=1 "$CHECKER" "$dir/pwnkit-summary.json"
 }
 
+test_rejects_missing_leg_artifacts_even_when_agent_errors_allowed() {
+  local dir
+  local output
+  local status=0
+  dir="$(new_temp_dir)"
+  write_summary "$dir/pwnkit-summary.json" 0 0
+  jq '
+    .runs.direct.artifact_status = "missing"
+    | del(.runs.eidolon.artifact_status)
+  ' "$dir/pwnkit-summary.json" > "$dir/pwnkit-summary.json.tmp"
+  mv "$dir/pwnkit-summary.json.tmp" "$dir/pwnkit-summary.json"
+
+  output="$(
+    EIDOLON_M3_ALLOW_AGENT_ERRORS=1 \
+      "$CHECKER" "$dir/pwnkit-summary.json" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 1 ]]
+  rg -q 'missing required leg artifacts' <<<"$output"
+  rg -q 'direct=missing' <<<"$output"
+  rg -q 'eidolon=missing' <<<"$output"
+  ! rg -q 'sensitive-refresh-detail' <<<"$output"
+}
+
 test_rejects_missing_summary() {
   local output
   local status=0
@@ -95,6 +121,7 @@ test_rejects_missing_summary() {
 test_accepts_clean_summary
 test_rejects_agent_error_summary_with_sanitized_output
 test_allows_agent_errors_when_explicitly_requested
+test_rejects_missing_leg_artifacts_even_when_agent_errors_allowed
 test_rejects_missing_summary
 
 printf 'check-pwnkit-summary-health fixture tests passed\n'
