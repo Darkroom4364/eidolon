@@ -73,6 +73,7 @@ test_source_checkout_metadata_records_version_and_origin_sync() {
     and .environment.runner_environment_source == "auto_detect"
     and .environment.network_topology == "same_host_loopback"
     and .pwnkit.timeout_seconds == 900
+    and .pwnkit.heartbeat_seconds == 60
     and (.environment.os.kernel_name | type) == "string"
     and any(
       .environment.tool_fingerprint[];
@@ -187,6 +188,27 @@ test_rejects_invalid_pwnkit_timeout_seconds() {
   rg -q 'EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS must be a positive integer' <<<"$output"
 }
 
+test_rejects_invalid_pwnkit_heartbeat_seconds() {
+  local repo
+  local artifact
+  local output
+  local status=0
+  repo="$(new_temp_dir)"
+  artifact="$(new_temp_dir)"
+  init_fake_pwnkit_checkout "$repo"
+
+  output="$(
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+      EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+      EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS=0 \
+      PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
+      "$RUNNER" preflight "$artifact" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS must be a positive integer' <<<"$output"
+}
+
 test_source_checkout_metadata_records_dirty_worktree() {
   local repo
   local artifact
@@ -207,9 +229,11 @@ test_retries_direct_wall_clock_timeout_attempt() {
   local artifact
   local fake_pwnkit
   local attempt_file
+  local runner_stderr
   artifact="$(new_temp_dir)"
   fake_pwnkit="$artifact/fake-pwnkit.js"
   attempt_file="$artifact/attempt-count.txt"
+  runner_stderr="$artifact/runner.stderr"
 
   cat > "$fake_pwnkit" <<'JS'
 #!/usr/bin/env node
@@ -232,17 +256,21 @@ JS
   EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
     EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
     EIDOLON_M3_PWNKIT_MAX_ATTEMPTS=2 \
-    EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=1 \
+    EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=2 \
+    EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS=1 \
     FIXTURE_ATTEMPT_FILE="$attempt_file" \
     PWNKIT_BIN="$fake_pwnkit" \
-    "$RUNNER" direct "$artifact" >/dev/null
+    "$RUNNER" direct "$artifact" >/dev/null 2>"$runner_stderr"
 
   [[ "$(cat "$attempt_file")" == "2" ]]
   [[ -f "$artifact/private/pwnkit-direct-attempt-1/pwnkit-direct.db" ]]
   [[ "$(sqlite3 "$artifact/private/pwnkit-direct-attempt-1/pwnkit-direct.db" "select count(*) from pipeline_events where eventType = 'agent_error';")" == "1" ]]
-  rg -q 'wall-clock timeout 1s' "$artifact/private/pwnkit-direct-attempt-1/pwnkit-direct.stderr.log"
+  rg -q 'wall-clock timeout 2s' "$artifact/private/pwnkit-direct-attempt-1/pwnkit-direct.stderr.log"
+  rg -q 'm3 pwnkit heartbeat label=direct attempt=1 status=running' "$runner_stderr"
+  rg -q 'm3 pwnkit heartbeat label=direct attempt=1 status=timeout' "$runner_stderr"
+  rg -q 'm3 pwnkit heartbeat label=direct attempt=2 status=finished' "$runner_stderr"
   jq -e '.findings == []' "$artifact/pwnkit-direct.json" >/dev/null
-  jq -e '.pwnkit.timeout_seconds == 1' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+  jq -e '.pwnkit.timeout_seconds == 2 and .pwnkit.heartbeat_seconds == 1' "$artifact/pwnkit-runner-metadata.json" >/dev/null
 }
 
 test_records_eidolon_wall_clock_timeout_without_in_place_retry() {
@@ -269,10 +297,11 @@ JS
   chmod +x "$fake_pwnkit"
 
   output="$(
-    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+      EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
       EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
       EIDOLON_M3_PWNKIT_MAX_ATTEMPTS=2 \
-      EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=1 \
+      EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=2 \
+      EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS=1 \
       FIXTURE_ATTEMPT_FILE="$attempt_file" \
       PWNKIT_BIN="$fake_pwnkit" \
       "$RUNNER" eidolon "$artifact" 2>&1
@@ -282,7 +311,9 @@ JS
   [[ "$(cat "$attempt_file")" == "1" ]]
   [[ ! -e "$artifact/private/pwnkit-eidolon-attempt-1" ]]
   [[ "$(sqlite3 "$artifact/pwnkit-eidolon.db" "select count(*) from pipeline_events where eventType = 'agent_error';")" == "1" ]]
-  rg -q 'wall-clock timeout 1s' "$artifact/pwnkit-eidolon.stderr.log"
+  rg -q 'wall-clock timeout 2s' "$artifact/pwnkit-eidolon.stderr.log"
+  rg -q 'm3 pwnkit heartbeat label=eidolon attempt=1 status=running' <<<"$output"
+  rg -q 'm3 pwnkit heartbeat label=eidolon attempt=1 status=timeout' <<<"$output"
   rg -q 'pwnkit eidolon exited 124 without a valid report' <<<"$output"
 }
 
@@ -480,6 +511,91 @@ JS
   kill "$pwnkit_pid" >/dev/null 2>&1 || true
   wait "$runner_pid" >/dev/null 2>&1 || status="$?"
   [[ "$status" -ne 0 ]]
+}
+
+test_emits_sanitized_heartbeat_while_scan_is_running() {
+  local artifact
+  local auth_file
+  local access_token
+  local fake_pwnkit
+  local heartbeat_lines
+  local heartbeat_seen=0
+  local ready_file
+  local runner_pid
+  local runner_stdout
+  local runner_stderr
+  local status=0
+  artifact="$(new_temp_dir)"
+  auth_file="$artifact/codex-auth.json"
+  fake_pwnkit="$artifact/fake-pwnkit.js"
+  ready_file="$artifact/pwnkit-ready.pid"
+  runner_stdout="$artifact/runner.stdout"
+  runner_stderr="$artifact/runner.stderr"
+  access_token="$(make_access_token "$(( $(date -u '+%s') + 3600 ))")"
+
+  cat > "$fake_pwnkit" <<'JS'
+#!/usr/bin/env node
+const fs = require('fs');
+fs.writeFileSync(process.env.FIXTURE_READY_FILE, `${process.pid}\n`);
+console.error(`fixture-child-detail ${process.env.PWNKIT_CHATGPT_ACCESS_TOKEN}`);
+console.error(`fixture-child-detail ${process.env.PWNKIT_CHATGPT_ACCOUNT_ID}`);
+console.error(`fixture-child-detail fixture-refresh-token ${process.env.FIXTURE_PRIVATE_PATH}`);
+setTimeout(() => {
+  process.stdout.write('{"findings":[]}\n');
+}, 3000);
+JS
+  chmod +x "$fake_pwnkit"
+
+  jq -n \
+    --arg access_token "$access_token" \
+    --arg account_id "fixture-account-id" \
+    '{tokens: {
+      access_token: $access_token,
+      account_id: $account_id
+    }}' > "$auth_file"
+
+  env \
+    -u PWNKIT_CHATGPT_ACCESS_TOKEN \
+    -u PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    EIDOLON_M3_CODEX_AUTH_FILE="$auth_file" \
+    EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS=1 \
+    EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=30 \
+    FIXTURE_PRIVATE_PATH="$artifact" \
+    FIXTURE_READY_FILE="$ready_file" \
+    PWNKIT_CHATGPT_ACCOUNT_ID=stale-account-id \
+    PWNKIT_BIN="$fake_pwnkit" \
+    "$RUNNER" direct "$artifact" >"$runner_stdout" 2>"$runner_stderr" &
+  runner_pid="$!"
+
+  for _ in {1..80}; do
+    if rg -q 'm3 pwnkit heartbeat label=direct attempt=1 status=running' "$runner_stderr"; then
+      if kill -0 "$runner_pid" >/dev/null 2>&1; then
+        heartbeat_seen=1
+      fi
+      break
+    fi
+    if ! kill -0 "$runner_pid" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  wait "$runner_pid" || status="$?"
+  [[ "$status" -eq 0 ]]
+  [[ "$heartbeat_seen" -eq 1 ]]
+  jq -e '.findings == []' "$artifact/pwnkit-direct.json" >/dev/null
+
+  heartbeat_lines="$(rg 'm3 pwnkit heartbeat' "$runner_stderr" || true)"
+  rg -q 'status=started' <<<"$heartbeat_lines"
+  rg -q 'status=running' <<<"$heartbeat_lines"
+  rg -q 'status=finished' <<<"$heartbeat_lines"
+  ! rg -q --fixed-strings "$access_token" <<<"$heartbeat_lines"
+  ! rg -q 'fixture-account-id' <<<"$heartbeat_lines"
+  ! rg -q 'stale-account-id' <<<"$heartbeat_lines"
+  ! rg -q 'fixture-refresh-token' <<<"$heartbeat_lines"
+  ! rg -q --fixed-strings "$artifact" <<<"$heartbeat_lines"
 }
 
 test_auto_loads_codex_refresh_token_from_auth_file_without_usable_access_token() {
@@ -884,10 +1000,12 @@ test_source_checkout_metadata_records_origin_drift
 test_source_checkout_metadata_records_pinned_fixture_id
 test_rejects_unsafe_pinned_fixture_id
 test_rejects_invalid_pwnkit_timeout_seconds
+test_rejects_invalid_pwnkit_heartbeat_seconds
 test_source_checkout_metadata_records_dirty_worktree
 test_preflight_writes_metadata_and_scopes_without_scan
 test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret
 test_auto_loaded_codex_access_token_stays_out_of_process_args
+test_emits_sanitized_heartbeat_while_scan_is_running
 test_auto_loads_codex_refresh_token_from_auth_file_without_usable_access_token
 test_retries_direct_wall_clock_timeout_attempt
 test_records_eidolon_wall_clock_timeout_without_in_place_retry
