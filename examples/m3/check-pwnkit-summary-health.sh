@@ -8,8 +8,9 @@ usage() {
   cat <<'USAGE'
 Usage: examples/m3/check-pwnkit-summary-health.sh <pwnkit-summary.json>
 
-Fails closed when an M3 pwnkit summary contains pwnkit agent_error events.
-The check prints only sanitized counts and coarse error classes.
+Fails closed when an M3 pwnkit summary is missing required pwnkit leg
+artifacts or contains pwnkit agent_error events. The check prints only
+sanitized counts and coarse error classes.
 
 Environment:
   EIDOLON_M3_ALLOW_AGENT_ERRORS  If true, allow agent-error summaries to pass.
@@ -53,8 +54,25 @@ fi
 
 require_command jq
 
-if truthy "$EIDOLON_M3_ALLOW_AGENT_ERRORS"; then
-  exit 0
+missing_artifact_legs="$(
+  jq -r '
+    [
+      (.runs.direct.artifact_status // "missing") as $direct
+      | select($direct != "present")
+      | "direct=" + $direct,
+      (.runs.eidolon.artifact_status // "missing") as $eidolon
+      | select($eidolon != "present")
+      | "eidolon=" + $eidolon
+    ]
+    | join(",")
+  ' "$SUMMARY_FILE"
+)"
+
+if [[ -n "$missing_artifact_legs" ]]; then
+  echo "error: pwnkit summary is missing required leg artifacts in $SUMMARY_FILE" >&2
+  echo "       rerun the sample; interrupted or partial runs are diagnostic only." >&2
+  echo "       missing_artifacts=$missing_artifact_legs" >&2
+  exit 1
 fi
 
 agent_error_count="$(
@@ -68,6 +86,10 @@ agent_error_count="$(
 )"
 
 if [[ "$agent_error_count" -eq 0 ]]; then
+  exit 0
+fi
+
+if truthy "$EIDOLON_M3_ALLOW_AGENT_ERRORS"; then
   exit 0
 fi
 

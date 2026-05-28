@@ -16,6 +16,8 @@ test_help_mentions_vm_contract() {
   "$RUNNER" --help | rg -q 'same_vm_loopback'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_KALI_VM_DRY_RUN'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_KALI_VM_PREFLIGHT'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_MAX_ATTEMPTS'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID'
 }
 
@@ -60,6 +62,8 @@ test_dry_run_records_vm_local_contract() {
   rg -q '^run_count=2$' "$sample_dir/sample-plan.txt"
   rg -q '^runner_environment=kali_vm$' "$sample_dir/sample-plan.txt"
   rg -q '^network_topology=same_vm_loopback$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_max_attempts=3$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_timeout_seconds=1800$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_fixture_id=pwnkit-v0\.12\.0-private$' "$sample_dir/sample-plan.txt"
 }
 
@@ -83,6 +87,8 @@ test_preflight_writes_runner_metadata() {
     .mode == "preflight"
     and .environment.runner_environment == "kali_vm"
     and .environment.network_topology == "same_vm_loopback"
+    and .pwnkit.max_attempts == 3
+    and .pwnkit.timeout_seconds == 1800
     and .pwnkit.command_source == "PWNKIT_BIN"
     and .pwnkit.fixture == {
       id: "pwnkit-v0.12.0-private",
