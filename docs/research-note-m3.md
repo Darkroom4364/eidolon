@@ -172,7 +172,9 @@ Current pwnkit did save Eidolon-side findings in its DB, but the sample's final
 JSON output did not promote those findings. The final JSON counts still drive
 the differential-finding claim, so the current M3 evidence supports the stronger
 same-session containment claim but not a final-output positive-differential
-finding claim.
+finding claim. The companion investigation note
+`docs/m3-pwnkit-finding-export-investigation.md` traces this to current pwnkit
+dropping discovery-stage findings from final JSON before report emission.
 
 The scripted action-trace artifact supports the M3 containment mechanics claim:
 when the harness replays each class-specific marker in the same session,
@@ -198,13 +200,13 @@ M3 does not yet claim:
 
 The immediate correlation gap is closed and the minimum three-run current-pwnkit
 stability gate now passes on post-merge mainline code. The next evidence target
-is a broader or periodic sample across later pwnkit heads, plus a separate
-investigation of why the fresh current-pwnkit runs save Eidolon-side findings in
-the DB but still produce no final JSON differential findings despite stable bait
-interaction and containment. A separate operational note from these reruns:
-local refresh-token auth can fail after rotation, while forwarding the current
-Codex access token allowed the runs to complete. Current pwnkit also honors
-`429 Retry-After` with a conservative floor, so post-containment runs can take
+is a broader or periodic sample across later pwnkit heads. The final JSON
+finding gap is documented in `docs/m3-pwnkit-finding-export-investigation.md`;
+future patched-pwnkit evidence should be labeled separately from upstream-current
+pwnkit evidence. A separate operational note from these reruns: local
+refresh-token auth can fail after rotation, while forwarding the current Codex
+access token allowed the runs to complete. Current pwnkit also honors `429
+Retry-After` with a conservative floor, so post-containment runs can take
 substantially longer as the seeded worklist grows.
 
 Use `examples/m3/run-pwnkit-sample.sh` for future repeated current-pwnkit
