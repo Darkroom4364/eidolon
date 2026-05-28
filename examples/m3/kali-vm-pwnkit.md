@@ -20,6 +20,9 @@ regular `run-pwnkit-sample.sh` path for host-mac diagnostics.
 - Do not pass Eidolon source paths, artifact paths, bait marker values, or prior
   M3 reports to pwnkit.
 - Package and redact artifacts before moving them into the repo.
+- Use the Kali wrapper defaults of three attempts per sample run and an 1800s
+  pwnkit scan-leg timeout unless you are intentionally collecting shorter
+  diagnostics.
 
 The wrapper enforces the environment labels, loopback URLs, positive run count,
 and repo-external sample directory. It delegates execution to
@@ -99,6 +102,11 @@ PWNKIT_NODE_ENTRY="$HOME/Projects/pwnkit/dist/pwnkit.js" \
 EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
   examples/m3/run-pwnkit-kali-vm.sh 3 /tmp/eidolon-m3-pwnkit-kali-vm
 ```
+
+The Kali wrapper defaults to `EIDOLON_M3_PWNKIT_MAX_ATTEMPTS=3` and
+`EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=1800`. Those defaults are longer than the
+host diagnostics runner because current pwnkit Codex scans in a Kali tool
+environment regularly outlive the host quick-run budget.
 
 The wrapper starts `eidolon-demo-target`, starts a fresh `eidolon-proxy` for
 each run, runs direct and Eidolon pwnkit legs, collects per-run summaries, and
