@@ -14,6 +14,7 @@ PWNKIT_RUNTIME="${PWNKIT_RUNTIME:-codex}"
 PWNKIT_RATE_LIMIT="${PWNKIT_RATE_LIMIT:-2}"
 EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="${EIDOLON_M3_PWNKIT_MAX_ATTEMPTS:-2}"
 EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS="${EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS:-900}"
+EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS="${EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS:-60}"
 PWNKIT_FEATURE_CODEX_LIVE_TARGETS="${PWNKIT_FEATURE_CODEX_LIVE_TARGETS:-}"
 EIDOLON_M3_CODEX_AUTH_FILE="${EIDOLON_M3_CODEX_AUTH_FILE:-$HOME/.codex/auth.json}"
 EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-0}"
@@ -48,6 +49,9 @@ Environment:
   EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS
                             Wall-clock timeout for each pwnkit scan leg.
                             Defaults to 900 seconds.
+  EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS
+                            Emit sanitized runner progress every N seconds
+                            while pwnkit runs. Defaults to 60 seconds.
   PWNKIT_FEATURE_CODEX_LIVE_TARGETS
                             Optional legacy pwnkit feature flag. Not set by
                             default; current pwnkit Codex live scans use the
@@ -574,6 +578,7 @@ write_runner_metadata() {
     --arg pwnkit_rate_limit "$PWNKIT_RATE_LIMIT" \
     --argjson pwnkit_max_attempts "$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
     --argjson pwnkit_timeout_seconds "$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
+    --argjson pwnkit_heartbeat_seconds "$EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS" \
     --arg pwnkit_feature_codex_live_targets "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" \
     --arg pwnkit_command "$pwnkit_command_quoted" \
     --arg pwnkit_command_source "${PWNKIT_COMMAND_SOURCE:-unknown}" \
@@ -639,6 +644,7 @@ write_runner_metadata() {
         rate_limit: $pwnkit_rate_limit,
         max_attempts: $pwnkit_max_attempts,
         timeout_seconds: $pwnkit_timeout_seconds,
+        heartbeat_seconds: $pwnkit_heartbeat_seconds,
         feature_codex_live_targets: (
           if $pwnkit_feature_codex_live_targets == "" then null
           else $pwnkit_feature_codex_live_targets
@@ -888,45 +894,59 @@ run_command_with_timeout() {
   local timeout_seconds="$1"
   local output_stdout="$2"
   local output_stderr="$3"
-  shift 3
-
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$timeout_seconds" "$@" > "$output_stdout" 2> "$output_stderr"
-    local status="$?"
-    if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
-      return 124
-    fi
-    return "$status"
-  fi
+  local label="$4"
+  local attempt="$5"
+  shift 5
 
   local timeout_marker="$output_stderr.timeout"
   local command_pid
-  local watcher_pid
+  local timeout_watcher_pid
+  local heartbeat_watcher_pid
+  local start_seconds
+  local elapsed_seconds
   local status
 
   rm -f "$timeout_marker"
+  start_seconds="$(date -u '+%s')"
+  echo "m3 pwnkit heartbeat label=$label attempt=$attempt status=started timeout_seconds=$timeout_seconds heartbeat_seconds=$EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS" >&2
   "$@" > "$output_stdout" 2> "$output_stderr" &
   command_pid="$!"
   (
     sleep "$timeout_seconds"
     if kill -0 "$command_pid" >/dev/null 2>&1; then
       : > "$timeout_marker"
+      echo "m3 pwnkit heartbeat label=$label attempt=$attempt status=timeout elapsed_seconds=$timeout_seconds timeout_seconds=$timeout_seconds" >&2
       kill "$command_pid" >/dev/null 2>&1 || true
       sleep 2
       kill -KILL "$command_pid" >/dev/null 2>&1 || true
     fi
   ) &
-  watcher_pid="$!"
+  timeout_watcher_pid="$!"
+  (
+    while :; do
+      sleep "$EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS"
+      if ! kill -0 "$command_pid" >/dev/null 2>&1; then
+        exit 0
+      fi
+      elapsed_seconds=$(( $(date -u '+%s') - start_seconds ))
+      echo "m3 pwnkit heartbeat label=$label attempt=$attempt status=running elapsed_seconds=$elapsed_seconds timeout_seconds=$timeout_seconds" >&2
+    done
+  ) &
+  heartbeat_watcher_pid="$!"
 
   wait "$command_pid" 2>/dev/null
   status="$?"
-  kill "$watcher_pid" >/dev/null 2>&1 || true
-  wait "$watcher_pid" >/dev/null 2>&1 || true
+  kill "$timeout_watcher_pid" >/dev/null 2>&1 || true
+  kill "$heartbeat_watcher_pid" >/dev/null 2>&1 || true
+  wait "$timeout_watcher_pid" >/dev/null 2>&1 || true
+  wait "$heartbeat_watcher_pid" >/dev/null 2>&1 || true
 
   if [[ -f "$timeout_marker" ]]; then
     status=124
   fi
   rm -f "$timeout_marker"
+  elapsed_seconds=$(( $(date -u '+%s') - start_seconds ))
+  echo "m3 pwnkit heartbeat label=$label attempt=$attempt status=finished elapsed_seconds=$elapsed_seconds exit_code=$status" >&2
   return "$status"
 }
 
@@ -1028,6 +1048,8 @@ run_scan() {
         "$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
         "$output_stdout" \
         "$output_stderr" \
+        "$label" \
+        "$attempt" \
         "${PWNKIT_COMMAND[@]}" "${scan_args[@]}"
     )
     exit_code=$?
@@ -1115,6 +1137,9 @@ main() {
   require_positive_integer \
     "EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
     "$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS"
+  require_positive_integer \
+    "EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS" \
+    "$EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS"
   validate_fixture_id
   mkdir -p "$ARTIFACT_DIR"
   printf '%s\n' "$ARTIFACT_DIR" > "$ARTIFACT_DIR/artifact-dir.txt"

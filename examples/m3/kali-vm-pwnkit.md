@@ -107,6 +107,9 @@ The Kali wrapper defaults to `EIDOLON_M3_PWNKIT_MAX_ATTEMPTS=3` and
 `EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS=1800`. Those defaults are longer than the
 host diagnostics runner because current pwnkit Codex scans in a Kali tool
 environment regularly outlive the host quick-run budget.
+The delegated pwnkit runner emits sanitized heartbeat lines while each scan leg
+runs. Override `EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS` only when intentionally
+collecting more or less verbose operator progress.
 
 The wrapper starts `eidolon-demo-target`, starts a fresh `eidolon-proxy` for
 each run, runs direct and Eidolon pwnkit legs, collects per-run summaries, and
