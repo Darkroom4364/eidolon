@@ -66,6 +66,7 @@ test_dry_run_creates_private_layout() {
   rg -q '^runner_environment=auto$' "$sample_dir/sample-plan.txt"
   rg -q '^network_topology=same_host_loopback$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_fixture_id=none$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_evidence_track=auto$' "$sample_dir/sample-plan.txt"
   rg -q '^debug_log=run-\*/private/eidolon-debug\.jsonl$' "$sample_dir/sample-plan.txt"
 }
 
@@ -149,9 +150,11 @@ test_dry_run_records_pwnkit_fixture_id() {
 
   EIDOLON_M3_SAMPLE_DRY_RUN=1 \
     EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
+    EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit \
     "$RUNNER" 1 "$sample_dir" >/dev/null
 
   rg -q '^pwnkit_fixture_id=pwnkit-v0\.12\.0-private$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_evidence_track=local_patched_pwnkit$' "$sample_dir/sample-plan.txt"
 }
 
 test_dry_run_records_bait_profile() {

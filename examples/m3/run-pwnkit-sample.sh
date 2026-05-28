@@ -185,6 +185,7 @@ write_dry_run_plan() {
     printf 'runner_environment=%s\n' "$EIDOLON_M3_RUNNER_ENVIRONMENT"
     printf 'network_topology=%s\n' "$EIDOLON_M3_NETWORK_TOPOLOGY"
     printf 'pwnkit_fixture_id=%s\n' "${EIDOLON_M3_PWNKIT_FIXTURE_ID:-none}"
+    printf 'pwnkit_evidence_track=%s\n' "${EIDOLON_M3_PWNKIT_EVIDENCE_TRACK:-auto}"
     printf 'debug_log=run-*/private/eidolon-debug.jsonl\n'
     printf 'sample_summary=pwnkit-stability-sample.json\n'
   } > "$plan_file"
