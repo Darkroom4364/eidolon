@@ -50,6 +50,15 @@ export EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private
 ```
 
 Pinned fixtures must still be clean git checkouts with a recorded git head.
+When validating a local pwnkit patch rather than upstream current behavior, set
+the evidence track explicitly:
+
+```sh
+export EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit
+```
+
+The Kali wrapper fails closed if `local_patched_pwnkit` is set without a
+fixture id, or if `upstream_current` is set while a fixture id is also present.
 
 ## Dry Run
 
@@ -78,6 +87,7 @@ cd ~/Projects/eidolon
 
 PWNKIT_NODE_ENTRY="$HOME/Projects/pwnkit/dist/pwnkit.js" \
 EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
+EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit \
   examples/m3/run-pwnkit-kali-vm.sh --preflight 3 /tmp/eidolon-m3-pwnkit-kali-vm
 ```
 
@@ -100,6 +110,7 @@ cd ~/Projects/eidolon
 
 PWNKIT_NODE_ENTRY="$HOME/Projects/pwnkit/dist/pwnkit.js" \
 EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
+EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit \
   examples/m3/run-pwnkit-kali-vm.sh 3 /tmp/eidolon-m3-pwnkit-kali-vm
 ```
 

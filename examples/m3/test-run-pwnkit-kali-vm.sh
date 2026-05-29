@@ -19,6 +19,7 @@ test_help_mentions_vm_contract() {
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_MAX_ATTEMPTS'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID'
+  "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_EVIDENCE_TRACK'
 }
 
 test_rejects_non_kali_without_override() {
@@ -56,6 +57,7 @@ test_dry_run_records_vm_local_contract() {
   EIDOLON_M3_ALLOW_NON_KALI_VM=1 \
     EIDOLON_M3_KALI_VM_DRY_RUN=1 \
     EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
+    EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit \
     "$RUNNER" 2 "$sample_dir" >/dev/null
 
   [[ -f "$sample_dir/sample-plan.txt" ]]
@@ -65,6 +67,7 @@ test_dry_run_records_vm_local_contract() {
   rg -q '^pwnkit_max_attempts=3$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_timeout_seconds=1800$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_fixture_id=pwnkit-v0\.12\.0-private$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_evidence_track=local_patched_pwnkit$' "$sample_dir/sample-plan.txt"
 }
 
 test_preflight_writes_runner_metadata() {
@@ -77,6 +80,7 @@ test_preflight_writes_runner_metadata() {
       EIDOLON_M3_KALI_VM_DRY_RUN=1 \
       EIDOLON_M3_PIN_SESSION=0 \
       EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
+      EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit \
       PWNKIT_BIN=true \
       "$RUNNER" --preflight 2 "$sample_dir" 2>&1
   )"
@@ -94,6 +98,7 @@ test_preflight_writes_runner_metadata() {
       id: "pwnkit-v0.12.0-private",
       pinned: true
     }
+    and .pwnkit.evidence_track == "local_patched_pwnkit"
   ' "$sample_dir/private/kali-vm-preflight/pwnkit-runner-metadata.json" >/dev/null
 }
 
@@ -126,6 +131,37 @@ test_rejects_non_vm_topology() {
 
   [[ "$status" -eq 2 ]]
   rg -q 'EIDOLON_M3_NETWORK_TOPOLOGY must be same_vm_loopback' <<<"$output"
+}
+
+test_rejects_local_patched_track_without_fixture_id() {
+  local output
+  local status=0
+
+  output="$(
+    EIDOLON_M3_ALLOW_NON_KALI_VM=1 \
+      EIDOLON_M3_KALI_VM_DRY_RUN=1 \
+      EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit \
+      "$RUNNER" 1 "$(new_temp_dir)" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID is required' <<<"$output"
+}
+
+test_rejects_upstream_current_track_with_fixture_id() {
+  local output
+  local status=0
+
+  output="$(
+    EIDOLON_M3_ALLOW_NON_KALI_VM=1 \
+      EIDOLON_M3_KALI_VM_DRY_RUN=1 \
+      EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=upstream_current \
+      EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
+      "$RUNNER" 1 "$(new_temp_dir)" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID must be unset' <<<"$output"
 }
 
 test_rejects_userinfo_loopback_smuggling() {
@@ -182,6 +218,8 @@ test_dry_run_records_vm_local_contract
 test_preflight_writes_runner_metadata
 test_preflight_requires_pwnkit_runner
 test_rejects_non_vm_topology
+test_rejects_local_patched_track_without_fixture_id
+test_rejects_upstream_current_track_with_fixture_id
 test_rejects_userinfo_loopback_smuggling
 test_rejects_repo_local_sample_dir
 test_rejects_symlinked_repo_local_sample_dir
