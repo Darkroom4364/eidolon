@@ -222,6 +222,7 @@ write_variant_sample() {
         rate_limit: "2",
         command: "node /tmp/pwnkit/dist/pwnkit.js",
         entry_path: "/tmp/pwnkit/dist/pwnkit.js",
+        source_dir: "/tmp/pwnkit",
         command_source: "fixture",
         package_version: "0.11.1",
         git_head: "abc123",
@@ -453,6 +454,7 @@ test_packager_redacts_matrix_and_variant_artifacts() {
 
   jq -e '
     .source_artifact_dir == "<source-artifact-path-omitted>"
+    and (.runner.pwnkit | has("source_dir") | not)
     and (.runner.pwnkit.scopes.eidolon | has("path") | not)
     and (.runner.pwnkit.scopes.direct | has("path") | not)
     and .comparison.correlated_bait_matrix[0].surfaces == ["/openapi.json"]

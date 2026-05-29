@@ -129,11 +129,21 @@ examples/m3/pwnkit-codex.sh all "$ART"
 examples/m3/collect-pwnkit-codex.sh "$ART" > "$ART/pwnkit-summary.json"
 ```
 
-For source checkouts of pwnkit, set `PWNKIT_NODE_ENTRY` if the built CLI is not
-at `~/Projects/pwnkit/dist/pwnkit.js`:
+The runner defaults to a local pwnkit source checkout at `~/Projects/pwnkit` and
+invokes `dist/pwnkit.js` from that checkout. It intentionally does not fall back
+to globally installed or package-manager pwnkit binaries. Rebuild after every
+pwnkit checkout change:
 
 ```sh
-PWNKIT_NODE_ENTRY=/path/to/pwnkit/dist/pwnkit.js examples/m3/pwnkit-codex.sh all "$ART"
+(cd ~/Projects/pwnkit && pnpm run build)
+examples/m3/pwnkit-codex.sh all "$ART"
+```
+
+Set `PWNKIT_SOURCE_DIR` when the local checkout lives elsewhere, or
+`PWNKIT_NODE_ENTRY` for an explicit built entrypoint:
+
+```sh
+PWNKIT_SOURCE_DIR=/path/to/pwnkit examples/m3/pwnkit-codex.sh all "$ART"
 ```
 
 The runner generates one pwnkit `--scope` file per scan leg:

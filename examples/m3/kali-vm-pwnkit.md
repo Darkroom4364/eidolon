@@ -41,9 +41,14 @@ pnpm install
 pnpm run build
 ```
 
-Keep the pwnkit checkout local to the VM. If the public upstream is no longer
-available, treat the local checkout as a pinned fixture instead of claiming
-moving-main behavior. Use a short non-secret fixture label, for example:
+Keep the pwnkit checkout local to the VM. The wrapper defaults to
+`PWNKIT_SOURCE_DIR=~/Projects/pwnkit` and invokes
+`$PWNKIT_SOURCE_DIR/dist/pwnkit.js`; it does not use globally installed pwnkit
+packages. Set `PWNKIT_SOURCE_DIR` only if the checkout lives elsewhere.
+
+If the public upstream is no longer available, treat the local checkout as a
+pinned fixture instead of claiming moving-main behavior. Use a short non-secret
+fixture label, for example:
 
 ```sh
 export EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private
@@ -66,7 +71,6 @@ fixture id, or if `upstream_current` is set while a fixture id is also present.
 cd ~/Projects/eidolon
 
 EIDOLON_M3_KALI_VM_DRY_RUN=1 \
-PWNKIT_NODE_ENTRY="$HOME/Projects/pwnkit/dist/pwnkit.js" \
   examples/m3/run-pwnkit-kali-vm.sh 3 /tmp/eidolon-m3-pwnkit-kali-vm
 ```
 
@@ -85,7 +89,6 @@ full sample:
 ```sh
 cd ~/Projects/eidolon
 
-PWNKIT_NODE_ENTRY="$HOME/Projects/pwnkit/dist/pwnkit.js" \
 EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
 EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit \
   examples/m3/run-pwnkit-kali-vm.sh --preflight 3 /tmp/eidolon-m3-pwnkit-kali-vm
@@ -108,7 +111,6 @@ demo target, proxy, or pwnkit scans.
 ```sh
 cd ~/Projects/eidolon
 
-PWNKIT_NODE_ENTRY="$HOME/Projects/pwnkit/dist/pwnkit.js" \
 EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
 EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit \
   examples/m3/run-pwnkit-kali-vm.sh 3 /tmp/eidolon-m3-pwnkit-kali-vm

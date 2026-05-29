@@ -27,7 +27,10 @@ Environment:
   EIDOLON_M3_ALLOW_AGENT_ERRORS  Passed through to run-pwnkit-sample.sh.
   EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE
                                   Passed through to run-pwnkit-sample.sh.
-  PWNKIT_NODE_ENTRY/PWNKIT_BIN   Passed through to pwnkit-codex.sh.
+  PWNKIT_SOURCE_DIR              Passed through to run-pwnkit-sample.sh.
+                                  Defaults to ~/Projects/pwnkit.
+  PWNKIT_NODE_ENTRY/PWNKIT_BIN   Explicit pwnkit runner overrides passed
+                                  through for diagnostics.
 
 Use only against the owned loopback Lab target. Sync and rebuild pwnkit before
 running when using a source checkout.

@@ -18,6 +18,7 @@ EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-}"
 EIDOLON_M3_PWNKIT_EVIDENCE_TRACK="${EIDOLON_M3_PWNKIT_EVIDENCE_TRACK:-}"
 EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="${EIDOLON_M3_PWNKIT_MAX_ATTEMPTS:-3}"
 EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS="${EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS:-1800}"
+PWNKIT_SOURCE_DIR="${PWNKIT_SOURCE_DIR-$HOME/Projects/pwnkit}"
 
 usage() {
   cat <<'USAGE'
@@ -52,7 +53,10 @@ Environment:
                                For Kali evidence, local_patched_pwnkit requires
                                EIDOLON_M3_PWNKIT_FIXTURE_ID; upstream_current
                                must leave the fixture id unset.
-  PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to run-pwnkit-sample.sh.
+  PWNKIT_SOURCE_DIR            Local pwnkit source checkout. Defaults to
+                               ~/Projects/pwnkit.
+  PWNKIT_NODE_ENTRY/PWNKIT_BIN Explicit pwnkit runner overrides passed through
+                               to run-pwnkit-sample.sh for diagnostics.
 
 The wrapper forces the evidence labels:
   EIDOLON_M3_RUNNER_ENVIRONMENT=kali_vm
@@ -175,16 +179,18 @@ require_pwnkit_runner_available() {
     return
   fi
 
-  if [[ -f "$HOME/Projects/pwnkit/dist/pwnkit.js" ]]; then
+  if [[ -n "$PWNKIT_SOURCE_DIR" ]]; then
+    if [[ ! -d "$PWNKIT_SOURCE_DIR" ]]; then
+      fail "PWNKIT_SOURCE_DIR does not exist: $PWNKIT_SOURCE_DIR"
+    fi
+    if [[ ! -f "$PWNKIT_SOURCE_DIR/dist/pwnkit.js" ]]; then
+      fail "local pwnkit source checkout is not built: $PWNKIT_SOURCE_DIR/dist/pwnkit.js; run: (cd \"$PWNKIT_SOURCE_DIR\" && pnpm run build)"
+    fi
     require_command node
     return
   fi
 
-  if command -v pwnkit >/dev/null 2>&1 || command -v pwnkit-cli >/dev/null 2>&1; then
-    return
-  fi
-
-  fail "could not find pwnkit; set PWNKIT_NODE_ENTRY or PWNKIT_BIN"
+  fail "could not find local pwnkit source checkout; set PWNKIT_SOURCE_DIR or set PWNKIT_NODE_ENTRY/PWNKIT_BIN explicitly"
 }
 
 canonicalize_path_allow_missing() {
@@ -284,6 +290,7 @@ main() {
   export EIDOLON_M3_PWNKIT_EVIDENCE_TRACK
   export EIDOLON_M3_PWNKIT_MAX_ATTEMPTS
   export EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS
+  export PWNKIT_SOURCE_DIR
 
   if truthy "$EIDOLON_M3_KALI_VM_DRY_RUN"; then
     export EIDOLON_M3_SAMPLE_DRY_RUN=1

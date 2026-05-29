@@ -12,6 +12,7 @@ PWNKIT_DEPTH="${PWNKIT_DEPTH:-quick}"
 PWNKIT_MODE="${PWNKIT_MODE:-web}"
 PWNKIT_RUNTIME="${PWNKIT_RUNTIME:-codex}"
 PWNKIT_RATE_LIMIT="${PWNKIT_RATE_LIMIT:-2}"
+PWNKIT_SOURCE_DIR="${PWNKIT_SOURCE_DIR-$HOME/Projects/pwnkit}"
 EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="${EIDOLON_M3_PWNKIT_MAX_ATTEMPTS:-2}"
 EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS="${EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS:-900}"
 EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS="${EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS:-60}"
@@ -37,8 +38,14 @@ Environment:
   EIDOLON_LAB_TARGET_URL    Direct demo target URL. Defaults to http://127.0.0.1:9001.
   EIDOLON_LAB_PROXY_URL     Eidolon proxy URL. Defaults to http://127.0.0.1:8080.
   EIDOLON_M3_ARTIFACT_DIR   Artifact directory if [artifact-dir] is omitted.
-  PWNKIT_NODE_ENTRY         Path to a built pwnkit dist/pwnkit.js entrypoint.
-  PWNKIT_BIN                pwnkit command name when PWNKIT_NODE_ENTRY is unset.
+  PWNKIT_SOURCE_DIR         Local pwnkit source checkout. Defaults to
+                            ~/Projects/pwnkit. The runner invokes
+                            $PWNKIT_SOURCE_DIR/dist/pwnkit.js and does not
+                            fall back to globally installed pwnkit packages.
+  PWNKIT_NODE_ENTRY         Explicit path to a built pwnkit dist/pwnkit.js
+                            entrypoint. Overrides PWNKIT_SOURCE_DIR.
+  PWNKIT_BIN                Explicit pwnkit command override for tests or
+                            diagnostics. Overrides PWNKIT_SOURCE_DIR.
   PWNKIT_DEPTH              pwnkit depth. Defaults to quick.
   PWNKIT_MODE               pwnkit mode. Defaults to web.
   PWNKIT_RUNTIME            pwnkit runtime. Defaults to codex.
@@ -93,9 +100,12 @@ The runner writes one pwnkit scope file per scan leg and always passes
 pinned-session Eidolon leg and fails closed if a leg target falls outside the
 generated loopback scope.
 
-For source checkouts, either set PWNKIT_NODE_ENTRY or keep a built checkout at
-~/Projects/pwnkit/dist/pwnkit.js. This runner refuses obviously stale ignored
-dist bundles unless EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1 is set.
+For source checkouts, keep a built checkout at PWNKIT_SOURCE_DIR, or set
+PWNKIT_NODE_ENTRY to a specific built dist/pwnkit.js. This runner refuses
+obviously stale ignored dist bundles unless EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1
+is set. Current pwnkit bundles also enforce their own build-commit freshness;
+rebuild with `(cd "$PWNKIT_SOURCE_DIR" && pnpm run build)` after changing the
+checkout.
 
 Some pwnkit builds exit nonzero after writing a valid JSON report with findings.
 This runner keeps those reports and continues; missing or invalid reports remain
@@ -111,6 +121,8 @@ USAGE
 }
 
 resolve_pwnkit_command() {
+  local source_entry
+
   if [[ -n "${PWNKIT_NODE_ENTRY:-}" ]]; then
     if [[ ! -f "$PWNKIT_NODE_ENTRY" ]]; then
       echo "error: PWNKIT_NODE_ENTRY does not exist: $PWNKIT_NODE_ENTRY" >&2
@@ -131,25 +143,25 @@ resolve_pwnkit_command() {
     return
   fi
 
-  if [[ -f "$HOME/Projects/pwnkit/dist/pwnkit.js" ]]; then
-    validate_pwnkit_node_entry "$HOME/Projects/pwnkit/dist/pwnkit.js"
-    set_pwnkit_node_command "$HOME/Projects/pwnkit/dist/pwnkit.js" "default_source_checkout"
+  if [[ -n "$PWNKIT_SOURCE_DIR" ]]; then
+    source_entry="$PWNKIT_SOURCE_DIR/dist/pwnkit.js"
+    if [[ ! -d "$PWNKIT_SOURCE_DIR" ]]; then
+      echo "error: PWNKIT_SOURCE_DIR does not exist: $PWNKIT_SOURCE_DIR" >&2
+      echo "       set PWNKIT_SOURCE_DIR to the local pwnkit checkout or set PWNKIT_NODE_ENTRY/PWNKIT_BIN explicitly" >&2
+      exit 2
+    fi
+    if [[ ! -f "$source_entry" ]]; then
+      echo "error: local pwnkit source checkout is not built: $source_entry" >&2
+      echo "       run: (cd \"$PWNKIT_SOURCE_DIR\" && pnpm run build)" >&2
+      echo "       or set PWNKIT_NODE_ENTRY/PWNKIT_BIN explicitly for diagnostics." >&2
+      exit 2
+    fi
+    validate_pwnkit_node_entry "$source_entry"
+    set_pwnkit_node_command "$source_entry" "PWNKIT_SOURCE_DIR"
     return
   fi
 
-  if command -v pwnkit >/dev/null 2>&1; then
-    PWNKIT_COMMAND=(pwnkit)
-    PWNKIT_COMMAND_SOURCE="PATH:pwnkit"
-    return
-  fi
-
-  if command -v pwnkit-cli >/dev/null 2>&1; then
-    PWNKIT_COMMAND=(pwnkit-cli)
-    PWNKIT_COMMAND_SOURCE="PATH:pwnkit-cli"
-    return
-  fi
-
-  echo "error: could not find pwnkit; set PWNKIT_NODE_ENTRY or PWNKIT_BIN" >&2
+  echo "error: could not find local pwnkit source checkout; set PWNKIT_SOURCE_DIR or set PWNKIT_NODE_ENTRY/PWNKIT_BIN explicitly" >&2
   exit 2
 }
 
@@ -603,6 +615,7 @@ write_runner_metadata() {
     --arg pwnkit_feature_codex_live_targets "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" \
     --arg pwnkit_command "$pwnkit_command_quoted" \
     --arg pwnkit_command_source "${PWNKIT_COMMAND_SOURCE:-unknown}" \
+    --arg pwnkit_source_dir "$PWNKIT_SOURCE_DIR" \
     --arg pwnkit_entry_path "${PWNKIT_ENTRY_PATH:-}" \
     --arg pwnkit_entry_mtime "$pwnkit_entry_mtime" \
     --arg pwnkit_repo_dir "$pwnkit_repo_dir" \
@@ -701,6 +714,13 @@ write_runner_metadata() {
         ),
         command: $pwnkit_command,
         command_source: $pwnkit_command_source,
+        source_dir: (
+          if $pwnkit_command_source == "PWNKIT_SOURCE_DIR" and $pwnkit_source_dir != "" then
+            $pwnkit_source_dir
+          else
+            null
+          end
+        ),
         entry_path: (if $pwnkit_entry_path == "" then null else $pwnkit_entry_path end),
         entry_mtime_seconds: (
           if $pwnkit_entry_mtime == "" then null
@@ -1091,6 +1111,9 @@ run_scan() {
       esac
       if [[ -n "$PWNKIT_FEATURE_CODEX_LIVE_TARGETS" ]]; then
         export PWNKIT_FEATURE_CODEX_LIVE_TARGETS
+      fi
+      if truthy "$EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST"; then
+        export PWNKIT_ALLOW_STALE_SOURCE_DIST=1
       fi
 
       run_command_with_timeout \

@@ -20,6 +20,8 @@ EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS="${EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS:-60}"
 EIDOLON_M3_RUNNER_ENVIRONMENT="${EIDOLON_M3_RUNNER_ENVIRONMENT:-auto}"
 EIDOLON_M3_NETWORK_TOPOLOGY="${EIDOLON_M3_NETWORK_TOPOLOGY:-same_host_loopback}"
 EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-}"
+EIDOLON_M3_PWNKIT_EVIDENCE_TRACK="${EIDOLON_M3_PWNKIT_EVIDENCE_TRACK:-}"
+PWNKIT_SOURCE_DIR="${PWNKIT_SOURCE_DIR-$HOME/Projects/pwnkit}"
 
 TARGET_PID=""
 PROXY_PID=""
@@ -70,7 +72,14 @@ Environment:
   EIDOLON_M3_PWNKIT_FIXTURE_ID  Optional safe label for archived/private pinned
                                 pwnkit fixtures. Leave unset for current-main
                                 pwnkit evidence claims.
-  PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to pwnkit-codex.sh.
+  EIDOLON_M3_PWNKIT_EVIDENCE_TRACK
+                                Optional evidence track override:
+                                upstream_current, local_patched_pwnkit, or
+                                historical_stale.
+  PWNKIT_SOURCE_DIR             Local pwnkit source checkout. Defaults to
+                                ~/Projects/pwnkit.
+  PWNKIT_NODE_ENTRY/PWNKIT_BIN  Explicit pwnkit runner overrides passed through
+                                to pwnkit-codex.sh for diagnostics.
 
 Use only against the owned loopback Lab target. Sync and rebuild pwnkit before
 running when using a source checkout.
@@ -186,6 +195,7 @@ write_dry_run_plan() {
     printf 'network_topology=%s\n' "$EIDOLON_M3_NETWORK_TOPOLOGY"
     printf 'pwnkit_fixture_id=%s\n' "${EIDOLON_M3_PWNKIT_FIXTURE_ID:-none}"
     printf 'pwnkit_evidence_track=%s\n' "${EIDOLON_M3_PWNKIT_EVIDENCE_TRACK:-auto}"
+    printf 'pwnkit_source_dir=%s\n' "${PWNKIT_SOURCE_DIR:-none}"
     printf 'debug_log=run-*/private/eidolon-debug.jsonl\n'
     printf 'sample_summary=pwnkit-stability-sample.json\n'
   } > "$plan_file"
@@ -249,6 +259,8 @@ run_pwnkit_preflight() {
     EIDOLON_M3_RUNNER_ENVIRONMENT="$EIDOLON_M3_RUNNER_ENVIRONMENT" \
     EIDOLON_M3_NETWORK_TOPOLOGY="$EIDOLON_M3_NETWORK_TOPOLOGY" \
     EIDOLON_M3_PWNKIT_FIXTURE_ID="$EIDOLON_M3_PWNKIT_FIXTURE_ID" \
+    EIDOLON_M3_PWNKIT_EVIDENCE_TRACK="$EIDOLON_M3_PWNKIT_EVIDENCE_TRACK" \
+    PWNKIT_SOURCE_DIR="$PWNKIT_SOURCE_DIR" \
     "$SCRIPT_DIR/pwnkit-codex.sh" preflight "$preflight_dir" >/dev/null
   EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE="$EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE" \
     "$SCRIPT_DIR/check-pwnkit-runner-freshness.sh" \
@@ -307,6 +319,8 @@ run_one_sample() {
       EIDOLON_M3_RUNNER_ENVIRONMENT="$EIDOLON_M3_RUNNER_ENVIRONMENT" \
       EIDOLON_M3_NETWORK_TOPOLOGY="$EIDOLON_M3_NETWORK_TOPOLOGY" \
       EIDOLON_M3_PWNKIT_FIXTURE_ID="$EIDOLON_M3_PWNKIT_FIXTURE_ID" \
+      EIDOLON_M3_PWNKIT_EVIDENCE_TRACK="$EIDOLON_M3_PWNKIT_EVIDENCE_TRACK" \
+      PWNKIT_SOURCE_DIR="$PWNKIT_SOURCE_DIR" \
       "$SCRIPT_DIR/pwnkit-codex.sh" all "$run_dir"
     runner_status="$?"
     set -e

@@ -53,6 +53,7 @@ write_manifest() {
 test_help_mentions_matrix_summary() {
   "$RUNNER" --help | rg -q 'pwnkit bait-promotion manifest'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PROMOTION_DRY_RUN'
+  "$RUNNER" --help | rg -q 'PWNKIT_SOURCE_DIR'
 }
 
 test_rejects_invalid_run_count() {
