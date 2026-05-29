@@ -267,13 +267,19 @@ changes:
 (cd ~/Projects/pwnkit && pnpm run build)
 ```
 
-`examples/m3/pwnkit-codex.sh` refuses obviously stale source-checkout
-`dist/pwnkit.js` bundles, including bundles that still contain the removed Codex
-MCP live runner. `EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1` exists only for debugging
-old artifacts. Each run writes `$ART/pwnkit-runner-metadata.json` with the
-resolved command, runtime settings, source-checkout package version, git head,
-dirty-worktree state, local `origin/main` ahead/behind counts, dist mtime, and
-generated pwnkit scope files; the collector copies this into
+`examples/m3/pwnkit-codex.sh` defaults to `PWNKIT_SOURCE_DIR=~/Projects/pwnkit`
+and invokes `$PWNKIT_SOURCE_DIR/dist/pwnkit.js`; it does not fall back to
+globally installed pwnkit packages. Set `PWNKIT_SOURCE_DIR` for a different
+checkout, or `PWNKIT_NODE_ENTRY` for an explicit built entrypoint.
+The runner refuses obviously stale source-checkout `dist/pwnkit.js` bundles,
+including bundles that still contain the removed Codex MCP live runner.
+Current pwnkit bundles also enforce their own build-commit freshness at
+startup. `EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST=1` exists only for debugging old
+artifacts and also passes pwnkit's `PWNKIT_ALLOW_STALE_SOURCE_DIST=1` bypass to
+the subprocess. Each run writes `$ART/pwnkit-runner-metadata.json` with the
+resolved command, runtime settings, source checkout path, package version, git
+head, dirty-worktree state, local `origin/main` ahead/behind counts, dist mtime,
+and generated pwnkit scope files; the collector copies this into
 `pwnkit-summary.json` under `runner`. For current-behavior claims against a
 moving pwnkit mainline, prefer artifacts where
 `runner.pwnkit.origin_main.in_sync` is `true` and

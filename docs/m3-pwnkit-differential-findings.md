@@ -84,7 +84,9 @@ containment?
 
 Before collecting a new sample:
 
-1. Sync pwnkit to upstream main and rebuild its dist bundle.
+1. Sync the local pwnkit source checkout and rebuild its dist bundle. The
+   runners default to `PWNKIT_SOURCE_DIR=~/Projects/pwnkit` and execute
+   `$PWNKIT_SOURCE_DIR/dist/pwnkit.js`, not a globally installed package.
 2. Confirm `examples/m3/pwnkit-codex.sh` records the pwnkit git head in
    `pwnkit-runner-metadata.json`.
 3. Keep `EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE=0` so

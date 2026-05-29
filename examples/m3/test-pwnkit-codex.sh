@@ -47,6 +47,68 @@ JS
   touch "$repo/dist/pwnkit.js"
 }
 
+test_help_mentions_local_source_checkout() {
+  "$RUNNER" --help | rg -q 'PWNKIT_SOURCE_DIR'
+  "$RUNNER" --help | rg -q 'globally installed pwnkit packages'
+}
+
+test_default_source_dir_resolves_local_checkout() {
+  local home_dir
+  local repo
+  local artifact
+  home_dir="$(new_temp_dir)"
+  repo="$home_dir/Projects/pwnkit"
+  artifact="$(new_temp_dir)"
+  mkdir -p "$(dirname "$repo")"
+  mkdir -p "$repo"
+  init_fake_pwnkit_checkout "$repo"
+
+  env -u PWNKIT_SOURCE_DIR \
+    HOME="$home_dir" \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    "$RUNNER" direct "$artifact" >/dev/null
+
+  jq -e \
+    --arg repo "$repo" \
+    --arg entry "$repo/dist/pwnkit.js" \
+    '
+      .pwnkit.command_source == "PWNKIT_SOURCE_DIR"
+      and .pwnkit.source_dir == $repo
+      and .pwnkit.entry_path == $entry
+      and .pwnkit.package_version == "9.8.7"
+      and .pwnkit.origin_main.in_sync == true
+    ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+}
+
+test_does_not_fall_back_to_path_pwnkit_packages() {
+  local artifact
+  local bin_dir
+  local output
+  local status=0
+  artifact="$(new_temp_dir)"
+  bin_dir="$artifact/bin"
+  mkdir -p "$bin_dir"
+  printf '#!/usr/bin/env bash\nprintf "path-pwnkit-was-run\\n" > "%s"\n' \
+    "$artifact/path-pwnkit-ran.txt" > "$bin_dir/pwnkit"
+  printf '#!/usr/bin/env bash\nprintf "path-pwnkit-cli-was-run\\n" > "%s"\n' \
+    "$artifact/path-pwnkit-cli-ran.txt" > "$bin_dir/pwnkit-cli"
+  chmod +x "$bin_dir/pwnkit" "$bin_dir/pwnkit-cli"
+
+  output="$(
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+      EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+      PWNKIT_SOURCE_DIR="" \
+      PATH="$bin_dir:$PATH" \
+      "$RUNNER" preflight "$artifact" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'could not find local pwnkit source checkout' <<<"$output"
+  [[ ! -e "$artifact/path-pwnkit-ran.txt" ]]
+  [[ ! -e "$artifact/path-pwnkit-cli-ran.txt" ]]
+}
+
 test_source_checkout_metadata_records_version_and_origin_sync() {
   local repo
   local artifact
@@ -1021,6 +1083,9 @@ SH
 }
 
 test_source_checkout_metadata_records_version_and_origin_sync
+test_help_mentions_local_source_checkout
+test_default_source_dir_resolves_local_checkout
+test_does_not_fall_back_to_path_pwnkit_packages
 test_source_checkout_metadata_records_origin_drift
 test_source_checkout_metadata_records_pinned_fixture_id
 test_rejects_unsafe_pinned_fixture_id
