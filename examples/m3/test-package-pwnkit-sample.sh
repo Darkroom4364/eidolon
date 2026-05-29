@@ -52,6 +52,13 @@ write_fixture_sample() {
   "runner_git_heads": ["abc123"],
   "runner_package_versions": ["v0.test"],
   "runner_pwnkit_fixture_ids": ["pwnkit-v0.12.0-private"],
+  "evidence_track_counts": [
+    {"evidence_track": "upstream_current", "count": 1}
+  ],
+  "evidence_tracks": ["upstream_current"],
+  "single_evidence_track": true,
+  "mixed_evidence_tracks": false,
+  "unknown_evidence_track_count": 0,
   "runner_environments": ["kali_vm"],
   "runner_network_topologies": ["same_vm_loopback"],
   "tool_fingerprint_summary": [
@@ -124,6 +131,7 @@ write_fixture_sample() {
     {
       "artifact_dir": "/private/tmp/eidolon-fixture",
       "present": true,
+      "evidence_track": "upstream_current",
       "runner_git_head": "abc123",
       "runner_package_version": "v0.test",
       "runner_git_dirty": false,
@@ -350,6 +358,7 @@ JSON
       "entry_path": "/tmp/pwnkit/dist/pwnkit.js",
       "command_source": "fixture",
       "package_version": "v0.test",
+      "evidence_track": "upstream_current",
       "git_head": "abc123",
       "git_head_short": "abc123",
       "git_head_time_seconds": 1770000000,
@@ -696,6 +705,7 @@ test_packager_redacts_raw_artifacts_and_query_values() {
       id: "pwnkit-v0.12.0-private",
       pinned: true
     }
+    and .runner.pwnkit.evidence_track == "upstream_current"
     and .redaction.raw_agent_error_text_omitted == true
     and (.runner.pwnkit | has("command") | not)
     and (.runner.pwnkit | has("entry_path") | not)
@@ -725,6 +735,11 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     ]
     and .runner_environments == ["kali_vm"]
     and .runner_pwnkit_fixture_ids == ["pwnkit-v0.12.0-private"]
+    and .evidence_tracks == ["upstream_current"]
+    and .evidence_track_counts == [{evidence_track: "upstream_current", count: 1}]
+    and .single_evidence_track == true
+    and .mixed_evidence_tracks == false
+    and .unknown_evidence_track_count == 0
     and .runner_network_topologies == ["same_vm_loopback"]
     and .tool_fingerprint_summary[0].name == "bash"
     and .finding_reconciliation.eidolon_db_saved_finding_total == 1
@@ -735,6 +750,7 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .evidence_gap_diagnostics.strict_controlled_reality_without_eidolon_finding_run_count == 1
     and .artifacts[0].agent_error_diagnostics.eidolon.count == 1
     and .artifacts[0].artifact_dir == "<source-artifact-path-omitted>"
+    and .artifacts[0].evidence_track == "upstream_current"
     and (.artifacts[0] | has("runner_command") | not)
     and .artifacts[0].runner_environment == "kali_vm"
     and .artifacts[0].runner_pwnkit_fixture_id == "pwnkit-v0.12.0-private"
@@ -761,6 +777,7 @@ test_packager_redacts_raw_artifacts_and_query_values() {
   rg -q 'evidence gaps: `strict_controlled_reality_without_eidolon_findings`' "$bundle_dir/README.md"
   rg -Fq 'runner environment(s): `kali_vm`' "$bundle_dir/README.md"
   rg -Fq 'pwnkit pinned fixture id(s): `pwnkit-v0.12.0-private`' "$bundle_dir/README.md"
+  rg -Fq 'evidence track(s): `upstream_current`' "$bundle_dir/README.md"
   rg -q 'DB-saved findings direct/Eidolon: `0/1`' "$bundle_dir/README.md"
   rg -q '`strict_stability.ready_for_stability_claim`: `false`' "$bundle_dir/README.md"
 }

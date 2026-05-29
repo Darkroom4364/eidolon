@@ -23,6 +23,7 @@ EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST="${EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST:-0}"
 EIDOLON_M3_RUNNER_ENVIRONMENT="${EIDOLON_M3_RUNNER_ENVIRONMENT:-auto}"
 EIDOLON_M3_NETWORK_TOPOLOGY="${EIDOLON_M3_NETWORK_TOPOLOGY:-same_host_loopback}"
 EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-}"
+EIDOLON_M3_PWNKIT_EVIDENCE_TRACK="${EIDOLON_M3_PWNKIT_EVIDENCE_TRACK:-}"
 
 usage() {
   cat <<'USAGE'
@@ -81,6 +82,11 @@ Environment:
                             Optional safe label for archived/private pinned
                             pwnkit fixtures. Current-main claims should leave
                             this unset and require origin/main freshness.
+  EIDOLON_M3_PWNKIT_EVIDENCE_TRACK
+                            Optional explicit evidence track. Allowed values:
+                            upstream_current, local_patched_pwnkit,
+                            historical_stale. When unset, collectors infer the
+                            track from runner freshness metadata.
 
 The runner writes one pwnkit scope file per scan leg and always passes
 `--scope`. This keeps pwnkit's shell-mode auth injection active for the
@@ -246,6 +252,21 @@ validate_fixture_id() {
     echo "error: EIDOLON_M3_PWNKIT_FIXTURE_ID must be 1-128 chars using only letters, numbers, '.', '_', ':', or '-'" >&2
     exit 2
   fi
+}
+
+validate_evidence_track() {
+  if [[ -z "$EIDOLON_M3_PWNKIT_EVIDENCE_TRACK" ]]; then
+    return
+  fi
+
+  case "$EIDOLON_M3_PWNKIT_EVIDENCE_TRACK" in
+    upstream_current|local_patched_pwnkit|historical_stale)
+      ;;
+    *)
+      echo "error: EIDOLON_M3_PWNKIT_EVIDENCE_TRACK must be upstream_current, local_patched_pwnkit, or historical_stale" >&2
+      exit 2
+      ;;
+  esac
 }
 
 os_release_value() {
@@ -595,6 +616,7 @@ write_runner_metadata() {
     --arg pwnkit_origin_main_ahead "$pwnkit_origin_main_ahead" \
     --arg pwnkit_origin_main_behind "$pwnkit_origin_main_behind" \
     --arg pwnkit_fixture_id "$EIDOLON_M3_PWNKIT_FIXTURE_ID" \
+    --arg pwnkit_evidence_track "$EIDOLON_M3_PWNKIT_EVIDENCE_TRACK" \
     --arg pwnkit_codex_auth_source "$PWNKIT_CODEX_AUTH_SOURCE" \
     --arg pwnkit_eidolon_scope_file "$PWNKIT_EIDOLON_SCOPE_FILE" \
     --arg pwnkit_direct_scope_file "$PWNKIT_DIRECT_SCOPE_FILE" \
@@ -638,6 +660,33 @@ write_runner_metadata() {
         tool_fingerprint: $tool_fingerprint
       },
       pwnkit: {
+        evidence_track: (
+          if $pwnkit_evidence_track != "" then
+            $pwnkit_evidence_track
+          elif $allow_stale_dist then
+            "historical_stale"
+          elif $pwnkit_git_dirty == "true" then
+            "local_patched_pwnkit"
+          elif $pwnkit_origin_main_ahead != ""
+            and (($pwnkit_origin_main_ahead | tonumber) > 0) then
+            "local_patched_pwnkit"
+          elif $pwnkit_git_dirty == "false"
+            and $pwnkit_origin_main_ahead != ""
+            and $pwnkit_origin_main_behind != ""
+            and (($pwnkit_origin_main_ahead | tonumber) == 0)
+            and (($pwnkit_origin_main_behind | tonumber) == 0) then
+            "upstream_current"
+          elif $pwnkit_origin_main_behind != ""
+            and (($pwnkit_origin_main_behind | tonumber) > 0) then
+            "historical_stale"
+          elif $pwnkit_fixture_id != ""
+            and $pwnkit_git_head != ""
+            and $pwnkit_git_dirty == "false" then
+            "local_patched_pwnkit"
+          else
+            null
+          end
+        ),
         depth: $pwnkit_depth,
         mode: $pwnkit_mode,
         runtime: $pwnkit_runtime,
@@ -1141,6 +1190,7 @@ main() {
     "EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS" \
     "$EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS"
   validate_fixture_id
+  validate_evidence_track
   mkdir -p "$ARTIFACT_DIR"
   printf '%s\n' "$ARTIFACT_DIR" > "$ARTIFACT_DIR/artifact-dir.txt"
 

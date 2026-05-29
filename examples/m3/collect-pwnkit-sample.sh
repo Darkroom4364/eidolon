@@ -90,6 +90,34 @@ done | jq -s '
     | group_by(.value)
     | map({($key_name): .[0].value, count: (map(.count) | add)});
 
+  def valid_evidence_track:
+    . == "upstream_current"
+    or . == "local_patched_pwnkit"
+    or . == "historical_stale";
+
+  def inferred_evidence_track:
+    (.runner.pwnkit.evidence_track // null) as $explicit
+    | if ($explicit | valid_evidence_track) then
+      $explicit
+    elif (.runner.pwnkit.stale_dist_guard_bypassed // false) == true then
+      "historical_stale"
+    elif .runner.pwnkit.git_dirty == true then
+      "local_patched_pwnkit"
+    elif ((.runner.pwnkit.origin_main.ahead // 0) > 0) then
+      "local_patched_pwnkit"
+    elif .runner.pwnkit.git_dirty == false
+      and (.runner.pwnkit.origin_main.in_sync // null) == true then
+      "upstream_current"
+    elif ((.runner.pwnkit.origin_main.behind // 0) > 0) then
+      "historical_stale"
+    elif (.runner.pwnkit.fixture.pinned // false) == true
+      and ((.runner.pwnkit.git_head // "") != "")
+      and .runner.pwnkit.git_dirty == false then
+      "local_patched_pwnkit"
+    else
+      "unknown"
+    end;
+
   def no_signal_likely_cause(
     $valid_count;
     $no_target_count;
@@ -176,12 +204,14 @@ done | jq -s '
         artifact_dir,
         present: false,
         missing_reason,
+        evidence_track: "missing",
         claim_level: "missing"
       }
     else
       {
         artifact_dir,
         present: true,
+        evidence_track: inferred_evidence_track,
         runner_git_head: (.runner.pwnkit.git_head // null),
         runner_package_version: (.runner.pwnkit.package_version // null),
         runner_git_dirty: (
@@ -234,8 +264,12 @@ done | jq -s '
           .comparison.same_session_confirmed_bait_action // false
         ),
         controlled_reality_entered: (.comparison.controlled_reality_entered // false),
-        direct_finding_count: (.runs.direct.finding_count // 0),
-        eidolon_finding_count: (.runs.eidolon.finding_count // 0),
+        direct_finding_count: (
+          .runs.direct.final_json_finding_count // .runs.direct.finding_count // 0
+        ),
+        eidolon_finding_count: (
+          .runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0
+        ),
         direct_final_json_finding_count: (
           .runs.direct.final_json_finding_count // .runs.direct.finding_count // 0
         ),
@@ -367,26 +401,37 @@ done | jq -s '
         ),
         finding_gap: (
           .comparison.finding_gap // {
-            direct_finding_count: (.runs.direct.finding_count // 0),
-            eidolon_finding_count: (.runs.eidolon.finding_count // 0),
+            direct_finding_count: (
+              .runs.direct.final_json_finding_count // .runs.direct.finding_count // 0
+            ),
+            eidolon_finding_count: (
+              .runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0
+            ),
             differential_finding_count: (
-              (.runs.eidolon.finding_count // 0) - (.runs.direct.finding_count // 0)
+              (.runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0)
+              - (.runs.direct.final_json_finding_count // .runs.direct.finding_count // 0)
             ),
             positive_differential_findings: (
-              (.runs.eidolon.finding_count // 0) > (.runs.direct.finding_count // 0)
+              (.runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0)
+              > (.runs.direct.final_json_finding_count // .runs.direct.finding_count // 0)
             ),
-            direct_quiet: ((.runs.direct.finding_count // 0) == 0),
-            eidolon_has_findings: ((.runs.eidolon.finding_count // 0) > 0),
+            direct_quiet: (
+              (.runs.direct.final_json_finding_count // .runs.direct.finding_count // 0) == 0
+            ),
+            eidolon_has_findings: (
+              (.runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0) > 0
+            ),
             eidolon_observed_target_evidence_without_findings: false,
             eidolon_bait_reached_without_findings: (
-              (.runs.eidolon.finding_count // 0) == 0 and (.comparison.bait_reached // false)
+              (.runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0) == 0
+              and (.comparison.bait_reached // false)
             ),
             eidolon_bait_action_without_findings: (
-              (.runs.eidolon.finding_count // 0) == 0
+              (.runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0) == 0
               and (.comparison.bait_action_observed // false)
             ),
             eidolon_controlled_reality_without_findings: (
-              (.runs.eidolon.finding_count // 0) == 0
+              (.runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0) == 0
               and (.comparison.controlled_reality_entered // false)
             ),
             next_question: null
@@ -485,7 +530,8 @@ done | jq -s '
           | (.comparison.claim_level // "missing") as $strict_claim
           | (.comparison.controlled_reality_entered // false) as $strict_controlled
           | (.comparison.same_session_confirmed_bait_action // false) as $strict_same_session
-          | (.runs.eidolon.finding_count // 0) as $eidolon_findings
+          | (.runs.eidolon.final_json_finding_count // .runs.eidolon.finding_count // 0)
+            as $eidolon_findings
           | (
               (.agent_trace_summary.metrics.real_surface_requests_after_containment // null)
             ) as $real_surface_after_containment
@@ -540,19 +586,55 @@ done | jq -s '
     as $same_session_count
   | ($present | map(select(.controlled_reality_entered)) | length)
     as $controlled_count
-  | ($present | map(select((.direct_finding_count // 0) == 0)) | length)
+  | ($present | map(select((.direct_final_json_finding_count // .direct_finding_count // 0) == 0)) | length)
     as $direct_quiet_count
-  | ($present | map(select((.direct_finding_count // 0) > 0)) | length)
+  | ($present | map(select((.direct_final_json_finding_count // .direct_finding_count // 0) > 0)) | length)
     as $direct_findings_count
-  | ($present | map(select((.eidolon_finding_count // 0) > 0)) | length)
+  | ($present | map(select((.eidolon_final_json_finding_count // .eidolon_finding_count // 0) > 0)) | length)
     as $eidolon_findings_count
-  | ($present | map(select(.finding_gap.positive_differential_findings)) | length)
+  | (
+      $present
+      | map(
+          select(
+            (.eidolon_final_json_finding_count // .eidolon_finding_count // 0)
+            > (.direct_final_json_finding_count // .direct_finding_count // 0)
+          )
+        )
+      | length
+    )
     as $positive_differential_count
-  | ($present | map(select(.finding_gap.eidolon_bait_reached_without_findings)) | length)
+  | (
+      $present
+      | map(
+          select(
+            (.eidolon_final_json_finding_count // .eidolon_finding_count // 0) == 0
+            and .bait_reached
+          )
+        )
+      | length
+    )
     as $bait_reached_without_findings_count
-  | ($present | map(select(.finding_gap.eidolon_bait_action_without_findings)) | length)
+  | (
+      $present
+      | map(
+          select(
+            (.eidolon_final_json_finding_count // .eidolon_finding_count // 0) == 0
+            and .bait_action_observed
+          )
+        )
+      | length
+    )
     as $bait_action_without_findings_count
-  | ($present | map(select(.finding_gap.eidolon_controlled_reality_without_findings)) | length)
+  | (
+      $present
+      | map(
+          select(
+            (.eidolon_final_json_finding_count // .eidolon_finding_count // 0) == 0
+            and .controlled_reality_entered
+          )
+        )
+      | length
+    )
     as $controlled_without_findings_count
   | ($present | map(.direct_final_json_finding_count // .direct_finding_count // 0) | add // 0)
     as $direct_final_json_finding_total
@@ -597,6 +679,14 @@ done | jq -s '
       | map(select(. != null and . != ""))
       | unique
     ) as $runner_fixture_ids
+  | ($present | map(.evidence_track // "unknown")) as $evidence_tracks_observed
+  | ($evidence_tracks_observed | unique) as $evidence_tracks
+  | ($evidence_tracks_observed | map(select(. == "unknown")) | length)
+    as $unknown_evidence_track_count
+  | (
+      count_values($evidence_tracks_observed)
+      | map({evidence_track: .value, count})
+    ) as $evidence_track_counts
   | ($present | map(.runner_environment // "unknown") | unique) as $runner_environments
   | ($present | map(.runner_network_topology // "unknown") | unique)
     as $runner_network_topologies
@@ -843,6 +933,15 @@ done | jq -s '
       runner_git_heads: $runner_heads,
       runner_package_versions: $runner_versions,
       runner_pwnkit_fixture_ids: $runner_fixture_ids,
+      evidence_track_counts: $evidence_track_counts,
+      evidence_tracks: $evidence_tracks,
+      single_evidence_track: (
+        $valid_count > 0
+        and ($evidence_tracks | length) == 1
+        and $unknown_evidence_track_count == 0
+      ),
+      mixed_evidence_tracks: (($evidence_tracks | length) > 1),
+      unknown_evidence_track_count: $unknown_evidence_track_count,
       runner_environments: $runner_environments,
       runner_network_topologies: $runner_network_topologies,
       tool_fingerprint_summary: $tool_fingerprint_summary,
@@ -959,13 +1058,24 @@ done | jq -s '
         bait_action_without_eidolon_finding_run_count: $bait_action_without_findings_count,
         controlled_reality_without_eidolon_finding_run_count: $controlled_without_findings_count,
         all_direct_quiet: (
-          $valid_count > 0 and all($present[]; (.direct_finding_count // 0) == 0)
+          $valid_count > 0
+          and all(
+            $present[];
+            (.direct_final_json_finding_count // .direct_finding_count // 0) == 0
+          )
         ),
         ready_for_differential_finding_claim: (
           $valid_count >= 3
           and $valid_count == $artifact_count
-          and all($present[]; (.direct_finding_count // 0) == 0)
-          and all($present[]; .finding_gap.positive_differential_findings)
+          and all(
+            $present[];
+            (.direct_final_json_finding_count // .direct_finding_count // 0) == 0
+          )
+          and all(
+            $present[];
+            (.eidolon_final_json_finding_count // .eidolon_finding_count // 0)
+            > (.direct_final_json_finding_count // .direct_finding_count // 0)
+          )
         ),
         next_questions: (
           $present
@@ -1051,6 +1161,11 @@ done | jq -s '
         sample_size: $valid_count,
         all_summaries_present: ($artifact_count > 0 and $valid_count == $artifact_count),
         single_runner_git_head: ($valid_count > 0 and ($runner_heads | length) == 1),
+        single_evidence_track: (
+          $valid_count > 0
+          and ($evidence_tracks | length) == 1
+          and $unknown_evidence_track_count == 0
+        ),
         all_target_interaction_observed: (
           $valid_count > 0 and all($present[]; .target_interaction_observed)
         ),
@@ -1078,6 +1193,8 @@ done | jq -s '
           $valid_count >= 3
           and $valid_count == $artifact_count
           and ($runner_heads | length) == 1
+          and ($evidence_tracks | length) == 1
+          and $unknown_evidence_track_count == 0
           and all($present[]; .runner_git_dirty == false)
           and all($present[]; .runner_origin_main_in_sync == true)
           and all($present[]; .target_interaction_observed)

@@ -69,6 +69,7 @@ test_source_checkout_metadata_records_version_and_origin_sync() {
     and .pwnkit.origin_main.ahead == 0
     and .pwnkit.origin_main.behind == 0
     and .pwnkit.origin_main.in_sync == true
+    and .pwnkit.evidence_track == "upstream_current"
     and (.environment.runner_environment | type) == "string"
     and .environment.runner_environment_source == "auto_detect"
     and .environment.network_topology == "same_host_loopback"
@@ -110,6 +111,7 @@ test_source_checkout_metadata_records_origin_drift() {
     and .pwnkit.origin_main.ahead == 1
     and .pwnkit.origin_main.behind == 0
     and .pwnkit.origin_main.in_sync == false
+    and .pwnkit.evidence_track == "local_patched_pwnkit"
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
 }
 
@@ -138,6 +140,7 @@ test_source_checkout_metadata_records_pinned_fixture_id() {
 
   jq -e '
     .pwnkit.origin_main.in_sync == false
+    and .pwnkit.evidence_track == "local_patched_pwnkit"
     and .pwnkit.fixture == {
       id: "pwnkit-v0.12.0-private",
       pinned: true
@@ -165,6 +168,28 @@ test_rejects_unsafe_pinned_fixture_id() {
   [[ "$status" -eq 2 ]]
   rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID must be 1-128 chars' <<<"$output"
   ! rg -q '/tmp/private-pwnkit' <<<"$output"
+}
+
+test_rejects_invalid_evidence_track() {
+  local repo
+  local artifact
+  local output
+  local status=0
+  repo="$(new_temp_dir)"
+  artifact="$(new_temp_dir)"
+  init_fake_pwnkit_checkout "$repo"
+
+  output="$(
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+      EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+      EIDOLON_M3_PWNKIT_EVIDENCE_TRACK="private/track" \
+      PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
+      "$RUNNER" preflight "$artifact" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'EIDOLON_M3_PWNKIT_EVIDENCE_TRACK must be upstream_current' <<<"$output"
+  ! rg -q 'private/track' <<<"$output"
 }
 
 test_rejects_invalid_pwnkit_timeout_seconds() {
@@ -999,6 +1024,7 @@ test_source_checkout_metadata_records_version_and_origin_sync
 test_source_checkout_metadata_records_origin_drift
 test_source_checkout_metadata_records_pinned_fixture_id
 test_rejects_unsafe_pinned_fixture_id
+test_rejects_invalid_evidence_track
 test_rejects_invalid_pwnkit_timeout_seconds
 test_rejects_invalid_pwnkit_heartbeat_seconds
 test_source_checkout_metadata_records_dirty_worktree
