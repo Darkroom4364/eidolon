@@ -133,6 +133,37 @@ test_rejects_non_vm_topology() {
   rg -q 'EIDOLON_M3_NETWORK_TOPOLOGY must be same_vm_loopback' <<<"$output"
 }
 
+test_rejects_local_patched_track_without_fixture_id() {
+  local output
+  local status=0
+
+  output="$(
+    EIDOLON_M3_ALLOW_NON_KALI_VM=1 \
+      EIDOLON_M3_KALI_VM_DRY_RUN=1 \
+      EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit \
+      "$RUNNER" 1 "$(new_temp_dir)" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID is required' <<<"$output"
+}
+
+test_rejects_upstream_current_track_with_fixture_id() {
+  local output
+  local status=0
+
+  output="$(
+    EIDOLON_M3_ALLOW_NON_KALI_VM=1 \
+      EIDOLON_M3_KALI_VM_DRY_RUN=1 \
+      EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=upstream_current \
+      EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
+      "$RUNNER" 1 "$(new_temp_dir)" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID must be unset' <<<"$output"
+}
+
 test_rejects_userinfo_loopback_smuggling() {
   local output
   local status=0
@@ -187,6 +218,8 @@ test_dry_run_records_vm_local_contract
 test_preflight_writes_runner_metadata
 test_preflight_requires_pwnkit_runner
 test_rejects_non_vm_topology
+test_rejects_local_patched_track_without_fixture_id
+test_rejects_upstream_current_track_with_fixture_id
 test_rejects_userinfo_loopback_smuggling
 test_rejects_repo_local_sample_dir
 test_rejects_symlinked_repo_local_sample_dir

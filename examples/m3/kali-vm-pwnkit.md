@@ -57,6 +57,9 @@ the evidence track explicitly:
 export EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit
 ```
 
+The Kali wrapper fails closed if `local_patched_pwnkit` is set without a
+fixture id, or if `upstream_current` is set while a fixture id is also present.
+
 ## Dry Run
 
 ```sh
