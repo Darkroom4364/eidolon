@@ -356,6 +356,7 @@ JSON
       "rate_limit": "2",
       "command": "node /tmp/pwnkit/dist/pwnkit.js",
       "entry_path": "/tmp/pwnkit/dist/pwnkit.js",
+      "source_dir": "/tmp/pwnkit",
       "command_source": "fixture",
       "package_version": "v0.test",
       "evidence_track": "upstream_current",
@@ -709,6 +710,7 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .redaction.raw_agent_error_text_omitted == true
     and (.runner.pwnkit | has("command") | not)
     and (.runner.pwnkit | has("entry_path") | not)
+    and (.runner.pwnkit | has("source_dir") | not)
     and (.runner.pwnkit.scopes.eidolon | has("path") | not)
     and (.runner.pwnkit.scopes.direct | has("path") | not)
     and .redaction.source_artifact_path_omitted == true

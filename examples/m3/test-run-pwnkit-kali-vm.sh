@@ -20,6 +20,7 @@ test_help_mentions_vm_contract() {
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_EVIDENCE_TRACK'
+  "$RUNNER" --help | rg -q 'PWNKIT_SOURCE_DIR'
 }
 
 test_rejects_non_kali_without_override() {
@@ -58,6 +59,7 @@ test_dry_run_records_vm_local_contract() {
     EIDOLON_M3_KALI_VM_DRY_RUN=1 \
     EIDOLON_M3_PWNKIT_FIXTURE_ID=pwnkit-v0.12.0-private \
     EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit \
+    PWNKIT_SOURCE_DIR=/tmp/kali-pwnkit-source \
     "$RUNNER" 2 "$sample_dir" >/dev/null
 
   [[ -f "$sample_dir/sample-plan.txt" ]]
@@ -68,6 +70,7 @@ test_dry_run_records_vm_local_contract() {
   rg -q '^pwnkit_timeout_seconds=1800$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_fixture_id=pwnkit-v0\.12\.0-private$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_evidence_track=local_patched_pwnkit$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_source_dir=/tmp/kali-pwnkit-source$' "$sample_dir/sample-plan.txt"
 }
 
 test_preflight_writes_runner_metadata() {
@@ -116,6 +119,22 @@ test_preflight_requires_pwnkit_runner() {
 
   [[ "$status" -eq 2 ]]
   rg -q 'PWNKIT_NODE_ENTRY does not exist' <<<"$output"
+}
+
+test_preflight_requires_built_source_checkout() {
+  local output
+  local status=0
+
+  output="$(
+    EIDOLON_M3_ALLOW_NON_KALI_VM=1 \
+      EIDOLON_M3_KALI_VM_DRY_RUN=1 \
+      EIDOLON_M3_PIN_SESSION=0 \
+      PWNKIT_SOURCE_DIR="$(new_temp_dir)/missing-pwnkit-source" \
+      "$RUNNER" --preflight 1 "$(new_temp_dir)" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'PWNKIT_SOURCE_DIR does not exist' <<<"$output"
 }
 
 test_rejects_non_vm_topology() {
@@ -217,6 +236,7 @@ test_rejects_non_kali_override_without_dry_run
 test_dry_run_records_vm_local_contract
 test_preflight_writes_runner_metadata
 test_preflight_requires_pwnkit_runner
+test_preflight_requires_built_source_checkout
 test_rejects_non_vm_topology
 test_rejects_local_patched_track_without_fixture_id
 test_rejects_upstream_current_track_with_fixture_id

@@ -20,6 +20,7 @@ test_help_mentions_sample_summary() {
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_FIXTURE_ID'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS'
   "$RUNNER" --help | rg -q 'EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS'
+  "$RUNNER" --help | rg -q 'PWNKIT_SOURCE_DIR'
 }
 
 test_rejects_invalid_run_count() {
@@ -67,7 +68,19 @@ test_dry_run_creates_private_layout() {
   rg -q '^network_topology=same_host_loopback$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_fixture_id=none$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_evidence_track=auto$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_source_dir=' "$sample_dir/sample-plan.txt"
   rg -q '^debug_log=run-\*/private/eidolon-debug\.jsonl$' "$sample_dir/sample-plan.txt"
+}
+
+test_dry_run_records_pwnkit_source_dir() {
+  local sample_dir
+  sample_dir="$(new_temp_dir)"
+
+  EIDOLON_M3_SAMPLE_DRY_RUN=1 \
+    PWNKIT_SOURCE_DIR=/tmp/local-pwnkit-source \
+    "$RUNNER" 1 "$sample_dir" >/dev/null
+
+  rg -q '^pwnkit_source_dir=/tmp/local-pwnkit-source$' "$sample_dir/sample-plan.txt"
 }
 
 test_dry_run_records_runner_environment_overrides() {
@@ -205,6 +218,7 @@ test_rejects_invalid_pwnkit_timeout_seconds
 test_rejects_invalid_pwnkit_heartbeat_seconds
 test_rejects_urls_with_query_values
 test_dry_run_creates_private_layout
+test_dry_run_records_pwnkit_source_dir
 test_dry_run_records_runner_environment_overrides
 test_dry_run_records_agent_error_override
 test_dry_run_records_unfresh_source_override
