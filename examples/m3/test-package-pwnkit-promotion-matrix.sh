@@ -101,9 +101,26 @@ write_variant_sample() {
       runner_git_heads: ["abc123"],
       runner_package_versions: ["0.11.1"],
       runner_pwnkit_fixture_ids: ["pwnkit-v0.12.0-private"],
+      evidence_track_counts: [
+        {evidence_track: "upstream_current", count: 1}
+      ],
+      evidence_tracks: ["upstream_current"],
+      single_evidence_track: true,
+      mixed_evidence_tracks: false,
+      unknown_evidence_track_count: 0,
       source_checkout: {
         all_runners_clean: true,
         all_runners_origin_main_synced: true
+      },
+      finding_reconciliation: {
+        direct_final_json_finding_total: 0,
+        eidolon_final_json_finding_total: $eidolon_findings,
+        direct_db_saved_finding_total: 0,
+        eidolon_db_saved_finding_total: $eidolon_findings,
+        direct_db_active_finding_total: 0,
+        eidolon_db_active_finding_total: $eidolon_findings,
+        any_db_saved_findings_omitted_from_final_json: false,
+        final_json_counts_still_drive_finding_claims: true
       },
       no_signal_diagnostics: {
         sample_size: 1,
@@ -137,6 +154,19 @@ write_variant_sample() {
         {
           artifact_dir: "/private/tmp/eidolon-secret-source",
           present: true,
+          evidence_track: "upstream_current",
+          runner_git_head: "abc123",
+          runner_git_dirty: false,
+          runner_origin_main_in_sync: true,
+          runner_origin_main: {
+            ahead: 0,
+            behind: 0,
+            in_sync: true
+          },
+          runner_pwnkit_fixture: {
+            id: "pwnkit-v0.12.0-private",
+            pinned: true
+          },
           claim_level: "controlled_reality_entered",
           conclusion: "bait_action_observed",
           target_interaction_observed: true,
@@ -146,6 +176,8 @@ write_variant_sample() {
           controlled_reality_entered: true,
           direct_finding_count: 0,
           eidolon_finding_count: $eidolon_findings,
+          direct_final_json_finding_count: 0,
+          eidolon_final_json_finding_count: $eidolon_findings,
           finding_gap: {
             positive_differential_findings: $positive_differential
           },

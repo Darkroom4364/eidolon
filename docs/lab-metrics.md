@@ -277,12 +277,17 @@ generated pwnkit scope files; the collector copies this into
 `pwnkit-summary.json` under `runner`. For current-behavior claims against a
 moving pwnkit mainline, prefer artifacts where
 `runner.pwnkit.origin_main.in_sync` is `true` and
-`runner.pwnkit.git_dirty` is `false`. Reproducible historical runs may use an
-archived or private local pinned pwnkit fixture instead; set
+`runner.pwnkit.git_dirty` is `false`. The runner records
+`runner.pwnkit.evidence_track` as `upstream_current`,
+`local_patched_pwnkit`, or `historical_stale`; leave it unset unless an
+explicit override is needed, because the collector can infer the track from
+freshness metadata. Reproducible historical runs may use an archived or private
+local pinned pwnkit fixture instead; set
 `EIDOLON_M3_PWNKIT_FIXTURE_ID` to a short non-secret label so runner metadata
 records `runner.pwnkit.fixture.id` and `runner.pwnkit.fixture.pinned: true`.
 Pinned fixtures still require a clean git worktree and recorded git head; they
-do not support current-main claims. Runner metadata also records
+do not support current-main claims unless the same metadata also proves the
+source checkout is clean and synced with local `origin/main`. Runner metadata also records
 `runner.environment.runner_environment`,
 `runner.environment.network_topology`, and
 `runner.environment.tool_fingerprint`.
@@ -364,9 +369,12 @@ no-signal artifacts.
 The sample runner and sample evidence packager also run
 `examples/m3/check-pwnkit-sample-health.sh` against the aggregated
 `pwnkit-stability-sample.json`. This catches manually aggregated samples that
-contain pwnkit `agent_error` events before they are treated as M3 evidence. Use
-`EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only when packaging an explicitly diagnostic
-artifact whose sanitized agent-error classes are part of the investigation.
+mix evidence tracks, lack a known evidence track, infer finding claims from
+DB-only findings, or contain pwnkit `agent_error` events before they are treated
+as M3 evidence. `EIDOLON_M3_ALLOW_AGENT_ERRORS=1` only bypasses the final
+agent-error rejection; track and final-JSON finding-claim guardrails still run.
+Use it only when packaging an explicitly diagnostic artifact whose sanitized
+agent-error classes are part of the investigation.
 
 The summary separates the strength of the pwnkit-correlated bait evidence.
 `comparison.conclusion` keeps the broad runner outcome, while
@@ -514,9 +522,10 @@ direct-target quietness, and strict pass rates. Treat
 `strict_stability.ready_for_stability_claim: true` as the minimum gate before
 describing current-pwnkit behavior as stable across repeated Lab scans; it
 requires at least three valid summaries from one runner git head, all with clean
-source-checkout metadata synced with local `origin/main`, target interaction,
-same-session confirmed bait action, controlled-reality entry, preserved pinned
-cookies, and quiet direct-target runs.
+source-checkout metadata synced with local `origin/main`, one non-unknown
+evidence track, target interaction, same-session confirmed bait action,
+controlled-reality entry, preserved pinned cookies, and quiet direct-target
+runs.
 
 `evidence_gap_diagnostics` compares the strict pwnkit-correlated claim with the
 sanitized proxy trace summary for each run. It separates three different cases:
