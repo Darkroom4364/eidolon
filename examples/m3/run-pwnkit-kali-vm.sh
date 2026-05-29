@@ -49,6 +49,9 @@ Environment:
   EIDOLON_M3_PWNKIT_EVIDENCE_TRACK
                                Optional track override: upstream_current,
                                local_patched_pwnkit, or historical_stale.
+                               For Kali evidence, local_patched_pwnkit requires
+                               EIDOLON_M3_PWNKIT_FIXTURE_ID; upstream_current
+                               must leave the fixture id unset.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to run-pwnkit-sample.sh.
 
 The wrapper forces the evidence labels:
@@ -141,6 +144,21 @@ require_vm_contract() {
   if [[ "$on_kali" -eq 0 ]] && ! truthy "$EIDOLON_M3_KALI_VM_DRY_RUN"; then
     fail "EIDOLON_M3_ALLOW_NON_KALI_VM is only allowed with EIDOLON_M3_KALI_VM_DRY_RUN=1"
   fi
+}
+
+require_evidence_track_contract() {
+  case "$EIDOLON_M3_PWNKIT_EVIDENCE_TRACK" in
+    local_patched_pwnkit)
+      if [[ -z "$EIDOLON_M3_PWNKIT_FIXTURE_ID" ]]; then
+        fail "EIDOLON_M3_PWNKIT_FIXTURE_ID is required when EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit"
+      fi
+      ;;
+    upstream_current)
+      if [[ -n "$EIDOLON_M3_PWNKIT_FIXTURE_ID" ]]; then
+        fail "EIDOLON_M3_PWNKIT_FIXTURE_ID must be unset when EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=upstream_current"
+      fi
+      ;;
+  esac
 }
 
 require_pwnkit_runner_available() {
@@ -253,6 +271,7 @@ main() {
 
   require_positive_integer "run-count" "$RUN_COUNT"
   require_vm_contract
+  require_evidence_track_contract
   require_sample_dir_outside_repo
   eidolon_lab_require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
   eidolon_lab_require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
