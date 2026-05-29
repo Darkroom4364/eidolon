@@ -15,6 +15,7 @@ EIDOLON_M3_KALI_VM_DRY_RUN="${EIDOLON_M3_KALI_VM_DRY_RUN:-0}"
 EIDOLON_M3_ALLOW_NON_KALI_VM="${EIDOLON_M3_ALLOW_NON_KALI_VM:-0}"
 EIDOLON_M3_KALI_VM_PREFLIGHT="${EIDOLON_M3_KALI_VM_PREFLIGHT:-0}"
 EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-}"
+EIDOLON_M3_PWNKIT_EVIDENCE_TRACK="${EIDOLON_M3_PWNKIT_EVIDENCE_TRACK:-}"
 EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="${EIDOLON_M3_PWNKIT_MAX_ATTEMPTS:-3}"
 EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS="${EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS:-1800}"
 
@@ -45,6 +46,12 @@ Environment:
                                Defaults to 1800 seconds for Kali VM.
   EIDOLON_M3_PWNKIT_FIXTURE_ID Optional safe label for archived/private pinned
                                pwnkit fixtures.
+  EIDOLON_M3_PWNKIT_EVIDENCE_TRACK
+                               Optional track override: upstream_current,
+                               local_patched_pwnkit, or historical_stale.
+                               For Kali evidence, local_patched_pwnkit requires
+                               EIDOLON_M3_PWNKIT_FIXTURE_ID; upstream_current
+                               must leave the fixture id unset.
   PWNKIT_NODE_ENTRY/PWNKIT_BIN Passed through to run-pwnkit-sample.sh.
 
 The wrapper forces the evidence labels:
@@ -139,6 +146,21 @@ require_vm_contract() {
   fi
 }
 
+require_evidence_track_contract() {
+  case "$EIDOLON_M3_PWNKIT_EVIDENCE_TRACK" in
+    local_patched_pwnkit)
+      if [[ -z "$EIDOLON_M3_PWNKIT_FIXTURE_ID" ]]; then
+        fail "EIDOLON_M3_PWNKIT_FIXTURE_ID is required when EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit"
+      fi
+      ;;
+    upstream_current)
+      if [[ -n "$EIDOLON_M3_PWNKIT_FIXTURE_ID" ]]; then
+        fail "EIDOLON_M3_PWNKIT_FIXTURE_ID must be unset when EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=upstream_current"
+      fi
+      ;;
+  esac
+}
+
 require_pwnkit_runner_available() {
   if [[ -n "${PWNKIT_NODE_ENTRY:-}" ]]; then
     if [[ ! -f "$PWNKIT_NODE_ENTRY" ]]; then
@@ -225,6 +247,7 @@ run_preflight() {
     EIDOLON_M3_RUNNER_ENVIRONMENT="$EIDOLON_M3_RUNNER_ENVIRONMENT" \
     EIDOLON_M3_NETWORK_TOPOLOGY="$EIDOLON_M3_NETWORK_TOPOLOGY" \
     EIDOLON_M3_PWNKIT_FIXTURE_ID="$EIDOLON_M3_PWNKIT_FIXTURE_ID" \
+    EIDOLON_M3_PWNKIT_EVIDENCE_TRACK="$EIDOLON_M3_PWNKIT_EVIDENCE_TRACK" \
     "$SCRIPT_DIR/pwnkit-codex.sh" preflight "$preflight_dir" >/dev/null
   EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE="${EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE:-0}" \
     "$SCRIPT_DIR/check-pwnkit-runner-freshness.sh" \
@@ -248,6 +271,7 @@ main() {
 
   require_positive_integer "run-count" "$RUN_COUNT"
   require_vm_contract
+  require_evidence_track_contract
   require_sample_dir_outside_repo
   eidolon_lab_require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
   eidolon_lab_require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
@@ -257,6 +281,7 @@ main() {
   export EIDOLON_M3_RUNNER_ENVIRONMENT
   export EIDOLON_M3_NETWORK_TOPOLOGY
   export EIDOLON_M3_PWNKIT_FIXTURE_ID
+  export EIDOLON_M3_PWNKIT_EVIDENCE_TRACK
   export EIDOLON_M3_PWNKIT_MAX_ATTEMPTS
   export EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS
 
