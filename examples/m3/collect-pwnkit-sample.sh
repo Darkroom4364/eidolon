@@ -681,6 +681,16 @@ done | jq -s '
     ) as $runner_fixture_ids
   | ($present | map(.evidence_track // "unknown")) as $evidence_tracks_observed
   | ($evidence_tracks_observed | unique) as $evidence_tracks
+  | (
+      $present
+      | map(
+          select(
+            (.runner_pwnkit_fixture.pinned // false) == true
+            and ((.runner_pwnkit_fixture.id // "") != "")
+          )
+        )
+      | length
+    ) as $pinned_fixture_count
   | ($evidence_tracks_observed | map(select(. == "unknown")) | length)
     as $unknown_evidence_track_count
   | (
@@ -718,6 +728,20 @@ done | jq -s '
     as $origin_drifted_count
   | ($present | map(select(.runner_origin_main_in_sync == null)) | length)
     as $unknown_origin_sync_count
+  | (
+      $valid_count > 0
+      and all($present[]; .runner_git_dirty == false)
+      and (
+        (
+          $evidence_tracks == ["upstream_current"]
+          and all($present[]; .runner_origin_main_in_sync == true)
+        )
+        or (
+          $evidence_tracks == ["local_patched_pwnkit"]
+          and $pinned_fixture_count == $valid_count
+        )
+      )
+    ) as $runner_source_claim_safe
   | ($present | map({claim_level, rank: claim_rank(.claim_level)}))
     as $ranked_claims
   | ($valid_count - $target_count) as $no_target_count
@@ -952,12 +976,17 @@ done | jq -s '
         origin_main_synced_count: $origin_synced_count,
         origin_main_drifted_count: $origin_drifted_count,
         unknown_origin_main_sync_count: $unknown_origin_sync_count,
+        pinned_fixture_count: $pinned_fixture_count,
+        all_runners_pinned_fixture: (
+          $valid_count > 0 and $pinned_fixture_count == $valid_count
+        ),
         all_runners_clean: (
           $valid_count > 0 and all($present[]; .runner_git_dirty == false)
         ),
         all_runners_origin_main_synced: (
           $valid_count > 0 and all($present[]; .runner_origin_main_in_sync == true)
-        )
+        ),
+        runner_source_claim_safe: $runner_source_claim_safe
       },
       finding_reconciliation: {
         sample_size: $valid_count,
@@ -1189,14 +1218,17 @@ done | jq -s '
         all_runners_origin_main_synced: (
           $valid_count > 0 and all($present[]; .runner_origin_main_in_sync == true)
         ),
+        all_runners_pinned_fixture: (
+          $valid_count > 0 and $pinned_fixture_count == $valid_count
+        ),
+        runner_source_claim_safe: $runner_source_claim_safe,
         ready_for_stability_claim: (
           $valid_count >= 3
           and $valid_count == $artifact_count
           and ($runner_heads | length) == 1
           and ($evidence_tracks | length) == 1
           and $unknown_evidence_track_count == 0
-          and all($present[]; .runner_git_dirty == false)
-          and all($present[]; .runner_origin_main_in_sync == true)
+          and $runner_source_claim_safe
           and all($present[]; .target_interaction_observed)
           and all($present[]; .same_session_confirmed_bait_action)
           and all($present[]; .controlled_reality_entered)

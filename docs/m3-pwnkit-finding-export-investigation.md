@@ -129,3 +129,21 @@ Keep two evidence tracks separate:
 The patched pwnkit fix should merge discovery-stage findings into the final
 candidate set or reload all saved DB findings before report construction, then
 continue to omit only false-positive/suppressed findings from final JSON.
+
+## Local Patched Follow-Up
+
+A three-run local patched sample was collected on 2026-05-30 and archived under
+`docs/evidence/m3/pwnkit-local-patched-2026-05-30/`.
+
+- pwnkit head: `fa3a3c6c34e0e50ddb7f40b86e58fb50ed95833f`
+- pwnkit fixture id: `pwnkit-local-patched-discovery-findings-2026-05-30`
+- evidence track: `local_patched_pwnkit`
+- strict same-session controlled reality: `3/3`
+- direct final JSON findings: `0`
+- Eidolon final JSON findings: `6` total across `2/3` runs
+- Eidolon DB-saved findings: `8` total
+
+This supports the patch direction: active Eidolon-side findings can now survive
+into final JSON. It does not make an upstream-current pwnkit claim, and it does
+not close the full stability question because one run still entered controlled
+reality with zero Eidolon final JSON findings.
