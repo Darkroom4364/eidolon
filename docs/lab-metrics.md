@@ -293,7 +293,10 @@ local pinned pwnkit fixture instead; set
 records `runner.pwnkit.fixture.id` and `runner.pwnkit.fixture.pinned: true`.
 Pinned fixtures still require a clean git worktree and recorded git head; they
 do not support current-main claims unless the same metadata also proves the
-source checkout is clean and synced with local `origin/main`. Runner metadata also records
+source checkout is clean and synced with local `origin/main`. For
+`local_patched_pwnkit` evidence, the sample collector treats a clean runner
+pinned to an explicit fixture id as source-claim-safe while still keeping that
+track separate from upstream-current evidence. Runner metadata also records
 `runner.environment.runner_environment`,
 `runner.environment.network_topology`, and
 `runner.environment.tool_fingerprint`.

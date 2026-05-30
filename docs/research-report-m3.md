@@ -64,6 +64,24 @@
 - M3 differential finding claim: `partial`; `1/3` runs produced Eidolon-only findings while direct stayed quiet.
 - Remaining empirical gap: investigate why current pwnkit promotes the chain to findings in only one run and why one run loses strict same-session confirmation despite proxy-trace containment.
 
+## Local Patched Follow-Up
+
+The local patched pwnkit fixture
+`docs/evidence/m3/pwnkit-local-patched-2026-05-30/` is a separate evidence
+track. It used pwnkit head `fa3a3c6c34e0e50ddb7f40b86e58fb50ed95833f` with
+fixture id `pwnkit-local-patched-discovery-findings-2026-05-30`.
+
+- Strict same-session controlled reality: `3/3`
+- Direct final JSON findings: `0/3`
+- Eidolon final JSON findings: `2/3` runs, `6` total findings
+- `strict_stability.ready_for_stability_claim`: `true`
+- `differential_findings.ready_for_differential_finding_claim`: `false`
+
+This supports the local export-gap patch direction while preserving the
+upstream-current distinction. One patched run still reached controlled reality
+without an Eidolon final JSON finding, so the differential-finding stability
+question remains open.
+
 ## Non-Claims
 
 - This report does not claim production readiness or stability beyond this three-run current-pwnkit Lab sample.
