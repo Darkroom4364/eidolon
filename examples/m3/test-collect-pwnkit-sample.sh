@@ -498,6 +498,8 @@ test_stability_claim_requires_three_matching_successes() {
     )
     and .source_checkout.all_runners_clean == true
     and .source_checkout.all_runners_origin_main_synced == true
+    and .source_checkout.all_runners_pinned_fixture == false
+    and .source_checkout.runner_source_claim_safe == true
     and .finding_reconciliation.direct_final_json_finding_total == 0
     and .finding_reconciliation.eidolon_final_json_finding_total == 0
     and .finding_reconciliation.direct_db_saved_finding_total == 0
@@ -515,6 +517,52 @@ test_stability_claim_requires_three_matching_successes() {
     and .strict_stability.all_pinned_cookie_preserved == true
     and .strict_stability.all_runners_clean == true
     and .strict_stability.all_runners_origin_main_synced == true
+    and .strict_stability.all_runners_pinned_fixture == false
+    and .strict_stability.runner_source_claim_safe == true
+    and .strict_stability.ready_for_stability_claim == true
+  ' "$output" >/dev/null
+}
+
+test_stability_claim_accepts_clean_pinned_local_patched_fixture() {
+  local first
+  local second
+  local third
+  local output
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" controlled_reality_entered head-a 0 true 3
+  write_summary "$second" controlled_reality_entered head-a 0 true 4
+  write_summary "$third" controlled_reality_entered head-a 0 true 5
+
+  for run_dir in "$first" "$second" "$third"; do
+    mutate_summary "$run_dir" '
+      .runner.pwnkit.evidence_track = "local_patched_pwnkit"
+      | .runner.pwnkit.origin_main.in_sync = false
+      | .runner.pwnkit.origin_main.ahead = 1
+      | .runner.pwnkit.fixture = {
+          id: "pwnkit-local-patched-fixture",
+          pinned: true
+        }
+    '
+  done
+
+  output="$first/sample-local-patched.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .evidence_tracks == ["local_patched_pwnkit"]
+    and .runner_pwnkit_fixture_ids == ["pwnkit-local-patched-fixture"]
+    and .source_checkout.all_runners_clean == true
+    and .source_checkout.all_runners_origin_main_synced == false
+    and .source_checkout.all_runners_pinned_fixture == true
+    and .source_checkout.runner_source_claim_safe == true
+    and .strict_stability.all_runners_clean == true
+    and .strict_stability.all_runners_origin_main_synced == false
+    and .strict_stability.all_runners_pinned_fixture == true
+    and .strict_stability.runner_source_claim_safe == true
     and .strict_stability.ready_for_stability_claim == true
   ' "$output" >/dev/null
 }
@@ -578,8 +626,10 @@ test_stability_rejects_dirty_or_unsynced_runner() {
     and .strict_stability.single_evidence_track == false
     and .source_checkout.all_runners_clean == false
     and .source_checkout.all_runners_origin_main_synced == false
+    and .source_checkout.runner_source_claim_safe == false
     and .strict_stability.all_runners_clean == false
     and .strict_stability.all_runners_origin_main_synced == false
+    and .strict_stability.runner_source_claim_safe == false
     and .strict_stability.ready_for_stability_claim == false
   ' "$output" >/dev/null
 }
@@ -899,6 +949,7 @@ test_evidence_gap_diagnostics_compare_strict_and_proxy_trace() {
 
 test_mixed_sample_counts_claims_and_missing_dirs
 test_stability_claim_requires_three_matching_successes
+test_stability_claim_accepts_clean_pinned_local_patched_fixture
 test_stability_rejects_mixed_runner_heads_or_direct_findings
 test_stability_rejects_dirty_or_unsynced_runner
 test_no_signal_diagnostics_aggregate_proxy_without_pwnkit_artifacts

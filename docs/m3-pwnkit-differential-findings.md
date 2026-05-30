@@ -80,6 +80,15 @@ and why does one run lose strict same-session confirmation despite proxy-trace
 containment?
 ```
 
+A local patched pwnkit fixture was collected on 2026-05-30 at head
+`fa3a3c6c34e0e50ddb7f40b86e58fb50ed95833f` and archived under
+`docs/evidence/m3/pwnkit-local-patched-2026-05-30`. The patch preserves
+discovery-stage findings into final JSON. In that sample direct final JSON
+findings stayed quiet in `3/3` runs, strict same-session controlled reality held
+in `3/3` runs, and Eidolon final JSON findings appeared in `2/3` runs. Treat
+that as `local_patched_pwnkit` evidence only; it confirms the export-gap patch
+direction but does not make an upstream-current pwnkit claim.
+
 ## Pre-Run Checklist
 
 Before collecting a new sample:
@@ -223,6 +232,9 @@ The sample health check fails closed if a sample mixes `upstream_current`,
 differential-finding claim is present without final JSON finding support.
 DB-saved finding deltas remain diagnostics under `finding_reconciliation`; they
 do not by themselves support a final-output pwnkit finding claim.
+For `local_patched_pwnkit` samples, the collector treats a clean runner pinned
+to an explicit fixture id as source-claim-safe even though `origin/main` is
+expected to be out of sync.
 
 `examples/m3/collect-pwnkit-promotion-matrix.sh` wraps those sample-level
 signals per manifest variant and adds:
