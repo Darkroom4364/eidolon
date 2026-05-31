@@ -452,6 +452,35 @@ test_exact_crawl_start_path_confirms_exposure_surface() {
   ' "$dir/summary.json" >/dev/null
 }
 
+test_later_same_session_request_artifact_preserves_confirmed_action() {
+  local dir
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  seed_exposure "$dir" "session-a" "exp-1"
+  append_bait_action "$dir" "session-a" "2026-01-01T00:00:03Z" "exp-1"
+  append_controlled_reality "$dir" "session-a" "2026-01-01T00:00:04Z"
+  append_request_seen "$dir" "session-a" "2026-01-01T00:00:05Z" POST /api/v2/import/reconcile eidolon_owned
+  insert_http_artifact "$dir" "http-action-late" 1767225605000 POST /api/v2/import/reconcile 202
+
+  assert_claim "$dir" "controlled_reality_entered"
+  jq -e '
+    .comparison.same_session_confirmed_bait_action == true
+    and .comparison.controlled_reality_entered == true
+    and .comparison.strict_correlation_gap.strict_confirmed_action_count == 1
+    and .comparison.strict_correlation_gap.correlation_basis_counts == [
+      {basis: "request_after_action_same_session", count: 1}
+    ]
+    and .comparison.strict_correlation_gap.request_after_action_same_session_count == 1
+    and .comparison.strict_correlation_gap.proxy_confirmed_action_not_strict_count == 0
+    and (.comparison.correlated_bait_events.actions | length) == 1
+    and .comparison.correlated_bait_events.actions[0].path == "/api/v2/import/reconcile"
+    and .comparison.correlated_bait_events.actions[0].correlation_basis == "request_after_action_same_session"
+    and (.comparison.correlated_bait_events.same_session_confirmed_actions | length) == 1
+    and .comparison.correlated_bait_events.same_session_confirmed_actions[0].correlation_basis == "request_after_action_same_session"
+    and (.comparison.correlated_bait_events.controlled_reality_entries | length) == 1
+  ' "$dir/summary.json" >/dev/null
+}
+
 test_redacted_proxy_query_paths_still_correlate() {
   local dir
   dir="$(new_artifact)"
@@ -783,6 +812,7 @@ test_large_runner_artifacts_do_not_hit_shell_argument_limit() {
 }
 
 test_exposure_only
+test_later_same_session_request_artifact_preserves_confirmed_action
 test_bash_http_output_upgrades_confirmed_action
 test_wrong_session_action_does_not_confirm
 test_strict_gap_marks_proxy_exposure_not_pwnkit_correlated
