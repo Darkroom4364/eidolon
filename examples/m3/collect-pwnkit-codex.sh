@@ -1034,6 +1034,11 @@ jq -n \
      | map(.start_path // null)
      | map(select(. != null and . != ""))
      | unique;
+   def exact_crawl_start_matches_surface($surface):
+     any(
+       crawl_artifact_start_paths[];
+       path_without_query(.) == path_without_query($surface)
+     );
    def path_under_start($path; $start):
      path_without_query($path) as $clean_path
      | path_without_query($start) as $clean_start
@@ -1100,7 +1105,8 @@ jq -n \
              .proxy_session_id == $exposure.session_id
              and path_without_query(.path) == path_without_query($exposure.surface)
              and ((.proxy_event_index // -1) <= ($exposure.event_index // -1))
-           )
+            )
+            or exact_crawl_start_matches_surface($exposure.surface)
          )
        | $exposure
      ];
@@ -1617,6 +1623,7 @@ jq -n \
       "target_interaction_observed requires at least one pwnkit HTTP artifact to match an Eidolon proxy request by method, path, and a 30 second timestamp window.",
       "bait_follow_rate counts bait-shaped actions whether or not the action preserved the original exposure session.",
       "same_session_confirmed_bait_follow_rate counts only bait actions whose exposure_id matches a prior bait exposure in the same session.",
+      "Exact crawl start-path matches count as exposure evidence when pwnkit omitted a per-page request artifact for that bait surface; broader crawl roots remain diagnostic-only.",
       "Controlled-reality depth metrics are null here; derive them from Eidolon trace evidence for final M3 reporting.",
       "finding_diagnostics intentionally keeps only counts, coarse classifications, and field presence; it omits finding titles, descriptions, raw evidence, request bodies, raw URLs, and analysis text.",
       "agent_error_diagnostics intentionally keeps only counts and coarse error classes; it omits raw pwnkit agent error text.",
