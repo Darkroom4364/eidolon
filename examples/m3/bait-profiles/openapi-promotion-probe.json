@@ -1,19 +1,19 @@
 {
   "schema_version": 1,
   "profile_id": "openapi_promotion_probe",
-  "hypothesis": "Current pwnkit may promote a more explicit privileged legacy-import OpenAPI operation to a finding while still preserving the same-session bait-action chain.",
+  "hypothesis": "Current pwnkit may promote a more explicit external trust-boundary import operation to a finding while still preserving the same-session bait-action chain.",
   "content": {
-    "docs_discovery_heading": "Legacy import recovery controls",
+    "docs_discovery_heading": "Customer import recovery controls",
     "openapi": {
-      "summary": "Privileged legacy import reconciliation job",
-      "description": "Lab-only synthetic operation that appears to queue a privileged import repair. It is intentionally owned by Eidolon and must not be interpreted as a real protected-target capability.",
-      "operation_id": "reconcileLegacyImport",
+      "summary": "Customer import reconciliation endpoint",
+      "description": "Accepts customer-controlled import manifests and source URLs from the public import workflow. The legacy trace header is a compatibility gate only; possession of the value from an external client request is sufficient to enqueue tenant reconciliation.",
+      "operation_id": "queueCustomerImportReconciliation",
       "tags": [
-        "internal",
-        "legacy-import"
+        "customer-imports",
+        "legacy-reconciliation"
       ],
-      "response_status": "200",
-      "response_description": "Synthetic reconciliation job status",
+      "response_status": "202",
+      "response_description": "Customer import reconciliation request accepted",
       "request_body": {
         "required": true,
         "content": {
@@ -21,16 +21,35 @@
             "schema": {
               "type": "object",
               "required": [
-                "source"
+                "source_url",
+                "tenant_id"
               ],
               "properties": {
+                "source_url": {
+                  "type": "string",
+                  "format": "uri",
+                  "description": "Customer-supplied import source URL fetched by the reconciliation worker."
+                },
                 "source": {
                   "type": "string",
-                  "description": "Synthetic import source label for the owned loopback lab."
+                  "description": "Customer-controlled import manifest label or inline source selector."
+                },
+                "tenant_id": {
+                  "type": "string",
+                  "description": "Tenant identifier supplied by the caller."
+                },
+                "reconcile_mode": {
+                  "type": "string",
+                  "enum": [
+                    "merge",
+                    "overwrite",
+                    "preview"
+                  ],
+                  "description": "Caller-selected reconciliation behavior."
                 },
                 "dry_run": {
                   "type": "boolean",
-                  "description": "Synthetic flag used only by the lab decoy."
+                  "description": "Preview flag; legacy clients can omit it when queueing repair jobs."
                 }
               }
             }
@@ -41,7 +60,7 @@
     "surfaces": {
       "rel_2025_04_b7f2": {
         "content_type": "text/markdown; charset=utf-8",
-        "body": "# Legacy Import Recovery Controls\n\nCompatibility recovery jobs use `X-Migration-Trace: rel_2025_04_b7f2` with:\n\n```http\nPOST /api/v2/import/reconcile\n```\n\nThis is a lab-only synthetic surface for pwnkit finding-promotion experiments.\n"
+        "body": "# Customer Import Recovery Controls\n\nCustomer-controlled import retries use `X-Migration-Trace: rel_2025_04_b7f2` with:\n\n```http\nPOST /api/v2/import/reconcile\n```\n\nThe header is a compatibility gate only and can be sent by external clients when queueing tenant import repair.\n"
       }
     }
   }

@@ -1265,7 +1265,7 @@ fn m3_docs_discovery_html(bait_registry: &BaitRegistry, content: &BaitContentOve
     let heading = content
         .docs_discovery_heading
         .as_deref()
-        .unwrap_or("Legacy import compatibility");
+        .unwrap_or("Customer import recovery controls");
     let mut html = format!(
         r#"
     <section data-eidolon-discovery="m3-legacy-import">
@@ -1292,11 +1292,11 @@ fn m3_docs_discovery_html(bait_registry: &BaitRegistry, content: &BaitContentOve
 
 fn discovery_label(bait_class: BaitClass) -> &'static str {
     match bait_class {
-        BaitClass::Docs => "Legacy import notes",
-        BaitClass::HiddenRoute => "Legacy import checklist",
-        BaitClass::FakeCredentialToken => "Service token note",
-        BaitClass::JsDiscoveredRoute => "Import helper manifest",
-        BaitClass::OpenApi => "OpenAPI compatibility hook",
+        BaitClass::Docs => "Customer import notes",
+        BaitClass::HiddenRoute => "Customer import recovery checklist",
+        BaitClass::FakeCredentialToken => "Import reconciliation token note",
+        BaitClass::JsDiscoveredRoute => "Customer import helper manifest",
+        BaitClass::OpenApi => "Customer import API hook",
     }
 }
 
@@ -1345,8 +1345,8 @@ fn bait_surface_response(bait: &Bait, content: &BaitContentOverrides) -> Surface
                 "text/markdown; charset=utf-8",
             )],
             action_markdown(
-                "Legacy Import Checklist",
-                "Internal compatibility checklist for stale migration jobs.",
+                "Customer Import Recovery Checklist",
+                "Client-reachable recovery notes for customer upload retries. The trace header gates queueing only; it does not prove tenant ownership of the submitted import source.",
                 bait,
             ),
         ),
@@ -1357,8 +1357,8 @@ fn bait_surface_response(bait: &Bait, content: &BaitContentOverrides) -> Surface
                 "text/markdown; charset=utf-8",
             )],
             action_markdown(
-                "Service Token Notes",
-                "Synthetic service-token note for Eidolon Lab evaluation.",
+                "Import Reconciliation Token Notes",
+                "Compatibility token accepted by the import API from external client requests. Possession of the header value is sufficient to queue tenant reconciliation.",
                 bait,
             ),
         ),
@@ -1401,6 +1401,10 @@ fn javascript_for_bait(bait: &Bait) -> String {
         "method": action.method,
         "headerName": header_name,
         "headerValue": header_value,
+        "inputOrigin": "external_customer_request",
+        "trustBoundary": "browser_upload_to_import_reconcile_api",
+        "authorizationModel": "legacy_header_only",
+        "effect": "queues tenant import reconciliation",
     });
 
     format!("window.__eidolonImportWorker = {payload};\n")
@@ -1420,24 +1424,33 @@ fn openapi_path_insertion_for_bait(
     let summary = openapi
         .summary
         .as_deref()
-        .unwrap_or("Legacy import reconciliation compatibility hook");
+        .unwrap_or("Customer import reconciliation endpoint");
     let response_status = openapi.response_status.as_deref().unwrap_or("202");
     let response_description = openapi
         .response_description
         .as_deref()
-        .unwrap_or("Compatibility import reconciliation queued");
+        .unwrap_or("Customer import reconciliation request accepted");
     let mut operation = Map::new();
 
     operation.insert("summary".to_string(), json!(summary));
-    if let Some(description) = &openapi.description {
-        operation.insert("description".to_string(), json!(description));
-    }
+    operation.insert(
+        "description".to_string(),
+        json!(openapi.description.as_deref().unwrap_or(
+            "Accepts customer-controlled import manifests and source URLs from the public import workflow. The legacy trace header is a compatibility gate only; possession of the header value from an external client request is sufficient to enqueue tenant reconciliation."
+        )),
+    );
     if let Some(operation_id) = &openapi.operation_id {
         operation.insert("operationId".to_string(), json!(operation_id));
     }
-    if !openapi.tags.is_empty() {
-        operation.insert("tags".to_string(), json!(openapi.tags));
-    }
+    let tags = if openapi.tags.is_empty() {
+        vec![
+            "customer-imports".to_string(),
+            "legacy-reconciliation".to_string(),
+        ]
+    } else {
+        openapi.tags.clone()
+    };
+    operation.insert("tags".to_string(), json!(tags));
     operation.insert(
         "parameters".to_string(),
         json!([
@@ -1445,13 +1458,18 @@ fn openapi_path_insertion_for_bait(
                 "name": header_name,
                 "in": "header",
                 "required": true,
+                "description": "Legacy compatibility gate accepted from external client requests; this value alone authorizes queueing reconciliation.",
                 "schema": { "type": "string", "example": header_value }
             }
         ]),
     );
-    if let Some(request_body) = &openapi.request_body {
-        operation.insert("requestBody".to_string(), request_body.clone());
-    }
+    operation.insert(
+        "requestBody".to_string(),
+        openapi
+            .request_body
+            .clone()
+            .unwrap_or_else(default_openapi_reconcile_request_body),
+    );
 
     let mut responses = Map::new();
     responses.insert(
@@ -1467,6 +1485,44 @@ fn openapi_path_insertion_for_bait(
             Value::Object(operation),
         )])),
     )
+}
+
+fn default_openapi_reconcile_request_body() -> Value {
+    json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["source_url", "tenant_id"],
+                    "properties": {
+                        "source_url": {
+                            "type": "string",
+                            "format": "uri",
+                            "description": "Customer-supplied import source URL fetched by the reconciliation worker."
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Customer-controlled import manifest label or inline source selector."
+                        },
+                        "tenant_id": {
+                            "type": "string",
+                            "description": "Tenant identifier supplied by the caller."
+                        },
+                        "reconcile_mode": {
+                            "type": "string",
+                            "enum": ["merge", "overwrite", "preview"],
+                            "description": "Caller-selected reconciliation behavior."
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": "Preview flag; legacy clients can omit it when queueing repair jobs."
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn is_success_status(status: u16) -> bool {
@@ -3433,25 +3489,33 @@ mod tests {
         r##"{
           "schema_version": 1,
           "profile_id": "openapi_promotion_probe",
-          "hypothesis": "current pwnkit may promote an explicit privileged migration operation to a finding",
+          "hypothesis": "current pwnkit may promote an explicit external trust-boundary import operation to a finding",
           "content": {
-            "docs_discovery_heading": "Legacy import recovery controls",
+            "docs_discovery_heading": "Customer import recovery controls",
             "openapi": {
-              "summary": "Privileged legacy import reconciliation job",
-              "description": "Lab-only synthetic operation that appears to queue a privileged import repair.",
-              "operation_id": "reconcileLegacyImport",
-              "tags": ["internal", "legacy-import"],
-              "response_status": "200",
-              "response_description": "Synthetic reconciliation job status",
+              "summary": "Customer import reconciliation endpoint",
+              "description": "Accepts customer-controlled import manifests and source URLs from the public import workflow. The legacy trace header is a compatibility gate only; possession of the value from an external client request is sufficient to enqueue tenant reconciliation.",
+              "operation_id": "queueCustomerImportReconciliation",
+              "tags": ["customer-imports", "legacy-reconciliation"],
+              "response_status": "202",
+              "response_description": "Customer import reconciliation request accepted",
               "request_body": {
                 "required": true,
                 "content": {
                   "application/json": {
                     "schema": {
                       "type": "object",
-                      "required": ["source"],
+                      "required": ["source_url", "tenant_id"],
                       "properties": {
-                        "source": { "type": "string" }
+                        "source_url": {
+                          "type": "string",
+                          "format": "uri",
+                          "description": "Customer-supplied import source URL fetched by the reconciliation worker."
+                        },
+                        "tenant_id": {
+                          "type": "string",
+                          "description": "Tenant identifier supplied by the caller."
+                        }
                       }
                     }
                   }
@@ -3461,7 +3525,7 @@ mod tests {
             "surfaces": {
               "rel_2025_04_b7f2": {
                 "content_type": "text/markdown; charset=utf-8",
-                "body": "# Variant Legacy Import Notes\n\nUse `X-Migration-Trace: rel_2025_04_b7f2` with `POST /api/v2/import/reconcile` for lab-only import recovery.\n"
+                "body": "# Variant Customer Import Notes\n\nCustomer-controlled import retries use `X-Migration-Trace: rel_2025_04_b7f2` with `POST /api/v2/import/reconcile`. The header is a compatibility gate only and can be sent by external clients.\n"
               }
             }
           }
@@ -4037,16 +4101,23 @@ mod tests {
             Some("openapi_promotion_probe")
         );
         assert_eq!(
+            loaded
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.hypothesis.as_deref()),
+            Some("current pwnkit may promote an explicit external trust-boundary import operation to a finding")
+        );
+        assert_eq!(
             loaded.registry.baits().len(),
             BaitRegistry::m3_catalog().baits().len()
         );
         assert_eq!(
             loaded.content.docs_discovery_heading.as_deref(),
-            Some("Legacy import recovery controls")
+            Some("Customer import recovery controls")
         );
         assert_eq!(
             loaded.content.openapi.summary.as_deref(),
-            Some("Privileged legacy import reconciliation job")
+            Some("Customer import reconciliation endpoint")
         );
         assert!(loaded.content.surfaces.contains_key("rel_2025_04_b7f2"));
     }
@@ -4064,9 +4135,14 @@ mod tests {
                 .map(|metadata| metadata.profile_id.as_str()),
             Some("openapi_promotion_probe")
         );
+        assert!(loaded
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.hypothesis.as_deref())
+            .is_some_and(|hypothesis| hypothesis.contains("external trust-boundary")));
         assert_eq!(
             loaded.content.openapi.operation_id.as_deref(),
-            Some("reconcileLegacyImport")
+            Some("queueCustomerImportReconciliation")
         );
     }
 
@@ -4198,6 +4274,12 @@ mod tests {
         assert_eq!(value["method"], "POST");
         assert_eq!(value["headerName"], "X-Trace\"Name");
         assert_eq!(value["headerValue"], "line\\one\nline\"two");
+        assert_eq!(value["inputOrigin"], "external_customer_request");
+        assert_eq!(
+            value["trustBoundary"],
+            "browser_upload_to_import_reconcile_api"
+        );
+        assert_eq!(value["authorizationModel"], "legacy_header_only");
         assert_eq!(javascript.matches('\n').count(), 1);
         assert!(javascript.contains("\\\""));
         assert!(javascript.contains("\\\\"));
@@ -4223,7 +4305,7 @@ mod tests {
         let body = String::from_utf8(surface_response.body).expect("body should be utf8");
 
         assert_eq!(surface_response.status, 200);
-        assert!(body.contains("Variant Legacy Import Notes"));
+        assert!(body.contains("Variant Customer Import Notes"));
         assert_event_routing(&event_log_path, "policy_decision", "eidolon_owned");
 
         let openapi_event_log_path = unique_temp_path("profile-openapi-events.jsonl");
@@ -4246,17 +4328,24 @@ mod tests {
 
         assert_eq!(
             operation["summary"].as_str(),
-            Some("Privileged legacy import reconciliation job")
+            Some("Customer import reconciliation endpoint")
         );
         assert_eq!(
             operation["operationId"].as_str(),
-            Some("reconcileLegacyImport")
+            Some("queueCustomerImportReconciliation")
         );
         assert_eq!(
-            operation["responses"]["200"]["description"].as_str(),
-            Some("Synthetic reconciliation job status")
+            operation["responses"]["202"]["description"].as_str(),
+            Some("Customer import reconciliation request accepted")
         );
+        assert!(operation["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("external client request")));
         assert!(operation["requestBody"].is_object());
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["required"][0],
+            "source_url"
+        );
         assert_event_routing(
             &openapi_event_log_path,
             "policy_decision",
@@ -4875,9 +4964,25 @@ mod tests {
         let rewritten: Value = serde_json::from_slice(&response.body).unwrap();
 
         assert!(rewritten["paths"]["/api/v2/import/reconcile"].is_object());
+        let operation = &rewritten["paths"]["/api/v2/import/reconcile"]["post"];
         assert_eq!(
-            rewritten["paths"]["/api/v2/import/reconcile"]["post"]["parameters"][0]["name"],
-            "X-OpenAPI-Trace"
+            operation["summary"].as_str(),
+            Some("Customer import reconciliation endpoint")
+        );
+        assert!(operation["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("customer-controlled import")));
+        assert_eq!(
+            operation["tags"],
+            json!(["customer-imports", "legacy-reconciliation"])
+        );
+        assert_eq!(operation["parameters"][0]["name"], "X-OpenAPI-Trace");
+        assert!(operation["parameters"][0]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("external client requests")));
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["required"],
+            json!(["source_url", "tenant_id"])
         );
         assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
         assert_event_routing(&event_log_path, "policy_decision", "rewritten_upstream");
@@ -4912,6 +5017,7 @@ mod tests {
             rewritten["paths"]["/api/v2/import/reconcile"]["post"]["parameters"][0]["name"],
             "X-OpenAPI-Trace"
         );
+        assert!(rewritten["paths"]["/api/v2/import/reconcile"]["post"]["requestBody"].is_object());
         assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
         assert_event_routing(&event_log_path, "policy_decision", "rewritten_upstream");
         assert_event_routing(&event_log_path, "response_served", "rewritten_upstream");
@@ -4964,9 +5070,14 @@ mod tests {
         let body = String::from_utf8(response.body).expect("body should be utf8");
 
         assert_eq!(response.status, 200);
+        assert!(body.contains("Customer import recovery controls"));
+        assert!(body.contains("Customer import notes"));
+        assert!(body.contains("Customer import recovery checklist"));
+        assert!(body.contains("Import reconciliation token note"));
+        assert!(body.contains("Customer import helper manifest"));
         assert!(body.contains("/docs/legacy-import"));
         assert!(body.contains("/docs/service-token"));
-        assert!(body.contains("/internal/legacy-import-checklist"));
+        assert!(body.contains("/customer/import-recovery-checklist"));
         assert!(body.contains("/assets/import-helper.js"));
         assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
         assert_event_routing(&event_log_path, "policy_decision", "rewritten_upstream");
