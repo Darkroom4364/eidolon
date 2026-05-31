@@ -1,19 +1,30 @@
 # M3 pwnkit Finding Export Investigation
 
-This note explains why the May 28 M3 current-pwnkit Kali VM sample persisted
-Eidolon-side findings in pwnkit's SQLite DB but emitted zero final JSON
-findings.
+This note explains two related M3 report-promotion gaps:
+
+1. the historical May 28 upstream-current Kali VM sample, which persisted
+   Eidolon-side findings in pwnkit's SQLite DB but emitted zero final JSON
+   findings, and
+2. the refreshed May 31 upstream-current Kali VM sample, which now emits
+   Eidolon final JSON findings in `2/3` runs but still leaves one strict
+   controlled-reality run at zero final JSON findings despite a saved active DB
+   finding.
 
 This is a Lab-only evidence note. It does not change the M3 containment claim
 or make a production-readiness claim.
 
 ## Scope
 
-- Eidolon evidence bundle:
+- historical zero-export evidence bundle:
   `docs/evidence/m3/pwnkit-stability-2026-05-28/`
-- pwnkit head:
+- refreshed upstream-current evidence bundle:
+  `docs/evidence/m3/pwnkit-stability-2026-05-31/`
+- historical pwnkit head:
   `1a8d6aac37818df29ff2e37d065c5bbcfe9c063b`
-- pwnkit fixture id: `pwnkit-local-kali-2026-05-28`
+- refreshed pwnkit head:
+  `c64410873b828f19f48ca4f8b12a3fc8dfe53c58`
+- historical pwnkit fixture id: `pwnkit-local-kali-2026-05-28`
+- refreshed pwnkit fixture id: none
 - runner environment: `kali_vm`
 - topology: `same_vm_loopback`
 - raw pwnkit DBs, raw JSON, stdout/stderr logs, auth material, proxy JSONL, and
@@ -41,6 +52,29 @@ Every Eidolon run had the same finding reconciliation shape:
 The discrepancy is therefore not a collector arithmetic error. The final JSON
 artifact had no top-level `findings`, while the pwnkit DB had saved findings.
 
+## Refreshed Upstream-Current Follow-Up
+
+The committed May 31 sample reports:
+
+- final JSON direct findings: `0`
+- final JSON Eidolon findings: `4` total across `3` runs
+- Eidolon DB-saved findings: `7`
+- Eidolon DB-active findings: `5`
+- `strict_stability.ready_for_stability_claim`: `true`
+
+Run shape in the refreshed sample:
+
+- run 1: strict controlled reality, `2` Eidolon final JSON findings,
+  `3` saved DB findings, `2` active DB findings
+- run 2: strict controlled reality, `0` Eidolon final JSON findings,
+  `1` saved DB finding, `1` active DB finding
+- run 3: strict controlled reality, `2` Eidolon final JSON findings,
+  `3` saved DB findings, `2` active DB findings
+
+So the current upstream-current gap is narrower than the May 28 case. It is no
+longer "final JSON always empty." It is now "one strict controlled-reality run
+still fails to promote an active saved Eidolon finding into final JSON."
+
 ## Collector Behavior
 
 `examples/m3/collect-pwnkit-codex.sh` intentionally treats final JSON and DB
@@ -59,7 +93,7 @@ That separation is intentional: pwnkit's public/reporting output is final JSON,
 while DB findings are diagnostic evidence that pwnkit saw and persisted a
 signal.
 
-## Root Cause
+## Historical Root Cause
 
 The local pwnkit pipeline drops discovery-stage findings from final JSON.
 
@@ -104,19 +138,29 @@ It does not support a final-output differential-finding claim against current
 upstream pwnkit, because current pwnkit did not emit the active Eidolon-side DB
 findings in final JSON.
 
-The best wording is:
+The best wording for the May 28 sample is:
 
-> current pwnkit persisted active Eidolon-side findings in SQLite, but the final
-> JSON report dropped discovery-stage findings before emission.
+> current pwnkit persisted active Eidolon-side findings in SQLite, but the
+> final JSON report dropped discovery-stage findings before emission.
+
+The best wording for the refreshed May 31 sample is:
+
+> upstream-current pwnkit now promotes some Eidolon-side findings into final
+> JSON, but one strict controlled-reality run still left an active saved DB
+> finding unreported in the final JSON output.
 
 ## Follow-Up Tracks
 
 Keep two evidence tracks separate:
 
 1. Upstream-current pwnkit evidence:
-   `pwnkit-local-kali-2026-05-28`
+   - May 28 historical zero-export sample:
+     `pwnkit-local-kali-2026-05-28`
+   - May 31 refreshed sample:
+     `docs/evidence/m3/pwnkit-stability-2026-05-31/`
    - containment/stability: supported
-   - final JSON differential findings: not claimed
+   - final JSON differential findings: partial in the May 31 sample, not
+     universal
 
 2. Local patched pwnkit evidence:
    label future runs with a distinct fixture id such as
@@ -149,7 +193,8 @@ not close the full stability question because one run still entered controlled
 reality with zero Eidolon final JSON findings.
 
 Follow-up collector diagnostics now expose the remaining run's saved-to-inactive
-transition without committing raw pwnkit DB contents. The useful fields are:
+or saved-but-unexported shape without committing raw pwnkit DB contents. The
+useful fields are:
 
 - `finding_reconciliation.db_rejection_diagnostics.inactive_reason_counts`
 - `finding_reconciliation.db_rejection_diagnostics.lifecycle_counts`
