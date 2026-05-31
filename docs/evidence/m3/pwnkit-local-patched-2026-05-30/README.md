@@ -1,6 +1,6 @@
 # M3 pwnkit Sample Evidence
 
-Lab-only evidence bundle packaged on 2026-05-30.
+Lab-only evidence bundle packaged on 2026-05-31.
 
 ## Scope
 
