@@ -139,7 +139,7 @@ jq -r -n \
     {
       rel_2025_04_b7f2: "/docs/legacy-import",
       openapi_reconcile_trace: "/openapi.json",
-      hidden_route_trace: "/internal/legacy-import-checklist",
+      hidden_route_trace: "/customer/import-recovery-checklist",
       fake_service_token: "/docs/service-token",
       js_worker_resume_trace: "/assets/import-helper.js"
     }[$bait_id] // "";
@@ -171,7 +171,7 @@ jq -r -n \
       elif $bait_id == "openapi_reconcile_trace" then
         ($text | contains("/openapi.json") or contains("x-openapi-trace"))
       elif $bait_id == "hidden_route_trace" then
-        ($text | contains("/internal/legacy-import-checklist") or contains("x-hidden-route-trace"))
+        ($text | contains("/customer/import-recovery-checklist") or contains("/internal/legacy-import-checklist") or contains("x-hidden-route-trace"))
       elif $bait_id == "fake_service_token" then
         ($text | contains("/docs/service-token") or contains("x-api-key"))
       elif $bait_id == "js_worker_resume_trace" then
