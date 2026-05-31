@@ -326,6 +326,13 @@ descriptions, raw evidence, request bodies, raw URLs, and analysis text. Use
 The collector also keeps final JSON findings separate from DB-saved findings
 with `finding_reconciliation` and `finding_export_gap`, so export-path gaps do
 not get confused with scanner behavior.
+`finding_reconciliation.db_rejection_diagnostics` adds shape-only lifecycle
+counts for saved findings that did not remain active: status/triage/workflow
+cross-tabs, artifact-presence counts, layer/verdict counts, reject-layer counts,
+coarse reject-reason buckets, confidence buckets, and severity-change buckets.
+It intentionally does not include finding titles, descriptions, evidence text,
+triage notes, raw layer-verdict reasons, PoC step text, URLs, request bodies, or
+agent messages.
 
 The corresponding sample-level fields live under `differential_findings`. See
 [`m3-pwnkit-differential-findings.md`](m3-pwnkit-differential-findings.md) for

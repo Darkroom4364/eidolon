@@ -147,3 +147,16 @@ This supports the patch direction: active Eidolon-side findings can now survive
 into final JSON. It does not make an upstream-current pwnkit claim, and it does
 not close the full stability question because one run still entered controlled
 reality with zero Eidolon final JSON findings.
+
+Follow-up collector diagnostics now expose the remaining run's saved-to-inactive
+transition without committing raw pwnkit DB contents. The useful fields are:
+
+- `finding_reconciliation.db_rejection_diagnostics.inactive_reason_counts`
+- `finding_reconciliation.db_rejection_diagnostics.lifecycle_counts`
+- `finding_reconciliation.db_rejection_diagnostics.reject_layer_counts`
+- `finding_reconciliation.db_rejection_diagnostics.reject_reason_class_counts`
+
+Those fields are shape-only buckets. They are designed to correlate pwnkit
+status, triage, workflow, and false-positive reduction-layer signals for saved
+findings that did not remain active, while omitting raw titles, descriptions,
+evidence, triage notes, layer-verdict reasons, and PoC step text.
