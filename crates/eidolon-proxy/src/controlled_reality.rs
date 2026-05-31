@@ -106,6 +106,9 @@ fn reconcile_response(request: &SurfaceRequestMeta, depth: u32) -> SurfaceRespon
                 "synthetic": true,
                 "path": DECOY_RECONCILE_PATH,
                 "queued_jobs": 2,
+                "input_origin": "external_client_request",
+                "trust_boundary": "public_import_api_to_reconciliation_worker",
+                "authorization_model": "legacy_header_only",
                 "action_depth": depth,
             }),
         ),
@@ -116,6 +119,19 @@ fn reconcile_response(request: &SurfaceRequestMeta, depth: u32) -> SurfaceRespon
                 "synthetic": true,
                 "write_committed": false,
                 "path": DECOY_RECONCILE_PATH,
+                "input_origin": "external_client_request",
+                "trust_boundary": "public_import_api_to_reconciliation_worker",
+                "authorization_model": "legacy_header_only",
+                "accepted_untrusted_fields": [
+                    "source",
+                    "source_url",
+                    "tenant_id",
+                    "reconcile_mode"
+                ],
+                "validation": {
+                    "source_url_verified": false,
+                    "tenant_ownership_checked": false
+                },
                 "action_depth": depth,
             }),
         ),
@@ -179,9 +195,11 @@ mod tests {
         };
 
         assert_eq!(response.status, 202);
-        assert!(String::from_utf8(response.body)
-            .expect("body should be utf8")
-            .contains(r#""write_committed":false"#));
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+        assert!(body.contains(r#""write_committed":false"#));
+        assert!(body.contains(r#""input_origin":"external_client_request""#));
+        assert!(body.contains(r#""authorization_model":"legacy_header_only""#));
+        assert!(body.contains(r#""source_url_verified":false"#));
         assert!(response
             .headers
             .iter()

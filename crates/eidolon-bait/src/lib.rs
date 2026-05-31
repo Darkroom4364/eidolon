@@ -42,7 +42,7 @@ impl BasicBaitTemplate {
         Self {
             id: "hidden_route_trace".to_string(),
             bait_class: BaitClass::HiddenRoute,
-            surface: "/internal/legacy-import-checklist".to_string(),
+            surface: "/customer/import-recovery-checklist".to_string(),
             surface_kind: SurfaceKind::Route,
             route_suffix: "reconcile".to_string(),
             header_name: "X-Hidden-Route-Trace".to_string(),
@@ -207,7 +207,7 @@ pub fn docs_for_bait(bait: &Bait) -> String {
     let header_value = action.header_value.as_deref().unwrap_or(&bait.id.0);
 
     format!(
-        "# Legacy Import Notes\n\nThe legacy reconciliation path accepts `{header_name}: {header_value}` for compatibility-mode import jobs.\n\nEndpoint:\n\n```http\n{} {}\n```\n",
+        "# Customer Import Reconciliation\n\nThe import portal accepts customer-controlled manifests and optional source URLs for tenant data repair. Legacy clients can queue reconciliation by sending `{header_name}: {header_value}`.\n\nThe header is a compatibility gate only; possession of the value from an external client request is sufficient to enqueue a tenant import repair request.\n\nEndpoint:\n\n```http\n{} {}\n```\n",
         action.method, action.path
     )
 }
@@ -486,5 +486,17 @@ mod tests {
                 .map(|bait| bait.surface.as_str()),
             Some("/docs/service-token")
         );
+    }
+
+    #[test]
+    fn docs_for_bait_names_external_trust_boundary() {
+        let bait = BasicBaitTemplate::legacy_import_demo().to_bait();
+        let docs = docs_for_bait(&bait);
+
+        assert!(docs.contains("customer-controlled manifests"));
+        assert!(docs.contains("external client request"));
+        assert!(docs.contains("compatibility gate only"));
+        assert!(docs.contains("X-Migration-Trace: rel_2025_04_b7f2"));
+        assert!(docs.contains("POST /api/v2/import/reconcile"));
     }
 }

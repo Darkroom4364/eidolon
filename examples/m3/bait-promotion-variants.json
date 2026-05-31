@@ -13,13 +13,15 @@
     {
       "variant_id": "openapi_promotion_probe",
       "bait_profile": "examples/m3/bait-profiles/openapi-promotion-probe.json",
-      "hypothesis": "More explicit privileged-operation wording, operationId, tags, request body, and response description may change pwnkit finding diagnostics.",
+      "hypothesis": "More explicit external trust-boundary import wording, operationId, tags, request body, response status, and discovery heading may change pwnkit finding diagnostics.",
       "knobs": [
+        "docs_discovery_heading",
         "openapi.summary",
         "openapi.description",
         "openapi.operation_id",
         "openapi.tags",
         "openapi.request_body",
+        "openapi.response_status",
         "openapi.response_description",
         "docs_surface.body"
       ],

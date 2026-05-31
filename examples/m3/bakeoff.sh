@@ -210,7 +210,7 @@ run_mode() {
 
   scenario "$defense_mode" "docs" "/docs/legacy-import" "X-Migration-Trace" "rel_2025_04_b7f2"
   scenario "$defense_mode" "open_api" "/openapi.json" "X-OpenAPI-Trace" "openapi_2026_05_f3a1"
-  scenario "$defense_mode" "hidden_route" "/internal/legacy-import-checklist" "X-Hidden-Route-Trace" "hidden_route_2026_05_d91c"
+  scenario "$defense_mode" "hidden_route" "/customer/import-recovery-checklist" "X-Hidden-Route-Trace" "hidden_route_2026_05_d91c"
   scenario "$defense_mode" "fake_credential_token" "/docs/service-token" "X-Api-Key" "eidolon_lab_token_2026_05_7e2a"
   scenario "$defense_mode" "js_discovered_route" "/assets/import-helper.js" "X-Import-Worker" "worker_2026_05_c19b"
 }

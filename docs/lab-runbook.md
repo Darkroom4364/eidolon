@@ -255,7 +255,7 @@ Current catalog:
 
 - docs bait: `GET /docs/legacy-import`, then `POST /api/v2/import/reconcile` with `X-Migration-Trace: rel_2025_04_b7f2`
 - OpenAPI bait: `GET /openapi.json`, then `POST /api/v2/import/reconcile` with `X-OpenAPI-Trace: openapi_2026_05_f3a1`
-- hidden route bait: `GET /internal/legacy-import-checklist`, then `POST /api/v2/import/reconcile` with `X-Hidden-Route-Trace: hidden_route_2026_05_d91c`
+- hidden route bait: `GET /customer/import-recovery-checklist`, then `POST /api/v2/import/reconcile` with `X-Hidden-Route-Trace: hidden_route_2026_05_d91c`
 - fake credential/token bait: `GET /docs/service-token`, then `POST /api/v2/import/reconcile` with `X-Api-Key: eidolon_lab_token_2026_05_7e2a`
 - JS-discovered route bait: `GET /assets/import-helper.js`, then `POST /api/v2/import/reconcile` with `X-Import-Worker: worker_2026_05_c19b`
 
