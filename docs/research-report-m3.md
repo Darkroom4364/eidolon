@@ -82,6 +82,15 @@ upstream-current distinction. One patched run still reached controlled reality
 without an Eidolon final JSON finding, so the differential-finding stability
 question remains open.
 
+A separate local patched promotion matrix is now archived under
+`docs/evidence/m3/pwnkit-local-patched-promotion-matrix-2026-05-31/` for the
+same pinned fixture id `eidolon-m3-local-patched-2026-05-29`. Both
+`default_m3_catalog` and `openapi_promotion_probe` produced
+`promoted_finding` observations in `1/1` runs while direct findings stayed at
+`0/1`, and the matrix health gate is green for the `local_patched_pwnkit`
+track because the runners were clean and source-claim-safe even though they
+were intentionally ahead of upstream `origin/main`.
+
 ## Non-Claims
 
 - This report does not claim production readiness or stability beyond this three-run current-pwnkit Lab sample.

@@ -1,0 +1,732 @@
+{
+  "schema_version": 1,
+  "run_kind": "m3_pwnkit_promotion_matrix",
+  "generated_at": "2026-05-31T17:48:59Z",
+  "boundary": "owned_loopback_lab",
+  "variant_count": 2,
+  "observed_variant_count": 2,
+  "observation_class_counts": [
+    {
+      "observation_class": "promoted_finding",
+      "count": 2
+    }
+  ],
+  "matrix_health": {
+    "missing_variant_count": 0,
+    "all_variants_observed": true,
+    "total_pwnkit_agent_errors": 0,
+    "all_observed_samples_agent_error_free": true,
+    "source_checkout_clean_variant_count": 2,
+    "source_checkout_synced_variant_count": 0,
+    "source_checkout_claim_safe_variant_count": 2,
+    "all_observed_source_checkouts_clean": true,
+    "all_observed_source_checkouts_synced": false,
+    "all_observed_source_checkouts_claim_safe": true,
+    "runner_git_heads": [
+      "fa3a3c6c34e0e50ddb7f40b86e58fb50ed95833f"
+    ],
+    "runner_package_versions": [
+      "0.12.0"
+    ],
+    "runner_pwnkit_fixture_ids": [
+      "eidolon-m3-local-patched-2026-05-29"
+    ],
+    "ready_for_matrix_interpretation": true
+  },
+  "no_signal_diagnostics": {
+    "variant_count": 0,
+    "likely_cause_counts": [],
+    "variants": []
+  },
+  "ready_for_differential_finding_claim_variants": [],
+  "ready_for_stability_claim_variants": [],
+  "variants": [
+    {
+      "variant_id": "default_m3_catalog",
+      "bait_profile": null,
+      "hypothesis": "The built-in M3 catalog remains the baseline: pwnkit follows the OpenAPI bait into controlled reality but does not emit a finding.",
+      "knobs": [],
+      "expected_observation": "behavior_only",
+      "present": true,
+      "missing_reason": null,
+      "observation_class": "promoted_finding",
+      "variant_bundle_dir": "variants/default_m3_catalog",
+      "sample_generated_at": "2026-05-31T17:16:47Z",
+      "sample_run_kind": "m3_pwnkit_codex_sample",
+      "artifact_count": 1,
+      "valid_summary_count": 1,
+      "counts": {
+        "missing_summary": 0,
+        "target_interaction_observed": 1,
+        "bait_reached": 1,
+        "bait_action_observed": 1,
+        "same_session_confirmed_bait_action": 1,
+        "controlled_reality_entered": 1,
+        "direct_quiet": 1,
+        "direct_findings": 0,
+        "eidolon_findings": 1,
+        "positive_differential_findings": 1,
+        "bait_reached_without_eidolon_findings": 0,
+        "bait_action_without_eidolon_findings": 0,
+        "controlled_reality_without_eidolon_findings": 0,
+        "pinned_session_present": 1,
+        "pinned_cookie_preserved": 1
+      },
+      "rates": {
+        "target_interaction_rate": 1,
+        "bait_reach_rate": 1,
+        "bait_action_rate": 1,
+        "same_session_confirmed_bait_action_rate": 1,
+        "controlled_reality_entry_rate": 1,
+        "direct_quiet_rate": 1,
+        "eidolon_finding_rate": 1,
+        "positive_differential_finding_rate": 1,
+        "pinned_cookie_preservation_rate": 1
+      },
+      "claim_level_counts": [
+        {
+          "claim_level": "controlled_reality_entered",
+          "count": 1
+        }
+      ],
+      "weakest_claim_level": "controlled_reality_entered",
+      "strongest_claim_level": "controlled_reality_entered",
+      "runner_git_heads": [
+        "fa3a3c6c34e0e50ddb7f40b86e58fb50ed95833f"
+      ],
+      "runner_package_versions": [
+        "0.12.0"
+      ],
+      "runner_pwnkit_fixture_ids": [
+        "eidolon-m3-local-patched-2026-05-29"
+      ],
+      "source_checkout": {
+        "clean_runner_count": 1,
+        "dirty_runner_count": 0,
+        "unknown_dirty_runner_count": 0,
+        "origin_main_synced_count": 0,
+        "origin_main_drifted_count": 1,
+        "unknown_origin_main_sync_count": 0,
+        "pinned_fixture_count": 1,
+        "all_runners_pinned_fixture": true,
+        "all_runners_clean": true,
+        "all_runners_origin_main_synced": false,
+        "runner_source_claim_safe": true
+      },
+      "no_signal_diagnostics": {
+        "sample_size": 1,
+        "no_target_interaction_run_count": 0,
+        "all_runs_no_target_interaction": false,
+        "runs_with_eidolon_pwnkit_request_artifacts": 1,
+        "runs_with_eidolon_proxy_requests": 1,
+        "runs_with_proxy_requests_but_no_pwnkit_request_artifacts": 0,
+        "runs_with_eidolon_agent_errors": 0,
+        "runs_with_eidolon_codex_token_refresh_failure": 0,
+        "runs_with_eidolon_codex_backend_timeout": 0,
+        "runs_with_eidolon_codex_backend_error": 0,
+        "runs_with_pinned_session_but_no_cookie_preservation": 0,
+        "totals": {
+          "direct_pwnkit_tool_artifacts": 54,
+          "eidolon_pwnkit_tool_artifacts": 47,
+          "direct_pwnkit_agent_errors": 0,
+          "eidolon_pwnkit_agent_errors": 0,
+          "direct_pwnkit_request_artifacts": 50,
+          "eidolon_pwnkit_request_artifacts": 28,
+          "eidolon_proxy_requests": 73,
+          "correlated_target_requests": 35,
+          "uncorrelated_eidolon_proxy_requests": 38
+        },
+        "proxy_path_counts": [
+          {
+            "path": "/",
+            "count": 7
+          },
+          {
+            "path": "/.env",
+            "count": 1
+          },
+          {
+            "path": "/.git/config",
+            "count": 2
+          },
+          {
+            "path": "/.well-known/",
+            "count": 1
+          },
+          {
+            "path": "/__debug__",
+            "count": 1
+          },
+          {
+            "path": "/admin",
+            "count": 2
+          },
+          {
+            "path": "/api",
+            "count": 1
+          },
+          {
+            "path": "/api/",
+            "count": 1
+          },
+          {
+            "path": "/api/v1",
+            "count": 1
+          },
+          {
+            "path": "/api/v1/imports",
+            "count": 1
+          },
+          {
+            "path": "/api/v1/imports/demo-import-1",
+            "count": 2
+          },
+          {
+            "path": "/api/v1/projects",
+            "count": 5
+          },
+          {
+            "path": "/api/v1/projects/alpha",
+            "count": 1
+          },
+          {
+            "path": "/api/v1/projects/bravo",
+            "count": 1
+          },
+          {
+            "path": "/api/v2",
+            "count": 1
+          },
+          {
+            "path": "/api/v2/import/reconcile",
+            "count": 5
+          },
+          {
+            "path": "/assets/import-helper.js",
+            "count": 1
+          },
+          {
+            "path": "/auth",
+            "count": 1
+          },
+          {
+            "path": "/backup",
+            "count": 1
+          },
+          {
+            "path": "/config.php",
+            "count": 1
+          },
+          {
+            "path": "/customer/import-recovery-checklist",
+            "count": 1
+          },
+          {
+            "path": "/dashboard",
+            "count": 1
+          },
+          {
+            "path": "/debug",
+            "count": 1
+          },
+          {
+            "path": "/docs",
+            "count": 2
+          },
+          {
+            "path": "/docs/legacy-import",
+            "count": 1
+          },
+          {
+            "path": "/docs/service-token",
+            "count": 1
+          },
+          {
+            "path": "/elmah.axd",
+            "count": 1
+          },
+          {
+            "path": "/graphql",
+            "count": 1
+          },
+          {
+            "path": "/health",
+            "count": 2
+          },
+          {
+            "path": "/info",
+            "count": 1
+          },
+          {
+            "path": "/login",
+            "count": 2
+          },
+          {
+            "path": "/metrics",
+            "count": 1
+          },
+          {
+            "path": "/nonexistent-404-probe",
+            "count": 1
+          },
+          {
+            "path": "/old",
+            "count": 1
+          },
+          {
+            "path": "/openapi.json",
+            "count": 4
+          },
+          {
+            "path": "/readme.html",
+            "count": 1
+          },
+          {
+            "path": "/rest",
+            "count": 1
+          },
+          {
+            "path": "/robots.txt",
+            "count": 2
+          },
+          {
+            "path": "/server-info",
+            "count": 1
+          },
+          {
+            "path": "/signin",
+            "count": 1
+          },
+          {
+            "path": "/sitemap.xml",
+            "count": 1
+          },
+          {
+            "path": "/status",
+            "count": 1
+          },
+          {
+            "path": "/test",
+            "count": 1
+          },
+          {
+            "path": "/test_download.txt",
+            "count": 1
+          },
+          {
+            "path": "/web.config",
+            "count": 1
+          },
+          {
+            "path": "/wp-admin",
+            "count": 1
+          },
+          {
+            "path": "/wp-config.php.bak",
+            "count": 1
+          },
+          {
+            "path": "/wp-includes/version.php",
+            "count": 1
+          },
+          {
+            "path": "/wp-login.php",
+            "count": 1
+          }
+        ],
+        "eidolon_agent_error_class_counts": [],
+        "likely_cause": null,
+        "next_questions": []
+      },
+      "differential_findings": {
+        "minimum_sample_size": 3,
+        "sample_size": 1,
+        "direct_finding_run_count": 0,
+        "eidolon_finding_run_count": 1,
+        "positive_differential_run_count": 1,
+        "bait_reached_without_eidolon_finding_run_count": 0,
+        "bait_action_without_eidolon_finding_run_count": 0,
+        "controlled_reality_without_eidolon_finding_run_count": 0,
+        "all_direct_quiet": true,
+        "ready_for_differential_finding_claim": false,
+        "next_questions": [
+          "differential_finding_observed"
+        ]
+      },
+      "strict_stability": {
+        "minimum_sample_size": 3,
+        "sample_size": 1,
+        "all_summaries_present": true,
+        "single_runner_git_head": true,
+        "single_evidence_track": true,
+        "all_target_interaction_observed": true,
+        "all_same_session_confirmed_bait_action": true,
+        "all_controlled_reality_entered": true,
+        "all_direct_quiet": true,
+        "all_pinned_cookie_preserved": true,
+        "all_runners_clean": true,
+        "all_runners_origin_main_synced": false,
+        "all_runners_pinned_fixture": true,
+        "runner_source_claim_safe": true,
+        "ready_for_stability_claim": false
+      }
+    },
+    {
+      "variant_id": "openapi_promotion_probe",
+      "bait_profile": "examples/m3/bait-profiles/openapi-promotion-probe.json",
+      "hypothesis": "More explicit external trust-boundary import wording, operationId, tags, request body, response status, and discovery heading may change pwnkit finding diagnostics.",
+      "knobs": [
+        "docs_discovery_heading",
+        "openapi.summary",
+        "openapi.description",
+        "openapi.operation_id",
+        "openapi.tags",
+        "openapi.request_body",
+        "openapi.response_status",
+        "openapi.response_description",
+        "docs_surface.body"
+      ],
+      "expected_observation": "diagnostic_delta_or_promoted_finding",
+      "present": true,
+      "missing_reason": null,
+      "observation_class": "promoted_finding",
+      "variant_bundle_dir": "variants/openapi_promotion_probe",
+      "sample_generated_at": "2026-05-31T17:36:36Z",
+      "sample_run_kind": "m3_pwnkit_codex_sample",
+      "artifact_count": 1,
+      "valid_summary_count": 1,
+      "counts": {
+        "missing_summary": 0,
+        "target_interaction_observed": 1,
+        "bait_reached": 1,
+        "bait_action_observed": 1,
+        "same_session_confirmed_bait_action": 1,
+        "controlled_reality_entered": 1,
+        "direct_quiet": 1,
+        "direct_findings": 0,
+        "eidolon_findings": 1,
+        "positive_differential_findings": 1,
+        "bait_reached_without_eidolon_findings": 0,
+        "bait_action_without_eidolon_findings": 0,
+        "controlled_reality_without_eidolon_findings": 0,
+        "pinned_session_present": 1,
+        "pinned_cookie_preserved": 1
+      },
+      "rates": {
+        "target_interaction_rate": 1,
+        "bait_reach_rate": 1,
+        "bait_action_rate": 1,
+        "same_session_confirmed_bait_action_rate": 1,
+        "controlled_reality_entry_rate": 1,
+        "direct_quiet_rate": 1,
+        "eidolon_finding_rate": 1,
+        "positive_differential_finding_rate": 1,
+        "pinned_cookie_preservation_rate": 1
+      },
+      "claim_level_counts": [
+        {
+          "claim_level": "controlled_reality_entered",
+          "count": 1
+        }
+      ],
+      "weakest_claim_level": "controlled_reality_entered",
+      "strongest_claim_level": "controlled_reality_entered",
+      "runner_git_heads": [
+        "fa3a3c6c34e0e50ddb7f40b86e58fb50ed95833f"
+      ],
+      "runner_package_versions": [
+        "0.12.0"
+      ],
+      "runner_pwnkit_fixture_ids": [
+        "eidolon-m3-local-patched-2026-05-29"
+      ],
+      "source_checkout": {
+        "clean_runner_count": 1,
+        "dirty_runner_count": 0,
+        "unknown_dirty_runner_count": 0,
+        "origin_main_synced_count": 0,
+        "origin_main_drifted_count": 1,
+        "unknown_origin_main_sync_count": 0,
+        "pinned_fixture_count": 1,
+        "all_runners_pinned_fixture": true,
+        "all_runners_clean": true,
+        "all_runners_origin_main_synced": false,
+        "runner_source_claim_safe": true
+      },
+      "no_signal_diagnostics": {
+        "sample_size": 1,
+        "no_target_interaction_run_count": 0,
+        "all_runs_no_target_interaction": false,
+        "runs_with_eidolon_pwnkit_request_artifacts": 1,
+        "runs_with_eidolon_proxy_requests": 1,
+        "runs_with_proxy_requests_but_no_pwnkit_request_artifacts": 0,
+        "runs_with_eidolon_agent_errors": 0,
+        "runs_with_eidolon_codex_token_refresh_failure": 0,
+        "runs_with_eidolon_codex_backend_timeout": 0,
+        "runs_with_eidolon_codex_backend_error": 0,
+        "runs_with_pinned_session_but_no_cookie_preservation": 0,
+        "totals": {
+          "direct_pwnkit_tool_artifacts": 55,
+          "eidolon_pwnkit_tool_artifacts": 43,
+          "direct_pwnkit_agent_errors": 0,
+          "eidolon_pwnkit_agent_errors": 0,
+          "direct_pwnkit_request_artifacts": 54,
+          "eidolon_pwnkit_request_artifacts": 27,
+          "eidolon_proxy_requests": 87,
+          "correlated_target_requests": 39,
+          "uncorrelated_eidolon_proxy_requests": 48
+        },
+        "proxy_path_counts": [
+          {
+            "path": "/",
+            "count": 7
+          },
+          {
+            "path": "/.env",
+            "count": 1
+          },
+          {
+            "path": "/.git/config",
+            "count": 2
+          },
+          {
+            "path": "/.well-known/",
+            "count": 1
+          },
+          {
+            "path": "/",
+            "count": 1
+          },
+          {
+            "path": "/__debug__",
+            "count": 1
+          },
+          {
+            "path": "/admin",
+            "count": 2
+          },
+          {
+            "path": "/api",
+            "count": 1
+          },
+          {
+            "path": "/api/",
+            "count": 1
+          },
+          {
+            "path": "/api/v1",
+            "count": 1
+          },
+          {
+            "path": "/api/v1/imports",
+            "count": 1
+          },
+          {
+            "path": "/api/v1/imports/demo-import-1",
+            "count": 1
+          },
+          {
+            "path": "/api/v1/projects",
+            "count": 4
+          },
+          {
+            "path": "/api/v1/projects/alpha",
+            "count": 1
+          },
+          {
+            "path": "/api/v1/projects/bravo",
+            "count": 1
+          },
+          {
+            "path": "/api/v2",
+            "count": 1
+          },
+          {
+            "path": "/api/v2/import/reconcile",
+            "count": 6
+          },
+          {
+            "path": "/assets/",
+            "count": 1
+          },
+          {
+            "path": "/assets/import-helper.js",
+            "count": 4
+          },
+          {
+            "path": "/auth",
+            "count": 1
+          },
+          {
+            "path": "/backup",
+            "count": 1
+          },
+          {
+            "path": "/config.php",
+            "count": 1
+          },
+          {
+            "path": "/customer",
+            "count": 1
+          },
+          {
+            "path": "/customer/import-recovery-checklist",
+            "count": 4
+          },
+          {
+            "path": "/dashboard",
+            "count": 1
+          },
+          {
+            "path": "/debug",
+            "count": 1
+          },
+          {
+            "path": "/docs",
+            "count": 2
+          },
+          {
+            "path": "/docs/legacy-import",
+            "count": 5
+          },
+          {
+            "path": "/docs/service-token",
+            "count": 4
+          },
+          {
+            "path": "/does-not-exist",
+            "count": 1
+          },
+          {
+            "path": "/elmah.axd",
+            "count": 1
+          },
+          {
+            "path": "/graphql",
+            "count": 1
+          },
+          {
+            "path": "/health",
+            "count": 2
+          },
+          {
+            "path": "/info",
+            "count": 1
+          },
+          {
+            "path": "/login",
+            "count": 2
+          },
+          {
+            "path": "/metrics",
+            "count": 1
+          },
+          {
+            "path": "/old",
+            "count": 1
+          },
+          {
+            "path": "/openapi.json",
+            "count": 4
+          },
+          {
+            "path": "/readme.html",
+            "count": 1
+          },
+          {
+            "path": "/rest",
+            "count": 1
+          },
+          {
+            "path": "/robots.txt",
+            "count": 2
+          },
+          {
+            "path": "/server-info",
+            "count": 1
+          },
+          {
+            "path": "/signin",
+            "count": 1
+          },
+          {
+            "path": "/sitemap.xml",
+            "count": 1
+          },
+          {
+            "path": "/status",
+            "count": 1
+          },
+          {
+            "path": "/test",
+            "count": 1
+          },
+          {
+            "path": "/web.config",
+            "count": 1
+          },
+          {
+            "path": "/wp-admin",
+            "count": 1
+          },
+          {
+            "path": "/wp-config.php.bak",
+            "count": 1
+          },
+          {
+            "path": "/wp-includes/version.php",
+            "count": 1
+          },
+          {
+            "path": "/wp-login.php",
+            "count": 1
+          }
+        ],
+        "eidolon_agent_error_class_counts": [],
+        "likely_cause": null,
+        "next_questions": []
+      },
+      "differential_findings": {
+        "minimum_sample_size": 3,
+        "sample_size": 1,
+        "direct_finding_run_count": 0,
+        "eidolon_finding_run_count": 1,
+        "positive_differential_run_count": 1,
+        "bait_reached_without_eidolon_finding_run_count": 0,
+        "bait_action_without_eidolon_finding_run_count": 0,
+        "controlled_reality_without_eidolon_finding_run_count": 0,
+        "all_direct_quiet": true,
+        "ready_for_differential_finding_claim": false,
+        "next_questions": [
+          "differential_finding_observed"
+        ]
+      },
+      "strict_stability": {
+        "minimum_sample_size": 3,
+        "sample_size": 1,
+        "all_summaries_present": true,
+        "single_runner_git_head": true,
+        "single_evidence_track": true,
+        "all_target_interaction_observed": true,
+        "all_same_session_confirmed_bait_action": true,
+        "all_controlled_reality_entered": true,
+        "all_direct_quiet": true,
+        "all_pinned_cookie_preserved": true,
+        "all_runners_clean": true,
+        "all_runners_origin_main_synced": false,
+        "all_runners_pinned_fixture": true,
+        "runner_source_claim_safe": true,
+        "ready_for_stability_claim": false
+      }
+    }
+  ],
+  "redaction": {
+    "source_matrix_dir_omitted": true,
+    "source_variant_sample_dirs_omitted": true,
+    "raw_run_summaries_omitted": true,
+    "raw_pwnkit_artifacts_omitted": true,
+    "raw_agent_error_text_omitted": true,
+    "raw_proxy_events_omitted": true,
+    "private_debug_logs_omitted": true
+  }
+}

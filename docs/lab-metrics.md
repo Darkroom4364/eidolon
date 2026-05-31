@@ -488,10 +488,15 @@ long matrix.
 
 The matrix summary also includes `matrix_health`, which aggregates missing
 variants, pwnkit `agent_error` counts, source-checkout cleanliness/sync status,
-runner heads, package versions, and pinned fixture IDs. Treat
+source-claim-safety, runner heads, package versions, and pinned fixture IDs. Treat
 `matrix_health.ready_for_matrix_interpretation: true` as the minimum health gate
 before interpreting a promotion matrix. For `no_signal` matrices, still inspect
 `no_signal_diagnostics.likely_cause` before tuning bait semantics.
+
+For `local_patched_pwnkit` matrices, `ready_for_matrix_interpretation: true`
+does not require `all_observed_source_checkouts_synced: true`; a clean pinned
+fixture can still be interpretation-ready when
+`all_observed_source_checkouts_claim_safe: true`.
 
 The matrix evidence packager enforces the same health gate by default through
 `examples/m3/check-pwnkit-promotion-matrix-health.sh`. A matrix whose
@@ -499,7 +504,7 @@ The matrix evidence packager enforces the same health gate by default through
 commit-ready evidence bundle. Set
 `EIDOLON_M3_ALLOW_UNHEALTHY_PROMOTION_MATRIX=1` only to preserve a diagnostic
 bundle for debugging failed collection, agent runtime errors, missing variants,
-or source-checkout drift.
+or source-claim-safety failures.
 
 To aggregate already-collected variant samples manually:
 

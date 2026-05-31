@@ -89,6 +89,20 @@ in `3/3` runs, and Eidolon final JSON findings appeared in `2/3` runs. Treat
 that as `local_patched_pwnkit` evidence only; it confirms the export-gap patch
 direction but does not make an upstream-current pwnkit claim.
 
+A follow-up local patched promotion matrix was collected on 2026-05-31 at the
+same head and archived under
+`docs/evidence/m3/pwnkit-local-patched-promotion-matrix-2026-05-31`. The
+matrix stayed agent-error-free, direct legs stayed quiet in both variants, both
+variants preserved the pinned session and reached same-session controlled
+reality, and both `default_m3_catalog` and `openapi_promotion_probe`
+classified as `promoted_finding`. The matrix is interpretation-ready for the
+`local_patched_pwnkit` track because every observed runner was clean, pinned to
+fixture id `eidolon-m3-local-patched-2026-05-29`, and recorded
+`source_checkout.runner_source_claim_safe: true` even though `origin/main`
+remained intentionally out of sync. Treat this as a local-patched confirmation
+that the export-gap patch is sufficient for both the baseline and the probe
+catalog shapes; it is still not an upstream-current claim.
+
 ## Pre-Run Checklist
 
 Before collecting a new sample:
@@ -244,6 +258,12 @@ signals per manifest variant and adds:
 - `no_signal_diagnostics`
 - `ready_for_differential_finding_claim_variants`
 - `ready_for_stability_claim_variants`
+
+The matrix-level `ready_for_matrix_interpretation` gate follows the same
+source-claim-safety rule: `upstream_current` matrices must stay clean and synced
+to local `origin/main`, while `local_patched_pwnkit` matrices may still be
+interpretation-ready when every observed sample is clean, pinned to an explicit
+fixture id, and records `source_checkout.runner_source_claim_safe: true`.
 
 ## Interpretation
 
