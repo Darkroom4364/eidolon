@@ -46,10 +46,12 @@ print_sanitized_matrix_health() {
       "       matrix_health.all_observed_samples_agent_error_free=\(bool_or_unknown($health.all_observed_samples_agent_error_free))",
       "       matrix_health.all_observed_source_checkouts_clean=\(bool_or_unknown($health.all_observed_source_checkouts_clean))",
       "       matrix_health.all_observed_source_checkouts_synced=\(bool_or_unknown($health.all_observed_source_checkouts_synced))",
+      "       matrix_health.all_observed_source_checkouts_claim_safe=\(bool_or_unknown($health.all_observed_source_checkouts_claim_safe))",
       "       matrix_health.missing_variant_count=\(count_or_unknown($health.missing_variant_count))",
       "       matrix_health.total_pwnkit_agent_errors=\(count_or_unknown($health.total_pwnkit_agent_errors))",
       "       matrix_health.source_checkout_clean_variant_count=\(count_or_unknown($health.source_checkout_clean_variant_count))",
       "       matrix_health.source_checkout_synced_variant_count=\(count_or_unknown($health.source_checkout_synced_variant_count))",
+      "       matrix_health.source_checkout_claim_safe_variant_count=\(count_or_unknown($health.source_checkout_claim_safe_variant_count))",
       "       matrix_health.runner_git_heads=\((($health.runner_git_heads // []) | map(safe_token) | join(",")) // "")",
       "       matrix_health.runner_package_versions=\((($health.runner_package_versions // []) | map(safe_token) | join(",")) // "")",
       "       matrix_health.runner_pwnkit_fixture_ids=\((($health.runner_pwnkit_fixture_ids // []) | map(safe_token) | join(",")) // "")"
@@ -81,7 +83,7 @@ if [[ "$ready" == "true" ]]; then
 fi
 
 echo "error: pwnkit promotion matrix is not healthy enough to interpret" >&2
-echo "       fix missing variants, pwnkit agent errors, or runner source drift before interpreting matrix results." >&2
+echo "       fix missing variants, pwnkit agent errors, or runner source-claim safety failures before interpreting matrix results." >&2
 echo "       set EIDOLON_M3_ALLOW_UNHEALTHY_PROMOTION_MATRIX=1 only for diagnostic no-signal runs." >&2
 print_sanitized_matrix_health
 exit 1

@@ -287,6 +287,19 @@ main() {
               | map(select(.source_checkout.all_runners_origin_main_synced == true))
               | length
             ),
+            source_checkout_claim_safe_variant_count: (
+              $observed
+              | map(
+                  select(
+                    (
+                      .source_checkout.runner_source_claim_safe
+                      // .source_checkout.all_runners_origin_main_synced
+                      // false
+                    ) == true
+                  )
+                )
+              | length
+            ),
             all_observed_source_checkouts_clean: (
               ($observed | length) > 0
               and all($observed[]; .source_checkout.all_runners_clean == true)
@@ -294,6 +307,17 @@ main() {
             all_observed_source_checkouts_synced: (
               ($observed | length) > 0
               and all($observed[]; .source_checkout.all_runners_origin_main_synced == true)
+            ),
+            all_observed_source_checkouts_claim_safe: (
+              ($observed | length) > 0
+              and all(
+                $observed[];
+                (
+                  .source_checkout.runner_source_claim_safe
+                  // .source_checkout.all_runners_origin_main_synced
+                  // false
+                ) == true
+              )
             ),
             runner_git_heads: ($observed | map(.runner_git_heads[]?) | unique),
             runner_package_versions: (
@@ -307,7 +331,14 @@ main() {
               and ($observed | length) == ($variants | length)
               and all($observed[]; agent_error_total(.) == 0)
               and all($observed[]; .source_checkout.all_runners_clean == true)
-              and all($observed[]; .source_checkout.all_runners_origin_main_synced == true)
+              and all(
+                $observed[];
+                (
+                  .source_checkout.runner_source_claim_safe
+                  // .source_checkout.all_runners_origin_main_synced
+                  // false
+                ) == true
+              )
             )
           },
           no_signal_diagnostics: {
