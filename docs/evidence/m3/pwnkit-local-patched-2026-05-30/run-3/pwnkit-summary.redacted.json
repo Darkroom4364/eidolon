@@ -184,6 +184,7 @@
         "final_json_finding_count": 0,
         "db_saved_finding_count": 2,
         "db_active_finding_count": 0,
+        "db_inactive_finding_count": 2,
         "counts_match": false,
         "db_saved_findings_omitted_from_final_json": true,
         "final_json_omitted_db_saved_finding_count": 2,
@@ -225,7 +226,188 @@
             "value": "missing-validation",
             "count": 2
           }
-        ]
+        ],
+        "db_rejection_diagnostics": {
+          "inactive_finding_count": 2,
+          "inactive_reason_counts": [
+            {
+              "value": "status:false-positive",
+              "count": 2
+            },
+            {
+              "value": "triage:suppressed",
+              "count": 1
+            }
+          ],
+          "lifecycle_counts": [
+            {
+              "status": "false-positive",
+              "triage_status": "new",
+              "workflow_status": "backlog",
+              "active": false,
+              "count": 1
+            },
+            {
+              "status": "false-positive",
+              "triage_status": "suppressed",
+              "workflow_status": "backlog",
+              "active": false,
+              "count": 1
+            }
+          ],
+          "inactive_lifecycle_counts": [
+            {
+              "status": "false-positive",
+              "triage_status": "new",
+              "workflow_status": "backlog",
+              "active": false,
+              "count": 1
+            },
+            {
+              "status": "false-positive",
+              "triage_status": "suppressed",
+              "workflow_status": "backlog",
+              "active": false,
+              "count": 1
+            }
+          ],
+          "artifact_presence": {
+            "triage_note": 1,
+            "layer_verdicts": 2,
+            "poc_steps": 2,
+            "verification_spec": 0,
+            "poc_execution": 0,
+            "score": 0,
+            "cvss_score": 1
+          },
+          "inactive_artifact_presence": {
+            "triage_note": 1,
+            "layer_verdicts": 2,
+            "poc_steps": 2,
+            "verification_spec": 0,
+            "poc_execution": 0,
+            "score": 0,
+            "cvss_score": 1
+          },
+          "confidence_bucket_counts": [
+            {
+              "value": "high",
+              "count": 2
+            }
+          ],
+          "layer_verdict_counts": [
+            {
+              "layer": "evidence_gate",
+              "verdict": "pass",
+              "count": 1
+            },
+            {
+              "layer": "holding_it_wrong",
+              "verdict": "pass",
+              "count": 1
+            },
+            {
+              "layer": "holding_it_wrong",
+              "verdict": "reject",
+              "count": 1
+            },
+            {
+              "layer": "multi_modal",
+              "verdict": "skip",
+              "count": 1
+            },
+            {
+              "layer": "oracle",
+              "verdict": "skip",
+              "count": 1
+            },
+            {
+              "layer": "pov_gate",
+              "verdict": "skip",
+              "count": 1
+            },
+            {
+              "layer": "reachability",
+              "verdict": "skip",
+              "count": 1
+            }
+          ],
+          "inactive_layer_verdict_counts": [
+            {
+              "layer": "evidence_gate",
+              "verdict": "pass",
+              "count": 1
+            },
+            {
+              "layer": "holding_it_wrong",
+              "verdict": "pass",
+              "count": 1
+            },
+            {
+              "layer": "holding_it_wrong",
+              "verdict": "reject",
+              "count": 1
+            },
+            {
+              "layer": "multi_modal",
+              "verdict": "skip",
+              "count": 1
+            },
+            {
+              "layer": "oracle",
+              "verdict": "skip",
+              "count": 1
+            },
+            {
+              "layer": "pov_gate",
+              "verdict": "skip",
+              "count": 1
+            },
+            {
+              "layer": "reachability",
+              "verdict": "skip",
+              "count": 1
+            }
+          ],
+          "reject_layer_counts": [
+            {
+              "layer": "holding_it_wrong",
+              "count": 1
+            }
+          ],
+          "inactive_reject_layer_counts": [
+            {
+              "layer": "holding_it_wrong",
+              "count": 1
+            }
+          ],
+          "reject_reason_class_counts": [
+            {
+              "layer": "holding_it_wrong",
+              "reason_class": "trusted_backend_or_no_trust_boundary",
+              "count": 1
+            }
+          ],
+          "inactive_reject_reason_class_counts": [
+            {
+              "layer": "holding_it_wrong",
+              "reason_class": "trusted_backend_or_no_trust_boundary",
+              "count": 1
+            }
+          ],
+          "severity_change_counts": [
+            {
+              "value": "medium_to_info",
+              "count": 1
+            }
+          ],
+          "inactive_severity_change_counts": [
+            {
+              "value": "medium_to_info",
+              "count": 1
+            }
+          ]
+        }
       },
       "target_evidence_diagnostics": {
         "request_artifact_count": 50,
@@ -301,6 +483,7 @@
         "final_json_finding_count": 0,
         "db_saved_finding_count": 0,
         "db_active_finding_count": 0,
+        "db_inactive_finding_count": 0,
         "counts_match": true,
         "db_saved_findings_omitted_from_final_json": false,
         "final_json_omitted_db_saved_finding_count": 0,
@@ -309,7 +492,40 @@
         "db_triage_status_counts": [],
         "db_workflow_status_counts": [],
         "db_severity_counts": [],
-        "db_category_counts": []
+        "db_category_counts": [],
+        "db_rejection_diagnostics": {
+          "inactive_finding_count": 0,
+          "inactive_reason_counts": [],
+          "lifecycle_counts": [],
+          "inactive_lifecycle_counts": [],
+          "artifact_presence": {
+            "triage_note": 0,
+            "layer_verdicts": 0,
+            "poc_steps": 0,
+            "verification_spec": 0,
+            "poc_execution": 0,
+            "score": 0,
+            "cvss_score": 0
+          },
+          "inactive_artifact_presence": {
+            "triage_note": 0,
+            "layer_verdicts": 0,
+            "poc_steps": 0,
+            "verification_spec": 0,
+            "poc_execution": 0,
+            "score": 0,
+            "cvss_score": 0
+          },
+          "confidence_bucket_counts": [],
+          "layer_verdict_counts": [],
+          "inactive_layer_verdict_counts": [],
+          "reject_layer_counts": [],
+          "inactive_reject_layer_counts": [],
+          "reject_reason_class_counts": [],
+          "inactive_reject_reason_class_counts": [],
+          "severity_change_counts": [],
+          "inactive_severity_change_counts": []
+        }
       },
       "target_evidence_diagnostics": {
         "request_artifact_count": 54,

@@ -116,6 +116,22 @@ sqlite_column_expr() {
   fi
 }
 
+sqlite_presence_expr() {
+  local db="$1"
+  local table="$2"
+  local column="$3"
+  local alias="$4"
+
+  if sqlite_has_column "$db" "$table" "$column"; then
+    printf 'case when "%s" is null or "%s" = "" then 0 else 1 end as "%s"' \
+      "$column" \
+      "$column" \
+      "$alias"
+  else
+    printf '0 as "%s"' "$alias"
+  fi
+}
+
 run_summary() {
   local label="$1"
   local report_file="$ARTIFACT_DIR/pwnkit-$label.json"
@@ -234,6 +250,15 @@ run_summary() {
        $(sqlite_column_expr "$db_file" "findings" "status" "status"),
        $(sqlite_column_expr "$db_file" "findings" "triageStatus" "triage_status"),
        $(sqlite_column_expr "$db_file" "findings" "workflowStatus" "workflow_status"),
+       $(sqlite_column_expr "$db_file" "findings" "confidence" "confidence"),
+       $(sqlite_column_expr "$db_file" "findings" "score" "score"),
+       $(sqlite_column_expr "$db_file" "findings" "cvssScore" "cvss_score"),
+       $(sqlite_column_expr "$db_file" "findings" "layerVerdicts" "layer_verdicts"),
+       $(sqlite_presence_expr "$db_file" "findings" "triageNote" "triage_note_present"),
+       $(sqlite_presence_expr "$db_file" "findings" "layerVerdicts" "layer_verdicts_present"),
+       $(sqlite_presence_expr "$db_file" "findings" "pocSteps" "poc_steps_present"),
+       $(sqlite_presence_expr "$db_file" "findings" "verificationSpec" "verification_spec_present"),
+       $(sqlite_presence_expr "$db_file" "findings" "pocExecution" "poc_execution_present"),
        $(sqlite_column_expr "$db_file" "findings" "timestamp" "timestamp")
      from findings
      order by rowid;"
@@ -380,23 +405,238 @@ run_summary() {
            or $status == "rejected"
            or $status == "closed"
          );
-     def db_active_findings:
+     def present_flag:
+       . == true or . == 1 or . == "1";
+     def parse_json_array:
+       if . == null then
+         []
+       elif type == "array" then
+         .
+       elif type == "string" and length > 0 then
+         try (fromjson | if type == "array" then . else [] end) catch []
+       else
+         []
+       end;
+     def numeric_value:
+       if . == null or . == "" then null else (try tonumber catch null) end;
+     def confidence_bucket:
+       (numeric_value) as $confidence
+       | if $confidence == null then
+           null
+         elif $confidence >= 0.8 then
+           "high"
+         elif $confidence >= 0.5 then
+           "medium"
+         else
+           "low"
+         end;
+     def reason_class:
+       ((. // "") | tostring | ascii_downcase) as $reason
+       | if $reason == "" then
+           null
+         elif (
+           ($reason | contains("trust boundary"))
+           or ($reason | contains("trusted backend"))
+           or ($reason | contains("trusted provider"))
+           or ($reason | contains("host application"))
+           or ($reason | contains("holding-it-wrong"))
+         ) then
+           "trusted_backend_or_no_trust_boundary"
+         elif (
+           ($reason | contains("evidence_completeness"))
+           or ($reason | contains("evidence completeness"))
+           or ($reason | contains("insufficient evidence"))
+         ) then
+           "evidence_gate"
+         elif (
+           ($reason | contains("reachability"))
+           or ($reason | contains("not reachable"))
+         ) then
+           "reachability_gate"
+         elif ($reason | contains("no oracle")) then
+           "oracle_unavailable"
+         elif (
+           ($reason | contains("pwnkit_feature_"))
+           or ($reason | contains("feature disabled"))
+         ) then
+           "feature_disabled"
+         elif (
+           ($reason | contains("could not independently reproduce"))
+           or ($reason | contains("verifier error"))
+           or ($reason | contains("verification failed"))
+         ) then
+           "verification_rejected"
+         elif (
+           ($reason | contains("timeout"))
+           or ($reason | contains("timed out"))
+         ) then
+           "timeout"
+         else
+           "other"
+         end;
+     def severity_change_class:
+       if (. // null) == null then
+         null
+       else
+         (((.from // "unknown") | tostring) + "_to_" + ((.to // "unknown") | tostring))
+       end;
+     def db_findings_with_lifecycle:
        db_findings
        | map(
-           select(
-             (rejected_finding_status(.status) | not)
-             and (rejected_finding_status(.triage_status) | not)
-           )
+           . + {
+             active: (
+               (rejected_finding_status(.status) | not)
+               and (rejected_finding_status(.triage_status) | not)
+             )
+           }
          );
+     def db_active_findings:
+       db_findings_with_lifecycle | map(select(.active));
+     def db_inactive_findings:
+       db_findings_with_lifecycle | map(select(.active | not));
      def db_saved_finding_count: (db_findings | length);
      def db_active_finding_count: (db_active_findings | length);
+     def db_inactive_finding_count: (db_inactive_findings | length);
      def positive_delta($left; $right):
        if $left > $right then $left - $right else 0 end;
+     def lifecycle_rejection_reasons($finding):
+       [
+         if rejected_finding_status($finding.status) then
+           "status:" + (($finding.status | normalized_value) // "unknown")
+         else
+           empty
+         end,
+         if rejected_finding_status($finding.triage_status) then
+           "triage:" + (($finding.triage_status | normalized_value) // "unknown")
+         else
+           empty
+         end,
+         if (($finding.workflow_status // "") | tostring | ascii_downcase) == "cancelled" then
+           "workflow:cancelled"
+         else
+           empty
+         end
+       ];
+     def db_lifecycle_counts($findings):
+       $findings
+       | map({
+           status: ((.status | normalized_value) // "unknown"),
+           triage_status: ((.triage_status | normalized_value) // "unknown"),
+           workflow_status: ((.workflow_status | normalized_value) // "unknown"),
+           active: (.active // false)
+         })
+       | sort_by(.status, .triage_status, .workflow_status, .active)
+       | group_by([.status, .triage_status, .workflow_status, .active])
+       | map({
+           status: .[0].status,
+           triage_status: .[0].triage_status,
+           workflow_status: .[0].workflow_status,
+           active: .[0].active,
+           count: length
+         });
+     def db_artifact_presence($findings):
+       {
+         triage_note: ($findings | map(select(.triage_note_present | present_flag)) | length),
+         layer_verdicts: ($findings | map(select(.layer_verdicts_present | present_flag)) | length),
+         poc_steps: ($findings | map(select(.poc_steps_present | present_flag)) | length),
+         verification_spec: (
+           $findings | map(select(.verification_spec_present | present_flag)) | length
+         ),
+         poc_execution: (
+           $findings | map(select(.poc_execution_present | present_flag)) | length
+         ),
+         score: ($findings | map(select((.score | numeric_value) != null)) | length),
+         cvss_score: ($findings | map(select((.cvss_score | numeric_value) != null)) | length)
+       };
+     def parsed_layer_verdicts($findings):
+       $findings
+       | map(
+           . as $finding
+           | (
+               $finding.layer_verdicts
+               | parse_json_array
+               | map({
+                   layer: ((.layer | normalized_value) // "unknown"),
+                   verdict: ((.verdict | normalized_value) // "unknown"),
+                   reason_class: (.reason | reason_class),
+                   severity_change: (.changedSeverity | severity_change_class),
+                   finding_active: ($finding.active // false)
+                 })
+             )
+         )
+       | add // [];
+     def count_by_layer_verdict($layer_verdicts):
+       $layer_verdicts
+       | sort_by(.layer, .verdict)
+       | group_by([.layer, .verdict])
+       | map({
+           layer: .[0].layer,
+           verdict: .[0].verdict,
+           count: length
+         });
+     def count_by_layer($layer_verdicts):
+       $layer_verdicts
+       | sort_by(.layer)
+       | group_by(.layer)
+       | map({layer: .[0].layer, count: length});
+     def count_by_layer_reason($layer_verdicts):
+       $layer_verdicts
+       | map(select(.reason_class != null))
+       | sort_by(.layer, .reason_class)
+       | group_by([.layer, .reason_class])
+       | map({
+           layer: .[0].layer,
+           reason_class: .[0].reason_class,
+           count: length
+         });
+     def count_by_severity_change($layer_verdicts):
+       $layer_verdicts
+       | map(.severity_change)
+       | count_by(.);
+     def db_rejection_diagnostics:
+       (db_findings_with_lifecycle) as $all_findings
+       | (db_inactive_findings) as $inactive_findings
+       | (parsed_layer_verdicts($all_findings)) as $all_layer_verdicts
+       | (parsed_layer_verdicts($inactive_findings)) as $inactive_layer_verdicts
+       | {
+           inactive_finding_count: ($inactive_findings | length),
+           inactive_reason_counts: count_by(
+             $inactive_findings
+             | map(lifecycle_rejection_reasons(.))
+             | add // []
+           ),
+           lifecycle_counts: db_lifecycle_counts($all_findings),
+           inactive_lifecycle_counts: db_lifecycle_counts($inactive_findings),
+           artifact_presence: db_artifact_presence($all_findings),
+           inactive_artifact_presence: db_artifact_presence($inactive_findings),
+           confidence_bucket_counts: count_by(
+             $all_findings | map(.confidence | confidence_bucket)
+           ),
+           layer_verdict_counts: count_by_layer_verdict($all_layer_verdicts),
+           inactive_layer_verdict_counts: count_by_layer_verdict($inactive_layer_verdicts),
+           reject_layer_counts: count_by_layer(
+             $all_layer_verdicts | map(select(.verdict == "reject"))
+           ),
+           inactive_reject_layer_counts: count_by_layer(
+             $inactive_layer_verdicts | map(select(.verdict == "reject"))
+           ),
+           reject_reason_class_counts: count_by_layer_reason(
+             $all_layer_verdicts | map(select(.verdict == "reject"))
+           ),
+           inactive_reject_reason_class_counts: count_by_layer_reason(
+             $inactive_layer_verdicts | map(select(.verdict == "reject"))
+           ),
+           severity_change_counts: count_by_severity_change($all_layer_verdicts),
+           inactive_severity_change_counts: count_by_severity_change(
+             $inactive_layer_verdicts
+           )
+         };
      def finding_reconciliation:
        {
          final_json_finding_count: finding_count,
          db_saved_finding_count: db_saved_finding_count,
          db_active_finding_count: db_active_finding_count,
+         db_inactive_finding_count: db_inactive_finding_count,
          counts_match: (finding_count == db_saved_finding_count),
          db_saved_findings_omitted_from_final_json: (
            db_saved_finding_count > finding_count
@@ -415,7 +655,8 @@ run_summary() {
            db_findings | map(.workflow_status | normalized_value)
          ),
          db_severity_counts: count_by(db_findings | map(.severity | normalized_value)),
-         db_category_counts: count_by(db_findings | map(.category | normalized_value))
+         db_category_counts: count_by(db_findings | map(.category | normalized_value)),
+         db_rejection_diagnostics: db_rejection_diagnostics
        };
      def field_presence($fields):
        $fields

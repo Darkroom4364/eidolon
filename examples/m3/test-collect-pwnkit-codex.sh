@@ -82,6 +82,14 @@ create_findings_table() {
       status text,
       triageStatus text,
       workflowStatus text,
+      triageNote text,
+      confidence real,
+      score integer,
+      cvssScore real,
+      layerVerdicts text,
+      pocSteps text,
+      verificationSpec text,
+      pocExecution text,
       timestamp integer
     );
   '
@@ -108,6 +116,53 @@ insert_db_finding() {
         '$(sql_quote "$workflow_status")',
         $timestamp_ms
       );
+  "
+}
+
+set_latest_db_finding_metadata() {
+  local dir="$1"
+  local triage_note="$2"
+  local confidence="$3"
+  local score="$4"
+  local cvss_score="$5"
+  local layer_verdicts="$6"
+  local poc_steps="$7"
+  local triage_note_sql
+  local score_sql
+  local cvss_score_sql
+  local layer_verdicts_sql
+  local poc_steps_sql
+
+  if [[ -z "$triage_note" ]]; then
+    triage_note_sql="null"
+  else
+    triage_note_sql="'$(sql_quote "$triage_note")'"
+  fi
+
+  if [[ -z "$score" ]]; then
+    score_sql="null"
+  else
+    score_sql="$score"
+  fi
+
+  if [[ -z "$cvss_score" ]]; then
+    cvss_score_sql="null"
+  else
+    cvss_score_sql="$cvss_score"
+  fi
+
+  layer_verdicts_sql="'$(sql_quote "$layer_verdicts")'"
+  poc_steps_sql="'$(sql_quote "$poc_steps")'"
+
+  sqlite3 "$dir/pwnkit-eidolon.db" "
+    update findings
+       set triageNote = $triage_note_sql,
+           confidence = $confidence,
+           score = $score_sql,
+           cvssScore = $cvss_score_sql,
+           layerVerdicts = $layer_verdicts_sql,
+           pocSteps = $poc_steps_sql
+     where rowid = (select max(rowid) from findings);
   "
 }
 
@@ -544,11 +599,48 @@ test_no_signal_diagnostics_do_not_classify_generic_api_timeouts_as_codex() {
 
 test_finding_diagnostics_are_shape_only() {
   local dir
+  local active_layer_verdicts
+  local inactive_layer_verdicts
+  local poc_steps
   dir="$(new_artifact)"
   init_artifact "$dir" "session-a"
   create_findings_table "$dir"
+
+  active_layer_verdicts="$(jq -cn '[
+    {
+      layer: "evidence_gate",
+      verdict: "pass",
+      reason: "do-not-emit-layer-reason evidence_completeness=1.00"
+    }
+  ]')"
+  inactive_layer_verdicts="$(jq -cn '[
+    {
+      layer: "holding_it_wrong",
+      verdict: "reject",
+      reason: "do-not-emit-layer-reason trusted backend crosses no trust boundary",
+      changedSeverity: {from: "medium", to: "info"}
+    }
+  ]')"
+  poc_steps="$(jq -cn '[{kind:"http",description:"do-not-emit-poc-step"}]')"
+
   insert_db_finding "$dir" high exposure open open reported 1767225601000
+  set_latest_db_finding_metadata \
+    "$dir" \
+    "" \
+    "0.92" \
+    "85" \
+    "" \
+    "$active_layer_verdicts" \
+    "$poc_steps"
   insert_db_finding "$dir" low noise suppressed suppressed closed 1767225602000
+  set_latest_db_finding_metadata \
+    "$dir" \
+    "do-not-emit-triage-note" \
+    "0.81" \
+    "" \
+    "4.0" \
+    "$inactive_layer_verdicts" \
+    "$poc_steps"
   cat > "$dir/pwnkit-eidolon.json" <<'JSON'
 {
   "findings": [
@@ -581,11 +673,43 @@ JSON
     and .comparison.finding_export_gap.eidolon_db_saved_finding_count == 2
     and .comparison.finding_export_gap.eidolon_db_active_finding_count == 1
     and .comparison.finding_export_gap.eidolon_db_saved_findings_omitted_from_final_json == true
+    and .runs.eidolon.finding_reconciliation.db_inactive_finding_count == 1
+    and .runs.eidolon.finding_reconciliation.db_rejection_diagnostics.inactive_finding_count == 1
+    and .runs.eidolon.finding_reconciliation.db_rejection_diagnostics.inactive_reason_counts == [
+      {value: "status:suppressed", count: 1},
+      {value: "triage:suppressed", count: 1}
+    ]
+    and .runs.eidolon.finding_reconciliation.db_rejection_diagnostics.artifact_presence == {
+      triage_note: 1,
+      layer_verdicts: 2,
+      poc_steps: 2,
+      verification_spec: 0,
+      poc_execution: 0,
+      score: 1,
+      cvss_score: 1
+    }
+    and .runs.eidolon.finding_reconciliation.db_rejection_diagnostics.confidence_bucket_counts == [
+      {value: "high", count: 2}
+    ]
+    and .runs.eidolon.finding_reconciliation.db_rejection_diagnostics.reject_layer_counts == [
+      {layer: "holding_it_wrong", count: 1}
+    ]
+    and .runs.eidolon.finding_reconciliation.db_rejection_diagnostics.reject_reason_class_counts == [
+      {
+        layer: "holding_it_wrong",
+        reason_class: "trusted_backend_or_no_trust_boundary",
+        count: 1
+      }
+    ]
+    and .runs.eidolon.finding_reconciliation.db_rejection_diagnostics.severity_change_counts == [
+      {value: "medium_to_info", count: 1}
+    ]
     and .runs.eidolon.finding_diagnostics.severity_counts == [{value: "high", count: 1}]
     and .runs.eidolon.finding_diagnostics.category_counts == [{value: "exposure", count: 1}]
     and .runs.eidolon.finding_diagnostics.confidence_counts == [{value: "medium", count: 1}]
     and .runs.eidolon.finding_diagnostics.evidence_presence.request_evidence == 1
     and (.runs.eidolon.finding_diagnostics | tostring | contains("do-not-emit") | not)
+    and (.runs.eidolon.finding_reconciliation | tostring | contains("do-not-emit") | not)
   ' "$dir/summary.json" >/dev/null
 }
 
