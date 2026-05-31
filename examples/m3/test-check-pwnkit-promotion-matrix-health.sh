@@ -17,6 +17,7 @@ write_matrix() {
   local all_agent_error_free="$6"
   local all_clean="$7"
   local all_synced="$8"
+  local all_claim_safe="$9"
 
   jq -n \
     --argjson ready "$ready" \
@@ -26,6 +27,7 @@ write_matrix() {
     --argjson all_agent_error_free "$all_agent_error_free" \
     --argjson all_clean "$all_clean" \
     --argjson all_synced "$all_synced" \
+    --argjson all_claim_safe "$all_claim_safe" \
     '{
       schema_version: 1,
       run_kind: "m3_pwnkit_promotion_matrix",
@@ -46,8 +48,12 @@ write_matrix() {
         source_checkout_synced_variant_count: (
           if $all_synced then 2 else 1 end
         ),
+        source_checkout_claim_safe_variant_count: (
+          if $all_claim_safe then 2 else 1 end
+        ),
         all_observed_source_checkouts_clean: $all_clean,
         all_observed_source_checkouts_synced: $all_synced,
+        all_observed_source_checkouts_claim_safe: $all_claim_safe,
         runner_git_heads: ["abc123"],
         runner_package_versions: ["0.11.1"],
         runner_pwnkit_fixture_ids: [
@@ -76,7 +82,7 @@ write_matrix() {
 test_accepts_clean_matrix() {
   local dir
   dir="$(new_temp_dir)"
-  write_matrix "$dir/pwnkit-promotion-matrix.json" true 0 0 true true true true
+  write_matrix "$dir/pwnkit-promotion-matrix.json" true 0 0 true true true true true
 
   "$CHECKER" "$dir/pwnkit-promotion-matrix.json"
 }
@@ -86,7 +92,7 @@ test_rejects_unhealthy_matrix_with_sanitized_output() {
   local output
   local status=0
   dir="$(new_temp_dir)"
-  write_matrix "$dir/pwnkit-promotion-matrix.json" false 1 2 false false false false
+  write_matrix "$dir/pwnkit-promotion-matrix.json" false 1 2 false false false false false
 
   output="$("$CHECKER" "$dir/pwnkit-promotion-matrix.json" 2>&1)" || status="$?"
 
@@ -95,6 +101,8 @@ test_rejects_unhealthy_matrix_with_sanitized_output() {
   rg -q 'matrix_health.ready_for_matrix_interpretation=false' <<<"$output"
   rg -q 'matrix_health.missing_variant_count=1' <<<"$output"
   rg -q 'matrix_health.total_pwnkit_agent_errors=2' <<<"$output"
+  rg -q 'matrix_health.all_observed_source_checkouts_claim_safe=false' <<<"$output"
+  rg -q 'matrix_health.source_checkout_claim_safe_variant_count=1' <<<"$output"
   rg -q 'matrix_health.runner_git_heads=abc123' <<<"$output"
   rg -q 'matrix_health.runner_package_versions=0.11.1' <<<"$output"
   rg -q 'matrix_health.runner_pwnkit_fixture_ids=pwnkit-v0.12.0-private,<redacted>' <<<"$output"
@@ -104,7 +112,7 @@ test_rejects_unhealthy_matrix_with_sanitized_output() {
 test_allows_unhealthy_matrix_when_explicitly_requested() {
   local dir
   dir="$(new_temp_dir)"
-  write_matrix "$dir/pwnkit-promotion-matrix.json" false 1 2 false false false false
+  write_matrix "$dir/pwnkit-promotion-matrix.json" false 1 2 false false false false false
 
   EIDOLON_M3_ALLOW_UNHEALTHY_PROMOTION_MATRIX=1 \
     "$CHECKER" "$dir/pwnkit-promotion-matrix.json"
@@ -115,7 +123,7 @@ test_rejects_unhealthy_matrix_when_bypass_is_not_exactly_one() {
   local output
   local status=0
   dir="$(new_temp_dir)"
-  write_matrix "$dir/pwnkit-promotion-matrix.json" false 1 2 false false false false
+  write_matrix "$dir/pwnkit-promotion-matrix.json" false 1 2 false false false false false
 
   output="$(
     EIDOLON_M3_ALLOW_UNHEALTHY_PROMOTION_MATRIX=true \
@@ -136,7 +144,16 @@ test_rejects_missing_matrix() {
   rg -q 'pwnkit promotion matrix not found' <<<"$output"
 }
 
+test_accepts_claim_safe_local_patch_matrix() {
+  local dir
+  dir="$(new_temp_dir)"
+  write_matrix "$dir/pwnkit-promotion-matrix.json" true 0 0 true true true false true
+
+  "$CHECKER" "$dir/pwnkit-promotion-matrix.json"
+}
+
 test_accepts_clean_matrix
+test_accepts_claim_safe_local_patch_matrix
 test_rejects_unhealthy_matrix_with_sanitized_output
 test_allows_unhealthy_matrix_when_explicitly_requested
 test_rejects_unhealthy_matrix_when_bypass_is_not_exactly_one

@@ -108,7 +108,8 @@ write_sample() {
       runner_pwnkit_fixture_ids: ["pwnkit-v0.12.0-private"],
       source_checkout: {
         all_runners_clean: true,
-        all_runners_origin_main_synced: true
+        all_runners_origin_main_synced: true,
+        runner_source_claim_safe: true
       },
       differential_findings: {
         ready_for_differential_finding_claim: $positive_differential,
@@ -174,7 +175,8 @@ write_no_signal_sample() {
     runner_pwnkit_fixture_ids: ["pwnkit-v0.12.0-private"],
     source_checkout: {
       all_runners_clean: true,
-      all_runners_origin_main_synced: true
+      all_runners_origin_main_synced: true,
+      runner_source_claim_safe: true
     },
     no_signal_diagnostics: {
       sample_size: 3,
@@ -254,6 +256,7 @@ test_collects_variant_observation_classes() {
     and .matrix_health.all_observed_samples_agent_error_free == true
     and .matrix_health.all_observed_source_checkouts_clean == true
     and .matrix_health.all_observed_source_checkouts_synced == true
+    and .matrix_health.all_observed_source_checkouts_claim_safe == true
     and .matrix_health.ready_for_matrix_interpretation == false
     and .matrix_health.runner_git_heads == ["abc123"]
     and .matrix_health.runner_pwnkit_fixture_ids == ["pwnkit-v0.12.0-private"]
@@ -375,6 +378,7 @@ test_collects_matrix_health_agent_error_and_source_drift() {
     .no_signal_diagnostics.totals.eidolon_pwnkit_agent_errors = 2
     | .source_checkout.all_runners_clean = false
     | .source_checkout.all_runners_origin_main_synced = false
+    | .source_checkout.runner_source_claim_safe = false
   ' "$matrix_dir/diagnostic_probe/pwnkit-stability-sample.json" \
     > "$matrix_dir/diagnostic_probe/pwnkit-stability-sample.tmp"
   mv "$matrix_dir/diagnostic_probe/pwnkit-stability-sample.tmp" \
@@ -389,9 +393,68 @@ test_collects_matrix_health_agent_error_and_source_drift() {
     and .matrix_health.all_observed_samples_agent_error_free == false
     and .matrix_health.source_checkout_clean_variant_count == 0
     and .matrix_health.source_checkout_synced_variant_count == 0
+    and .matrix_health.source_checkout_claim_safe_variant_count == 0
     and .matrix_health.all_observed_source_checkouts_clean == false
     and .matrix_health.all_observed_source_checkouts_synced == false
+    and .matrix_health.all_observed_source_checkouts_claim_safe == false
     and .matrix_health.ready_for_matrix_interpretation == false
+  ' "$output" >/dev/null
+}
+
+test_collects_local_patched_matrix_as_claim_safe() {
+  local temp_dir
+  local manifest
+  local matrix_dir
+  local output
+
+  temp_dir="$(new_temp_dir)"
+  manifest="$temp_dir/manifest.json"
+  matrix_dir="$temp_dir/matrix"
+  output="$temp_dir/summary.json"
+
+  jq -n '{
+    schema_version: 1,
+    run_kind: "m3_pwnkit_promotion_matrix_manifest",
+    boundary: "owned_loopback_lab",
+    variants: [
+      {
+        variant_id: "patched_probe",
+        bait_profile: null,
+        hypothesis: "clean pinned local patch should stay interpretable",
+        knobs: [],
+        expected_observation: "behavior_only"
+      }
+    ]
+  }' > "$manifest"
+
+  mkdir -p "$matrix_dir/patched_probe"
+  write_sample "$matrix_dir/patched_probe/pwnkit-stability-sample.json" 0 1 true
+  jq '
+    .evidence_track_counts = [{evidence_track: "local_patched_pwnkit", count: 1}]
+    | .evidence_tracks = ["local_patched_pwnkit"]
+    | .single_evidence_track = true
+    | .mixed_evidence_tracks = false
+    | .source_checkout.all_runners_origin_main_synced = false
+    | .source_checkout.runner_source_claim_safe = true
+  ' "$matrix_dir/patched_probe/pwnkit-stability-sample.json" \
+    > "$matrix_dir/patched_probe/pwnkit-stability-sample.tmp"
+  mv "$matrix_dir/patched_probe/pwnkit-stability-sample.tmp" \
+    "$matrix_dir/patched_probe/pwnkit-stability-sample.json"
+
+  "$COLLECTOR" "$manifest" "$matrix_dir" > "$output"
+
+  jq -e '
+    .matrix_health.missing_variant_count == 0
+    and .matrix_health.all_variants_observed == true
+    and .matrix_health.total_pwnkit_agent_errors == 0
+    and .matrix_health.all_observed_samples_agent_error_free == true
+    and .matrix_health.all_observed_source_checkouts_clean == true
+    and .matrix_health.all_observed_source_checkouts_synced == false
+    and .matrix_health.all_observed_source_checkouts_claim_safe == true
+    and .matrix_health.source_checkout_synced_variant_count == 0
+    and .matrix_health.source_checkout_claim_safe_variant_count == 1
+    and .matrix_health.runner_pwnkit_fixture_ids == ["pwnkit-v0.12.0-private"]
+    and .matrix_health.ready_for_matrix_interpretation == true
   ' "$output" >/dev/null
 }
 
@@ -429,6 +492,7 @@ test_help_mentions_matrix_summary
 test_collects_variant_observation_classes
 test_collects_no_signal_diagnostics
 test_collects_matrix_health_agent_error_and_source_drift
+test_collects_local_patched_matrix_as_claim_safe
 test_rejects_invalid_variant_id
 
 printf 'collect-pwnkit-promotion-matrix fixture tests passed\n'

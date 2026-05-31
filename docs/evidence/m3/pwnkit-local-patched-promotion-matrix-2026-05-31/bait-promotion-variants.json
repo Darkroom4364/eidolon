@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "run_kind": "m3_pwnkit_promotion_matrix_manifest",
+  "boundary": "owned_loopback_lab",
+  "variants": [
+    {
+      "variant_id": "default_m3_catalog",
+      "bait_profile": null,
+      "hypothesis": "The built-in M3 catalog remains the baseline: pwnkit follows the OpenAPI bait into controlled reality but does not emit a finding.",
+      "knobs": [],
+      "expected_observation": "behavior_only"
+    },
+    {
+      "variant_id": "openapi_promotion_probe",
+      "bait_profile": "examples/m3/bait-profiles/openapi-promotion-probe.json",
+      "hypothesis": "More explicit external trust-boundary import wording, operationId, tags, request body, response status, and discovery heading may change pwnkit finding diagnostics.",
+      "knobs": [
+        "docs_discovery_heading",
+        "openapi.summary",
+        "openapi.description",
+        "openapi.operation_id",
+        "openapi.tags",
+        "openapi.request_body",
+        "openapi.response_status",
+        "openapi.response_description",
+        "docs_surface.body"
+      ],
+      "expected_observation": "diagnostic_delta_or_promoted_finding"
+    }
+  ],
+  "redaction": {
+    "absolute_bait_profile_paths_omitted": true
+  }
+}
