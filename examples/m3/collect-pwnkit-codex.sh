@@ -1113,16 +1113,47 @@ jq -n \
    def correlated_bait_actions:
      [
        ($proxy.bait_events.actions // [])[] as $action
+       | (
+           [
+             correlated_target_requests[] as $request
+             | select($request.proxy_session_id == $action.session_id)
+             | select($request.method == $action.method)
+             | select(redacted_target($request.path) == redacted_target($action.path))
+             | $request
+           ]
+         ) as $matching_requests
+       | (
+           $matching_requests
+           | map(select((.proxy_event_index // -1) <= ($action.event_index // -1)))
+         ) as $on_or_before_requests
+       | (
+           $matching_requests
+           | map(select((.proxy_event_index // -1) > ($action.event_index // -1)))
+         ) as $after_requests
        | select(
-           any(
-             correlated_target_requests[];
-             .proxy_session_id == $action.session_id
-             and .method == $action.method
-             and redacted_target(.path) == redacted_target($action.path)
-             and ((.proxy_event_index // -1) <= ($action.event_index // -1))
+           ($on_or_before_requests | length) > 0
+           or (
+             ($action.same_session_confirmed // false)
+             and ($after_requests | length) > 0
            )
          )
        | $action
+         + {
+             correlation_basis: (
+               if ($on_or_before_requests | length) > 0 then
+                 "request_at_or_before_action"
+               else
+                 "request_after_action_same_session"
+               end
+             ),
+             matched_proxy_request_event_indexes: (
+               if ($on_or_before_requests | length) > 0 then
+                 ($on_or_before_requests | map(.proxy_event_index) | unique)
+               else
+                 ($after_requests | map(.proxy_event_index) | unique)
+               end
+             )
+           }
      ];
    def correlated_confirmed_bait_actions:
      [
@@ -1406,6 +1437,18 @@ jq -n \
          proxy_confirmed_action_count: ($proxy_confirmed_actions | length),
          strict_correlated_action_count: ($strict_actions | length),
          strict_confirmed_action_count: ($strict_confirmed_actions | length),
+         correlation_basis_counts: (
+           $strict_actions
+           | map(.correlation_basis // "unknown")
+           | sort
+           | group_by(.)
+           | map({basis: .[0], count: length})
+         ),
+         request_after_action_same_session_count: (
+           $strict_actions
+           | map(select((.correlation_basis // null) == "request_after_action_same_session"))
+           | length
+         ),
          unconfirmed_strict_action_count: ($unconfirmed_actions | length),
          proxy_confirmed_action_not_strict_count: $proxy_confirmed_not_strict_count,
          matching_proxy_exposure_not_pwnkit_correlated_count: (
@@ -1623,6 +1666,7 @@ jq -n \
       "target_interaction_observed requires at least one pwnkit HTTP artifact to match an Eidolon proxy request by method, path, and a 30 second timestamp window.",
       "bait_follow_rate counts bait-shaped actions whether or not the action preserved the original exposure session.",
       "same_session_confirmed_bait_follow_rate counts only bait actions whose exposure_id matches a prior bait exposure in the same session.",
+      "If a proxy-confirmed same-session bait action only later appears in persisted pwnkit request artifacts for that same session and path, the action remains attributable and is marked with correlation_basis=request_after_action_same_session.",
       "Exact crawl start-path matches count as exposure evidence when pwnkit omitted a per-page request artifact for that bait surface; broader crawl roots remain diagnostic-only.",
       "Controlled-reality depth metrics are null here; derive them from Eidolon trace evidence for final M3 reporting.",
       "finding_diagnostics intentionally keeps only counts, coarse classifications, and field presence; it omits finding titles, descriptions, raw evidence, request bodies, raw URLs, and analysis text.",
