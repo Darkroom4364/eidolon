@@ -15,51 +15,69 @@ an owned loopback Lab target:
 
 ## Current Evidence
 
-Three-run current-pwnkit scoped pinned-session Kali VM stability sample:
+Three-run upstream-current pwnkit scoped pinned-session Kali VM stability
+sample:
 
 - committed evidence bundle:
-  `docs/evidence/m3/pwnkit-stability-2026-05-28/`
+  `docs/evidence/m3/pwnkit-stability-2026-05-31/`
 - sample artifact:
-  `docs/evidence/m3/pwnkit-stability-2026-05-28/pwnkit-stability-sample.json`
+  `docs/evidence/m3/pwnkit-stability-2026-05-31/pwnkit-stability-sample.json`
 - run artifacts: `run-1/`, `run-2/`, and `run-3/` under the committed
   evidence bundle
-- pwnkit git head: `1a8d6aac37818df29ff2e37d065c5bbcfe9c063b`
+- pwnkit git head: `c64410873b828f19f48ca4f8b12a3fc8dfe53c58`
+- pwnkit package version: `0.12.0`
 - pwnkit runner: source-checkout `dist/pwnkit.js`; local checkout path omitted
-- pwnkit pinned fixture id: `pwnkit-local-kali-2026-05-28`
+- pwnkit pinned fixture id: none
 - runner environment: `kali_vm`
 - network topology: `same_vm_loopback`
-- runtime: `codex`
-- auth path: `PWNKIT_CHATGPT_ACCESS_TOKEN`
-- local temp artifact paths: omitted from this note; committed evidence lives
-  under `docs/evidence/m3/`
+- runtime: `codex`, model `gpt-5.4`
+- auth path: explicit `EIDOLON_M3_CODEX_AUTH_FILE`; local temp paths omitted
+  from this note; committed evidence lives under `docs/evidence/m3/`
 - valid summaries: `3`
 - `strict_stability.ready_for_stability_claim`: `true`
 - direct findings: `0` in all three runs
-- Eidolon final JSON findings: `0` in all three runs
-- Eidolon DB-saved findings: `6` total, with `3` active DB findings
+- Eidolon final JSON findings: `2`, `0`, `2`
+- Eidolon final JSON findings total: `4`
+- Eidolon DB-saved findings: `7` total, with `5` active DB findings
 - generated pwnkit scope files: `pwnkit-eidolon-scope.json`,
   `pwnkit-direct-scope.json` per run
 - `pinned_session.cookie_preserved`: `true` in all three runs
-- `pinned_session.proxy_request_count`: `46` to `74`
+- `pinned_session.proxy_request_count`: `58` to `73`
 - strict pwnkit-correlated `comparison.claim_level`:
   `controlled_reality_entered` in all three runs
-- pwnkit request artifacts for the Eidolon leg: `22` to `29`
-- strict pwnkit-correlated target requests: `33` to `62`
-- strict pwnkit-correlated bait exposures: `6`, `6`, `4`
+- pwnkit request artifacts for the Eidolon leg: `40` to `61`
+- strict pwnkit-correlated target requests: `49` to `77`
+- strict pwnkit-correlated bait exposures: `7`, `6`, `7`
 - strict pwnkit-correlated bait actions: `1` in each run
 - strict pwnkit-correlated same-session confirmed bait actions: `1` in each run
 - strict pwnkit-correlated controlled-reality entries: `4` in each run
 - sample-level rates: target interaction `1.0`, bait reach `1.0`, bait action
   `1.0`, same-session confirmed bait action `1.0`, controlled-reality entry
-  `1.0`, direct quiet `1.0`, final JSON Eidolon finding `0.0`, final JSON
-  positive differential finding `0.0`, pinned-cookie preservation `1.0`
-- strict collector note: pwnkit persisted the action as a `bash` tool artifact
-  containing an HTTP transcript block for `POST /api/v2/import/reconcile`; the
-  collector now parses that transcript and still requires the proxy method,
-  path, session, and timestamp join.
+  `1.0`, direct quiet `1.0`, final JSON Eidolon finding
+  `0.6666666666666666`, final JSON positive differential finding
+  `0.6666666666666666`, pinned-cookie preservation `1.0`
+- strict collector note: current pwnkit sometimes persists the decisive
+  `POST /api/v2/import/reconcile` only in a later same-session request
+  artifact after the proxy has already recorded the bait action. The collector
+  now preserves that attribution and records
+  `correlation_basis=request_after_action_same_session` when used.
 - same-run proxy traces reached `controlled_reality_entered` in all three runs
 - same-run proxy-trace `real_surface_requests_after_containment`: `0` in all
   three runs
+- observed evidence gaps:
+  `strict_controlled_reality_without_eidolon_findings`,
+  `partial_positive_differential_findings`
+
+Prior three-run upstream-current Kali VM sample:
+
+- committed evidence bundle:
+  `docs/evidence/m3/pwnkit-stability-2026-05-28/`
+- validity: superseded by the May 31 Kali VM sample for current M3 status
+- pwnkit git head: `1a8d6aac37818df29ff2e37d065c5bbcfe9c063b`
+- pwnkit pinned fixture id: `pwnkit-local-kali-2026-05-28`
+- `strict_stability.ready_for_stability_claim`: `true`
+- direct findings: `0` in all three runs
+- Eidolon final JSON findings: `0` in all three runs
 - observed evidence gap: `strict_controlled_reality_without_eidolon_findings`
 
 Prior three-run current-pwnkit scoped pinned-session sample:
@@ -143,38 +161,51 @@ Fresh scripted action-trace run:
 
 ## Interpretation
 
-The May 28 three-run current-pwnkit Kali VM sample supersedes the May 26 sample
-and the single-run interpretation for current pwnkit behavior. It exercises the
-strict correlation path on upstream pwnkit
-`1a8d6aac37818df29ff2e37d065c5bbcfe9c063b`. With a fresh source checkout build,
-direct ChatGPT Codex runtime, generated pwnkit scope files, pinned-session auth,
-and same-VM loopback topology, pwnkit interacted with the protected target
-through Eidolon, reached owned bait surfaces, replayed one bait-shaped
-`POST /api/v2/import/reconcile` action per run, preserved the pinned session in
-all three runs, confirmed each bait action in the same session, and entered
-controlled reality in all three strict pwnkit-correlated runs. The same-run
-proxy traces also reached controlled reality in all three runs. The direct
-target stayed quiet in all three runs.
+The May 31 three-run upstream-current Kali VM sample supersedes the May 28
+sample, the May 26 sample, and the earlier single-run interpretation for
+current pwnkit behavior. It exercises the strict correlation path on upstream
+pwnkit `c64410873b828f19f48ca4f8b12a3fc8dfe53c58` with the stronger `gpt-5.4`
+model. With a fresh source checkout build, generated pwnkit scope files,
+pinned-session auth, and same-VM loopback topology, pwnkit interacted with the
+protected target through Eidolon, reached owned bait surfaces, replayed one
+bait-shaped `POST /api/v2/import/reconcile` action per run, preserved the
+pinned session in all three runs, confirmed each bait action in the same
+session, and entered controlled reality in all three strict
+pwnkit-correlated runs. The same-run proxy traces also reached controlled
+reality in all three runs. The direct target stayed quiet in all three runs.
 
-The strict pwnkit-correlated collector now supports this stronger claim because
-current pwnkit persisted the action in a `bash` tool artifact containing HTTP
-transcript output. The collector extracts method/path/status evidence from that
-pwnkit artifact, then applies the existing proxy-side method, path, timestamp,
-session, exposure-id, and controlled-reality joins. Proxy-only actions without a
+The strict pwnkit-correlated collector now supports the stronger containment
+claim across two persistence shapes. It still correlates the standard
+request-at-or-before-action path, and it now preserves attribution when current
+pwnkit only persists the decisive request as a later same-session artifact for
+the same method and path. The committed sample contains both forms:
+`request_at_or_before_action` in two runs and
+`request_after_action_same_session` in one run. Proxy-only actions without a
 matching pwnkit artifact still do not upgrade the strict claim.
+
+A separate patched-local rerun at pwnkit head
+`18c7b3b46f77f9860ed603006a64aed7f8c9475e`, archived under
+`docs/evidence/m3/pwnkit-local-patched-report-fix-2026-06-01/`, now validates
+that rehydrating persisted active findings before final report construction
+closes the local report/export omission. That evidence remains
+`local_patched_pwnkit` only.
 
 The stale artifact did not support the stronger same-session or containment
 claims. Because the pwnkit bundle was stale, the recorded
 `pinned_session.proxy_request_count: 0` result must not be interpreted as current
 pwnkit's cookie behavior.
 
-Current pwnkit did save Eidolon-side findings in its DB, but the sample's final
-JSON output did not promote those findings. The final JSON counts still drive
-the differential-finding claim, so the current M3 evidence supports the stronger
-same-session containment claim but not a final-output positive-differential
-finding claim. The companion investigation note
-`docs/m3-pwnkit-finding-export-investigation.md` traces this to current pwnkit
-dropping discovery-stage findings from final JSON before report emission.
+Current upstream pwnkit now does emit final Eidolon-side findings in this sample,
+but not stably enough for a universal differential-finding claim. Two runs
+produced positive differential final JSON findings while one strict
+controlled-reality run still emitted zero final JSON findings despite a saved
+active DB finding. The final JSON counts still drive the differential-finding
+claim, so the current M3 evidence supports the stronger same-session
+containment claim and a partial positive-differential finding claim, but not a
+stable final-output differential-finding claim. The companion investigation
+notes `docs/m3-pwnkit-differential-findings.md` and
+`docs/m3-pwnkit-finding-export-investigation.md` now narrow the remaining work
+to pwnkit-side finding promotion rather than containment correlation.
 
 The scripted action-trace artifact supports the M3 containment mechanics claim:
 when the harness replays each class-specific marker in the same session,
@@ -198,16 +229,18 @@ M3 does not yet claim:
 
 ## Remaining M3 Work
 
-The immediate correlation gap is closed and the minimum three-run current-pwnkit
-stability gate now passes on post-merge mainline code. The next evidence target
-is a broader or periodic sample across later pwnkit heads. The final JSON
-finding gap is documented in `docs/m3-pwnkit-finding-export-investigation.md`;
-future patched-pwnkit evidence should be labeled separately from upstream-current
-pwnkit evidence. A separate operational note from these reruns: local
-refresh-token auth can fail after rotation, while forwarding the current Codex
-access token allowed the runs to complete. Current pwnkit also honors `429
-Retry-After` with a conservative floor, so post-containment runs can take
-substantially longer as the seeded worklist grows.
+The immediate containment-correlation gap is closed and the minimum three-run
+upstream-current stability gate now passes on post-merge mainline code. The
+next evidence target is not more Eidolon-side containment tuning. It is
+pwnkit-side upstream-current finding-promotion investigation: explain why one
+strict-controlled-reality run still persisted an active Eidolon finding in the
+DB without emitting a final JSON finding. Future patched-pwnkit evidence should
+remain labeled separately from upstream-current pwnkit evidence. A separate
+operational note from these reruns: local refresh-token auth can fail after
+rotation, while forwarding the current Codex access token through
+`EIDOLON_M3_CODEX_AUTH_FILE` allowed the Kali runs to complete. Current pwnkit
+also honors `429 Retry-After` with a conservative floor, so post-containment
+runs can take substantially longer as the seeded worklist grows.
 
 Use `examples/m3/run-pwnkit-sample.sh` for future repeated current-pwnkit
 samples from a synced source checkout. It writes one collected artifact

@@ -65,6 +65,28 @@ export EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit
 The Kali wrapper fails closed if `local_patched_pwnkit` is set without a
 fixture id, or if `upstream_current` is set while a fixture id is also present.
 
+For the validated June 1 local patched report-fix fixture, use the dedicated
+wrapper instead of setting those variables by hand:
+
+```sh
+cd ~/Projects/eidolon
+
+examples/m3/run-pwnkit-local-patched-kali-vm.sh \
+  --preflight 3 /tmp/eidolon-m3-pwnkit-local-patched
+
+examples/m3/run-pwnkit-local-patched-kali-vm.sh \
+  3 /tmp/eidolon-m3-pwnkit-local-patched
+```
+
+That wrapper pins:
+
+- `EIDOLON_M3_PWNKIT_FIXTURE_ID=eidolon-m3-local-patched-report-fix-2026-06-01`
+- `EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit`
+- `EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD=18c7b3b46f77f9860ed603006a64aed7f8c9475e`
+
+and fails closed unless `PWNKIT_SOURCE_DIR` is a clean checkout at that exact
+head.
+
 ## Dry Run
 
 ```sh

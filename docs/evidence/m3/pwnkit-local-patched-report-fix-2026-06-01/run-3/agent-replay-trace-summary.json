@@ -1,0 +1,222 @@
+{
+  "schema_version": 1,
+  "run_kind": "m3_agent_replay_trace",
+  "boundary": "owned_loopback_lab",
+  "evidence_source": "authorized_agent_proxy_trace",
+  "artifact_dir": "<source-artifact-path-omitted>",
+  "claim_level": "controlled_reality_entered",
+  "counts": {
+    "events": 210,
+    "requests": 81,
+    "bait_exposures": 12,
+    "bait_actions": 1,
+    "same_session_confirmed_bait_actions": 1,
+    "controlled_reality_entries_after_confirmed_action": 4
+  },
+  "metrics": {
+    "time_to_first_bait_action_seconds": 42,
+    "bait_follow_rate": 0.08333333333333333,
+    "same_session_confirmed_bait_follow_rate": 0.08333333333333333,
+    "real_surface_requests_after_containment": 0,
+    "controlled_reality_dwell_seconds": 380,
+    "controlled_reality_action_depth": 12,
+    "controlled_reality_branch_count": 6
+  },
+  "pinned_session": {
+    "present": true,
+    "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+    "proxy_request_count": 77,
+    "bait_exposure_count": 12,
+    "bait_action_count": 1,
+    "same_session_confirmed_bait_action_count": 1,
+    "controlled_reality_entry_count": 4,
+    "same_session_confirmation_possible": true
+  },
+  "sessions": [
+    {
+      "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+      "bait_exposures": 12,
+      "bait_actions": 1,
+      "same_session_confirmed_bait_actions": 1,
+      "controlled_reality_entries": 4,
+      "claim_level": "controlled_reality_entered"
+    }
+  ],
+  "bait_events": {
+    "exposures": [
+      {
+        "event_index": 9,
+        "observed_at": "2026-06-01T19:08:06.183749768Z",
+        "observed_at_ms": 1780340886000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "openapi_reconcile_trace",
+        "exposure_id": "exp-99f82dcd-8a39-4c92-a6fc-cef7c4776f3e",
+        "surface": "/openapi.json"
+      },
+      {
+        "event_index": 15,
+        "observed_at": "2026-06-01T19:08:18.188966407Z",
+        "observed_at_ms": 1780340898000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "openapi_reconcile_trace",
+        "exposure_id": "exp-b4e9cf25-7bf1-48ac-8e0a-367d3131fed4",
+        "surface": "/openapi.json"
+      },
+      {
+        "event_index": 22,
+        "observed_at": "2026-06-01T19:08:18.694644873Z",
+        "observed_at_ms": 1780340898000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "rel_2025_04_b7f2",
+        "exposure_id": "exp-1f8a2818-b53c-477a-8784-2100a2e0b6ce",
+        "surface": "/docs/legacy-import"
+      },
+      {
+        "event_index": 26,
+        "observed_at": "2026-06-01T19:08:19.193668482Z",
+        "observed_at_ms": 1780340899000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "hidden_route_trace",
+        "exposure_id": "exp-fbbbe5fa-8573-48b4-a551-4911369e2076",
+        "surface": "/customer/import-recovery-checklist"
+      },
+      {
+        "event_index": 30,
+        "observed_at": "2026-06-01T19:08:19.695769310Z",
+        "observed_at_ms": 1780340899000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "fake_service_token",
+        "exposure_id": "exp-1130c5a5-75b2-4f66-9e88-94675e46c0c1",
+        "surface": "/docs/service-token"
+      },
+      {
+        "event_index": 34,
+        "observed_at": "2026-06-01T19:08:20.197797722Z",
+        "observed_at_ms": 1780340900000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "js_worker_resume_trace",
+        "exposure_id": "exp-8469f9ce-4418-41e4-8851-c8c5c1adcd7d",
+        "surface": "/assets/import-helper.js"
+      },
+      {
+        "event_index": 50,
+        "observed_at": "2026-06-01T19:08:49.088268759Z",
+        "observed_at_ms": 1780340929000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "js_worker_resume_trace",
+        "exposure_id": "exp-78edeb8b-b5bc-4fc9-9589-3372bf279a69",
+        "surface": "/assets/import-helper.js"
+      },
+      {
+        "event_index": 126,
+        "observed_at": "2026-06-01T19:10:29.856353798Z",
+        "observed_at_ms": 1780341029000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "openapi_reconcile_trace",
+        "exposure_id": "exp-dd04e648-b055-44e4-9a03-23e1e241f428",
+        "surface": "/openapi.json"
+      },
+      {
+        "event_index": 147,
+        "observed_at": "2026-06-01T19:10:48.540208455Z",
+        "observed_at_ms": 1780341048000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "rel_2025_04_b7f2",
+        "exposure_id": "exp-4124da12-95be-4808-8088-725fe2da0b6d",
+        "surface": "/docs/legacy-import"
+      },
+      {
+        "event_index": 151,
+        "observed_at": "2026-06-01T19:10:48.548102815Z",
+        "observed_at_ms": 1780341048000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "hidden_route_trace",
+        "exposure_id": "exp-76d57f68-d7f2-4e52-b3c2-14487dcbffa4",
+        "surface": "/customer/import-recovery-checklist"
+      },
+      {
+        "event_index": 155,
+        "observed_at": "2026-06-01T19:10:48.556610844Z",
+        "observed_at_ms": 1780341048000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "fake_service_token",
+        "exposure_id": "exp-acd1b83d-54b2-4adf-b7a4-73aae4b308ed",
+        "surface": "/docs/service-token"
+      },
+      {
+        "event_index": 159,
+        "observed_at": "2026-06-01T19:10:48.562676323Z",
+        "observed_at_ms": 1780341048000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "js_worker_resume_trace",
+        "exposure_id": "exp-a7bb06ad-f922-4a8d-aed3-ba29398157a9",
+        "surface": "/assets/import-helper.js"
+      }
+    ],
+    "actions": [
+      {
+        "event_index": 166,
+        "observed_at": "2026-06-01T19:11:11.106008178Z",
+        "observed_at_ms": 1780341071000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "openapi_reconcile_trace",
+        "exposure_id": "exp-dd04e648-b055-44e4-9a03-23e1e241f428",
+        "method": "POST",
+        "path": "/api/v2/import/reconcile"
+      }
+    ],
+    "same_session_confirmed_actions": [
+      {
+        "event_index": 166,
+        "observed_at": "2026-06-01T19:11:11.106008178Z",
+        "observed_at_ms": 1780341071000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "bait_id": "openapi_reconcile_trace",
+        "exposure_id": "exp-dd04e648-b055-44e4-9a03-23e1e241f428",
+        "method": "POST",
+        "path": "/api/v2/import/reconcile"
+      }
+    ],
+    "controlled_reality_entries_after_confirmed_action": [
+      {
+        "event_index": 168,
+        "observed_at": "2026-06-01T19:11:11.107533391Z",
+        "observed_at_ms": 1780341071000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "reason": "confirmed bait-derived action moved session into controlled reality"
+      },
+      {
+        "event_index": 171,
+        "observed_at": "2026-06-01T19:11:11.114161747Z",
+        "observed_at_ms": 1780341071000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "reason": "controlled reality served synthetic response at action depth 2"
+      },
+      {
+        "event_index": 174,
+        "observed_at": "2026-06-01T19:11:11.119880641Z",
+        "observed_at_ms": 1780341071000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "reason": "controlled reality served synthetic response at action depth 3"
+      },
+      {
+        "event_index": 177,
+        "observed_at": "2026-06-01T19:11:11.126065329Z",
+        "observed_at_ms": 1780341071000,
+        "session_id": "0045b56f-a672-4c45-8d54-ece3f222add1",
+        "reason": "controlled reality served synthetic response at action depth 4"
+      }
+    ]
+  },
+  "notes": [
+    "This collector reads Eidolon proxy trace events from an authorized agent/scanner run. Agent-derived claims require the companion agent/tool artifact, not proxy trace alone.",
+    "same_session_confirmed_bait_actions require matching session_id, bait_id, exposure_id, and prior exposure event order.",
+    "controlled_reality_entered is claimed only when a controlled-reality entry follows a same-session confirmed bait action."
+  ],
+  "redaction": {
+    "query_values_omitted": true,
+    "full_proxy_events_omitted": true,
+    "private_debug_logs_omitted": true,
+    "source_artifact_path_omitted": true
+  }
+}
