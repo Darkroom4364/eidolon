@@ -2,6 +2,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$SCRIPT_DIR/../lib/pwnkit-worktree.sh"
+if [[ -n "${PWNKIT_SOURCE_DIR+x}" ]]; then
+  PWNKIT_SOURCE_DIR_EXPLICIT=1
+else
+  PWNKIT_SOURCE_DIR_EXPLICIT=0
+fi
 PWNKIT_SOURCE_DIR="${PWNKIT_SOURCE_DIR-$HOME/Projects/pwnkit}"
 EIDOLON_M3_UPSTREAM_CURRENT_REF="${EIDOLON_M3_UPSTREAM_CURRENT_REF:-origin/main}"
 EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-}"
@@ -24,6 +30,9 @@ The wrapper fails closed unless:
   - the checkout is clean
   - EIDOLON_M3_PWNKIT_FIXTURE_ID is unset
   - HEAD matches EIDOLON_M3_UPSTREAM_CURRENT_REF
+
+If PWNKIT_SOURCE_DIR is left unset and the default checkout does not match,
+the wrapper will auto-discover a clean sibling worktree for the upstream ref.
 
 Use examples/m3/run-pwnkit-kali-vm.sh directly for custom pinned-fixture or
 diagnostic runs.
@@ -48,13 +57,26 @@ require_clean_upstream_checkout() {
   local actual_head
   local expected_head
   local status_output
+  local auto_discovered_path
 
   [[ -d "$PWNKIT_SOURCE_DIR" ]] || fail "PWNKIT_SOURCE_DIR does not exist: $PWNKIT_SOURCE_DIR"
-  [[ -d "$PWNKIT_SOURCE_DIR/.git" ]] || fail "PWNKIT_SOURCE_DIR is not a git checkout: $PWNKIT_SOURCE_DIR"
+  pwnkit_worktree_is_git_checkout "$PWNKIT_SOURCE_DIR" \
+    || fail "PWNKIT_SOURCE_DIR is not a git checkout: $PWNKIT_SOURCE_DIR"
 
   expected_head="$(git -C "$PWNKIT_SOURCE_DIR" rev-parse "$expected_ref" 2>/dev/null)" \
     || fail "upstream-current ref not found in PWNKIT_SOURCE_DIR: $expected_ref"
   actual_head="$(git -C "$PWNKIT_SOURCE_DIR" rev-parse HEAD)"
+
+  if [[ "$actual_head" != "$expected_head" ]]; then
+    if [[ "$PWNKIT_SOURCE_DIR_EXPLICIT" -eq 0 ]]; then
+      auto_discovered_path="$(pwnkit_worktree_find_clean_path_by_head "$PWNKIT_SOURCE_DIR" "$expected_head" || true)"
+      if [[ -n "$auto_discovered_path" ]]; then
+        PWNKIT_SOURCE_DIR="$auto_discovered_path"
+        actual_head="$expected_head"
+        printf 'info: using auto-discovered upstream-current pwnkit worktree: %s\n' "$PWNKIT_SOURCE_DIR" >&2
+      fi
+    fi
+  fi
 
   if [[ "$actual_head" != "$expected_head" ]]; then
     fail "upstream-current pwnkit checkout head mismatch: expected $expected_head from $expected_ref, got $actual_head"
