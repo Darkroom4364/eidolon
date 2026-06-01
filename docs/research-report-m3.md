@@ -82,6 +82,23 @@ upstream-current distinction. One patched run still reached controlled reality
 without an Eidolon final JSON finding, so the differential-finding stability
 question remains open.
 
+A refreshed local patched rerun is now archived under
+`docs/evidence/m3/pwnkit-local-patched-report-fix-2026-06-01/`. It used
+pwnkit head `18c7b3b46f77f9860ed603006a64aed7f8c9475e` with fixture id
+`eidolon-m3-local-patched-report-fix-2026-06-01`.
+
+- Strict same-session controlled reality: `3/3`
+- Direct final JSON findings: `0/3`
+- Eidolon final JSON findings: `3/3` runs, `5` total findings (`1/2/2`)
+- `strict_stability.ready_for_stability_claim`: `true`
+
+This refreshed local patched sample validates the report/export fix on the
+patched track: every strict controlled-reality run now emitted final Eidolon
+JSON findings. The only remaining DB-saved versus final-JSON delta was one row
+already marked `status:false-positive`, so it is expected filtering rather than
+loss of an active finding. This still remains a patched-local pwnkit result,
+not an upstream-current claim.
+
 A separate local patched promotion matrix is now archived under
 `docs/evidence/m3/pwnkit-local-patched-promotion-matrix-2026-05-31/` for the
 same pinned fixture id `eidolon-m3-local-patched-2026-05-29`. Both

@@ -1,6 +1,7 @@
 # M3 pwnkit Finding Export Investigation
 
-This note explains two related M3 report-promotion gaps:
+This note explains two related M3 report-promotion gaps and one local-patched
+validation:
 
 1. the historical May 28 upstream-current Kali VM sample, which persisted
    Eidolon-side findings in pwnkit's SQLite DB but emitted zero final JSON
@@ -8,7 +9,10 @@ This note explains two related M3 report-promotion gaps:
 2. the refreshed May 31 upstream-current Kali VM sample, which now emits
    Eidolon final JSON findings in `2/3` runs but still leaves one strict
    controlled-reality run at zero final JSON findings despite a saved active DB
-   finding.
+   finding, and
+3. the June 1 local-patched Kali rerun, which validates the report/export fix
+   by promoting every strict controlled-reality run into final JSON while
+   filtering only an inactive false-positive row.
 
 This is a Lab-only evidence note. It does not change the M3 containment claim
 or make a production-readiness claim.
@@ -165,14 +169,14 @@ Keep two evidence tracks separate:
 2. Local patched pwnkit evidence:
    label future runs with a distinct fixture id such as
    `pwnkit-local-patched-discovery-findings-2026-05-28`
-   - expected to preserve discovery-stage active findings into final JSON if the
-     pwnkit patch is correct
+   - expected to preserve discovery-stage or persisted active findings into
+     final JSON if the pwnkit patch is correct
    - must be documented as a patched local pwnkit fixture, not upstream-current
      pwnkit behavior
 
-The patched pwnkit fix should merge discovery-stage findings into the final
-candidate set or reload all saved DB findings before report construction, then
-continue to omit only false-positive/suppressed findings from final JSON.
+The local patched validation now uses a pwnkit build that reloads persisted
+active findings before report construction, then continues to omit only
+false-positive/suppressed findings from final JSON.
 
 ## Local Patched Follow-Up
 
@@ -191,6 +195,24 @@ This supports the patch direction: active Eidolon-side findings can now survive
 into final JSON. It does not make an upstream-current pwnkit claim, and it does
 not close the full stability question because one run still entered controlled
 reality with zero Eidolon final JSON findings.
+
+A refreshed three-run local patched rerun was then collected on 2026-06-01 and
+archived under
+`docs/evidence/m3/pwnkit-local-patched-report-fix-2026-06-01/`.
+
+- pwnkit head: `18c7b3b46f77f9860ed603006a64aed7f8c9475e`
+- pwnkit fixture id: `eidolon-m3-local-patched-report-fix-2026-06-01`
+- evidence track: `local_patched_pwnkit`
+- strict same-session controlled reality: `3/3`
+- direct final JSON findings: `0`
+- Eidolon final JSON findings: `5` total across `3/3` runs (`1/2/2`)
+- Eidolon DB-saved findings: `6` total
+- Eidolon DB-active findings: `5` total
+
+This validates the active-finding export fix on the local patched track. The
+only remaining saved-to-final mismatch in that rerun is one row already marked
+inactive with `status:false-positive`; it is expected filtering rather than a
+lost active finding before final JSON emission.
 
 Follow-up collector diagnostics now expose the remaining run's saved-to-inactive
 or saved-but-unexported shape without committing raw pwnkit DB contents. The

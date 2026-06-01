@@ -183,6 +183,13 @@ the same method and path. The committed sample contains both forms:
 `request_after_action_same_session` in one run. Proxy-only actions without a
 matching pwnkit artifact still do not upgrade the strict claim.
 
+A separate patched-local rerun at pwnkit head
+`18c7b3b46f77f9860ed603006a64aed7f8c9475e`, archived under
+`docs/evidence/m3/pwnkit-local-patched-report-fix-2026-06-01/`, now validates
+that rehydrating persisted active findings before final report construction
+closes the local report/export omission. That evidence remains
+`local_patched_pwnkit` only.
+
 The stale artifact did not support the stronger same-session or containment
 claims. Because the pwnkit bundle was stale, the recorded
 `pinned_session.proxy_request_count: 0` result must not be interpreted as current
@@ -225,7 +232,7 @@ M3 does not yet claim:
 The immediate containment-correlation gap is closed and the minimum three-run
 upstream-current stability gate now passes on post-merge mainline code. The
 next evidence target is not more Eidolon-side containment tuning. It is
-pwnkit-side finding-promotion investigation: explain why one
+pwnkit-side upstream-current finding-promotion investigation: explain why one
 strict-controlled-reality run still persisted an active Eidolon finding in the
 DB without emitting a final JSON finding. Future patched-pwnkit evidence should
 remain labeled separately from upstream-current pwnkit evidence. A separate

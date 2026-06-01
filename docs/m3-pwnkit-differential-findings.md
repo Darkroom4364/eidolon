@@ -89,6 +89,17 @@ in `3/3` runs, and Eidolon final JSON findings appeared in `2/3` runs. Treat
 that as `local_patched_pwnkit` evidence only; it confirms the export-gap patch
 direction but does not make an upstream-current pwnkit claim.
 
+A follow-up local patched report-fix rerun was collected on 2026-06-01 at head
+`18c7b3b46f77f9860ed603006a64aed7f8c9475e` and archived under
+`docs/evidence/m3/pwnkit-local-patched-report-fix-2026-06-01`. It used fixture
+id `eidolon-m3-local-patched-report-fix-2026-06-01`, kept direct final JSON
+findings quiet in `3/3` runs, preserved strict same-session controlled reality
+in `3/3` runs, and emitted Eidolon final JSON findings in `3/3` runs
+(`1/2/2`, `5` total). The only remaining saved-to-final delta in that rerun
+was one row already marked `status:false-positive`, so treat this as
+local-patched confirmation that rehydrating persisted active findings before
+report construction closes the active-finding omission.
+
 A follow-up local patched promotion matrix was collected on 2026-05-31 at the
 same head and archived under
 `docs/evidence/m3/pwnkit-local-patched-promotion-matrix-2026-05-31`. The
@@ -101,7 +112,9 @@ fixture id `eidolon-m3-local-patched-2026-05-29`, and recorded
 `source_checkout.runner_source_claim_safe: true` even though `origin/main`
 remained intentionally out of sync. Treat this as a local-patched confirmation
 that the export-gap patch is sufficient for both the baseline and the probe
-catalog shapes; it is still not an upstream-current claim.
+catalog shapes, and use the June 1 rerun as the local-patched proof that the
+report/export path now promotes every strict controlled-reality run into final
+JSON. It is still not an upstream-current claim.
 
 A refreshed 3-run upstream-current Kali sample was collected on 2026-05-31
 against synced pwnkit `v0.12.0` / head
