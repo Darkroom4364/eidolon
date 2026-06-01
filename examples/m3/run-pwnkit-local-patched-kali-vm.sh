@@ -2,6 +2,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+source "$SCRIPT_DIR/../lib/pwnkit-worktree.sh"
+if [[ -n "${PWNKIT_SOURCE_DIR+x}" ]]; then
+  PWNKIT_SOURCE_DIR_EXPLICIT=1
+else
+  PWNKIT_SOURCE_DIR_EXPLICIT=0
+fi
 PWNKIT_SOURCE_DIR="${PWNKIT_SOURCE_DIR-$HOME/Projects/pwnkit}"
 EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD="${EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD:-18c7b3b46f77f9860ed603006a64aed7f8c9475e}"
 EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-eidolon-m3-local-patched-report-fix-2026-06-01}"
@@ -25,6 +31,9 @@ The wrapper fails closed unless:
   - the checkout is clean
   - HEAD matches EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD
 
+If PWNKIT_SOURCE_DIR is left unset and the default checkout does not match,
+the wrapper will auto-discover a clean sibling worktree for the expected head.
+
 Use examples/m3/run-pwnkit-kali-vm.sh directly for other upstream-current or
 custom pinned-fixture runs.
 USAGE
@@ -47,11 +56,24 @@ require_clean_pinned_checkout() {
   local expected_head="$EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD"
   local actual_head
   local status_output
+  local auto_discovered_path
 
   [[ -d "$PWNKIT_SOURCE_DIR" ]] || fail "PWNKIT_SOURCE_DIR does not exist: $PWNKIT_SOURCE_DIR"
-  [[ -d "$PWNKIT_SOURCE_DIR/.git" ]] || fail "PWNKIT_SOURCE_DIR is not a git checkout: $PWNKIT_SOURCE_DIR"
+  pwnkit_worktree_is_git_checkout "$PWNKIT_SOURCE_DIR" \
+    || fail "PWNKIT_SOURCE_DIR is not a git checkout: $PWNKIT_SOURCE_DIR"
 
   actual_head="$(git -C "$PWNKIT_SOURCE_DIR" rev-parse HEAD)"
+  if [[ "$actual_head" != "$expected_head" ]]; then
+    if [[ "$PWNKIT_SOURCE_DIR_EXPLICIT" -eq 0 ]]; then
+      auto_discovered_path="$(pwnkit_worktree_find_clean_path_by_head "$PWNKIT_SOURCE_DIR" "$expected_head" || true)"
+      if [[ -n "$auto_discovered_path" ]]; then
+        PWNKIT_SOURCE_DIR="$auto_discovered_path"
+        actual_head="$expected_head"
+        printf 'info: using auto-discovered local patched pwnkit worktree: %s\n' "$PWNKIT_SOURCE_DIR" >&2
+      fi
+    fi
+  fi
+
   if [[ "$actual_head" != "$expected_head" ]]; then
     fail "local patched pwnkit checkout head mismatch: expected $expected_head, got $actual_head"
   fi
