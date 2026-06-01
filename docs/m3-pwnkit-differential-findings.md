@@ -4,9 +4,9 @@ This note defines the next M3 investigation after the archived current-pwnkit
 stability sample. The open question is narrow:
 
 ```text
-Why did current pwnkit reach bait, replay the open_api action, preserve the
-Eidolon session, and enter controlled reality, while still reporting 0 Eidolon
-findings versus 0 direct-target findings?
+Why does upstream-current pwnkit now reach bait, replay the open_api action,
+preserve the Eidolon session, and enter controlled reality in every strict run,
+while still promoting Eidolon final JSON findings in only 2 of 3 runs?
 ```
 
 ## Scope
@@ -89,6 +89,17 @@ in `3/3` runs, and Eidolon final JSON findings appeared in `2/3` runs. Treat
 that as `local_patched_pwnkit` evidence only; it confirms the export-gap patch
 direction but does not make an upstream-current pwnkit claim.
 
+A follow-up local patched report-fix rerun was collected on 2026-06-01 at head
+`18c7b3b46f77f9860ed603006a64aed7f8c9475e` and archived under
+`docs/evidence/m3/pwnkit-local-patched-report-fix-2026-06-01`. It used fixture
+id `eidolon-m3-local-patched-report-fix-2026-06-01`, kept direct final JSON
+findings quiet in `3/3` runs, preserved strict same-session controlled reality
+in `3/3` runs, and emitted Eidolon final JSON findings in `3/3` runs
+(`1/2/2`, `5` total). The only remaining saved-to-final delta in that rerun
+was one row already marked `status:false-positive`, so treat this as
+local-patched confirmation that rehydrating persisted active findings before
+report construction closes the active-finding omission.
+
 A follow-up local patched promotion matrix was collected on 2026-05-31 at the
 same head and archived under
 `docs/evidence/m3/pwnkit-local-patched-promotion-matrix-2026-05-31`. The
@@ -101,7 +112,29 @@ fixture id `eidolon-m3-local-patched-2026-05-29`, and recorded
 `source_checkout.runner_source_claim_safe: true` even though `origin/main`
 remained intentionally out of sync. Treat this as a local-patched confirmation
 that the export-gap patch is sufficient for both the baseline and the probe
-catalog shapes; it is still not an upstream-current claim.
+catalog shapes, and use the June 1 rerun as the local-patched proof that the
+report/export path now promotes every strict controlled-reality run into final
+JSON. It is still not an upstream-current claim.
+
+A refreshed 3-run upstream-current Kali sample was collected on 2026-05-31
+against synced pwnkit `v0.12.0` / head
+`c64410873b828f19f48ca4f8b12a3fc8dfe53c58` and archived under
+`docs/evidence/m3/pwnkit-stability-2026-05-31`. It used `gpt-5.4`, stayed
+agent-error-free, kept direct findings quiet in `3/3` runs, preserved the
+pinned session in `3/3` runs, reached same-session confirmed bait action in
+`3/3` runs, and entered strict pwnkit-correlated controlled reality in `3/3`
+runs. Two runs emitted positive differential Eidolon final JSON findings, while
+one strict controlled-reality run still emitted zero Eidolon final JSON
+findings despite a saved active DB finding. One of the positive runs required a
+later same-session request artifact to preserve the strict action attribution,
+and the collector now records that as
+`correlation_basis=request_after_action_same_session`. Treat the active open
+question as:
+
+```text
+Why does upstream-current pwnkit still leave one strict controlled-reality run
+at 0 final Eidolon findings after the containment-correlation gap is closed?
+```
 
 ## Pre-Run Checklist
 
