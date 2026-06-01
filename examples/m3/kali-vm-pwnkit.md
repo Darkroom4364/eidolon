@@ -85,7 +85,9 @@ That wrapper pins:
 - `EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD=18c7b3b46f77f9860ed603006a64aed7f8c9475e`
 
 and fails closed unless `PWNKIT_SOURCE_DIR` is a clean checkout at that exact
-head.
+head. If `PWNKIT_SOURCE_DIR` is unset and `~/Projects/pwnkit` is on a different
+head, the wrapper will auto-discover a clean sibling worktree at the validated
+local-patched head.
 
 For upstream-current runs, use the symmetric wrapper:
 
@@ -105,7 +107,10 @@ That wrapper pins:
 - `EIDOLON_M3_UPSTREAM_CURRENT_REF=origin/main`
 
 and fails closed unless `PWNKIT_SOURCE_DIR` is a clean checkout whose `HEAD`
-matches local `origin/main`, with `EIDOLON_M3_PWNKIT_FIXTURE_ID` unset.
+matches local `origin/main`, with `EIDOLON_M3_PWNKIT_FIXTURE_ID` unset. If
+`PWNKIT_SOURCE_DIR` is unset and `~/Projects/pwnkit` is on a different head,
+the wrapper will auto-discover a clean sibling worktree whose `HEAD` matches
+local `origin/main`.
 
 ## Dry Run
 
