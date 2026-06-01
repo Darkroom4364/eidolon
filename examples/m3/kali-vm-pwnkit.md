@@ -87,6 +87,26 @@ That wrapper pins:
 and fails closed unless `PWNKIT_SOURCE_DIR` is a clean checkout at that exact
 head.
 
+For upstream-current runs, use the symmetric wrapper:
+
+```sh
+cd ~/Projects/eidolon
+
+examples/m3/run-pwnkit-upstream-current-kali-vm.sh \
+  --preflight 3 /tmp/eidolon-m3-pwnkit-upstream-current
+
+examples/m3/run-pwnkit-upstream-current-kali-vm.sh \
+  3 /tmp/eidolon-m3-pwnkit-upstream-current
+```
+
+That wrapper pins:
+
+- `EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=upstream_current`
+- `EIDOLON_M3_UPSTREAM_CURRENT_REF=origin/main`
+
+and fails closed unless `PWNKIT_SOURCE_DIR` is a clean checkout whose `HEAD`
+matches local `origin/main`, with `EIDOLON_M3_PWNKIT_FIXTURE_ID` unset.
+
 ## Dry Run
 
 ```sh
