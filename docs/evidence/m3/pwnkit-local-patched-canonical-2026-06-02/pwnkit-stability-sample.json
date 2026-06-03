@@ -1,0 +1,2868 @@
+{
+  "schema_version": 1,
+  "run_kind": "m3_pwnkit_codex_sample",
+  "generated_at": "2026-06-02T20:17:38Z",
+  "artifact_count": 3,
+  "valid_summary_count": 3,
+  "counts": {
+    "missing_summary": 0,
+    "target_interaction_observed": 3,
+    "bait_reached": 3,
+    "bait_action_observed": 3,
+    "same_session_confirmed_bait_action": 3,
+    "controlled_reality_entered": 3,
+    "direct_quiet": 3,
+    "direct_findings": 0,
+    "eidolon_findings": 3,
+    "positive_differential_findings": 3,
+    "bait_reached_without_eidolon_findings": 0,
+    "bait_action_without_eidolon_findings": 0,
+    "controlled_reality_without_eidolon_findings": 0,
+    "pinned_session_present": 3,
+    "pinned_cookie_preserved": 3
+  },
+  "rates": {
+    "target_interaction_rate": 1,
+    "bait_reach_rate": 1,
+    "bait_action_rate": 1,
+    "same_session_confirmed_bait_action_rate": 1,
+    "controlled_reality_entry_rate": 1,
+    "direct_quiet_rate": 1,
+    "eidolon_finding_rate": 1,
+    "positive_differential_finding_rate": 1,
+    "pinned_cookie_preservation_rate": 1
+  },
+  "claim_level_counts": [
+    {
+      "claim_level": "controlled_reality_entered",
+      "count": 3
+    }
+  ],
+  "weakest_claim_level": "controlled_reality_entered",
+  "strongest_claim_level": "controlled_reality_entered",
+  "runner_git_heads": [
+    "abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4"
+  ],
+  "runner_package_versions": [
+    "0.12.0"
+  ],
+  "runner_pwnkit_fixture_ids": [
+    "eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02"
+  ],
+  "evidence_track_counts": [
+    {
+      "evidence_track": "local_patched_pwnkit",
+      "count": 3
+    }
+  ],
+  "evidence_tracks": [
+    "local_patched_pwnkit"
+  ],
+  "single_evidence_track": true,
+  "mixed_evidence_tracks": false,
+  "unknown_evidence_track_count": 0,
+  "runner_environments": [
+    "kali_vm"
+  ],
+  "runner_network_topologies": [
+    "same_vm_loopback"
+  ],
+  "tool_fingerprint_summary": [
+    {
+      "name": "bash",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "GNU bash, version 5.3.9(1)-release (aarch64-unknown-linux-gnu) "
+      ]
+    },
+    {
+      "name": "cargo",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "cargo 1.94.1 (29ea6fb6a 2026-03-24) (built from a source tarball)"
+      ]
+    },
+    {
+      "name": "curl",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "curl 8.19.0 (aarch64-unknown-linux-gnu) libcurl/8.19.0 OpenSSL/3.6.2 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.69.0 ngtcp2/1.22.1 nghttp3/1.15.0 librtmp/2"
+      ]
+    },
+    {
+      "name": "ffuf",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "ffuf version: 2.1.0-dev"
+      ]
+    },
+    {
+      "name": "gobuster",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "No help topic for 'version' "
+      ]
+    },
+    {
+      "name": "jq",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "jq-1.8.1"
+      ]
+    },
+    {
+      "name": "nikto",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "Nikto 2.6.0 (LW 2.5)"
+      ]
+    },
+    {
+      "name": "nmap",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "Nmap version 7.99 ( https://nmap.org ) "
+      ]
+    },
+    {
+      "name": "node",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "v24.15.0"
+      ]
+    },
+    {
+      "name": "python3",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "Python 3.13.12"
+      ]
+    },
+    {
+      "name": "sqlite3",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "3.46.1 2024-08-13 09:16:08 c9c2ab54ba1f5f46360f1b4f35d849cd3f080e6fc2b6c60e91b16c63f69aalt1 (64-bit)"
+      ]
+    },
+    {
+      "name": "sqlmap",
+      "present_count": 3,
+      "missing_count": 0,
+      "versions": [
+        "1.10.4#stable"
+      ]
+    }
+  ],
+  "source_checkout": {
+    "clean_runner_count": 3,
+    "dirty_runner_count": 0,
+    "unknown_dirty_runner_count": 0,
+    "origin_main_synced_count": 0,
+    "origin_main_drifted_count": 3,
+    "unknown_origin_main_sync_count": 0,
+    "pinned_fixture_count": 3,
+    "all_runners_pinned_fixture": true,
+    "all_runners_clean": true,
+    "all_runners_origin_main_synced": false,
+    "runner_source_claim_safe": true
+  },
+  "finding_reconciliation": {
+    "sample_size": 3,
+    "direct_final_json_finding_total": 0,
+    "eidolon_final_json_finding_total": 5,
+    "direct_db_saved_finding_total": 0,
+    "eidolon_db_saved_finding_total": 5,
+    "direct_db_active_finding_total": 0,
+    "eidolon_db_active_finding_total": 5,
+    "direct_db_saved_findings_omitted_run_count": 0,
+    "eidolon_db_saved_findings_omitted_run_count": 0,
+    "positive_eidolon_db_saved_finding_delta_run_count": 3,
+    "positive_eidolon_db_active_finding_delta_run_count": 3,
+    "any_db_saved_findings_omitted_from_final_json": false,
+    "final_json_counts_still_drive_finding_claims": true
+  },
+  "no_signal_diagnostics": {
+    "sample_size": 3,
+    "no_target_interaction_run_count": 0,
+    "all_runs_no_target_interaction": false,
+    "runs_with_eidolon_pwnkit_request_artifacts": 3,
+    "runs_with_eidolon_proxy_requests": 3,
+    "runs_with_proxy_requests_but_no_pwnkit_request_artifacts": 0,
+    "runs_with_eidolon_agent_errors": 0,
+    "runs_with_eidolon_codex_token_refresh_failure": 0,
+    "runs_with_eidolon_codex_backend_timeout": 0,
+    "runs_with_eidolon_codex_backend_error": 0,
+    "runs_with_pinned_session_but_no_cookie_preservation": 0,
+    "totals": {
+      "direct_pwnkit_tool_artifacts": 187,
+      "eidolon_pwnkit_tool_artifacts": 119,
+      "direct_pwnkit_agent_errors": 0,
+      "eidolon_pwnkit_agent_errors": 0,
+      "direct_pwnkit_request_artifacts": 159,
+      "eidolon_pwnkit_request_artifacts": 126,
+      "eidolon_proxy_requests": 166,
+      "correlated_target_requests": 154,
+      "uncorrelated_eidolon_proxy_requests": 12
+    },
+    "proxy_path_counts": [
+      {
+        "path": "/",
+        "count": 12
+      },
+      {
+        "path": "/.env",
+        "count": 3
+      },
+      {
+        "path": "/.git/config",
+        "count": 6
+      },
+      {
+        "path": "/.well-known/",
+        "count": 3
+      },
+      {
+        "path": "/__debug__",
+        "count": 2
+      },
+      {
+        "path": "/admin",
+        "count": 5
+      },
+      {
+        "path": "/api",
+        "count": 3
+      },
+      {
+        "path": "/api/",
+        "count": 3
+      },
+      {
+        "path": "/api/v1",
+        "count": 3
+      },
+      {
+        "path": "/api/v1/imports",
+        "count": 5
+      },
+      {
+        "path": "/api/v1/imports/demo-import-1",
+        "count": 1
+      },
+      {
+        "path": "/api/v1/imports/test-id",
+        "count": 1
+      },
+      {
+        "path": "/api/v1/projects",
+        "count": 5
+      },
+      {
+        "path": "/api/v1/projects/1",
+        "count": 1
+      },
+      {
+        "path": "/api/v1/projects/alpha",
+        "count": 1
+      },
+      {
+        "path": "/api/v1/projects/bravo",
+        "count": 1
+      },
+      {
+        "path": "/api/v2",
+        "count": 2
+      },
+      {
+        "path": "/api/v2/import/reconcile",
+        "count": 10
+      },
+      {
+        "path": "/assets/import-helper.js",
+        "count": 6
+      },
+      {
+        "path": "/backup",
+        "count": 1
+      },
+      {
+        "path": "/config.php",
+        "count": 3
+      },
+      {
+        "path": "/customer/import-recovery-checklist",
+        "count": 6
+      },
+      {
+        "path": "/debug",
+        "count": 1
+      },
+      {
+        "path": "/docs",
+        "count": 6
+      },
+      {
+        "path": "/docs/legacy-import",
+        "count": 6
+      },
+      {
+        "path": "/docs/service-token",
+        "count": 6
+      },
+      {
+        "path": "/doesnotexist",
+        "count": 1
+      },
+      {
+        "path": "/graphql",
+        "count": 3
+      },
+      {
+        "path": "/health",
+        "count": 6
+      },
+      {
+        "path": "/info",
+        "count": 2
+      },
+      {
+        "path": "/login",
+        "count": 3
+      },
+      {
+        "path": "/metrics",
+        "count": 2
+      },
+      {
+        "path": "/nonexistent-404-probe",
+        "count": 1
+      },
+      {
+        "path": "/nonexistent404",
+        "count": 1
+      },
+      {
+        "path": "/nonexistent500probe",
+        "count": 1
+      },
+      {
+        "path": "/old",
+        "count": 1
+      },
+      {
+        "path": "/openapi.json",
+        "count": 10
+      },
+      {
+        "path": "/readme.html",
+        "count": 3
+      },
+      {
+        "path": "/rest",
+        "count": 2
+      },
+      {
+        "path": "/robots.txt",
+        "count": 6
+      },
+      {
+        "path": "/server-info",
+        "count": 2
+      },
+      {
+        "path": "/sitemap.xml",
+        "count": 3
+      },
+      {
+        "path": "/status",
+        "count": 3
+      },
+      {
+        "path": "/swagger.json",
+        "count": 1
+      },
+      {
+        "path": "/test",
+        "count": 1
+      },
+      {
+        "path": "/web.config",
+        "count": 3
+      },
+      {
+        "path": "/wp-admin",
+        "count": 2
+      },
+      {
+        "path": "/wp-config.php.bak",
+        "count": 1
+      },
+      {
+        "path": "/wp-includes/version.php",
+        "count": 3
+      },
+      {
+        "path": "/wp-login.php",
+        "count": 3
+      }
+    ],
+    "eidolon_agent_error_class_counts": [],
+    "likely_cause": null,
+    "next_questions": []
+  },
+  "differential_findings": {
+    "minimum_sample_size": 3,
+    "sample_size": 3,
+    "direct_finding_run_count": 0,
+    "eidolon_finding_run_count": 3,
+    "positive_differential_run_count": 3,
+    "bait_reached_without_eidolon_finding_run_count": 0,
+    "bait_action_without_eidolon_finding_run_count": 0,
+    "controlled_reality_without_eidolon_finding_run_count": 0,
+    "all_direct_quiet": true,
+    "ready_for_differential_finding_claim": true,
+    "next_questions": [
+      "differential_finding_observed"
+    ]
+  },
+  "evidence_gap_diagnostics": {
+    "sample_size": 3,
+    "proxy_trace_present_run_count": 3,
+    "proxy_trace_controlled_reality_run_count": 3,
+    "proxy_trace_real_surface_quiet_run_count": 3,
+    "pwnkit_strict_controlled_reality_run_count": 3,
+    "pwnkit_strict_same_session_run_count": 3,
+    "proxy_trace_without_strict_controlled_reality_run_count": 0,
+    "strict_controlled_reality_without_eidolon_finding_run_count": 0,
+    "positive_differential_without_strict_controlled_reality_run_count": 0,
+    "matching_proxy_exposure_not_pwnkit_correlated_run_count": 0,
+    "matching_proxy_exposure_crawl_start_path_run_count": 0,
+    "strict_correlation_gap_likely_causes": [],
+    "all_proxy_trace_contained": true,
+    "all_strict_pwnkit_controlled_reality": true,
+    "all_strict_controlled_reality_promoted_to_findings": true,
+    "observed_gaps": [
+      "none"
+    ],
+    "next_questions": []
+  },
+  "strict_stability": {
+    "minimum_sample_size": 3,
+    "sample_size": 3,
+    "all_summaries_present": true,
+    "single_runner_git_head": true,
+    "single_evidence_track": true,
+    "all_target_interaction_observed": true,
+    "all_same_session_confirmed_bait_action": true,
+    "all_controlled_reality_entered": true,
+    "all_direct_quiet": true,
+    "all_pinned_cookie_preserved": true,
+    "all_runners_clean": true,
+    "all_runners_origin_main_synced": false,
+    "all_runners_pinned_fixture": true,
+    "runner_source_claim_safe": true,
+    "ready_for_stability_claim": true
+  },
+  "artifacts": [
+    {
+      "artifact_dir": "<source-artifact-path-omitted>",
+      "present": true,
+      "missing_reason": null,
+      "evidence_track": "local_patched_pwnkit",
+      "runner_git_head": "abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4",
+      "runner_package_version": "0.12.0",
+      "runner_git_dirty": false,
+      "runner_origin_main": {
+        "head": "c64410873b828f19f48ca4f8b12a3fc8dfe53c58",
+        "head_short": "c64410873b82",
+        "ahead": 4,
+        "behind": 0,
+        "in_sync": false
+      },
+      "runner_origin_main_in_sync": false,
+      "runner_pwnkit_fixture": {
+        "id": "eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02",
+        "pinned": true
+      },
+      "runner_pwnkit_fixture_id": "eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02",
+      "stale_dist_guard_bypassed": false,
+      "runner_environment": "kali_vm",
+      "runner_environment_source": "env_override",
+      "runner_network_topology": "same_vm_loopback",
+      "runner_os": {
+        "kernel_name": "Linux",
+        "kernel_release": "7.0.5-orbstack-00330-ge3df4e19b0a0-dirty",
+        "kernel_version": "#1 SMP PREEMPT Sun May 10 11:47:42 UTC 2026",
+        "machine_arch": "aarch64",
+        "os_release_id": "kali",
+        "os_release_version_id": "2026.2"
+      },
+      "runner_tool_fingerprint": [
+        {
+          "name": "bash",
+          "present": true,
+          "version": "GNU bash, version 5.3.9(1)-release (aarch64-unknown-linux-gnu) "
+        },
+        {
+          "name": "curl",
+          "present": true,
+          "version": "curl 8.19.0 (aarch64-unknown-linux-gnu) libcurl/8.19.0 OpenSSL/3.6.2 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.69.0 ngtcp2/1.22.1 nghttp3/1.15.0 librtmp/2"
+        },
+        {
+          "name": "jq",
+          "present": true,
+          "version": "jq-1.8.1"
+        },
+        {
+          "name": "node",
+          "present": true,
+          "version": "v24.15.0"
+        },
+        {
+          "name": "python3",
+          "present": true,
+          "version": "Python 3.13.12"
+        },
+        {
+          "name": "sqlite3",
+          "present": true,
+          "version": "3.46.1 2024-08-13 09:16:08 c9c2ab54ba1f5f46360f1b4f35d849cd3f080e6fc2b6c60e91b16c63f69aalt1 (64-bit)"
+        },
+        {
+          "name": "cargo",
+          "present": true,
+          "version": "cargo 1.94.1 (29ea6fb6a 2026-03-24) (built from a source tarball)"
+        },
+        {
+          "name": "nmap",
+          "present": true,
+          "version": "Nmap version 7.99 ( https://nmap.org ) "
+        },
+        {
+          "name": "sqlmap",
+          "present": true,
+          "version": "1.10.4#stable"
+        },
+        {
+          "name": "ffuf",
+          "present": true,
+          "version": "ffuf version: 2.1.0-dev"
+        },
+        {
+          "name": "gobuster",
+          "present": true,
+          "version": "No help topic for 'version' "
+        },
+        {
+          "name": "nikto",
+          "present": true,
+          "version": "Nikto 2.6.0 (LW 2.5)"
+        }
+      ],
+      "claim_level": "controlled_reality_entered",
+      "conclusion": "bait_action_observed",
+      "target_interaction_observed": true,
+      "bait_reached": true,
+      "bait_action_observed": true,
+      "same_session_confirmed_bait_action": true,
+      "controlled_reality_entered": true,
+      "direct_finding_count": 0,
+      "eidolon_finding_count": 3,
+      "direct_final_json_finding_count": 0,
+      "eidolon_final_json_finding_count": 3,
+      "direct_db_saved_finding_count": 0,
+      "eidolon_db_saved_finding_count": 3,
+      "direct_db_active_finding_count": 0,
+      "eidolon_db_active_finding_count": 3,
+      "finding_diagnostics": {
+        "direct": {
+          "count": 0,
+          "severity_counts": [],
+          "category_counts": [],
+          "confidence_counts": [],
+          "field_presence": [],
+          "evidence_presence": {
+            "evidence_object": 0,
+            "request_evidence": 0,
+            "analysis_text": 0
+          }
+        },
+        "eidolon": {
+          "count": 3,
+          "severity_counts": [
+            {
+              "value": "high",
+              "count": 1
+            },
+            {
+              "value": "low",
+              "count": 2
+            }
+          ],
+          "category_counts": [
+            {
+              "value": "information-disclosure",
+              "count": 1
+            },
+            {
+              "value": "missing-validation",
+              "count": 1
+            },
+            {
+              "value": "ssrf",
+              "count": 1
+            }
+          ],
+          "confidence_counts": [
+            {
+              "value": "0.9",
+              "count": 1
+            },
+            {
+              "value": "0.98",
+              "count": 1
+            },
+            {
+              "value": "0.99",
+              "count": 1
+            }
+          ],
+          "field_presence": [
+            {
+              "field": "id",
+              "count": 3
+            },
+            {
+              "field": "title",
+              "count": 3
+            },
+            {
+              "field": "severity",
+              "count": 3
+            },
+            {
+              "field": "category",
+              "count": 3
+            },
+            {
+              "field": "confidence",
+              "count": 3
+            },
+            {
+              "field": "evidence",
+              "count": 3
+            }
+          ],
+          "evidence_presence": {
+            "evidence_object": 3,
+            "request_evidence": 3,
+            "analysis_text": 3
+          }
+        }
+      },
+      "finding_reconciliation": {
+        "direct": {
+          "final_json_finding_count": 0,
+          "db_saved_finding_count": 0,
+          "db_active_finding_count": 0,
+          "db_inactive_finding_count": 0,
+          "counts_match": true,
+          "db_saved_findings_omitted_from_final_json": false,
+          "final_json_omitted_db_saved_finding_count": 0,
+          "final_json_exceeds_db_saved_finding_count": 0,
+          "db_status_counts": [],
+          "db_triage_status_counts": [],
+          "db_workflow_status_counts": [],
+          "db_severity_counts": [],
+          "db_category_counts": [],
+          "db_rejection_diagnostics": {
+            "inactive_finding_count": 0,
+            "inactive_reason_counts": [],
+            "lifecycle_counts": [],
+            "inactive_lifecycle_counts": [],
+            "artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 0,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 0
+            },
+            "inactive_artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 0,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 0
+            },
+            "confidence_bucket_counts": [],
+            "layer_verdict_counts": [],
+            "inactive_layer_verdict_counts": [],
+            "reject_layer_counts": [],
+            "inactive_reject_layer_counts": [],
+            "reject_reason_class_counts": [],
+            "inactive_reject_reason_class_counts": [],
+            "severity_change_counts": [],
+            "inactive_severity_change_counts": []
+          }
+        },
+        "eidolon": {
+          "final_json_finding_count": 3,
+          "db_saved_finding_count": 3,
+          "db_active_finding_count": 3,
+          "db_inactive_finding_count": 0,
+          "counts_match": true,
+          "db_saved_findings_omitted_from_final_json": false,
+          "final_json_omitted_db_saved_finding_count": 0,
+          "final_json_exceeds_db_saved_finding_count": 0,
+          "db_status_counts": [
+            {
+              "value": "discovered",
+              "count": 3
+            }
+          ],
+          "db_triage_status_counts": [
+            {
+              "value": "new",
+              "count": 3
+            }
+          ],
+          "db_workflow_status_counts": [
+            {
+              "value": "backlog",
+              "count": 3
+            }
+          ],
+          "db_severity_counts": [
+            {
+              "value": "high",
+              "count": 1
+            },
+            {
+              "value": "low",
+              "count": 2
+            }
+          ],
+          "db_category_counts": [
+            {
+              "value": "information-disclosure",
+              "count": 1
+            },
+            {
+              "value": "missing-validation",
+              "count": 1
+            },
+            {
+              "value": "ssrf",
+              "count": 1
+            }
+          ],
+          "db_rejection_diagnostics": {
+            "inactive_finding_count": 0,
+            "inactive_reason_counts": [],
+            "lifecycle_counts": [
+              {
+                "status": "discovered",
+                "triage_status": "new",
+                "workflow_status": "backlog",
+                "active": true,
+                "count": 3
+              }
+            ],
+            "inactive_lifecycle_counts": [],
+            "artifact_presence": {
+              "triage_note": 2,
+              "layer_verdicts": 3,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 3
+            },
+            "inactive_artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 0,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 0
+            },
+            "confidence_bucket_counts": [
+              {
+                "value": "high",
+                "count": 3
+              }
+            ],
+            "layer_verdict_counts": [
+              {
+                "layer": "evidence_gate",
+                "verdict": "pass",
+                "count": 3
+              },
+              {
+                "layer": "holding_it_wrong",
+                "verdict": "pass",
+                "count": 3
+              },
+              {
+                "layer": "multi_modal",
+                "verdict": "skip",
+                "count": 3
+              },
+              {
+                "layer": "oracle",
+                "verdict": "downgrade",
+                "count": 2
+              },
+              {
+                "layer": "oracle",
+                "verdict": "skip",
+                "count": 1
+              },
+              {
+                "layer": "pov_gate",
+                "verdict": "skip",
+                "count": 3
+              },
+              {
+                "layer": "reachability",
+                "verdict": "skip",
+                "count": 3
+              }
+            ],
+            "inactive_layer_verdict_counts": [],
+            "reject_layer_counts": [],
+            "inactive_reject_layer_counts": [],
+            "reject_reason_class_counts": [],
+            "inactive_reject_reason_class_counts": [],
+            "severity_change_counts": [
+              {
+                "value": "high_to_low",
+                "count": 1
+              },
+              {
+                "value": "medium_to_low",
+                "count": 1
+              }
+            ],
+            "inactive_severity_change_counts": []
+          }
+        }
+      },
+      "pwnkit_events": {
+        "direct": {
+          "pipeline_events": 71,
+          "tool_artifacts": 43,
+          "tool_counts": [
+            {
+              "tool": "bash",
+              "count": 3
+            },
+            {
+              "tool": "crawl",
+              "count": 1
+            },
+            {
+              "tool": "http_request",
+              "count": 39
+            }
+          ],
+          "bash_http_output_requests": 12,
+          "crawl_artifacts": [
+            {
+              "timestamp_ms": 1780430309493,
+              "start_path": "/",
+              "depth": 2,
+              "pages_visited": 4
+            }
+          ],
+          "agent_errors": 0
+        },
+        "eidolon": {
+          "pipeline_events": 104,
+          "tool_artifacts": 48,
+          "tool_counts": [
+            {
+              "tool": "bash",
+              "count": 2
+            },
+            {
+              "tool": "crawl",
+              "count": 2
+            },
+            {
+              "tool": "http_request",
+              "count": 44
+            }
+          ],
+          "bash_http_output_requests": 6,
+          "crawl_artifacts": [
+            {
+              "timestamp_ms": 1780429237343,
+              "start_path": "/",
+              "depth": 2,
+              "pages_visited": 4
+            },
+            {
+              "timestamp_ms": 1780429276176,
+              "start_path": "/docs",
+              "depth": 2,
+              "pages_visited": 5
+            }
+          ],
+          "agent_errors": 0
+        }
+      },
+      "target_evidence_diagnostics": {
+        "direct": {
+          "request_artifact_count": 51,
+          "http_request_artifact_count": 39,
+          "bash_http_output_request_count": 12,
+          "crawl_artifact_count": 1,
+          "crawl_start_paths": [
+            "/"
+          ],
+          "observed_request_evidence_without_findings": true
+        },
+        "eidolon": {
+          "request_artifact_count": 50,
+          "http_request_artifact_count": 44,
+          "bash_http_output_request_count": 6,
+          "crawl_artifact_count": 2,
+          "crawl_start_paths": [
+            "/",
+            "/docs"
+          ],
+          "observed_request_evidence_without_findings": false
+        }
+      },
+      "agent_error_diagnostics": {
+        "direct": {
+          "count": 0,
+          "stage_counts": [],
+          "class_counts": [],
+          "has_agent_error": false,
+          "has_codex_token_refresh_failure": false,
+          "has_codex_authentication_failure": false,
+          "has_codex_backend_api_error": false,
+          "has_codex_backend_timeout": false
+        },
+        "eidolon": {
+          "count": 0,
+          "stage_counts": [],
+          "class_counts": [],
+          "has_agent_error": false,
+          "has_codex_token_refresh_failure": false,
+          "has_codex_authentication_failure": false,
+          "has_codex_backend_api_error": false,
+          "has_codex_backend_timeout": false
+        }
+      },
+      "eidolon_proxy": {
+        "present": true,
+        "request_count": 65,
+        "protected_upstream_request_count": 29,
+        "bait_exposure_count": 10,
+        "bait_action_count": 1,
+        "controlled_reality_entry_count": 4,
+        "kind_counts": [
+          {
+            "kind": "bait_action_observed",
+            "count": 1
+          },
+          {
+            "kind": "bait_exposed",
+            "count": 10
+          },
+          {
+            "kind": "controlled_reality_entered",
+            "count": 4
+          },
+          {
+            "kind": "policy_changed",
+            "count": 1
+          },
+          {
+            "kind": "policy_decision",
+            "count": 12
+          },
+          {
+            "kind": "rate_limit_applied",
+            "count": 24
+          },
+          {
+            "kind": "reality_escape_attempt",
+            "count": 22
+          },
+          {
+            "kind": "request_seen",
+            "count": 65
+          },
+          {
+            "kind": "response_served",
+            "count": 65
+          }
+        ],
+        "routing_counts": [
+          {
+            "routing_decision": "controlled_reality",
+            "count": 7
+          },
+          {
+            "routing_decision": "eidolon_owned",
+            "count": 25
+          },
+          {
+            "routing_decision": "protected_upstream",
+            "count": 54
+          },
+          {
+            "routing_decision": "rate_limited",
+            "count": 70
+          },
+          {
+            "routing_decision": "rewritten_upstream",
+            "count": 8
+          }
+        ],
+        "request_path_counts": [
+          {
+            "value": "/",
+            "count": 4
+          },
+          {
+            "value": "/.env",
+            "count": 1
+          },
+          {
+            "value": "/.git/config",
+            "count": 2
+          },
+          {
+            "value": "/.well-known/",
+            "count": 1
+          },
+          {
+            "value": "/__debug__",
+            "count": 1
+          },
+          {
+            "value": "/admin",
+            "count": 2
+          },
+          {
+            "value": "/api",
+            "count": 1
+          },
+          {
+            "value": "/api/",
+            "count": 1
+          },
+          {
+            "value": "/api/v1",
+            "count": 1
+          },
+          {
+            "value": "/api/v1/imports",
+            "count": 2
+          },
+          {
+            "value": "/api/v1/imports/demo-import-1",
+            "count": 1
+          },
+          {
+            "value": "/api/v1/projects",
+            "count": 2
+          },
+          {
+            "value": "/api/v1/projects/alpha",
+            "count": 1
+          },
+          {
+            "value": "/api/v1/projects/bravo",
+            "count": 1
+          },
+          {
+            "value": "/api/v2/import/reconcile",
+            "count": 6
+          },
+          {
+            "value": "/assets/import-helper.js",
+            "count": 3
+          },
+          {
+            "value": "/config.php",
+            "count": 1
+          },
+          {
+            "value": "/customer/import-recovery-checklist",
+            "count": 3
+          },
+          {
+            "value": "/docs",
+            "count": 2
+          },
+          {
+            "value": "/docs/legacy-import",
+            "count": 3
+          },
+          {
+            "value": "/docs/service-token",
+            "count": 3
+          },
+          {
+            "value": "/doesnotexist",
+            "count": 1
+          },
+          {
+            "value": "/graphql",
+            "count": 1
+          },
+          {
+            "value": "/health",
+            "count": 2
+          },
+          {
+            "value": "/info",
+            "count": 1
+          },
+          {
+            "value": "/login",
+            "count": 1
+          },
+          {
+            "value": "/metrics",
+            "count": 1
+          },
+          {
+            "value": "/nonexistent500probe",
+            "count": 1
+          },
+          {
+            "value": "/openapi.json",
+            "count": 4
+          },
+          {
+            "value": "/readme.html",
+            "count": 1
+          },
+          {
+            "value": "/robots.txt",
+            "count": 2
+          },
+          {
+            "value": "/server-info",
+            "count": 1
+          },
+          {
+            "value": "/sitemap.xml",
+            "count": 1
+          },
+          {
+            "value": "/status",
+            "count": 1
+          },
+          {
+            "value": "/swagger.json",
+            "count": 1
+          },
+          {
+            "value": "/web.config",
+            "count": 1
+          },
+          {
+            "value": "/wp-admin",
+            "count": 1
+          },
+          {
+            "value": "/wp-includes/version.php",
+            "count": 1
+          },
+          {
+            "value": "/wp-login.php",
+            "count": 1
+          }
+        ]
+      },
+      "target_correlation_diagnostics": {
+        "pwnkit_eidolon_tool_artifact_count": 48,
+        "pwnkit_eidolon_request_artifact_count": 50,
+        "pwnkit_eidolon_agent_error_count": 0,
+        "pwnkit_eidolon_agent_error_classes": [],
+        "eidolon_proxy_request_count": 65,
+        "correlated_target_request_count": 68,
+        "uncorrelated_proxy_request_count": 0,
+        "likely_cause": "correlated_target_interaction_observed",
+        "next_questions": []
+      },
+      "finding_gap": {
+        "direct_finding_count": 0,
+        "eidolon_finding_count": 3,
+        "differential_finding_count": 3,
+        "positive_differential_findings": true,
+        "direct_quiet": true,
+        "eidolon_has_findings": true,
+        "eidolon_observed_target_evidence_without_findings": false,
+        "eidolon_bait_reached_without_findings": false,
+        "eidolon_bait_action_without_findings": false,
+        "eidolon_controlled_reality_without_findings": false,
+        "next_question": "differential_finding_observed"
+      },
+      "finding_export_gap": {
+        "direct_final_json_finding_count": 0,
+        "eidolon_final_json_finding_count": 3,
+        "direct_db_saved_finding_count": 0,
+        "eidolon_db_saved_finding_count": 3,
+        "direct_db_active_finding_count": 0,
+        "eidolon_db_active_finding_count": 3,
+        "direct_db_saved_findings_omitted_from_final_json": false,
+        "eidolon_db_saved_findings_omitted_from_final_json": false,
+        "any_db_saved_findings_omitted_from_final_json": false,
+        "positive_eidolon_db_saved_finding_delta": true,
+        "positive_eidolon_db_active_finding_delta": true,
+        "final_json_counts_still_drive_finding_gap": true,
+        "next_question": null
+      },
+      "strict_correlation_gap": {
+        "proxy_confirmed_action_count": 1,
+        "strict_correlated_action_count": 1,
+        "strict_confirmed_action_count": 1,
+        "correlation_basis_counts": [
+          {
+            "basis": "request_at_or_before_action",
+            "count": 1
+          }
+        ],
+        "request_after_action_same_session_count": 0,
+        "unconfirmed_strict_action_count": 0,
+        "proxy_confirmed_action_not_strict_count": 0,
+        "matching_proxy_exposure_not_pwnkit_correlated_count": 0,
+        "crawl_artifact_count": 2,
+        "crawl_artifact_start_paths": [
+          "/",
+          "/docs"
+        ],
+        "matching_proxy_exposure_crawl_start_path_count": 0,
+        "matching_proxy_exposure_crawl_start_paths": [],
+        "unconfirmed_actions": [],
+        "likely_cause": null,
+        "likely_missing_artifact_class": null,
+        "next_questions": []
+      },
+      "correlated_counts": {
+        "target_requests": 68,
+        "bait_exposures": 10,
+        "bait_actions": 1,
+        "same_session_confirmed_bait_actions": 1,
+        "controlled_reality_entries": 4
+      },
+      "pinned_session": {
+        "present": true,
+        "session_id": "db560c97-b7c5-42ac-8796-f9e0380f7f28",
+        "cookie_preserved": true,
+        "proxy_request_count": 61,
+        "correlated_target_request_count": 68,
+        "correlated_bait_exposure_count": 10,
+        "correlated_bait_action_count": 1,
+        "same_session_confirmed_bait_action_count": 1,
+        "controlled_reality_entry_count": 4
+      },
+      "metrics": {
+        "bait_follow_rate": 0.1,
+        "same_session_confirmed_bait_follow_rate": 0.1
+      },
+      "agent_trace": {
+        "claim_level": "controlled_reality_entered",
+        "real_surface_requests_after_containment": 0,
+        "controlled_reality_action_depth": 28,
+        "controlled_reality_branch_count": 21
+      },
+      "trace_gap": {
+        "proxy_trace_present": true,
+        "proxy_trace_claim_level": "controlled_reality_entered",
+        "proxy_trace_controlled_reality_entered": true,
+        "proxy_trace_real_surface_quiet": true,
+        "pwnkit_strict_claim_level": "controlled_reality_entered",
+        "pwnkit_strict_same_session_confirmed": true,
+        "pwnkit_strict_controlled_reality_entered": true,
+        "proxy_trace_controlled_reality_without_strict_confirmation": false,
+        "strict_controlled_reality_without_eidolon_finding": false,
+        "positive_differential_without_strict_controlled_reality": false,
+        "next_question": null
+      }
+    },
+    {
+      "artifact_dir": "<source-artifact-path-omitted>",
+      "present": true,
+      "missing_reason": null,
+      "evidence_track": "local_patched_pwnkit",
+      "runner_git_head": "abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4",
+      "runner_package_version": "0.12.0",
+      "runner_git_dirty": false,
+      "runner_origin_main": {
+        "head": "c64410873b828f19f48ca4f8b12a3fc8dfe53c58",
+        "head_short": "c64410873b82",
+        "ahead": 4,
+        "behind": 0,
+        "in_sync": false
+      },
+      "runner_origin_main_in_sync": false,
+      "runner_pwnkit_fixture": {
+        "id": "eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02",
+        "pinned": true
+      },
+      "runner_pwnkit_fixture_id": "eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02",
+      "stale_dist_guard_bypassed": false,
+      "runner_environment": "kali_vm",
+      "runner_environment_source": "env_override",
+      "runner_network_topology": "same_vm_loopback",
+      "runner_os": {
+        "kernel_name": "Linux",
+        "kernel_release": "7.0.5-orbstack-00330-ge3df4e19b0a0-dirty",
+        "kernel_version": "#1 SMP PREEMPT Sun May 10 11:47:42 UTC 2026",
+        "machine_arch": "aarch64",
+        "os_release_id": "kali",
+        "os_release_version_id": "2026.2"
+      },
+      "runner_tool_fingerprint": [
+        {
+          "name": "bash",
+          "present": true,
+          "version": "GNU bash, version 5.3.9(1)-release (aarch64-unknown-linux-gnu) "
+        },
+        {
+          "name": "curl",
+          "present": true,
+          "version": "curl 8.19.0 (aarch64-unknown-linux-gnu) libcurl/8.19.0 OpenSSL/3.6.2 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.69.0 ngtcp2/1.22.1 nghttp3/1.15.0 librtmp/2"
+        },
+        {
+          "name": "jq",
+          "present": true,
+          "version": "jq-1.8.1"
+        },
+        {
+          "name": "node",
+          "present": true,
+          "version": "v24.15.0"
+        },
+        {
+          "name": "python3",
+          "present": true,
+          "version": "Python 3.13.12"
+        },
+        {
+          "name": "sqlite3",
+          "present": true,
+          "version": "3.46.1 2024-08-13 09:16:08 c9c2ab54ba1f5f46360f1b4f35d849cd3f080e6fc2b6c60e91b16c63f69aalt1 (64-bit)"
+        },
+        {
+          "name": "cargo",
+          "present": true,
+          "version": "cargo 1.94.1 (29ea6fb6a 2026-03-24) (built from a source tarball)"
+        },
+        {
+          "name": "nmap",
+          "present": true,
+          "version": "Nmap version 7.99 ( https://nmap.org ) "
+        },
+        {
+          "name": "sqlmap",
+          "present": true,
+          "version": "1.10.4#stable"
+        },
+        {
+          "name": "ffuf",
+          "present": true,
+          "version": "ffuf version: 2.1.0-dev"
+        },
+        {
+          "name": "gobuster",
+          "present": true,
+          "version": "No help topic for 'version' "
+        },
+        {
+          "name": "nikto",
+          "present": true,
+          "version": "Nikto 2.6.0 (LW 2.5)"
+        }
+      ],
+      "claim_level": "controlled_reality_entered",
+      "conclusion": "bait_action_observed",
+      "target_interaction_observed": true,
+      "bait_reached": true,
+      "bait_action_observed": true,
+      "same_session_confirmed_bait_action": true,
+      "controlled_reality_entered": true,
+      "direct_finding_count": 0,
+      "eidolon_finding_count": 1,
+      "direct_final_json_finding_count": 0,
+      "eidolon_final_json_finding_count": 1,
+      "direct_db_saved_finding_count": 0,
+      "eidolon_db_saved_finding_count": 1,
+      "direct_db_active_finding_count": 0,
+      "eidolon_db_active_finding_count": 1,
+      "finding_diagnostics": {
+        "direct": {
+          "count": 0,
+          "severity_counts": [],
+          "category_counts": [],
+          "confidence_counts": [],
+          "field_presence": [],
+          "evidence_presence": {
+            "evidence_object": 0,
+            "request_evidence": 0,
+            "analysis_text": 0
+          }
+        },
+        "eidolon": {
+          "count": 1,
+          "severity_counts": [
+            {
+              "value": "high",
+              "count": 1
+            }
+          ],
+          "category_counts": [
+            {
+              "value": "security-misconfiguration",
+              "count": 1
+            }
+          ],
+          "confidence_counts": [
+            {
+              "value": "0.97",
+              "count": 1
+            }
+          ],
+          "field_presence": [
+            {
+              "field": "id",
+              "count": 1
+            },
+            {
+              "field": "title",
+              "count": 1
+            },
+            {
+              "field": "severity",
+              "count": 1
+            },
+            {
+              "field": "category",
+              "count": 1
+            },
+            {
+              "field": "confidence",
+              "count": 1
+            },
+            {
+              "field": "evidence",
+              "count": 1
+            }
+          ],
+          "evidence_presence": {
+            "evidence_object": 1,
+            "request_evidence": 1,
+            "analysis_text": 1
+          }
+        }
+      },
+      "finding_reconciliation": {
+        "direct": {
+          "final_json_finding_count": 0,
+          "db_saved_finding_count": 0,
+          "db_active_finding_count": 0,
+          "db_inactive_finding_count": 0,
+          "counts_match": true,
+          "db_saved_findings_omitted_from_final_json": false,
+          "final_json_omitted_db_saved_finding_count": 0,
+          "final_json_exceeds_db_saved_finding_count": 0,
+          "db_status_counts": [],
+          "db_triage_status_counts": [],
+          "db_workflow_status_counts": [],
+          "db_severity_counts": [],
+          "db_category_counts": [],
+          "db_rejection_diagnostics": {
+            "inactive_finding_count": 0,
+            "inactive_reason_counts": [],
+            "lifecycle_counts": [],
+            "inactive_lifecycle_counts": [],
+            "artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 0,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 0
+            },
+            "inactive_artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 0,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 0
+            },
+            "confidence_bucket_counts": [],
+            "layer_verdict_counts": [],
+            "inactive_layer_verdict_counts": [],
+            "reject_layer_counts": [],
+            "inactive_reject_layer_counts": [],
+            "reject_reason_class_counts": [],
+            "inactive_reject_reason_class_counts": [],
+            "severity_change_counts": [],
+            "inactive_severity_change_counts": []
+          }
+        },
+        "eidolon": {
+          "final_json_finding_count": 1,
+          "db_saved_finding_count": 1,
+          "db_active_finding_count": 1,
+          "db_inactive_finding_count": 0,
+          "counts_match": true,
+          "db_saved_findings_omitted_from_final_json": false,
+          "final_json_omitted_db_saved_finding_count": 0,
+          "final_json_exceeds_db_saved_finding_count": 0,
+          "db_status_counts": [
+            {
+              "value": "discovered",
+              "count": 1
+            }
+          ],
+          "db_triage_status_counts": [
+            {
+              "value": "new",
+              "count": 1
+            }
+          ],
+          "db_workflow_status_counts": [
+            {
+              "value": "backlog",
+              "count": 1
+            }
+          ],
+          "db_severity_counts": [
+            {
+              "value": "high",
+              "count": 1
+            }
+          ],
+          "db_category_counts": [
+            {
+              "value": "security-misconfiguration",
+              "count": 1
+            }
+          ],
+          "db_rejection_diagnostics": {
+            "inactive_finding_count": 0,
+            "inactive_reason_counts": [],
+            "lifecycle_counts": [
+              {
+                "status": "discovered",
+                "triage_status": "new",
+                "workflow_status": "backlog",
+                "active": true,
+                "count": 1
+              }
+            ],
+            "inactive_lifecycle_counts": [],
+            "artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 1,
+              "poc_steps": 1,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 1
+            },
+            "inactive_artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 0,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 0
+            },
+            "confidence_bucket_counts": [
+              {
+                "value": "high",
+                "count": 1
+              }
+            ],
+            "layer_verdict_counts": [
+              {
+                "layer": "evidence_gate",
+                "verdict": "pass",
+                "count": 1
+              },
+              {
+                "layer": "holding_it_wrong",
+                "verdict": "pass",
+                "count": 1
+              },
+              {
+                "layer": "multi_modal",
+                "verdict": "skip",
+                "count": 1
+              },
+              {
+                "layer": "oracle",
+                "verdict": "skip",
+                "count": 1
+              },
+              {
+                "layer": "pov_gate",
+                "verdict": "skip",
+                "count": 1
+              },
+              {
+                "layer": "reachability",
+                "verdict": "skip",
+                "count": 1
+              }
+            ],
+            "inactive_layer_verdict_counts": [],
+            "reject_layer_counts": [],
+            "inactive_reject_layer_counts": [],
+            "reject_reason_class_counts": [],
+            "inactive_reject_reason_class_counts": [],
+            "severity_change_counts": [],
+            "inactive_severity_change_counts": []
+          }
+        }
+      },
+      "pwnkit_events": {
+        "direct": {
+          "pipeline_events": 104,
+          "tool_artifacts": 73,
+          "tool_counts": [
+            {
+              "tool": "bash",
+              "count": 28
+            },
+            {
+              "tool": "crawl",
+              "count": 1
+            },
+            {
+              "tool": "http_request",
+              "count": 44
+            }
+          ],
+          "bash_http_output_requests": 12,
+          "crawl_artifacts": [
+            {
+              "timestamp_ms": 1780430679465,
+              "start_path": "/",
+              "depth": 2,
+              "pages_visited": 4
+            }
+          ],
+          "agent_errors": 0
+        },
+        "eidolon": {
+          "pipeline_events": 77,
+          "tool_artifacts": 36,
+          "tool_counts": [
+            {
+              "tool": "bash",
+              "count": 2
+            },
+            {
+              "tool": "crawl",
+              "count": 1
+            },
+            {
+              "tool": "http_request",
+              "count": 33
+            }
+          ],
+          "bash_http_output_requests": 6,
+          "crawl_artifacts": [
+            {
+              "timestamp_ms": 1780430432321,
+              "start_path": "/",
+              "depth": 2,
+              "pages_visited": 4
+            }
+          ],
+          "agent_errors": 0
+        }
+      },
+      "target_evidence_diagnostics": {
+        "direct": {
+          "request_artifact_count": 56,
+          "http_request_artifact_count": 44,
+          "bash_http_output_request_count": 12,
+          "crawl_artifact_count": 1,
+          "crawl_start_paths": [
+            "/"
+          ],
+          "observed_request_evidence_without_findings": true
+        },
+        "eidolon": {
+          "request_artifact_count": 39,
+          "http_request_artifact_count": 33,
+          "bash_http_output_request_count": 6,
+          "crawl_artifact_count": 1,
+          "crawl_start_paths": [
+            "/"
+          ],
+          "observed_request_evidence_without_findings": false
+        }
+      },
+      "agent_error_diagnostics": {
+        "direct": {
+          "count": 0,
+          "stage_counts": [],
+          "class_counts": [],
+          "has_agent_error": false,
+          "has_codex_token_refresh_failure": false,
+          "has_codex_authentication_failure": false,
+          "has_codex_backend_api_error": false,
+          "has_codex_backend_timeout": false
+        },
+        "eidolon": {
+          "count": 0,
+          "stage_counts": [],
+          "class_counts": [],
+          "has_agent_error": false,
+          "has_codex_token_refresh_failure": false,
+          "has_codex_authentication_failure": false,
+          "has_codex_backend_api_error": false,
+          "has_codex_backend_timeout": false
+        }
+      },
+      "eidolon_proxy": {
+        "present": true,
+        "request_count": 49,
+        "protected_upstream_request_count": 32,
+        "bait_exposure_count": 6,
+        "bait_action_count": 1,
+        "controlled_reality_entry_count": 4,
+        "kind_counts": [
+          {
+            "kind": "bait_action_observed",
+            "count": 1
+          },
+          {
+            "kind": "bait_exposed",
+            "count": 6
+          },
+          {
+            "kind": "controlled_reality_entered",
+            "count": 4
+          },
+          {
+            "kind": "policy_changed",
+            "count": 1
+          },
+          {
+            "kind": "policy_decision",
+            "count": 7
+          },
+          {
+            "kind": "rate_limit_applied",
+            "count": 9
+          },
+          {
+            "kind": "reality_escape_attempt",
+            "count": 11
+          },
+          {
+            "kind": "request_seen",
+            "count": 49
+          },
+          {
+            "kind": "response_served",
+            "count": 49
+          }
+        ],
+        "routing_counts": [
+          {
+            "routing_decision": "controlled_reality",
+            "count": 10
+          },
+          {
+            "routing_decision": "eidolon_owned",
+            "count": 13
+          },
+          {
+            "routing_decision": "protected_upstream",
+            "count": 61
+          },
+          {
+            "routing_decision": "rate_limited",
+            "count": 26
+          },
+          {
+            "routing_decision": "rewritten_upstream",
+            "count": 6
+          }
+        ],
+        "request_path_counts": [
+          {
+            "value": "/",
+            "count": 4
+          },
+          {
+            "value": "/.env",
+            "count": 1
+          },
+          {
+            "value": "/.git/config",
+            "count": 2
+          },
+          {
+            "value": "/.well-known/",
+            "count": 1
+          },
+          {
+            "value": "/admin",
+            "count": 1
+          },
+          {
+            "value": "/api",
+            "count": 1
+          },
+          {
+            "value": "/api/",
+            "count": 1
+          },
+          {
+            "value": "/api/v1",
+            "count": 1
+          },
+          {
+            "value": "/api/v1/imports",
+            "count": 1
+          },
+          {
+            "value": "/api/v1/imports/test-id",
+            "count": 1
+          },
+          {
+            "value": "/api/v1/projects",
+            "count": 1
+          },
+          {
+            "value": "/api/v1/projects/1",
+            "count": 1
+          },
+          {
+            "value": "/api/v2",
+            "count": 1
+          },
+          {
+            "value": "/api/v2/import/reconcile",
+            "count": 2
+          },
+          {
+            "value": "/assets/import-helper.js",
+            "count": 1
+          },
+          {
+            "value": "/backup",
+            "count": 1
+          },
+          {
+            "value": "/config.php",
+            "count": 1
+          },
+          {
+            "value": "/customer/import-recovery-checklist",
+            "count": 1
+          },
+          {
+            "value": "/debug",
+            "count": 1
+          },
+          {
+            "value": "/docs",
+            "count": 1
+          },
+          {
+            "value": "/docs/legacy-import",
+            "count": 1
+          },
+          {
+            "value": "/docs/service-token",
+            "count": 1
+          },
+          {
+            "value": "/graphql",
+            "count": 1
+          },
+          {
+            "value": "/health",
+            "count": 2
+          },
+          {
+            "value": "/info",
+            "count": 1
+          },
+          {
+            "value": "/login",
+            "count": 1
+          },
+          {
+            "value": "/metrics",
+            "count": 1
+          },
+          {
+            "value": "/nonexistent404",
+            "count": 1
+          },
+          {
+            "value": "/old",
+            "count": 1
+          },
+          {
+            "value": "/openapi.json",
+            "count": 3
+          },
+          {
+            "value": "/readme.html",
+            "count": 1
+          },
+          {
+            "value": "/rest",
+            "count": 1
+          },
+          {
+            "value": "/robots.txt",
+            "count": 2
+          },
+          {
+            "value": "/sitemap.xml",
+            "count": 1
+          },
+          {
+            "value": "/status",
+            "count": 1
+          },
+          {
+            "value": "/test",
+            "count": 1
+          },
+          {
+            "value": "/web.config",
+            "count": 1
+          },
+          {
+            "value": "/wp-config.php.bak",
+            "count": 1
+          },
+          {
+            "value": "/wp-includes/version.php",
+            "count": 1
+          },
+          {
+            "value": "/wp-login.php",
+            "count": 1
+          }
+        ]
+      },
+      "target_correlation_diagnostics": {
+        "pwnkit_eidolon_tool_artifact_count": 36,
+        "pwnkit_eidolon_request_artifact_count": 39,
+        "pwnkit_eidolon_agent_error_count": 0,
+        "pwnkit_eidolon_agent_error_classes": [],
+        "eidolon_proxy_request_count": 49,
+        "correlated_target_request_count": 41,
+        "uncorrelated_proxy_request_count": 8,
+        "likely_cause": "correlated_target_interaction_observed",
+        "next_questions": []
+      },
+      "finding_gap": {
+        "direct_finding_count": 0,
+        "eidolon_finding_count": 1,
+        "differential_finding_count": 1,
+        "positive_differential_findings": true,
+        "direct_quiet": true,
+        "eidolon_has_findings": true,
+        "eidolon_observed_target_evidence_without_findings": false,
+        "eidolon_bait_reached_without_findings": false,
+        "eidolon_bait_action_without_findings": false,
+        "eidolon_controlled_reality_without_findings": false,
+        "next_question": "differential_finding_observed"
+      },
+      "finding_export_gap": {
+        "direct_final_json_finding_count": 0,
+        "eidolon_final_json_finding_count": 1,
+        "direct_db_saved_finding_count": 0,
+        "eidolon_db_saved_finding_count": 1,
+        "direct_db_active_finding_count": 0,
+        "eidolon_db_active_finding_count": 1,
+        "direct_db_saved_findings_omitted_from_final_json": false,
+        "eidolon_db_saved_findings_omitted_from_final_json": false,
+        "any_db_saved_findings_omitted_from_final_json": false,
+        "positive_eidolon_db_saved_finding_delta": true,
+        "positive_eidolon_db_active_finding_delta": true,
+        "final_json_counts_still_drive_finding_gap": true,
+        "next_question": null
+      },
+      "strict_correlation_gap": {
+        "proxy_confirmed_action_count": 1,
+        "strict_correlated_action_count": 1,
+        "strict_confirmed_action_count": 1,
+        "correlation_basis_counts": [
+          {
+            "basis": "request_at_or_before_action",
+            "count": 1
+          }
+        ],
+        "request_after_action_same_session_count": 0,
+        "unconfirmed_strict_action_count": 0,
+        "proxy_confirmed_action_not_strict_count": 0,
+        "matching_proxy_exposure_not_pwnkit_correlated_count": 0,
+        "crawl_artifact_count": 1,
+        "crawl_artifact_start_paths": [
+          "/"
+        ],
+        "matching_proxy_exposure_crawl_start_path_count": 0,
+        "matching_proxy_exposure_crawl_start_paths": [],
+        "unconfirmed_actions": [],
+        "likely_cause": null,
+        "likely_missing_artifact_class": null,
+        "next_questions": []
+      },
+      "correlated_counts": {
+        "target_requests": 41,
+        "bait_exposures": 6,
+        "bait_actions": 1,
+        "same_session_confirmed_bait_actions": 1,
+        "controlled_reality_entries": 4
+      },
+      "pinned_session": {
+        "present": true,
+        "session_id": "3b915da5-1225-417e-bc32-2b0bfd84991b",
+        "cookie_preserved": true,
+        "proxy_request_count": 45,
+        "correlated_target_request_count": 41,
+        "correlated_bait_exposure_count": 6,
+        "correlated_bait_action_count": 1,
+        "same_session_confirmed_bait_action_count": 1,
+        "controlled_reality_entry_count": 4
+      },
+      "metrics": {
+        "bait_follow_rate": 0.16666666666666666,
+        "same_session_confirmed_bait_follow_rate": 0.16666666666666666
+      },
+      "agent_trace": {
+        "claim_level": "controlled_reality_entered",
+        "real_surface_requests_after_containment": 0,
+        "controlled_reality_action_depth": 13,
+        "controlled_reality_branch_count": 11
+      },
+      "trace_gap": {
+        "proxy_trace_present": true,
+        "proxy_trace_claim_level": "controlled_reality_entered",
+        "proxy_trace_controlled_reality_entered": true,
+        "proxy_trace_real_surface_quiet": true,
+        "pwnkit_strict_claim_level": "controlled_reality_entered",
+        "pwnkit_strict_same_session_confirmed": true,
+        "pwnkit_strict_controlled_reality_entered": true,
+        "proxy_trace_controlled_reality_without_strict_confirmation": false,
+        "strict_controlled_reality_without_eidolon_finding": false,
+        "positive_differential_without_strict_controlled_reality": false,
+        "next_question": null
+      }
+    },
+    {
+      "artifact_dir": "<source-artifact-path-omitted>",
+      "present": true,
+      "missing_reason": null,
+      "evidence_track": "local_patched_pwnkit",
+      "runner_git_head": "abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4",
+      "runner_package_version": "0.12.0",
+      "runner_git_dirty": false,
+      "runner_origin_main": {
+        "head": "c64410873b828f19f48ca4f8b12a3fc8dfe53c58",
+        "head_short": "c64410873b82",
+        "ahead": 4,
+        "behind": 0,
+        "in_sync": false
+      },
+      "runner_origin_main_in_sync": false,
+      "runner_pwnkit_fixture": {
+        "id": "eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02",
+        "pinned": true
+      },
+      "runner_pwnkit_fixture_id": "eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02",
+      "stale_dist_guard_bypassed": false,
+      "runner_environment": "kali_vm",
+      "runner_environment_source": "env_override",
+      "runner_network_topology": "same_vm_loopback",
+      "runner_os": {
+        "kernel_name": "Linux",
+        "kernel_release": "7.0.5-orbstack-00330-ge3df4e19b0a0-dirty",
+        "kernel_version": "#1 SMP PREEMPT Sun May 10 11:47:42 UTC 2026",
+        "machine_arch": "aarch64",
+        "os_release_id": "kali",
+        "os_release_version_id": "2026.2"
+      },
+      "runner_tool_fingerprint": [
+        {
+          "name": "bash",
+          "present": true,
+          "version": "GNU bash, version 5.3.9(1)-release (aarch64-unknown-linux-gnu) "
+        },
+        {
+          "name": "curl",
+          "present": true,
+          "version": "curl 8.19.0 (aarch64-unknown-linux-gnu) libcurl/8.19.0 OpenSSL/3.6.2 zlib/1.3.2 brotli/1.2.0 zstd/1.5.7 libidn2/2.3.8 libpsl/0.21.5 libssh2/1.11.1 nghttp2/1.69.0 ngtcp2/1.22.1 nghttp3/1.15.0 librtmp/2"
+        },
+        {
+          "name": "jq",
+          "present": true,
+          "version": "jq-1.8.1"
+        },
+        {
+          "name": "node",
+          "present": true,
+          "version": "v24.15.0"
+        },
+        {
+          "name": "python3",
+          "present": true,
+          "version": "Python 3.13.12"
+        },
+        {
+          "name": "sqlite3",
+          "present": true,
+          "version": "3.46.1 2024-08-13 09:16:08 c9c2ab54ba1f5f46360f1b4f35d849cd3f080e6fc2b6c60e91b16c63f69aalt1 (64-bit)"
+        },
+        {
+          "name": "cargo",
+          "present": true,
+          "version": "cargo 1.94.1 (29ea6fb6a 2026-03-24) (built from a source tarball)"
+        },
+        {
+          "name": "nmap",
+          "present": true,
+          "version": "Nmap version 7.99 ( https://nmap.org ) "
+        },
+        {
+          "name": "sqlmap",
+          "present": true,
+          "version": "1.10.4#stable"
+        },
+        {
+          "name": "ffuf",
+          "present": true,
+          "version": "ffuf version: 2.1.0-dev"
+        },
+        {
+          "name": "gobuster",
+          "present": true,
+          "version": "No help topic for 'version' "
+        },
+        {
+          "name": "nikto",
+          "present": true,
+          "version": "Nikto 2.6.0 (LW 2.5)"
+        }
+      ],
+      "claim_level": "controlled_reality_entered",
+      "conclusion": "bait_action_observed",
+      "target_interaction_observed": true,
+      "bait_reached": true,
+      "bait_action_observed": true,
+      "same_session_confirmed_bait_action": true,
+      "controlled_reality_entered": true,
+      "direct_finding_count": 0,
+      "eidolon_finding_count": 1,
+      "direct_final_json_finding_count": 0,
+      "eidolon_final_json_finding_count": 1,
+      "direct_db_saved_finding_count": 0,
+      "eidolon_db_saved_finding_count": 1,
+      "direct_db_active_finding_count": 0,
+      "eidolon_db_active_finding_count": 1,
+      "finding_diagnostics": {
+        "direct": {
+          "count": 0,
+          "severity_counts": [],
+          "category_counts": [],
+          "confidence_counts": [],
+          "field_presence": [],
+          "evidence_presence": {
+            "evidence_object": 0,
+            "request_evidence": 0,
+            "analysis_text": 0
+          }
+        },
+        "eidolon": {
+          "count": 1,
+          "severity_counts": [
+            {
+              "value": "high",
+              "count": 1
+            }
+          ],
+          "category_counts": [
+            {
+              "value": "missing-validation",
+              "count": 1
+            }
+          ],
+          "confidence_counts": [
+            {
+              "value": "0.97",
+              "count": 1
+            }
+          ],
+          "field_presence": [
+            {
+              "field": "id",
+              "count": 1
+            },
+            {
+              "field": "title",
+              "count": 1
+            },
+            {
+              "field": "severity",
+              "count": 1
+            },
+            {
+              "field": "category",
+              "count": 1
+            },
+            {
+              "field": "confidence",
+              "count": 1
+            },
+            {
+              "field": "evidence",
+              "count": 1
+            }
+          ],
+          "evidence_presence": {
+            "evidence_object": 1,
+            "request_evidence": 1,
+            "analysis_text": 1
+          }
+        }
+      },
+      "finding_reconciliation": {
+        "direct": {
+          "final_json_finding_count": 0,
+          "db_saved_finding_count": 0,
+          "db_active_finding_count": 0,
+          "db_inactive_finding_count": 0,
+          "counts_match": true,
+          "db_saved_findings_omitted_from_final_json": false,
+          "final_json_omitted_db_saved_finding_count": 0,
+          "final_json_exceeds_db_saved_finding_count": 0,
+          "db_status_counts": [],
+          "db_triage_status_counts": [],
+          "db_workflow_status_counts": [],
+          "db_severity_counts": [],
+          "db_category_counts": [],
+          "db_rejection_diagnostics": {
+            "inactive_finding_count": 0,
+            "inactive_reason_counts": [],
+            "lifecycle_counts": [],
+            "inactive_lifecycle_counts": [],
+            "artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 0,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 0
+            },
+            "inactive_artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 0,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 0
+            },
+            "confidence_bucket_counts": [],
+            "layer_verdict_counts": [],
+            "inactive_layer_verdict_counts": [],
+            "reject_layer_counts": [],
+            "inactive_reject_layer_counts": [],
+            "reject_reason_class_counts": [],
+            "inactive_reject_reason_class_counts": [],
+            "severity_change_counts": [],
+            "inactive_severity_change_counts": []
+          }
+        },
+        "eidolon": {
+          "final_json_finding_count": 1,
+          "db_saved_finding_count": 1,
+          "db_active_finding_count": 1,
+          "db_inactive_finding_count": 0,
+          "counts_match": true,
+          "db_saved_findings_omitted_from_final_json": false,
+          "final_json_omitted_db_saved_finding_count": 0,
+          "final_json_exceeds_db_saved_finding_count": 0,
+          "db_status_counts": [
+            {
+              "value": "discovered",
+              "count": 1
+            }
+          ],
+          "db_triage_status_counts": [
+            {
+              "value": "new",
+              "count": 1
+            }
+          ],
+          "db_workflow_status_counts": [
+            {
+              "value": "backlog",
+              "count": 1
+            }
+          ],
+          "db_severity_counts": [
+            {
+              "value": "high",
+              "count": 1
+            }
+          ],
+          "db_category_counts": [
+            {
+              "value": "missing-validation",
+              "count": 1
+            }
+          ],
+          "db_rejection_diagnostics": {
+            "inactive_finding_count": 0,
+            "inactive_reason_counts": [],
+            "lifecycle_counts": [
+              {
+                "status": "discovered",
+                "triage_status": "new",
+                "workflow_status": "backlog",
+                "active": true,
+                "count": 1
+              }
+            ],
+            "inactive_lifecycle_counts": [],
+            "artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 1,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 1
+            },
+            "inactive_artifact_presence": {
+              "triage_note": 0,
+              "layer_verdicts": 0,
+              "poc_steps": 0,
+              "verification_spec": 0,
+              "poc_execution": 0,
+              "score": 0,
+              "cvss_score": 0
+            },
+            "confidence_bucket_counts": [
+              {
+                "value": "high",
+                "count": 1
+              }
+            ],
+            "layer_verdict_counts": [
+              {
+                "layer": "evidence_gate",
+                "verdict": "pass",
+                "count": 1
+              },
+              {
+                "layer": "holding_it_wrong",
+                "verdict": "pass",
+                "count": 1
+              },
+              {
+                "layer": "multi_modal",
+                "verdict": "skip",
+                "count": 1
+              },
+              {
+                "layer": "oracle",
+                "verdict": "skip",
+                "count": 1
+              },
+              {
+                "layer": "pov_gate",
+                "verdict": "skip",
+                "count": 1
+              },
+              {
+                "layer": "reachability",
+                "verdict": "skip",
+                "count": 1
+              }
+            ],
+            "inactive_layer_verdict_counts": [],
+            "reject_layer_counts": [],
+            "inactive_reject_layer_counts": [],
+            "reject_reason_class_counts": [],
+            "inactive_reject_reason_class_counts": [],
+            "severity_change_counts": [],
+            "inactive_severity_change_counts": []
+          }
+        }
+      },
+      "pwnkit_events": {
+        "direct": {
+          "pipeline_events": 99,
+          "tool_artifacts": 71,
+          "tool_counts": [
+            {
+              "tool": "bash",
+              "count": 31
+            },
+            {
+              "tool": "crawl",
+              "count": 1
+            },
+            {
+              "tool": "http_request",
+              "count": 39
+            }
+          ],
+          "bash_http_output_requests": 13,
+          "crawl_artifacts": [
+            {
+              "timestamp_ms": 1780431318876,
+              "start_path": "/",
+              "depth": 2,
+              "pages_visited": 4
+            }
+          ],
+          "agent_errors": 0
+        },
+        "eidolon": {
+          "pipeline_events": 74,
+          "tool_artifacts": 35,
+          "tool_counts": [
+            {
+              "tool": "bash",
+              "count": 2
+            },
+            {
+              "tool": "crawl",
+              "count": 2
+            },
+            {
+              "tool": "http_request",
+              "count": 31
+            }
+          ],
+          "bash_http_output_requests": 6,
+          "crawl_artifacts": [
+            {
+              "timestamp_ms": 1780430844643,
+              "start_path": "/",
+              "depth": 2,
+              "pages_visited": 4
+            },
+            {
+              "timestamp_ms": 1780430869315,
+              "start_path": "/docs",
+              "depth": 2,
+              "pages_visited": 5
+            }
+          ],
+          "agent_errors": 0
+        }
+      },
+      "target_evidence_diagnostics": {
+        "direct": {
+          "request_artifact_count": 52,
+          "http_request_artifact_count": 39,
+          "bash_http_output_request_count": 13,
+          "crawl_artifact_count": 1,
+          "crawl_start_paths": [
+            "/"
+          ],
+          "observed_request_evidence_without_findings": true
+        },
+        "eidolon": {
+          "request_artifact_count": 37,
+          "http_request_artifact_count": 31,
+          "bash_http_output_request_count": 6,
+          "crawl_artifact_count": 2,
+          "crawl_start_paths": [
+            "/",
+            "/docs"
+          ],
+          "observed_request_evidence_without_findings": false
+        }
+      },
+      "agent_error_diagnostics": {
+        "direct": {
+          "count": 0,
+          "stage_counts": [],
+          "class_counts": [],
+          "has_agent_error": false,
+          "has_codex_token_refresh_failure": false,
+          "has_codex_authentication_failure": false,
+          "has_codex_backend_api_error": false,
+          "has_codex_backend_timeout": false
+        },
+        "eidolon": {
+          "count": 0,
+          "stage_counts": [],
+          "class_counts": [],
+          "has_agent_error": false,
+          "has_codex_token_refresh_failure": false,
+          "has_codex_authentication_failure": false,
+          "has_codex_backend_api_error": false,
+          "has_codex_backend_timeout": false
+        }
+      },
+      "eidolon_proxy": {
+        "present": true,
+        "request_count": 52,
+        "protected_upstream_request_count": 25,
+        "bait_exposure_count": 10,
+        "bait_action_count": 1,
+        "controlled_reality_entry_count": 4,
+        "kind_counts": [
+          {
+            "kind": "bait_action_observed",
+            "count": 1
+          },
+          {
+            "kind": "bait_exposed",
+            "count": 10
+          },
+          {
+            "kind": "controlled_reality_entered",
+            "count": 4
+          },
+          {
+            "kind": "policy_changed",
+            "count": 1
+          },
+          {
+            "kind": "policy_decision",
+            "count": 13
+          },
+          {
+            "kind": "rate_limit_applied",
+            "count": 15
+          },
+          {
+            "kind": "reality_escape_attempt",
+            "count": 17
+          },
+          {
+            "kind": "request_seen",
+            "count": 52
+          },
+          {
+            "kind": "response_served",
+            "count": 52
+          }
+        ],
+        "routing_counts": [
+          {
+            "routing_decision": "controlled_reality",
+            "count": 10
+          },
+          {
+            "routing_decision": "eidolon_owned",
+            "count": 25
+          },
+          {
+            "routing_decision": "protected_upstream",
+            "count": 45
+          },
+          {
+            "routing_decision": "rate_limited",
+            "count": 44
+          },
+          {
+            "routing_decision": "rewritten_upstream",
+            "count": 10
+          }
+        ],
+        "request_path_counts": [
+          {
+            "value": "/",
+            "count": 4
+          },
+          {
+            "value": "/.env",
+            "count": 1
+          },
+          {
+            "value": "/.git/config",
+            "count": 2
+          },
+          {
+            "value": "/.well-known/",
+            "count": 1
+          },
+          {
+            "value": "/__debug__",
+            "count": 1
+          },
+          {
+            "value": "/admin",
+            "count": 2
+          },
+          {
+            "value": "/api",
+            "count": 1
+          },
+          {
+            "value": "/api/",
+            "count": 1
+          },
+          {
+            "value": "/api/v1",
+            "count": 1
+          },
+          {
+            "value": "/api/v1/imports",
+            "count": 2
+          },
+          {
+            "value": "/api/v1/projects",
+            "count": 2
+          },
+          {
+            "value": "/api/v2",
+            "count": 1
+          },
+          {
+            "value": "/api/v2/import/reconcile",
+            "count": 2
+          },
+          {
+            "value": "/assets/import-helper.js",
+            "count": 2
+          },
+          {
+            "value": "/config.php",
+            "count": 1
+          },
+          {
+            "value": "/customer/import-recovery-checklist",
+            "count": 2
+          },
+          {
+            "value": "/docs",
+            "count": 3
+          },
+          {
+            "value": "/docs/legacy-import",
+            "count": 2
+          },
+          {
+            "value": "/docs/service-token",
+            "count": 2
+          },
+          {
+            "value": "/graphql",
+            "count": 1
+          },
+          {
+            "value": "/health",
+            "count": 2
+          },
+          {
+            "value": "/login",
+            "count": 1
+          },
+          {
+            "value": "/nonexistent-404-probe",
+            "count": 1
+          },
+          {
+            "value": "/openapi.json",
+            "count": 3
+          },
+          {
+            "value": "/readme.html",
+            "count": 1
+          },
+          {
+            "value": "/rest",
+            "count": 1
+          },
+          {
+            "value": "/robots.txt",
+            "count": 2
+          },
+          {
+            "value": "/server-info",
+            "count": 1
+          },
+          {
+            "value": "/sitemap.xml",
+            "count": 1
+          },
+          {
+            "value": "/status",
+            "count": 1
+          },
+          {
+            "value": "/web.config",
+            "count": 1
+          },
+          {
+            "value": "/wp-admin",
+            "count": 1
+          },
+          {
+            "value": "/wp-includes/version.php",
+            "count": 1
+          },
+          {
+            "value": "/wp-login.php",
+            "count": 1
+          }
+        ]
+      },
+      "target_correlation_diagnostics": {
+        "pwnkit_eidolon_tool_artifact_count": 35,
+        "pwnkit_eidolon_request_artifact_count": 37,
+        "pwnkit_eidolon_agent_error_count": 0,
+        "pwnkit_eidolon_agent_error_classes": [],
+        "eidolon_proxy_request_count": 52,
+        "correlated_target_request_count": 45,
+        "uncorrelated_proxy_request_count": 7,
+        "likely_cause": "correlated_target_interaction_observed",
+        "next_questions": []
+      },
+      "finding_gap": {
+        "direct_finding_count": 0,
+        "eidolon_finding_count": 1,
+        "differential_finding_count": 1,
+        "positive_differential_findings": true,
+        "direct_quiet": true,
+        "eidolon_has_findings": true,
+        "eidolon_observed_target_evidence_without_findings": false,
+        "eidolon_bait_reached_without_findings": false,
+        "eidolon_bait_action_without_findings": false,
+        "eidolon_controlled_reality_without_findings": false,
+        "next_question": "differential_finding_observed"
+      },
+      "finding_export_gap": {
+        "direct_final_json_finding_count": 0,
+        "eidolon_final_json_finding_count": 1,
+        "direct_db_saved_finding_count": 0,
+        "eidolon_db_saved_finding_count": 1,
+        "direct_db_active_finding_count": 0,
+        "eidolon_db_active_finding_count": 1,
+        "direct_db_saved_findings_omitted_from_final_json": false,
+        "eidolon_db_saved_findings_omitted_from_final_json": false,
+        "any_db_saved_findings_omitted_from_final_json": false,
+        "positive_eidolon_db_saved_finding_delta": true,
+        "positive_eidolon_db_active_finding_delta": true,
+        "final_json_counts_still_drive_finding_gap": true,
+        "next_question": null
+      },
+      "strict_correlation_gap": {
+        "proxy_confirmed_action_count": 1,
+        "strict_correlated_action_count": 1,
+        "strict_confirmed_action_count": 1,
+        "correlation_basis_counts": [
+          {
+            "basis": "request_at_or_before_action",
+            "count": 1
+          }
+        ],
+        "request_after_action_same_session_count": 0,
+        "unconfirmed_strict_action_count": 0,
+        "proxy_confirmed_action_not_strict_count": 0,
+        "matching_proxy_exposure_not_pwnkit_correlated_count": 0,
+        "crawl_artifact_count": 2,
+        "crawl_artifact_start_paths": [
+          "/",
+          "/docs"
+        ],
+        "matching_proxy_exposure_crawl_start_path_count": 0,
+        "matching_proxy_exposure_crawl_start_paths": [],
+        "unconfirmed_actions": [],
+        "likely_cause": null,
+        "likely_missing_artifact_class": null,
+        "next_questions": []
+      },
+      "correlated_counts": {
+        "target_requests": 45,
+        "bait_exposures": 10,
+        "bait_actions": 1,
+        "same_session_confirmed_bait_actions": 1,
+        "controlled_reality_entries": 4
+      },
+      "pinned_session": {
+        "present": true,
+        "session_id": "6622a70a-f47f-433a-9928-8afd4e4ed73b",
+        "cookie_preserved": true,
+        "proxy_request_count": 48,
+        "correlated_target_request_count": 45,
+        "correlated_bait_exposure_count": 10,
+        "correlated_bait_action_count": 1,
+        "same_session_confirmed_bait_action_count": 1,
+        "controlled_reality_entry_count": 4
+      },
+      "metrics": {
+        "bait_follow_rate": 0.1,
+        "same_session_confirmed_bait_follow_rate": 0.1
+      },
+      "agent_trace": {
+        "claim_level": "controlled_reality_entered",
+        "real_surface_requests_after_containment": 0,
+        "controlled_reality_action_depth": 19,
+        "controlled_reality_branch_count": 15
+      },
+      "trace_gap": {
+        "proxy_trace_present": true,
+        "proxy_trace_claim_level": "controlled_reality_entered",
+        "proxy_trace_controlled_reality_entered": true,
+        "proxy_trace_real_surface_quiet": true,
+        "pwnkit_strict_claim_level": "controlled_reality_entered",
+        "pwnkit_strict_same_session_confirmed": true,
+        "pwnkit_strict_controlled_reality_entered": true,
+        "proxy_trace_controlled_reality_without_strict_confirmation": false,
+        "strict_controlled_reality_without_eidolon_finding": false,
+        "positive_differential_without_strict_controlled_reality": false,
+        "next_question": null
+      }
+    }
+  ],
+  "redaction": {
+    "raw_run_summaries_omitted": true,
+    "raw_requested_paths_omitted": true,
+    "raw_tool_evidence_labels_omitted": true,
+    "raw_agent_error_text_omitted": true,
+    "raw_pwnkit_artifacts_omitted": true,
+    "raw_proxy_events_omitted": true,
+    "private_debug_logs_omitted": true,
+    "source_artifact_paths_omitted": true,
+    "runner_command_paths_omitted": true
+  }
+}

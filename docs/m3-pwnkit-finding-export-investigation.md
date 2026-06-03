@@ -1,18 +1,21 @@
 # M3 pwnkit Finding Export Investigation
 
-This note explains two related M3 report-promotion gaps and one local-patched
-validation:
+This note explains two historical M3 report-promotion gaps and two
+local-patched validations:
 
 1. the historical May 28 upstream-current Kali VM sample, which persisted
    Eidolon-side findings in pwnkit's SQLite DB but emitted zero final JSON
    findings, and
-2. the refreshed May 31 upstream-current Kali VM sample, which now emits
+2. the refreshed May 31 upstream-current Kali VM sample, which emits
    Eidolon final JSON findings in `2/3` runs but still leaves one strict
    controlled-reality run at zero final JSON findings despite a saved active DB
    finding, and
 3. the June 1 local-patched Kali rerun, which validates the report/export fix
    by promoting every strict controlled-reality run into final JSON while
-   filtering only an inactive false-positive row.
+   filtering only an inactive false-positive row, and
+4. the June 2 canonical local-patched Kali sample, which keeps direct findings
+   quiet in `3/3` runs and emits positive differential Eidolon findings in
+   `3/3` runs with no saved-vs-final mismatch.
 
 This is a Lab-only evidence note. It does not change the M3 containment claim
 or make a production-readiness claim.
@@ -23,12 +26,18 @@ or make a production-readiness claim.
   `docs/evidence/m3/pwnkit-stability-2026-05-28/`
 - refreshed upstream-current evidence bundle:
   `docs/evidence/m3/pwnkit-stability-2026-05-31/`
+- canonical local-patched evidence bundle:
+  `docs/evidence/m3/pwnkit-local-patched-canonical-2026-06-02/`
 - historical pwnkit head:
   `1a8d6aac37818df29ff2e37d065c5bbcfe9c063b`
 - refreshed pwnkit head:
   `c64410873b828f19f48ca4f8b12a3fc8dfe53c58`
+- canonical local-patched pwnkit head:
+  `abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4`
 - historical pwnkit fixture id: `pwnkit-local-kali-2026-05-28`
 - refreshed pwnkit fixture id: none
+- canonical local-patched fixture id:
+  `eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02`
 - runner environment: `kali_vm`
 - topology: `same_vm_loopback`
 - raw pwnkit DBs, raw JSON, stdout/stderr logs, auth material, proxy JSONL, and
@@ -78,6 +87,29 @@ Run shape in the refreshed sample:
 So the current upstream-current gap is narrower than the May 28 case. It is no
 longer "final JSON always empty." It is now "one strict controlled-reality run
 still fails to promote an active saved Eidolon finding into final JSON."
+
+## Canonical Local-Patched Closeout
+
+The committed June 2 canonical local-patched sample reports:
+
+- final JSON direct findings: `0`
+- final JSON Eidolon findings: `5` total across `3` runs
+- Eidolon DB-saved findings: `5`
+- Eidolon DB-active findings: `5`
+- `strict_stability.ready_for_stability_claim`: `true`
+- `differential_findings.ready_for_differential_finding_claim`: `true`
+
+Run shape in the canonical sample:
+
+- run 1: strict controlled reality, `3` Eidolon final JSON findings,
+  `3` saved DB findings, `3` active DB findings
+- run 2: strict controlled reality, `1` Eidolon final JSON finding,
+  `1` saved DB finding, `1` active DB finding
+- run 3: strict controlled reality, `1` Eidolon final JSON finding,
+  `1` saved DB finding, `1` active DB finding
+
+So the active export gap is closed on the current canonical patched track. The
+saved-vs-final mismatch is now `0`.
 
 ## Collector Behavior
 
@@ -153,6 +185,12 @@ The best wording for the refreshed May 31 sample is:
 > JSON, but one strict controlled-reality run still left an active saved DB
 > finding unreported in the final JSON output.
 
+The best wording for the June 2 canonical sample is:
+
+> on the canonical local-patched research fixture, pwnkit now preserves active
+> Eidolon-side findings into final JSON in every strict controlled-reality run,
+> while direct findings remain quiet.
+
 ## Follow-Up Tracks
 
 Keep two evidence tracks separate:
@@ -213,6 +251,24 @@ This validates the active-finding export fix on the local patched track. The
 only remaining saved-to-final mismatch in that rerun is one row already marked
 inactive with `status:false-positive`; it is expected filtering rather than a
 lost active finding before final JSON emission.
+
+A further canonical local-patched sample was then collected on 2026-06-02 and
+archived under
+`docs/evidence/m3/pwnkit-local-patched-canonical-2026-06-02/`.
+
+- pwnkit head: `abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4`
+- pwnkit fixture id: `eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02`
+- evidence track: `local_patched_pwnkit`
+- strict same-session controlled reality: `3/3`
+- direct final JSON findings: `0`
+- Eidolon final JSON findings: `5` total across `3/3` runs (`3/1/1`)
+- Eidolon DB-saved findings: `5` total
+- Eidolon DB-active findings: `5` total
+- any DB-saved findings omitted from final JSON: `false`
+
+This is the current canonical patched-track closeout. It shows that the export
+gap and the malformed-body control-leg noise are both gone on the pinned
+research fixture.
 
 Follow-up collector diagnostics now expose the remaining run's saved-to-inactive
 or saved-but-unexported shape without committing raw pwnkit DB contents. The

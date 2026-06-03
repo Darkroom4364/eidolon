@@ -203,21 +203,21 @@ Current status:
 - the stale pinned-session probe recorded `pinned_session.proxy_request_count: 0`;
   do not interpret that as current pwnkit cookie behavior
 - scripted proxy trace reaches `controlled_reality_entered`; see `docs/research-report-m3.md`
-- current-pwnkit three-run stability evidence is archived at
-  `docs/evidence/m3/pwnkit-stability-2026-05-19/`
+- current canonical M3 pwnkit evidence is archived at
+  `docs/evidence/m3/pwnkit-local-patched-canonical-2026-06-02/`
 - strict pwnkit-correlated same-session confirmation, pinned-session
-  preservation, and controlled-reality entry now pass in `3/3` current-pwnkit
-  runs, with `strict_stability.ready_for_stability_claim: true`
-- differential pwnkit findings remain open: current-pwnkit reached bait and
-  containment reliably, but still produced `0` Eidolon findings versus `0`
-  direct-target findings in the archived sample
+  preservation, controlled-reality entry, and positive differential findings
+  now pass in `3/3` canonical runs, with
+  `strict_stability.ready_for_stability_claim: true`
+- the current canonical evidence track is `local_patched_pwnkit`; the May 31
+  upstream-current sample remains the historical unpatched baseline
 
 Issues:
 
 1. Run Eidolon MVP bakeoff against baselines
 2. Produce internal uniqueness report with metrics table - initial report exists in `docs/research-report-m3.md`
 3. Identify bait classes that actually influence agent plans - initial class decisions are in the internal report
-4. Investigate why current pwnkit produces no differential findings despite stable bait interaction and containment
+4. Keep upstream-current drift checks separate from the canonical local-patched M3 fixture, and decide whether further parity work is worth the churn
 5. Decide go/no-go criteria for adaptive bait policy - current posture is no-go for automation until broader samples show stable class signal beyond the current `open_api` action path
 
 ## M4 Edge/CDN Integration
