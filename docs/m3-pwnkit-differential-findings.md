@@ -1,13 +1,32 @@
 # M3 pwnkit Differential Findings Investigation
 
-This note defines the next M3 investigation after the archived current-pwnkit
-stability sample. The open question is narrow:
+This note records the historical pwnkit finding-promotion gap and the current
+canonical closeout on the pinned local-patched research fixture. The previous
+open question was:
 
 ```text
 Why does upstream-current pwnkit now reach bait, replay the open_api action,
 preserve the Eidolon session, and enter controlled reality in every strict run,
 while still promoting Eidolon final JSON findings in only 2 of 3 runs?
 ```
+
+The current canonical answer is now available on the patched local track:
+
+- committed evidence bundle:
+  `docs/evidence/m3/pwnkit-local-patched-canonical-2026-06-02/`
+- pwnkit head: `abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4`
+- pwnkit fixture id:
+  `eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02`
+- evidence track: `local_patched_pwnkit`
+- direct quiet: `3/3`
+- same-session confirmed bait action: `3/3`
+- controlled reality entered: `3/3`
+- positive differential findings: `3/3`
+
+Treat the May 31 upstream-current sample as the historical unpatched baseline.
+The prior `2/3` promotion gap is closed on the canonical patched track. Any
+remaining question is parity or drift between tracks, not an Eidolon-side
+containment failure.
 
 ## Scope
 
@@ -135,6 +154,17 @@ question as:
 Why does upstream-current pwnkit still leave one strict controlled-reality run
 at 0 final Eidolon findings after the containment-correlation gap is closed?
 ```
+
+A canonical three-run local-patched Kali sample was then collected on
+2026-06-02 at pwnkit head `abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4` and
+archived under `docs/evidence/m3/pwnkit-local-patched-canonical-2026-06-02`.
+It used fixture id `eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02`,
+kept direct findings quiet in `3/3` runs, preserved same-session confirmed bait
+action in `3/3` runs, reached controlled reality in `3/3` runs, and emitted
+positive differential Eidolon final JSON findings in `3/3` runs (`3/1/1`,
+`5` total). Treat this as the current canonical patched-track answer: the
+historical `2/3` promotion gap is no longer active on the pinned local-patched
+fixture.
 
 ## Pre-Run Checklist
 
