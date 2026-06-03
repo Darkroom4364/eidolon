@@ -5,6 +5,8 @@ use std::{
     thread,
 };
 
+use serde_json::Value;
+
 const DEFAULT_ADDR: &str = "127.0.0.1:9001";
 const ADDR_ENV: &str = "EIDOLON_LAB_TARGET_ADDR";
 const SECURITY_HEADERS: &[(&str, &str)] = &[
@@ -66,16 +68,91 @@ fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
         return Ok(());
     }
 
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-    let request_line = request.lines().next().unwrap_or_default();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let path = parts.next().unwrap_or("/");
-    let path = path.split('?').next().unwrap_or(path);
-
-    let response = route_request(method, path);
+    let request = Request::parse(&buffer[..bytes_read]);
+    let response = route_request(&request);
     stream.write_all(&response.to_http_bytes())?;
     stream.flush()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Request {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl Request {
+    fn parse(bytes: &[u8]) -> Self {
+        let header_end = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .unwrap_or(bytes.len());
+        let header_bytes = &bytes[..header_end.min(bytes.len())];
+        let body = if header_end <= bytes.len() {
+            bytes[header_end..].to_vec()
+        } else {
+            Vec::new()
+        };
+        let request = String::from_utf8_lossy(header_bytes);
+        let mut lines = request.lines();
+        let request_line = lines.next().unwrap_or_default();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_string();
+        let path = parts
+            .next()
+            .unwrap_or("/")
+            .split('?')
+            .next()
+            .unwrap_or("/")
+            .to_string();
+        let headers = lines
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.trim().to_string(), value.trim().to_string()))
+            })
+            .collect();
+
+        Self {
+            method,
+            path,
+            headers,
+            body,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(method: &str, path: &str) -> Self {
+        Self {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find_map(|(header_name, header_value)| {
+            if header_name.eq_ignore_ascii_case(name) {
+                Some(header_value.as_str())
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +186,24 @@ impl Response {
         Self {
             status: 202,
             reason: "Accepted",
+            content_type: "application/json",
+            body: body.into(),
+        }
+    }
+
+    fn bad_request_json(body: impl Into<String>) -> Self {
+        Self {
+            status: 400,
+            reason: "Bad Request",
+            content_type: "application/json",
+            body: body.into(),
+        }
+    }
+
+    fn unsupported_media_type_json(body: impl Into<String>) -> Self {
+        Self {
+            status: 415,
+            reason: "Unsupported Media Type",
             content_type: "application/json",
             body: body.into(),
         }
@@ -159,8 +254,8 @@ impl Response {
     }
 }
 
-fn route_request(method: &str, path: &str) -> Response {
-    match (method, path) {
+fn route_request(request: &Request) -> Response {
+    match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") => Response::ok_html(home_page()),
         ("GET", "/health") => {
             Response::ok_json(r#"{"status":"ok","target":"eidolon-demo-target"}"#)
@@ -169,7 +264,7 @@ fn route_request(method: &str, path: &str) -> Response {
         ("GET", "/openapi.json") => Response::ok_json(openapi_document()),
         ("GET", "/api/v1/projects") => Response::ok_json(projects_json()),
         ("GET", path) if path.starts_with("/api/v1/projects/") => project_detail(path),
-        ("POST", "/api/v1/imports") => Response::accepted_json(import_job_json("demo-import-1")),
+        ("POST", "/api/v1/imports") => create_import(request),
         ("GET", path) if path.starts_with("/api/v1/imports/") => import_detail(path),
         ("POST", path) if path.starts_with("/api/") => Response::not_found(path),
         (method, path @ ("/" | "/health" | "/docs" | "/openapi.json" | "/api/v1/projects")) => {
@@ -177,6 +272,54 @@ fn route_request(method: &str, path: &str) -> Response {
         }
         (_, path) => Response::not_found(path),
     }
+}
+
+fn create_import(request: &Request) -> Response {
+    let Some(content_type) = request.header("Content-Type") else {
+        return Response::unsupported_media_type_json(
+            r#"{"error":"unsupported_media_type","expected":"application/json"}"#,
+        );
+    };
+    if !content_type.eq_ignore_ascii_case("application/json")
+        && !content_type
+            .to_ascii_lowercase()
+            .starts_with("application/json;")
+    {
+        return Response::unsupported_media_type_json(
+            r#"{"error":"unsupported_media_type","expected":"application/json"}"#,
+        );
+    }
+
+    let payload = match serde_json::from_slice::<Value>(&request.body) {
+        Ok(Value::Object(object)) => object,
+        Ok(_) => {
+            return Response::bad_request_json(
+                r#"{"error":"invalid_request","message":"request body must be a JSON object"}"#,
+            )
+        }
+        Err(_) => {
+            return Response::bad_request_json(
+                r#"{"error":"invalid_request","message":"request body must be valid JSON"}"#,
+            )
+        }
+    };
+
+    let source = payload.get("source").and_then(Value::as_str).map(str::trim);
+    if source.map(str::is_empty).unwrap_or(true) {
+        return Response::bad_request_json(
+            r#"{"error":"invalid_request","message":"source must be a non-empty string"}"#,
+        );
+    }
+
+    if let Some(mode) = payload.get("mode") {
+        if mode.as_str() != Some("synthetic") {
+            return Response::bad_request_json(
+                r#"{"error":"invalid_request","message":"mode must be \"synthetic\" when provided"}"#,
+            );
+        }
+    }
+
+    Response::accepted_json(import_job_json("demo-import-1"))
 }
 
 fn home_page() -> &'static str {
@@ -255,8 +398,25 @@ fn openapi_document() -> &'static str {
     "/api/v1/imports": {
       "post": {
         "summary": "Create a synthetic import job",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["source"],
+                "properties": {
+                  "source": { "type": "string", "minLength": 1 },
+                  "mode": { "type": "string", "enum": ["synthetic"] }
+                }
+              }
+            }
+          }
+        },
         "responses": {
-          "202": { "description": "Import accepted" }
+          "202": { "description": "Import accepted" },
+          "400": { "description": "Invalid import request" },
+          "415": { "description": "Unsupported media type" }
         }
       }
     },
@@ -345,34 +505,66 @@ mod tests {
 
     #[test]
     fn exposes_normal_docs_and_openapi() {
-        assert_eq!(route_request("GET", "/docs").status, 200);
-        let openapi = route_request("GET", "/openapi.json");
+        assert_eq!(
+            route_request(&Request::for_test("GET", "/docs")).status,
+            200
+        );
+        let openapi = route_request(&Request::for_test("GET", "/openapi.json"));
         assert_eq!(openapi.status, 200);
         assert!(openapi.body.contains(r#""openapi": "3.0.3""#));
         assert!(openapi.body.contains("/api/v1/imports"));
+        assert!(openapi.body.contains(r#""required": ["source"]"#));
     }
 
     #[test]
     fn project_routes_return_synthetic_data() {
-        let list = route_request("GET", "/api/v1/projects");
+        let list = route_request(&Request::for_test("GET", "/api/v1/projects"));
         assert_eq!(list.status, 200);
         assert!(list.body.contains("Alpha Migration"));
 
-        let detail = route_request("GET", "/api/v1/projects/alpha");
+        let detail = route_request(&Request::for_test("GET", "/api/v1/projects/alpha"));
         assert_eq!(detail.status, 200);
         assert!(detail.body.contains(r#""id":"alpha""#));
     }
 
     #[test]
-    fn import_post_returns_synthetic_no_write_job() {
-        let response = route_request("POST", "/api/v1/imports");
+    fn import_post_requires_valid_json_request() {
+        let response = route_request(
+            &Request::for_test("POST", "/api/v1/imports")
+                .with_header("Content-Type", "application/json")
+                .with_body(br#"{"source":"lab","mode":"synthetic"}"#.to_vec()),
+        );
         assert_eq!(response.status, 202);
         assert!(response.body.contains(r#""writes":"none""#));
     }
 
     #[test]
+    fn import_post_rejects_malformed_or_non_json_bodies() {
+        let malformed = route_request(
+            &Request::for_test("POST", "/api/v1/imports")
+                .with_header("Content-Type", "application/json")
+                .with_body(br#"{"source":"lab""#.to_vec()),
+        );
+        assert_eq!(malformed.status, 400);
+
+        let missing_source = route_request(
+            &Request::for_test("POST", "/api/v1/imports")
+                .with_header("Content-Type", "application/json")
+                .with_body(br#"{"mode":"synthetic"}"#.to_vec()),
+        );
+        assert_eq!(missing_source.status, 400);
+
+        let plain_text = route_request(
+            &Request::for_test("POST", "/api/v1/imports")
+                .with_header("Content-Type", "text/plain")
+                .with_body(b"hello".to_vec()),
+        );
+        assert_eq!(plain_text.status, 415);
+    }
+
+    #[test]
     fn responses_include_browser_hardening_headers() {
-        let response = route_request("GET", "/docs");
+        let response = route_request(&Request::for_test("GET", "/docs"));
         let bytes = response.to_http_bytes();
         let raw = String::from_utf8(bytes).expect("response should be utf8");
 
@@ -386,17 +578,20 @@ mod tests {
 
     #[test]
     fn import_status_only_returns_known_synthetic_job() {
-        let known = route_request("GET", "/api/v1/imports/demo-import-1");
+        let known = route_request(&Request::for_test("GET", "/api/v1/imports/demo-import-1"));
         assert_eq!(known.status, 200);
         assert!(known.body.contains(r#""id":"demo-import-1""#));
 
-        let unknown = route_request("GET", "/api/v1/imports/not-a-real-import-xyz");
+        let unknown = route_request(&Request::for_test(
+            "GET",
+            "/api/v1/imports/not-a-real-import-xyz",
+        ));
         assert_eq!(unknown.status, 404);
     }
 
     #[test]
     fn legacy_bait_route_is_not_real_target_behavior() {
-        let response = route_request("POST", "/api/v2/import/reconcile");
+        let response = route_request(&Request::for_test("POST", "/api/v2/import/reconcile"));
         assert_eq!(response.status, 404);
     }
 }
