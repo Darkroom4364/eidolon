@@ -416,12 +416,16 @@ exposure for the action, but pwnkit did not emit a request artifact that
 correlated to that exposure surface. In that case, inspect pwnkit artifact
 persistence or non-HTTP tool output before changing Eidolon bait behavior.
 
-The current post-merge M3 note is recorded in
-[`docs/research-note-m3.md`](research-note-m3.md). It records a fresh current
-pwnkit run plus a strict collector pass that extracts the pwnkit shell-mode HTTP
-transcript and correlates one same-session bait action into
-`controlled_reality_entered`. Older stale-runner artifacts remain historical
-only and must not be used to claim current pwnkit behavior.
+The current canonical M3 note is recorded in
+[`docs/research-note-m3.md`](research-note-m3.md). It now summarizes the Kali
+`gpt-5.4` three-run sample on pwnkit checkout
+`abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4` after the demo-target
+import-validation fix. That sample records `direct_quiet=3/3`,
+`same_session_confirmed_bait_action=3/3`,
+`controlled_reality_entered=3/3`, and
+`positive_differential_findings=3/3` on the canonical
+`local_patched_pwnkit` research track. Older stale-runner artifacts remain
+historical only and must not be used to claim current pwnkit behavior.
 
 To collect a repeated current-pwnkit sample from a synced source checkout, use
 the sample wrapper. It starts the local demo target once, starts a fresh proxy
