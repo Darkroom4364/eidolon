@@ -65,7 +65,7 @@ export EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit
 The Kali wrapper fails closed if `local_patched_pwnkit` is set without a
 fixture id, or if `upstream_current` is set while a fixture id is also present.
 
-For the validated June 1 local patched report-fix fixture, use the dedicated
+For the validated June 2 canonical local patched fixture, use the dedicated
 wrapper instead of setting those variables by hand:
 
 ```sh
@@ -80,9 +80,9 @@ examples/m3/run-pwnkit-local-patched-kali-vm.sh \
 
 That wrapper pins:
 
-- `EIDOLON_M3_PWNKIT_FIXTURE_ID=eidolon-m3-local-patched-report-fix-2026-06-01`
+- `EIDOLON_M3_PWNKIT_FIXTURE_ID=eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02`
 - `EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit`
-- `EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD=18c7b3b46f77f9860ed603006a64aed7f8c9475e`
+- `EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD=abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4`
 
 and fails closed unless `PWNKIT_SOURCE_DIR` is a clean checkout at that exact
 head. If `PWNKIT_SOURCE_DIR` is unset and `~/Projects/pwnkit` is on a different
@@ -111,6 +111,33 @@ matches local `origin/main`, with `EIDOLON_M3_PWNKIT_FIXTURE_ID` unset. If
 `PWNKIT_SOURCE_DIR` is unset and `~/Projects/pwnkit` is on a different head,
 the wrapper will auto-discover a clean sibling worktree whose `HEAD` matches
 local `origin/main`.
+
+For ongoing parity or drift checks, use the parity wrapper:
+
+```sh
+cd ~/Projects/eidolon
+
+examples/m3/run-pwnkit-parity-kali-vm.sh \
+  --preflight 3 /tmp/eidolon-m3-pwnkit-parity
+
+examples/m3/run-pwnkit-parity-kali-vm.sh \
+  3 /tmp/eidolon-m3-pwnkit-parity
+```
+
+That wrapper runs both dedicated track wrappers back to back and writes:
+
+- `/tmp/eidolon-m3-pwnkit-parity/upstream-current/pwnkit-stability-sample.json`
+- `/tmp/eidolon-m3-pwnkit-parity/local-patched/pwnkit-stability-sample.json`
+- `/tmp/eidolon-m3-pwnkit-parity/pwnkit-parity-summary.json`
+
+If the two tracks live in separate explicit worktrees, set:
+
+```sh
+export EIDOLON_M3_PARITY_UPSTREAM_PWNKIT_SOURCE_DIR=/path/to/pwnkit-upstream
+export EIDOLON_M3_PARITY_LOCAL_PATCHED_PWNKIT_SOURCE_DIR=/path/to/pwnkit-patched
+```
+
+before invoking the parity wrapper.
 
 ## Dry Run
 

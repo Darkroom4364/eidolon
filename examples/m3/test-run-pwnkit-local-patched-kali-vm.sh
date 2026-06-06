@@ -38,8 +38,8 @@ advance_fake_pwnkit_repo() {
 }
 
 test_help_mentions_validated_fixture() {
-  "$RUNNER" --help | rg -q 'eidolon-m3-local-patched-report-fix-2026-06-01'
-  "$RUNNER" --help | rg -q '18c7b3b46f77f9860ed603006a64aed7f8c9475e'
+  "$RUNNER" --help | rg -q 'eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02'
+  "$RUNNER" --help | rg -q 'abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4'
   "$RUNNER" --help | rg -q 'local_patched_pwnkit'
 }
 
@@ -59,7 +59,7 @@ test_dry_run_uses_local_patched_defaults() {
     "$RUNNER" 2 "$sample_dir" >/dev/null
 
   [[ -f "$sample_dir/sample-plan.txt" ]]
-  rg -q '^pwnkit_fixture_id=eidolon-m3-local-patched-report-fix-2026-06-01$' "$sample_dir/sample-plan.txt"
+  rg -q '^pwnkit_fixture_id=eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02$' "$sample_dir/sample-plan.txt"
   rg -q '^pwnkit_evidence_track=local_patched_pwnkit$' "$sample_dir/sample-plan.txt"
   rg -q "^pwnkit_source_dir=$repo_root$" "$sample_dir/sample-plan.txt"
 }

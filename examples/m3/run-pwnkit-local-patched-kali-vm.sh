@@ -9,8 +9,8 @@ else
   PWNKIT_SOURCE_DIR_EXPLICIT=0
 fi
 PWNKIT_SOURCE_DIR="${PWNKIT_SOURCE_DIR-$HOME/Projects/pwnkit}"
-EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD="${EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD:-18c7b3b46f77f9860ed603006a64aed7f8c9475e}"
-EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-eidolon-m3-local-patched-report-fix-2026-06-01}"
+EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD="${EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD:-abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4}"
+EIDOLON_M3_PWNKIT_FIXTURE_ID="${EIDOLON_M3_PWNKIT_FIXTURE_ID:-eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02}"
 EIDOLON_M3_PWNKIT_EVIDENCE_TRACK="${EIDOLON_M3_PWNKIT_EVIDENCE_TRACK:-local_patched_pwnkit}"
 
 usage() {
@@ -18,12 +18,12 @@ usage() {
 Usage: examples/m3/run-pwnkit-local-patched-kali-vm.sh [--preflight] [run-count] [sample-dir]
 
 Runs the Kali VM M3 sample wrapper against the validated local patched pwnkit
-fixture used for the June 1 report-fix confirmation sample.
+fixture used for the June 2 canonical M3 sample.
 
 Defaults enforced by this wrapper:
-  EIDOLON_M3_PWNKIT_FIXTURE_ID=eidolon-m3-local-patched-report-fix-2026-06-01
+  EIDOLON_M3_PWNKIT_FIXTURE_ID=eidolon-m3-canonical-pwnkit-demo-target-fix-2026-06-02
   EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit
-  EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD=18c7b3b46f77f9860ed603006a64aed7f8c9475e
+  EIDOLON_M3_LOCAL_PATCHED_PWNKIT_HEAD=abd034b61042f14a0b9b3a2cf9b0dbfa5ef4f2b4
   PWNKIT_SOURCE_DIR=~/Projects/pwnkit
 
 The wrapper fails closed unless:
