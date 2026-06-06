@@ -1,0 +1,224 @@
+{
+  "name": "eidolon-trusted-ingress-cloudflare-transform",
+  "kind": "zone",
+  "phase": "http_request_late_transform",
+  "rules": [
+    {
+      "description": "Remove client-supplied Eidolon ingress headers that Cloudflare can target by explicit name",
+      "expression": "http.host eq \"replace-me.example.com\"",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Identity-Source": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Trust-Tier": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Identity-Label": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Identity-Expires-At": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Transport-Auth": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Verification-Strength": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Actor-Kind": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Verified-Category": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Attestation-Ref": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Vendor-Score": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Vendor-Score-Kind": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Vendor-Score-Scale": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Detection-Ids": {
+            "operation": "remove"
+          },
+          "X-Eidolon-Ingress-Edge-Action": {
+            "operation": "remove"
+          }
+        }
+      }
+    },
+    {
+      "description": "Attach the shared transport auth header expected by Eidolon",
+      "expression": "http.host eq \"replace-me.example.com\"",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Transport-Auth": {
+            "operation": "set",
+            "value": "replace-me-shared-secret"
+          }
+        }
+      }
+    },
+    {
+      "description": "Forward Cloudflare Bot Management score and raw detection IDs without inventing trust",
+      "expression": "http.host eq \"replace-me.example.com\" and cf.bot_management.score ge 1",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Vendor-Score": {
+            "operation": "set",
+            "expression": "to_string(cf.bot_management.score)"
+          },
+          "X-Eidolon-Ingress-Vendor-Score-Kind": {
+            "operation": "set",
+            "value": "automation_likelihood_inverse"
+          },
+          "X-Eidolon-Ingress-Vendor-Score-Scale": {
+            "operation": "set",
+            "value": "1-99"
+          },
+          "X-Eidolon-Ingress-Detection-Ids": {
+            "operation": "set",
+            "expression": "join(cf.bot_management.detection_ids, \",\")"
+          }
+        }
+      }
+    },
+    {
+      "description": "Forward Cloudflare verified bot category",
+      "expression": "http.host eq \"replace-me.example.com\" and cf.verified_bot_category ne \"\"",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Verified-Category": {
+            "operation": "set",
+            "expression": "cf.verified_bot_category"
+          }
+        }
+      }
+    },
+    {
+      "description": "Map AI Assistant verified bot category to Eidolon actor kind",
+      "expression": "http.host eq \"replace-me.example.com\" and cf.verified_bot_category eq \"AI Assistant\"",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Actor-Kind": {
+            "operation": "set",
+            "value": "assistant"
+          }
+        }
+      }
+    },
+    {
+      "description": "Map AI Crawler verified bot category to Eidolon actor kind",
+      "expression": "http.host eq \"replace-me.example.com\" and cf.verified_bot_category eq \"AI Crawler\"",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Actor-Kind": {
+            "operation": "set",
+            "value": "crawler"
+          }
+        }
+      }
+    },
+    {
+      "description": "Map Autonomous Agent verified bot category to Eidolon actor kind",
+      "expression": "http.host eq \"replace-me.example.com\" and cf.verified_bot_category eq \"Autonomous Agent\"",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Actor-Kind": {
+            "operation": "set",
+            "value": "autonomous_agent"
+          }
+        }
+      }
+    },
+    {
+      "description": "Map Agentic Browser verified bot category to Eidolon actor kind",
+      "expression": "http.host eq \"replace-me.example.com\" and cf.verified_bot_category eq \"Agentic Browser\"",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Actor-Kind": {
+            "operation": "set",
+            "value": "agentic_browser"
+          }
+        }
+      }
+    },
+    {
+      "description": "Mark untrusted Bot Management traffic as observe-only at the edge",
+      "expression": "http.host eq \"replace-me.example.com\" and cf.bot_management.score ge 1 and not cf.bot_management.verified_bot and not cf.bot_management.signed_agent",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Edge-Action": {
+            "operation": "set",
+            "value": "observe"
+          }
+        }
+      }
+    },
+    {
+      "description": "Normalize verified bots into Eidolon trusted ingress headers",
+      "expression": "http.host eq \"replace-me.example.com\" and cf.bot_management.verified_bot",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Identity-Source": {
+            "operation": "set",
+            "value": "verified_bot"
+          },
+          "X-Eidolon-Ingress-Trust-Tier": {
+            "operation": "set",
+            "value": "edge_verified"
+          },
+          "X-Eidolon-Ingress-Verification-Strength": {
+            "operation": "set",
+            "value": "high"
+          },
+          "X-Eidolon-Ingress-Edge-Action": {
+            "operation": "set",
+            "value": "allow"
+          }
+        }
+      }
+    },
+    {
+      "description": "Normalize signed agents into Eidolon trusted ingress headers",
+      "expression": "http.host eq \"replace-me.example.com\" and cf.bot_management.signed_agent",
+      "action": "rewrite",
+      "action_parameters": {
+        "headers": {
+          "X-Eidolon-Ingress-Identity-Source": {
+            "operation": "set",
+            "value": "signed_agent"
+          },
+          "X-Eidolon-Ingress-Trust-Tier": {
+            "operation": "set",
+            "value": "signed_attested"
+          },
+          "X-Eidolon-Ingress-Verification-Strength": {
+            "operation": "set",
+            "value": "cryptographic"
+          },
+          "X-Eidolon-Ingress-Edge-Action": {
+            "operation": "set",
+            "value": "allow"
+          }
+        }
+      }
+    }
+  ]
+}

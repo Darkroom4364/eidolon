@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const EVENT_SCHEMA_VERSION: u16 = 2;
+pub const TRUSTED_INGRESS_CONTRACT_VERSION: &str = "2026-06-05.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
@@ -91,6 +92,40 @@ pub struct SafeHeaderObservation {
     pub present: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressIdentitySource {
+    #[default]
+    None,
+    InternalScanner,
+    LocalAllowlist,
+    VerifiedBot,
+    SignedAgent,
+    PartnerAutomation,
+    OperatorOverride,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressTrustTier {
+    #[default]
+    None,
+    WeaklyAsserted,
+    Allowlisted,
+    EdgeVerified,
+    SignedAttested,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngressIdentity {
+    pub source: IngressIdentitySource,
+    pub trust_tier: IngressTrustTier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
@@ -98,6 +133,8 @@ pub enum EventKind {
         method: String,
         path: String,
         safe_headers: Vec<SafeHeaderObservation>,
+        #[serde(default)]
+        ingress_identity: IngressIdentity,
         routing_decision: RoutingDecision,
     },
     ResponseServed {
@@ -195,6 +232,57 @@ pub struct Score {
     pub reasons: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeRecommendedAction {
+    Allow,
+    Observe,
+    RateLimit,
+    Challenge,
+    Block,
+    PreserveEidolonRouting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRequestRef {
+    pub method: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgePolicySnapshot {
+    pub state: PolicyState,
+    pub routing_decision: RoutingDecision,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeEvidenceRef {
+    pub event_schema_version: u16,
+    pub event_ids: Vec<Uuid>,
+    pub bundle_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeRecommendation {
+    pub action: EdgeRecommendedAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EidolonEdgeDecisionExport {
+    pub contract_version: String,
+    pub observed_at: DateTime<Utc>,
+    pub session_id: SessionId,
+    pub request: EdgeRequestRef,
+    pub ingress_identity: IngressIdentity,
+    pub policy: EdgePolicySnapshot,
+    pub evidence: EdgeEvidenceRef,
+    pub edge_recommendation: EdgeRecommendation,
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -220,6 +308,7 @@ mod tests {
                     name: "user-agent".to_string(),
                     present: true,
                 }],
+                ingress_identity: IngressIdentity::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         );
@@ -252,6 +341,72 @@ mod tests {
         assert_eq!(serialized["kind"]["type"], json!("policy_changed"));
         assert_eq!(serialized["kind"]["from"], json!("observe"));
         assert_eq!(serialized["kind"]["to"], json!("suspicious"));
+    }
+
+    #[test]
+    fn request_seen_event_serializes_ingress_identity_fields() {
+        let session_id = SessionId::new();
+        let event = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::RequestSeen {
+                method: "GET".to_string(),
+                path: "/openapi.json".to_string(),
+                safe_headers: vec![SafeHeaderObservation {
+                    name: "user-agent".to_string(),
+                    present: true,
+                }],
+                ingress_identity: IngressIdentity {
+                    source: IngressIdentitySource::VerifiedBot,
+                    trust_tier: IngressTrustTier::EdgeVerified,
+                    label: Some("googlebot".to_string()),
+                    expires_at: None,
+                },
+                routing_decision: RoutingDecision::ProtectedUpstream,
+            },
+        );
+
+        let serialized = serde_json::to_value(event).expect("event should serialize");
+
+        assert_eq!(
+            serialized["kind"]["ingress_identity"]["source"],
+            "verified_bot"
+        );
+        assert_eq!(
+            serialized["kind"]["ingress_identity"]["trust_tier"],
+            "edge_verified"
+        );
+        assert_eq!(serialized["kind"]["ingress_identity"]["label"], "googlebot");
+    }
+
+    #[test]
+    fn request_seen_event_deserializes_without_ingress_identity() {
+        let session_id = SessionId::new();
+        let event = json!({
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "id": Uuid::new_v4(),
+            "session_id": session_id,
+            "observed_at": Utc::now(),
+            "source": "proxy",
+            "policy_state": "observe",
+            "kind": {
+                "type": "request_seen",
+                "method": "GET",
+                "path": "/openapi.json",
+                "safe_headers": [],
+                "routing_decision": "protected_upstream"
+            }
+        });
+
+        let parsed: Event = serde_json::from_value(event).expect("legacy event should parse");
+
+        match parsed.kind {
+            EventKind::RequestSeen {
+                ingress_identity, ..
+            } => assert_eq!(ingress_identity, IngressIdentity::default()),
+            other => panic!("expected request_seen, got {other:?}"),
+        }
     }
 
     #[test]
@@ -319,5 +474,52 @@ mod tests {
         .expect("older bait record should parse");
 
         assert_eq!(bait.bait_class, BaitClass::Docs);
+    }
+
+    #[test]
+    fn edge_decision_export_serializes_stable_snake_case_contract() {
+        let session_id = SessionId::new();
+        let export = EidolonEdgeDecisionExport {
+            contract_version: TRUSTED_INGRESS_CONTRACT_VERSION.to_string(),
+            observed_at: Utc::now(),
+            session_id,
+            request: EdgeRequestRef {
+                method: "GET".to_string(),
+                path: "/openapi.json".to_string(),
+            },
+            ingress_identity: IngressIdentity {
+                source: IngressIdentitySource::VerifiedBot,
+                trust_tier: IngressTrustTier::EdgeVerified,
+                label: Some("googlebot".to_string()),
+                expires_at: None,
+            },
+            policy: EdgePolicySnapshot {
+                state: PolicyState::Observe,
+                routing_decision: RoutingDecision::ProtectedUpstream,
+                reason: "trusted ingress identity suppressed bait surface intervention before runtime suspicion was established".to_string(),
+            },
+            evidence: EdgeEvidenceRef {
+                event_schema_version: EVENT_SCHEMA_VERSION,
+                event_ids: vec![Uuid::new_v4()],
+                bundle_ref: "session:ref".to_string(),
+            },
+            edge_recommendation: EdgeRecommendation {
+                action: EdgeRecommendedAction::Allow,
+                ttl_seconds: Some(300),
+                reason_codes: vec!["trusted_identity".to_string(), "bait_softened".to_string()],
+            },
+        };
+
+        let serialized = serde_json::to_value(export).expect("edge export should serialize");
+
+        assert_eq!(
+            serialized["contract_version"],
+            json!(TRUSTED_INGRESS_CONTRACT_VERSION)
+        );
+        assert_eq!(serialized["edge_recommendation"]["action"], json!("allow"));
+        assert_eq!(
+            serialized["ingress_identity"]["trust_tier"],
+            json!("edge_verified")
+        );
     }
 }

@@ -9,6 +9,7 @@ use serde_json::Value;
 
 const DEFAULT_ADDR: &str = "127.0.0.1:9001";
 const ADDR_ENV: &str = "EIDOLON_LAB_TARGET_ADDR";
+const OWNED_CLUSTER_LAB_ENV: &str = "EIDOLON_OWNED_CLUSTER_LAB";
 const SECURITY_HEADERS: &[(&str, &str)] = &[
     (
         "Content-Security-Policy",
@@ -21,11 +22,16 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
 
 fn main() -> io::Result<()> {
     let addr = env::var(ADDR_ENV).unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-    ensure_loopback_addr(&addr)?;
+    let owned_cluster_lab = env_flag_enabled(OWNED_CLUSTER_LAB_ENV);
+    ensure_allowed_lab_addr(&addr, owned_cluster_lab)?;
 
     let listener = TcpListener::bind(&addr)?;
     println!("eidolon-demo-target listening on http://{addr}");
-    println!("local owned-target lab only; set {ADDR_ENV}=127.0.0.1:<port> to change the port");
+    if owned_cluster_lab {
+        println!("owned cluster lab enabled via {OWNED_CLUSTER_LAB_ENV}=1");
+    } else {
+        println!("local owned-target lab only; set {ADDR_ENV}=127.0.0.1:<port> to change the port");
+    }
 
     for stream in listener.incoming() {
         match stream {
@@ -43,7 +49,7 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn ensure_loopback_addr(addr: &str) -> io::Result<()> {
+fn ensure_allowed_lab_addr(addr: &str, owned_cluster_lab: bool) -> io::Result<()> {
     let socket_addr = addr.parse::<SocketAddr>().map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -51,7 +57,7 @@ fn ensure_loopback_addr(addr: &str) -> io::Result<()> {
         )
     })?;
 
-    if socket_addr.ip().is_loopback() {
+    if owned_cluster_lab || socket_addr.ip().is_loopback() {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -59,6 +65,13 @@ fn ensure_loopback_addr(addr: &str) -> io::Result<()> {
             format!("{ADDR_ENV} must bind to a loopback address for the local lab"),
         ))
     }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    matches!(
+        env::var(name).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
 }
 
 fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
@@ -494,13 +507,20 @@ mod tests {
 
     #[test]
     fn default_lab_address_is_loopback() {
-        ensure_loopback_addr(DEFAULT_ADDR).expect("default address should be loopback");
+        ensure_allowed_lab_addr(DEFAULT_ADDR, false).expect("default address should be loopback");
     }
 
     #[test]
     fn non_loopback_lab_address_is_rejected() {
-        let error = ensure_loopback_addr("0.0.0.0:9001").expect_err("wildcard bind is rejected");
+        let error =
+            ensure_allowed_lab_addr("0.0.0.0:9001", false).expect_err("wildcard bind is rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn owned_cluster_lab_allows_non_loopback_bind() {
+        ensure_allowed_lab_addr("0.0.0.0:9001", true)
+            .expect("owned cluster lab should allow non-loopback bind");
     }
 
     #[test]

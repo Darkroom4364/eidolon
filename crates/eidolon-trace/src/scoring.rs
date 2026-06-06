@@ -103,7 +103,8 @@ fn confidence_rank(confidence: ConfidenceBand) -> i32 {
 #[cfg(test)]
 mod tests {
     use eidolon_core::{
-        BaitId, Event, EventKind, EventSource, ExposureId, PolicyState, RoutingDecision, SessionId,
+        BaitId, Event, EventKind, EventSource, ExposureId, IngressIdentity, PolicyState,
+        RoutingDecision, SessionId,
     };
 
     use super::*;
@@ -168,6 +169,7 @@ mod tests {
                 method: "POST".to_string(),
                 path: path.to_string(),
                 safe_headers: Vec::new(),
+                ingress_identity: IngressIdentity::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         )

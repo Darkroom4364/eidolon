@@ -36,6 +36,15 @@ eidolon_lab_url_authority() {
 eidolon_lab_loopback_host_for_url() {
   local name="$1"
   local url="$2"
+  local host
+
+  host="$(eidolon_lab_host_for_url "$name" "$url")"
+  printf '%s' "$host"
+}
+
+eidolon_lab_host_for_url() {
+  local name="$1"
+  local url="$2"
   local authority
   local host
 
@@ -50,12 +59,19 @@ eidolon_lab_loopback_host_for_url() {
   printf '%s' "$host"
 }
 
+eidolon_lab_require_http_url() {
+  local name="$1"
+  local url="$2"
+
+  eidolon_lab_url_authority "$name" "$url" >/dev/null
+}
+
 eidolon_lab_require_loopback_url() {
   local name="$1"
   local url="$2"
   local host
 
-  host="$(eidolon_lab_loopback_host_for_url "$name" "$url")"
+  host="$(eidolon_lab_host_for_url "$name" "$url")"
   if [[ "$host" == "localhost" || "$host" == "::1" || "$host" =~ ^127(\.[0-9]{1,3}){3}$ ]]; then
     return
   fi

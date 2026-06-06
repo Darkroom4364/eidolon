@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+  - shield-edge-service.yaml
+  - target-edge-service.yaml
+patches:
+  - path: eidolon-proxy-trusted-ingress-patch.yaml

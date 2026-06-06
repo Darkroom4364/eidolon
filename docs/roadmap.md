@@ -233,6 +233,31 @@ Issues:
 3. Export Eidolon decisions as webhook/SIEM/WAF events
 4. Document SEO, accessibility, verified crawler, Tor/VPN, and analytics-safety constraints
 
+The contract work for issue 2 lives in
+`docs/trusted-ingress-signal-contract.md`. The current runtime already
+normalizes ingress identity and local allowlist trust behind a transport-auth
+gate for explicit edge headers, but raw vendor score and attestation fields
+remain a contract-first follow-on rather than ad hoc runtime glue.
+
+The current Worker spike lives in
+`examples/edge/cloudflare/eidolon-ingress-worker.mjs`.
+
+The current OrbStack deployment and Kali validation contract lives in
+`docs/m4-edge-operations.md`.
+
+Acceptance criteria:
+
+- Cloudflare Worker and Transform Rules examples exist and are tested.
+- Trusted ingress contract is documented and reflected in current runtime trust
+  handling.
+- Eidolon edge decisions can be exported live from OrbStack state as concrete
+  webhook/SIEM payloads.
+- OrbStack Kubernetes exposes both the shield edge and a direct baseline target
+  path.
+- Kali VM validation against OrbStack NodePorts is documented and scripted.
+- SEO, accessibility, verified crawler, Tor/VPN, and analytics-safety
+  constraints are documented.
+
 ## M5 Adaptive Bait Policy And Shield Hardening
 
 Goal:

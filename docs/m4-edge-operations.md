@@ -1,0 +1,225 @@
+# M4 Edge/CDN Integration Operations
+
+This note defines what "M4 complete" means in this repo and how to operate the
+current deployment path safely.
+
+## Scope
+
+M4 is complete only when all four of these are true:
+
+1. Edge trust inputs are normalized and testable.
+2. Eidolon edge decisions are exportable as concrete webhook/SIEM/WAF payloads.
+3. OrbStack Kubernetes is a real deployment target, not a hypothetical one.
+4. A Kali VM can validate the deployed shield against both the direct baseline
+   and the defended edge path.
+
+This note is the operational companion to:
+
+- [trusted-ingress-signal-contract.md](./trusted-ingress-signal-contract.md)
+- [examples/edge/cloudflare/README.md](../examples/edge/cloudflare/README.md)
+- [examples/shield-lab/README.md](../examples/shield-lab/README.md)
+
+## Current M4 Artifacts
+
+### Inbound trust
+
+Runtime support:
+
+- normalized ingress identity headers
+- transport-auth gate for explicit edge-provided identity
+- local trust config
+- precedence merging between explicit and local trust
+- scoped bait softening for stronger trusted identities
+
+Relevant code:
+
+- [crates/eidolon-proxy/src/session.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-proxy/src/session.rs)
+- [crates/eidolon-proxy/src/ingress_identity.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-proxy/src/ingress_identity.rs)
+- [crates/eidolon-proxy/src/main.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-proxy/src/main.rs)
+
+### Edge adapters
+
+Cloudflare examples:
+
+- Worker adapter:
+  [examples/edge/cloudflare/eidolon-ingress-worker.mjs](/Users/darkroom/Projects/eidolon/examples/edge/cloudflare/eidolon-ingress-worker.mjs)
+- Request-header Transform Rules payload:
+  [examples/edge/cloudflare/eidolon-request-header-transform-rules.json](/Users/darkroom/Projects/eidolon/examples/edge/cloudflare/eidolon-request-header-transform-rules.json)
+
+### Outbound decisions
+
+Contract and export path:
+
+- edge export types:
+  [crates/eidolon-core/src/lib.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-core/src/lib.rs)
+- trace builder:
+  [crates/eidolon-trace/src/report.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-trace/src/report.rs)
+- file-based exporter:
+  [crates/eidolon-trace/src/bin/eidolon-edge-export.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-trace/src/bin/eidolon-edge-export.rs)
+- live OrbStack wrapper:
+  [examples/shield-lab/export-edge-decisions-orbstack.sh](/Users/darkroom/Projects/eidolon/examples/shield-lab/export-edge-decisions-orbstack.sh)
+
+### Deployment target
+
+OrbStack Kubernetes shield-lab:
+
+- [examples/shield-lab/README.md](../examples/shield-lab/README.md)
+- [examples/shield-lab/k8s/orbstack/kustomization.yaml](/Users/darkroom/Projects/eidolon/examples/shield-lab/k8s/orbstack/kustomization.yaml)
+- [examples/shield-lab/k8s/orbstack/shield-edge-service.yaml](/Users/darkroom/Projects/eidolon/examples/shield-lab/k8s/orbstack/shield-edge-service.yaml)
+- [examples/shield-lab/k8s/orbstack/target-edge-service.yaml](/Users/darkroom/Projects/eidolon/examples/shield-lab/k8s/orbstack/target-edge-service.yaml)
+
+### Kali validation path
+
+- Kali scanner wrapper against OrbStack NodePorts:
+  [examples/shield-lab/run-pwnkit-kali-vm.sh](/Users/darkroom/Projects/eidolon/examples/shield-lab/run-pwnkit-kali-vm.sh)
+- Kali validation runbook:
+  [examples/shield-lab/kali-vm-pwnkit.md](../examples/shield-lab/kali-vm-pwnkit.md)
+
+## OrbStack Deployment Contract
+
+The OrbStack overlay exposes two NodePort services on the macOS host:
+
+- shield edge: `http://127.0.0.1:31080`
+- direct target edge: `http://127.0.0.1:31081`
+
+Inside an OrbStack Kali VM, the default validation contract is:
+
+- shield edge: `http://host.internal:31080`
+- direct target edge: `http://host.internal:31081`
+
+This is a distinct topology from the older M3 same-VM loopback path.
+
+Important trust boundary:
+
+- these NodePorts are deployment-validation ingress, not a trusted adapter hop
+- explicit `X-Eidolon-Ingress-*` identity headers are ignored there unless the
+  proxy is configured with the shared transport-auth secret
+- the Cloudflare Worker or Transform Rules adapter is the intended trusted edge
+  boundary for explicit ingress identity
+- the OrbStack overlay now mounts a cluster-local transport-auth secret so the
+  accepted trusted-ingress path can be smoke-tested live on the deployment too
+
+Recorded labels:
+
+- `runner_environment = kali_vm`
+- `network_topology = kali_vm_to_orbstack_nodeport`
+
+## Operational Edge Export
+
+There are two export layers:
+
+1. offline/session export:
+   `eidolon-edge-export`
+2. live OrbStack cluster export:
+   `examples/shield-lab/export-edge-decisions-orbstack.sh`
+
+The live wrapper reads the proxy's PVC-backed `events.jsonl`, derives the latest
+`EidolonEdgeDecisionExport` snapshot per session, and can either:
+
+- print JSON/NDJSON
+- write JSON to a file
+- POST each decision to a webhook or SIEM collector
+
+Example:
+
+```sh
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format ndjson \
+  --webhook-url https://collector.example.test/eidolon
+```
+
+This is the current concrete M4 answer to "webhook/SIEM/WAF export" in the
+public repo. It is a session-snapshot poller, not yet a cursor-based event
+stream.
+
+## Kali Validation Path
+
+Use this sequence:
+
+1. On the macOS host, deploy or refresh the OrbStack shield-lab.
+2. Confirm both NodePort services are reachable.
+3. Inside the Kali VM, run the dedicated wrapper against `host.internal`.
+4. On the host, export the live cluster evidence and edge decisions.
+
+Minimal sequence:
+
+Host:
+
+```sh
+examples/shield-lab/build-orbstack-images.sh
+examples/shield-lab/deploy-orbstack.sh
+examples/shield-lab/status-orbstack.sh
+```
+
+Kali VM:
+
+```sh
+cd ~/Projects/eidolon
+examples/shield-lab/run-pwnkit-kali-vm.sh --preflight 1 /tmp/eidolon-m4-orbstack
+examples/shield-lab/run-pwnkit-kali-vm.sh 1 /tmp/eidolon-m4-orbstack
+```
+
+Host:
+
+```sh
+examples/shield-lab/export-orbstack-evidence.sh /tmp/eidolon-m4-orbstack-bundle
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --output /tmp/eidolon-m4-orbstack-edge-decisions.json
+examples/shield-lab/collect-kali-vm-sample.sh \
+  --host-bundle-dir /tmp/eidolon-m4-orbstack-bundle \
+  --edge-decisions /tmp/eidolon-m4-orbstack-edge-decisions.json \
+  /tmp/eidolon-m4-orbstack \
+  /tmp/eidolon-m4-orbstack-kali
+```
+
+## Operational Constraints
+
+### SEO and verified crawlers
+
+- Do not let generic bot score alone create high trust.
+- Use verified or signed ingress identities to soften only configured discovery
+  surfaces.
+- Keep `/docs` and `/openapi.json` softening scoped; do not globally exempt
+  crawlers from containment.
+- Preserve audit of every softened request.
+
+### Accessibility tooling
+
+- Accessibility probes and link checkers can resemble crawlers.
+- Treat them like allowlisted or partner automation only when the operator can
+  assert identity explicitly.
+- Do not rely on `User-Agent` alone.
+
+### Tor/VPN handling
+
+- Tor/VPN status is risk context, not identity.
+- Do not collapse Tor/VPN use directly into `signed_attested` or
+  `edge_verified`.
+- Prefer preserving the raw edge signal in export/webhook output and letting
+  policy or SIEM correlation decide the next action.
+
+### Analytics safety
+
+- Do not emit raw request bodies, cookies, or query values into edge export.
+- Do not feed bait markers into public analytics products.
+- Use redacted bundle export for operator review and evidence packaging.
+
+### WAF / CDN interference
+
+- When Eidolon is already in controlled reality, the outbound recommendation
+  should prefer `preserve_eidolon_routing`.
+- Edge layers should avoid challenging or rewriting that session out from under
+  Eidolon unless the operator explicitly wants the edge to take over.
+
+## M4 Acceptance Criteria
+
+M4 is complete when:
+
+- Cloudflare Worker and Transform Rules examples exist and are tested.
+- Trusted ingress contract is documented and matches runtime behavior.
+- Eidolon edge decisions can be exported live from OrbStack state and sent to a
+  webhook.
+- OrbStack Kubernetes exposes both the shield edge and direct baseline path.
+- Kali VM validation against OrbStack NodePorts is documented and scripted.
+- SEO, accessibility, verified crawler, Tor/VPN, and analytics-safety
+  constraints are documented in one operational note.

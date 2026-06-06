@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eidolon-shield-proxy
+  namespace: shield-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: shield-proxy
+          args:
+            - --owned-cluster-lab
+            - --listen-addr
+            - $(EIDOLON_LISTEN_ADDR)
+            - --upstream
+            - $(EIDOLON_UPSTREAM_TARGET)
+            - --event-log
+            - $(EIDOLON_EVENT_LOG_PATH)
+            - --debug-log
+            - $(EIDOLON_DEBUG_LOG_PATH)
+            - --intervention-control
+            - $(EIDOLON_INTERVENTION_CONTROL_PATH)
+            - --policy-state
+            - $(EIDOLON_POLICY_STATE_PATH)
+            - --ingress-transport-auth-secret-file
+            - /var/run/secrets/eidolon-trusted-ingress/transport-auth.txt
+          volumeMounts:
+            - name: eidolon-trusted-ingress
+              mountPath: /var/run/secrets/eidolon-trusted-ingress
+              readOnly: true
+      volumes:
+        - name: eidolon-trusted-ingress
+          secret:
+            secretName: eidolon-trusted-ingress
