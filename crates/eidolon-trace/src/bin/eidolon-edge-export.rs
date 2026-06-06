@@ -234,17 +234,17 @@ fn parse_events_path(raw: &str) -> Result<PathBuf, CliError> {
         return Err(CliError::new("events path cannot be empty"));
     }
 
-    if raw
-        .split(['/', '\\'])
-        .any(|segment| segment == "..")
-    {
+    if raw.split(['/', '\\']).any(|segment| segment == "..") {
         return Err(CliError::new(format!(
             "events path must not contain parent traversal components: `{raw}`",
         )));
     }
 
-    let path = fs::canonicalize(raw)
-        .map_err(|error| CliError::new(format!("events path must exist and resolve cleanly: {error}")))?;
+    let path = fs::canonicalize(raw).map_err(|error| {
+        CliError::new(format!(
+            "events path must exist and resolve cleanly: {error}"
+        ))
+    })?;
     if !path.is_file() {
         return Err(CliError::new(format!(
             "events path must be an existing file: `{}`",
@@ -315,7 +315,10 @@ mod tests {
             .map(|event| must_ok(serde_json::to_string(event), "event should serialize"))
             .collect::<Vec<_>>()
             .join("\n");
-        must_ok(fs::write(&path, format!("{body}\n")), "event log should write");
+        must_ok(
+            fs::write(&path, format!("{body}\n")),
+            "event log should write",
+        );
         path
     }
 
@@ -365,7 +368,10 @@ mod tests {
 
         assert_eq!(
             config.events_path,
-            must_ok(fs::canonicalize(&events_path), "events path should canonicalize")
+            must_ok(
+                fs::canonicalize(&events_path),
+                "events path should canonicalize"
+            )
         );
         assert_eq!(config.session_id, Some(session_id));
         assert!(config.pretty);

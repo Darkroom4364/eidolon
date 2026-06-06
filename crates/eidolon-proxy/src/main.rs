@@ -3665,7 +3665,10 @@ mod tests {
 
     fn write_ingress_trust_config(contents: &str) -> PathBuf {
         let path = unique_temp_path("ingress-trust-config.json");
-        must_ok(fs::write(&path, contents), "ingress trust config should write");
+        must_ok(
+            fs::write(&path, contents),
+            "ingress trust config should write",
+        );
         path
     }
 
@@ -3740,12 +3743,14 @@ mod tests {
         let bait_registry = Arc::new(BaitRegistry::m3_catalog());
         ProxyRuntime {
             upstream,
-            event_log: Arc::new(Mutex::new(
-                must_ok(FileEventLogWriter::open(event_log_path), "event log should open"),
-            )),
-            debug_log: Some(Arc::new(Mutex::new(
-                must_ok(FileDebugLogWriter::open(debug_log_path), "debug log should open"),
+            event_log: Arc::new(Mutex::new(must_ok(
+                FileEventLogWriter::open(event_log_path),
+                "event log should open",
             ))),
+            debug_log: Some(Arc::new(Mutex::new(must_ok(
+                FileDebugLogWriter::open(debug_log_path),
+                "debug log should open",
+            )))),
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
             controlled_reality_config: ControlledRealityConfig::default(),
@@ -4299,18 +4304,13 @@ mod tests {
 
     #[test]
     fn connect_upstream_returns_stream_with_deadlines() {
-        let listener = must_ok(
-            TcpListener::bind("127.0.0.1:0"),
-            "upstream should bind",
-        );
+        let listener = must_ok(TcpListener::bind("127.0.0.1:0"), "upstream should bind");
         let addr = must_ok(listener.local_addr(), "upstream should have address");
         let upstream = must_ok(
             parse_upstream(&format!("http://{addr}"), false),
             "upstream target should parse",
         );
-        let handle = thread::spawn(move || {
-            must_ok(listener.accept(), "upstream should accept").0
-        });
+        let handle = thread::spawn(move || must_ok(listener.accept(), "upstream should accept").0);
 
         let stream = must_ok(connect_upstream(&upstream), "upstream should connect");
         let accepted = must_join(handle.join(), "upstream accept should join");
@@ -5562,12 +5562,10 @@ mod tests {
               ]
             }"#,
         );
-        runtime.ingress_identity_resolver = Arc::new(
-            must_ok(
-                ingress_identity::load_ingress_identity_resolver(&config_path),
-                "ingress trust config should load",
-            ),
-        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
 
         let request = request_with_cookie(
             "GET",
@@ -5622,12 +5620,10 @@ mod tests {
               ]
             }"#,
         );
-        runtime.ingress_identity_resolver = Arc::new(
-            must_ok(
-                ingress_identity::load_ingress_identity_resolver(&config_path),
-                "ingress trust config should load",
-            ),
-        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
         runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
 
         let request = request_with_cookie(
@@ -5689,12 +5685,10 @@ mod tests {
               ]
             }"#,
         );
-        runtime.ingress_identity_resolver = Arc::new(
-            must_ok(
-                ingress_identity::load_ingress_identity_resolver(&config_path),
-                "ingress trust config should load",
-            ),
-        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
         runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
 
         let request = request_with_cookie(
@@ -5757,12 +5751,10 @@ mod tests {
               ]
             }"#,
         );
-        runtime.ingress_identity_resolver = Arc::new(
-            must_ok(
-                ingress_identity::load_ingress_identity_resolver(&config_path),
-                "ingress trust config should load",
-            ),
-        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
 
         let response = parse_downstream_response(&run_runtime_request(
             runtime,
@@ -5830,12 +5822,10 @@ mod tests {
               ]
             }"#,
         );
-        runtime.ingress_identity_resolver = Arc::new(
-            must_ok(
-                ingress_identity::load_ingress_identity_resolver(&config_path),
-                "ingress trust config should load",
-            ),
-        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
 
         let response = parse_downstream_response(&run_runtime_request(
             runtime,
@@ -6223,8 +6213,11 @@ mod tests {
             ));
 
             assert_eq!(action_response.status, 202);
-            assert!(must_ok(String::from_utf8(action_response.body), "body should be utf8")
-                .contains(r#""write_committed":false"#));
+            assert!(must_ok(
+                String::from_utf8(action_response.body),
+                "body should be utf8"
+            )
+            .contains(r#""write_committed":false"#));
 
             let exposure = first_event_of_type(&event_log_path, "bait_exposed");
             let action = first_event_of_type(&event_log_path, "bait_action_observed");
@@ -6545,8 +6538,11 @@ mod tests {
         let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
 
         assert_eq!(response.body, br#"{"mode":"upstream"}"#);
-        assert!(must_ok(String::from_utf8(upstream_request), "request should be utf8")
-            .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+        assert!(must_ok(
+            String::from_utf8(upstream_request),
+            "request should be utf8"
+        )
+        .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
         assert_eq!(events_of_type(&event_log_path, "bait_exposed").len(), 1);
         assert_event_type_absent(&event_log_path, "bait_action_observed");
     }
@@ -6555,7 +6551,10 @@ mod tests {
     fn disabled_interventions_fail_closed_for_known_decoy_write_path() {
         let event_log_path = unique_temp_path("disabled-bait-events.jsonl");
         let control_path = unique_temp_path("disabled-bait-control.txt");
-        must_ok(fs::write(&control_path, "disabled"), "control file should write");
+        must_ok(
+            fs::write(&control_path, "disabled"),
+            "control file should write",
+        );
         let runtime =
             test_runtime_with_m1_controller(closed_upstream(), &event_log_path, control_path);
 
@@ -6569,8 +6568,10 @@ mod tests {
         ));
 
         assert_eq!(response.status, 403);
-        assert!(must_ok(String::from_utf8(response.body), "body should be utf8")
-            .contains("failed closed"));
+        assert!(
+            must_ok(String::from_utf8(response.body), "body should be utf8")
+                .contains("failed closed")
+        );
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_type_absent(&event_log_path, "bait_exposed");
         assert_event_type_absent(&event_log_path, "bait_action_observed");
@@ -6597,8 +6598,10 @@ mod tests {
         ));
 
         assert_eq!(response.status, 200);
-        assert!(must_ok(String::from_utf8(response.body), "body should be utf8")
-            .contains(r#""synthetic":true"#));
+        assert!(
+            must_ok(String::from_utf8(response.body), "body should be utf8")
+                .contains(r#""synthetic":true"#)
+        );
         assert_event_routing(&event_log_path, "request_seen", "controlled_reality");
         assert_event_routing(&event_log_path, "response_served", "controlled_reality");
     }
