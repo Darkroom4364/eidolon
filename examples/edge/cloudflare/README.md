@@ -51,12 +51,19 @@ traffic gets raw score and detection metadata, but no `source` or `trust_tier`.
 
 ## Usage
 
-Bind the protected Eidolon origin as `EIDOLON_ORIGIN` and the proxy's shared
-transport secret as `EIDOLON_INGRESS_TRANSPORT_AUTH`, then deploy the Worker in
-front of it.
+Bind:
+
+- the protected Eidolon origin as `EIDOLON_ORIGIN`
+- an explicit comma-separated allowlist of permitted origin hosts as
+  `EIDOLON_ALLOWED_ORIGIN_HOSTS`
+- the proxy's shared transport secret as `EIDOLON_INGRESS_TRANSPORT_AUTH`
+
+Then deploy the Worker in front of it.
 
 The Worker forwards method, path, query, headers, and body to that origin after
-header normalization and transport-auth attachment.
+header normalization and transport-auth attachment. The allowlist is enforced
+before forwarding so the Worker only proxies to approved upstream hosts even if
+the binding is misconfigured.
 
 ## Transform Rules Variant
 
