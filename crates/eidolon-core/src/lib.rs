@@ -289,6 +289,13 @@ mod tests {
 
     use super::*;
 
+    fn must_ok<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
     #[test]
     fn event_schema_version_is_the_m2_5_contract_version() {
         assert_eq!(EVENT_SCHEMA_VERSION, 2);
@@ -333,7 +340,7 @@ mod tests {
             },
         );
 
-        let serialized = serde_json::to_value(event).expect("event should serialize");
+        let serialized = must_ok(serde_json::to_value(event), "event should serialize");
 
         assert_eq!(serialized["schema_version"], json!(EVENT_SCHEMA_VERSION));
         assert_eq!(serialized["source"], json!("policy_router"));
@@ -399,7 +406,7 @@ mod tests {
             }
         });
 
-        let parsed: Event = serde_json::from_value(event).expect("legacy event should parse");
+        let parsed: Event = must_ok(serde_json::from_value(event), "legacy event should parse");
 
         match parsed.kind {
             EventKind::RequestSeen {
@@ -510,7 +517,7 @@ mod tests {
             },
         };
 
-        let serialized = serde_json::to_value(export).expect("edge export should serialize");
+        let serialized = must_ok(serde_json::to_value(export), "edge export should serialize");
 
         assert_eq!(
             serialized["contract_version"],
