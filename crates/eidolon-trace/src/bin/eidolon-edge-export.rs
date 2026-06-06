@@ -1,8 +1,4 @@
-use std::{
-    env, fmt,
-    path::{Path, PathBuf},
-    process::ExitCode,
-};
+use std::{env, fmt, fs, path::PathBuf, process::ExitCode};
 
 use eidolon_core::SessionId;
 use eidolon_trace::{
@@ -234,7 +230,21 @@ fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<(), CliErro
 }
 
 fn parse_events_path(raw: &str) -> Result<PathBuf, CliError> {
-    let path = parse_file_path(raw, "events")?;
+    if raw.trim().is_empty() {
+        return Err(CliError::new("events path cannot be empty"));
+    }
+
+    if raw
+        .split(['/', '\\'])
+        .any(|segment| segment == "..")
+    {
+        return Err(CliError::new(format!(
+            "events path must not contain parent traversal components: `{raw}`",
+        )));
+    }
+
+    let path = fs::canonicalize(raw)
+        .map_err(|error| CliError::new(format!("events path must exist and resolve cleanly: {error}")))?;
     if !path.is_file() {
         return Err(CliError::new(format!(
             "events path must be an existing file: `{}`",
@@ -255,43 +265,9 @@ fn parse_session_id(raw: &str) -> Result<SessionId, CliError> {
         .map_err(|error| CliError::new(format!("session ID must be a valid UUID: {error}")))
 }
 
-fn parse_file_path(raw: &str, label: &str) -> Result<PathBuf, CliError> {
-    if raw.trim().is_empty() {
-        return Err(CliError::new(format!("{label} path cannot be empty")));
-    }
-
-    let path = PathBuf::from(raw);
-    if path.exists() && path.is_dir() {
-        return Err(CliError::new(format!(
-            "{label} path must be a file path, got directory `{}`",
-            path.display()
-        )));
-    }
-
-    if let Some(parent) = meaningful_parent(&path) {
-        if !parent.exists() {
-            return Err(CliError::new(format!(
-                "{label} path parent directory does not exist: `{}`",
-                parent.display()
-            )));
-        }
-    }
-
-    Ok(path)
-}
-
-fn meaningful_parent(path: &Path) -> Option<&Path> {
-    let parent = path.parent()?;
-    if parent.as_os_str().is_empty() || parent == Path::new(".") {
-        None
-    } else {
-        Some(parent)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use chrono::{TimeZone, Utc};
     use eidolon_core::{
@@ -301,6 +277,27 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    fn must_ok<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
+    fn must_some<T>(value: Option<T>, context: &str) -> T {
+        match value {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
+
+    fn path_str<'a>(path: &'a Path, context: &str) -> &'a str {
+        match path.to_str() {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
 
     fn unique_temp_path(name: &str) -> PathBuf {
         let unique = format!(
@@ -315,10 +312,10 @@ mod tests {
         let path = unique_temp_path("events.jsonl");
         let body = events
             .iter()
-            .map(|event| serde_json::to_string(event).expect("event should serialize"))
+            .map(|event| must_ok(serde_json::to_string(event), "event should serialize"))
             .collect::<Vec<_>>()
             .join("\n");
-        fs::write(&path, format!("{body}\n")).expect("event log should write");
+        must_ok(fs::write(&path, format!("{body}\n")), "event log should write");
         path
     }
 
@@ -343,30 +340,33 @@ mod tests {
         event.observed_at = Utc
             .with_ymd_and_hms(2026, 6, 5, 12, 0, 0)
             .single()
-            .expect("timestamp should be valid");
+            .unwrap_or_else(|| panic!("timestamp should be valid"));
         event
     }
 
     #[test]
     fn parses_explicit_flags() {
         let events_path = unique_temp_path("parse-events.jsonl");
-        fs::write(&events_path, "").expect("placeholder should write");
+        must_ok(fs::write(&events_path, ""), "placeholder should write");
         let session_id = SessionId::new();
 
         let action = CliAction::from_args([
             "--events",
-            events_path.to_str().unwrap(),
+            path_str(&events_path, "events path should be utf8"),
             "--session",
             &session_id.0.to_string(),
             "--pretty",
         ])
-        .expect("config should parse");
+        .unwrap_or_else(|error| panic!("config should parse: {error}"));
 
         let CliAction::Run(config) = action else {
             panic!("expected runnable config");
         };
 
-        assert_eq!(config.events_path, events_path);
+        assert_eq!(
+            config.events_path,
+            must_ok(fs::canonicalize(&events_path), "events path should canonicalize")
+        );
         assert_eq!(config.session_id, Some(session_id));
         assert!(config.pretty);
     }
@@ -374,12 +374,12 @@ mod tests {
     #[test]
     fn rejects_missing_or_invalid_inputs() {
         let events_path = unique_temp_path("invalid-session-events.jsonl");
-        fs::write(&events_path, "").expect("placeholder should write");
+        must_ok(fs::write(&events_path, ""), "placeholder should write");
         let missing_events =
             CliAction::from_args(["--events", ""]).expect_err("empty path should fail");
         let invalid_session = CliAction::from_args([
             "--events",
-            events_path.to_str().unwrap(),
+            path_str(&events_path, "events path should be utf8"),
             "--session",
             "not-a-uuid",
         ])
@@ -401,7 +401,7 @@ mod tests {
             request_event(first_session, "/docs/legacy-import"),
             request_event(second_session, "/openapi.json"),
         ]);
-        let events = read_events_jsonl_file(&path).expect("events should parse");
+        let events = must_ok(read_events_jsonl_file(&path), "events should parse");
         let timelines = build_session_timelines(events);
 
         let error = select_timeline(&timelines, None).expect_err("selection should fail");
@@ -426,11 +426,16 @@ mod tests {
                 },
             ),
         ]);
-        let events = read_events_jsonl_file(&path).expect("events should parse");
+        let events = must_ok(read_events_jsonl_file(&path), "events should parse");
         let timelines = build_session_timelines(events);
-        let timeline = select_timeline(&timelines, None).expect("single session should select");
-        let export =
-            edge_decision_export_for_timeline(timeline).expect("edge decision export should exist");
+        let timeline = must_ok(
+            select_timeline(&timelines, None),
+            "single session should select",
+        );
+        let export = must_some(
+            edge_decision_export_for_timeline(timeline),
+            "edge decision export should exist",
+        );
 
         assert_eq!(export.session_id, session_id);
         assert_eq!(export.request.path, "/docs/legacy-import");

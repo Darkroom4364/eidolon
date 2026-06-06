@@ -104,6 +104,7 @@ test("buildOriginRequest rewrites the origin and applies sanitized trusted ingre
 
   const forwarded = buildOriginRequest(request, {
     EIDOLON_ORIGIN: "https://eidolon.internal:9102/base-path",
+    EIDOLON_ALLOWED_ORIGIN_HOSTS: "eidolon.internal",
     EIDOLON_INGRESS_TRANSPORT_AUTH: "edge-secret",
   });
 
@@ -120,7 +121,11 @@ test("buildOriginRequest requires an explicit origin binding", () => {
   const request = new Request("https://edge.example.com/docs");
 
   assert.throws(
-    () => buildOriginRequest(request, { EIDOLON_INGRESS_TRANSPORT_AUTH: "edge-secret" }),
+    () =>
+      buildOriginRequest(request, {
+        EIDOLON_ALLOWED_ORIGIN_HOSTS: "eidolon.internal",
+        EIDOLON_INGRESS_TRANSPORT_AUTH: "edge-secret",
+      }),
     /missing required EIDOLON_ORIGIN binding/,
   );
 });
@@ -129,7 +134,25 @@ test("buildOriginRequest requires an explicit transport auth binding", () => {
   const request = new Request("https://edge.example.com/docs");
 
   assert.throws(
-    () => buildOriginRequest(request, { EIDOLON_ORIGIN: "https://eidolon.internal:9102" }),
+    () =>
+      buildOriginRequest(request, {
+        EIDOLON_ORIGIN: "https://eidolon.internal:9102",
+        EIDOLON_ALLOWED_ORIGIN_HOSTS: "eidolon.internal",
+      }),
     /missing required EIDOLON_INGRESS_TRANSPORT_AUTH binding/,
+  );
+});
+
+test("buildOriginRequest requires the origin host to be allowlisted", () => {
+  const request = new Request("https://edge.example.com/docs");
+
+  assert.throws(
+    () =>
+      buildOriginRequest(request, {
+        EIDOLON_ORIGIN: "https://eidolon.internal:9102",
+        EIDOLON_ALLOWED_ORIGIN_HOSTS: "other.internal",
+        EIDOLON_INGRESS_TRANSPORT_AUTH: "edge-secret",
+      }),
+    /EIDOLON_ORIGIN host must be present in EIDOLON_ALLOWED_ORIGIN_HOSTS/,
   );
 });
