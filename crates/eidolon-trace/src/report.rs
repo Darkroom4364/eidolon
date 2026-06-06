@@ -1,6 +1,10 @@
 use std::fmt::Write;
 
-use eidolon_core::{EventKind, RoutingDecision};
+use eidolon_core::{
+    EdgeEvidenceRef, EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestRef,
+    EidolonEdgeDecisionExport, EventKind, PolicyState, RoutingDecision,
+    TRUSTED_INGRESS_CONTRACT_VERSION,
+};
 
 use crate::evidence::trace_metric_summary_for_timeline;
 use crate::{
@@ -209,6 +213,147 @@ pub fn render_replay_view(timeline: &SessionTimeline, bundle: &EvidenceBundle) -
     replay
 }
 
+pub fn edge_decision_export_for_timeline(
+    timeline: &SessionTimeline,
+) -> Option<EidolonEdgeDecisionExport> {
+    let bundle = evidence_bundle_for_timeline(timeline);
+    edge_decision_export_for_evidence(timeline, &bundle)
+}
+
+pub fn edge_decision_export_for_evidence(
+    timeline: &SessionTimeline,
+    bundle: &EvidenceBundle,
+) -> Option<EidolonEdgeDecisionExport> {
+    let latest_request = timeline.events.iter().rev().find_map(|event| {
+        let EventKind::RequestSeen {
+            method,
+            path,
+            ingress_identity,
+            routing_decision,
+            ..
+        } = &event.event.kind
+        else {
+            return None;
+        };
+
+        Some((
+            event,
+            method.clone(),
+            path.clone(),
+            ingress_identity.clone(),
+            *routing_decision,
+        ))
+    })?;
+
+    let (request_event, method, path, ingress_identity, request_routing_decision) = latest_request;
+    let latest_policy_event = bundle.policy_events.last();
+    let policy_state = latest_policy_event
+        .map(|event| event.policy_state)
+        .or(bundle.policy_state)
+        .unwrap_or(request_event.event.policy_state);
+    let routing_decision = latest_policy_event
+        .and_then(|event| event.routing_decision)
+        .unwrap_or(request_routing_decision);
+    let reason = latest_policy_event
+        .and_then(|event| event.reason.clone())
+        .unwrap_or_else(|| "latest request routing decision".to_string());
+    let edge_recommendation =
+        edge_recommendation_for(policy_state, routing_decision, reason.as_str());
+
+    Some(EidolonEdgeDecisionExport {
+        contract_version: TRUSTED_INGRESS_CONTRACT_VERSION.to_string(),
+        observed_at: request_event.event.observed_at,
+        session_id: bundle.session_id,
+        request: EdgeRequestRef { method, path },
+        ingress_identity,
+        policy: EdgePolicySnapshot {
+            state: policy_state,
+            routing_decision,
+            reason,
+        },
+        evidence: EdgeEvidenceRef {
+            event_schema_version: request_event.event.schema_version,
+            event_ids: edge_export_event_ids(timeline, request_event, latest_policy_event),
+            bundle_ref: format!("session:{}", bundle.session_id.0),
+        },
+        edge_recommendation,
+    })
+}
+
+fn edge_export_event_ids(
+    timeline: &SessionTimeline,
+    request_event: &TimelineEvent,
+    latest_policy_event: Option<&crate::PolicyEventEvidence>,
+) -> Vec<uuid::Uuid> {
+    let mut event_ids = vec![request_event.event.id];
+
+    if let Some(policy_event) = latest_policy_event {
+        if let Some(timeline_event) = timeline_event_by_ref(timeline, policy_event.event_ref) {
+            if timeline_event.event.id != request_event.event.id {
+                event_ids.push(timeline_event.event.id);
+            }
+        }
+    }
+
+    event_ids
+}
+
+fn timeline_event_by_ref(
+    timeline: &SessionTimeline,
+    event_ref: TimelineEventRef,
+) -> Option<&TimelineEvent> {
+    timeline.events.iter().find(|event| {
+        event.file_order == event_ref.file_order && event.line_number == event_ref.line_number
+    })
+}
+
+fn edge_recommendation_for(
+    policy_state: PolicyState,
+    routing_decision: RoutingDecision,
+    reason: &str,
+) -> EdgeRecommendation {
+    if reason.contains("trusted ingress identity suppressed bait surface intervention") {
+        return EdgeRecommendation {
+            action: EdgeRecommendedAction::Allow,
+            ttl_seconds: Some(300),
+            reason_codes: vec!["trusted_identity".to_string(), "bait_softened".to_string()],
+        };
+    }
+
+    if matches!(
+        policy_state,
+        PolicyState::ControlledReality | PolicyState::RateLimited | PolicyState::Blocked
+    ) || matches!(
+        routing_decision,
+        RoutingDecision::ControlledReality
+            | RoutingDecision::RateLimited
+            | RoutingDecision::EidolonOwned
+    ) {
+        return EdgeRecommendation {
+            action: EdgeRecommendedAction::PreserveEidolonRouting,
+            ttl_seconds: Some(300),
+            reason_codes: vec![
+                "eidolon_runtime_enforcement".to_string(),
+                snake_case_debug(&routing_decision),
+            ],
+        };
+    }
+
+    if policy_state == PolicyState::Suspicious {
+        return EdgeRecommendation {
+            action: EdgeRecommendedAction::Observe,
+            ttl_seconds: None,
+            reason_codes: vec!["suspicious_session".to_string()],
+        };
+    }
+
+    EdgeRecommendation {
+        action: EdgeRecommendedAction::Observe,
+        ttl_seconds: None,
+        reason_codes: vec![snake_case_debug(&routing_decision)],
+    }
+}
+
 fn replay_summary(event: &TimelineEvent, bundle: &EvidenceBundle) -> String {
     match &event.event.kind {
         EventKind::RequestSeen {
@@ -216,6 +361,7 @@ fn replay_summary(event: &TimelineEvent, bundle: &EvidenceBundle) -> String {
             path,
             safe_headers,
             routing_decision,
+            ..
         } => {
             let present_headers: Vec<&str> = safe_headers
                 .iter()
@@ -444,13 +590,21 @@ fn markdown_text(value: &str) -> String {
 mod tests {
     use chrono::{TimeDelta, TimeZone, Utc};
     use eidolon_core::{
-        BaitId, Event, EventKind, EventSource, ExposureId, PolicyState, RoutingDecision,
-        SafeHeaderObservation, SessionId,
+        BaitId, EdgeRecommendedAction, Event, EventKind, EventSource, ExposureId, IngressIdentity,
+        IngressIdentitySource, IngressTrustTier, PolicyState, RoutingDecision,
+        SafeHeaderObservation, SessionId, TRUSTED_INGRESS_CONTRACT_VERSION,
     };
 
     use crate::{evidence_bundle_for_timeline, TimelineEvent};
 
     use super::*;
+
+    fn must_some<T>(value: Option<T>, context: &str) -> T {
+        match value {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
 
     fn timeline(events: Vec<Event>) -> SessionTimeline {
         let session_id = events[0].session_id;
@@ -486,6 +640,7 @@ mod tests {
                         present: true,
                     },
                 ],
+                ingress_identity: IngressIdentity::default(),
                 routing_decision: RoutingDecision::EidolonOwned,
             },
         )
@@ -554,6 +709,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/admin/decoy".to_string(),
                 safe_headers: Vec::new(),
+                ingress_identity: IngressIdentity::default(),
                 routing_decision,
             },
         )
@@ -703,6 +859,7 @@ mod tests {
                         "/oauth/callback?code=authcode-secret&state=session-secret#fragment-secret"
                             .to_string(),
                     safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             ),
@@ -751,6 +908,105 @@ mod tests {
         assert!(report.contains("No confirmed bait exposure to action chain"));
         assert!(report.contains("Unconfirmed Bait-Shaped Actions"));
         assert!(report.contains("did not carry the matching exposure identifier"));
+    }
+
+    #[test]
+    fn edge_decision_export_uses_allow_for_trusted_bait_softening() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs/legacy-import".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity {
+                        source: IngressIdentitySource::LocalAllowlist,
+                        trust_tier: IngressTrustTier::Allowlisted,
+                        label: Some("internal-crawler".to_string()),
+                        expires_at: None,
+                    },
+                    routing_decision: RoutingDecision::ProtectedUpstream,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Observe,
+                EventKind::PolicyDecision {
+                    routing_decision: RoutingDecision::ProtectedUpstream,
+                    reason: "trusted ingress identity suppressed bait surface intervention before runtime suspicion was established".to_string(),
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(export.contract_version, TRUSTED_INGRESS_CONTRACT_VERSION);
+        assert_eq!(export.request.path, "/docs/legacy-import");
+        assert_eq!(
+            export.ingress_identity.label.as_deref(),
+            Some("internal-crawler")
+        );
+        assert_eq!(
+            export.edge_recommendation.action,
+            EdgeRecommendedAction::Allow
+        );
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec!["trusted_identity".to_string(), "bait_softened".to_string()]
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_preserves_eidolon_routing_for_containment() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::ControlledReality,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    routing_decision: RoutingDecision::ControlledReality,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::ControlledReality,
+                EventKind::ControlledRealityEntered {
+                    reason: "confirmed bait-derived action".to_string(),
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(
+            export.edge_recommendation.action,
+            EdgeRecommendedAction::PreserveEidolonRouting
+        );
+        assert_eq!(export.policy.state, PolicyState::ControlledReality);
+        assert_eq!(
+            export.policy.routing_decision,
+            RoutingDecision::ControlledReality
+        );
+        assert!(export
+            .edge_recommendation
+            .reason_codes
+            .contains(&"eidolon_runtime_enforcement".to_string()));
     }
 
     #[test]

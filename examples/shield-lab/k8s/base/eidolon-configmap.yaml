@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: eidolon-shield-proxy-config
+  namespace: shield-system
+data:
+  EIDOLON_LISTEN_ADDR: "0.0.0.0:9102"
+  EIDOLON_UPSTREAM_TARGET: "http://eidolon-owned-demo-target.shield-targets.svc.cluster.local:9101"
+  EIDOLON_EVENT_LOG_PATH: "/var/lib/eidolon/events.jsonl"
+  EIDOLON_DEBUG_LOG_PATH: "/var/lib/eidolon/debug.jsonl"
+  EIDOLON_POLICY_STATE_PATH: "/var/lib/eidolon/policy-state.json"
+  EIDOLON_INTERVENTION_CONTROL_PATH: "/var/lib/eidolon/interventions.txt"

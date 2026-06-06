@@ -84,7 +84,9 @@ Every event should include:
 - current policy state
 - reason or correlation fields when applicable
 
-Request events should log method, path, selected safe header metadata, and routing decision. They should not log request bodies or secrets by default.
+Request events should log method, path, selected safe header metadata,
+normalized ingress identity metadata, and routing decision. They should not log
+request bodies or secrets by default.
 
 `policy_decision` records an audited routing decision without claiming the policy state changed. `policy_changed` is reserved for actual state transitions where `from` and `to` differ.
 `controlled_reality_entered` and `rate_limit_applied` are per-request enforcement markers, not policy-state transition events. `reality_escape_attempt` records a contained session requesting outside the configured controlled branch without logging request bodies or secret values.
@@ -99,10 +101,16 @@ Responsibilities:
 
 - listen on a local/public port
 - identify or assign a session
+- normalize trusted ingress identity and risk signals before proxy policy uses
+  them
 - forward normal traffic to the protected target
 - call the surface controller for Eidolon-owned routes and rewrites
 - emit structured events
 - enforce current policy state
+
+Trusted ingress identity, score, and attestation signals should flow through a
+vendor-neutral contract. See
+`docs/trusted-ingress-signal-contract.md`.
 
 The v1 proxy should be boring:
 

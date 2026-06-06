@@ -9,6 +9,9 @@ pub use evidence::{
     EvidenceBundle, ObservedSurface, PolicyEventEvidence, PolicyEvidenceKind,
 };
 pub use reader::{read_events_jsonl, read_events_jsonl_file, TraceReadError};
-pub use report::{render_evidence_markdown, render_markdown_report, render_replay_view};
+pub use report::{
+    edge_decision_export_for_evidence, edge_decision_export_for_timeline, render_evidence_markdown,
+    render_markdown_report, render_replay_view,
+};
 pub use scoring::{score_events, score_evidence, score_timeline, score_timelines};
 pub use timeline::{build_session_timelines, SessionTimeline, TimelineEvent, TimelineEventRef};

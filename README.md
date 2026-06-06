@@ -136,6 +136,8 @@ docs/
   lab-metrics.md
   research-anchors.md
   roadmap.md
+  trusted-ingress-signal-contract.md
+  m4-edge-operations.md
 
 examples/
   baselines/

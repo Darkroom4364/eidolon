@@ -181,7 +181,9 @@ fn line_location(path: Option<&Path>, line_number: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use eidolon_core::{EventKind, EventSource, PolicyState, RoutingDecision, SessionId};
+    use eidolon_core::{
+        EventKind, EventSource, IngressIdentity, PolicyState, RoutingDecision, SessionId,
+    };
 
     use super::*;
 
@@ -194,6 +196,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: path.to_string(),
                 safe_headers: Vec::new(),
+                ingress_identity: IngressIdentity::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         )

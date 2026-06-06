@@ -51,8 +51,8 @@ mod tests {
     use std::io::{self, Write};
 
     use eidolon_core::{
-        Event, EventKind, EventSource, PolicyState, RoutingDecision, SafeHeaderObservation,
-        SessionId,
+        Event, EventKind, EventSource, IngressIdentity, PolicyState, RoutingDecision,
+        SafeHeaderObservation, SessionId,
     };
     use serde_json::Value;
 
@@ -94,6 +94,7 @@ mod tests {
                         present: false,
                     },
                 ],
+                ingress_identity: IngressIdentity::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         )
