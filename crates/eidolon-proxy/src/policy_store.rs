@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -138,7 +139,21 @@ impl PolicyStateStore {
         })?;
         let temp_path = path.with_extension("tmp");
 
-        fs::write(&temp_path, serialized)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+
+        file.write_all(&serialized)?;
+        file.flush()?;
         fs::rename(temp_path, path)
     }
 }
@@ -192,6 +207,8 @@ mod tests {
     use eidolon_core::PolicyState;
 
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn unique_temp_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -233,6 +250,28 @@ mod tests {
             reopened.policy_state(session_id),
             PolicyState::ControlledReality
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_policy_state_is_owner_only() {
+        let path = unique_temp_path("owner-only");
+        let session_id = SessionId::new();
+
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("state should persist");
+
+        let mode = fs::metadata(&path)
+            .expect("policy state metadata should read")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600);
+
+        fs::remove_file(path).expect("policy state should remove");
     }
 
     #[test]

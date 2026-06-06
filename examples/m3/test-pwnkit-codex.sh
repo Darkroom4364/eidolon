@@ -436,6 +436,28 @@ test_preflight_writes_metadata_and_scopes_without_scan() {
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
 }
 
+test_preflight_accepts_orbstack_nodeport_topology_and_non_loopback_scope() {
+  local repo
+  local artifact
+  repo="$(new_temp_dir)"
+  artifact="$(new_temp_dir)"
+  init_fake_pwnkit_checkout "$repo"
+
+  EIDOLON_LAB_TARGET_URL=http://host.internal:31081 \
+    EIDOLON_LAB_PROXY_URL=http://host.internal:31080 \
+    EIDOLON_M3_RUNNER_ENVIRONMENT=kali_vm \
+    EIDOLON_M3_NETWORK_TOPOLOGY=kali_vm_to_orbstack_nodeport \
+    PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
+    "$RUNNER" preflight "$artifact" >/dev/null
+
+  jq -e '
+    .environment.runner_environment == "kali_vm"
+    and .environment.network_topology == "kali_vm_to_orbstack_nodeport"
+    and .pwnkit.scopes.eidolon.in_scope == ["host.internal"]
+    and .pwnkit.scopes.direct.in_scope == ["host.internal"]
+  ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+}
+
 test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret() {
   local repo
   local artifact
@@ -1094,6 +1116,7 @@ test_rejects_invalid_pwnkit_timeout_seconds
 test_rejects_invalid_pwnkit_heartbeat_seconds
 test_source_checkout_metadata_records_dirty_worktree
 test_preflight_writes_metadata_and_scopes_without_scan
+test_preflight_accepts_orbstack_nodeport_topology_and_non_loopback_scope
 test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret
 test_auto_loaded_codex_access_token_stays_out_of_process_args
 test_emits_sanitized_heartbeat_while_scan_is_running

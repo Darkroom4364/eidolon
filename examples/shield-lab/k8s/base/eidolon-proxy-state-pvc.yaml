@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: eidolon-shield-proxy-state
+  namespace: shield-system
+  labels:
+    app.kubernetes.io/name: eidolon-shield-proxy-state
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

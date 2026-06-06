@@ -1,0 +1,644 @@
+use std::{fmt, fs, path::Path};
+
+use chrono::{DateTime, Utc};
+use eidolon_core::{IngressIdentity, IngressIdentitySource, IngressTrustTier};
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngressIdentityResolver {
+    entries: Vec<TrustedIngressEntry>,
+}
+
+impl IngressIdentityResolver {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn resolve<I, N, V>(&self, method: &str, path: &str, headers: I) -> Option<IngressIdentity>
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let headers: Vec<(String, String)> = headers
+            .into_iter()
+            .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
+            .collect();
+        let method = method.trim().to_ascii_uppercase();
+
+        self.entries
+            .iter()
+            .find(|entry| entry.matches(&method, path, &headers))
+            .map(|entry| entry.identity.clone())
+    }
+}
+
+/// Merge an explicit normalized ingress claim with a locally matched claim.
+///
+/// The stronger claim wins. When strength is equal, the local claim wins so an
+/// operator-controlled allowlist can override an equally strong inbound claim.
+pub fn merge_ingress_identity(
+    explicit: IngressIdentity,
+    local: Option<IngressIdentity>,
+) -> IngressIdentity {
+    let Some(local) = local else {
+        return explicit;
+    };
+
+    if explicit == IngressIdentity::default() {
+        return local;
+    }
+    if local == IngressIdentity::default() {
+        return explicit;
+    }
+
+    if ingress_identity_strength(&local) >= ingress_identity_strength(&explicit) {
+        local
+    } else {
+        explicit
+    }
+}
+
+/// Return whether this identity is strong enough to suppress bait exposure
+/// while the session is still in an observe-only posture.
+pub fn softens_bait_surface_exposure(identity: &IngressIdentity) -> bool {
+    identity.source != IngressIdentitySource::None
+        && matches!(
+            identity.trust_tier,
+            IngressTrustTier::Allowlisted
+                | IngressTrustTier::EdgeVerified
+                | IngressTrustTier::SignedAttested
+        )
+}
+
+fn ingress_identity_strength(identity: &IngressIdentity) -> (u8, u8) {
+    (
+        identity_policy_rank(identity),
+        ingress_identity_source_rank(identity),
+    )
+}
+
+fn identity_policy_rank(identity: &IngressIdentity) -> u8 {
+    if identity.source == IngressIdentitySource::OperatorOverride {
+        return 5;
+    }
+
+    match identity.trust_tier {
+        IngressTrustTier::None => 0,
+        IngressTrustTier::WeaklyAsserted => 1,
+        IngressTrustTier::Allowlisted => 2,
+        IngressTrustTier::EdgeVerified => 3,
+        IngressTrustTier::SignedAttested => 4,
+    }
+}
+
+fn ingress_identity_source_rank(identity: &IngressIdentity) -> u8 {
+    match identity.source {
+        IngressIdentitySource::None => 0,
+        IngressIdentitySource::VerifiedBot => 1,
+        IngressIdentitySource::PartnerAutomation => 2,
+        IngressIdentitySource::InternalScanner => 3,
+        IngressIdentitySource::LocalAllowlist => 4,
+        IngressIdentitySource::SignedAgent => 5,
+        IngressIdentitySource::OperatorOverride => 6,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedIngressEntry {
+    identity: IngressIdentity,
+    methods: Vec<String>,
+    path_prefixes: Vec<String>,
+    required_headers: Vec<RequiredHeaderMatch>,
+}
+
+impl TrustedIngressEntry {
+    fn matches(&self, method: &str, path: &str, headers: &[(String, String)]) -> bool {
+        if !self.methods.is_empty() && !self.methods.iter().any(|candidate| candidate == method) {
+            return false;
+        }
+
+        if !self.path_prefixes.is_empty()
+            && !self
+                .path_prefixes
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+        {
+            return false;
+        }
+
+        self.required_headers.iter().all(|required| {
+            headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(&required.name) && value == &required.value
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequiredHeaderMatch {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressTrustConfigError {
+    message: String,
+}
+
+impl IngressTrustConfigError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for IngressTrustConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for IngressTrustConfigError {}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIngressTrustConfig {
+    schema_version: u16,
+    #[serde(default)]
+    entries: Vec<RawTrustedIngressEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTrustedIngressEntry {
+    label: String,
+    source: IngressIdentitySource,
+    trust_tier: IngressTrustTier,
+    #[serde(default)]
+    expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    path_prefixes: Vec<String>,
+    required_headers: Vec<RawRequiredHeaderMatch>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRequiredHeaderMatch {
+    name: String,
+    value: String,
+}
+
+pub fn load_ingress_identity_resolver(
+    path: &Path,
+) -> Result<IngressIdentityResolver, IngressTrustConfigError> {
+    let raw = fs::read_to_string(path).map_err(|error| {
+        IngressTrustConfigError::new(format!(
+            "failed to read ingress trust config `{}`: {error}",
+            path.display()
+        ))
+    })?;
+
+    parse_ingress_identity_resolver(&raw)
+}
+
+fn parse_ingress_identity_resolver(
+    raw: &str,
+) -> Result<IngressIdentityResolver, IngressTrustConfigError> {
+    let config: RawIngressTrustConfig = serde_json::from_str(raw).map_err(|error| {
+        IngressTrustConfigError::new(format!("failed to parse ingress trust config: {error}"))
+    })?;
+
+    config.into_resolver()
+}
+
+impl RawIngressTrustConfig {
+    fn into_resolver(self) -> Result<IngressIdentityResolver, IngressTrustConfigError> {
+        if self.schema_version != 1 {
+            return Err(IngressTrustConfigError::new(format!(
+                "ingress trust config schema_version must be 1, got {}",
+                self.schema_version
+            )));
+        }
+        if self.entries.is_empty() {
+            return Err(IngressTrustConfigError::new(
+                "ingress trust config entries must not be empty",
+            ));
+        }
+
+        let entries = self
+            .entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| entry.into_entry(index))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(IngressIdentityResolver { entries })
+    }
+}
+
+impl RawTrustedIngressEntry {
+    fn into_entry(self, index: usize) -> Result<TrustedIngressEntry, IngressTrustConfigError> {
+        let label = self.label.trim();
+        if label.is_empty() {
+            return Err(IngressTrustConfigError::new(format!(
+                "ingress trust config entry {index} label must not be empty"
+            )));
+        }
+        if self.source == IngressIdentitySource::None {
+            return Err(IngressTrustConfigError::new(format!(
+                "ingress trust config entry {index} source must not be `none`"
+            )));
+        }
+        if self.trust_tier == IngressTrustTier::None {
+            return Err(IngressTrustConfigError::new(format!(
+                "ingress trust config entry {index} trust_tier must not be `none`"
+            )));
+        }
+        if self.required_headers.is_empty() {
+            return Err(IngressTrustConfigError::new(format!(
+                "ingress trust config entry {index} required_headers must not be empty"
+            )));
+        }
+
+        let methods = self
+            .methods
+            .into_iter()
+            .map(|method| {
+                let method = method.trim().to_ascii_uppercase();
+                if method.is_empty() {
+                    Err(IngressTrustConfigError::new(format!(
+                        "ingress trust config entry {index} methods must not contain empty values"
+                    )))
+                } else {
+                    Ok(method)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let path_prefixes = self
+            .path_prefixes
+            .into_iter()
+            .map(|prefix| {
+                let prefix = prefix.trim().to_string();
+                if prefix.is_empty() || !prefix.starts_with('/') {
+                    Err(IngressTrustConfigError::new(format!(
+                        "ingress trust config entry {index} path_prefixes must start with `/`"
+                    )))
+                } else {
+                    Ok(prefix)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let required_headers = self
+            .required_headers
+            .into_iter()
+            .map(|header| header.into_match(index))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(TrustedIngressEntry {
+            identity: IngressIdentity {
+                source: self.source,
+                trust_tier: self.trust_tier,
+                label: Some(label.to_string()),
+                expires_at: self.expires_at,
+            },
+            methods,
+            path_prefixes,
+            required_headers,
+        })
+    }
+}
+
+impl RawRequiredHeaderMatch {
+    fn into_match(self, index: usize) -> Result<RequiredHeaderMatch, IngressTrustConfigError> {
+        let name = self.name.trim();
+        let value = self.value.trim();
+
+        if name.is_empty() {
+            return Err(IngressTrustConfigError::new(format!(
+                "ingress trust config entry {index} required_headers.name must not be empty"
+            )));
+        }
+        if value.is_empty() {
+            return Err(IngressTrustConfigError::new(format!(
+                "ingress trust config entry {index} required_headers.value must not be empty"
+            )));
+        }
+        if name.eq_ignore_ascii_case("user-agent") {
+            return Err(IngressTrustConfigError::new(format!(
+                "ingress trust config entry {index} must not trust `user-agent` as a matcher"
+            )));
+        }
+
+        Ok(RequiredHeaderMatch {
+            name: name.to_string(),
+            value: value.to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+    use eidolon_core::{IngressIdentity, IngressIdentitySource, IngressTrustTier};
+
+    use super::*;
+
+    #[test]
+    fn parses_and_resolves_matching_entry() {
+        let resolver = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "internal-crawler",
+                  "source": "operator_override",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs", "/openapi.json"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "internal-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect("config should parse");
+
+        let identity = resolver
+            .resolve(
+                "GET",
+                "/docs/legacy-import",
+                [("X-Eidolon-Trusted-Actor", "internal-crawler")],
+            )
+            .expect("entry should match");
+
+        assert_eq!(resolver.len(), 1);
+        assert_eq!(identity.source, IngressIdentitySource::OperatorOverride);
+        assert_eq!(identity.trust_tier, IngressTrustTier::Allowlisted);
+        assert_eq!(identity.label.as_deref(), Some("internal-crawler"));
+    }
+
+    #[test]
+    fn method_and_path_scopes_must_match() {
+        let resolver = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "internal-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "internal-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect("config should parse");
+
+        assert!(resolver
+            .resolve(
+                "POST",
+                "/docs/legacy-import",
+                [("X-Eidolon-Trusted-Actor", "internal-crawler")],
+            )
+            .is_none());
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/health",
+                [("X-Eidolon-Trusted-Actor", "internal-crawler")],
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn first_matching_entry_wins() {
+        let resolver = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "operator-seed",
+                  "source": "operator_override",
+                  "trust_tier": "allowlisted",
+                  "required_headers": [
+                    { "name": "X-Actor", "value": "seed" }
+                  ]
+                },
+                {
+                  "label": "scanner-seed",
+                  "source": "internal_scanner",
+                  "trust_tier": "weakly_asserted",
+                  "required_headers": [
+                    { "name": "X-Actor", "value": "seed" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect("config should parse");
+
+        let identity = resolver
+            .resolve("GET", "/docs", [("X-Actor", "seed")])
+            .expect("entry should match");
+
+        assert_eq!(identity.source, IngressIdentitySource::OperatorOverride);
+        assert_eq!(identity.trust_tier, IngressTrustTier::Allowlisted);
+    }
+
+    #[test]
+    fn preserves_optional_expiry() {
+        let resolver = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "operator-window",
+                  "source": "operator_override",
+                  "trust_tier": "allowlisted",
+                  "expires_at": "2026-06-05T12:00:00Z",
+                  "required_headers": [
+                    { "name": "X-Actor", "value": "window" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect("config should parse");
+
+        let identity = resolver
+            .resolve("GET", "/docs", [("X-Actor", "window")])
+            .expect("entry should match");
+
+        assert_eq!(
+            identity.expires_at,
+            Some(
+                Utc.with_ymd_and_hms(2026, 6, 5, 12, 0, 0)
+                    .single()
+                    .expect("timestamp should be valid")
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_empty_entries_and_user_agent_matchers() {
+        let empty = parse_ingress_identity_resolver(r#"{"schema_version":1,"entries":[]}"#)
+            .expect_err("empty config should fail");
+        let user_agent = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "bad",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "required_headers": [
+                    { "name": "User-Agent", "value": "Googlebot/2.1" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect_err("user-agent matcher should fail");
+
+        assert!(empty.to_string().contains("must not be empty"));
+        assert!(user_agent
+            .to_string()
+            .contains("must not trust `user-agent`"));
+    }
+
+    #[test]
+    fn rejects_none_source_or_trust_tier() {
+        let bad_source = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "bad-source",
+                  "source": "none",
+                  "trust_tier": "allowlisted",
+                  "required_headers": [
+                    { "name": "X-Actor", "value": "bad" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect_err("none source should fail");
+        let bad_tier = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "bad-tier",
+                  "source": "local_allowlist",
+                  "trust_tier": "none",
+                  "required_headers": [
+                    { "name": "X-Actor", "value": "bad" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect_err("none trust tier should fail");
+
+        assert!(bad_source.to_string().contains("source must not be `none`"));
+        assert!(bad_tier
+            .to_string()
+            .contains("trust_tier must not be `none`"));
+    }
+
+    #[test]
+    fn merge_prefers_stronger_local_identity() {
+        let explicit = IngressIdentity {
+            source: IngressIdentitySource::VerifiedBot,
+            trust_tier: IngressTrustTier::WeaklyAsserted,
+            label: Some("edge-bot".to_string()),
+            expires_at: None,
+        };
+        let local = IngressIdentity {
+            source: IngressIdentitySource::LocalAllowlist,
+            trust_tier: IngressTrustTier::Allowlisted,
+            label: Some("internal-crawler".to_string()),
+            expires_at: None,
+        };
+
+        let merged = merge_ingress_identity(explicit, Some(local.clone()));
+
+        assert_eq!(merged, local);
+    }
+
+    #[test]
+    fn merge_prefers_explicit_signed_attested_identity_over_weaker_local_claim() {
+        let explicit = IngressIdentity {
+            source: IngressIdentitySource::SignedAgent,
+            trust_tier: IngressTrustTier::SignedAttested,
+            label: Some("signed-agent".to_string()),
+            expires_at: None,
+        };
+        let local = IngressIdentity {
+            source: IngressIdentitySource::LocalAllowlist,
+            trust_tier: IngressTrustTier::Allowlisted,
+            label: Some("internal-crawler".to_string()),
+            expires_at: None,
+        };
+
+        let merged = merge_ingress_identity(explicit.clone(), Some(local));
+
+        assert_eq!(merged, explicit);
+    }
+
+    #[test]
+    fn merge_prefers_local_identity_when_strength_is_equal() {
+        let explicit = IngressIdentity {
+            source: IngressIdentitySource::LocalAllowlist,
+            trust_tier: IngressTrustTier::Allowlisted,
+            label: Some("edge".to_string()),
+            expires_at: None,
+        };
+        let local = IngressIdentity {
+            source: IngressIdentitySource::LocalAllowlist,
+            trust_tier: IngressTrustTier::Allowlisted,
+            label: Some("local".to_string()),
+            expires_at: None,
+        };
+
+        let merged = merge_ingress_identity(explicit, Some(local.clone()));
+
+        assert_eq!(merged, local);
+    }
+
+    #[test]
+    fn only_stronger_trust_tiers_soften_bait_surface_exposure() {
+        let weak = IngressIdentity {
+            source: IngressIdentitySource::VerifiedBot,
+            trust_tier: IngressTrustTier::WeaklyAsserted,
+            label: None,
+            expires_at: None,
+        };
+        let allowlisted = IngressIdentity {
+            source: IngressIdentitySource::LocalAllowlist,
+            trust_tier: IngressTrustTier::Allowlisted,
+            label: None,
+            expires_at: None,
+        };
+
+        assert!(!softens_bait_surface_exposure(&IngressIdentity::default()));
+        assert!(!softens_bait_surface_exposure(&weak));
+        assert!(softens_bait_surface_exposure(&allowlisted));
+    }
+}
