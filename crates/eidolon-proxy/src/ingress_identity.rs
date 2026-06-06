@@ -353,6 +353,20 @@ mod tests {
 
     use super::*;
 
+    fn must_ok<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
+    fn must_some<T>(value: Option<T>, context: &str) -> T {
+        match value {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
+
     #[test]
     fn parses_and_resolves_matching_entry() {
         let resolver = parse_ingress_identity_resolver(
@@ -371,16 +385,17 @@ mod tests {
                 }
               ]
             }"#,
-        )
-        .expect("config should parse");
+        );
+        let resolver = must_ok(resolver, "config should parse");
 
-        let identity = resolver
-            .resolve(
+        let identity = must_some(
+            resolver.resolve(
                 "GET",
                 "/docs/legacy-import",
                 [("X-Eidolon-Trusted-Actor", "internal-crawler")],
-            )
-            .expect("entry should match");
+            ),
+            "entry should match",
+        );
 
         assert_eq!(resolver.len(), 1);
         assert_eq!(identity.source, IngressIdentitySource::OperatorOverride);
@@ -406,8 +421,8 @@ mod tests {
                 }
               ]
             }"#,
-        )
-        .expect("config should parse");
+        );
+        let resolver = must_ok(resolver, "config should parse");
 
         assert!(resolver
             .resolve(
@@ -449,12 +464,13 @@ mod tests {
                 }
               ]
             }"#,
-        )
-        .expect("config should parse");
+        );
+        let resolver = must_ok(resolver, "config should parse");
 
-        let identity = resolver
-            .resolve("GET", "/docs", [("X-Actor", "seed")])
-            .expect("entry should match");
+        let identity = must_some(
+            resolver.resolve("GET", "/docs", [("X-Actor", "seed")]),
+            "entry should match",
+        );
 
         assert_eq!(identity.source, IngressIdentitySource::OperatorOverride);
         assert_eq!(identity.trust_tier, IngressTrustTier::Allowlisted);
@@ -477,19 +493,20 @@ mod tests {
                 }
               ]
             }"#,
-        )
-        .expect("config should parse");
+        );
+        let resolver = must_ok(resolver, "config should parse");
 
-        let identity = resolver
-            .resolve("GET", "/docs", [("X-Actor", "window")])
-            .expect("entry should match");
+        let identity = must_some(
+            resolver.resolve("GET", "/docs", [("X-Actor", "window")]),
+            "entry should match",
+        );
 
         assert_eq!(
             identity.expires_at,
             Some(
                 Utc.with_ymd_and_hms(2026, 6, 5, 12, 0, 0)
                     .single()
-                    .expect("timestamp should be valid")
+                    .unwrap_or_else(|| panic!("timestamp should be valid"))
             )
         );
     }

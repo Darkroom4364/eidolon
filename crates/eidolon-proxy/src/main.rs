@@ -3617,13 +3617,34 @@ mod tests {
         );
     }
 
+    fn must_ok<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
+    fn path_str<'a>(path: &'a Path, context: &str) -> &'a str {
+        match path.to_str() {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
+
+    fn parse_socket_addr(value: &str, context: &str) -> SocketAddr {
+        match value.parse() {
+            Ok(addr) => addr,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
     fn unique_temp_path(label: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
         let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after epoch")
+            .unwrap_or_else(|error| panic!("system clock should be after epoch: {error}"))
             .as_nanos();
 
         env::temp_dir().join(format!(
@@ -3634,19 +3655,22 @@ mod tests {
 
     fn write_bait_profile(contents: &str) -> PathBuf {
         let path = unique_temp_path("bait-profile.json");
-        fs::write(&path, contents).expect("bait profile should write");
+        must_ok(fs::write(&path, contents), "bait profile should write");
         path
     }
 
     fn write_ingress_trust_config(contents: &str) -> PathBuf {
         let path = unique_temp_path("ingress-trust-config.json");
-        fs::write(&path, contents).expect("ingress trust config should write");
+        must_ok(fs::write(&path, contents), "ingress trust config should write");
         path
     }
 
     fn write_ingress_transport_auth_secret(contents: &str) -> PathBuf {
         let path = unique_temp_path("ingress-transport-auth-secret.txt");
-        fs::write(&path, contents).expect("ingress transport auth secret should write");
+        must_ok(
+            fs::write(&path, contents),
+            "ingress transport auth secret should write",
+        );
         path
     }
 
@@ -3713,10 +3737,10 @@ mod tests {
         ProxyRuntime {
             upstream,
             event_log: Arc::new(Mutex::new(
-                FileEventLogWriter::open(event_log_path).expect("event log should open"),
+                must_ok(FileEventLogWriter::open(event_log_path), "event log should open"),
             )),
             debug_log: Some(Arc::new(Mutex::new(
-                FileDebugLogWriter::open(debug_log_path).expect("debug log should open"),
+                must_ok(FileDebugLogWriter::open(debug_log_path), "debug log should open"),
             ))),
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
@@ -3873,8 +3897,10 @@ mod tests {
             stream.flush().expect("upstream response should flush");
             request
         });
-        let upstream =
-            parse_upstream(&format!("http://{addr}"), false).expect("upstream target should parse");
+        let upstream = must_ok(
+            parse_upstream(&format!("http://{addr}"), false),
+            "upstream target should parse",
+        );
 
         (upstream, handle)
     }
@@ -3884,7 +3910,10 @@ mod tests {
         let addr = listener.local_addr().expect("upstream should have address");
         drop(listener);
 
-        parse_upstream(&format!("http://{addr}"), false).expect("upstream target should parse")
+        must_ok(
+            parse_upstream(&format!("http://{addr}"), false),
+            "upstream target should parse",
+        )
     }
 
     fn run_runtime_request(runtime: ProxyRuntime, request: &[u8]) -> Vec<u8> {
@@ -4129,9 +4158,14 @@ mod tests {
         let bait_profile_path = unique_temp_path("bait-profile.json");
         let ingress_trust_config_path = unique_temp_path("ingress-trust-config.json");
         let ingress_transport_auth_secret_path = write_ingress_transport_auth_secret("edge-secret");
-        fs::write(&bait_profile_path, "{}").expect("bait profile placeholder should write");
-        fs::write(&ingress_trust_config_path, "{}")
-            .expect("ingress trust config placeholder should write");
+        must_ok(
+            fs::write(&bait_profile_path, "{}"),
+            "bait profile placeholder should write",
+        );
+        must_ok(
+            fs::write(&ingress_trust_config_path, "{}"),
+            "ingress trust config placeholder should write",
+        );
 
         let config = run_config(&[
             "--listen-addr",
@@ -4143,11 +4177,17 @@ mod tests {
             "--debug-log",
             "/tmp/eidolon-debug-test.jsonl",
             "--bait-profile",
-            bait_profile_path.to_str().unwrap(),
+            path_str(&bait_profile_path, "bait profile path should be utf8"),
             "--ingress-trust-config",
-            ingress_trust_config_path.to_str().unwrap(),
+            path_str(
+                &ingress_trust_config_path,
+                "ingress trust config path should be utf8",
+            ),
             "--ingress-transport-auth-secret-file",
-            ingress_transport_auth_secret_path.to_str().unwrap(),
+            path_str(
+                &ingress_transport_auth_secret_path,
+                "transport auth secret path should be utf8",
+            ),
             "--trusted-bait-soften-prefix",
             "/customer",
             "--trusted-bait-soften-prefix",
@@ -4162,10 +4202,13 @@ mod tests {
             "5",
             "--controlled-reality-retry-after-seconds",
             "9",
-        ])
-        .expect("explicit config should parse");
+        ]);
+        let config = must_ok(config, "explicit config should parse");
 
-        assert_eq!(config.listen_addr, "127.0.0.1:8181".parse().unwrap());
+        assert_eq!(
+            config.listen_addr,
+            parse_socket_addr("127.0.0.1:8181", "listen addr should parse")
+        );
         assert_eq!(config.upstream.to_string(), "http://localhost:9101");
         assert_eq!(config.upstream.authority, "localhost:9101");
         assert_eq!(config.upstream.connect_addr, "localhost:9101");
@@ -4254,11 +4297,14 @@ mod tests {
     fn connect_upstream_returns_stream_with_deadlines() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("upstream should bind");
         let addr = listener.local_addr().expect("upstream should have address");
-        let upstream =
-            parse_upstream(&format!("http://{addr}"), false).expect("upstream target should parse");
-        let handle = thread::spawn(move || listener.accept().expect("upstream should accept").0);
+        let upstream = must_ok(
+            parse_upstream(&format!("http://{addr}"), false),
+            "upstream target should parse",
+        );
+        let handle =
+            thread::spawn(move || listener.accept().expect("upstream should accept").0);
 
-        let stream = connect_upstream(&upstream).expect("upstream should connect");
+        let stream = must_ok(connect_upstream(&upstream), "upstream should connect");
         let accepted = handle.join().expect("upstream accept should join");
 
         assert_eq!(stream.read_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
@@ -4390,11 +4436,14 @@ mod tests {
             "0.0.0.0:9102",
             "--upstream",
             "http://eidolon-demo-target.shield-targets.svc.cluster.local:9101",
-        ])
-        .expect("owned cluster lab config should parse");
+        ]);
+        let config = must_ok(config, "owned cluster lab config should parse");
 
         assert!(config.owned_cluster_lab);
-        assert_eq!(config.listen_addr, "0.0.0.0:9102".parse().unwrap());
+        assert_eq!(
+            config.listen_addr,
+            parse_socket_addr("0.0.0.0:9102", "listen addr should parse")
+        );
         assert_eq!(
             config.upstream.to_string(),
             "http://eidolon-demo-target.shield-targets.svc.cluster.local:9101"
@@ -4752,8 +4801,10 @@ mod tests {
 
     #[test]
     fn rewrites_request_for_upstream() {
-        let upstream =
-            parse_upstream("http://127.0.0.1:9001", false).expect("upstream should parse");
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9001", false),
+            "upstream should parse",
+        );
         let mut request_bytes = &b"GET /docs?view=full HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: keep-alive\r\nUser-Agent: eidolon-test\r\n\r\n"[..];
         let request = read_http_request(&mut request_bytes)
             .expect("request should parse")
