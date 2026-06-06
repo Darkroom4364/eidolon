@@ -1,6 +1,7 @@
 pub mod controlled_reality;
 pub mod debug_log;
 pub mod event_log;
+pub mod ingress_identity;
 pub mod policy;
 pub mod policy_store;
 pub mod session;

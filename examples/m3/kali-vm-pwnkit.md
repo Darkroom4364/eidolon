@@ -5,6 +5,10 @@ Eidolon proxy, and pwnkit runner all execute inside one Kali Linux VM. An
 OrbStack Kali machine is a suitable host, but the harness does not create or
 manage the VM.
 
+For the M4 deployment validation path where Kali scans an OrbStack Kubernetes
+shield over NodePorts, use
+[`../shield-lab/kali-vm-pwnkit.md`](../shield-lab/kali-vm-pwnkit.md) instead.
+
 Use this path when the question is whether Eidolon still shapes current local
 pwnkit behavior when pwnkit has access to a Linux/Kali tool environment. Use the
 regular `run-pwnkit-sample.sh` path for host-mac diagnostics.

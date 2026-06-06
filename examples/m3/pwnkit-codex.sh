@@ -84,7 +84,9 @@ Environment:
                             linux_host.
   EIDOLON_M3_NETWORK_TOPOLOGY
                             Network topology label for evidence metadata.
-                            Defaults to same_host_loopback.
+                            Defaults to same_host_loopback. Use
+                            kali_vm_to_orbstack_nodeport for the OrbStack
+                            Shield lab NodePort path.
   EIDOLON_M3_PWNKIT_FIXTURE_ID
                             Optional safe label for archived/private pinned
                             pwnkit fixtures. Current-main claims should leave
@@ -98,7 +100,7 @@ Environment:
 The runner writes one pwnkit scope file per scan leg and always passes
 `--scope`. This keeps pwnkit's shell-mode auth injection active for the
 pinned-session Eidolon leg and fails closed if a leg target falls outside the
-generated loopback scope.
+generated host scope.
 
 For source checkouts, keep a built checkout at PWNKIT_SOURCE_DIR, or set
 PWNKIT_NODE_ENTRY to a specific built dist/pwnkit.js. This runner refuses
@@ -523,7 +525,7 @@ write_pwnkit_scope_file() {
   local host
   local bracketed_host=""
 
-  host="$(eidolon_lab_loopback_host_for_url "$label target URL" "$url")"
+  host="$(eidolon_lab_host_for_url "$label target URL" "$url")"
   if [[ "$host" == *:* ]]; then
     bracketed_host="[$host]"
   fi
@@ -538,6 +540,23 @@ write_pwnkit_scope_file() {
     }' > "$scope_file"
 
   printf '%s' "$scope_file"
+}
+
+require_supported_target_urls() {
+  case "$EIDOLON_M3_NETWORK_TOPOLOGY" in
+    same_host_loopback|same_vm_loopback|vm_loopback_forward)
+      eidolon_lab_require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
+      eidolon_lab_require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
+      ;;
+    kali_vm_to_orbstack_nodeport)
+      eidolon_lab_require_http_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
+      eidolon_lab_require_http_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
+      ;;
+    *)
+      eidolon_lab_require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
+      eidolon_lab_require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
+      ;;
+  esac
 }
 
 write_runner_metadata() {
@@ -1201,8 +1220,7 @@ main() {
     exit 0
   fi
 
-  eidolon_lab_require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
-  eidolon_lab_require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
+  require_supported_target_urls
   require_positive_integer \
     "EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
     "$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS"

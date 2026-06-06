@@ -26,6 +26,7 @@ use eidolon_proxy::{
     },
     debug_log::FileDebugLogWriter,
     event_log::FileEventLogWriter,
+    ingress_identity::{self, IngressIdentityResolver},
     policy::{self, InterventionMode},
     policy_store::PolicyStateStore,
     session::{self, SessionContext},
@@ -42,6 +43,7 @@ const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
 const DEFAULT_EVENT_LOG: &str = "/tmp/eidolon-events.jsonl";
 const DEFAULT_INTERVENTION_CONTROL: &str = "/tmp/eidolon-interventions.txt";
 const DEFAULT_POLICY_STATE: &str = "/tmp/eidolon-policy-state.json";
+const DEFAULT_TRUSTED_BAIT_SOFTEN_PREFIXES: &[&str] = &["/docs", "/openapi.json"];
 const DOCS_DISCOVERY_TARGET: &str = "/docs";
 const LEGACY_IMPORT_OPENAPI_QUERY: &str = "eidolon_surface=legacy-import";
 const DEFAULT_HTTP_PORT: u16 = 80;
@@ -60,6 +62,10 @@ const SAFE_HEADER_NAMES: &[&str] = &[
     "referer",
     "user-agent",
     "x-api-key",
+    "x-eidolon-ingress-identity-expires-at",
+    "x-eidolon-ingress-identity-label",
+    "x-eidolon-ingress-identity-source",
+    "x-eidolon-ingress-trust-tier",
 ];
 
 fn main() -> ExitCode {
@@ -81,6 +87,22 @@ fn main() -> ExitCode {
                 Some(path) => println!("bait_profile: {}", path.display()),
                 None => println!("bait_profile: default"),
             }
+            match &config.ingress_trust_config_path {
+                Some(path) => println!("ingress_trust_config: {}", path.display()),
+                None => println!("ingress_trust_config: disabled"),
+            }
+            println!(
+                "ingress_transport_auth: {}",
+                if config.ingress_transport_auth_secret_path.is_some() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!(
+                "trusted_bait_soften_prefixes: {}",
+                config.trusted_bait_soften_path_prefixes.join(", ")
+            );
             println!(
                 "intervention_control: {}",
                 config.intervention_control_path.display()
@@ -91,6 +113,14 @@ fn main() -> ExitCode {
                 config.controlled_reality_config.max_action_depth,
                 config.controlled_reality_config.tarpit_delay.as_millis(),
                 config.controlled_reality_config.retry_after_seconds
+            );
+            println!(
+                "owned_cluster_lab: {}",
+                if config.owned_cluster_lab {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             );
 
             match run_proxy(*config) {
@@ -115,9 +145,13 @@ struct ProxyConfig {
     event_log_path: PathBuf,
     debug_log_path: Option<PathBuf>,
     bait_profile_path: Option<PathBuf>,
+    ingress_trust_config_path: Option<PathBuf>,
+    ingress_transport_auth_secret_path: Option<PathBuf>,
+    trusted_bait_soften_path_prefixes: Vec<String>,
     intervention_control_path: PathBuf,
     policy_state_path: PathBuf,
     controlled_reality_config: ControlledRealityConfig,
+    owned_cluster_lab: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,11 +191,11 @@ impl CliAction {
             match flag {
                 "--listen-addr" => {
                     let value = option_value(flag, inline_value, &mut args)?;
-                    set_once(&mut builder.listen_addr, flag, parse_listen_addr(&value)?)?;
+                    set_once(&mut builder.listen_addr, flag, value)?;
                 }
                 "--upstream" => {
                     let value = option_value(flag, inline_value, &mut args)?;
-                    set_once(&mut builder.upstream, flag, parse_upstream(&value)?)?;
+                    set_once(&mut builder.upstream, flag, value)?;
                 }
                 "--event-log" => {
                     let value = option_value(flag, inline_value, &mut args)?;
@@ -185,6 +219,30 @@ impl CliAction {
                         &mut builder.bait_profile_path,
                         flag,
                         parse_bait_profile_path(&value)?,
+                    )?;
+                }
+                "--ingress-trust-config" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.ingress_trust_config_path,
+                        flag,
+                        parse_ingress_trust_config_path(&value)?,
+                    )?;
+                }
+                "--ingress-transport-auth-secret-file" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.ingress_transport_auth_secret_path,
+                        flag,
+                        parse_ingress_transport_auth_secret_path(&value)?,
+                    )?;
+                }
+                "--trusted-bait-soften-prefix" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    push_unique(
+                        &mut builder.trusted_bait_soften_path_prefixes,
+                        flag,
+                        parse_trusted_bait_soften_prefix(&value)?,
                     )?;
                 }
                 "--intervention-control" => {
@@ -227,6 +285,12 @@ impl CliAction {
                         parse_u64_option(&value, "controlled reality retry-after seconds")?,
                     )?;
                 }
+                "--owned-cluster-lab" => {
+                    if builder.owned_cluster_lab {
+                        return Err(ConfigError::new(format!("duplicate option `{flag}`")));
+                    }
+                    builder.owned_cluster_lab = true;
+                }
                 _ if flag.starts_with('-') => {
                     return Err(ConfigError::new(format!("unknown option `{flag}`")));
                 }
@@ -244,28 +308,32 @@ impl CliAction {
 
 #[derive(Debug, Default)]
 struct ConfigBuilder {
-    listen_addr: Option<SocketAddr>,
-    upstream: Option<UpstreamTarget>,
+    listen_addr: Option<String>,
+    upstream: Option<String>,
     event_log_path: Option<PathBuf>,
     debug_log_path: Option<PathBuf>,
     bait_profile_path: Option<PathBuf>,
+    ingress_trust_config_path: Option<PathBuf>,
+    ingress_transport_auth_secret_path: Option<PathBuf>,
+    trusted_bait_soften_path_prefixes: Vec<String>,
     intervention_control_path: Option<PathBuf>,
     policy_state_path: Option<PathBuf>,
     controlled_reality_max_depth: Option<u32>,
     controlled_reality_tarpit_delay: Option<Duration>,
     controlled_reality_retry_after_seconds: Option<u64>,
+    owned_cluster_lab: bool,
 }
 
 impl ConfigBuilder {
     fn build(self) -> Result<ProxyConfig, ConfigError> {
         Ok(ProxyConfig {
             listen_addr: match self.listen_addr {
-                Some(value) => value,
-                None => parse_listen_addr(DEFAULT_LISTEN_ADDR)?,
+                Some(value) => parse_listen_addr(&value, self.owned_cluster_lab)?,
+                None => parse_listen_addr(DEFAULT_LISTEN_ADDR, self.owned_cluster_lab)?,
             },
             upstream: match self.upstream {
-                Some(value) => value,
-                None => parse_upstream(DEFAULT_UPSTREAM)?,
+                Some(value) => parse_upstream(&value, self.owned_cluster_lab)?,
+                None => parse_upstream(DEFAULT_UPSTREAM, self.owned_cluster_lab)?,
             },
             event_log_path: match self.event_log_path {
                 Some(value) => value,
@@ -273,6 +341,14 @@ impl ConfigBuilder {
             },
             debug_log_path: self.debug_log_path,
             bait_profile_path: self.bait_profile_path,
+            ingress_trust_config_path: self.ingress_trust_config_path,
+            ingress_transport_auth_secret_path: self.ingress_transport_auth_secret_path,
+            trusted_bait_soften_path_prefixes: if self.trusted_bait_soften_path_prefixes.is_empty()
+            {
+                default_trusted_bait_soften_path_prefixes()
+            } else {
+                self.trusted_bait_soften_path_prefixes
+            },
             intervention_control_path: match self.intervention_control_path {
                 Some(value) => value,
                 None => parse_control_path(DEFAULT_INTERVENTION_CONTROL)?,
@@ -292,6 +368,7 @@ impl ConfigBuilder {
                     .controlled_reality_retry_after_seconds
                     .unwrap_or(DEFAULT_RETRY_AFTER_SECONDS),
             },
+            owned_cluster_lab: self.owned_cluster_lab,
         })
     }
 }
@@ -356,14 +433,25 @@ fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<(), ConfigE
     Ok(())
 }
 
-fn parse_listen_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
+fn push_unique<T>(values: &mut Vec<T>, flag: &str, value: T) -> Result<(), ConfigError>
+where
+    T: PartialEq,
+{
+    if values.contains(&value) {
+        return Err(ConfigError::new(format!("duplicate option `{flag}`")));
+    }
+    values.push(value);
+    Ok(())
+}
+
+fn parse_listen_addr(raw: &str, owned_cluster_lab: bool) -> Result<SocketAddr, ConfigError> {
     let addr = raw.parse::<SocketAddr>().map_err(|error| {
         ConfigError::new(format!(
             "listen address must be a socket address such as {DEFAULT_LISTEN_ADDR}: {error}"
         ))
     })?;
 
-    if !addr.ip().is_loopback() {
+    if !owned_cluster_lab && !addr.ip().is_loopback() {
         return Err(ConfigError::new(
             "listen address must bind to a loopback address for the local lab",
         ));
@@ -376,7 +464,7 @@ fn parse_listen_addr(raw: &str) -> Result<SocketAddr, ConfigError> {
     Ok(addr)
 }
 
-fn parse_upstream(raw: &str) -> Result<UpstreamTarget, ConfigError> {
+fn parse_upstream(raw: &str, owned_cluster_lab: bool) -> Result<UpstreamTarget, ConfigError> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(ConfigError::new("upstream target URL cannot be empty"));
@@ -409,7 +497,7 @@ fn parse_upstream(raw: &str) -> Result<UpstreamTarget, ConfigError> {
     }
 
     let (host, port) = parse_authority(authority)?;
-    ensure_loopback_host(host)?;
+    ensure_allowed_upstream_host(host, owned_cluster_lab)?;
 
     if matches!(port, Some(0)) {
         return Err(ConfigError::new("upstream target port must not be 0"));
@@ -509,23 +597,21 @@ fn parse_tarpit_delay(raw: &str, label: &str) -> Result<Duration, ConfigError> {
     Ok(delay)
 }
 
-fn ensure_loopback_host(host: &str) -> Result<(), ConfigError> {
+fn ensure_allowed_upstream_host(host: &str, owned_cluster_lab: bool) -> Result<(), ConfigError> {
     if host.eq_ignore_ascii_case("localhost") {
         return Ok(());
     }
 
-    let ip = host.parse::<IpAddr>().map_err(|_| {
-        ConfigError::new(
-            "upstream target host must be loopback: use localhost, a 127.0.0.0/8 address, or ::1 for the local lab",
-        )
-    })?;
-
-    if ip.is_loopback() {
-        Ok(())
-    } else {
-        Err(ConfigError::new(
+    match host.parse::<IpAddr>() {
+        Ok(ip) if ip.is_loopback() => Ok(()),
+        Ok(ip) if owned_cluster_lab && !ip.is_unspecified() => Ok(()),
+        Ok(_) => Err(ConfigError::new(
             "upstream target host must be loopback for the local lab",
-        ))
+        )),
+        Err(_) if owned_cluster_lab => Ok(()),
+        Err(_) => Err(ConfigError::new(
+            "upstream target host must be loopback: use localhost, a 127.0.0.0/8 address, or ::1 for the local lab",
+        )),
     }
 }
 
@@ -547,6 +633,66 @@ fn parse_bait_profile_path(raw: &str) -> Result<PathBuf, ConfigError> {
     }
 
     Ok(path)
+}
+
+fn parse_ingress_trust_config_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = parse_file_path(raw, "ingress trust config")?;
+    if !path.is_file() {
+        return Err(ConfigError::new(format!(
+            "ingress trust config path must be an existing file: `{}`",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
+fn parse_ingress_transport_auth_secret_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = parse_file_path(raw, "ingress transport auth secret")?;
+    if !path.is_file() {
+        return Err(ConfigError::new(format!(
+            "ingress transport auth secret path must be an existing file: `{}`",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
+fn load_ingress_transport_auth_secret(path: &Path) -> io::Result<Arc<str>> {
+    let secret = fs::read_to_string(path)?;
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return Err(invalid_data(format!(
+            "ingress transport auth secret file `{}` must not be empty",
+            path.display()
+        )));
+    }
+
+    Ok(Arc::<str>::from(secret.to_owned()))
+}
+
+fn parse_trusted_bait_soften_prefix(raw: &str) -> Result<String, ConfigError> {
+    let prefix = raw.trim();
+    if prefix.is_empty() {
+        return Err(ConfigError::new(
+            "trusted bait soften prefix cannot be empty",
+        ));
+    }
+    if !prefix.starts_with('/') {
+        return Err(ConfigError::new(
+            "trusted bait soften prefix must start with `/`",
+        ));
+    }
+
+    Ok(prefix.to_string())
+}
+
+fn default_trusted_bait_soften_path_prefixes() -> Vec<String> {
+    DEFAULT_TRUSTED_BAIT_SOFTEN_PREFIXES
+        .iter()
+        .map(|prefix| (*prefix).to_string())
+        .collect()
 }
 
 fn parse_control_path(raw: &str) -> Result<PathBuf, ConfigError> {
@@ -712,6 +858,15 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     let bait_profile_debug = bait_profile_debug_value(&loaded_bait_profile.metadata);
     let bait_registry = Arc::new(loaded_bait_profile.registry);
     let bait_content = loaded_bait_profile.content;
+    let ingress_identity_resolver = match &config.ingress_trust_config_path {
+        Some(path) => ingress_identity::load_ingress_identity_resolver(path)
+            .map_err(|error| invalid_data(error.to_string()))?,
+        None => IngressIdentityResolver::default(),
+    };
+    let ingress_transport_auth_secret = match &config.ingress_transport_auth_secret_path {
+        Some(path) => Some(load_ingress_transport_auth_secret(path)?),
+        None => None,
+    };
     let debug_log = match &config.debug_log_path {
         Some(path) => Some(Arc::new(Mutex::new(FileDebugLogWriter::open(path)?))),
         None => None,
@@ -734,6 +889,9 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
             Arc::clone(&bait_registry),
             bait_content,
         )),
+        ingress_identity_resolver: Arc::new(ingress_identity_resolver),
+        ingress_transport_auth_secret,
+        trusted_bait_soften_path_prefixes: config.trusted_bait_soften_path_prefixes,
         bait_registry,
         bait_exposures: Arc::new(Mutex::new(bait_exposures)),
     };
@@ -750,6 +908,9 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 "retry_after_seconds": runtime.controlled_reality_config.retry_after_seconds,
             },
             "bait_profile": bait_profile_debug,
+            "ingress_identity_rule_count": runtime.ingress_identity_resolver.len(),
+            "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
+            "trusted_bait_soften_path_prefixes": runtime.trusted_bait_soften_path_prefixes,
             "restored_bait_exposure_count": restored_bait_exposure_count,
             "debug_log_visibility": "server_side_only",
         }),
@@ -788,6 +949,9 @@ struct ProxyRuntime {
     controlled_reality_config: ControlledRealityConfig,
     controlled_reality: Arc<ControlledRealityResponder>,
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
+    ingress_identity_resolver: Arc<IngressIdentityResolver>,
+    ingress_transport_auth_secret: Option<Arc<str>>,
+    trusted_bait_soften_path_prefixes: Vec<String>,
     bait_registry: Arc<BaitRegistry>,
     bait_exposures: Arc<Mutex<BaitExposureStore>>,
 }
@@ -1545,10 +1709,10 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         return Ok(());
     };
 
-    let session = session::derive_session_from_headers(header_pairs(&request.headers));
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
     let path = normalized_event_path(&request)?;
     let surface_request = surface_request_meta(&request, &path);
+    let session = effective_session_context(runtime, &request, &surface_request);
     let policy_state = policy_state_for_session(runtime, session.session_id)?;
     write_debug(
         runtime,
@@ -1565,6 +1729,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "header_count": request.headers.len(),
             "safe_headers": safe_header_observations(&request.headers),
             "session_source": debug_session_source(session.source),
+            "ingress_identity": &session.ingress_identity,
             "policy_state": policy_state,
             "intervention_mode": debug_intervention_mode(intervention_mode),
         }),
@@ -1608,7 +1773,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     }
 
     let decision = policy::decide_for_state(policy_state, intervention_mode);
-    let surface_action = if intervention_mode.interventions_enabled() {
+    let candidate_surface_action = if intervention_mode.interventions_enabled() {
         match decision.routing_decision {
             RoutingDecision::ProtectedUpstream => {
                 runtime.surface_controller.decide(&surface_request)
@@ -1637,13 +1802,23 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     } else {
         SurfaceAction::ProtectedUpstream
     };
+    let (surface_action, trusted_ingress_softening_reason) =
+        maybe_soften_surface_action_for_trusted_ingress(
+            &runtime.trusted_bait_soften_path_prefixes,
+            &session,
+            decision.policy_state,
+            &surface_request,
+            candidate_surface_action.clone(),
+        );
     let mut effective_decision = policy::PolicyDecision::new(
         decision.policy_state,
         surface_action.routing_decision(),
-        decision.reason.clone(),
+        trusted_ingress_softening_reason
+            .clone()
+            .unwrap_or_else(|| decision.reason.clone()),
     );
     let surface_requested_intervention =
-        !matches!(&surface_action, SurfaceAction::ProtectedUpstream);
+        !matches!(&candidate_surface_action, SurfaceAction::ProtectedUpstream);
     write_debug(
         runtime,
         "surface_action_selected",
@@ -1652,8 +1827,12 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "policy_state": decision.policy_state,
             "policy_routing_decision": decision.routing_decision,
             "policy_reason": decision.reason.as_str(),
+            "candidate_surface_action": debug_surface_action(&candidate_surface_action),
             "surface_action": debug_surface_action(&surface_action),
             "surface_requested_intervention": surface_requested_intervention,
+            "trusted_ingress_softened_surface": trusted_ingress_softening_reason.is_some(),
+            "trusted_ingress_softening_reason": trusted_ingress_softening_reason,
+            "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
         }),
     )?;
 
@@ -1828,7 +2007,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let upstream_request_decision = upstream_request_decision(
         decision.policy_state,
         &surface_action,
-        decision.reason.clone(),
+        effective_decision.reason.clone(),
     );
     write_event(
         &runtime.event_log,
@@ -2419,6 +2598,7 @@ fn request_seen_event(
             method: request.method.clone(),
             path: redacted_event_target(path),
             safe_headers: safe_header_observations(&request.headers),
+            ingress_identity: session.ingress_identity.clone(),
             routing_decision: decision.routing_decision,
         },
     )
@@ -2504,6 +2684,66 @@ fn write_event(log: &Arc<Mutex<FileEventLogWriter>>, event: &Event) -> io::Resul
         .lock()
         .map_err(|_| io::Error::other("event log lock poisoned"))?;
     log.write_event(event)
+}
+
+fn effective_session_context(
+    runtime: &ProxyRuntime,
+    request: &HttpRequest,
+    surface_request: &SurfaceRequestMeta,
+) -> SessionContext {
+    let headers: Vec<(&str, &str)> = header_pairs(&request.headers).collect();
+    let mut session = session::derive_session_from_headers(headers.iter().copied());
+    session.ingress_identity = session::authenticated_ingress_identity_from_headers(
+        headers.iter().copied(),
+        runtime.ingress_transport_auth_secret.as_deref(),
+    );
+    let local_identity = runtime.ingress_identity_resolver.resolve(
+        &request.method,
+        &surface_request.path,
+        headers.iter().copied(),
+    );
+    session.ingress_identity =
+        ingress_identity::merge_ingress_identity(session.ingress_identity, local_identity);
+
+    session
+}
+
+fn maybe_soften_surface_action_for_trusted_ingress(
+    trusted_bait_soften_path_prefixes: &[String],
+    session: &SessionContext,
+    policy_state: PolicyState,
+    surface_request: &SurfaceRequestMeta,
+    surface_action: SurfaceAction,
+) -> (SurfaceAction, Option<String>) {
+    if !matches!(policy_state, PolicyState::Normal | PolicyState::Observe) {
+        return (surface_action, None);
+    }
+    if surface_request.method != "GET" {
+        return (surface_action, None);
+    }
+    if !ingress_identity::softens_bait_surface_exposure(&session.ingress_identity) {
+        return (surface_action, None);
+    }
+    if !trusted_bait_soften_path_prefixes
+        .iter()
+        .any(|prefix| surface_request.path.starts_with(prefix))
+    {
+        return (surface_action, None);
+    }
+    if !matches!(
+        &surface_action,
+        SurfaceAction::EidolonOwned { .. } | SurfaceAction::RewrittenUpstream { .. }
+    ) {
+        return (surface_action, None);
+    }
+
+    (
+        SurfaceAction::ProtectedUpstream,
+        Some(
+            "trusted ingress identity suppressed bait surface intervention before runtime suspicion was established"
+                .to_string(),
+        ),
+    )
 }
 
 fn write_debug(
@@ -3274,6 +3514,7 @@ fn should_skip_forwarded_header(name: &str, connection_nominated_headers: &[Stri
         || name.eq_ignore_ascii_case("trailer")
         || name.eq_ignore_ascii_case("transfer-encoding")
         || name.eq_ignore_ascii_case("upgrade")
+        || name.to_ascii_lowercase().starts_with("x-eidolon-")
         || connection_nominated_headers
             .iter()
             .any(|header| name.eq_ignore_ascii_case(header))
@@ -3296,6 +3537,15 @@ Options:
                          internal decisions only; never emits debug data to HTTP clients
   --bait-profile <PATH> Lab-only JSON bait profile for M3 promotion experiments.
                          Defaults to the built-in M3 catalog
+  --ingress-trust-config <PATH>
+                         JSON ingress trust config for local allowlists and trusted
+                         automation claims
+  --ingress-transport-auth-secret-file <PATH>
+                         Shared-secret file required before explicit
+                         X-Eidolon-Ingress-* identity headers are trusted
+  --trusted-bait-soften-prefix <PATH_PREFIX>
+                         Repeatable path prefix where strong trusted identities may
+                         skip bait exposure surfaces [default: /docs, /openapi.json]
   --intervention-control <PATH>
                          Optional control file; write `disabled` to force protected forwarding
                          [default: {DEFAULT_INTERVENTION_CONTROL}]
@@ -3309,10 +3559,15 @@ Options:
   --controlled-reality-retry-after-seconds <SECONDS>
                          Retry-After value for controlled-reality rate limits
                          [default: {DEFAULT_RETRY_AFTER_SECONDS}]
+  --owned-cluster-lab   Allow non-loopback listen and upstream addresses for an
+                         owned Kubernetes or cluster lab
   -h, --help            Show this help text
 
 Example:
   cargo run -p eidolon-proxy -- --listen-addr 127.0.0.1:8080 --upstream http://127.0.0.1:9001 --event-log /tmp/eidolon-events.jsonl --debug-log /tmp/eidolon-debug.jsonl --intervention-control /tmp/eidolon-interventions.txt --policy-state /tmp/eidolon-policy-state.json --controlled-reality-max-depth 4 --controlled-reality-tarpit-ms {default_tarpit_ms} --controlled-reality-retry-after-seconds {DEFAULT_RETRY_AFTER_SECONDS}
+
+Owned cluster lab:
+  cargo run -p eidolon-proxy -- --owned-cluster-lab --listen-addr 0.0.0.0:9102 --upstream http://eidolon-demo-target.shield-targets.svc.cluster.local:9101 --event-log /tmp/eidolon-events.jsonl --intervention-control /tmp/eidolon-interventions.txt --policy-state /tmp/eidolon-policy-state.json
 "
 ,
         default_tarpit_ms = DEFAULT_TARPIT_DELAY.as_millis(),
@@ -3362,13 +3617,38 @@ mod tests {
         );
     }
 
+    fn must_ok<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
+    fn must_join<T>(result: std::thread::Result<T>, context: &str) -> T {
+        result.unwrap_or_else(|_| panic!("{context}"))
+    }
+
+    fn path_str<'a>(path: &'a Path, context: &str) -> &'a str {
+        match path.to_str() {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
+
+    fn parse_socket_addr(value: &str, context: &str) -> SocketAddr {
+        match value.parse() {
+            Ok(addr) => addr,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
     fn unique_temp_path(label: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
         let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after epoch")
+            .unwrap_or_else(|error| panic!("system clock should be after epoch: {error}"))
             .as_nanos();
 
         env::temp_dir().join(format!(
@@ -3379,7 +3659,25 @@ mod tests {
 
     fn write_bait_profile(contents: &str) -> PathBuf {
         let path = unique_temp_path("bait-profile.json");
-        fs::write(&path, contents).expect("bait profile should write");
+        must_ok(fs::write(&path, contents), "bait profile should write");
+        path
+    }
+
+    fn write_ingress_trust_config(contents: &str) -> PathBuf {
+        let path = unique_temp_path("ingress-trust-config.json");
+        must_ok(
+            fs::write(&path, contents),
+            "ingress trust config should write",
+        );
+        path
+    }
+
+    fn write_ingress_transport_auth_secret(contents: &str) -> PathBuf {
+        let path = unique_temp_path("ingress-transport-auth-secret.txt");
+        must_ok(
+            fs::write(&path, contents),
+            "ingress transport auth secret should write",
+        );
         path
     }
 
@@ -3415,6 +3713,9 @@ mod tests {
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller,
+            ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
+            ingress_transport_auth_secret: None,
+            trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
         }
@@ -3431,6 +3732,39 @@ mod tests {
             intervention_control_path,
             BaitExposureStore::default(),
         )
+    }
+
+    fn test_runtime_with_m1_controller_and_debug_log(
+        upstream: UpstreamTarget,
+        event_log_path: &Path,
+        debug_log_path: &Path,
+        intervention_control_path: PathBuf,
+    ) -> ProxyRuntime {
+        let bait_registry = Arc::new(BaitRegistry::m3_catalog());
+        ProxyRuntime {
+            upstream,
+            event_log: Arc::new(Mutex::new(must_ok(
+                FileEventLogWriter::open(event_log_path),
+                "event log should open",
+            ))),
+            debug_log: Some(Arc::new(Mutex::new(must_ok(
+                FileDebugLogWriter::open(debug_log_path),
+                "debug log should open",
+            )))),
+            intervention_control_path,
+            policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            controlled_reality_config: ControlledRealityConfig::default(),
+            controlled_reality: Arc::new(ControlledRealityResponder),
+            surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
+                Arc::clone(&bait_registry),
+                BaitContentOverrides::default(),
+            )),
+            ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
+            ingress_transport_auth_secret: None,
+            trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
+            bait_registry,
+            bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+        }
     }
 
     fn test_runtime_with_m1_controller_and_bait_exposures(
@@ -3454,6 +3788,9 @@ mod tests {
                 Arc::clone(&bait_registry),
                 BaitContentOverrides::default(),
             )),
+            ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
+            ingress_transport_auth_secret: None,
+            trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
             bait_exposures: Arc::new(Mutex::new(bait_exposures)),
         }
@@ -3480,6 +3817,9 @@ mod tests {
                 Arc::clone(&bait_registry),
                 loaded_profile.content,
             )),
+            ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
+            ingress_transport_auth_secret: None,
+            trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
         }
@@ -3566,8 +3906,10 @@ mod tests {
             stream.flush().expect("upstream response should flush");
             request
         });
-        let upstream =
-            parse_upstream(&format!("http://{addr}")).expect("upstream target should parse");
+        let upstream = must_ok(
+            parse_upstream(&format!("http://{addr}"), false),
+            "upstream target should parse",
+        );
 
         (upstream, handle)
     }
@@ -3577,7 +3919,10 @@ mod tests {
         let addr = listener.local_addr().expect("upstream should have address");
         drop(listener);
 
-        parse_upstream(&format!("http://{addr}")).expect("upstream target should parse")
+        must_ok(
+            parse_upstream(&format!("http://{addr}"), false),
+            "upstream target should parse",
+        )
     }
 
     fn run_runtime_request(runtime: ProxyRuntime, request: &[u8]) -> Vec<u8> {
@@ -3796,6 +4141,12 @@ mod tests {
         assert_eq!(config.event_log_path, PathBuf::from(DEFAULT_EVENT_LOG));
         assert_eq!(config.debug_log_path, None);
         assert_eq!(config.bait_profile_path, None);
+        assert_eq!(config.ingress_trust_config_path, None);
+        assert_eq!(config.ingress_transport_auth_secret_path, None);
+        assert_eq!(
+            config.trusted_bait_soften_path_prefixes,
+            default_trusted_bait_soften_path_prefixes()
+        );
         assert_eq!(
             config.intervention_control_path,
             PathBuf::from(DEFAULT_INTERVENTION_CONTROL)
@@ -3808,12 +4159,22 @@ mod tests {
             config.controlled_reality_config,
             ControlledRealityConfig::default()
         );
+        assert!(!config.owned_cluster_lab);
     }
 
     #[test]
     fn parses_explicit_flags() {
         let bait_profile_path = unique_temp_path("bait-profile.json");
-        fs::write(&bait_profile_path, "{}").expect("bait profile placeholder should write");
+        let ingress_trust_config_path = unique_temp_path("ingress-trust-config.json");
+        let ingress_transport_auth_secret_path = write_ingress_transport_auth_secret("edge-secret");
+        must_ok(
+            fs::write(&bait_profile_path, "{}"),
+            "bait profile placeholder should write",
+        );
+        must_ok(
+            fs::write(&ingress_trust_config_path, "{}"),
+            "ingress trust config placeholder should write",
+        );
 
         let config = run_config(&[
             "--listen-addr",
@@ -3825,7 +4186,21 @@ mod tests {
             "--debug-log",
             "/tmp/eidolon-debug-test.jsonl",
             "--bait-profile",
-            bait_profile_path.to_str().unwrap(),
+            path_str(&bait_profile_path, "bait profile path should be utf8"),
+            "--ingress-trust-config",
+            path_str(
+                &ingress_trust_config_path,
+                "ingress trust config path should be utf8",
+            ),
+            "--ingress-transport-auth-secret-file",
+            path_str(
+                &ingress_transport_auth_secret_path,
+                "transport auth secret path should be utf8",
+            ),
+            "--trusted-bait-soften-prefix",
+            "/customer",
+            "--trusted-bait-soften-prefix",
+            "/assets",
             "--intervention-control",
             "/tmp/eidolon-interventions-test.txt",
             "--policy-state",
@@ -3836,10 +4211,13 @@ mod tests {
             "5",
             "--controlled-reality-retry-after-seconds",
             "9",
-        ])
-        .expect("explicit config should parse");
+        ]);
+        let config = must_ok(config, "explicit config should parse");
 
-        assert_eq!(config.listen_addr, "127.0.0.1:8181".parse().unwrap());
+        assert_eq!(
+            config.listen_addr,
+            parse_socket_addr("127.0.0.1:8181", "listen addr should parse")
+        );
         assert_eq!(config.upstream.to_string(), "http://localhost:9101");
         assert_eq!(config.upstream.authority, "localhost:9101");
         assert_eq!(config.upstream.connect_addr, "localhost:9101");
@@ -3852,6 +4230,18 @@ mod tests {
             Some(PathBuf::from("/tmp/eidolon-debug-test.jsonl"))
         );
         assert_eq!(config.bait_profile_path, Some(bait_profile_path));
+        assert_eq!(
+            config.ingress_trust_config_path,
+            Some(ingress_trust_config_path)
+        );
+        assert_eq!(
+            config.ingress_transport_auth_secret_path,
+            Some(ingress_transport_auth_secret_path)
+        );
+        assert_eq!(
+            config.trusted_bait_soften_path_prefixes,
+            vec!["/customer".to_string(), "/assets".to_string()]
+        );
         assert_eq!(
             config.intervention_control_path,
             PathBuf::from("/tmp/eidolon-interventions-test.txt")
@@ -3868,6 +4258,7 @@ mod tests {
                 retry_after_seconds: 9,
             }
         );
+        assert!(!config.owned_cluster_lab);
     }
 
     #[test]
@@ -3913,14 +4304,16 @@ mod tests {
 
     #[test]
     fn connect_upstream_returns_stream_with_deadlines() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("upstream should bind");
-        let addr = listener.local_addr().expect("upstream should have address");
-        let upstream =
-            parse_upstream(&format!("http://{addr}")).expect("upstream target should parse");
-        let handle = thread::spawn(move || listener.accept().expect("upstream should accept").0);
+        let listener = must_ok(TcpListener::bind("127.0.0.1:0"), "upstream should bind");
+        let addr = must_ok(listener.local_addr(), "upstream should have address");
+        let upstream = must_ok(
+            parse_upstream(&format!("http://{addr}"), false),
+            "upstream target should parse",
+        );
+        let handle = thread::spawn(move || must_ok(listener.accept(), "upstream should accept").0);
 
-        let stream = connect_upstream(&upstream).expect("upstream should connect");
-        let accepted = handle.join().expect("upstream accept should join");
+        let stream = must_ok(connect_upstream(&upstream), "upstream should connect");
+        let accepted = must_join(handle.join(), "upstream accept should join");
 
         assert_eq!(stream.read_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
         assert_eq!(stream.write_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
@@ -4044,6 +4437,28 @@ mod tests {
     }
 
     #[test]
+    fn owned_cluster_lab_allows_non_loopback_addresses() {
+        let config = run_config(&[
+            "--owned-cluster-lab",
+            "--listen-addr",
+            "0.0.0.0:9102",
+            "--upstream",
+            "http://eidolon-demo-target.shield-targets.svc.cluster.local:9101",
+        ]);
+        let config = must_ok(config, "owned cluster lab config should parse");
+
+        assert!(config.owned_cluster_lab);
+        assert_eq!(
+            config.listen_addr,
+            parse_socket_addr("0.0.0.0:9102", "listen addr should parse")
+        );
+        assert_eq!(
+            config.upstream.to_string(),
+            "http://eidolon-demo-target.shield-targets.svc.cluster.local:9101"
+        );
+    }
+
+    #[test]
     fn rejects_invalid_event_log_paths() {
         assert_error_contains(&["--event-log", ""], "cannot be empty");
         assert_error_contains(&["--event-log", "/tmp"], "must be a file path");
@@ -4051,6 +4466,32 @@ mod tests {
         assert_error_contains(&["--debug-log", "/tmp"], "must be a file path");
         assert_error_contains(&["--bait-profile", ""], "cannot be empty");
         assert_error_contains(&["--bait-profile", "/tmp"], "must be a file path");
+        assert_error_contains(&["--ingress-trust-config", ""], "cannot be empty");
+        assert_error_contains(&["--ingress-trust-config", "/tmp"], "must be a file path");
+        assert_error_contains(
+            &["--trusted-bait-soften-prefix", ""],
+            "trusted bait soften prefix cannot be empty",
+        );
+        assert_error_contains(
+            &["--trusted-bait-soften-prefix", "docs"],
+            "must start with `/`",
+        );
+        assert_error_contains(
+            &[
+                "--trusted-bait-soften-prefix",
+                "/docs",
+                "--trusted-bait-soften-prefix",
+                "/docs",
+            ],
+            "duplicate option `--trusted-bait-soften-prefix`",
+        );
+        assert_error_contains(
+            &[
+                "--ingress-trust-config",
+                "/tmp/eidolon-missing-ingress-trust.json",
+            ],
+            "must be an existing file",
+        );
 
         let missing_parent =
             env::temp_dir().join(format!("eidolon-missing-parent-{}", std::process::id()));
@@ -4368,7 +4809,10 @@ mod tests {
 
     #[test]
     fn rewrites_request_for_upstream() {
-        let upstream = parse_upstream("http://127.0.0.1:9001").expect("upstream should parse");
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9001", false),
+            "upstream should parse",
+        );
         let mut request_bytes = &b"GET /docs?view=full HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: keep-alive\r\nUser-Agent: eidolon-test\r\n\r\n"[..];
         let request = read_http_request(&mut request_bytes)
             .expect("request should parse")
@@ -4386,7 +4830,10 @@ mod tests {
 
     #[test]
     fn upstream_request_strips_hop_by_hop_and_connection_nominated_headers() {
-        let upstream = parse_upstream("http://127.0.0.1:9001").expect("upstream should parse");
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9001", false),
+            "upstream should parse",
+        );
         let request = HttpRequest {
             method: "GET".to_string(),
             target: "/docs".to_string(),
@@ -4453,7 +4900,10 @@ mod tests {
 
     #[test]
     fn upstream_request_emits_one_canonical_content_length() {
-        let upstream = parse_upstream("http://127.0.0.1:9001").expect("upstream should parse");
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9001", false),
+            "upstream should parse",
+        );
         let mut request_bytes = &b"POST /api/v1/imports HTTP/1.1\r\nHost: proxy.local\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\ntest"[..];
         let request = read_http_request(&mut request_bytes)
             .expect("request should parse")
@@ -4698,6 +5148,7 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
+                    ingress_identity: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             ),
@@ -4832,7 +5283,10 @@ mod tests {
     fn runtime_path_serves_eidolon_owned_surface_response() {
         let event_log_path = unique_temp_path("owned-events.jsonl");
         let runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("owned-control.txt"),
             SurfaceAction::EidolonOwned {
@@ -4857,7 +5311,10 @@ mod tests {
         let event_log_path = unique_temp_path("debug-owned-events.jsonl");
         let debug_log_path = unique_temp_path("debug-owned-debug.jsonl");
         let mut runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("debug-owned-control.txt"),
             SurfaceAction::EidolonOwned {
@@ -4899,6 +5356,14 @@ mod tests {
         assert_eq!(request_debug["fields"]["query_present"], true);
         assert_eq!(request_debug["fields"]["body_len"], 7);
         assert_eq!(
+            request_debug["fields"]["ingress_identity"]["source"],
+            "none"
+        );
+        assert_eq!(
+            request_debug["fields"]["ingress_identity"]["trust_tier"],
+            "none"
+        );
+        assert_eq!(
             request_debug["fields"]["safe_headers"][1]["name"],
             "authorization"
         );
@@ -4916,10 +5381,555 @@ mod tests {
     }
 
     #[test]
+    fn runtime_records_normalized_ingress_identity_in_request_audit() {
+        let event_log_path = unique_temp_path("ingress-identity-events.jsonl");
+        let debug_log_path = unique_temp_path("ingress-identity-debug.jsonl");
+        let (upstream, upstream_handle) =
+            spawn_upstream(html_response("<html><body>upstream</body></html>"));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("ingress-identity-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let request = request_with_cookie(
+            "GET",
+            "/docs/legacy-import",
+            &cookie_header(),
+            &[
+                (
+                    session::INGRESS_IDENTITY_SOURCE_HEADER_NAME,
+                    "operator_override",
+                ),
+                (session::INGRESS_TRUST_TIER_HEADER_NAME, "allowlisted"),
+                (
+                    session::INGRESS_IDENTITY_LABEL_HEADER_NAME,
+                    "internal-crawler",
+                ),
+                (
+                    session::INGRESS_IDENTITY_EXPIRES_AT_HEADER_NAME,
+                    "2099-06-04T12:00:00Z",
+                ),
+                (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            ],
+        );
+        let _response = run_runtime_request(runtime, &request);
+        must_join(upstream_handle.join(), "upstream thread should join");
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["source"],
+            "operator_override"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["trust_tier"],
+            "allowlisted"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["label"],
+            "internal-crawler"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["expires_at"],
+            "2099-06-04T12:00:00Z"
+        );
+
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(
+            request_debug["fields"]["ingress_identity"]["source"],
+            "operator_override"
+        );
+        assert_eq!(
+            request_debug["fields"]["ingress_identity"]["trust_tier"],
+            "allowlisted"
+        );
+    }
+
+    #[test]
+    fn runtime_ignores_forged_explicit_ingress_headers_without_transport_auth() {
+        let event_log_path = unique_temp_path("forged-ingress-identity-events.jsonl");
+        let debug_log_path = unique_temp_path("forged-ingress-identity-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("forged-ingress-identity-control.txt"),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs/legacy-import",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+                    (
+                        session::INGRESS_IDENTITY_LABEL_HEADER_NAME,
+                        "forged-edge-agent",
+                    ),
+                ],
+            ),
+        ));
+
+        assert_eq!(response.status, 200);
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["kind"]["ingress_identity"]["source"], "none");
+        assert_eq!(
+            request_event["kind"]["routing_decision"].as_str(),
+            Some("eidolon_owned")
+        );
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+    }
+
+    #[test]
+    fn proxy_never_forwards_reserved_eidolon_headers_upstream() {
+        let event_log_path = unique_temp_path("strip-eidolon-headers-events.jsonl");
+        let (upstream, upstream_handle) =
+            spawn_upstream(html_response("<html><body>upstream</body></html>"));
+        let mut runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            unique_temp_path("strip-eidolon-headers-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let _response = run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/health",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    ("X-Eidolon-Ingress-Vendor-Score", "91"),
+                ],
+            ),
+        );
+        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
+        let upstream_request = must_ok(
+            String::from_utf8(upstream_request),
+            "request should be utf8",
+        );
+
+        assert!(!upstream_request.contains("X-Eidolon-Ingress-Identity-Source:"));
+        assert!(!upstream_request.contains("X-Eidolon-Ingress-Trust-Tier:"));
+        assert!(!upstream_request.contains("X-Eidolon-Ingress-Transport-Auth:"));
+        assert!(!upstream_request.contains("X-Eidolon-Ingress-Vendor-Score:"));
+    }
+
+    #[test]
+    fn runtime_records_local_trust_config_identity_when_explicit_headers_are_absent() {
+        let event_log_path = unique_temp_path("local-trust-events.jsonl");
+        let debug_log_path = unique_temp_path("local-trust-debug.jsonl");
+        let (upstream, upstream_handle) =
+            spawn_upstream(html_response("<html><body>upstream</body></html>"));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("local-trust-control.txt"),
+        );
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "internal-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "internal-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let request = request_with_cookie(
+            "GET",
+            "/docs/legacy-import",
+            &cookie_header(),
+            &[("X-Eidolon-Trusted-Actor", "internal-crawler")],
+        );
+        let _response = run_runtime_request(runtime, &request);
+        upstream_handle.join().expect("upstream thread should join");
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["source"],
+            "local_allowlist"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["trust_tier"],
+            "allowlisted"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["label"],
+            "internal-crawler"
+        );
+    }
+
+    #[test]
+    fn runtime_prefers_stronger_local_trust_identity_over_weaker_explicit_claim() {
+        let event_log_path = unique_temp_path("local-trust-precedence-events.jsonl");
+        let debug_log_path = unique_temp_path("local-trust-precedence-debug.jsonl");
+        let (upstream, upstream_handle) =
+            spawn_upstream(html_response("<html><body>upstream</body></html>"));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("local-trust-precedence-control.txt"),
+        );
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "internal-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "internal-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let request = request_with_cookie(
+            "GET",
+            "/docs/legacy-import",
+            &cookie_header(),
+            &[
+                (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "verified_bot"),
+                (session::INGRESS_TRUST_TIER_HEADER_NAME, "weakly_asserted"),
+                (session::INGRESS_IDENTITY_LABEL_HEADER_NAME, "edge-bot"),
+                (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ("X-Eidolon-Trusted-Actor", "internal-crawler"),
+            ],
+        );
+        let _response = run_runtime_request(runtime, &request);
+        upstream_handle.join().expect("upstream thread should join");
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["source"],
+            "local_allowlist"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["trust_tier"],
+            "allowlisted"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["label"],
+            "internal-crawler"
+        );
+    }
+
+    #[test]
+    fn runtime_prefers_stronger_explicit_identity_over_local_allowlist() {
+        let event_log_path = unique_temp_path("explicit-trust-precedence-events.jsonl");
+        let debug_log_path = unique_temp_path("explicit-trust-precedence-debug.jsonl");
+        let (upstream, upstream_handle) =
+            spawn_upstream(html_response("<html><body>upstream</body></html>"));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("explicit-trust-precedence-control.txt"),
+        );
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "internal-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "internal-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let request = request_with_cookie(
+            "GET",
+            "/docs/legacy-import",
+            &cookie_header(),
+            &[
+                (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+                (session::INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+                (session::INGRESS_IDENTITY_LABEL_HEADER_NAME, "signed-agent"),
+                (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ("X-Eidolon-Trusted-Actor", "internal-crawler"),
+            ],
+        );
+        let _response = run_runtime_request(runtime, &request);
+        upstream_handle.join().expect("upstream thread should join");
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["source"],
+            "signed_agent"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["trust_tier"],
+            "signed_attested"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["label"],
+            "signed-agent"
+        );
+    }
+
+    #[test]
+    fn trusted_identity_suppresses_direct_bait_surface_intervention() {
+        let event_log_path = unique_temp_path("trusted-direct-softening-events.jsonl");
+        let debug_log_path = unique_temp_path("trusted-direct-softening-debug.jsonl");
+        let original = "<html><body>upstream-not-found</body></html>";
+        let (upstream, upstream_handle) =
+            spawn_upstream(html_response_with_status(404, "Not Found", original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("trusted-direct-softening-control.txt"),
+        );
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "internal-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "internal-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs/legacy-import",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "internal-crawler")],
+            ),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 404);
+        assert_eq!(body, original);
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_policy_decision_reason_contains(
+            &event_log_path,
+            "trusted ingress identity suppressed bait surface intervention",
+        );
+        assert_event_routing(&event_log_path, "response_served", "protected_upstream");
+        assert_event_type_absent(&event_log_path, "bait_exposed");
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            true
+        );
+    }
+
+    #[test]
+    fn trusted_identity_suppresses_docs_rewrite_intervention() {
+        let event_log_path = unique_temp_path("trusted-rewrite-softening-events.jsonl");
+        let debug_log_path = unique_temp_path("trusted-rewrite-softening-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("trusted-rewrite-softening-control.txt"),
+        );
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "internal-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "internal-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "internal-crawler")],
+            ),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(body, original);
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_policy_decision_reason_contains(
+            &event_log_path,
+            "trusted ingress identity suppressed bait surface intervention",
+        );
+        assert_event_routing(&event_log_path, "response_served", "protected_upstream");
+        assert_event_type_absent(&event_log_path, "bait_exposed");
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "rewritten_upstream"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            true
+        );
+    }
+
+    #[test]
+    fn trusted_identity_does_not_suppress_unconfigured_bait_surface() {
+        let event_log_path = unique_temp_path("trusted-unconfigured-softening-events.jsonl");
+        let debug_log_path = unique_temp_path("trusted-unconfigured-softening-debug.jsonl");
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("trusted-unconfigured-softening-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/assets/import-helper.js",
+                &cookie_header(),
+                &[
+                    (
+                        session::INGRESS_IDENTITY_SOURCE_HEADER_NAME,
+                        "operator_override",
+                    ),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "allowlisted"),
+                    (
+                        session::INGRESS_IDENTITY_LABEL_HEADER_NAME,
+                        "internal-crawler",
+                    ),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert!(body.contains("/api/v2/import/reconcile"));
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+        assert_event_routing(&event_log_path, "policy_decision", "eidolon_owned");
+        assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(exposure["kind"]["bait_id"], "js_worker_resume_trace");
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+    }
+
+    #[test]
     fn runtime_default_controller_serves_demo_owned_surface() {
         let event_log_path = unique_temp_path("default-owned-events.jsonl");
         let runtime = test_runtime_with_m1_controller(
-            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("default-owned-control.txt"),
         );
@@ -4960,7 +5970,7 @@ mod tests {
             runtime,
             &get_request("/openapi.json?eidolon_surface=legacy-import"),
         ));
-        upstream_handle.join().expect("upstream thread should join");
+        must_join(upstream_handle.join(), "upstream thread should join");
         let rewritten: Value = serde_json::from_slice(&response.body).unwrap();
 
         assert!(rewritten["paths"]["/api/v2/import/reconcile"].is_object());
@@ -5009,7 +6019,7 @@ mod tests {
 
         let response =
             parse_downstream_response(&run_runtime_request(runtime, &get_request("/openapi.json")));
-        upstream_handle.join().expect("upstream thread should join");
+        must_join(upstream_handle.join(), "upstream thread should join");
         let rewritten: Value = serde_json::from_slice(&response.body).unwrap();
 
         assert!(rewritten["paths"]["/api/v2/import/reconcile"].is_object());
@@ -5067,7 +6077,7 @@ mod tests {
             &get_request("/docs?topic=imports"),
         ));
         upstream_handle.join().expect("upstream thread should join");
-        let body = String::from_utf8(response.body).expect("body should be utf8");
+        let body = must_ok(String::from_utf8(response.body), "body should be utf8");
 
         assert_eq!(response.status, 200);
         assert!(body.contains("Customer import recovery controls"));
@@ -5174,7 +6184,7 @@ mod tests {
                     runtime.clone(),
                     &get_request_with_cookie(&bait.surface, &cookie),
                 ));
-                upstream_handle.join().expect("upstream thread should join");
+                must_join(upstream_handle.join(), "upstream thread should join");
                 assert_eq!(exposure_response.status, 200);
                 runtime
             } else {
@@ -5203,9 +6213,11 @@ mod tests {
             ));
 
             assert_eq!(action_response.status, 202);
-            assert!(String::from_utf8(action_response.body)
-                .expect("body should be utf8")
-                .contains(r#""write_committed":false"#));
+            assert!(must_ok(
+                String::from_utf8(action_response.body),
+                "body should be utf8"
+            )
+            .contains(r#""write_committed":false"#));
 
             let exposure = first_event_of_type(&event_log_path, "bait_exposed");
             let action = first_event_of_type(&event_log_path, "bait_action_observed");
@@ -5231,7 +6243,7 @@ mod tests {
 
         let response =
             parse_downstream_response(&run_runtime_request(runtime, &get_request("/schema.json")));
-        upstream_handle.join().expect("upstream thread should join");
+        must_join(upstream_handle.join(), "upstream thread should join");
 
         assert_eq!(response.body, original.as_bytes());
         assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
@@ -5523,12 +6535,14 @@ mod tests {
                 &[("X-Migration-Trace", "wrong")],
             ),
         ));
-        let upstream_request = upstream_handle.join().expect("upstream thread should join");
+        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
 
         assert_eq!(response.body, br#"{"mode":"upstream"}"#);
-        assert!(String::from_utf8(upstream_request)
-            .expect("request should be utf8")
-            .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+        assert!(must_ok(
+            String::from_utf8(upstream_request),
+            "request should be utf8"
+        )
+        .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
         assert_eq!(events_of_type(&event_log_path, "bait_exposed").len(), 1);
         assert_event_type_absent(&event_log_path, "bait_action_observed");
     }
@@ -5537,7 +6551,10 @@ mod tests {
     fn disabled_interventions_fail_closed_for_known_decoy_write_path() {
         let event_log_path = unique_temp_path("disabled-bait-events.jsonl");
         let control_path = unique_temp_path("disabled-bait-control.txt");
-        fs::write(&control_path, "disabled").expect("control file should write");
+        must_ok(
+            fs::write(&control_path, "disabled"),
+            "control file should write",
+        );
         let runtime =
             test_runtime_with_m1_controller(closed_upstream(), &event_log_path, control_path);
 
@@ -5551,9 +6568,10 @@ mod tests {
         ));
 
         assert_eq!(response.status, 403);
-        assert!(String::from_utf8(response.body)
-            .expect("body should be utf8")
-            .contains("failed closed"));
+        assert!(
+            must_ok(String::from_utf8(response.body), "body should be utf8")
+                .contains("failed closed")
+        );
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_type_absent(&event_log_path, "bait_exposed");
         assert_event_type_absent(&event_log_path, "bait_action_observed");
@@ -5563,7 +6581,10 @@ mod tests {
     fn runtime_path_uses_injected_policy_state_for_intervention_routing() {
         let event_log_path = unique_temp_path("controlled-events.jsonl");
         let runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("controlled-control.txt"),
             SurfaceAction::ProtectedUpstream,
@@ -5577,9 +6598,10 @@ mod tests {
         ));
 
         assert_eq!(response.status, 200);
-        assert!(String::from_utf8(response.body)
-            .expect("body should be utf8")
-            .contains(r#""synthetic":true"#));
+        assert!(
+            must_ok(String::from_utf8(response.body), "body should be utf8")
+                .contains(r#""synthetic":true"#)
+        );
         assert_event_routing(&event_log_path, "request_seen", "controlled_reality");
         assert_event_routing(&event_log_path, "response_served", "controlled_reality");
     }
@@ -5588,7 +6610,10 @@ mod tests {
     fn runtime_rate_limits_after_controlled_reality_action_depth_limit() {
         let event_log_path = unique_temp_path("controlled-rate-limit-events.jsonl");
         let runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("controlled-rate-limit-control.txt"),
             SurfaceAction::ProtectedUpstream,
@@ -5619,7 +6644,10 @@ mod tests {
     fn runtime_rate_limit_uses_configured_depth_delay_and_retry_after() {
         let event_log_path = unique_temp_path("controlled-configured-rate-limit-events.jsonl");
         let mut runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("controlled-configured-rate-limit-control.txt"),
             SurfaceAction::ProtectedUpstream,
@@ -5654,7 +6682,10 @@ mod tests {
     fn controlled_session_logs_escape_attempt_outside_configured_branch() {
         let event_log_path = unique_temp_path("controlled-escape-events.jsonl");
         let runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("controlled-escape-control.txt"),
             SurfaceAction::ProtectedUpstream,
@@ -5679,7 +6710,10 @@ mod tests {
     fn runtime_policy_owned_response_does_not_log_bait_exposure() {
         let event_log_path = unique_temp_path("blocked-no-exposure-events.jsonl");
         let runtime = test_runtime_with_m1_controller(
-            parse_upstream(DEFAULT_UPSTREAM).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("blocked-no-exposure-control.txt"),
         );

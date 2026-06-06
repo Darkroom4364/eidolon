@@ -1,0 +1,14 @@
+FROM rust:1.95-bookworm AS builder
+WORKDIR /workspace
+
+COPY . .
+RUN cargo build --release -p eidolon-demo-target
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /workspace/target/release/eidolon-demo-target /usr/local/bin/eidolon-demo-target
+EXPOSE 9101
+ENTRYPOINT ["/usr/local/bin/eidolon-demo-target"]

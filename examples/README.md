@@ -4,6 +4,29 @@ Examples are for local, owned-target Eidolon Lab use only.
 
 Do not point example runners or future agent integrations at public third-party targets.
 
+## Edge Adapters
+
+Trusted ingress adapters belong at the edge, not inside the proxy runtime.
+
+The first concrete adapter is the Cloudflare Worker example in
+[edge/cloudflare](edge/cloudflare/README.md). It strips forged
+`X-Eidolon-*` headers, maps official Cloudflare bot signals into the normalized
+Eidolon ingress contract, and forwards to the protected origin. The same
+directory also includes a Cloudflare request-header Transform Rules payload for
+zones that want a Workerless transport path.
+
+Run its local mapping test with:
+
+```sh
+examples/edge/test-cloudflare-worker.sh
+```
+
+Run the Transform Rules payload test with:
+
+```sh
+examples/edge/test-cloudflare-transform-rules.sh
+```
+
 ## Demo Target
 
 Run the local synthetic target:

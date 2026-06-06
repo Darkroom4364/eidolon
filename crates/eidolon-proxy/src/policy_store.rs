@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -138,7 +139,21 @@ impl PolicyStateStore {
         })?;
         let temp_path = path.with_extension("tmp");
 
-        fs::write(&temp_path, serialized)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+
+        file.write_all(&serialized)?;
+        file.flush()?;
         fs::rename(temp_path, path)
     }
 }
@@ -192,11 +207,20 @@ mod tests {
     use eidolon_core::PolicyState;
 
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn must_ok<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
 
     fn unique_temp_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after epoch")
+            .unwrap_or_else(|error| panic!("system clock should be after epoch: {error}"))
             .as_nanos();
 
         env::temp_dir().join(format!(
@@ -233,6 +257,27 @@ mod tests {
             reopened.policy_state(session_id),
             PolicyState::ControlledReality
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_policy_state_is_owner_only() {
+        let path = unique_temp_path("owner-only");
+        let session_id = SessionId::new();
+
+        let mut store = must_ok(PolicyStateStore::open(&path), "store should open");
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .unwrap_or_else(|error| panic!("state should persist: {error}"));
+
+        let mode = must_ok(fs::metadata(&path), "policy state metadata should read")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(mode, 0o600);
+
+        must_ok(fs::remove_file(path), "policy state should remove");
     }
 
     #[test]

@@ -487,7 +487,8 @@ fn seconds_between(start: &TimelineEvent, end: &TimelineEvent) -> f64 {
 mod tests {
     use chrono::{TimeDelta, TimeZone, Utc};
     use eidolon_core::{
-        Event, EventKind, EventSource, ExposureId, PolicyState, RoutingDecision, SessionId,
+        Event, EventKind, EventSource, ExposureId, IngressIdentity, PolicyState, RoutingDecision,
+        SessionId,
     };
     use serde_json::json;
 
@@ -560,6 +561,7 @@ mod tests {
                 method: "GET".to_string(),
                 path: path.to_string(),
                 safe_headers: Vec::new(),
+                ingress_identity: IngressIdentity::default(),
                 routing_decision,
             },
         )
