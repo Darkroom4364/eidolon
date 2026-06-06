@@ -210,10 +210,17 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    fn must_ok<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
     fn unique_temp_path(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after epoch")
+            .unwrap_or_else(|error| panic!("system clock should be after epoch: {error}"))
             .as_nanos();
 
         env::temp_dir().join(format!(
@@ -258,20 +265,19 @@ mod tests {
         let path = unique_temp_path("owner-only");
         let session_id = SessionId::new();
 
-        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        let mut store = must_ok(PolicyStateStore::open(&path), "store should open");
         store
             .set_policy_state(session_id, PolicyState::ControlledReality)
-            .expect("state should persist");
+            .unwrap_or_else(|error| panic!("state should persist: {error}"));
 
-        let mode = fs::metadata(&path)
-            .expect("policy state metadata should read")
+        let mode = must_ok(fs::metadata(&path), "policy state metadata should read")
             .permissions()
             .mode()
             & 0o777;
 
         assert_eq!(mode, 0o600);
 
-        fs::remove_file(path).expect("policy state should remove");
+        must_ok(fs::remove_file(path), "policy state should remove");
     }
 
     #[test]

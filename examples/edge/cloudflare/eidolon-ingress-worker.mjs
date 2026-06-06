@@ -87,8 +87,7 @@ export function applyCloudflareBotSignals(headers, cf = null) {
   return next;
 }
 
-export function buildOriginRequest(request, env) {
-  const targetUrl = buildOriginUrl(request, env);
+export function buildOriginRequestInit(request, env) {
   const transportAuth = buildTransportAuth(env);
   const headers = applyCloudflareBotSignals(
     stripClientEidolonHeaders(request.headers),
@@ -97,26 +96,69 @@ export function buildOriginRequest(request, env) {
   headers.set(EIDOLON_HEADERS.transportAuth, transportAuth);
   const hasBody = !BODYLESS_METHODS.has(request.method.toUpperCase());
 
-  return new Request(targetUrl, {
+  return {
     method: request.method,
     headers,
     body: hasBody ? request.body : undefined,
     duplex: hasBody ? "half" : undefined,
     redirect: request.redirect,
-  });
+  };
+}
+
+export function buildOriginRequest(request, env) {
+  return new Request(
+    buildOriginUrl(request, env).toString(),
+    buildOriginRequestInit(request, env),
+  );
 }
 
 function buildOriginUrl(request, env) {
+  const trustedOrigin = parseTrustedOrigin(env);
+  const incoming = new URL(request.url);
+  trustedOrigin.pathname = incoming.pathname;
+  trustedOrigin.search = incoming.search;
+  return trustedOrigin;
+}
+
+function parseTrustedOrigin(env) {
   const origin = normalizeString(env?.EIDOLON_ORIGIN);
   if (origin === null) {
     throw new Error("missing required EIDOLON_ORIGIN binding");
   }
 
   const upstream = new URL(origin);
-  const incoming = new URL(request.url);
-  upstream.pathname = incoming.pathname;
-  upstream.search = incoming.search;
-  return upstream.toString();
+  if (upstream.protocol !== "http:" && upstream.protocol !== "https:") {
+    throw new Error("EIDOLON_ORIGIN must use http or https");
+  }
+  if (upstream.username !== "" || upstream.password !== "") {
+    throw new Error("EIDOLON_ORIGIN must not include credentials");
+  }
+  if (!parseAllowedOriginHosts(env).has(upstream.hostname.toLowerCase())) {
+    throw new Error("EIDOLON_ORIGIN host must be present in EIDOLON_ALLOWED_ORIGIN_HOSTS");
+  }
+
+  upstream.pathname = "/";
+  upstream.search = "";
+  upstream.hash = "";
+  return upstream;
+}
+
+function parseAllowedOriginHosts(env) {
+  const raw = normalizeString(env?.EIDOLON_ALLOWED_ORIGIN_HOSTS);
+  if (raw === null) {
+    throw new Error("missing required EIDOLON_ALLOWED_ORIGIN_HOSTS binding");
+  }
+
+  const hosts = raw
+    .split(",")
+    .map((value) => normalizeString(value)?.toLowerCase() ?? null)
+    .filter((value) => value !== null);
+
+  if (hosts.length === 0) {
+    throw new Error("EIDOLON_ALLOWED_ORIGIN_HOSTS must contain at least one hostname");
+  }
+
+  return new Set(hosts);
 }
 
 function buildTransportAuth(env) {
@@ -164,6 +206,9 @@ function setHeader(headers, name, value) {
 
 export default {
   async fetch(request, env) {
-    return fetch(buildOriginRequest(request, env));
+    const targetUrl = buildOriginUrl(request, env).toString();
+    const requestInit = buildOriginRequestInit(request, env);
+    // foxguard: ignore[js/no-ssrf]
+    return fetch(targetUrl, requestInit);
   },
 };

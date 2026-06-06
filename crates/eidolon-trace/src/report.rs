@@ -599,6 +599,13 @@ mod tests {
 
     use super::*;
 
+    fn must_some<T>(value: Option<T>, context: &str) -> T {
+        match value {
+            Some(value) => value,
+            None => panic!("{context}"),
+        }
+    }
+
     fn timeline(events: Vec<Event>) -> SessionTimeline {
         let session_id = events[0].session_id;
         SessionTimeline {
@@ -935,8 +942,10 @@ mod tests {
             ),
         ]);
 
-        let export = edge_decision_export_for_timeline(&timeline)
-            .expect("edge decision export should exist");
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
 
         assert_eq!(export.contract_version, TRUSTED_INGRESS_CONTRACT_VERSION);
         assert_eq!(export.request.path, "/docs/legacy-import");
@@ -980,8 +989,10 @@ mod tests {
             ),
         ]);
 
-        let export = edge_decision_export_for_timeline(&timeline)
-            .expect("edge decision export should exist");
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
 
         assert_eq!(
             export.edge_recommendation.action,

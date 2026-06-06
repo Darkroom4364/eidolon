@@ -3624,6 +3624,10 @@ mod tests {
         }
     }
 
+    fn must_join<T>(result: std::thread::Result<T>, context: &str) -> T {
+        result.unwrap_or_else(|_| panic!("{context}"))
+    }
+
     fn path_str<'a>(path: &'a Path, context: &str) -> &'a str {
         match path.to_str() {
             Some(value) => value,
@@ -4295,17 +4299,21 @@ mod tests {
 
     #[test]
     fn connect_upstream_returns_stream_with_deadlines() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("upstream should bind");
-        let addr = listener.local_addr().expect("upstream should have address");
+        let listener = must_ok(
+            TcpListener::bind("127.0.0.1:0"),
+            "upstream should bind",
+        );
+        let addr = must_ok(listener.local_addr(), "upstream should have address");
         let upstream = must_ok(
             parse_upstream(&format!("http://{addr}"), false),
             "upstream target should parse",
         );
-        let handle =
-            thread::spawn(move || listener.accept().expect("upstream should accept").0);
+        let handle = thread::spawn(move || {
+            must_ok(listener.accept(), "upstream should accept").0
+        });
 
         let stream = must_ok(connect_upstream(&upstream), "upstream should connect");
-        let accepted = handle.join().expect("upstream accept should join");
+        let accepted = must_join(handle.join(), "upstream accept should join");
 
         assert_eq!(stream.read_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
         assert_eq!(stream.write_timeout().unwrap(), Some(UPSTREAM_IO_TIMEOUT));
@@ -4822,8 +4830,10 @@ mod tests {
 
     #[test]
     fn upstream_request_strips_hop_by_hop_and_connection_nominated_headers() {
-        let upstream =
-            parse_upstream("http://127.0.0.1:9001", false).expect("upstream should parse");
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9001", false),
+            "upstream should parse",
+        );
         let request = HttpRequest {
             method: "GET".to_string(),
             target: "/docs".to_string(),
@@ -4890,8 +4900,10 @@ mod tests {
 
     #[test]
     fn upstream_request_emits_one_canonical_content_length() {
-        let upstream =
-            parse_upstream("http://127.0.0.1:9001", false).expect("upstream should parse");
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9001", false),
+            "upstream should parse",
+        );
         let mut request_bytes = &b"POST /api/v1/imports HTTP/1.1\r\nHost: proxy.local\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\ntest"[..];
         let request = read_http_request(&mut request_bytes)
             .expect("request should parse")
@@ -5271,7 +5283,10 @@ mod tests {
     fn runtime_path_serves_eidolon_owned_surface_response() {
         let event_log_path = unique_temp_path("owned-events.jsonl");
         let runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM, false).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("owned-control.txt"),
             SurfaceAction::EidolonOwned {
@@ -5296,7 +5311,10 @@ mod tests {
         let event_log_path = unique_temp_path("debug-owned-events.jsonl");
         let debug_log_path = unique_temp_path("debug-owned-debug.jsonl");
         let mut runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM, false).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("debug-owned-control.txt"),
             SurfaceAction::EidolonOwned {
@@ -5398,7 +5416,7 @@ mod tests {
             ],
         );
         let _response = run_runtime_request(runtime, &request);
-        upstream_handle.join().expect("upstream thread should join");
+        must_join(upstream_handle.join(), "upstream thread should join");
 
         let request_event = first_event_of_type(&event_log_path, "request_seen");
         assert_eq!(
@@ -5503,8 +5521,11 @@ mod tests {
                 ],
             ),
         );
-        let upstream_request = upstream_handle.join().expect("upstream thread should join");
-        let upstream_request = String::from_utf8(upstream_request).expect("request should be utf8");
+        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
+        let upstream_request = must_ok(
+            String::from_utf8(upstream_request),
+            "request should be utf8",
+        );
 
         assert!(!upstream_request.contains("X-Eidolon-Ingress-Identity-Source:"));
         assert!(!upstream_request.contains("X-Eidolon-Ingress-Trust-Tier:"));
@@ -5542,8 +5563,10 @@ mod tests {
             }"#,
         );
         runtime.ingress_identity_resolver = Arc::new(
-            ingress_identity::load_ingress_identity_resolver(&config_path)
-                .expect("ingress trust config should load"),
+            must_ok(
+                ingress_identity::load_ingress_identity_resolver(&config_path),
+                "ingress trust config should load",
+            ),
         );
 
         let request = request_with_cookie(
@@ -5600,8 +5623,10 @@ mod tests {
             }"#,
         );
         runtime.ingress_identity_resolver = Arc::new(
-            ingress_identity::load_ingress_identity_resolver(&config_path)
-                .expect("ingress trust config should load"),
+            must_ok(
+                ingress_identity::load_ingress_identity_resolver(&config_path),
+                "ingress trust config should load",
+            ),
         );
         runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
 
@@ -5665,8 +5690,10 @@ mod tests {
             }"#,
         );
         runtime.ingress_identity_resolver = Arc::new(
-            ingress_identity::load_ingress_identity_resolver(&config_path)
-                .expect("ingress trust config should load"),
+            must_ok(
+                ingress_identity::load_ingress_identity_resolver(&config_path),
+                "ingress trust config should load",
+            ),
         );
         runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
 
@@ -5731,8 +5758,10 @@ mod tests {
             }"#,
         );
         runtime.ingress_identity_resolver = Arc::new(
-            ingress_identity::load_ingress_identity_resolver(&config_path)
-                .expect("ingress trust config should load"),
+            must_ok(
+                ingress_identity::load_ingress_identity_resolver(&config_path),
+                "ingress trust config should load",
+            ),
         );
 
         let response = parse_downstream_response(&run_runtime_request(
@@ -5802,8 +5831,10 @@ mod tests {
             }"#,
         );
         runtime.ingress_identity_resolver = Arc::new(
-            ingress_identity::load_ingress_identity_resolver(&config_path)
-                .expect("ingress trust config should load"),
+            must_ok(
+                ingress_identity::load_ingress_identity_resolver(&config_path),
+                "ingress trust config should load",
+            ),
         );
 
         let response = parse_downstream_response(&run_runtime_request(
@@ -5905,7 +5936,10 @@ mod tests {
     fn runtime_default_controller_serves_demo_owned_surface() {
         let event_log_path = unique_temp_path("default-owned-events.jsonl");
         let runtime = test_runtime_with_m1_controller(
-            parse_upstream(DEFAULT_UPSTREAM, false).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("default-owned-control.txt"),
         );
@@ -5946,7 +5980,7 @@ mod tests {
             runtime,
             &get_request("/openapi.json?eidolon_surface=legacy-import"),
         ));
-        upstream_handle.join().expect("upstream thread should join");
+        must_join(upstream_handle.join(), "upstream thread should join");
         let rewritten: Value = serde_json::from_slice(&response.body).unwrap();
 
         assert!(rewritten["paths"]["/api/v2/import/reconcile"].is_object());
@@ -5995,7 +6029,7 @@ mod tests {
 
         let response =
             parse_downstream_response(&run_runtime_request(runtime, &get_request("/openapi.json")));
-        upstream_handle.join().expect("upstream thread should join");
+        must_join(upstream_handle.join(), "upstream thread should join");
         let rewritten: Value = serde_json::from_slice(&response.body).unwrap();
 
         assert!(rewritten["paths"]["/api/v2/import/reconcile"].is_object());
@@ -6053,7 +6087,7 @@ mod tests {
             &get_request("/docs?topic=imports"),
         ));
         upstream_handle.join().expect("upstream thread should join");
-        let body = String::from_utf8(response.body).expect("body should be utf8");
+        let body = must_ok(String::from_utf8(response.body), "body should be utf8");
 
         assert_eq!(response.status, 200);
         assert!(body.contains("Customer import recovery controls"));
@@ -6160,7 +6194,7 @@ mod tests {
                     runtime.clone(),
                     &get_request_with_cookie(&bait.surface, &cookie),
                 ));
-                upstream_handle.join().expect("upstream thread should join");
+                must_join(upstream_handle.join(), "upstream thread should join");
                 assert_eq!(exposure_response.status, 200);
                 runtime
             } else {
@@ -6189,8 +6223,7 @@ mod tests {
             ));
 
             assert_eq!(action_response.status, 202);
-            assert!(String::from_utf8(action_response.body)
-                .expect("body should be utf8")
+            assert!(must_ok(String::from_utf8(action_response.body), "body should be utf8")
                 .contains(r#""write_committed":false"#));
 
             let exposure = first_event_of_type(&event_log_path, "bait_exposed");
@@ -6217,7 +6250,7 @@ mod tests {
 
         let response =
             parse_downstream_response(&run_runtime_request(runtime, &get_request("/schema.json")));
-        upstream_handle.join().expect("upstream thread should join");
+        must_join(upstream_handle.join(), "upstream thread should join");
 
         assert_eq!(response.body, original.as_bytes());
         assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
@@ -6509,11 +6542,10 @@ mod tests {
                 &[("X-Migration-Trace", "wrong")],
             ),
         ));
-        let upstream_request = upstream_handle.join().expect("upstream thread should join");
+        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
 
         assert_eq!(response.body, br#"{"mode":"upstream"}"#);
-        assert!(String::from_utf8(upstream_request)
-            .expect("request should be utf8")
+        assert!(must_ok(String::from_utf8(upstream_request), "request should be utf8")
             .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
         assert_eq!(events_of_type(&event_log_path, "bait_exposed").len(), 1);
         assert_event_type_absent(&event_log_path, "bait_action_observed");
@@ -6523,7 +6555,7 @@ mod tests {
     fn disabled_interventions_fail_closed_for_known_decoy_write_path() {
         let event_log_path = unique_temp_path("disabled-bait-events.jsonl");
         let control_path = unique_temp_path("disabled-bait-control.txt");
-        fs::write(&control_path, "disabled").expect("control file should write");
+        must_ok(fs::write(&control_path, "disabled"), "control file should write");
         let runtime =
             test_runtime_with_m1_controller(closed_upstream(), &event_log_path, control_path);
 
@@ -6537,8 +6569,7 @@ mod tests {
         ));
 
         assert_eq!(response.status, 403);
-        assert!(String::from_utf8(response.body)
-            .expect("body should be utf8")
+        assert!(must_ok(String::from_utf8(response.body), "body should be utf8")
             .contains("failed closed"));
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_type_absent(&event_log_path, "bait_exposed");
@@ -6549,7 +6580,10 @@ mod tests {
     fn runtime_path_uses_injected_policy_state_for_intervention_routing() {
         let event_log_path = unique_temp_path("controlled-events.jsonl");
         let runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM, false).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("controlled-control.txt"),
             SurfaceAction::ProtectedUpstream,
@@ -6563,8 +6597,7 @@ mod tests {
         ));
 
         assert_eq!(response.status, 200);
-        assert!(String::from_utf8(response.body)
-            .expect("body should be utf8")
+        assert!(must_ok(String::from_utf8(response.body), "body should be utf8")
             .contains(r#""synthetic":true"#));
         assert_event_routing(&event_log_path, "request_seen", "controlled_reality");
         assert_event_routing(&event_log_path, "response_served", "controlled_reality");
@@ -6574,7 +6607,10 @@ mod tests {
     fn runtime_rate_limits_after_controlled_reality_action_depth_limit() {
         let event_log_path = unique_temp_path("controlled-rate-limit-events.jsonl");
         let runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM, false).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("controlled-rate-limit-control.txt"),
             SurfaceAction::ProtectedUpstream,
@@ -6605,7 +6641,10 @@ mod tests {
     fn runtime_rate_limit_uses_configured_depth_delay_and_retry_after() {
         let event_log_path = unique_temp_path("controlled-configured-rate-limit-events.jsonl");
         let mut runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM, false).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("controlled-configured-rate-limit-control.txt"),
             SurfaceAction::ProtectedUpstream,
@@ -6640,7 +6679,10 @@ mod tests {
     fn controlled_session_logs_escape_attempt_outside_configured_branch() {
         let event_log_path = unique_temp_path("controlled-escape-events.jsonl");
         let runtime = test_runtime(
-            parse_upstream(DEFAULT_UPSTREAM, false).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("controlled-escape-control.txt"),
             SurfaceAction::ProtectedUpstream,
@@ -6665,7 +6707,10 @@ mod tests {
     fn runtime_policy_owned_response_does_not_log_bait_exposure() {
         let event_log_path = unique_temp_path("blocked-no-exposure-events.jsonl");
         let runtime = test_runtime_with_m1_controller(
-            parse_upstream(DEFAULT_UPSTREAM, false).expect("default upstream should parse"),
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             unique_temp_path("blocked-no-exposure-control.txt"),
         );

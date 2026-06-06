@@ -505,9 +505,19 @@ fn escape_json(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn must_ok<T, E: std::fmt::Display>(result: Result<T, E>, context: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+
     #[test]
     fn default_lab_address_is_loopback() {
-        ensure_allowed_lab_addr(DEFAULT_ADDR, false).expect("default address should be loopback");
+        must_ok(
+            ensure_allowed_lab_addr(DEFAULT_ADDR, false),
+            "default address should be loopback",
+        );
     }
 
     #[test]
@@ -519,8 +529,10 @@ mod tests {
 
     #[test]
     fn owned_cluster_lab_allows_non_loopback_bind() {
-        ensure_allowed_lab_addr("0.0.0.0:9001", true)
-            .expect("owned cluster lab should allow non-loopback bind");
+        must_ok(
+            ensure_allowed_lab_addr("0.0.0.0:9001", true),
+            "owned cluster lab should allow non-loopback bind",
+        );
     }
 
     #[test]
