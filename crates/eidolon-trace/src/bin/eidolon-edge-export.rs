@@ -337,6 +337,7 @@ mod tests {
                     label: Some("internal-crawler".to_string()),
                     expires_at: None,
                 },
+                ingress_signals: Default::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         );

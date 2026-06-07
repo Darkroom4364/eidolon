@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "profile_id": "orbstack_default_m3_catalog",
+  "hypothesis": "OrbStack Shield baseline profile that preserves the built-in M3 bait catalog while exposing explicit profile provenance for deployment-side validation."
+}

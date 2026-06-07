@@ -29,6 +29,8 @@ spec:
             - $(EIDOLON_EVENT_LOG_PATH)
             - --debug-log
             - $(EIDOLON_DEBUG_LOG_PATH)
+            - --bait-profile
+            - /etc/eidolon/bait-profile.json
             - --intervention-control
             - $(EIDOLON_INTERVENTION_CONTROL_PATH)
             - --policy-state
@@ -70,6 +72,9 @@ spec:
           volumeMounts:
             - name: eidolon-state
               mountPath: /var/lib/eidolon
+            - name: eidolon-bait-profile
+              mountPath: /etc/eidolon
+              readOnly: true
           readinessProbe:
             tcpSocket:
               port: http
@@ -84,6 +89,12 @@ spec:
         - name: eidolon-state
           persistentVolumeClaim:
             claimName: eidolon-shield-proxy-state
+        - name: eidolon-bait-profile
+          configMap:
+            name: eidolon-shield-bait-profile
+            items:
+              - key: bait-profile.json
+                path: bait-profile.json
 ---
 apiVersion: v1
 kind: Service

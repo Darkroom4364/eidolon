@@ -270,3 +270,7 @@ Issues:
 2. Add per-session polymorphic bait generation
 3. Add deployment-safe allowlists and verified crawler handling
 4. Prepare external-readiness research note and release checklist
+
+Current design note:
+
+- `docs/m5-multi-signal-policy.md`
