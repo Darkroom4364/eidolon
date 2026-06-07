@@ -5604,8 +5604,10 @@ mod tests {
                 ],
             ),
         ));
-        upstream_handle.join().expect("upstream thread should join");
-        let body = String::from_utf8(response.body).expect("body should be utf8");
+        assert!(upstream_handle.join().is_ok(), "upstream thread should join");
+        let Ok(body) = String::from_utf8(response.body) else {
+            panic!("body should be utf8");
+        };
 
         assert_eq!(response.status, 200);
         assert!(body.contains("/docs/legacy-import"));
@@ -5663,8 +5665,10 @@ mod tests {
                 ],
             ),
         ));
-        upstream_handle.join().expect("upstream thread should join");
-        let body = String::from_utf8(response.body).expect("body should be utf8");
+        assert!(upstream_handle.join().is_ok(), "upstream thread should join");
+        let Ok(body) = String::from_utf8(response.body) else {
+            panic!("body should be utf8");
+        };
 
         assert_eq!(response.status, 200);
         assert_eq!(body, original);

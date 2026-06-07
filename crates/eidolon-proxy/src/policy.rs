@@ -313,10 +313,14 @@ mod tests {
 
     #[test]
     fn correlated_bait_action_transitions_observe_or_suspicious_to_controlled_reality() {
-        let observe = transition_after_correlated_bait_action(PolicyState::Observe)
-            .expect("observe should transition");
-        let suspicious = transition_after_correlated_bait_action(PolicyState::Suspicious)
-            .expect("suspicious should transition");
+        let Some(observe) = transition_after_correlated_bait_action(PolicyState::Observe) else {
+            panic!("observe should transition");
+        };
+        let Some(suspicious) =
+            transition_after_correlated_bait_action(PolicyState::Suspicious)
+        else {
+            panic!("suspicious should transition");
+        };
 
         assert_eq!(observe.from, PolicyState::Observe);
         assert_eq!(observe.to, PolicyState::ControlledReality);
@@ -326,7 +330,7 @@ mod tests {
 
     #[test]
     fn low_score_agentic_discovery_signals_promote_to_suspicious() {
-        let transition = transition_to_suspicious_from_ingress_signals(
+        let Some(transition) = transition_to_suspicious_from_ingress_signals(
             PolicyState::Observe,
             "/docs/legacy-import",
             &["/docs".to_string(), "/openapi.json".to_string()],
@@ -338,7 +342,9 @@ mod tests {
                 ..Default::default()
             },
         )
-        .expect("observe should transition to suspicious");
+        else {
+            panic!("observe should transition to suspicious");
+        };
 
         assert_eq!(transition.from, PolicyState::Observe);
         assert_eq!(transition.to, PolicyState::Suspicious);
