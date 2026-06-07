@@ -170,6 +170,7 @@ mod tests {
                 path: path.to_string(),
                 safe_headers: Vec::new(),
                 ingress_identity: IngressIdentity::default(),
+                ingress_signals: Default::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         )

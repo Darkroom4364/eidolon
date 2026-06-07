@@ -148,13 +148,24 @@ examples/
 
 ## Current Status
 
-This repository is a project scaffold and documentation base. The first implementation target is a minimal Rust reverse proxy with:
+M3 and M4 are complete on `main`. Current work is in M5: adaptive bait policy
+and shield hardening.
 
-- session IDs
-- bait registry
-- one docs/header/path bait chain
-- event logging
-- trace report
+The repository already includes:
+
+- a Rust reverse proxy with per-session policy state, controlled reality, and
+  replayable JSONL evidence
+- a correlated M3 bait catalog plus bait-profile overrides for owned validation
+  runs
+- offline trace scoring, Markdown reporting, and edge-decision export
+- trusted-ingress normalization with transport-auth gating and scoped bait
+  softening
+- an OrbStack shield-lab deployment with live status, evidence export,
+  edge-decision export, trusted-ingress smoke checks, and Kali VM validation
+
+The current gap is no longer basic proxy plumbing. The main product work is
+graduated multi-signal policy that keeps ingress identity, advisory risk
+signals, runtime evidence, policy state, and enforcement separate.
 
 For the end-state definition, see [docs/completed-project.md](docs/completed-project.md).
 

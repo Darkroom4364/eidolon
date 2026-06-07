@@ -66,6 +66,15 @@ const SAFE_HEADER_NAMES: &[&str] = &[
     "x-eidolon-ingress-identity-label",
     "x-eidolon-ingress-identity-source",
     "x-eidolon-ingress-trust-tier",
+    "x-eidolon-ingress-verification-strength",
+    "x-eidolon-ingress-actor-kind",
+    "x-eidolon-ingress-verified-category",
+    "x-eidolon-ingress-attestation-ref",
+    "x-eidolon-ingress-vendor-score",
+    "x-eidolon-ingress-vendor-score-kind",
+    "x-eidolon-ingress-vendor-score-scale",
+    "x-eidolon-ingress-detection-ids",
+    "x-eidolon-ingress-edge-action",
 ];
 
 fn main() -> ExitCode {
@@ -1730,6 +1739,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "safe_headers": safe_header_observations(&request.headers),
             "session_source": debug_session_source(session.source),
             "ingress_identity": &session.ingress_identity,
+            "ingress_signals": &session.ingress_signals,
             "policy_state": policy_state,
             "intervention_mode": debug_intervention_mode(intervention_mode),
         }),
@@ -2599,6 +2609,7 @@ fn request_seen_event(
             path: redacted_event_target(path),
             safe_headers: safe_header_observations(&request.headers),
             ingress_identity: session.ingress_identity.clone(),
+            ingress_signals: session.ingress_signals.clone(),
             routing_decision: decision.routing_decision,
         },
     )
@@ -2694,6 +2705,10 @@ fn effective_session_context(
     let headers: Vec<(&str, &str)> = header_pairs(&request.headers).collect();
     let mut session = session::derive_session_from_headers(headers.iter().copied());
     session.ingress_identity = session::authenticated_ingress_identity_from_headers(
+        headers.iter().copied(),
+        runtime.ingress_transport_auth_secret.as_deref(),
+    );
+    session.ingress_signals = session::authenticated_ingress_advisory_signals_from_headers(
         headers.iter().copied(),
         runtime.ingress_transport_auth_secret.as_deref(),
     );
@@ -5149,6 +5164,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: Default::default(),
+                    ingress_signals: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             ),
@@ -5448,6 +5464,90 @@ mod tests {
     }
 
     #[test]
+    fn runtime_records_authenticated_ingress_advisory_signals_in_request_audit() {
+        let event_log_path = unique_temp_path("ingress-signals-events.jsonl");
+        let debug_log_path = unique_temp_path("ingress-signals-debug.jsonl");
+        let (upstream, upstream_handle) =
+            spawn_upstream(html_response("<html><body>upstream</body></html>"));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("ingress-signals-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let request = request_with_cookie(
+            "GET",
+            "/health",
+            &cookie_header(),
+            &[
+                (
+                    session::INGRESS_VERIFICATION_STRENGTH_HEADER_NAME,
+                    "cryptographic",
+                ),
+                (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                (
+                    session::INGRESS_VERIFIED_CATEGORY_HEADER_NAME,
+                    "AI Assistant",
+                ),
+                (
+                    session::INGRESS_ATTESTATION_REF_HEADER_NAME,
+                    "jkt:sha256:ba3e64",
+                ),
+                (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
+                (
+                    session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                    "automation_likelihood_inverse",
+                ),
+                (session::INGRESS_VENDOR_SCORE_SCALE_HEADER_NAME, "1-99"),
+                (session::INGRESS_DETECTION_IDS_HEADER_NAME, "3355446,445566"),
+                (session::INGRESS_EDGE_ACTION_HEADER_NAME, "allow"),
+                (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            ],
+        );
+        let _response = run_runtime_request(runtime, &request);
+        must_join(upstream_handle.join(), "upstream thread should join");
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(
+            request_event["kind"]["ingress_signals"]["verification_strength"],
+            "cryptographic"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_signals"]["actor_kind"],
+            "agentic_browser"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_signals"]["verified_category"],
+            "AI Assistant"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_signals"]["attestation_ref"],
+            "jkt:sha256:ba3e64"
+        );
+        assert_eq!(request_event["kind"]["ingress_signals"]["vendor_score"], 12);
+        assert_eq!(
+            request_event["kind"]["ingress_signals"]["detection_ids"][0],
+            "3355446"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_signals"]["edge_action"],
+            "allow"
+        );
+
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(
+            request_debug["fields"]["ingress_signals"]["verification_strength"],
+            "cryptographic"
+        );
+        assert_eq!(
+            request_debug["fields"]["ingress_signals"]["vendor_score"],
+            12
+        );
+    }
+
+    #[test]
     fn runtime_ignores_forged_explicit_ingress_headers_without_transport_auth() {
         let event_log_path = unique_temp_path("forged-ingress-identity-events.jsonl");
         let debug_log_path = unique_temp_path("forged-ingress-identity-debug.jsonl");
@@ -5471,6 +5571,8 @@ mod tests {
                         session::INGRESS_IDENTITY_LABEL_HEADER_NAME,
                         "forged-edge-agent",
                     ),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "91"),
+                    (session::INGRESS_EDGE_ACTION_HEADER_NAME, "allow"),
                 ],
             ),
         ));
@@ -5478,6 +5580,7 @@ mod tests {
         assert_eq!(response.status, 200);
         let request_event = first_event_of_type(&event_log_path, "request_seen");
         assert_eq!(request_event["kind"]["ingress_identity"]["source"], "none");
+        assert!(request_event["kind"]["ingress_signals"].is_null());
         assert_eq!(
             request_event["kind"]["routing_decision"].as_str(),
             Some("eidolon_owned")
