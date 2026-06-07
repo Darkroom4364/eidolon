@@ -431,13 +431,17 @@ Today the proxy supports:
 - local trust config
 - precedence merging between explicit and local trust
 - trusted bait-softening on configured path prefixes
+- one conservative `observe -> suspicious` promotion for authenticated
+  discovery-surface requests that combine a low inverse vendor score with an
+  explicitly agentic actor kind
 - runtime containment overriding ingress trust
 
 It does not yet support:
 
 - automatic push delivery of webhook/SIEM export directly from the proxy runtime
 - automatic enforcement that interprets attestation references
-- automatic enforcement on vendor score, detection IDs, or edge action hints
+- automatic containment or high-friction enforcement on vendor score,
+  detection IDs, or edge action hints alone
 - automatic vendor adapters
 
 Those should land after this document, not before it.
