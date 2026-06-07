@@ -34,6 +34,7 @@ cd ~/Projects/eidolon
 examples/shield-lab/build-orbstack-images.sh
 examples/shield-lab/deploy-orbstack.sh
 examples/shield-lab/status-orbstack.sh
+examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
 ```
 
 The expected host URLs are:

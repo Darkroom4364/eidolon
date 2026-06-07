@@ -60,6 +60,7 @@ Keep out of the private repo:
   export-orbstack-evidence.sh
   export-edge-decisions-orbstack.sh
   smoke-trusted-ingress-orbstack.sh
+  smoke-suspicious-promotion-orbstack.sh
   collect-kali-vm-sample.sh
   run-pwnkit-kali-vm.sh
   kali-vm-pwnkit.md
@@ -235,6 +236,19 @@ Treat those NodePorts as raw lab ingress only:
 - the OrbStack overlay now enables that transport-auth path with a cluster-local
   shared secret so operators can smoke-test both the rejected raw path and the
   accepted authenticated path on the same deployment
+
+Validate those two ingress-side runtime paths directly on the live OrbStack
+shield:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-orbstack.sh
+examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
+```
+
+The second smoke proves the first M5 graduated-enforcement slice: one
+authenticated advisory discovery request is promoted from `observe` to
+`suspicious`, stays baited, and exports the advisory signals in the edge
+decision contract.
 
 Create a `kind` cluster:
 
