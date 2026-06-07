@@ -1,4 +1,9 @@
-use eidolon_core::{Event, EventKind, EventSource, PolicyState, RoutingDecision, SessionId};
+use eidolon_core::{
+    Event, EventKind, EventSource, IngressActorKind, IngressAdvisorySignals, IngressIdentity,
+    PolicyState, RoutingDecision, SessionId,
+};
+
+use crate::ingress_identity;
 
 pub const INITIAL_POLICY_STATE: PolicyState = PolicyState::Observe;
 
@@ -7,6 +12,10 @@ const INTERVENTIONS_DISABLED_REASON: &str =
     "interventions disabled; forwarding to protected upstream";
 const BAIT_ACTION_CONTROLLED_REALITY_REASON: &str =
     "confirmed bait-derived action moved session into controlled reality";
+const DISCOVERY_INGRESS_SUSPICIOUS_REASON_PREFIX: &str =
+    "authenticated ingress advisory signals promoted discovery request to suspicious";
+const AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND: &str = "automation_likelihood_inverse";
+const DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX: u16 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDecision {
@@ -91,6 +100,51 @@ pub fn transition_after_correlated_bait_action(
         | PolicyState::RateLimited
         | PolicyState::Blocked => None,
     }
+}
+
+pub fn transition_to_suspicious_from_ingress_signals(
+    current_state: PolicyState,
+    path: &str,
+    discovery_path_prefixes: &[String],
+    ingress_identity: &IngressIdentity,
+    ingress_signals: &IngressAdvisorySignals,
+) -> Option<PolicyTransition> {
+    if !matches!(current_state, PolicyState::Normal | PolicyState::Observe) {
+        return None;
+    }
+    if ingress_identity::softens_bait_surface_exposure(ingress_identity) {
+        return None;
+    }
+    if !discovery_path_prefixes
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
+        return None;
+    }
+    if !matches!(
+        ingress_signals.actor_kind,
+        IngressActorKind::AutonomousAgent | IngressActorKind::AgenticBrowser
+    ) {
+        return None;
+    }
+    if ingress_signals.vendor_score_kind.as_deref()
+        != Some(AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND)
+    {
+        return None;
+    }
+    let vendor_score = ingress_signals.vendor_score?;
+    if vendor_score > DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX {
+        return None;
+    }
+
+    Some(PolicyTransition::new(
+        current_state,
+        PolicyState::Suspicious,
+        format!(
+            "{DISCOVERY_INGRESS_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} kind={AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND}",
+            snake_case_actor_kind(ingress_signals.actor_kind),
+        ),
+    ))
 }
 
 pub fn decide_for_state(
@@ -203,6 +257,18 @@ pub fn reality_escape_attempt_event(
     )
 }
 
+fn snake_case_actor_kind(actor_kind: IngressActorKind) -> &'static str {
+    match actor_kind {
+        IngressActorKind::Unknown => "unknown",
+        IngressActorKind::Crawler => "crawler",
+        IngressActorKind::Assistant => "assistant",
+        IngressActorKind::AutonomousAgent => "autonomous_agent",
+        IngressActorKind::AgenticBrowser => "agentic_browser",
+        IngressActorKind::PartnerAutomation => "partner_automation",
+        IngressActorKind::InternalScanner => "internal_scanner",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +322,85 @@ mod tests {
         assert_eq!(observe.to, PolicyState::ControlledReality);
         assert_eq!(suspicious.from, PolicyState::Suspicious);
         assert_eq!(suspicious.to, PolicyState::ControlledReality);
+    }
+
+    #[test]
+    fn low_score_agentic_discovery_signals_promote_to_suspicious() {
+        let transition = transition_to_suspicious_from_ingress_signals(
+            PolicyState::Observe,
+            "/docs/legacy-import",
+            &["/docs".to_string(), "/openapi.json".to_string()],
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(12),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("observe should transition to suspicious");
+
+        assert_eq!(transition.from, PolicyState::Observe);
+        assert_eq!(transition.to, PolicyState::Suspicious);
+        assert!(transition
+            .reason
+            .contains(DISCOVERY_INGRESS_SUSPICIOUS_REASON_PREFIX));
+        assert!(transition.reason.contains("actor_kind=agentic_browser"));
+        assert!(transition.reason.contains("vendor_score=12"));
+    }
+
+    #[test]
+    fn trusted_identity_does_not_promote_to_suspicious_from_ingress_signals() {
+        let transition = transition_to_suspicious_from_ingress_signals(
+            PolicyState::Observe,
+            "/docs/legacy-import",
+            &["/docs".to_string(), "/openapi.json".to_string()],
+            &IngressIdentity {
+                source: eidolon_core::IngressIdentitySource::SignedAgent,
+                trust_tier: eidolon_core::IngressTrustTier::SignedAttested,
+                label: Some("signed-agent".to_string()),
+                expires_at: None,
+            },
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(12),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(transition, None);
+    }
+
+    #[test]
+    fn non_discovery_or_high_score_signals_do_not_promote_to_suspicious() {
+        let high_score = transition_to_suspicious_from_ingress_signals(
+            PolicyState::Observe,
+            "/docs/legacy-import",
+            &["/docs".to_string(), "/openapi.json".to_string()],
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(91),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+        );
+        let non_discovery = transition_to_suspicious_from_ingress_signals(
+            PolicyState::Observe,
+            "/health",
+            &["/docs".to_string(), "/openapi.json".to_string()],
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AutonomousAgent,
+                vendor_score: Some(12),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(high_score, None);
+        assert_eq!(non_discovery, None);
     }
 
     #[test]
