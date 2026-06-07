@@ -316,8 +316,7 @@ mod tests {
         let Some(observe) = transition_after_correlated_bait_action(PolicyState::Observe) else {
             panic!("observe should transition");
         };
-        let Some(suspicious) =
-            transition_after_correlated_bait_action(PolicyState::Suspicious)
+        let Some(suspicious) = transition_after_correlated_bait_action(PolicyState::Suspicious)
         else {
             panic!("suspicious should transition");
         };
@@ -341,8 +340,7 @@ mod tests {
                 vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
                 ..Default::default()
             },
-        )
-        else {
+        ) else {
             panic!("observe should transition to suspicious");
         };
 

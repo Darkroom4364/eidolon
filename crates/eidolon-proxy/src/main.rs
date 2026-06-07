@@ -5604,7 +5604,10 @@ mod tests {
                 ],
             ),
         ));
-        assert!(upstream_handle.join().is_ok(), "upstream thread should join");
+        assert!(
+            upstream_handle.join().is_ok(),
+            "upstream thread should join"
+        );
         let Ok(body) = String::from_utf8(response.body) else {
             panic!("body should be utf8");
         };
@@ -5665,7 +5668,10 @@ mod tests {
                 ],
             ),
         ));
-        assert!(upstream_handle.join().is_ok(), "upstream thread should join");
+        assert!(
+            upstream_handle.join().is_ok(),
+            "upstream thread should join"
+        );
         let Ok(body) = String::from_utf8(response.body) else {
             panic!("body should be utf8");
         };
