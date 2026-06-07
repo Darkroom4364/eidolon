@@ -20,115 +20,132 @@ pub fn render_markdown_report(timeline: &SessionTimeline) -> String {
 pub fn render_evidence_markdown(timeline: &SessionTimeline, bundle: &EvidenceBundle) -> String {
     let mut report = String::new();
 
-    writeln!(report, "# Eidolon Trace Report").expect("writing to string should not fail");
-    writeln!(report).expect("writing to string should not fail");
-    writeln!(report, "- Session: `{}`", bundle.session_id.0)
-        .expect("writing to string should not fail");
-    writeln!(report, "- Score: `{}`", bundle.score.points)
-        .expect("writing to string should not fail");
-    writeln!(
-        report,
-        "- Confidence: `{}`",
-        snake_case_debug(&bundle.score.confidence)
-    )
-    .expect("writing to string should not fail");
+    push_line(&mut report, format_args!("# Eidolon Trace Report"));
+    report.push('\n');
+    push_line(
+        &mut report,
+        format_args!("- Session: `{}`", bundle.session_id.0),
+    );
+    push_line(
+        &mut report,
+        format_args!("- Score: `{}`", bundle.score.points),
+    );
+    push_line(
+        &mut report,
+        format_args!(
+            "- Confidence: `{}`",
+            snake_case_debug(&bundle.score.confidence)
+        ),
+    );
     if let Some(policy_state) = bundle.policy_state {
-        writeln!(
-            report,
-            "- Current policy state: `{}`",
-            snake_case_debug(&policy_state)
-        )
-        .expect("writing to string should not fail");
+        push_line(
+            &mut report,
+            format_args!(
+                "- Current policy state: `{}`",
+                snake_case_debug(&policy_state)
+            ),
+        );
     }
-    writeln!(
-        report,
-        "- Safety note: this report is behavioral evidence from the owned lab trace. It is not proof of AI identity and does not include request bodies, secret header values, or raw query values."
-    )
-    .expect("writing to string should not fail");
+    push_line(
+        &mut report,
+        format_args!(
+            "- Safety note: this report is behavioral evidence from the owned lab trace. It is not proof of AI identity and does not include request bodies, secret header values, or raw query values."
+        ),
+    );
     if let Some(summary) = latest_ingress_signal_summary(timeline) {
-        writeln!(report, "- Ingress advisory signals: `{}`", summary)
-            .expect("writing to string should not fail");
+        push_line(
+            &mut report,
+            format_args!("- Ingress advisory signals: `{}`", summary),
+        );
     }
 
     render_metric_summary(timeline, bundle, &mut report);
 
-    writeln!(report, "\n## Score Reasons").expect("writing to string should not fail");
+    push_line(&mut report, format_args!("\n## Score Reasons"));
     if bundle.score.reasons.is_empty() {
-        writeln!(report, "- No score reasons recorded.")
-            .expect("writing to string should not fail");
+        push_line(&mut report, format_args!("- No score reasons recorded."));
     } else {
         for reason in &bundle.score.reasons {
-            writeln!(report, "- {}", markdown_text(reason))
-                .expect("writing to string should not fail");
+            push_line(&mut report, format_args!("- {}", markdown_text(reason)));
         }
     }
 
-    writeln!(report, "\n## Bait Chain").expect("writing to string should not fail");
+    push_line(&mut report, format_args!("\n## Bait Chain"));
     if bundle.matched_actions.is_empty() {
-        writeln!(report, "- No confirmed bait exposure to action chain.")
-            .expect("writing to string should not fail");
+        push_line(
+            &mut report,
+            format_args!("- No confirmed bait exposure to action chain."),
+        );
     } else {
         for action in &bundle.matched_actions {
             if let Some(exposure) = action
                 .matched_exposure
                 .and_then(|event_ref| exposure_by_ref(bundle, event_ref))
             {
-                writeln!(
-                    report,
-                    "- Exposure `{}` on `{}` at line `{}` matched action `{}` `{}` at line `{}`.",
-                    inline_code(&exposure.exposure_id.0),
-                    inline_code(&report_target(&exposure.surface)),
-                    exposure.event_ref.line_number,
-                    inline_code(&action.method),
-                    inline_code(&report_target(&action.path)),
-                    action.event_ref.line_number
-                )
-                .expect("writing to string should not fail");
+                push_line(
+                    &mut report,
+                    format_args!(
+                        "- Exposure `{}` on `{}` at line `{}` matched action `{}` `{}` at line `{}`.",
+                        inline_code(&exposure.exposure_id.0),
+                        inline_code(&report_target(&exposure.surface)),
+                        exposure.event_ref.line_number,
+                        inline_code(&action.method),
+                        inline_code(&report_target(&action.path)),
+                        action.event_ref.line_number
+                    ),
+                );
             }
         }
     }
 
     if !bundle.unmatched_actions.is_empty() {
-        writeln!(report, "\n## Unconfirmed Bait-Shaped Actions")
-            .expect("writing to string should not fail");
+        push_line(
+            &mut report,
+            format_args!("\n## Unconfirmed Bait-Shaped Actions"),
+        );
         for action in &bundle.unmatched_actions {
-            writeln!(
-                report,
-                "- `{}` `{}` for bait `{}` at line `{}`: {}.",
-                inline_code(&action.method),
-                inline_code(&report_target(&action.path)),
-                inline_code(&action.bait_id.0),
-                action.event_ref.line_number,
-                unconfirmed_action_reason(action)
-            )
-            .expect("writing to string should not fail");
+            push_line(
+                &mut report,
+                format_args!(
+                    "- `{}` `{}` for bait `{}` at line `{}`: {}.",
+                    inline_code(&action.method),
+                    inline_code(&report_target(&action.path)),
+                    inline_code(&action.bait_id.0),
+                    action.event_ref.line_number,
+                    unconfirmed_action_reason(action)
+                ),
+            );
         }
     }
 
-    writeln!(report, "\n## Policy Actions").expect("writing to string should not fail");
+    push_line(&mut report, format_args!("\n## Policy Actions"));
     if bundle.policy_events.is_empty() {
-        writeln!(report, "- No policy action events recorded.")
-            .expect("writing to string should not fail");
+        push_line(
+            &mut report,
+            format_args!("- No policy action events recorded."),
+        );
     } else {
-        writeln!(
-            report,
-            "| Line | Kind | Policy State | Decision | Status | Reason |"
-        )
-        .expect("writing to string should not fail");
-        writeln!(report, "| --- | --- | --- | --- | --- | --- |")
-            .expect("writing to string should not fail");
+        push_line(
+            &mut report,
+            format_args!("| Line | Kind | Policy State | Decision | Status | Reason |"),
+        );
+        push_line(
+            &mut report,
+            format_args!("| --- | --- | --- | --- | --- | --- |"),
+        );
         for event in &bundle.policy_events {
-            writeln!(
-                report,
-                "| {} | `{}` | `{}` | {} | {} | {} |",
-                event.event_ref.line_number,
-                snake_case_debug(&event.kind),
-                snake_case_debug(&event.policy_state),
-                optional_decision(event.routing_decision),
-                optional_status(event.status),
-                optional_reason(event.reason.as_deref())
-            )
-            .expect("writing to string should not fail");
+            push_line(
+                &mut report,
+                format_args!(
+                    "| {} | `{}` | `{}` | {} | {} | {} |",
+                    event.event_ref.line_number,
+                    snake_case_debug(&event.kind),
+                    snake_case_debug(&event.policy_state),
+                    optional_decision(event.routing_decision),
+                    optional_status(event.status),
+                    optional_reason(event.reason.as_deref())
+                ),
+            );
         }
     }
 
@@ -140,81 +157,92 @@ pub fn render_evidence_markdown(timeline: &SessionTimeline, bundle: &EvidenceBun
 fn render_metric_summary(timeline: &SessionTimeline, bundle: &EvidenceBundle, report: &mut String) {
     let summary = trace_metric_summary_for_timeline(timeline, bundle);
 
-    writeln!(report, "\n## Metrics Summary").expect("writing to string should not fail");
-    writeln!(report, "| Metric | Value |").expect("writing to string should not fail");
-    writeln!(report, "| --- | --- |").expect("writing to string should not fail");
-    writeln!(
+    push_line(report, format_args!("\n## Metrics Summary"));
+    push_line(report, format_args!("| Metric | Value |"));
+    push_line(report, format_args!("| --- | --- |"));
+    push_line(
         report,
-        "| `time_to_first_bait_action_seconds` | {} |",
-        optional_seconds(summary.time_to_first_bait_action_seconds)
-    )
-    .expect("writing to string should not fail");
-    writeln!(
+        format_args!(
+            "| `time_to_first_bait_action_seconds` | {} |",
+            optional_seconds(summary.time_to_first_bait_action_seconds)
+        ),
+    );
+    push_line(
         report,
-        "| `bait_follow_rate` | `{:.3}` |",
-        summary.bait_follow_rate
-    )
-    .expect("writing to string should not fail");
-    writeln!(
+        format_args!("| `bait_follow_rate` | `{:.3}` |", summary.bait_follow_rate),
+    );
+    push_line(
         report,
-        "| `trace_confidence_score` | `{}` |",
-        summary.trace_confidence_score
-    )
-    .expect("writing to string should not fail");
-    writeln!(
+        format_args!(
+            "| `trace_confidence_score` | `{}` |",
+            summary.trace_confidence_score
+        ),
+    );
+    push_line(
         report,
-        "| `real_surface_requests_after_containment` | {} |",
-        optional_usize(summary.real_surface_requests_after_containment)
-    )
-    .expect("writing to string should not fail");
-    writeln!(
+        format_args!(
+            "| `real_surface_requests_after_containment` | {} |",
+            optional_usize(summary.real_surface_requests_after_containment)
+        ),
+    );
+    push_line(
         report,
-        "| `controlled_reality_dwell_seconds` | {} |",
-        optional_seconds(summary.controlled_reality_dwell_seconds)
-    )
-    .expect("writing to string should not fail");
-    writeln!(
+        format_args!(
+            "| `controlled_reality_dwell_seconds` | {} |",
+            optional_seconds(summary.controlled_reality_dwell_seconds)
+        ),
+    );
+    push_line(
         report,
-        "| `controlled_reality_action_depth` | `{}` |",
-        summary.controlled_reality_action_depth
-    )
-    .expect("writing to string should not fail");
-    writeln!(
+        format_args!(
+            "| `controlled_reality_action_depth` | `{}` |",
+            summary.controlled_reality_action_depth
+        ),
+    );
+    push_line(
         report,
-        "| `controlled_reality_branch_count` | `{}` |",
-        summary.controlled_reality_branch_count
-    )
-    .expect("writing to string should not fail");
+        format_args!(
+            "| `controlled_reality_branch_count` | `{}` |",
+            summary.controlled_reality_branch_count
+        ),
+    );
 }
 
 pub fn render_replay_view(timeline: &SessionTimeline, bundle: &EvidenceBundle) -> String {
     let mut replay = String::new();
 
-    writeln!(replay, "\n## Replay").expect("writing to string should not fail");
-    writeln!(
-        replay,
-        "| Line | Order | Time | Source | Policy | Event | Summary |"
-    )
-    .expect("writing to string should not fail");
-    writeln!(replay, "| --- | --- | --- | --- | --- | --- | --- |")
-        .expect("writing to string should not fail");
+    push_line(&mut replay, format_args!("\n## Replay"));
+    push_line(
+        &mut replay,
+        format_args!("| Line | Order | Time | Source | Policy | Event | Summary |"),
+    );
+    push_line(
+        &mut replay,
+        format_args!("| --- | --- | --- | --- | --- | --- | --- |"),
+    );
 
     for event in &timeline.events {
-        writeln!(
-            replay,
-            "| {} | {} | `{}` | `{}` | `{}` | `{}` | {} |",
-            event.line_number,
-            event.file_order,
-            event.event.observed_at.to_rfc3339(),
-            snake_case_debug(&event.event.source),
-            snake_case_debug(&event.event.policy_state),
-            event_kind_name(&event.event.kind),
-            replay_summary(event, bundle)
-        )
-        .expect("writing to string should not fail");
+        push_line(
+            &mut replay,
+            format_args!(
+                "| {} | {} | `{}` | `{}` | `{}` | `{}` | {} |",
+                event.line_number,
+                event.file_order,
+                event.event.observed_at.to_rfc3339(),
+                snake_case_debug(&event.event.source),
+                snake_case_debug(&event.event.policy_state),
+                event_kind_name(&event.event.kind),
+                replay_summary(event, bundle)
+            ),
+        );
     }
 
     replay
+}
+
+fn push_line(buffer: &mut String, args: std::fmt::Arguments<'_>) {
+    let _ = buffer.write_fmt(args);
+    buffer.push('\n');
 }
 
 pub fn edge_decision_export_for_timeline(
