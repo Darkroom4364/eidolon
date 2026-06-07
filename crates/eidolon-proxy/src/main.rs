@@ -1722,7 +1722,33 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let path = normalized_event_path(&request)?;
     let surface_request = surface_request_meta(&request, &path);
     let session = effective_session_context(runtime, &request, &surface_request);
-    let policy_state = policy_state_for_session(runtime, session.session_id)?;
+    let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
+    if intervention_mode.interventions_enabled() {
+        if let Some(transition) = policy::transition_to_suspicious_from_ingress_signals(
+            policy_state,
+            &surface_request.path,
+            &runtime.trusted_bait_soften_path_prefixes,
+            &session.ingress_identity,
+            &session.ingress_signals,
+        ) {
+            write_debug(
+                runtime,
+                "policy_transition_selected",
+                Some(session.session_id),
+                json!({
+                    "from": transition.from,
+                    "to": transition.to,
+                    "reason": transition.reason.as_str(),
+                }),
+            )?;
+            set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+            write_event(
+                &runtime.event_log,
+                &policy::policy_changed_event(session.session_id, &transition),
+            )?;
+            policy_state = transition.to;
+        }
+    }
     write_debug(
         runtime,
         "request_received",
@@ -5544,6 +5570,127 @@ mod tests {
         assert_eq!(
             request_debug["fields"]["ingress_signals"]["vendor_score"],
             12
+        );
+    }
+
+    #[test]
+    fn runtime_promotes_low_score_agentic_discovery_request_to_suspicious() {
+        let event_log_path = unique_temp_path("suspicious-discovery-events.jsonl");
+        let debug_log_path = unique_temp_path("suspicious-discovery-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("suspicious-discovery-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
+                    (
+                        session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                        "automation_likelihood_inverse",
+                    ),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        assert!(
+            upstream_handle.join().is_ok(),
+            "upstream thread should join"
+        );
+        let Ok(body) = String::from_utf8(response.body) else {
+            panic!("body should be utf8");
+        };
+
+        assert_eq!(response.status, 200);
+        assert!(body.contains("/docs/legacy-import"));
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["policy_state"], "suspicious");
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "authenticated ingress advisory signals promoted discovery request to suspicious"
+            )));
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+    }
+
+    #[test]
+    fn trusted_identity_is_not_promoted_to_suspicious_by_low_score_discovery_request() {
+        let event_log_path = unique_temp_path("trusted-low-score-discovery-events.jsonl");
+        let debug_log_path = unique_temp_path("trusted-low-score-discovery-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("trusted-low-score-discovery-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+                    (session::INGRESS_IDENTITY_LABEL_HEADER_NAME, "signed-agent"),
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
+                    (
+                        session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                        "automation_likelihood_inverse",
+                    ),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        assert!(
+            upstream_handle.join().is_ok(),
+            "upstream thread should join"
+        );
+        let Ok(body) = String::from_utf8(response.body) else {
+            panic!("body should be utf8");
+        };
+
+        assert_eq!(response.status, 200);
+        assert_eq!(body, original);
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["policy_state"], "observe");
+        assert_event_type_absent(&event_log_path, "policy_changed");
+        assert_policy_decision_reason_contains(
+            &event_log_path,
+            "trusted ingress identity suppressed bait surface intervention",
+        );
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            true
         );
     }
 

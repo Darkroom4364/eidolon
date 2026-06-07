@@ -124,9 +124,12 @@ The current M5 slice is intentionally narrow:
 
 - authenticated advisory ingress signals are now first-class request-audit data
 - those signals remain separate from ingress identity and from runtime evidence
-- reports now surface the latest advisory ingress signal summary
-- automatic policy changes still do not trigger on vendor score or edge hints
-  alone
+- reports and edge-decision export now preserve the latest authenticated
+  advisory ingress signal snapshot when present
+- one conservative `observe -> suspicious` promotion now exists for authenticated
+  discovery-surface requests that combine a low inverse vendor score with an
+  explicitly agentic actor kind, while stronger trusted identities still keep
+  their low-confidence bait-softening behavior
 
 That keeps the current containment invariants stable while giving `#175` a
 typed signal plane to build on.
