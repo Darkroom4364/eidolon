@@ -27,11 +27,14 @@ This contract covers:
 4. adapter examples
 
 This contract does not require Eidolon to implement every field immediately.
-The current runtime consumes only the normalized ingress identity subset plus
+The current runtime enforces only the normalized ingress identity subset plus
 local trust config, and it accepts explicit edge-provided identity only when a
-trusted adapter also supplies the configured transport-auth secret. Richer
-score and attestation fields are specified here so future adapters do not fork
-the schema.
+trusted adapter also supplies the configured transport-auth secret. It now also
+captures authenticated advisory ingress signal fields into request audit events,
+includes them in outbound edge-decision export when present, but those fields
+remain advisory rather than direct enforcement inputs. Richer score and
+attestation fields are specified here so future adapters do not fork the
+schema.
 
 ## Design Principles
 
@@ -165,7 +168,7 @@ transport-auth header is not part of the identity model; it is a transport-only
 attestation check that must match the proxy's configured shared secret before
 the explicit identity is trusted.
 
-Reserved but not yet consumed by the runtime:
+Reserved and now captured in authenticated request audit events:
 
 - `X-Eidolon-Ingress-Verification-Strength`
 - `X-Eidolon-Ingress-Actor-Kind`
@@ -274,6 +277,17 @@ Conceptual JSON shape:
     "trust_tier": "signed_attested",
     "label": "operator.openai.com"
   },
+  "ingress_signals": {
+    "verification_strength": "cryptographic",
+    "actor_kind": "agentic_browser",
+    "verified_category": "AI Assistant",
+    "attestation_ref": "jkt:sha256:ba3e64",
+    "vendor_score": 12,
+    "vendor_score_kind": "automation_likelihood_inverse",
+    "vendor_score_scale": "1-99",
+    "detection_ids": ["3355446"],
+    "edge_action": "allow"
+  },
   "policy": {
     "state": "observe",
     "routing_decision": "protected_upstream",
@@ -297,6 +311,7 @@ Minimum outbound fields:
 - `session_id`
 - request method/path
 - normalized ingress identity
+- latest authenticated advisory ingress signals when present
 - Eidolon policy state
 - routing decision
 - human-readable reason
@@ -408,6 +423,11 @@ collapsed directly into Eidolon trust tiers without adapter-specific policy.
 Today the proxy supports:
 
 - normalized ingress identity headers
+- authenticated request-audit capture of advisory ingress signals such as
+  verification strength, actor kind, vendor score, detection IDs, and edge
+  action hints
+- outbound edge-decision export that preserves normalized ingress identity plus
+  the latest authenticated advisory ingress signals when present
 - local trust config
 - precedence merging between explicit and local trust
 - trusted bait-softening on configured path prefixes
@@ -415,9 +435,9 @@ Today the proxy supports:
 
 It does not yet support:
 
-- direct parsing of vendor score headers
-- direct parsing of attestation references
-- outbound webhook/SIEM export of this contract
+- automatic push delivery of webhook/SIEM export directly from the proxy runtime
+- automatic enforcement that interprets attestation references
+- automatic enforcement on vendor score, detection IDs, or edge action hints
 - automatic vendor adapters
 
 Those should land after this document, not before it.

@@ -18,6 +18,8 @@ spec:
             - $(EIDOLON_EVENT_LOG_PATH)
             - --debug-log
             - $(EIDOLON_DEBUG_LOG_PATH)
+            - --bait-profile
+            - /etc/eidolon/bait-profile.json
             - --intervention-control
             - $(EIDOLON_INTERVENTION_CONTROL_PATH)
             - --policy-state
