@@ -26,6 +26,7 @@ This note is the operational companion to:
 Runtime support:
 
 - normalized ingress identity headers
+- authenticated request-audit capture of advisory ingress signal headers
 - transport-auth gate for explicit edge-provided identity
 - local trust config
 - precedence merging between explicit and local trust
@@ -36,6 +37,7 @@ Relevant code:
 - [crates/eidolon-proxy/src/session.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-proxy/src/session.rs)
 - [crates/eidolon-proxy/src/ingress_identity.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-proxy/src/ingress_identity.rs)
 - [crates/eidolon-proxy/src/main.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-proxy/src/main.rs)
+- [examples/shield-lab/deploy-orbstack.sh](/Users/darkroom/Projects/eidolon/examples/shield-lab/deploy-orbstack.sh)
 
 ### Edge adapters
 
@@ -131,6 +133,14 @@ examples/shield-lab/export-edge-decisions-orbstack.sh \
 This is the current concrete M4 answer to "webhook/SIEM/WAF export" in the
 public repo. It is a session-snapshot poller, not yet a cursor-based event
 stream.
+
+For deployment-side stress variation, the OrbStack deploy script now accepts
+`EIDOLON_SHIELD_BAIT_PROFILE_PATH`, refreshes a cluster-local bait-profile
+ConfigMap, patches the proxy pod template with the selected profile digest, and
+waits for rollout status. That lets operators rerun the same external `pwnkit`
+validation path against different Shield-side bait semantics without modifying
+the scanner itself or guessing whether the live proxy has picked up the new
+profile yet.
 
 ## Kali Validation Path
 

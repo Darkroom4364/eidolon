@@ -1,5 +1,8 @@
 use chrono::{DateTime, Utc};
-use eidolon_core::{IngressIdentity, IngressIdentitySource, IngressTrustTier, SessionId};
+use eidolon_core::{
+    EdgeRecommendedAction, IngressActorKind, IngressAdvisorySignals, IngressIdentity,
+    IngressIdentitySource, IngressTrustTier, IngressVerificationStrength, SessionId,
+};
 
 /// Request header carrying first-party cookies.
 pub const COOKIE_HEADER_NAME: &str = "Cookie";
@@ -34,6 +37,16 @@ pub const INGRESS_TRUST_TIER_HEADER_NAME: &str = "X-Eidolon-Ingress-Trust-Tier";
 pub const INGRESS_IDENTITY_LABEL_HEADER_NAME: &str = "X-Eidolon-Ingress-Identity-Label";
 pub const INGRESS_IDENTITY_EXPIRES_AT_HEADER_NAME: &str = "X-Eidolon-Ingress-Identity-Expires-At";
 pub const INGRESS_TRANSPORT_AUTH_HEADER_NAME: &str = "X-Eidolon-Ingress-Transport-Auth";
+pub const INGRESS_VERIFICATION_STRENGTH_HEADER_NAME: &str =
+    "X-Eidolon-Ingress-Verification-Strength";
+pub const INGRESS_ACTOR_KIND_HEADER_NAME: &str = "X-Eidolon-Ingress-Actor-Kind";
+pub const INGRESS_VERIFIED_CATEGORY_HEADER_NAME: &str = "X-Eidolon-Ingress-Verified-Category";
+pub const INGRESS_ATTESTATION_REF_HEADER_NAME: &str = "X-Eidolon-Ingress-Attestation-Ref";
+pub const INGRESS_VENDOR_SCORE_HEADER_NAME: &str = "X-Eidolon-Ingress-Vendor-Score";
+pub const INGRESS_VENDOR_SCORE_KIND_HEADER_NAME: &str = "X-Eidolon-Ingress-Vendor-Score-Kind";
+pub const INGRESS_VENDOR_SCORE_SCALE_HEADER_NAME: &str = "X-Eidolon-Ingress-Vendor-Score-Scale";
+pub const INGRESS_DETECTION_IDS_HEADER_NAME: &str = "X-Eidolon-Ingress-Detection-Ids";
+pub const INGRESS_EDGE_ACTION_HEADER_NAME: &str = "X-Eidolon-Ingress-Edge-Action";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionSource {
@@ -52,6 +65,7 @@ pub struct SessionContext {
     pub session_id: SessionId,
     pub source: SessionSource,
     pub ingress_identity: IngressIdentity,
+    pub ingress_signals: IngressAdvisorySignals,
 }
 
 impl SessionContext {
@@ -86,6 +100,11 @@ where
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
     );
+    let ingress_signals = ingress_advisory_signals_from_headers(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
 
     if let Some(session_id) = session_id_from_headers(
         headers
@@ -96,12 +115,14 @@ where
             session_id,
             source: SessionSource::Cookie,
             ingress_identity,
+            ingress_signals,
         }
     } else {
         SessionContext {
             session_id: SessionId::new(),
             source: SessionSource::Generated,
             ingress_identity,
+            ingress_signals,
         }
     }
 }
@@ -147,6 +168,51 @@ where
     }
 }
 
+/// Return normalized advisory ingress signals from explicit Eidolon headers.
+///
+/// These signals are kept separate from normalized ingress identity so runtime
+/// policy can treat verification, score, and edge hints as advisory inputs
+/// instead of identity or proof.
+pub fn ingress_advisory_signals_from_headers<I, N, V>(headers: I) -> IngressAdvisorySignals
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
+    let mut signals = IngressAdvisorySignals::default();
+
+    for (name, value) in headers {
+        let name = name.as_ref();
+        let value = value.as_ref().trim();
+
+        if name.eq_ignore_ascii_case(INGRESS_VERIFICATION_STRENGTH_HEADER_NAME) {
+            if let Some(parsed) = parse_ingress_verification_strength(value) {
+                signals.verification_strength = parsed;
+            }
+        } else if name.eq_ignore_ascii_case(INGRESS_ACTOR_KIND_HEADER_NAME) {
+            if let Some(parsed) = parse_ingress_actor_kind(value) {
+                signals.actor_kind = parsed;
+            }
+        } else if name.eq_ignore_ascii_case(INGRESS_VERIFIED_CATEGORY_HEADER_NAME) {
+            signals.verified_category = parse_non_empty_header(value);
+        } else if name.eq_ignore_ascii_case(INGRESS_ATTESTATION_REF_HEADER_NAME) {
+            signals.attestation_ref = parse_non_empty_header(value);
+        } else if name.eq_ignore_ascii_case(INGRESS_VENDOR_SCORE_HEADER_NAME) {
+            signals.vendor_score = value.parse().ok();
+        } else if name.eq_ignore_ascii_case(INGRESS_VENDOR_SCORE_KIND_HEADER_NAME) {
+            signals.vendor_score_kind = parse_non_empty_header(value);
+        } else if name.eq_ignore_ascii_case(INGRESS_VENDOR_SCORE_SCALE_HEADER_NAME) {
+            signals.vendor_score_scale = parse_non_empty_header(value);
+        } else if name.eq_ignore_ascii_case(INGRESS_DETECTION_IDS_HEADER_NAME) {
+            signals.detection_ids = parse_detection_ids(value);
+        } else if name.eq_ignore_ascii_case(INGRESS_EDGE_ACTION_HEADER_NAME) {
+            signals.edge_action = parse_edge_recommended_action(value);
+        }
+    }
+
+    signals
+}
+
 /// Return a normalized ingress identity only when the transport-auth header
 /// matches the configured shared secret.
 ///
@@ -180,6 +246,42 @@ where
     }
 
     ingress_identity_from_headers(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    )
+}
+
+/// Return normalized advisory ingress signals only when the transport-auth
+/// header matches the configured shared secret.
+pub fn authenticated_ingress_advisory_signals_from_headers<I, N, V>(
+    headers: I,
+    shared_secret: Option<&str>,
+) -> IngressAdvisorySignals
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
+    let Some(shared_secret) = shared_secret
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return IngressAdvisorySignals::default();
+    };
+
+    let headers: Vec<(String, String)> = headers
+        .into_iter()
+        .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
+        .collect();
+    let authenticated = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case(INGRESS_TRANSPORT_AUTH_HEADER_NAME) && value == shared_secret
+    });
+    if !authenticated {
+        return IngressAdvisorySignals::default();
+    }
+
+    ingress_advisory_signals_from_headers(
         headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
@@ -252,6 +354,55 @@ fn parse_ingress_trust_tier(value: &str) -> Option<IngressTrustTier> {
     })
 }
 
+fn parse_ingress_verification_strength(value: &str) -> Option<IngressVerificationStrength> {
+    Some(match value {
+        "none" => IngressVerificationStrength::None,
+        "low" => IngressVerificationStrength::Low,
+        "medium" => IngressVerificationStrength::Medium,
+        "high" => IngressVerificationStrength::High,
+        "cryptographic" => IngressVerificationStrength::Cryptographic,
+        _ => return None,
+    })
+}
+
+fn parse_ingress_actor_kind(value: &str) -> Option<IngressActorKind> {
+    Some(match value {
+        "unknown" => IngressActorKind::Unknown,
+        "crawler" => IngressActorKind::Crawler,
+        "assistant" => IngressActorKind::Assistant,
+        "autonomous_agent" => IngressActorKind::AutonomousAgent,
+        "agentic_browser" => IngressActorKind::AgenticBrowser,
+        "partner_automation" => IngressActorKind::PartnerAutomation,
+        "internal_scanner" => IngressActorKind::InternalScanner,
+        _ => return None,
+    })
+}
+
+fn parse_edge_recommended_action(value: &str) -> Option<EdgeRecommendedAction> {
+    Some(match value {
+        "allow" => EdgeRecommendedAction::Allow,
+        "observe" => EdgeRecommendedAction::Observe,
+        "rate_limit" => EdgeRecommendedAction::RateLimit,
+        "challenge" => EdgeRecommendedAction::Challenge,
+        "block" => EdgeRecommendedAction::Block,
+        "preserve_eidolon_routing" => EdgeRecommendedAction::PreserveEidolonRouting,
+        _ => return None,
+    })
+}
+
+fn parse_non_empty_header(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn parse_detection_ids(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -272,6 +423,7 @@ mod tests {
         assert_eq!(context.session_id, expected);
         assert_eq!(context.source, SessionSource::Cookie);
         assert_eq!(context.ingress_identity, IngressIdentity::default());
+        assert_eq!(context.ingress_signals, IngressAdvisorySignals::default());
         assert!(!context.should_set_cookie());
         assert_eq!(context.set_cookie_value(), None);
     }
@@ -282,6 +434,7 @@ mod tests {
 
         assert_eq!(context.source, SessionSource::Generated);
         assert_eq!(context.ingress_identity, IngressIdentity::default());
+        assert_eq!(context.ingress_signals, IngressAdvisorySignals::default());
         assert!(context.should_set_cookie());
         assert_eq!(
             context.set_cookie_value(),
@@ -296,6 +449,7 @@ mod tests {
 
         assert_eq!(context.source, SessionSource::Generated);
         assert_eq!(context.ingress_identity, IngressIdentity::default());
+        assert_eq!(context.ingress_signals, IngressAdvisorySignals::default());
         assert!(context.should_set_cookie());
     }
 
@@ -315,6 +469,7 @@ mod tests {
         assert_eq!(context.session_id, expected);
         assert_eq!(context.source, SessionSource::Cookie);
         assert_eq!(context.ingress_identity, IngressIdentity::default());
+        assert_eq!(context.ingress_signals, IngressAdvisorySignals::default());
         assert!(!context.should_set_cookie());
     }
 
@@ -374,6 +529,7 @@ mod tests {
                 ),
             }
         );
+        assert_eq!(context.ingress_signals, IngressAdvisorySignals::default());
     }
 
     #[test]
@@ -389,6 +545,53 @@ mod tests {
 
         assert_eq!(missing_tier, IngressIdentity::default());
         assert_eq!(invalid_tier, IngressIdentity::default());
+    }
+
+    #[test]
+    fn derives_advisory_ingress_signals_from_headers() {
+        let context = derive_session_from_headers([
+            ("Host", "proxy.local"),
+            (INGRESS_VERIFICATION_STRENGTH_HEADER_NAME, "cryptographic"),
+            (INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (INGRESS_VERIFIED_CATEGORY_HEADER_NAME, "AI Assistant"),
+            (INGRESS_ATTESTATION_REF_HEADER_NAME, "jkt:sha256:ba3e64"),
+            (INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
+            (
+                INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (INGRESS_VENDOR_SCORE_SCALE_HEADER_NAME, "1-99"),
+            (INGRESS_DETECTION_IDS_HEADER_NAME, "3355446, 445566"),
+            (INGRESS_EDGE_ACTION_HEADER_NAME, "allow"),
+        ]);
+
+        assert_eq!(
+            context.ingress_signals,
+            IngressAdvisorySignals {
+                verification_strength: IngressVerificationStrength::Cryptographic,
+                actor_kind: IngressActorKind::AgenticBrowser,
+                verified_category: Some("AI Assistant".to_string()),
+                attestation_ref: Some("jkt:sha256:ba3e64".to_string()),
+                vendor_score: Some(12),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                vendor_score_scale: Some("1-99".to_string()),
+                detection_ids: vec!["3355446".to_string(), "445566".to_string()],
+                edge_action: Some(EdgeRecommendedAction::Allow),
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_advisory_ingress_signals() {
+        let signals = ingress_advisory_signals_from_headers([
+            (INGRESS_VERIFICATION_STRENGTH_HEADER_NAME, "very-real"),
+            (INGRESS_ACTOR_KIND_HEADER_NAME, "definitely-normal"),
+            (INGRESS_VENDOR_SCORE_HEADER_NAME, "not-a-number"),
+            (INGRESS_EDGE_ACTION_HEADER_NAME, "permit"),
+            (INGRESS_DETECTION_IDS_HEADER_NAME, " , "),
+        ]);
+
+        assert_eq!(signals, IngressAdvisorySignals::default());
     }
 
     #[test]
@@ -413,5 +616,35 @@ mod tests {
         assert_eq!(identity.source, IngressIdentitySource::SignedAgent);
         assert_eq!(identity.trust_tier, IngressTrustTier::SignedAttested);
         assert_eq!(identity.label.as_deref(), Some("edge-signed-agent"));
+    }
+
+    #[test]
+    fn authenticated_ingress_signals_require_matching_transport_secret() {
+        let headers = [
+            (INGRESS_VERIFICATION_STRENGTH_HEADER_NAME, "high"),
+            (INGRESS_ACTOR_KIND_HEADER_NAME, "crawler"),
+            (INGRESS_VENDOR_SCORE_HEADER_NAME, "91"),
+            (INGRESS_EDGE_ACTION_HEADER_NAME, "observe"),
+            (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        assert_eq!(
+            authenticated_ingress_advisory_signals_from_headers(headers, None),
+            IngressAdvisorySignals::default()
+        );
+        assert_eq!(
+            authenticated_ingress_advisory_signals_from_headers(headers, Some("wrong-secret")),
+            IngressAdvisorySignals::default()
+        );
+
+        let signals =
+            authenticated_ingress_advisory_signals_from_headers(headers, Some("edge-secret"));
+        assert_eq!(
+            signals.verification_strength,
+            IngressVerificationStrength::High
+        );
+        assert_eq!(signals.actor_kind, IngressActorKind::Crawler);
+        assert_eq!(signals.vendor_score, Some(91));
+        assert_eq!(signals.edge_action, Some(EdgeRecommendedAction::Observe));
     }
 }

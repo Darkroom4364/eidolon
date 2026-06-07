@@ -126,6 +126,58 @@ pub struct IngressIdentity {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressVerificationStrength {
+    #[default]
+    None,
+    Low,
+    Medium,
+    High,
+    Cryptographic,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressActorKind {
+    #[default]
+    Unknown,
+    Crawler,
+    Assistant,
+    AutonomousAgent,
+    AgenticBrowser,
+    PartnerAutomation,
+    InternalScanner,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngressAdvisorySignals {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub verification_strength: IngressVerificationStrength,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub actor_kind: IngressActorKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor_score: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor_score_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor_score_scale: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detection_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_action: Option<EdgeRecommendedAction>,
+}
+
+impl IngressAdvisorySignals {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
@@ -135,6 +187,8 @@ pub enum EventKind {
         safe_headers: Vec<SafeHeaderObservation>,
         #[serde(default)]
         ingress_identity: IngressIdentity,
+        #[serde(default, skip_serializing_if = "IngressAdvisorySignals::is_empty")]
+        ingress_signals: IngressAdvisorySignals,
         routing_decision: RoutingDecision,
     },
     ResponseServed {
@@ -278,9 +332,18 @@ pub struct EidolonEdgeDecisionExport {
     pub session_id: SessionId,
     pub request: EdgeRequestRef,
     pub ingress_identity: IngressIdentity,
+    #[serde(default, skip_serializing_if = "IngressAdvisorySignals::is_empty")]
+    pub ingress_signals: IngressAdvisorySignals,
     pub policy: EdgePolicySnapshot,
     pub evidence: EdgeEvidenceRef,
     pub edge_recommendation: EdgeRecommendation,
+}
+
+fn is_default<T>(value: &T) -> bool
+where
+    T: Default + PartialEq,
+{
+    value == &T::default()
 }
 
 #[cfg(test)]
@@ -316,6 +379,7 @@ mod tests {
                     present: true,
                 }],
                 ingress_identity: IngressIdentity::default(),
+                ingress_signals: IngressAdvisorySignals::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         );
@@ -370,6 +434,17 @@ mod tests {
                     label: Some("googlebot".to_string()),
                     expires_at: None,
                 },
+                ingress_signals: IngressAdvisorySignals {
+                    verification_strength: IngressVerificationStrength::High,
+                    actor_kind: IngressActorKind::Crawler,
+                    verified_category: Some("AI Assistant".to_string()),
+                    attestation_ref: None,
+                    vendor_score: Some(12),
+                    vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                    vendor_score_scale: Some("1-99".to_string()),
+                    detection_ids: vec!["3355446".to_string()],
+                    edge_action: Some(EdgeRecommendedAction::Allow),
+                },
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         );
@@ -385,6 +460,19 @@ mod tests {
             "edge_verified"
         );
         assert_eq!(serialized["kind"]["ingress_identity"]["label"], "googlebot");
+        assert_eq!(
+            serialized["kind"]["ingress_signals"]["verification_strength"],
+            "high"
+        );
+        assert_eq!(
+            serialized["kind"]["ingress_signals"]["actor_kind"],
+            "crawler"
+        );
+        assert_eq!(serialized["kind"]["ingress_signals"]["vendor_score"], 12);
+        assert_eq!(
+            serialized["kind"]["ingress_signals"]["edge_action"],
+            "allow"
+        );
     }
 
     #[test]
@@ -412,6 +500,39 @@ mod tests {
             EventKind::RequestSeen {
                 ingress_identity, ..
             } => assert_eq!(ingress_identity, IngressIdentity::default()),
+            other => panic!("expected request_seen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_seen_event_deserializes_without_ingress_signals() {
+        let session_id = SessionId::new();
+        let event = json!({
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "id": Uuid::new_v4(),
+            "session_id": session_id,
+            "observed_at": Utc::now(),
+            "source": "proxy",
+            "policy_state": "observe",
+            "kind": {
+                "type": "request_seen",
+                "method": "GET",
+                "path": "/openapi.json",
+                "safe_headers": [],
+                "ingress_identity": {
+                    "source": "verified_bot",
+                    "trust_tier": "edge_verified"
+                },
+                "routing_decision": "protected_upstream"
+            }
+        });
+
+        let parsed: Event = must_ok(serde_json::from_value(event), "legacy event should parse");
+
+        match parsed.kind {
+            EventKind::RequestSeen {
+                ingress_signals, ..
+            } => assert_eq!(ingress_signals, IngressAdvisorySignals::default()),
             other => panic!("expected request_seen, got {other:?}"),
         }
     }
@@ -500,6 +621,17 @@ mod tests {
                 label: Some("googlebot".to_string()),
                 expires_at: None,
             },
+            ingress_signals: IngressAdvisorySignals {
+                verification_strength: IngressVerificationStrength::High,
+                actor_kind: IngressActorKind::Crawler,
+                verified_category: Some("Search Engine".to_string()),
+                attestation_ref: None,
+                vendor_score: Some(12),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                vendor_score_scale: Some("1-99".to_string()),
+                detection_ids: vec!["3355446".to_string()],
+                edge_action: Some(EdgeRecommendedAction::Allow),
+            },
             policy: EdgePolicySnapshot {
                 state: PolicyState::Observe,
                 routing_decision: RoutingDecision::ProtectedUpstream,
@@ -528,5 +660,7 @@ mod tests {
             serialized["ingress_identity"]["trust_tier"],
             json!("edge_verified")
         );
+        assert_eq!(serialized["ingress_signals"]["vendor_score"], json!(12));
+        assert_eq!(serialized["ingress_signals"]["edge_action"], json!("allow"));
     }
 }

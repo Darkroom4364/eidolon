@@ -92,6 +92,19 @@ This writes:
 - `/tmp/eidolon-m4-orbstack/run-1/pwnkit-summary.json`
 - `/tmp/eidolon-m4-orbstack/pwnkit-stability-sample.json`
 
+To stress the same `pwnkit` runner against different Shield-side bait
+semantics, redeploy the host-side shield with a different bait profile before
+running the Kali sample:
+
+```sh
+EIDOLON_SHIELD_BAIT_PROFILE_PATH=examples/m3/bait-profiles/openapi-promotion-probe.json \
+examples/shield-lab/deploy-orbstack.sh
+```
+
+That deploy step waits for the proxy rollout tied to the new profile digest.
+Then rerun the same Kali wrapper and compare the host-side evidence bundle,
+edge-decision export, and redacted `pwnkit` summaries across profiles.
+
 ## Host-Side Evidence Export
 
 After the Kali run finishes, export host-side cluster evidence and then copy

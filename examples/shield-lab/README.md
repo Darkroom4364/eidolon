@@ -187,6 +187,29 @@ Deploy to the active OrbStack Kubernetes context:
 examples/shield-lab/deploy-orbstack.sh
 ```
 
+To rotate Shield-side bait semantics without changing `pwnkit`, redeploy with
+an explicit bait profile:
+
+```sh
+EIDOLON_SHIELD_BAIT_PROFILE_PATH=examples/m3/bait-profiles/openapi-promotion-probe.json \
+examples/shield-lab/deploy-orbstack.sh
+```
+
+The default OrbStack deployment profile is:
+
+```text
+examples/shield-lab/bait-profiles/default-m3-catalog.json
+```
+
+That profile preserves the built-in M3 bait catalog while making deployment
+profile provenance explicit. This is the preferred way to make the same
+external scanner face harder or different bait semantics without drifting this
+repo into scanner development.
+
+The deploy script also patches the proxy pod template with the selected bait
+profile digest and waits for rollout status, so the next Kali run sees the
+profile you just selected instead of a stale mounted file.
+
 That applies the `k8s/orbstack` overlay, which adds a dedicated
 `NodePort` service named `eidolon-shield-edge` for the proxy while keeping the
 base manifests cluster-internal.
