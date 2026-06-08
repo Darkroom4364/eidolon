@@ -896,12 +896,13 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         controlled_reality: Arc::new(ControlledRealityResponder),
         surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
             Arc::clone(&bait_registry),
-            bait_content,
+            bait_content.clone(),
         )),
         ingress_identity_resolver: Arc::new(ingress_identity_resolver),
         ingress_transport_auth_secret,
         trusted_bait_soften_path_prefixes: config.trusted_bait_soften_path_prefixes,
         bait_registry,
+        bait_content,
         bait_exposures: Arc::new(Mutex::new(bait_exposures)),
     };
     write_debug(
@@ -962,6 +963,7 @@ struct ProxyRuntime {
     ingress_transport_auth_secret: Option<Arc<str>>,
     trusted_bait_soften_path_prefixes: Vec<String>,
     bait_registry: Arc<BaitRegistry>,
+    bait_content: BaitContentOverrides,
     bait_exposures: Arc<Mutex<BaitExposureStore>>,
 }
 
@@ -1809,7 +1811,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     }
 
     let decision = policy::decide_for_state(policy_state, intervention_mode);
-    let candidate_surface_action = if intervention_mode.interventions_enabled() {
+    let controller_surface_action = if intervention_mode.interventions_enabled() {
         match decision.routing_decision {
             RoutingDecision::ProtectedUpstream => {
                 runtime.surface_controller.decide(&surface_request)
@@ -1838,6 +1840,12 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     } else {
         SurfaceAction::ProtectedUpstream
     };
+    let candidate_surface_action = strengthen_surface_action_for_suspicious_discovery(
+        runtime,
+        decision.policy_state,
+        &surface_request,
+        controller_surface_action.clone(),
+    );
     let (surface_action, trusted_ingress_softening_reason) =
         maybe_soften_surface_action_for_trusted_ingress(
             &runtime.trusted_bait_soften_path_prefixes,
@@ -1863,6 +1871,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "policy_state": decision.policy_state,
             "policy_routing_decision": decision.routing_decision,
             "policy_reason": decision.reason.as_str(),
+            "controller_surface_action": debug_surface_action(&controller_surface_action),
             "candidate_surface_action": debug_surface_action(&candidate_surface_action),
             "surface_action": debug_surface_action(&surface_action),
             "surface_requested_intervention": surface_requested_intervention,
@@ -2388,7 +2397,40 @@ fn bait_exposure_for_direct_surface<'a>(
         return None;
     }
 
-    bait_registry.bait_for_surface(&surface_request.path)
+    bait_registry
+        .bait_for_surface(&surface_request.path)
+        .or_else(|| {
+            (policy_decision.policy_state == PolicyState::Suspicious
+                && surface_request.path == DOCS_DISCOVERY_TARGET)
+                .then(|| bait_registry.bait_for_class(BaitClass::Docs))
+                .flatten()
+        })
+}
+
+fn strengthen_surface_action_for_suspicious_discovery(
+    runtime: &ProxyRuntime,
+    policy_state: PolicyState,
+    surface_request: &SurfaceRequestMeta,
+    controller_surface_action: SurfaceAction,
+) -> SurfaceAction {
+    if policy_state != PolicyState::Suspicious
+        || surface_request.method != "GET"
+        || surface_request.path != DOCS_DISCOVERY_TARGET
+        || !matches!(
+            &controller_surface_action,
+            SurfaceAction::RewrittenUpstream { .. }
+        )
+    {
+        return controller_surface_action;
+    }
+
+    let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::Docs) else {
+        return controller_surface_action;
+    };
+
+    SurfaceAction::EidolonOwned {
+        response: bait_surface_response(bait, &runtime.bait_content),
+    }
 }
 
 fn upstream_request_decision(
@@ -3758,6 +3800,7 @@ mod tests {
             ingress_transport_auth_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
+            bait_content: BaitContentOverrides::default(),
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
         }
     }
@@ -3804,6 +3847,7 @@ mod tests {
             ingress_transport_auth_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
+            bait_content: BaitContentOverrides::default(),
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
         }
     }
@@ -3833,6 +3877,7 @@ mod tests {
             ingress_transport_auth_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
+            bait_content: BaitContentOverrides::default(),
             bait_exposures: Arc::new(Mutex::new(bait_exposures)),
         }
     }
@@ -3844,6 +3889,7 @@ mod tests {
         loaded_profile: LoadedBaitProfile,
     ) -> ProxyRuntime {
         let bait_registry = Arc::new(loaded_profile.registry);
+        let bait_content = loaded_profile.content;
         ProxyRuntime {
             upstream,
             event_log: Arc::new(Mutex::new(
@@ -3856,12 +3902,13 @@ mod tests {
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
                 Arc::clone(&bait_registry),
-                loaded_profile.content,
+                bait_content.clone(),
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
+            bait_content,
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
         }
     }
@@ -5577,10 +5624,11 @@ mod tests {
     fn runtime_promotes_low_score_agentic_discovery_request_to_suspicious() {
         let event_log_path = unique_temp_path("suspicious-discovery-events.jsonl");
         let debug_log_path = unique_temp_path("suspicious-discovery-debug.jsonl");
-        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
-        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
         let mut runtime = test_runtime_with_m1_controller_and_debug_log(
-            upstream,
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
             &event_log_path,
             &debug_log_path,
             unique_temp_path("suspicious-discovery-control.txt"),
@@ -5604,19 +5652,17 @@ mod tests {
                 ],
             ),
         ));
-        assert!(
-            upstream_handle.join().is_ok(),
-            "upstream thread should join"
-        );
         let Ok(body) = String::from_utf8(response.body) else {
             panic!("body should be utf8");
         };
 
         assert_eq!(response.status, 200);
-        assert!(body.contains("/docs/legacy-import"));
+        assert!(body.contains("X-Migration-Trace: rel_2025_04_b7f2"));
+        assert!(body.contains("POST /api/v2/import/reconcile"));
 
         let request_event = first_event_of_type(&event_log_path, "request_seen");
         assert_eq!(request_event["policy_state"], "suspicious");
+        assert_eq!(request_event["kind"]["routing_decision"], "eidolon_owned");
         let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
         assert_eq!(policy_changed["kind"]["from"], "observe");
         assert_eq!(policy_changed["kind"]["to"], "suspicious");
@@ -5625,9 +5671,24 @@ mod tests {
             .is_some_and(|reason| reason.contains(
                 "authenticated ingress advisory signals promoted discovery request to suspicious"
             )));
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert_eq!(bait_exposed["kind"]["surface"], "/docs");
 
         let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
         assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            surface_debug["fields"]["controller_surface_action"]["type"],
+            "rewritten_upstream"
+        );
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
         assert_eq!(
             surface_debug["fields"]["trusted_ingress_softened_surface"],
             false
