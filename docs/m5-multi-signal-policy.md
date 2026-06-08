@@ -130,6 +130,10 @@ The current M5 slice is intentionally narrow:
   discovery-surface requests that combine a low inverse vendor score with an
   explicitly agentic actor kind, while stronger trusted identities still keep
   their low-confidence bait-softening behavior
+- suspicious `GET /docs` discovery requests now receive an Eidolon-owned docs
+  bait surface instead of a rewritten upstream docs page, and that owned
+  response records a normal bait exposure so same-session causal correlation
+  still works while edge export recommends `preserve_eidolon_routing`
 
 That keeps the current containment invariants stable while giving `#175` a
 typed signal plane to build on.

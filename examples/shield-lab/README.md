@@ -247,8 +247,9 @@ examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
 
 The second smoke proves the first M5 graduated-enforcement slice: one
 authenticated advisory discovery request is promoted from `observe` to
-`suspicious`, stays baited, and exports the advisory signals in the edge
-decision contract.
+`suspicious`, stays baited, is served from an Eidolon-owned docs surface, and
+exports the advisory signals with a `preserve_eidolon_routing` edge
+recommendation.
 
 Create a `kind` cluster:
 
