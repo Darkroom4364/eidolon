@@ -13,13 +13,14 @@ write_fixture_state() {
 
   cat > "$dir/events.jsonl" <<'JSONL'
 {"schema_version":2,"id":"11111111-1111-1111-1111-111111111111","session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761","observed_at":"2026-06-07T14:54:37.546301637Z","source":"policy_router","policy_state":"suspicious","kind":{"type":"policy_changed","from":"observe","to":"suspicious","reason":"authenticated ingress advisory signals promoted discovery request to suspicious: path=/docs actor_kind=agentic_browser vendor_score=12 kind=automation_likelihood_inverse"}}
-{"schema_version":2,"id":"22222222-2222-2222-2222-222222222222","session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761","observed_at":"2026-06-07T14:54:37.546362804Z","source":"proxy","policy_state":"suspicious","kind":{"type":"request_seen","method":"GET","path":"/docs?topic=<redacted>","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":12,"vendor_score_kind":"automation_likelihood_inverse"},"routing_decision":"protected_upstream"}}
-{"schema_version":2,"id":"33333333-3333-3333-3333-333333333333","session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761","observed_at":"2026-06-07T14:54:37.547781103Z","source":"policy_router","policy_state":"suspicious","kind":{"type":"policy_decision","routing_decision":"rewritten_upstream","reason":"surface controller rewrote upstream response"}}
-{"schema_version":2,"id":"44444444-4444-4444-4444-444444444444","session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761","observed_at":"2026-06-07T14:54:37.547788353Z","source":"proxy","policy_state":"suspicious","kind":{"type":"response_served","status":200,"routing_decision":"rewritten_upstream"}}
+{"schema_version":2,"id":"22222222-2222-2222-2222-222222222222","session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761","observed_at":"2026-06-07T14:54:37.546362804Z","source":"proxy","policy_state":"suspicious","kind":{"type":"request_seen","method":"GET","path":"/docs?topic=<redacted>","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":12,"vendor_score_kind":"automation_likelihood_inverse"},"routing_decision":"eidolon_owned"}}
+{"schema_version":2,"id":"33333333-3333-3333-3333-333333333333","session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761","observed_at":"2026-06-07T14:54:37.547700000Z","source":"surface_controller","policy_state":"suspicious","kind":{"type":"bait_exposed","bait_id":"rel_2025_04_b7f2","exposure_id":"exp-1234","surface":"/docs"}}
+{"schema_version":2,"id":"44444444-4444-4444-4444-444444444444","session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761","observed_at":"2026-06-07T14:54:37.547781103Z","source":"policy_router","policy_state":"suspicious","kind":{"type":"policy_decision","routing_decision":"eidolon_owned","reason":"surface controller served eidolon-owned response"}}
+{"schema_version":2,"id":"55555555-5555-5555-5555-555555555555","session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761","observed_at":"2026-06-07T14:54:37.547788353Z","source":"proxy","policy_state":"suspicious","kind":{"type":"response_served","status":200,"routing_decision":"eidolon_owned"}}
 JSONL
 
   cat > "$dir/debug.jsonl" <<'JSONL'
-{"event":"surface_action_selected","fields":{"candidate_surface_action":{"plan":"html","type":"rewritten_upstream"},"policy_reason":"suspicious policy observes only and forwards to the protected upstream","policy_routing_decision":"protected_upstream","policy_state":"suspicious","surface_action":{"plan":"html","type":"rewritten_upstream"},"surface_requested_intervention":true,"trusted_bait_soften_path_prefixes":["/docs","/openapi.json"],"trusted_ingress_softened_surface":false,"trusted_ingress_softening_reason":null},"observed_at_unix_ms":1780844077546,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761"}
+{"event":"surface_action_selected","fields":{"controller_surface_action":{"plan":"html","type":"rewritten_upstream"},"candidate_surface_action":{"status":200,"type":"eidolon_owned"},"policy_reason":"suspicious policy observes only and forwards to the protected upstream","policy_routing_decision":"protected_upstream","policy_state":"suspicious","surface_action":{"status":200,"type":"eidolon_owned"},"surface_requested_intervention":true,"trusted_bait_soften_path_prefixes":["/docs","/openapi.json"],"trusted_ingress_softened_surface":false,"trusted_ingress_softening_reason":null},"observed_at_unix_ms":1780844077546,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761"}
 JSONL
 }
 
@@ -108,8 +109,13 @@ done
 
 printf 'HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\r\n' > "$headers_file"
 cat > "$body_file" <<'HTML'
-<!doctype html>
-<html><body><main><a href="/docs/legacy-import">legacy import</a></main></body></html>
+# Customer Import Notes
+
+Use `X-Migration-Trace: rel_2025_04_b7f2` with:
+
+```http
+POST /api/v2/import/reconcile
+```
 HTML
 SH
 
@@ -139,7 +145,7 @@ done
 [[ "$session" == "8c1c53ad-d352-4db6-b812-a93cc7950761" ]]
 
 cat <<'JSON'
-{"contract_version":"2026-06-05.v1","observed_at":"2026-06-07T14:54:37.546362804Z","session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761","request":{"method":"GET","path":"/docs?topic=<redacted>"},"ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":12,"vendor_score_kind":"automation_likelihood_inverse"},"policy":{"state":"suspicious","routing_decision":"rewritten_upstream","reason":"latest request routing decision"},"evidence":{"event_schema_version":2,"event_ids":["22222222-2222-2222-2222-222222222222","44444444-4444-4444-4444-444444444444"],"bundle_ref":"session:8c1c53ad-d352-4db6-b812-a93cc7950761"},"edge_recommendation":{"action":"observe","reason_codes":["suspicious_session"]}}
+{"contract_version":"2026-06-05.v1","observed_at":"2026-06-07T14:54:37.546362804Z","session_id":"8c1c53ad-d352-4db6-b812-a93cc7950761","request":{"method":"GET","path":"/docs?topic=<redacted>"},"ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":12,"vendor_score_kind":"automation_likelihood_inverse"},"policy":{"state":"suspicious","routing_decision":"eidolon_owned","reason":"latest request routing decision"},"evidence":{"event_schema_version":2,"event_ids":["22222222-2222-2222-2222-222222222222","55555555-5555-5555-5555-555555555555"],"bundle_ref":"session:8c1c53ad-d352-4db6-b812-a93cc7950761"},"edge_recommendation":{"action":"preserve_eidolon_routing","ttl_seconds":300,"reason_codes":["eidolon_runtime_enforcement","eidolon_owned"]}}
 JSON
 SH
 

@@ -14,7 +14,7 @@ LOCAL_STATE_DIR="${EIDOLON_SHIELD_LOCAL_STATE_DIR:-}"
 EDGE_EXPORT_BIN="${EIDOLON_EDGE_EXPORT_BIN:-}"
 PROMOTION_PATH="${EIDOLON_SHIELD_SUSPICIOUS_PROMOTION_PATH:-/docs?topic=imports}"
 PROMOTION_PATH_PREFIX="${EIDOLON_SHIELD_SUSPICIOUS_PROMOTION_PATH_PREFIX:-/docs}"
-EXPECTED_BAIT_MARKER="${EIDOLON_SHIELD_SUSPICIOUS_PROMOTION_BAIT_MARKER:-/docs/legacy-import}"
+EXPECTED_BAIT_MARKER="${EIDOLON_SHIELD_SUSPICIOUS_PROMOTION_BAIT_MARKER:-X-Migration-Trace: rel_2025_04_b7f2}"
 ACTOR_KIND="${EIDOLON_SHIELD_SUSPICIOUS_PROMOTION_ACTOR_KIND:-agentic_browser}"
 VENDOR_SCORE="${EIDOLON_SHIELD_SUSPICIOUS_PROMOTION_VENDOR_SCORE:-12}"
 VENDOR_SCORE_KIND="${EIDOLON_SHIELD_SUSPICIOUS_PROMOTION_VENDOR_SCORE_KIND:-automation_likelihood_inverse}"
@@ -187,9 +187,29 @@ surface_debug_json="$(
 
 jq -e '
   .fields.policy_state == "suspicious"
+  and .fields.controller_surface_action.type == "rewritten_upstream"
+  and .fields.candidate_surface_action.type == "eidolon_owned"
+  and .fields.surface_action.type == "eidolon_owned"
   and .fields.trusted_ingress_softened_surface == false
 ' <<<"$surface_debug_json" >/dev/null \
-  || fail "session ${session_id} was softened or did not remain suspicious on the discovery surface"
+  || fail "session ${session_id} did not keep the stronger suspicious discovery shaping"
+
+bait_exposed_json="$(
+  jq -c -e -s \
+    --arg session_id "$session_id" '
+      map(
+        select(
+          .session_id == $session_id
+          and .kind.type == "bait_exposed"
+          and .kind.bait_id == "rel_2025_04_b7f2"
+        )
+      )
+      | last
+    ' "$events_file"
+)" || fail "session ${session_id} did not record a suspicious owned-surface bait exposure"
+
+jq -e '.kind.surface == "/docs"' <<<"$bait_exposed_json" >/dev/null \
+  || fail "session ${session_id} suspicious owned-surface exposure was not recorded on /docs"
 
 EIDOLON_SHIELD_LOCAL_STATE_DIR="$LOCAL_STATE_DIR" \
   EIDOLON_EDGE_EXPORT_BIN="$EDGE_EXPORT_BIN" \
@@ -206,11 +226,13 @@ jq -e \
     length == 1
     and .[0].session_id == $session_id
     and .[0].policy.state == "suspicious"
+    and .[0].policy.routing_decision == "eidolon_owned"
     and .[0].ingress_signals.actor_kind == $actor_kind
     and .[0].ingress_signals.vendor_score == $vendor_score
     and .[0].ingress_signals.vendor_score_kind == $score_kind
-    and .[0].edge_recommendation.action == "observe"
+    and .[0].edge_recommendation.action == "preserve_eidolon_routing"
+    and (.[0].edge_recommendation.reason_codes // []) == ["eidolon_runtime_enforcement", "eidolon_owned"]
   ' "$edge_export_file" >/dev/null \
   || fail "session ${session_id} edge export did not preserve the suspicious advisory-signal result"
 
-echo "suspicious-promotion smoke ok: session ${session_id} promoted to suspicious, stayed baited, and exported advisory signals"
+echo "suspicious-promotion smoke ok: session ${session_id} promoted to suspicious, served owned docs bait, and exported advisory signals"
