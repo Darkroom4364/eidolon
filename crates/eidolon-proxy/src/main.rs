@@ -45,6 +45,7 @@ const DEFAULT_INTERVENTION_CONTROL: &str = "/tmp/eidolon-interventions.txt";
 const DEFAULT_POLICY_STATE: &str = "/tmp/eidolon-policy-state.json";
 const DEFAULT_TRUSTED_BAIT_SOFTEN_PREFIXES: &[&str] = &["/docs", "/openapi.json"];
 const DOCS_DISCOVERY_TARGET: &str = "/docs";
+const OPENAPI_DISCOVERY_TARGET: &str = "/openapi.json";
 const LEGACY_IMPORT_OPENAPI_QUERY: &str = "eidolon_surface=legacy-import";
 const DEFAULT_HTTP_PORT: u16 = 80;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -1662,6 +1663,35 @@ fn openapi_path_insertion_for_bait(
     )
 }
 
+fn owned_openapi_discovery_response(
+    bait: &Bait,
+    openapi: &OpenApiOperationOverride,
+) -> SurfaceResponse {
+    let insertion = openapi_path_insertion_for_bait(bait, openapi);
+    let mut paths = Map::new();
+    paths.insert(insertion.path, insertion.path_item);
+    let document = json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Customer import recovery schema",
+            "version": "0.0.0-eidolon"
+        },
+        "paths": Value::Object(paths),
+    });
+
+    match serde_json::to_vec(&document) {
+        Ok(body) => SurfaceResponse::new(
+            200,
+            vec![SurfaceHeader::new(
+                "Content-Type",
+                "application/json; charset=utf-8",
+            )],
+            body,
+        ),
+        Err(_) => surface_text_response(500, "failed to render owned openapi discovery response\n"),
+    }
+}
+
 fn default_openapi_reconcile_request_body() -> Value {
     json!({
         "required": true,
@@ -2415,7 +2445,6 @@ fn strengthen_surface_action_for_suspicious_discovery(
 ) -> SurfaceAction {
     if policy_state != PolicyState::Suspicious
         || surface_request.method != "GET"
-        || surface_request.path != DOCS_DISCOVERY_TARGET
         || !matches!(
             &controller_surface_action,
             SurfaceAction::RewrittenUpstream { .. }
@@ -2424,12 +2453,27 @@ fn strengthen_surface_action_for_suspicious_discovery(
         return controller_surface_action;
     }
 
-    let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::Docs) else {
+    if surface_request.path == DOCS_DISCOVERY_TARGET {
+        let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::Docs) else {
+            return controller_surface_action;
+        };
+
+        return SurfaceAction::EidolonOwned {
+            response: bait_surface_response(bait, &runtime.bait_content),
+        };
+    }
+
+    let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::OpenApi) else {
         return controller_surface_action;
     };
+    if surface_request.path != OPENAPI_DISCOVERY_TARGET
+        || !is_openapi_discovery_request(surface_request, bait)
+    {
+        return controller_surface_action;
+    }
 
     SurfaceAction::EidolonOwned {
-        response: bait_surface_response(bait, &runtime.bait_content),
+        response: owned_openapi_discovery_response(bait, &runtime.bait_content.openapi),
     }
 }
 
@@ -5674,6 +5718,86 @@ mod tests {
         let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(bait_exposed["kind"]["bait_id"], "rel_2025_04_b7f2");
         assert_eq!(bait_exposed["kind"]["surface"], "/docs");
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            surface_debug["fields"]["controller_surface_action"]["type"],
+            "rewritten_upstream"
+        );
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+    }
+
+    #[test]
+    fn runtime_serves_owned_openapi_discovery_for_suspicious_session() {
+        let event_log_path = unique_temp_path("suspicious-openapi-events.jsonl");
+        let debug_log_path = unique_temp_path("suspicious-openapi-debug.jsonl");
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("suspicious-openapi-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/openapi.json",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
+                    (
+                        session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                        "automation_likelihood_inverse",
+                    ),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        let Ok(rewritten) = serde_json::from_slice::<Value>(&response.body) else {
+            panic!("body should be json");
+        };
+
+        assert_eq!(response.status, 200);
+        assert_eq!(rewritten["openapi"].as_str(), Some("3.0.3"));
+        assert!(rewritten["paths"]["/api/v2/import/reconcile"].is_object());
+        assert_eq!(
+            rewritten["paths"]["/api/v2/import/reconcile"]["post"]["parameters"][0]["name"],
+            "X-OpenAPI-Trace"
+        );
+        assert!(rewritten["paths"]["/api/v2/import/reconcile"]["post"]["requestBody"].is_object());
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["policy_state"], "suspicious");
+        assert_eq!(request_event["kind"]["routing_decision"], "eidolon_owned");
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "authenticated ingress advisory signals promoted discovery request to suspicious"
+            )));
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
+        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
 
         let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
         assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
