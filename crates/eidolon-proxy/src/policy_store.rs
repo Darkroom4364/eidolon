@@ -21,6 +21,8 @@ pub struct SessionPolicyRecord {
     pub policy_state: PolicyState,
     pub controlled_reality_depth: u32,
     #[serde(default)]
+    pub reality_escape_attempt_count: u32,
+    #[serde(default)]
     pub discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
 }
 
@@ -29,6 +31,7 @@ impl SessionPolicyRecord {
         Self {
             policy_state,
             controlled_reality_depth: 0,
+            reality_escape_attempt_count: 0,
             discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout::default(),
         }
     }
@@ -52,6 +55,8 @@ struct StoredSessionPolicy {
     policy_state: PolicyState,
     #[serde(default)]
     controlled_reality_depth: u32,
+    #[serde(default)]
+    reality_escape_attempt_count: u32,
     #[serde(default)]
     discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
 }
@@ -102,6 +107,7 @@ impl PolicyStateStore {
             record.policy_state = policy_state;
             if policy_state != PolicyState::ControlledReality {
                 record.controlled_reality_depth = 0;
+                record.reality_escape_attempt_count = 0;
             }
         }
         self.records.insert(session_id, record);
@@ -114,6 +120,25 @@ impl PolicyStateStore {
         self.records.insert(session_id, record);
         self.persist()?;
         Ok(record.controlled_reality_depth)
+    }
+
+    pub fn note_reality_escape_attempt(&mut self, session_id: SessionId) -> io::Result<u32> {
+        let mut record = self.record(session_id);
+        record.reality_escape_attempt_count = record.reality_escape_attempt_count.saturating_add(1);
+        self.records.insert(session_id, record);
+        self.persist()?;
+        Ok(record.reality_escape_attempt_count)
+    }
+
+    pub fn clear_reality_escape_attempts(&mut self, session_id: SessionId) -> io::Result<()> {
+        let mut record = self.record(session_id);
+        if record.reality_escape_attempt_count == 0 {
+            return Ok(());
+        }
+
+        record.reality_escape_attempt_count = 0;
+        self.records.insert(session_id, record);
+        self.persist()
     }
 
     pub fn mark_discovery_surface(
@@ -140,6 +165,7 @@ impl PolicyStateStore {
                 session_id: *session_id,
                 policy_state: record.policy_state,
                 controlled_reality_depth: record.controlled_reality_depth,
+                reality_escape_attempt_count: record.reality_escape_attempt_count,
                 discovery_surface_fanout: record.discovery_surface_fanout,
             })
             .collect();
@@ -209,6 +235,7 @@ fn deserialize_records(
                 SessionPolicyRecord {
                     policy_state: session.policy_state,
                     controlled_reality_depth: session.controlled_reality_depth,
+                    reality_escape_attempt_count: session.reality_escape_attempt_count,
                     discovery_surface_fanout: session.discovery_surface_fanout,
                 },
             )
@@ -365,6 +392,12 @@ mod tests {
             .expect("state should update");
         assert_eq!(
             store
+                .note_reality_escape_attempt(session_id)
+                .expect("escape attempts should increment"),
+            1
+        );
+        assert_eq!(
+            store
                 .increment_controlled_reality_depth(session_id)
                 .expect("depth should increment"),
             1
@@ -376,6 +409,32 @@ mod tests {
         let record = store.record(session_id);
         assert_eq!(record.policy_state, PolicyState::Observe);
         assert_eq!(record.controlled_reality_depth, 0);
+        assert_eq!(record.reality_escape_attempt_count, 0);
+    }
+
+    #[test]
+    fn reality_escape_attempts_increment_and_clear() {
+        let mut store = PolicyStateStore::in_memory();
+        let session_id = SessionId::new();
+
+        assert_eq!(
+            store
+                .note_reality_escape_attempt(session_id)
+                .expect("escape attempts should increment"),
+            1
+        );
+        assert_eq!(
+            store
+                .note_reality_escape_attempt(session_id)
+                .expect("escape attempts should increment"),
+            2
+        );
+        assert_eq!(store.record(session_id).reality_escape_attempt_count, 2);
+
+        store
+            .clear_reality_escape_attempts(session_id)
+            .expect("escape attempts should clear");
+        assert_eq!(store.record(session_id).reality_escape_attempt_count, 0);
     }
 
     #[test]
@@ -433,5 +492,6 @@ mod tests {
             reopened.record(session_id).discovery_surface_fanout,
             crate::policy::DiscoverySurfaceFanout::default()
         );
+        assert_eq!(reopened.record(session_id).reality_escape_attempt_count, 0);
     }
 }

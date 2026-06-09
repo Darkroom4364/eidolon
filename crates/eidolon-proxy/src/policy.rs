@@ -23,6 +23,8 @@ const REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX: &str =
     "rate-limited same-bait near miss retry moved session to blocked";
 const REPEATED_CONTROLLED_REALITY_DEPTH_LIMIT_BLOCKED_REASON_PREFIX: &str =
     "controlled-reality probe continued after depth-limit throttle and moved session to blocked";
+const REPEATED_REALITY_ESCAPE_BLOCKED_REASON_PREFIX: &str =
+    "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked";
 const AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND: &str = "automation_likelihood_inverse";
 const DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX: u16 = 20;
 
@@ -275,6 +277,24 @@ pub fn transition_to_blocked_from_repeated_controlled_reality_depth_limit(
         PolicyState::Blocked,
         format!(
             "{REPEATED_CONTROLLED_REALITY_DEPTH_LIMIT_BLOCKED_REASON_PREFIX}: path={path} depth={depth} depth_limit={depth_limit}",
+        ),
+    ))
+}
+
+pub fn transition_to_blocked_from_repeated_reality_escape_attempt(
+    current_state: PolicyState,
+    path: &str,
+    attempt_count: u32,
+) -> Option<PolicyTransition> {
+    if current_state != PolicyState::ControlledReality || attempt_count < 2 {
+        return None;
+    }
+
+    Some(PolicyTransition::new(
+        current_state,
+        PolicyState::Blocked,
+        format!(
+            "{REPEATED_REALITY_ESCAPE_BLOCKED_REASON_PREFIX}: path={path} attempt_count={attempt_count}",
         ),
     ))
 }
@@ -727,6 +747,42 @@ mod tests {
         );
 
         assert_eq!(first_over_limit, None);
+        assert_eq!(wrong_state, None);
+    }
+
+    #[test]
+    fn repeated_reality_escape_attempt_promotes_to_blocked() {
+        let Some(transition) = transition_to_blocked_from_repeated_reality_escape_attempt(
+            PolicyState::ControlledReality,
+            "/api/v1/projects",
+            2,
+        ) else {
+            panic!("second reality escape attempt should transition to blocked");
+        };
+
+        assert_eq!(transition.from, PolicyState::ControlledReality);
+        assert_eq!(transition.to, PolicyState::Blocked);
+        assert!(transition
+            .reason
+            .contains(REPEATED_REALITY_ESCAPE_BLOCKED_REASON_PREFIX));
+        assert!(transition.reason.contains("path=/api/v1/projects"));
+        assert!(transition.reason.contains("attempt_count=2"));
+    }
+
+    #[test]
+    fn repeated_reality_escape_attempt_requires_controlled_state_and_repetition() {
+        let first_attempt = transition_to_blocked_from_repeated_reality_escape_attempt(
+            PolicyState::ControlledReality,
+            "/api/v1/projects",
+            1,
+        );
+        let wrong_state = transition_to_blocked_from_repeated_reality_escape_attempt(
+            PolicyState::Suspicious,
+            "/api/v1/projects",
+            2,
+        );
+
+        assert_eq!(first_attempt, None);
         assert_eq!(wrong_state, None);
     }
 

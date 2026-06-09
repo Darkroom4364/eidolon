@@ -11,25 +11,25 @@ EDGE_HOST="${EIDOLON_SHIELD_EDGE_HOST:-127.0.0.1}"
 LOCAL_STATE_DIR="${EIDOLON_SHIELD_LOCAL_STATE_DIR:-}"
 EDGE_EXPORT_BIN="${EIDOLON_EDGE_EXPORT_BIN:-}"
 EXPOSURE_PATH="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_EXPOSURE_PATH:-/docs/legacy-import}"
-EXPOSURE_PATH_PREFIX="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_EXPOSURE_PATH_PREFIX:-/docs}"
-ACTION_PATH="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_ACTION_PATH:-/api/v2/import/reconcile}"
-ACTION_PATH_PREFIX="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_ACTION_PATH_PREFIX:-/api/v2/import/reconcile}"
+ENTRY_ACTION_PATH="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_ENTRY_ACTION_PATH:-/api/v2/import/reconcile}"
+ENTRY_ACTION_PATH_PREFIX="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_ENTRY_ACTION_PATH_PREFIX:-/api/v2/import/reconcile}"
+ESCAPE_PATH="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_ESCAPE_PATH:-/api/v1/projects}"
+ESCAPE_PATH_PREFIX="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_ESCAPE_PATH_PREFIX:-/api/v1/projects}"
 EXPECTED_BAIT_MARKER="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_BAIT_MARKER:-X-Migration-Trace: rel_2025_04_b7f2}"
 EXACT_HEADER_NAME="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_HEADER_NAME:-X-Migration-Trace}"
 EXACT_HEADER_VALUE="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_HEADER_VALUE:-rel_2025_04_b7f2}"
-EXPECTED_RETRY_AFTER="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_RETRY_AFTER:-30}"
-WARMUP_CONTROLLED_REQUESTS="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_WARMUP_REQUESTS:-3}"
-EXPECTED_BLOCK_DEPTH="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_DEPTH:-6}"
 
 usage() {
   cat <<'USAGE'
 Usage: examples/shield-lab/smoke-controlled-reality-blocked-orbstack.sh
 
 Performs a live OrbStack smoke check for the first controlled-reality-to-blocked
-slice. It exposes one docs bait surface, performs the exact same-session decoy
-action to enter controlled_reality, keeps probing the controlled branch until
-Eidolon first rate-limits and then blocks the session, and verifies the same
-session through edge export.
+slice tied to repeated reality escape attempts. It exposes one docs bait
+surface, performs the exact same-session decoy action to enter
+controlled_reality, requests a path outside the controlled branch once to
+record a reality_escape_attempt, repeats that same outside-branch request, and
+verifies that Eidolon moved the session into blocked and preserved the new
+evidence in edge export.
 USAGE
 }
 
@@ -109,12 +109,10 @@ exposure_headers="$tmp_dir/exposure.headers"
 exposure_body="$tmp_dir/exposure.body"
 entry_headers="$tmp_dir/entry.headers"
 entry_body="$tmp_dir/entry.body"
-probe_headers="$tmp_dir/probe.headers"
-probe_body="$tmp_dir/probe.body"
-throttle_headers="$tmp_dir/throttle.headers"
-throttle_body="$tmp_dir/throttle.body"
-blocked_headers="$tmp_dir/blocked.headers"
-blocked_body="$tmp_dir/blocked.body"
+first_escape_headers="$tmp_dir/first-escape.headers"
+first_escape_body="$tmp_dir/first-escape.body"
+second_escape_headers="$tmp_dir/second-escape.headers"
+second_escape_body="$tmp_dir/second-escape.body"
 events_file="$tmp_dir/events.jsonl"
 debug_file="$tmp_dir/debug.jsonl"
 edge_export_file="$tmp_dir/edge-export.json"
@@ -137,55 +135,40 @@ curl_cmd -sS \
   -D "$entry_headers" \
   -o "$entry_body" \
   -H "${EXACT_HEADER_NAME}: ${EXACT_HEADER_VALUE}" \
-  "${edge_url}${ACTION_PATH}"
+  "${edge_url}${ENTRY_ACTION_PATH}"
 
 entry_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$entry_headers")"
 [[ "$entry_http_code" == "202" ]] || fail "expected HTTP 202 from controlled-reality entry request, got: ${entry_http_code:-none}"
 grep -Fq '"write_committed":false' "$entry_body" \
   || fail "controlled-reality entry request did not receive the expected synthetic write response"
 
-for ((i = 0; i < WARMUP_CONTROLLED_REQUESTS; i += 1)); do
-  curl_cmd -sS \
-    -b "$cookie_jar" \
-    -c "$cookie_jar" \
-    -D "$probe_headers" \
-    -o "$probe_body" \
-    "${edge_url}${ACTION_PATH}"
+curl_cmd -sS \
+  -b "$cookie_jar" \
+  -c "$cookie_jar" \
+  -D "$first_escape_headers" \
+  -o "$first_escape_body" \
+  "${edge_url}${ESCAPE_PATH}"
 
-  probe_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$probe_headers")"
-  [[ "$probe_http_code" == "200" ]] || fail "expected HTTP 200 from controlled-reality warmup request $((i + 1)), got: ${probe_http_code:-none}"
-  grep -Fq '"synthetic":true' "$probe_body" \
-    || fail "controlled-reality warmup request $((i + 1)) did not stay on the synthetic branch"
-done
+first_escape_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$first_escape_headers")"
+[[ "$first_escape_http_code" == "404" ]] || fail "expected HTTP 404 from first controlled-reality escape request, got: ${first_escape_http_code:-none}"
+grep -Fq '"synthetic":true' "$first_escape_body" \
+  || fail "first controlled-reality escape request did not stay on the synthetic path"
 
 curl_cmd -sS \
   -b "$cookie_jar" \
   -c "$cookie_jar" \
-  -D "$throttle_headers" \
-  -o "$throttle_body" \
-  "${edge_url}${ACTION_PATH}"
+  -D "$second_escape_headers" \
+  -o "$second_escape_body" \
+  "${edge_url}${ESCAPE_PATH}"
 
-throttle_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$throttle_headers")"
-[[ "$throttle_http_code" == "429" ]] || fail "expected HTTP 429 from controlled-reality throttle request, got: ${throttle_http_code:-none}"
-retry_after="$(awk 'BEGIN{IGNORECASE=1} tolower($1) == "retry-after:" {gsub("\r", "", $2); print $2}' "$throttle_headers" | tail -n 1)"
-[[ "$retry_after" == "$EXPECTED_RETRY_AFTER" ]] \
-  || fail "expected Retry-After ${EXPECTED_RETRY_AFTER} from controlled-reality throttle request, got: ${retry_after:-none}"
-
-curl_cmd -sS \
-  -b "$cookie_jar" \
-  -c "$cookie_jar" \
-  -D "$blocked_headers" \
-  -o "$blocked_body" \
-  "${edge_url}${ACTION_PATH}"
-
-blocked_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$blocked_headers")"
-[[ "$blocked_http_code" == "403" ]] || fail "expected HTTP 403 from controlled-reality blocked request, got: ${blocked_http_code:-none}"
+second_escape_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$second_escape_headers")"
+[[ "$second_escape_http_code" == "403" ]] || fail "expected HTTP 403 from repeated controlled-reality escape request, got: ${second_escape_http_code:-none}"
 
 read_proxy_state_file events.jsonl > "$events_file"
 
 blocked_request_json="$(
   jq -c -e -s \
-    --arg path_prefix "$ACTION_PATH_PREFIX" '
+    --arg path_prefix "$ESCAPE_PATH_PREFIX" '
       map(
         select(
           .kind.type == "request_seen"
@@ -194,16 +177,16 @@ blocked_request_json="$(
       )
       | last
     ' "$events_file"
-)" || fail "could not find the controlled-reality blocked request in the proxy event log"
+)" || fail "could not find the blocked escape request in the proxy event log"
 
 session_id="$(jq -r '.session_id // empty' <<<"$blocked_request_json")"
-[[ -n "$session_id" ]] || fail "matching controlled-reality blocked request had no session id"
+[[ -n "$session_id" ]] || fail "matching blocked escape request had no session id"
 
 jq -e '
   .policy_state == "blocked"
   and .kind.routing_decision == "eidolon_owned"
 ' <<<"$blocked_request_json" >/dev/null \
-  || fail "matching controlled-reality blocked request did not persist the blocked decision"
+  || fail "matching blocked escape request did not persist the blocked decision"
 
 controlled_entry_json="$(
   jq -c -e -s \
@@ -221,21 +204,27 @@ controlled_entry_json="$(
 jq -e '.policy_state == "controlled_reality"' <<<"$controlled_entry_json" >/dev/null \
   || fail "session ${session_id} did not enter controlled_reality before the blocked step"
 
-rate_limit_json="$(
+escape_events_json="$(
   jq -c -e -s \
-    --arg session_id "$session_id" '
+    --arg session_id "$session_id" \
+    --arg path "$ESCAPE_PATH_PREFIX" '
       map(
         select(
           .session_id == $session_id
-          and .kind.type == "rate_limit_applied"
+          and .kind.type == "reality_escape_attempt"
+          and (.kind.path // "") == $path
         )
       )
-      | last
     ' "$events_file"
-)" || fail "session ${session_id} had no controlled-reality rate-limit event"
+)" || fail "session ${session_id} had no repeated reality_escape_attempt evidence"
 
-jq -e '.policy_state == "controlled_reality"' <<<"$rate_limit_json" >/dev/null \
-  || fail "session ${session_id} did not keep controlled_reality state on the first depth-limit throttle"
+jq -e '
+  length >= 2
+  and .[-1].policy_state == "controlled_reality"
+  and .[-1].kind.routing_decision == "controlled_reality"
+  and .[-1].kind.method == "GET"
+' <<<"$escape_events_json" >/dev/null \
+  || fail "session ${session_id} did not preserve the repeated controlled-reality escape evidence"
 
 blocked_transition_json="$(
   jq -c -e -s \
@@ -253,10 +242,10 @@ blocked_transition_json="$(
 )" || fail "session ${session_id} had no controlled_reality -> blocked policy transition event"
 
 jq -e \
-  --arg reason_substring "controlled-reality probe continued after depth-limit throttle and moved session to blocked" '
+  --arg reason_substring "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked" '
     (.kind.reason // "") | contains($reason_substring)
   ' <<<"$blocked_transition_json" >/dev/null \
-  || fail "session ${session_id} blocked transition reason did not match the repeated post-containment probe path"
+  || fail "session ${session_id} blocked transition reason did not match the repeated escape path"
 
 blocked_response_json="$(
   jq -c -e -s \
@@ -280,21 +269,20 @@ jq -e '
 
 read_proxy_state_file debug.jsonl > "$debug_file"
 
-controlled_debug_json="$(
+escape_debug_json="$(
   jq -c -e -s \
     --arg session_id "$session_id" '
-      map(select(.session_id == $session_id and .event == "controlled_reality_action_selected"))
+      map(select(.session_id == $session_id and .event == "reality_escape_attempt"))
       | last
     ' "$debug_file"
-)" || fail "session ${session_id} had no controlled_reality_action_selected debug record"
+)" || fail "session ${session_id} had no reality_escape_attempt debug record"
 
-jq -e \
-  --argjson expected_depth "$EXPECTED_BLOCK_DEPTH" '
-    .fields.depth == $expected_depth
-    and .fields.action.type == "eidolon_owned"
-    and .fields.transition.to == "blocked"
-  ' <<<"$controlled_debug_json" >/dev/null \
-  || fail "session ${session_id} did not record the blocked controlled-reality transition at the expected action depth"
+jq -e '
+  .fields.attempt_count == 2
+  and .fields.routing_decision == "controlled_reality"
+  and .fields.path == "/api/v1/projects"
+' <<<"$escape_debug_json" >/dev/null \
+  || fail "session ${session_id} repeated escape debug record did not preserve the expected signal details"
 
 surface_debug_json="$(
   jq -c -e -s \
@@ -321,13 +309,13 @@ EIDOLON_SHIELD_LOCAL_STATE_DIR="$LOCAL_STATE_DIR" \
 jq -e '
   (if type == "array" then . else [.] end) as $exports
   | ($exports | length) == 1
-  and $exports[0].request.path == "/api/v2/import/reconcile"
+  and $exports[0].request.path == "/api/v1/projects"
   and $exports[0].policy.state == "blocked"
   and $exports[0].policy.routing_decision == "eidolon_owned"
   and $exports[0].edge_recommendation.action == "preserve_eidolon_routing"
   and (($exports[0].edge_recommendation.reason_codes // []) | index("eidolon_runtime_enforcement")) != null
   and (($exports[0].edge_recommendation.reason_codes // []) | index("eidolon_owned")) != null
 ' "$edge_export_file" >/dev/null \
-  || fail "edge export did not preserve the new controlled-reality blocked runtime decision"
+  || fail "edge export did not preserve the new repeated escape runtime decision"
 
-printf 'controlled-reality-blocked smoke ok: session=%s blocked_after_post_containment_probe=true\n' "$session_id"
+printf 'controlled-reality-blocked smoke ok: session=%s blocked_after_repeated_escape=true\n' "$session_id"

@@ -2009,6 +2009,66 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
         }),
     )?;
+    if let Some(transition) = maybe_transition_to_blocked_from_reality_escape_attempt(
+        runtime,
+        &session,
+        &request,
+        &surface_request,
+        &effective_decision,
+    )? {
+        write_debug(
+            runtime,
+            "policy_transition_selected",
+            Some(session.session_id),
+            json!({
+                "from": transition.from,
+                "to": transition.to,
+                "reason": transition.reason.as_str(),
+            }),
+        )?;
+        set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+        write_event(
+            &runtime.event_log,
+            &policy::policy_changed_event(session.session_id, &transition),
+        )?;
+        let blocked_decision = policy::PolicyDecision::new(
+            transition.to,
+            RoutingDecision::EidolonOwned,
+            transition.reason.clone(),
+        );
+        let blocked_response = surface_text_response(403, "blocked by eidolon policy\n");
+        let blocked_surface_action = SurfaceAction::EidolonOwned {
+            response: blocked_response.clone(),
+        };
+        write_debug(
+            runtime,
+            "surface_action_selected",
+            Some(session.session_id),
+            json!({
+                "policy_state": blocked_decision.policy_state,
+                "policy_routing_decision": blocked_decision.routing_decision,
+                "policy_reason": blocked_decision.reason.as_str(),
+                "controller_surface_action": debug_surface_action(&controller_surface_action),
+                "candidate_surface_action": debug_surface_action(&candidate_surface_action),
+                "surface_action": debug_surface_action(&blocked_surface_action),
+                "surface_requested_intervention": true,
+                "trusted_ingress_softened_surface": false,
+                "trusted_ingress_softening_reason": Value::Null,
+                "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
+            }),
+        )?;
+        return write_direct_response(DirectResponseContext {
+            client_stream,
+            runtime,
+            session: &session,
+            request: &request,
+            path: &path,
+            decision: &blocked_decision,
+            response: blocked_response,
+            intervention_mode,
+            surface_requested_intervention: true,
+        });
+    }
 
     if intervention_mode.interventions_enabled()
         && (matches!(&surface_action, SurfaceAction::ProtectedUpstream)
@@ -2315,13 +2375,6 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             intervention_mode,
             surface_requested_intervention,
         )?;
-        write_reality_escape_attempt_if_needed(
-            runtime,
-            &session,
-            &request,
-            &surface_request,
-            &effective_decision,
-        )?;
         apply_response_headers(&mut response, &session);
         if let Some(bait) = bait_exposure_for_direct_surface(
             &decision,
@@ -2502,24 +2555,32 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     client_stream.flush()
 }
 
-fn write_reality_escape_attempt_if_needed(
+fn maybe_transition_to_blocked_from_reality_escape_attempt(
     runtime: &ProxyRuntime,
     session: &SessionContext,
     request: &HttpRequest,
     surface_request: &SurfaceRequestMeta,
     decision: &policy::PolicyDecision,
-) -> io::Result<()> {
+) -> io::Result<Option<policy::PolicyTransition>> {
+    if decision.policy_state != PolicyState::ControlledReality {
+        return Ok(None);
+    }
+    if runtime
+        .controlled_reality
+        .is_controlled_branch(surface_request)
+    {
+        clear_reality_escape_attempts_for_session(runtime, session.session_id)?;
+        return Ok(None);
+    }
     if decision.policy_state != PolicyState::ControlledReality
         || !matches!(
             decision.routing_decision,
             RoutingDecision::ControlledReality | RoutingDecision::RateLimited
         )
-        || runtime
-            .controlled_reality
-            .is_controlled_branch(surface_request)
     {
-        return Ok(());
+        return Ok(None);
     }
+    let attempt_count = note_reality_escape_attempt_for_session(runtime, session.session_id)?;
 
     write_debug(
         runtime,
@@ -2531,6 +2592,7 @@ fn write_reality_escape_attempt_if_needed(
             "query_present": surface_request.query.is_some(),
             "policy_state": decision.policy_state,
             "routing_decision": decision.routing_decision,
+            "attempt_count": attempt_count,
         }),
     )?;
 
@@ -2543,6 +2605,14 @@ fn write_reality_escape_attempt_if_needed(
             redacted_event_target(&surface_request.path),
             decision.routing_decision,
             "controlled session requested a path outside the configured controlled-reality branch",
+        ),
+    )?;
+
+    Ok(
+        policy::transition_to_blocked_from_repeated_reality_escape_attempt(
+            decision.policy_state,
+            &surface_request.path,
+            attempt_count,
         ),
     )
 }
@@ -2630,6 +2700,30 @@ fn set_policy_state_for_session(
         .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
 
     store.set_policy_state(session_id, policy_state)
+}
+
+fn note_reality_escape_attempt_for_session(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+) -> io::Result<u32> {
+    let mut store = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+
+    store.note_reality_escape_attempt(session_id)
+}
+
+fn clear_reality_escape_attempts_for_session(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+) -> io::Result<()> {
+    let mut store = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+
+    store.clear_reality_escape_attempts(session_id)
 }
 
 fn update_discovery_surface_fanout_for_request(
@@ -8154,6 +8248,102 @@ mod tests {
         assert_eq!(escape["kind"]["method"], "GET");
         assert_eq!(escape["kind"]["path"], "/api/v1/projects");
         assert_eq!(escape["kind"]["routing_decision"], "controlled_reality");
+    }
+
+    #[test]
+    fn controlled_session_repeated_escape_attempt_becomes_blocked() {
+        let event_log_path = unique_temp_path("controlled-escape-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("controlled-escape-blocked-debug.jsonl");
+        let mut runtime = test_runtime(
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
+            &event_log_path,
+            unique_temp_path("controlled-escape-blocked-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.debug_log = Some(Arc::new(Mutex::new(must_ok(
+            FileDebugLogWriter::open(&debug_log_path),
+            "debug log should open",
+        ))));
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/api/v1/projects", &cookie),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/api/v1/projects", &cookie),
+        ));
+
+        assert_eq!(first_response.status, 404);
+        assert_eq!(second_response.status, 403);
+
+        let escape_attempts = events_of_type(&event_log_path, "reality_escape_attempt");
+        assert_eq!(escape_attempts.len(), 2);
+        assert_eq!(escape_attempts[1]["policy_state"], "controlled_reality");
+        assert_eq!(escape_attempts[1]["kind"]["path"], "/api/v1/projects");
+        assert_eq!(
+            escape_attempts[1]["kind"]["routing_decision"],
+            "controlled_reality"
+        );
+
+        let blocked_change = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| {
+                event["kind"]["from"].as_str() == Some("controlled_reality")
+                    && event["kind"]["to"].as_str() == Some("blocked")
+            })
+            .unwrap_or_else(|| panic!("blocked policy change should exist"));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked"
+            )));
+
+        let blocked_request = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v1/projects"))
+            .unwrap_or_else(|| panic!("blocked request_seen should exist"));
+        assert_eq!(blocked_request["policy_state"], "blocked");
+        assert_eq!(blocked_request["kind"]["routing_decision"], "eidolon_owned");
+
+        let blocked_response = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .rfind(|event| event["policy_state"].as_str() == Some("blocked"))
+            .unwrap_or_else(|| panic!("blocked response should exist"));
+        assert_eq!(blocked_response["kind"]["status"], 403);
+        assert_eq!(
+            blocked_response["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+
+        let escape_debug = debug_events(&debug_log_path, "reality_escape_attempt")
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("reality escape debug should exist"));
+        assert_eq!(escape_debug["fields"]["attempt_count"], 2);
+        assert_eq!(
+            escape_debug["fields"]["routing_decision"],
+            "controlled_reality"
+        );
+
+        let surface_debug = debug_events(&debug_log_path, "surface_action_selected")
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("surface debug should exist"));
+        assert_eq!(surface_debug["fields"]["policy_state"], "blocked");
+        assert_eq!(
+            surface_debug["fields"]["policy_routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
     }
 
     #[test]
