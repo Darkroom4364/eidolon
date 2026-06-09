@@ -41,6 +41,7 @@ examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
 examples/shield-lab/smoke-rate-limited-blocked-orbstack.sh
 examples/shield-lab/smoke-rate-limited-controlled-reality-orbstack.sh
+examples/shield-lab/smoke-controlled-reality-blocked-orbstack.sh
 ```
 
 The expected host URLs are:

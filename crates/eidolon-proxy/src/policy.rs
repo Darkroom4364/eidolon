@@ -21,6 +21,8 @@ const SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX: &str =
     "suspicious same-bait near miss after exposure moved session to rate limited";
 const REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX: &str =
     "rate-limited same-bait near miss retry moved session to blocked";
+const REPEATED_CONTROLLED_REALITY_DEPTH_LIMIT_BLOCKED_REASON_PREFIX: &str =
+    "controlled-reality probe continued after depth-limit throttle and moved session to blocked";
 const AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND: &str = "automation_likelihood_inverse";
 const DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX: u16 = 20;
 
@@ -254,6 +256,25 @@ pub fn transition_to_blocked_from_repeated_same_bait_near_miss(
         format!(
             "{REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX}: path={path} bait_id={}",
             bait_id.0
+        ),
+    ))
+}
+
+pub fn transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+    current_state: PolicyState,
+    path: &str,
+    depth: u32,
+    depth_limit: u32,
+) -> Option<PolicyTransition> {
+    if current_state != PolicyState::ControlledReality || depth <= depth_limit.saturating_add(1) {
+        return None;
+    }
+
+    Some(PolicyTransition::new(
+        current_state,
+        PolicyState::Blocked,
+        format!(
+            "{REPEATED_CONTROLLED_REALITY_DEPTH_LIMIT_BLOCKED_REASON_PREFIX}: path={path} depth={depth} depth_limit={depth_limit}",
         ),
     ))
 }
@@ -667,6 +688,46 @@ mod tests {
 
         assert_eq!(no_prior, None);
         assert_eq!(suspicious, None);
+    }
+
+    #[test]
+    fn repeated_controlled_reality_depth_limit_promotes_to_blocked() {
+        let Some(transition) = transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+            PolicyState::ControlledReality,
+            "/api/v2/import/reconcile",
+            6,
+            4,
+        ) else {
+            panic!("controlled-reality repeated depth-limit probe should transition to blocked");
+        };
+
+        assert_eq!(transition.from, PolicyState::ControlledReality);
+        assert_eq!(transition.to, PolicyState::Blocked);
+        assert!(transition
+            .reason
+            .contains(REPEATED_CONTROLLED_REALITY_DEPTH_LIMIT_BLOCKED_REASON_PREFIX));
+        assert!(transition.reason.contains("path=/api/v2/import/reconcile"));
+        assert!(transition.reason.contains("depth=6"));
+        assert!(transition.reason.contains("depth_limit=4"));
+    }
+
+    #[test]
+    fn controlled_reality_depth_limit_block_requires_repeated_over_limit_probe() {
+        let first_over_limit = transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+            PolicyState::ControlledReality,
+            "/api/v2/import/reconcile",
+            5,
+            4,
+        );
+        let wrong_state = transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+            PolicyState::RateLimited,
+            "/api/v2/import/reconcile",
+            6,
+            4,
+        );
+
+        assert_eq!(first_over_limit, None);
+        assert_eq!(wrong_state, None);
     }
 
     #[test]
