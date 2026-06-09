@@ -20,6 +20,8 @@ pub struct PolicyStateStore {
 pub struct SessionPolicyRecord {
     pub policy_state: PolicyState,
     pub controlled_reality_depth: u32,
+    #[serde(default)]
+    pub discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
 }
 
 impl SessionPolicyRecord {
@@ -27,6 +29,7 @@ impl SessionPolicyRecord {
         Self {
             policy_state,
             controlled_reality_depth: 0,
+            discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout::default(),
         }
     }
 }
@@ -49,6 +52,8 @@ struct StoredSessionPolicy {
     policy_state: PolicyState,
     #[serde(default)]
     controlled_reality_depth: u32,
+    #[serde(default)]
+    discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
 }
 
 impl PolicyStateStore {
@@ -111,6 +116,18 @@ impl PolicyStateStore {
         Ok(record.controlled_reality_depth)
     }
 
+    pub fn mark_discovery_surface(
+        &mut self,
+        session_id: SessionId,
+        kind: crate::policy::DiscoverySurfaceKind,
+    ) -> io::Result<crate::policy::DiscoverySurfaceFanout> {
+        let mut record = self.record(session_id);
+        record.discovery_surface_fanout = record.discovery_surface_fanout.mark(kind);
+        self.records.insert(session_id, record);
+        self.persist()?;
+        Ok(record.discovery_surface_fanout)
+    }
+
     fn persist(&self) -> io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -123,6 +140,7 @@ impl PolicyStateStore {
                 session_id: *session_id,
                 policy_state: record.policy_state,
                 controlled_reality_depth: record.controlled_reality_depth,
+                discovery_surface_fanout: record.discovery_surface_fanout,
             })
             .collect();
         sessions.sort_by_key(|record| record.session_id.0);
@@ -191,6 +209,7 @@ fn deserialize_records(
                 SessionPolicyRecord {
                     policy_state: session.policy_state,
                     controlled_reality_depth: session.controlled_reality_depth,
+                    discovery_surface_fanout: session.discovery_surface_fanout,
                 },
             )
         })
@@ -357,5 +376,62 @@ mod tests {
         let record = store.record(session_id);
         assert_eq!(record.policy_state, PolicyState::Observe);
         assert_eq!(record.controlled_reality_depth, 0);
+    }
+
+    #[test]
+    fn marks_and_persists_discovery_surface_fanout() {
+        let path = unique_temp_path("fanout");
+        let session_id = SessionId::new();
+
+        let mut store = must_ok(PolicyStateStore::open(&path), "store should open");
+        assert_eq!(
+            must_ok(
+                store.mark_discovery_surface(session_id, crate::policy::DiscoverySurfaceKind::Docs),
+                "docs should persist"
+            ),
+            crate::policy::DiscoverySurfaceFanout {
+                docs_seen: true,
+                openapi_seen: false,
+            }
+        );
+        assert_eq!(
+            must_ok(
+                store.mark_discovery_surface(
+                    session_id,
+                    crate::policy::DiscoverySurfaceKind::OpenApi
+                ),
+                "openapi should persist"
+            ),
+            crate::policy::DiscoverySurfaceFanout {
+                docs_seen: true,
+                openapi_seen: true,
+            }
+        );
+
+        let reopened = must_ok(PolicyStateStore::open(&path), "store should reopen");
+        assert_eq!(
+            reopened.record(session_id).discovery_surface_fanout,
+            crate::policy::DiscoverySurfaceFanout {
+                docs_seen: true,
+                openapi_seen: true,
+            }
+        );
+    }
+
+    #[test]
+    fn older_store_without_discovery_fanout_defaults_cleanly() {
+        let path = unique_temp_path("legacy-fanout");
+        let session_id = SessionId::new();
+        let legacy = format!(
+            "{{\"schema_version\":1,\"sessions\":[{{\"session_id\":\"{}\",\"policy_state\":\"observe\",\"controlled_reality_depth\":0}}]}}",
+            session_id.0
+        );
+        must_ok(fs::write(&path, legacy), "legacy store should write");
+
+        let reopened = must_ok(PolicyStateStore::open(&path), "legacy store should reopen");
+        assert_eq!(
+            reopened.record(session_id).discovery_surface_fanout,
+            crate::policy::DiscoverySurfaceFanout::default()
+        );
     }
 }

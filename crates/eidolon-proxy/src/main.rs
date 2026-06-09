@@ -1437,6 +1437,24 @@ fn is_openapi_discovery_request(request: &SurfaceRequestMeta, bait: &Bait) -> bo
         )
 }
 
+fn discovery_surface_kind(
+    runtime: &ProxyRuntime,
+    request: &SurfaceRequestMeta,
+) -> Option<policy::DiscoverySurfaceKind> {
+    if request.method != "GET" {
+        return None;
+    }
+    if request.path == DOCS_DISCOVERY_TARGET {
+        return Some(policy::DiscoverySurfaceKind::Docs);
+    }
+
+    runtime
+        .bait_registry
+        .bait_for_class(BaitClass::OpenApi)
+        .filter(|bait| is_openapi_discovery_request(request, bait))
+        .map(|_| policy::DiscoverySurfaceKind::OpenApi)
+}
+
 fn m3_docs_discovery_html(bait_registry: &BaitRegistry, content: &BaitContentOverrides) -> String {
     let heading = content
         .docs_discovery_heading
@@ -1755,6 +1773,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let surface_request = surface_request_meta(&request, &path);
     let session = effective_session_context(runtime, &request, &surface_request);
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
+    let discovery_surface_fanout =
+        update_discovery_surface_fanout_for_request(runtime, session.session_id, &surface_request)?;
     if intervention_mode.interventions_enabled() {
         if let Some(transition) = policy::transition_to_suspicious_from_ingress_signals(
             policy_state,
@@ -1762,6 +1782,28 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             &runtime.trusted_bait_soften_path_prefixes,
             &session.ingress_identity,
             &session.ingress_signals,
+        ) {
+            write_debug(
+                runtime,
+                "policy_transition_selected",
+                Some(session.session_id),
+                json!({
+                    "from": transition.from,
+                    "to": transition.to,
+                    "reason": transition.reason.as_str(),
+                }),
+            )?;
+            set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+            write_event(
+                &runtime.event_log,
+                &policy::policy_changed_event(session.session_id, &transition),
+            )?;
+            policy_state = transition.to;
+        } else if let Some(transition) = policy::transition_to_suspicious_from_discovery_fanout(
+            policy_state,
+            &surface_request.path,
+            &session.ingress_identity,
+            discovery_surface_fanout,
         ) {
             write_debug(
                 runtime,
@@ -1798,6 +1840,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "session_source": debug_session_source(session.source),
             "ingress_identity": &session.ingress_identity,
             "ingress_signals": &session.ingress_signals,
+            "discovery_surface_fanout": debug_discovery_surface_fanout(discovery_surface_fanout),
             "policy_state": policy_state,
             "intervention_mode": debug_intervention_mode(intervention_mode),
         }),
@@ -2349,6 +2392,23 @@ fn set_policy_state_for_session(
         .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
 
     store.set_policy_state(session_id, policy_state)
+}
+
+fn update_discovery_surface_fanout_for_request(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    request: &SurfaceRequestMeta,
+) -> io::Result<policy::DiscoverySurfaceFanout> {
+    let mut store = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+
+    let Some(kind) = discovery_surface_kind(runtime, request) else {
+        return Ok(store.record(session_id).discovery_surface_fanout);
+    };
+
+    store.mark_discovery_surface(session_id, kind)
 }
 
 fn controlled_reality_action(
@@ -2986,6 +3046,14 @@ fn debug_intervention_mode(mode: InterventionMode) -> &'static str {
         InterventionMode::Enabled => "enabled",
         InterventionMode::Disabled => "disabled",
     }
+}
+
+fn debug_discovery_surface_fanout(fanout: policy::DiscoverySurfaceFanout) -> Value {
+    json!({
+        "docs_seen": fanout.docs_seen,
+        "openapi_seen": fanout.openapi_seen,
+        "distinct_surfaces": fanout.distinct_surface_count(),
+    })
 }
 
 fn debug_response_fields(response: &HttpResponse) -> Value {
@@ -5817,6 +5885,104 @@ mod tests {
             surface_debug["fields"]["trusted_ingress_softened_surface"],
             false
         );
+    }
+
+    #[test]
+    fn runtime_promotes_discovery_surface_fanout_to_suspicious() {
+        let event_log_path = unique_temp_path("fanout-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("fanout-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("fanout-suspicious-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs?topic=imports", &cookie),
+        ));
+        let first_body = must_ok(
+            String::from_utf8(first_response.body),
+            "body should be utf8",
+        );
+        must_join(upstream_handle.join(), "upstream thread should join");
+
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/openapi.json", &cookie),
+        ));
+        let second_body: Value = must_ok(
+            serde_json::from_slice(&second_response.body),
+            "body should be json",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert!(first_body.contains("/docs/legacy-import"));
+        assert_eq!(second_response.status, 200);
+        assert_eq!(second_body["openapi"].as_str(), Some("3.0.3"));
+        assert!(second_body["paths"]["/api/v2/import/reconcile"].is_object());
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["kind"]["path"], "/openapi.json");
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "session recon discovery-surface fanout promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("distinct_surfaces=2")));
+
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
+        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_surface_fanout"]["docs_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_surface_fanout"]["openapi_seen"],
+            true
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(
+            surface_debugs[1]["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(surface_debugs[1]["fields"]["policy_state"], "suspicious");
     }
 
     #[test]

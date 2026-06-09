@@ -62,6 +62,7 @@ Keep out of the private repo:
   smoke-trusted-ingress-orbstack.sh
   smoke-suspicious-promotion-orbstack.sh
   smoke-suspicious-openapi-orbstack.sh
+  smoke-suspicious-discovery-fanout-orbstack.sh
   collect-kali-vm-sample.sh
   run-pwnkit-kali-vm.sh
   kali-vm-pwnkit.md
@@ -245,6 +246,7 @@ shield:
 examples/shield-lab/smoke-trusted-ingress-orbstack.sh
 examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
+examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 ```
 
 The second smoke proves the first M5 graduated-enforcement slice: one
@@ -258,6 +260,12 @@ authenticated advisory OpenAPI discovery request is promoted from `observe` to
 `suspicious`, is served from an Eidolon-owned OpenAPI surface instead of a
 rewritten upstream schema, and exports the same
 `preserve_eidolon_routing` recommendation.
+
+The fourth smoke proves the first session-recon promotion slice: one session
+first requests `/docs` and then `/openapi.json`, gets promoted from `observe`
+to `suspicious` on the second request because it fanned out across both
+discovery surfaces, and is then served from the owned OpenAPI path with the
+same `preserve_eidolon_routing` export recommendation.
 
 Create a `kind` cluster:
 

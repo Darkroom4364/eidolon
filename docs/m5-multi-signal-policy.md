@@ -130,6 +130,9 @@ The current M5 slice is intentionally narrow:
   discovery-surface requests that combine a low inverse vendor score with an
   explicitly agentic actor kind, while stronger trusted identities still keep
   their low-confidence bait-softening behavior
+- one conservative session-recon promotion now exists for same-session
+  discovery-surface fanout across `/docs` and `/openapi.json`, while stronger
+  trusted identities still suppress that low-confidence runtime promotion
 - suspicious `GET /docs` and `GET /openapi.json` discovery requests now receive
   Eidolon-owned bait surfaces instead of rewritten upstream discovery views,
   and those owned responses record normal bait exposure so same-session causal
