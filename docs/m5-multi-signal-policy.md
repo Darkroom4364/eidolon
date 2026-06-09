@@ -156,6 +156,9 @@ The current M5 slice is intentionally narrow:
   to probe the same controlled branch after Eidolon has already depth-throttled
   the session once, keeping the hard-fail tied to explicit post-containment
   persistence rather than the first over-limit request
+- edge export now groups both post-containment blocked paths under the shared
+  `post_containment_persistence` reason-code family while preserving distinct
+  detail codes for branch-escape versus depth-limit persistence
 - near-miss matching on the shared reconcile path is now header-aware, so
   `X-Migration-Trace` and `X-OpenAPI-Trace` requests are attributed to the
   correct bait family instead of collapsing onto the first registered decoy

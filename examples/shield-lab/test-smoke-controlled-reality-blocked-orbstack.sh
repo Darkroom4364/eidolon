@@ -190,7 +190,7 @@ done
 [[ "$session" == "1f612f75-2ce8-4de0-9536-0e08df0b38a8" ]]
 
 cat <<'JSON'
-{"contract_version":"2026-06-05.v1","observed_at":"2026-06-09T17:00:04Z","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","request":{"method":"GET","path":"/api/v1/projects"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"blocked","routing_decision":"eidolon_owned","reason":"controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2"},"evidence":{"event_schema_version":2,"event_ids":["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","dddddddd-dddd-dddd-dddd-dddddddddddd"],"bundle_ref":"session:1f612f75-2ce8-4de0-9536-0e08df0b38a8"},"edge_recommendation":{"action":"preserve_eidolon_routing","ttl_seconds":300,"reason_codes":["eidolon_runtime_enforcement","eidolon_owned"]}}
+{"contract_version":"2026-06-05.v1","observed_at":"2026-06-09T17:00:04Z","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","request":{"method":"GET","path":"/api/v1/projects"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"blocked","routing_decision":"eidolon_owned","reason":"controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2"},"evidence":{"event_schema_version":2,"event_ids":["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","dddddddd-dddd-dddd-dddd-dddddddddddd"],"bundle_ref":"session:1f612f75-2ce8-4de0-9536-0e08df0b38a8"},"edge_recommendation":{"action":"preserve_eidolon_routing","ttl_seconds":300,"reason_codes":["eidolon_runtime_enforcement","eidolon_owned","post_containment_persistence","controlled_reality_branch_escape"]}}
 JSON
 SH
 

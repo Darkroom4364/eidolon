@@ -307,12 +307,17 @@ repeated reality-escape attempts: after a session has already entered
 containment, requesting a path outside the configured controlled-reality branch
 once records the escape signal, and repeating that same outside-branch probe
 moves the session into `blocked` with the hard-fail preserved in edge export.
+That export now groups the decision under
+`post_containment_persistence` with the detail code
+`controlled_reality_branch_escape`.
 
 The tenth smoke proves the adjacent post-containment depth-limit path: after a
 session has already entered `controlled_reality`, continuing to probe the same
 contained branch past the first throttle moves the session from
 `controlled_reality` into `blocked`, preserving the depth-limit evidence and
-the final Eidolon-owned hard fail in edge export.
+the final Eidolon-owned hard fail in edge export. That export uses the same
+`post_containment_persistence` family with the detail code
+`controlled_reality_depth_limit`.
 
 Create a `kind` cluster:
 
