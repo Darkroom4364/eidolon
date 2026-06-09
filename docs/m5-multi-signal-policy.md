@@ -145,6 +145,10 @@ The current M5 slice is intentionally narrow:
 - one conservative `rate_limited -> blocked` path now exists for repeating
   that same-bait near miss again after Eidolon has already throttled the
   session once, keeping blocked rare and tied to explicit retry behavior
+- one conservative `rate_limited -> controlled_reality` path now exists for a
+  confirmed same-session exact bait-derived action after throttling, so stronger
+  runtime evidence still moves the session into containment instead of stopping
+  at a synthetic intercept
 - near-miss matching on the shared reconcile path is now header-aware, so
   `X-Migration-Trace` and `X-OpenAPI-Trace` requests are attributed to the
   correct bait family instead of collapsing onto the first registered decoy

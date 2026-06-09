@@ -135,15 +135,14 @@ pub fn transition_after_correlated_bait_action(
     current_state: PolicyState,
 ) -> Option<PolicyTransition> {
     match current_state {
-        PolicyState::Observe | PolicyState::Suspicious => Some(PolicyTransition::new(
-            current_state,
-            PolicyState::ControlledReality,
-            BAIT_ACTION_CONTROLLED_REALITY_REASON,
-        )),
-        PolicyState::Normal
-        | PolicyState::ControlledReality
-        | PolicyState::RateLimited
-        | PolicyState::Blocked => None,
+        PolicyState::Observe | PolicyState::Suspicious | PolicyState::RateLimited => {
+            Some(PolicyTransition::new(
+                current_state,
+                PolicyState::ControlledReality,
+                BAIT_ACTION_CONTROLLED_REALITY_REASON,
+            ))
+        }
+        PolicyState::Normal | PolicyState::ControlledReality | PolicyState::Blocked => None,
     }
 }
 
@@ -424,7 +423,8 @@ mod tests {
     }
 
     #[test]
-    fn correlated_bait_action_transitions_observe_or_suspicious_to_controlled_reality() {
+    fn correlated_bait_action_transitions_observe_suspicious_or_rate_limited_to_controlled_reality()
+    {
         let Some(observe) = transition_after_correlated_bait_action(PolicyState::Observe) else {
             panic!("observe should transition");
         };
@@ -432,11 +432,17 @@ mod tests {
         else {
             panic!("suspicious should transition");
         };
+        let Some(rate_limited) = transition_after_correlated_bait_action(PolicyState::RateLimited)
+        else {
+            panic!("rate_limited should transition");
+        };
 
         assert_eq!(observe.from, PolicyState::Observe);
         assert_eq!(observe.to, PolicyState::ControlledReality);
         assert_eq!(suspicious.from, PolicyState::Suspicious);
         assert_eq!(suspicious.to, PolicyState::ControlledReality);
+        assert_eq!(rate_limited.from, PolicyState::RateLimited);
+        assert_eq!(rate_limited.to, PolicyState::ControlledReality);
     }
 
     #[test]
@@ -668,7 +674,6 @@ mod tests {
         for state in [
             PolicyState::Normal,
             PolicyState::ControlledReality,
-            PolicyState::RateLimited,
             PolicyState::Blocked,
         ] {
             assert_eq!(transition_after_correlated_bait_action(state), None);

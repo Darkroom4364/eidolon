@@ -1955,7 +1955,9 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     )?;
 
     if intervention_mode.interventions_enabled()
-        && matches!(&surface_action, SurfaceAction::ProtectedUpstream)
+        && (matches!(&surface_action, SurfaceAction::ProtectedUpstream)
+            || (decision.policy_state == PolicyState::RateLimited
+                && matches!(&surface_action, SurfaceAction::RateLimited { .. })))
     {
         if let Some(action_match) = runtime.bait_registry.match_action(
             &request.method,
@@ -2060,7 +2062,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             client_stream.write_all(&response.to_http_bytes())?;
             return client_stream.flush();
         }
+    }
 
+    if intervention_mode.interventions_enabled()
+        && matches!(&surface_action, SurfaceAction::ProtectedUpstream)
+    {
         if let Some(action_shape_match) = runtime.bait_registry.match_action_shape(
             &request.method,
             &surface_request.path,
@@ -7572,6 +7578,109 @@ mod tests {
         assert_eq!(action_debugs.len(), 2);
         assert_eq!(action_debugs[1]["fields"]["matched_prior_exposure"], false);
         assert_eq!(action_debugs[1]["fields"]["prior_same_bait_exposure"], true);
+    }
+
+    #[test]
+    fn runtime_rate_limited_exact_bait_action_enters_controlled_reality() {
+        let event_log_path = unique_temp_path("rate-limited-exact-action-events.jsonl");
+        let debug_log_path = unique_temp_path("rate-limited-exact-action-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("rate-limited-exact-action-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        let exposure_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Suspicious);
+        let near_miss_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "wrong")],
+            ),
+        ));
+        let action_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "rel_2025_04_b7f2")],
+            ),
+        ));
+
+        assert_eq!(exposure_response.status, 200);
+        assert_eq!(near_miss_response.status, 429);
+        assert_eq!(action_response.status, 202);
+        assert!(must_ok(
+            String::from_utf8(action_response.body),
+            "body should be utf8"
+        )
+        .contains(r#""write_committed":false"#));
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        let controlled_change = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| {
+                event["kind"]["from"].as_str() == Some("rate_limited")
+                    && event["kind"]["to"].as_str() == Some("controlled_reality")
+            })
+            .unwrap_or_else(|| panic!("controlled reality policy change should exist"));
+        assert!(controlled_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason
+                    .contains("confirmed bait-derived action moved session into controlled reality")
+            }));
+
+        let action_request = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("exact bait action request_seen should exist"));
+        assert_eq!(action_request["policy_state"], "rate_limited");
+        assert_eq!(action_request["kind"]["routing_decision"], "eidolon_owned");
+
+        let bait_actions = events_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(bait_actions.len(), 2);
+        assert_eq!(bait_actions[1]["policy_state"], "rate_limited");
+        assert_eq!(bait_actions[1]["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert_eq!(
+            bait_actions[1]["kind"]["exposure_id"],
+            exposure["kind"]["exposure_id"]
+        );
+
+        let controlled_entry = first_event_of_type(&event_log_path, "controlled_reality_entered");
+        assert_eq!(controlled_entry["policy_state"], "controlled_reality");
+
+        let controlled_response = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .rfind(|event| event["policy_state"].as_str() == Some("controlled_reality"))
+            .unwrap_or_else(|| panic!("controlled reality response should exist"));
+        assert_eq!(
+            controlled_response["kind"]["routing_decision"],
+            "controlled_reality"
+        );
+        assert_eq!(controlled_response["kind"]["status"], 202);
+
+        let action_debugs = debug_events(&debug_log_path, "bait_action_observed");
+        assert_eq!(action_debugs.len(), 2);
+        assert_eq!(action_debugs[1]["fields"]["matched_prior_exposure"], true);
+        assert_eq!(action_debugs[1]["fields"]["prior_same_bait_exposure"], true);
+
+        let controlled_debug = debug_events(&debug_log_path, "controlled_reality_action_selected")
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("controlled reality debug should exist"));
+        assert_eq!(controlled_debug["fields"]["depth"], 1);
+        assert_eq!(
+            controlled_debug["fields"]["action"]["type"],
+            "controlled_reality"
+        );
     }
 
     #[test]
