@@ -274,3 +274,34 @@ Issues:
 Current design note:
 
 - `docs/m5-multi-signal-policy.md`
+
+Status checklist:
+
+- [x] Design anchor exists in `docs/m5-multi-signal-policy.md` (`main`)
+- [x] Authenticated ingress advisory signals are captured, audited, and exported (`main`)
+- [x] Trusted ingress remains distinct from runtime suspicion (`main`)
+- [x] Narrow `observe -> suspicious` promotion exists for low-score authenticated
+  agentic discovery (`main`)
+- [x] Suspicious owned shaping exists for `/docs` and `/openapi.json` (`main`)
+- [x] Same-session discovery fanout promotion across `/docs` and
+  `/openapi.json` exists (`current branch only`)
+- [x] `suspicious -> rate_limited` exists for same-bait near misses
+  (`current branch only`)
+- [x] `rate_limited -> blocked` exists for repeated same-bait near misses
+  (`current branch only`)
+- [x] `rate_limited -> controlled_reality` exists for exact bait-derived
+  follow-up actions (`current branch only`)
+- [x] `controlled_reality -> blocked` exists for repeated branch-escape
+  attempts (`current branch only`)
+- [x] `controlled_reality -> blocked` exists for repeated same-branch
+  depth-limit persistence (`current branch only`)
+- [x] Post-containment blocked exports now use a shared grouped reason-code
+  family with live OrbStack smoke coverage (`current branch only`)
+- [ ] Merge the current `feature/suspicious-discovery-fanout` branch
+- [ ] Normalize blocked/export taxonomy for the pre-containment blocked paths
+- [ ] Broaden the narrow hand-tuned transitions into a more general
+  multi-signal aggregation plane
+- [ ] Add per-session signed polymorphic bait generation
+- [ ] Expand deployment-safe allowlists and verified crawler handling beyond
+  the current trusted-ingress slice
+- [ ] Prepare the external-readiness note and release checklist
