@@ -2060,6 +2060,74 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             client_stream.write_all(&response.to_http_bytes())?;
             return client_stream.flush();
         }
+
+        if let Some(action_shape_match) = runtime
+            .bait_registry
+            .match_action_shape(&request.method, &surface_request.path)
+        {
+            let prior_same_bait_exposure = write_bait_action_near_miss_event(
+                runtime,
+                &session,
+                decision.policy_state,
+                &action_shape_match.bait,
+                &request.method,
+                &surface_request.path,
+            )?;
+            write_debug(
+                runtime,
+                "bait_action_near_miss",
+                Some(session.session_id),
+                json!({
+                    "bait_id": &action_shape_match.bait.id,
+                    "method": request.method.as_str(),
+                    "path": debug_path(&surface_request.path),
+                    "query_present": surface_request.query.is_some(),
+                    "prior_same_bait_exposure": prior_same_bait_exposure,
+                }),
+            )?;
+
+            if let Some(transition) = policy::transition_to_rate_limited_from_same_bait_near_miss(
+                decision.policy_state,
+                &surface_request.path,
+                &action_shape_match.bait.id,
+                prior_same_bait_exposure,
+            ) {
+                write_debug(
+                    runtime,
+                    "policy_transition_selected",
+                    Some(session.session_id),
+                    json!({
+                        "from": transition.from,
+                        "to": transition.to,
+                        "reason": transition.reason.as_str(),
+                    }),
+                )?;
+                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_changed_event(session.session_id, &transition),
+                )?;
+                let response =
+                    rate_limited_response(runtime.controlled_reality_config.retry_after_seconds);
+                let action = SurfaceAction::RateLimited {
+                    reason: transition.reason.clone(),
+                    response: response.clone(),
+                };
+                effective_decision =
+                    direct_surface_decision(transition.to, &action, transition.reason);
+                return write_direct_response(DirectResponseContext {
+                    client_stream,
+                    runtime,
+                    session: &session,
+                    request: &request,
+                    path: &path,
+                    decision: &effective_decision,
+                    response,
+                    intervention_mode,
+                    surface_requested_intervention: true,
+                });
+            }
+        }
     }
 
     if let Some(mut response) = direct_surface_response(surface_action.clone()) {
@@ -2597,22 +2665,41 @@ fn write_bait_exposed_event(
     Ok(exposure_id)
 }
 
-fn write_bait_action_observed_event(
+fn bait_action_exposure_id(
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    bait_id: &BaitId,
+) -> io::Result<Option<ExposureId>> {
+    let exposures = runtime
+        .bait_exposures
+        .lock()
+        .map_err(|_| io::Error::other("bait exposure store lock poisoned"))?;
+
+    Ok(exposures.exposure_for_action(session.session_id, bait_id))
+}
+
+struct BaitActionObservation<'a> {
+    bait: &'a Bait,
+    method: &'a str,
+    path: &'a str,
+    exposure_id: Option<ExposureId>,
+    prior_same_bait_exposure: bool,
+}
+
+fn write_bait_action_observed_event_with_exposure(
     runtime: &ProxyRuntime,
     session: &SessionContext,
     policy_state: PolicyState,
-    bait: &Bait,
-    method: &str,
-    path: &str,
-) -> io::Result<Option<ExposureId>> {
-    let exposure_id = {
-        let exposures = runtime
-            .bait_exposures
-            .lock()
-            .map_err(|_| io::Error::other("bait exposure store lock poisoned"))?;
-        exposures.exposure_for_action(session.session_id, &bait.id)
-    };
-
+    observation: BaitActionObservation<'_>,
+) -> io::Result<()> {
+    let BaitActionObservation {
+        bait,
+        method,
+        path,
+        exposure_id,
+        prior_same_bait_exposure,
+    } = observation;
+    let matched_prior_exposure = exposure_id.is_some();
     write_event(
         &runtime.event_log,
         &Event::new(
@@ -2637,12 +2724,61 @@ fn write_bait_action_observed_event(
             "method": method,
             "path": debug_path(path),
             "query_present": debug_query_present(path),
-            "matched_prior_exposure": exposure_id.is_some(),
+            "matched_prior_exposure": matched_prior_exposure,
+            "prior_same_bait_exposure": prior_same_bait_exposure,
             "exposure_id": &exposure_id,
         }),
+    )
+}
+
+fn write_bait_action_observed_event(
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    policy_state: PolicyState,
+    bait: &Bait,
+    method: &str,
+    path: &str,
+) -> io::Result<Option<ExposureId>> {
+    let exposure_id = bait_action_exposure_id(runtime, session, &bait.id)?;
+    write_bait_action_observed_event_with_exposure(
+        runtime,
+        session,
+        policy_state,
+        BaitActionObservation {
+            bait,
+            method,
+            path,
+            exposure_id: exposure_id.clone(),
+            prior_same_bait_exposure: exposure_id.is_some(),
+        },
     )?;
 
     Ok(exposure_id)
+}
+
+fn write_bait_action_near_miss_event(
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    policy_state: PolicyState,
+    bait: &Bait,
+    method: &str,
+    path: &str,
+) -> io::Result<bool> {
+    let prior_same_bait_exposure = bait_action_exposure_id(runtime, session, &bait.id)?.is_some();
+    write_bait_action_observed_event_with_exposure(
+        runtime,
+        session,
+        policy_state,
+        BaitActionObservation {
+            bait,
+            method,
+            path,
+            exposure_id: None,
+            prior_same_bait_exposure,
+        },
+    )?;
+
+    Ok(prior_same_bait_exposure)
 }
 
 fn bait_action_synthetic_response() -> HttpResponse {
@@ -7114,7 +7250,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_wrong_bait_header_value_forwards_as_near_miss() {
+    fn runtime_wrong_bait_header_value_logs_unmatched_bait_action_and_forwards_upstream() {
         let event_log_path = unique_temp_path("near-miss-events.jsonl");
         let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
         let runtime = test_runtime_with_m1_controller(
@@ -7145,7 +7281,75 @@ mod tests {
         )
         .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
         assert_eq!(events_of_type(&event_log_path, "bait_exposed").len(), 1);
-        assert_event_type_absent(&event_log_path, "bait_action_observed");
+        let near_miss = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(near_miss["policy_state"], "observe");
+        assert_eq!(near_miss["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert!(near_miss["kind"]["exposure_id"].is_null());
+        assert_eq!(
+            events_of_type(&event_log_path, "rate_limit_applied").len(),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_rate_limits_suspicious_same_bait_near_miss_after_exposure() {
+        let event_log_path = unique_temp_path("suspicious-near-miss-events.jsonl");
+        let debug_log_path = unique_temp_path("suspicious-near-miss-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("suspicious-near-miss-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Suspicious);
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "wrong")],
+            ),
+        ));
+
+        assert_eq!(response.status, 429);
+        assert_eq!(header_values(&response, "retry-after"), vec!["30"]);
+
+        let near_miss = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(near_miss["policy_state"], "suspicious");
+        assert_eq!(near_miss["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert!(near_miss["kind"]["exposure_id"].is_null());
+
+        let policy_changed = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| event["kind"]["to"].as_str() == Some("rate_limited"))
+            .unwrap_or_else(|| panic!("rate-limited policy change should exist"));
+        assert_eq!(policy_changed["kind"]["from"], "suspicious");
+        assert_eq!(policy_changed["kind"]["to"], "rate_limited");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "suspicious same-bait near miss after exposure moved session to rate limited"
+            )));
+        let request_seen = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("rate-limited request_seen should exist"));
+        assert_eq!(request_seen["policy_state"], "rate_limited");
+        assert_eq!(request_seen["kind"]["routing_decision"], "rate_limited");
+        let rate_limit = first_event_of_type(&event_log_path, "rate_limit_applied");
+        assert_eq!(rate_limit["policy_state"], "rate_limited");
+
+        let near_miss_debug = first_debug_event(&debug_log_path, "bait_action_near_miss");
+        assert_eq!(near_miss_debug["fields"]["prior_same_bait_exposure"], true);
+        let action_debug = first_debug_event(&debug_log_path, "bait_action_observed");
+        assert_eq!(action_debug["fields"]["matched_prior_exposure"], false);
+        assert_eq!(action_debug["fields"]["prior_same_bait_exposure"], true);
     }
 
     #[test]

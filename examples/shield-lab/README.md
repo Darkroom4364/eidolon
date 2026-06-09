@@ -63,6 +63,7 @@ Keep out of the private repo:
   smoke-suspicious-promotion-orbstack.sh
   smoke-suspicious-openapi-orbstack.sh
   smoke-suspicious-discovery-fanout-orbstack.sh
+  smoke-suspicious-rate-limit-orbstack.sh
   collect-kali-vm-sample.sh
   run-pwnkit-kali-vm.sh
   kali-vm-pwnkit.md
@@ -247,6 +248,7 @@ examples/shield-lab/smoke-trusted-ingress-orbstack.sh
 examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
+examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
 ```
 
 The second smoke proves the first M5 graduated-enforcement slice: one
@@ -260,6 +262,17 @@ authenticated advisory OpenAPI discovery request is promoted from `observe` to
 `suspicious`, is served from an Eidolon-owned OpenAPI surface instead of a
 rewritten upstream schema, and exports the same
 `preserve_eidolon_routing` recommendation.
+
+The fourth smoke proves the session-recon fanout slice: `/docs` followed by
+`/openapi.json` in the same session promotes the second request from `observe`
+to `suspicious`, keeps the owned OpenAPI shaping, and exports the preserved
+Eidolon routing decision.
+
+The fifth smoke proves the first `suspicious -> rate_limited` slice: a session
+that was promoted on the owned docs surface and then performs a wrong-header
+same-bait near miss on `/api/v2/import/reconcile` is throttled with
+`Retry-After`, preserves unmatched bait-action evidence, and exports the
+`rate_limited` runtime decision.
 
 The fourth smoke proves the first session-recon promotion slice: one session
 first requests `/docs` and then `/openapi.json`, gets promoted from `observe`
