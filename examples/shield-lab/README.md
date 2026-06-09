@@ -68,6 +68,7 @@ Keep out of the private repo:
   smoke-rate-limited-blocked-orbstack.sh
   smoke-rate-limited-controlled-reality-orbstack.sh
   smoke-controlled-reality-blocked-orbstack.sh
+  smoke-controlled-reality-depth-limit-blocked-orbstack.sh
   collect-kali-vm-sample.sh
   run-pwnkit-kali-vm.sh
   kali-vm-pwnkit.md
@@ -257,6 +258,7 @@ examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
 examples/shield-lab/smoke-rate-limited-blocked-orbstack.sh
 examples/shield-lab/smoke-rate-limited-controlled-reality-orbstack.sh
 examples/shield-lab/smoke-controlled-reality-blocked-orbstack.sh
+examples/shield-lab/smoke-controlled-reality-depth-limit-blocked-orbstack.sh
 ```
 
 The second smoke proves the first M5 graduated-enforcement slice: one
@@ -305,6 +307,12 @@ repeated reality-escape attempts: after a session has already entered
 containment, requesting a path outside the configured controlled-reality branch
 once records the escape signal, and repeating that same outside-branch probe
 moves the session into `blocked` with the hard-fail preserved in edge export.
+
+The tenth smoke proves the adjacent post-containment depth-limit path: after a
+session has already entered `controlled_reality`, continuing to probe the same
+contained branch past the first throttle moves the session from
+`controlled_reality` into `blocked`, preserving the depth-limit evidence and
+the final Eidolon-owned hard fail in edge export.
 
 Create a `kind` cluster:
 
