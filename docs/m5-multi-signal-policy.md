@@ -135,6 +135,10 @@ The current M5 slice is intentionally narrow:
   has also shown query-bearing discovery recon, so one lower-confidence
   advisory signal plus two weaker recon contributors can promote without
   requiring a strong single-request score
+- one adjacent aggregated `observe -> suspicious` path now exists for one
+  query-bearing medium-score authenticated discovery request when authenticated
+  detection IDs also contribute, so multiple weak advisory and recon facts can
+  promote on first contact without requiring a strong single-request score
 - one conservative session-recon promotion now exists for same-session
   discovery-surface fanout across `/docs` and `/openapi.json`, while stronger
   trusted identities still suppress that low-confidence runtime promotion
