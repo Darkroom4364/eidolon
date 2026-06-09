@@ -300,11 +300,11 @@ same-session exact bait-derived action on `/api/v2/import/reconcile` moves the
 session into `controlled_reality`, preserves the matched exposure evidence, and
 exports the contained runtime decision.
 
-The ninth smoke proves the first `controlled_reality -> blocked` slice: after a
-session has already entered containment, continuing to probe the same
-controlled branch past the configured depth-limit throttle first triggers the
-existing `429` tarpit and then moves the session into `blocked`, preserving the
-post-containment hard-fail in edge export.
+The ninth smoke proves the first `controlled_reality -> blocked` slice tied to
+repeated reality-escape attempts: after a session has already entered
+containment, requesting a path outside the configured controlled-reality branch
+once records the escape signal, and repeating that same outside-branch probe
+moves the session into `blocked` with the hard-fail preserved in edge export.
 
 Create a `kind` cluster:
 

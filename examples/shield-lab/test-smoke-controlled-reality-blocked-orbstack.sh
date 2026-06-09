@@ -18,17 +18,19 @@ write_fixture_state() {
 {"schema_version":2,"id":"44444444-4444-4444-4444-444444444444","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:02Z","source":"policy_router","policy_state":"controlled_reality","kind":{"type":"policy_changed","from":"observe","to":"controlled_reality","reason":"confirmed bait-derived action moved session into controlled reality"}}
 {"schema_version":2,"id":"55555555-5555-5555-5555-555555555555","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:02Z","source":"policy_router","policy_state":"controlled_reality","kind":{"type":"controlled_reality_entered","reason":"confirmed bait-derived action moved session into controlled reality"}}
 {"schema_version":2,"id":"66666666-6666-6666-6666-666666666666","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:02Z","source":"proxy","policy_state":"controlled_reality","kind":{"type":"response_served","status":202,"routing_decision":"controlled_reality"}}
-{"schema_version":2,"id":"77777777-7777-7777-7777-777777777777","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:06Z","source":"policy_router","policy_state":"controlled_reality","kind":{"type":"rate_limit_applied","reason":"controlled reality action depth 5 exceeded limit 4; tarpit delay 25ms"}}
-{"schema_version":2,"id":"88888888-8888-8888-8888-888888888888","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:06Z","source":"proxy","policy_state":"controlled_reality","kind":{"type":"response_served","status":429,"routing_decision":"rate_limited"}}
-{"schema_version":2,"id":"99999999-9999-9999-9999-999999999999","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:07Z","source":"policy_router","policy_state":"blocked","kind":{"type":"policy_changed","from":"controlled_reality","to":"blocked","reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4"}}
-{"schema_version":2,"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:07Z","source":"proxy","policy_state":"blocked","kind":{"type":"request_seen","method":"GET","path":"/api/v2/import/reconcile","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"routing_decision":"eidolon_owned"}}
-{"schema_version":2,"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:07Z","source":"policy_router","policy_state":"blocked","kind":{"type":"policy_decision","routing_decision":"eidolon_owned","reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4"}}
-{"schema_version":2,"id":"cccccccc-cccc-cccc-cccc-cccccccccccc","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:07Z","source":"proxy","policy_state":"blocked","kind":{"type":"response_served","status":403,"routing_decision":"eidolon_owned"}}
+{"schema_version":2,"id":"77777777-7777-7777-7777-777777777777","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:03Z","source":"policy_router","policy_state":"controlled_reality","kind":{"type":"reality_escape_attempt","method":"GET","path":"/api/v1/projects","routing_decision":"controlled_reality","reason":"controlled session requested a path outside the configured controlled-reality branch"}}
+{"schema_version":2,"id":"88888888-8888-8888-8888-888888888888","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:03Z","source":"proxy","policy_state":"controlled_reality","kind":{"type":"response_served","status":404,"routing_decision":"controlled_reality"}}
+{"schema_version":2,"id":"99999999-9999-9999-9999-999999999999","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:04Z","source":"policy_router","policy_state":"controlled_reality","kind":{"type":"reality_escape_attempt","method":"GET","path":"/api/v1/projects","routing_decision":"controlled_reality","reason":"controlled session requested a path outside the configured controlled-reality branch"}}
+{"schema_version":2,"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:04Z","source":"policy_router","policy_state":"blocked","kind":{"type":"policy_changed","from":"controlled_reality","to":"blocked","reason":"controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2"}}
+{"schema_version":2,"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:04Z","source":"proxy","policy_state":"blocked","kind":{"type":"request_seen","method":"GET","path":"/api/v1/projects","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"routing_decision":"eidolon_owned"}}
+{"schema_version":2,"id":"cccccccc-cccc-cccc-cccc-cccccccccccc","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:04Z","source":"policy_router","policy_state":"blocked","kind":{"type":"policy_decision","routing_decision":"eidolon_owned","reason":"controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2"}}
+{"schema_version":2,"id":"dddddddd-dddd-dddd-dddd-dddddddddddd","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:04Z","source":"proxy","policy_state":"blocked","kind":{"type":"response_served","status":403,"routing_decision":"eidolon_owned"}}
 JSONL
 
   cat > "$dir/debug.jsonl" <<'JSONL'
-{"event":"controlled_reality_action_selected","fields":{"depth":6,"depth_limit":4,"tarpit_ms":25,"transition":{"from":"controlled_reality","to":"blocked","reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4"},"action":{"type":"eidolon_owned","response_status":403}},"observed_at_unix_ms":1781014807000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8"}
-{"event":"surface_action_selected","fields":{"policy_state":"blocked","policy_routing_decision":"eidolon_owned","policy_reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4","controller_surface_action":{"type":"eidolon_owned","response_status":403},"candidate_surface_action":{"type":"eidolon_owned","response_status":403},"surface_action":{"type":"eidolon_owned","response_status":403},"surface_requested_intervention":true,"trusted_bait_soften_path_prefixes":["/docs","/openapi.json"],"trusted_ingress_softened_surface":false,"trusted_ingress_softening_reason":null},"observed_at_unix_ms":1781014807001,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8"}
+{"event":"reality_escape_attempt","fields":{"attempt_count":1,"method":"GET","path":"/api/v1/projects","policy_state":"controlled_reality","query_present":false,"routing_decision":"controlled_reality"},"observed_at_unix_ms":1781014803000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8"}
+{"event":"reality_escape_attempt","fields":{"attempt_count":2,"method":"GET","path":"/api/v1/projects","policy_state":"controlled_reality","query_present":false,"routing_decision":"controlled_reality"},"observed_at_unix_ms":1781014804000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8"}
+{"event":"surface_action_selected","fields":{"policy_state":"blocked","policy_routing_decision":"eidolon_owned","policy_reason":"controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2","controller_surface_action":{"type":"controlled_reality","reason":"controlled reality served synthetic response at action depth 3","response_status":404},"candidate_surface_action":{"type":"controlled_reality","reason":"controlled reality served synthetic response at action depth 3","response_status":404},"surface_action":{"type":"eidolon_owned","response_status":403},"surface_requested_intervention":true,"trusted_bait_soften_path_prefixes":["/docs","/openapi.json"],"trusted_ingress_softened_surface":false,"trusted_ingress_softening_reason":null},"observed_at_unix_ms":1781014804001,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8"}
 JSONL
 }
 
@@ -141,24 +143,17 @@ HTML
     printf 'HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
     printf '{"status":"queued","synthetic":true,"write_committed":false}\n' > "$body_file"
     ;;
-  3|4|5)
+  3)
     [[ "$method" == "GET" ]]
     [[ -n "$cookie_read" && -f "$cookie_read" ]]
-    [[ "$request_url" == "http://127.0.0.1:31080/api/v2/import/reconcile" ]]
-    printf 'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
-    printf '{"status":"ready","synthetic":true}\n' > "$body_file"
+    [[ "$request_url" == "http://127.0.0.1:31080/api/v1/projects" ]]
+    printf 'HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
+    printf '{"status":"not_found","synthetic":true,"path":"/api/v1/projects"}\n' > "$body_file"
     ;;
-  6)
+  4)
     [[ "$method" == "GET" ]]
     [[ -n "$cookie_read" && -f "$cookie_read" ]]
-    [[ "$request_url" == "http://127.0.0.1:31080/api/v2/import/reconcile" ]]
-    printf 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\ncontent-type: text/plain\r\n\r\n' > "$headers_file"
-    printf 'rate limited by eidolon\n' > "$body_file"
-    ;;
-  7)
-    [[ "$method" == "GET" ]]
-    [[ -n "$cookie_read" && -f "$cookie_read" ]]
-    [[ "$request_url" == "http://127.0.0.1:31080/api/v2/import/reconcile" ]]
+    [[ "$request_url" == "http://127.0.0.1:31080/api/v1/projects" ]]
     printf 'HTTP/1.1 403 Forbidden\r\ncontent-type: text/plain\r\n\r\n' > "$headers_file"
     printf 'blocked by eidolon policy\n' > "$body_file"
     ;;
@@ -195,14 +190,14 @@ done
 [[ "$session" == "1f612f75-2ce8-4de0-9536-0e08df0b38a8" ]]
 
 cat <<'JSON'
-{"contract_version":"2026-06-05.v1","observed_at":"2026-06-09T17:00:07Z","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","request":{"method":"GET","path":"/api/v2/import/reconcile"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"blocked","routing_decision":"eidolon_owned","reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4"},"evidence":{"event_schema_version":2,"event_ids":["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","cccccccc-cccc-cccc-cccc-cccccccccccc"],"bundle_ref":"session:1f612f75-2ce8-4de0-9536-0e08df0b38a8"},"edge_recommendation":{"action":"preserve_eidolon_routing","ttl_seconds":300,"reason_codes":["eidolon_runtime_enforcement","eidolon_owned"]}}
+{"contract_version":"2026-06-05.v1","observed_at":"2026-06-09T17:00:04Z","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","request":{"method":"GET","path":"/api/v1/projects"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"blocked","routing_decision":"eidolon_owned","reason":"controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2"},"evidence":{"event_schema_version":2,"event_ids":["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","dddddddd-dddd-dddd-dddd-dddddddddddd"],"bundle_ref":"session:1f612f75-2ce8-4de0-9536-0e08df0b38a8"},"edge_recommendation":{"action":"preserve_eidolon_routing","ttl_seconds":300,"reason_codes":["eidolon_runtime_enforcement","eidolon_owned"]}}
 JSON
 SH
 
   chmod +x "$dir/kubectl" "$dir/curl" "$dir/edge-export"
 }
 
-test_smoke_script_verifies_post_containment_probe_becomes_blocked() {
+test_smoke_script_verifies_repeated_escape_attempt_becomes_blocked() {
   local temp_dir
   local state_dir
   local output
@@ -225,6 +220,6 @@ test_smoke_script_verifies_post_containment_probe_becomes_blocked() {
   rg -q '1f612f75-2ce8-4de0-9536-0e08df0b38a8' <<<"$output"
 }
 
-test_smoke_script_verifies_post_containment_probe_becomes_blocked
+test_smoke_script_verifies_repeated_escape_attempt_becomes_blocked
 
 printf 'shield-lab controlled reality blocked smoke checks passed\n'
