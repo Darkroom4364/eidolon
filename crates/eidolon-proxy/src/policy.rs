@@ -2,6 +2,7 @@ use eidolon_core::{
     Event, EventKind, EventSource, IngressActorKind, IngressAdvisorySignals, IngressIdentity,
     PolicyState, RoutingDecision, SessionId,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::ingress_identity;
 
@@ -14,8 +15,48 @@ const BAIT_ACTION_CONTROLLED_REALITY_REASON: &str =
     "confirmed bait-derived action moved session into controlled reality";
 const DISCOVERY_INGRESS_SUSPICIOUS_REASON_PREFIX: &str =
     "authenticated ingress advisory signals promoted discovery request to suspicious";
+const DISCOVERY_FANOUT_SUSPICIOUS_REASON_PREFIX: &str =
+    "session recon discovery-surface fanout promoted request to suspicious";
 const AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND: &str = "automation_likelihood_inverse";
 const DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX: u16 = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoverySurfaceKind {
+    Docs,
+    OpenApi,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoverySurfaceFanout {
+    #[serde(default)]
+    pub docs_seen: bool,
+    #[serde(default)]
+    pub openapi_seen: bool,
+}
+
+impl DiscoverySurfaceFanout {
+    pub fn mark(self, kind: DiscoverySurfaceKind) -> Self {
+        let mut next = self;
+        match kind {
+            DiscoverySurfaceKind::Docs => next.docs_seen = true,
+            DiscoverySurfaceKind::OpenApi => next.openapi_seen = true,
+        }
+        next
+    }
+
+    pub fn distinct_surface_count(self) -> u8 {
+        u8::from(self.docs_seen) + u8::from(self.openapi_seen)
+    }
+
+    pub fn summary(self) -> &'static str {
+        match (self.docs_seen, self.openapi_seen) {
+            (true, true) => "/docs,/openapi.json",
+            (true, false) => "/docs",
+            (false, true) => "/openapi.json",
+            (false, false) => "none",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDecision {
@@ -143,6 +184,33 @@ pub fn transition_to_suspicious_from_ingress_signals(
         format!(
             "{DISCOVERY_INGRESS_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} kind={AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND}",
             snake_case_actor_kind(ingress_signals.actor_kind),
+        ),
+    ))
+}
+
+pub fn transition_to_suspicious_from_discovery_fanout(
+    current_state: PolicyState,
+    path: &str,
+    ingress_identity: &IngressIdentity,
+    fanout: DiscoverySurfaceFanout,
+) -> Option<PolicyTransition> {
+    if !matches!(current_state, PolicyState::Normal | PolicyState::Observe) {
+        return None;
+    }
+    if ingress_identity::softens_bait_surface_exposure(ingress_identity) {
+        return None;
+    }
+    if fanout.distinct_surface_count() < 2 {
+        return None;
+    }
+
+    Some(PolicyTransition::new(
+        current_state,
+        PolicyState::Suspicious,
+        format!(
+            "{DISCOVERY_FANOUT_SUSPICIOUS_REASON_PREFIX}: path={path} distinct_surfaces={} surfaces={}",
+            fanout.distinct_surface_count(),
+            fanout.summary(),
         ),
     ))
 }
@@ -405,6 +473,72 @@ mod tests {
 
         assert_eq!(high_score, None);
         assert_eq!(non_discovery, None);
+    }
+
+    #[test]
+    fn discovery_surface_fanout_promotes_to_suspicious() {
+        let Some(transition) = transition_to_suspicious_from_discovery_fanout(
+            PolicyState::Observe,
+            "/openapi.json",
+            &IngressIdentity::default(),
+            DiscoverySurfaceFanout {
+                docs_seen: true,
+                openapi_seen: true,
+            },
+        ) else {
+            panic!("observe should transition to suspicious");
+        };
+
+        assert_eq!(transition.from, PolicyState::Observe);
+        assert_eq!(transition.to, PolicyState::Suspicious);
+        assert!(transition.reason.contains("discovery-surface fanout"));
+        assert!(transition.reason.contains("distinct_surfaces=2"));
+        assert!(transition.reason.contains("surfaces=/docs,/openapi.json"));
+    }
+
+    #[test]
+    fn trusted_identity_does_not_promote_to_suspicious_from_discovery_fanout() {
+        let transition = transition_to_suspicious_from_discovery_fanout(
+            PolicyState::Observe,
+            "/openapi.json",
+            &IngressIdentity {
+                source: eidolon_core::IngressIdentitySource::SignedAgent,
+                trust_tier: eidolon_core::IngressTrustTier::SignedAttested,
+                label: Some("signed-agent".to_string()),
+                expires_at: None,
+            },
+            DiscoverySurfaceFanout {
+                docs_seen: true,
+                openapi_seen: true,
+            },
+        );
+
+        assert_eq!(transition, None);
+    }
+
+    #[test]
+    fn incomplete_discovery_surface_fanout_does_not_promote_to_suspicious() {
+        let docs_only = transition_to_suspicious_from_discovery_fanout(
+            PolicyState::Observe,
+            "/docs",
+            &IngressIdentity::default(),
+            DiscoverySurfaceFanout {
+                docs_seen: true,
+                openapi_seen: false,
+            },
+        );
+        let already_suspicious = transition_to_suspicious_from_discovery_fanout(
+            PolicyState::Suspicious,
+            "/openapi.json",
+            &IngressIdentity::default(),
+            DiscoverySurfaceFanout {
+                docs_seen: true,
+                openapi_seen: true,
+            },
+        );
+
+        assert_eq!(docs_only, None);
+        assert_eq!(already_suspicious, None);
     }
 
     #[test]
