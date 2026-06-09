@@ -138,6 +138,10 @@ The current M5 slice is intentionally narrow:
   and those owned responses record normal bait exposure so same-session causal
   correlation still works while edge export recommends
   `preserve_eidolon_routing`
+- one conservative `suspicious -> rate_limited` path now exists for a
+  same-session, same-bait action near miss after prior exposure on
+  `/api/v2/import/reconcile`; the unmatched bait-shaped action is preserved as
+  evidence, but only already-suspicious sessions are throttled
 
 That keeps the current containment invariants stable while giving `#175` a
 typed signal plane to build on.

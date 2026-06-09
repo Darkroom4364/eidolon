@@ -1,6 +1,6 @@
 use eidolon_core::{
-    Event, EventKind, EventSource, IngressActorKind, IngressAdvisorySignals, IngressIdentity,
-    PolicyState, RoutingDecision, SessionId,
+    BaitId, Event, EventKind, EventSource, IngressActorKind, IngressAdvisorySignals,
+    IngressIdentity, PolicyState, RoutingDecision, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,8 @@ const DISCOVERY_INGRESS_SUSPICIOUS_REASON_PREFIX: &str =
     "authenticated ingress advisory signals promoted discovery request to suspicious";
 const DISCOVERY_FANOUT_SUSPICIOUS_REASON_PREFIX: &str =
     "session recon discovery-surface fanout promoted request to suspicious";
+const SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX: &str =
+    "suspicious same-bait near miss after exposure moved session to rate limited";
 const AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND: &str = "automation_likelihood_inverse";
 const DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX: u16 = 20;
 
@@ -211,6 +213,26 @@ pub fn transition_to_suspicious_from_discovery_fanout(
             "{DISCOVERY_FANOUT_SUSPICIOUS_REASON_PREFIX}: path={path} distinct_surfaces={} surfaces={}",
             fanout.distinct_surface_count(),
             fanout.summary(),
+        ),
+    ))
+}
+
+pub fn transition_to_rate_limited_from_same_bait_near_miss(
+    current_state: PolicyState,
+    path: &str,
+    bait_id: &BaitId,
+    prior_same_bait_exposure: bool,
+) -> Option<PolicyTransition> {
+    if current_state != PolicyState::Suspicious || !prior_same_bait_exposure {
+        return None;
+    }
+
+    Some(PolicyTransition::new(
+        current_state,
+        PolicyState::RateLimited,
+        format!(
+            "{SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX}: path={path} bait_id={}",
+            bait_id.0
         ),
     ))
 }
@@ -539,6 +561,45 @@ mod tests {
 
         assert_eq!(docs_only, None);
         assert_eq!(already_suspicious, None);
+    }
+
+    #[test]
+    fn suspicious_same_bait_near_miss_after_exposure_promotes_to_rate_limited() {
+        let Some(transition) = transition_to_rate_limited_from_same_bait_near_miss(
+            PolicyState::Suspicious,
+            "/api/v2/import/reconcile",
+            &BaitId("rel_2025_04_b7f2".to_string()),
+            true,
+        ) else {
+            panic!("suspicious near miss should transition to rate limited");
+        };
+
+        assert_eq!(transition.from, PolicyState::Suspicious);
+        assert_eq!(transition.to, PolicyState::RateLimited);
+        assert!(transition
+            .reason
+            .contains(SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX));
+        assert!(transition.reason.contains("path=/api/v2/import/reconcile"));
+        assert!(transition.reason.contains("bait_id=rel_2025_04_b7f2"));
+    }
+
+    #[test]
+    fn same_bait_near_miss_requires_suspicious_state_and_prior_exposure() {
+        let no_prior = transition_to_rate_limited_from_same_bait_near_miss(
+            PolicyState::Suspicious,
+            "/api/v2/import/reconcile",
+            &BaitId("rel_2025_04_b7f2".to_string()),
+            false,
+        );
+        let observe = transition_to_rate_limited_from_same_bait_near_miss(
+            PolicyState::Observe,
+            "/api/v2/import/reconcile",
+            &BaitId("rel_2025_04_b7f2".to_string()),
+            true,
+        );
+
+        assert_eq!(no_prior, None);
+        assert_eq!(observe, None);
     }
 
     #[test]

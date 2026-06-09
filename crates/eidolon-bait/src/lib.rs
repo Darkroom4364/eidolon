@@ -155,7 +155,17 @@ impl BaitRegistry {
 
         self.baits
             .iter()
-            .find(|bait| action_matches(&bait.expected_action, method, path, &headers))
+            .find(|bait| exact_action_matches(&bait.expected_action, method, path, &headers))
+            .cloned()
+            .map(|bait| BaitActionMatch { bait })
+    }
+
+    /// Returns the first registered bait whose method and path match the request,
+    /// even if the expected bait header is missing or wrong.
+    pub fn match_action_shape(&self, method: &str, path: &str) -> Option<BaitActionMatch> {
+        self.baits
+            .iter()
+            .find(|bait| action_shape_matches(&bait.expected_action, method, path))
             .cloned()
             .map(|bait| BaitActionMatch { bait })
     }
@@ -179,13 +189,17 @@ pub struct BaitActionMatch {
     pub bait: Bait,
 }
 
-fn action_matches(
+fn action_shape_matches(expected: &ExpectedAction, method: &str, path: &str) -> bool {
+    expected.method.eq_ignore_ascii_case(method) && expected.path == path
+}
+
+fn exact_action_matches(
     expected: &ExpectedAction,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
 ) -> bool {
-    if !expected.method.eq_ignore_ascii_case(method) || expected.path != path {
+    if !action_shape_matches(expected, method, path) {
         return false;
     }
 
@@ -247,6 +261,18 @@ mod tests {
         );
 
         assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn match_action_shape_accepts_wrong_header_value_near_miss() {
+        let registry = demo_registry();
+
+        let matched = registry.match_action_shape("POST", "/api/v2/import/reconcile");
+
+        assert_eq!(
+            matched.map(|matched| matched.bait.id),
+            Some(BaitId("rel_2025_04_b7f2".to_string()))
+        );
     }
 
     #[test]
