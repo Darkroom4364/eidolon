@@ -66,6 +66,7 @@ Keep out of the private repo:
   smoke-suspicious-rate-limit-orbstack.sh
   smoke-suspicious-openapi-rate-limit-orbstack.sh
   smoke-rate-limited-blocked-orbstack.sh
+  smoke-rate-limited-controlled-reality-orbstack.sh
   collect-kali-vm-sample.sh
   run-pwnkit-kali-vm.sh
   kali-vm-pwnkit.md
@@ -253,6 +254,7 @@ examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
 examples/shield-lab/smoke-rate-limited-blocked-orbstack.sh
+examples/shield-lab/smoke-rate-limited-controlled-reality-orbstack.sh
 ```
 
 The second smoke proves the first M5 graduated-enforcement slice: one
@@ -267,10 +269,11 @@ authenticated advisory OpenAPI discovery request is promoted from `observe` to
 rewritten upstream schema, and exports the same
 `preserve_eidolon_routing` recommendation.
 
-The fourth smoke proves the session-recon fanout slice: `/docs` followed by
-`/openapi.json` in the same session promotes the second request from `observe`
-to `suspicious`, keeps the owned OpenAPI shaping, and exports the preserved
-Eidolon routing decision.
+The fourth smoke proves the first session-recon promotion slice: one session
+first requests `/docs` and then `/openapi.json`, gets promoted from `observe`
+to `suspicious` on the second request because it fanned out across both
+discovery surfaces, and is then served from the owned OpenAPI path with the
+same `preserve_eidolon_routing` export recommendation.
 
 The fifth smoke proves the first `suspicious -> rate_limited` slice: a session
 that was promoted on the owned docs surface and then performs a wrong-header
@@ -289,11 +292,11 @@ same-bait wrong-header retry has already moved the session into
 `blocked`, preserves the second unmatched bait-action observation, and exports
 the blocked Eidolon-owned decision.
 
-The fourth smoke proves the first session-recon promotion slice: one session
-first requests `/docs` and then `/openapi.json`, gets promoted from `observe`
-to `suspicious` on the second request because it fanned out across both
-discovery surfaces, and is then served from the owned OpenAPI path with the
-same `preserve_eidolon_routing` export recommendation.
+The eighth smoke proves the first `rate_limited -> controlled_reality` slice:
+after a same-bait near miss has already throttled the session once, a confirmed
+same-session exact bait-derived action on `/api/v2/import/reconcile` moves the
+session into `controlled_reality`, preserves the matched exposure evidence, and
+exports the contained runtime decision.
 
 Create a `kind` cluster:
 
