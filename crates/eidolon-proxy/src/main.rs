@@ -1866,8 +1866,10 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "session_source": debug_session_source(session.source),
             "ingress_identity": &session.ingress_identity,
             "ingress_signals": &session.ingress_signals,
-            "discovery_surface_fanout": debug_discovery_surface_fanout(discovery_recon_state.fanout),
+            "discovery_surface_fanout":
+                debug_discovery_surface_fanout(discovery_recon_state.fanout),
             "discovery_request_count": discovery_recon_state.request_count,
+            "discovery_query_seen": discovery_recon_state.query_seen,
             "policy_state": policy_state,
             "intervention_mode": debug_intervention_mode(intervention_mode),
         }),
@@ -2768,10 +2770,11 @@ fn update_discovery_recon_state_for_request(
         return Ok(policy::DiscoveryReconState {
             fanout: record.discovery_surface_fanout,
             request_count: record.discovery_request_count,
+            query_seen: record.discovery_query_seen,
         });
     };
 
-    store.note_discovery_surface_request(session_id, kind)
+    store.note_discovery_surface_request(session_id, kind, request.query.is_some())
 }
 
 fn controlled_reality_action(
@@ -6471,7 +6474,7 @@ mod tests {
         must_join(upstream_handle.join(), "upstream thread should join");
         let second_response = parse_downstream_response(&run_runtime_request(
             runtime,
-            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
         ));
         let second_body = must_ok(
             String::from_utf8(second_response.body),
@@ -6509,6 +6512,9 @@ mod tests {
         assert!(policy_changed["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("vendor_score=35")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -6516,6 +6522,8 @@ mod tests {
             .collect();
         assert_eq!(request_debugs.len(), 2);
         assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 2);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
         assert_eq!(
             request_debugs[1]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
             1

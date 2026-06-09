@@ -271,9 +271,10 @@ recommendation.
 
 The third smoke proves the first weaker aggregated `observe -> suspicious`
 slice: a medium-score authenticated agentic discovery request stays in
-`observe` on first contact, but repeating that same discovery request in the
-same session moves the second request into `suspicious` through multi-signal
-aggregation and serves the stronger owned docs surface.
+`observe` on first contact, but after the session has shown query-bearing
+discovery recon, a second same-session discovery request moves into
+`suspicious` through multi-signal aggregation and serves the stronger owned
+docs surface.
 
 The fourth smoke proves the next `#175` slice on `/openapi.json`: one
 authenticated advisory OpenAPI discovery request is promoted from `observe` to

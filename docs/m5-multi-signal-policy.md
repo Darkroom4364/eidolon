@@ -131,9 +131,10 @@ The current M5 slice is intentionally narrow:
   explicitly agentic actor kind, while stronger trusted identities still keep
   their low-confidence bait-softening behavior
 - one weaker aggregated `observe -> suspicious` path now exists for repeated
-  same-session medium-score authenticated discovery requests, so one lower-
-  confidence advisory signal plus repeated session recon can promote on the
-  second request without requiring a strong single-request score
+  same-session medium-score authenticated discovery requests when the session
+  has also shown query-bearing discovery recon, so one lower-confidence
+  advisory signal plus two weaker recon contributors can promote without
+  requiring a strong single-request score
 - one conservative session-recon promotion now exists for same-session
   discovery-surface fanout across `/docs` and `/openapi.json`, while stronger
   trusted identities still suppress that low-confidence runtime promotion

@@ -13,16 +13,16 @@ write_fixture_state() {
 
   cat > "$dir/events.jsonl" <<'JSONL'
 {"schema_version":2,"id":"11111111-1111-1111-1111-111111111111","session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a","observed_at":"2026-06-09T19:00:01Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"GET","path":"/docs?topic=<redacted>","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":35,"vendor_score_kind":"automation_likelihood_inverse"},"routing_decision":"protected_upstream"}}
-{"schema_version":2,"id":"22222222-2222-2222-2222-222222222222","session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a","observed_at":"2026-06-09T19:00:02Z","source":"policy_router","policy_state":"suspicious","kind":{"type":"policy_changed","from":"observe","to":"suspicious","reason":"multi-signal discovery recon aggregation promoted request to suspicious: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=1"}}
-{"schema_version":2,"id":"33333333-3333-3333-3333-333333333333","session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a","observed_at":"2026-06-09T19:00:02Z","source":"proxy","policy_state":"suspicious","kind":{"type":"request_seen","method":"GET","path":"/docs?topic=<redacted>","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":35,"vendor_score_kind":"automation_likelihood_inverse"},"routing_decision":"eidolon_owned"}}
+{"schema_version":2,"id":"22222222-2222-2222-2222-222222222222","session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a","observed_at":"2026-06-09T19:00:02Z","source":"policy_router","policy_state":"suspicious","kind":{"type":"policy_changed","from":"observe","to":"suspicious","reason":"multi-signal discovery recon aggregation promoted request to suspicious: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=1 query_seen=true weak_signals=2"}}
+{"schema_version":2,"id":"33333333-3333-3333-3333-333333333333","session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a","observed_at":"2026-06-09T19:00:02Z","source":"proxy","policy_state":"suspicious","kind":{"type":"request_seen","method":"GET","path":"/docs","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":35,"vendor_score_kind":"automation_likelihood_inverse"},"routing_decision":"eidolon_owned"}}
 {"schema_version":2,"id":"44444444-4444-4444-4444-444444444444","session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a","observed_at":"2026-06-09T19:00:02Z","source":"surface_controller","policy_state":"suspicious","kind":{"type":"bait_exposed","bait_id":"rel_2025_04_b7f2","exposure_id":"exp-5678","surface":"/docs"}}
 {"schema_version":2,"id":"55555555-5555-5555-5555-555555555555","session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a","observed_at":"2026-06-09T19:00:02Z","source":"policy_router","policy_state":"suspicious","kind":{"type":"policy_decision","routing_decision":"eidolon_owned","reason":"surface controller served eidolon-owned response"}}
 {"schema_version":2,"id":"66666666-6666-6666-6666-666666666666","session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a","observed_at":"2026-06-09T19:00:02Z","source":"proxy","policy_state":"suspicious","kind":{"type":"response_served","status":200,"routing_decision":"eidolon_owned"}}
 JSONL
 
   cat > "$dir/debug.jsonl" <<'JSONL'
-{"event":"request_received","fields":{"client_peer":"127.0.0.1:50500","method":"GET","target_form":"origin","path":"/docs","query_present":true,"http_version":"HTTP/1.1","body_len":0,"header_count":6,"safe_headers":[],"session_source":"cookie","ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":35,"vendor_score_kind":"automation_likelihood_inverse"},"discovery_surface_fanout":{"docs_seen":true,"openapi_seen":false,"distinct_surfaces":1},"discovery_request_count":1,"policy_state":"observe","intervention_mode":"enabled"},"observed_at_unix_ms":1781031601000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a"}
-{"event":"request_received","fields":{"client_peer":"127.0.0.1:50500","method":"GET","target_form":"origin","path":"/docs","query_present":true,"http_version":"HTTP/1.1","body_len":0,"header_count":6,"safe_headers":[],"session_source":"cookie","ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":35,"vendor_score_kind":"automation_likelihood_inverse"},"discovery_surface_fanout":{"docs_seen":true,"openapi_seen":false,"distinct_surfaces":1},"discovery_request_count":2,"policy_state":"suspicious","intervention_mode":"enabled"},"observed_at_unix_ms":1781031602000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a"}
+{"event":"request_received","fields":{"client_peer":"127.0.0.1:50500","method":"GET","target_form":"origin","path":"/docs","query_present":true,"http_version":"HTTP/1.1","body_len":0,"header_count":6,"safe_headers":[],"session_source":"cookie","ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":35,"vendor_score_kind":"automation_likelihood_inverse"},"discovery_surface_fanout":{"docs_seen":true,"openapi_seen":false,"distinct_surfaces":1},"discovery_request_count":1,"discovery_query_seen":true,"policy_state":"observe","intervention_mode":"enabled"},"observed_at_unix_ms":1781031601000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a"}
+{"event":"request_received","fields":{"client_peer":"127.0.0.1:50500","method":"GET","target_form":"origin","path":"/docs","query_present":false,"http_version":"HTTP/1.1","body_len":0,"header_count":6,"safe_headers":[],"session_source":"cookie","ingress_identity":{"source":"none","trust_tier":"none"},"ingress_signals":{"actor_kind":"agentic_browser","vendor_score":35,"vendor_score_kind":"automation_likelihood_inverse"},"discovery_surface_fanout":{"docs_seen":true,"openapi_seen":false,"distinct_surfaces":1},"discovery_request_count":2,"discovery_query_seen":true,"policy_state":"suspicious","intervention_mode":"enabled"},"observed_at_unix_ms":1781031602000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a"}
 {"event":"surface_action_selected","fields":{"controller_surface_action":{"plan":"html","type":"rewritten_upstream"},"candidate_surface_action":{"status":200,"type":"eidolon_owned"},"policy_reason":"suspicious policy observes only and forwards to the protected upstream","policy_routing_decision":"protected_upstream","policy_state":"suspicious","surface_action":{"status":200,"type":"eidolon_owned"},"surface_requested_intervention":true,"trusted_bait_soften_path_prefixes":["/docs","/openapi.json"],"trusted_ingress_softened_surface":false,"trusted_ingress_softening_reason":null},"observed_at_unix_ms":1781031602001,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"4d808e0e-6b0b-4d60-9d90-7d86e4780e8a"}
 JSONL
 }
@@ -126,10 +126,10 @@ done
 [[ "$vendor_score" == "35" ]]
 [[ "$vendor_score_kind" == "automation_likelihood_inverse" ]]
 [[ "$transport_auth" == "secret-value" ]]
-[[ "$request_url" == "http://127.0.0.1:31080/docs?topic=imports" ]]
 
 case "$request_count" in
   1)
+    [[ "$request_url" == "http://127.0.0.1:31080/docs?topic=imports" ]]
     [[ -n "$cookie_write" ]]
     printf '# Netscape HTTP Cookie File\n' > "$cookie_write"
     printf 'HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\r\n' > "$headers_file"
@@ -138,6 +138,7 @@ case "$request_count" in
 HTML
     ;;
   2)
+    [[ "$request_url" == "http://127.0.0.1:31080/docs" ]]
     [[ -n "$cookie_read" && -f "$cookie_read" ]]
     [[ -n "$cookie_write" ]]
     printf 'HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\r\n' > "$headers_file"
