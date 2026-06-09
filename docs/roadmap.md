@@ -284,7 +284,8 @@ Status checklist:
   agentic discovery (`main`)
 - [x] Suspicious owned shaping exists for `/docs` and `/openapi.json` (`main`)
 - [x] First weak aggregated suspicious-promotion path exists for repeated
-  medium-score authenticated discovery (`current branch only`)
+  medium-score authenticated discovery plus query-bearing recon
+  (`current branch only`)
 - [x] Same-session discovery fanout promotion across `/docs` and
   `/openapi.json` exists (`current branch only`)
 - [x] `suspicious -> rate_limited` exists for same-bait near misses

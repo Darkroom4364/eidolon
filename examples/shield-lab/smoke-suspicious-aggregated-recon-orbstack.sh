@@ -12,8 +12,9 @@ TRUSTED_INGRESS_SECRET_NAME="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET_NAME:-eidol
 TRUSTED_INGRESS_SECRET_KEY="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET_KEY:-transport-auth.txt}"
 LOCAL_STATE_DIR="${EIDOLON_SHIELD_LOCAL_STATE_DIR:-}"
 EDGE_EXPORT_BIN="${EIDOLON_EDGE_EXPORT_BIN:-}"
-PROMOTION_PATH="${EIDOLON_SHIELD_SUSPICIOUS_AGGREGATED_RECON_PATH:-/docs?topic=imports}"
-PROMOTION_PATH_PREFIX="${EIDOLON_SHIELD_SUSPICIOUS_AGGREGATED_RECON_PATH_PREFIX:-/docs}"
+FIRST_REQUEST_PATH="${EIDOLON_SHIELD_SUSPICIOUS_AGGREGATED_RECON_FIRST_PATH:-/docs?topic=imports}"
+SECOND_REQUEST_PATH="${EIDOLON_SHIELD_SUSPICIOUS_AGGREGATED_RECON_SECOND_PATH:-/docs}"
+REQUEST_PATH_PREFIX="${EIDOLON_SHIELD_SUSPICIOUS_AGGREGATED_RECON_PATH_PREFIX:-/docs}"
 FIRST_BAIT_MARKER="${EIDOLON_SHIELD_SUSPICIOUS_AGGREGATED_RECON_FIRST_BAIT_MARKER:-/docs/legacy-import}"
 SECOND_BAIT_MARKER="${EIDOLON_SHIELD_SUSPICIOUS_AGGREGATED_RECON_SECOND_BAIT_MARKER:-X-Migration-Trace: rel_2025_04_b7f2}"
 ACTOR_KIND="${EIDOLON_SHIELD_SUSPICIOUS_AGGREGATED_RECON_ACTOR_KIND:-agentic_browser}"
@@ -26,9 +27,10 @@ Usage: examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 
 Performs a live OrbStack smoke check for the first weaker aggregated
 observe-to-suspicious path. It sends two same-session transport-authenticated
-medium-score discovery requests, verifies that the first request stayed in
-observe, confirms that the second request was promoted to suspicious through
-multi-signal aggregation, and checks the same session through edge export.
+medium-score discovery requests, verifies that the first query-bearing request
+stayed in observe, confirms that the second same-session discovery request was
+promoted to suspicious through multi-signal aggregation, and checks the same
+session through edge export.
 USAGE
 }
 
@@ -125,7 +127,7 @@ curl_cmd -fsS \
   -H "X-Eidolon-Ingress-Vendor-Score: ${VENDOR_SCORE}" \
   -H "X-Eidolon-Ingress-Vendor-Score-Kind: ${VENDOR_SCORE_KIND}" \
   -H "X-Eidolon-Ingress-Transport-Auth: ${transport_auth_secret}" \
-  "${edge_url}${PROMOTION_PATH}"
+  "${edge_url}${FIRST_REQUEST_PATH}"
 
 curl_cmd -fsS \
   -b "$cookie_jar" \
@@ -136,7 +138,7 @@ curl_cmd -fsS \
   -H "X-Eidolon-Ingress-Vendor-Score: ${VENDOR_SCORE}" \
   -H "X-Eidolon-Ingress-Vendor-Score-Kind: ${VENDOR_SCORE_KIND}" \
   -H "X-Eidolon-Ingress-Transport-Auth: ${transport_auth_secret}" \
-  "${edge_url}${PROMOTION_PATH}"
+  "${edge_url}${SECOND_REQUEST_PATH}"
 
 first_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$first_headers")"
 [[ "$first_http_code" == "200" ]] || fail "expected HTTP 200 from first aggregated recon request, got: ${first_http_code:-none}"
@@ -151,7 +153,7 @@ grep -Fq "$SECOND_BAIT_MARKER" "$second_body" \
 read_proxy_state_file events.jsonl > "$events_file"
 request_events_json="$(
   jq -c -e -s \
-    --arg path_prefix "$PROMOTION_PATH_PREFIX" \
+    --arg path_prefix "$REQUEST_PATH_PREFIX" \
     --arg actor_kind "$ACTOR_KIND" \
     --arg score_kind "$VENDOR_SCORE_KIND" \
     --argjson vendor_score "$VENDOR_SCORE" '
@@ -210,6 +212,11 @@ jq -e \
   ' <<<"$policy_changed_json" >/dev/null \
   || fail "session ${session_id} suspicious transition reason did not preserve the medium advisory score"
 
+jq -e '
+    (.kind.reason // "") | contains("query_seen=true")
+  ' <<<"$policy_changed_json" >/dev/null \
+  || fail "session ${session_id} suspicious transition reason did not preserve the query-bearing recon signal"
+
 read_proxy_state_file debug.jsonl > "$debug_file"
 request_debug_json="$(
   jq -c -e -s \
@@ -221,6 +228,8 @@ request_debug_json="$(
 
 jq -e '
   .fields.discovery_request_count == 2
+  and .fields.discovery_query_seen == true
+  and .fields.query_present == false
   and .fields.discovery_surface_fanout.distinct_surfaces == 1
 ' <<<"$request_debug_json" >/dev/null \
   || fail "session ${session_id} did not preserve the expected aggregated recon debug state"
@@ -266,4 +275,4 @@ jq -e \
   ' "$edge_export_file" >/dev/null \
   || fail "session ${session_id} edge export did not preserve the aggregated recon suspicious result"
 
-echo "suspicious-aggregated-recon smoke ok: session ${session_id} promoted on repeated medium-score discovery"
+echo "suspicious-aggregated-recon smoke ok: session ${session_id} promoted on medium-score discovery plus query-bearing recon"

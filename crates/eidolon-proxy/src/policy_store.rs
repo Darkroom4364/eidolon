@@ -26,6 +26,8 @@ pub struct SessionPolicyRecord {
     pub discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
     #[serde(default)]
     pub discovery_request_count: u32,
+    #[serde(default)]
+    pub discovery_query_seen: bool,
 }
 
 impl SessionPolicyRecord {
@@ -36,6 +38,7 @@ impl SessionPolicyRecord {
             reality_escape_attempt_count: 0,
             discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout::default(),
             discovery_request_count: 0,
+            discovery_query_seen: false,
         }
     }
 }
@@ -64,6 +67,8 @@ struct StoredSessionPolicy {
     discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
     #[serde(default)]
     discovery_request_count: u32,
+    #[serde(default)]
+    discovery_query_seen: bool,
 }
 
 impl PolicyStateStore {
@@ -150,15 +155,18 @@ impl PolicyStateStore {
         &mut self,
         session_id: SessionId,
         kind: crate::policy::DiscoverySurfaceKind,
+        query_present: bool,
     ) -> io::Result<crate::policy::DiscoveryReconState> {
         let mut record = self.record(session_id);
         record.discovery_surface_fanout = record.discovery_surface_fanout.mark(kind);
         record.discovery_request_count = record.discovery_request_count.saturating_add(1);
+        record.discovery_query_seen |= query_present;
         self.records.insert(session_id, record);
         self.persist()?;
         Ok(crate::policy::DiscoveryReconState {
             fanout: record.discovery_surface_fanout,
             request_count: record.discovery_request_count,
+            query_seen: record.discovery_query_seen,
         })
     }
 
@@ -177,6 +185,7 @@ impl PolicyStateStore {
                 reality_escape_attempt_count: record.reality_escape_attempt_count,
                 discovery_surface_fanout: record.discovery_surface_fanout,
                 discovery_request_count: record.discovery_request_count,
+                discovery_query_seen: record.discovery_query_seen,
             })
             .collect();
         sessions.sort_by_key(|record| record.session_id.0);
@@ -248,6 +257,7 @@ fn deserialize_records(
                     reality_escape_attempt_count: session.reality_escape_attempt_count,
                     discovery_surface_fanout: session.discovery_surface_fanout,
                     discovery_request_count: session.discovery_request_count,
+                    discovery_query_seen: session.discovery_query_seen,
                 },
             )
         })
@@ -458,7 +468,8 @@ mod tests {
             must_ok(
                 store.note_discovery_surface_request(
                     session_id,
-                    crate::policy::DiscoverySurfaceKind::Docs
+                    crate::policy::DiscoverySurfaceKind::Docs,
+                    true,
                 ),
                 "docs should persist"
             ),
@@ -468,13 +479,15 @@ mod tests {
                     openapi_seen: false,
                 },
                 request_count: 1,
+                query_seen: true,
             }
         );
         assert_eq!(
             must_ok(
                 store.note_discovery_surface_request(
                     session_id,
-                    crate::policy::DiscoverySurfaceKind::OpenApi
+                    crate::policy::DiscoverySurfaceKind::OpenApi,
+                    false,
                 ),
                 "openapi should persist"
             ),
@@ -484,6 +497,7 @@ mod tests {
                     openapi_seen: true,
                 },
                 request_count: 2,
+                query_seen: true,
             }
         );
 
@@ -496,6 +510,7 @@ mod tests {
             }
         );
         assert_eq!(reopened.record(session_id).discovery_request_count, 2);
+        assert!(reopened.record(session_id).discovery_query_seen);
     }
 
     #[test]
@@ -515,5 +530,6 @@ mod tests {
         );
         assert_eq!(reopened.record(session_id).reality_escape_attempt_count, 0);
         assert_eq!(reopened.record(session_id).discovery_request_count, 0);
+        assert!(!reopened.record(session_id).discovery_query_seen);
     }
 }

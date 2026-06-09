@@ -30,11 +30,13 @@ const REPEATED_REALITY_ESCAPE_BLOCKED_REASON_PREFIX: &str =
 const AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND: &str = "automation_likelihood_inverse";
 const DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX: u16 = 20;
 const DISCOVERY_RECON_AGGREGATION_VENDOR_SCORE_MAX: u16 = 40;
+const DISCOVERY_RECON_AGGREGATION_MIN_WEAK_SIGNALS: u8 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiscoveryReconState {
     pub fanout: DiscoverySurfaceFanout,
     pub request_count: u32,
+    pub query_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,7 +270,9 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
     {
         return None;
     }
-    if recon_state.request_count < 2 {
+    let repeated_discovery = recon_state.request_count >= 2;
+    let weak_signal_count = u8::from(repeated_discovery) + u8::from(recon_state.query_seen);
+    if weak_signal_count < DISCOVERY_RECON_AGGREGATION_MIN_WEAK_SIGNALS {
         return None;
     }
 
@@ -276,10 +280,11 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
         current_state,
         PolicyState::Suspicious,
         format!(
-            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={}",
+            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} weak_signals={weak_signal_count}",
             snake_case_actor_kind(ingress_signals.actor_kind),
             recon_state.request_count,
             recon_state.fanout.distinct_surface_count(),
+            recon_state.query_seen,
         ),
     ))
 }
@@ -791,6 +796,7 @@ mod tests {
                     openapi_seen: false,
                 },
                 request_count: 2,
+                query_seen: true,
             },
         ) else {
             panic!("aggregated discovery recon should transition to suspicious");
@@ -803,10 +809,12 @@ mod tests {
             .contains(DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX));
         assert!(transition.reason.contains("vendor_score=35"));
         assert!(transition.reason.contains("discovery_requests=2"));
+        assert!(transition.reason.contains("query_seen=true"));
+        assert!(transition.reason.contains("weak_signals=2"));
     }
 
     #[test]
-    fn aggregated_discovery_recon_requires_repetition_and_medium_score() {
+    fn aggregated_discovery_recon_requires_multiple_weak_signals_and_medium_score() {
         let no_repetition = transition_to_suspicious_from_aggregated_discovery_recon(
             PolicyState::Observe,
             "/docs",
@@ -824,6 +832,27 @@ mod tests {
                     openapi_seen: false,
                 },
                 request_count: 1,
+                query_seen: true,
+            },
+        );
+        let no_query_signal = transition_to_suspicious_from_aggregated_discovery_recon(
+            PolicyState::Observe,
+            "/docs",
+            &["/docs".to_string(), "/openapi.json".to_string()],
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 2,
+                query_seen: false,
             },
         );
         let stronger_direct_score = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -843,6 +872,7 @@ mod tests {
                     openapi_seen: false,
                 },
                 request_count: 2,
+                query_seen: true,
             },
         );
         let trusted = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -866,10 +896,12 @@ mod tests {
                     openapi_seen: false,
                 },
                 request_count: 2,
+                query_seen: true,
             },
         );
 
         assert_eq!(no_repetition, None);
+        assert_eq!(no_query_signal, None);
         assert_eq!(stronger_direct_score, None);
         assert_eq!(trusted, None);
     }
