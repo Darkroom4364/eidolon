@@ -65,6 +65,7 @@ Keep out of the private repo:
   smoke-suspicious-discovery-fanout-orbstack.sh
   smoke-suspicious-rate-limit-orbstack.sh
   smoke-suspicious-openapi-rate-limit-orbstack.sh
+  smoke-rate-limited-blocked-orbstack.sh
   collect-kali-vm-sample.sh
   run-pwnkit-kali-vm.sh
   kali-vm-pwnkit.md
@@ -251,6 +252,7 @@ examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
+examples/shield-lab/smoke-rate-limited-blocked-orbstack.sh
 ```
 
 The second smoke proves the first M5 graduated-enforcement slice: one
@@ -280,6 +282,12 @@ The sixth smoke proves the same rate-limit path for the owned OpenAPI bait:
 after a suspicious `/openapi.json` exposure, a wrong-value
 `X-OpenAPI-Trace` request on the shared reconcile path is attributed to the
 OpenAPI bait rather than the docs bait and is throttled the same way.
+
+The seventh smoke proves the first `rate_limited -> blocked` slice: after one
+same-bait wrong-header retry has already moved the session into
+`rate_limited`, repeating that same near miss again moves the session into
+`blocked`, preserves the second unmatched bait-action observation, and exports
+the blocked Eidolon-owned decision.
 
 The fourth smoke proves the first session-recon promotion slice: one session
 first requests `/docs` and then `/openapi.json`, gets promoted from `observe`

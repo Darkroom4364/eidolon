@@ -2131,6 +2131,87 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         }
     }
 
+    if intervention_mode.interventions_enabled()
+        && decision.policy_state == PolicyState::RateLimited
+        && matches!(&surface_action, SurfaceAction::RateLimited { .. })
+        && runtime
+            .bait_registry
+            .match_action(
+                &request.method,
+                &surface_request.path,
+                header_pairs(&request.headers),
+            )
+            .is_none()
+    {
+        if let Some(action_shape_match) = runtime.bait_registry.match_action_shape(
+            &request.method,
+            &surface_request.path,
+            header_pairs(&request.headers),
+        ) {
+            let prior_same_bait_exposure = write_bait_action_near_miss_event(
+                runtime,
+                &session,
+                decision.policy_state,
+                &action_shape_match.bait,
+                &request.method,
+                &surface_request.path,
+            )?;
+            write_debug(
+                runtime,
+                "bait_action_near_miss",
+                Some(session.session_id),
+                json!({
+                    "bait_id": &action_shape_match.bait.id,
+                    "method": request.method.as_str(),
+                    "path": debug_path(&surface_request.path),
+                    "query_present": surface_request.query.is_some(),
+                    "prior_same_bait_exposure": prior_same_bait_exposure,
+                }),
+            )?;
+
+            if let Some(transition) =
+                policy::transition_to_blocked_from_repeated_same_bait_near_miss(
+                    decision.policy_state,
+                    &surface_request.path,
+                    &action_shape_match.bait.id,
+                    prior_same_bait_exposure,
+                )
+            {
+                write_debug(
+                    runtime,
+                    "policy_transition_selected",
+                    Some(session.session_id),
+                    json!({
+                        "from": transition.from,
+                        "to": transition.to,
+                        "reason": transition.reason.as_str(),
+                    }),
+                )?;
+                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_changed_event(session.session_id, &transition),
+                )?;
+                effective_decision = policy::PolicyDecision::new(
+                    transition.to,
+                    RoutingDecision::EidolonOwned,
+                    transition.reason.clone(),
+                );
+                return write_direct_response(DirectResponseContext {
+                    client_stream,
+                    runtime,
+                    session: &session,
+                    request: &request,
+                    path: &path,
+                    decision: &effective_decision,
+                    response: surface_text_response(403, "blocked by eidolon policy\n"),
+                    intervention_mode,
+                    surface_requested_intervention: true,
+                });
+            }
+        }
+    }
+
     if let Some(mut response) = direct_surface_response(surface_action.clone()) {
         effective_decision = direct_surface_decision(
             decision.policy_state,
@@ -4401,6 +4482,13 @@ mod tests {
             .into_iter()
             .find(|event| event["event"].as_str() == Some(event_type))
             .unwrap_or_else(|| panic!("missing debug event `{event_type}`"))
+    }
+
+    fn debug_events(path: &Path, event_type: &str) -> Vec<Value> {
+        debug_values(path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some(event_type))
+            .collect()
     }
 
     fn events_of_type(path: &Path, event_type: &str) -> Vec<Value> {
@@ -7386,6 +7474,141 @@ mod tests {
         let action_debug = first_debug_event(&debug_log_path, "bait_action_observed");
         assert_eq!(action_debug["fields"]["matched_prior_exposure"], false);
         assert_eq!(action_debug["fields"]["prior_same_bait_exposure"], true);
+    }
+
+    #[test]
+    fn runtime_repeated_rate_limited_same_bait_near_miss_becomes_blocked() {
+        let event_log_path = unique_temp_path("blocked-near-miss-events.jsonl");
+        let debug_log_path = unique_temp_path("blocked-near-miss-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("blocked-near-miss-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Suspicious);
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "wrong")],
+            ),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "wrong")],
+            ),
+        ));
+
+        assert_eq!(first_response.status, 429);
+        assert_eq!(second_response.status, 403);
+
+        let blocked_change = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| {
+                event["kind"]["from"].as_str() == Some("rate_limited")
+                    && event["kind"]["to"].as_str() == Some("blocked")
+            })
+            .unwrap_or_else(|| panic!("blocked policy change should exist"));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("rate-limited same-bait near miss retry moved session to blocked")));
+
+        let blocked_request = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("blocked request_seen should exist"));
+        assert_eq!(blocked_request["policy_state"], "blocked");
+        assert_eq!(blocked_request["kind"]["routing_decision"], "eidolon_owned");
+
+        let bait_actions = events_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(bait_actions.len(), 2);
+        assert_eq!(bait_actions[1]["policy_state"], "rate_limited");
+        assert_eq!(bait_actions[1]["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert!(bait_actions[1]["kind"]["exposure_id"].is_null());
+
+        let blocked_response = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .rfind(|event| event["policy_state"].as_str() == Some("blocked"))
+            .unwrap_or_else(|| panic!("blocked response should exist"));
+        assert_eq!(
+            blocked_response["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(blocked_response["kind"]["status"], 403);
+
+        let surface_debugs = debug_events(&debug_log_path, "surface_action_selected");
+        let last_surface_debug = surface_debugs
+            .last()
+            .unwrap_or_else(|| panic!("surface debug should exist"));
+        assert_eq!(last_surface_debug["fields"]["policy_state"], "rate_limited");
+        assert_eq!(
+            last_surface_debug["fields"]["controller_surface_action"]["type"],
+            "rate_limited"
+        );
+        assert_eq!(
+            last_surface_debug["fields"]["surface_action"]["type"],
+            "rate_limited"
+        );
+
+        let near_miss_debugs = debug_events(&debug_log_path, "bait_action_near_miss");
+        assert_eq!(near_miss_debugs.len(), 2);
+        assert_eq!(
+            near_miss_debugs[1]["fields"]["prior_same_bait_exposure"],
+            true
+        );
+        let action_debugs = debug_events(&debug_log_path, "bait_action_observed");
+        assert_eq!(action_debugs.len(), 2);
+        assert_eq!(action_debugs[1]["fields"]["matched_prior_exposure"], false);
+        assert_eq!(action_debugs[1]["fields"]["prior_same_bait_exposure"], true);
+    }
+
+    #[test]
+    fn runtime_rate_limited_request_without_bait_header_stays_rate_limited() {
+        let event_log_path = unique_temp_path("rate-limited-no-header-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("rate-limited-no-header-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::RateLimited);
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &[]),
+        ));
+
+        assert_eq!(response.status, 429);
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+        assert_eq!(
+            events_of_type(&event_log_path, "policy_changed")
+                .into_iter()
+                .filter(|event| event["kind"]["to"].as_str() == Some("blocked"))
+                .count(),
+            0
+        );
+        let request_seen = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("rate-limited request_seen should exist"));
+        assert_eq!(request_seen["policy_state"], "rate_limited");
+        assert_eq!(request_seen["kind"]["routing_decision"], "rate_limited");
     }
 
     #[test]

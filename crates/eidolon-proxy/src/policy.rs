@@ -19,6 +19,8 @@ const DISCOVERY_FANOUT_SUSPICIOUS_REASON_PREFIX: &str =
     "session recon discovery-surface fanout promoted request to suspicious";
 const SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX: &str =
     "suspicious same-bait near miss after exposure moved session to rate limited";
+const REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX: &str =
+    "rate-limited same-bait near miss retry moved session to blocked";
 const AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND: &str = "automation_likelihood_inverse";
 const DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX: u16 = 20;
 
@@ -232,6 +234,26 @@ pub fn transition_to_rate_limited_from_same_bait_near_miss(
         PolicyState::RateLimited,
         format!(
             "{SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX}: path={path} bait_id={}",
+            bait_id.0
+        ),
+    ))
+}
+
+pub fn transition_to_blocked_from_repeated_same_bait_near_miss(
+    current_state: PolicyState,
+    path: &str,
+    bait_id: &BaitId,
+    prior_same_bait_exposure: bool,
+) -> Option<PolicyTransition> {
+    if current_state != PolicyState::RateLimited || !prior_same_bait_exposure {
+        return None;
+    }
+
+    Some(PolicyTransition::new(
+        current_state,
+        PolicyState::Blocked,
+        format!(
+            "{REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX}: path={path} bait_id={}",
             bait_id.0
         ),
     ))
@@ -600,6 +622,45 @@ mod tests {
 
         assert_eq!(no_prior, None);
         assert_eq!(observe, None);
+    }
+
+    #[test]
+    fn repeated_same_bait_near_miss_after_rate_limit_promotes_to_blocked() {
+        let Some(transition) = transition_to_blocked_from_repeated_same_bait_near_miss(
+            PolicyState::RateLimited,
+            "/api/v2/import/reconcile",
+            &BaitId("rel_2025_04_b7f2".to_string()),
+            true,
+        ) else {
+            panic!("rate-limited repeated near miss should transition to blocked");
+        };
+
+        assert_eq!(transition.from, PolicyState::RateLimited);
+        assert_eq!(transition.to, PolicyState::Blocked);
+        assert!(transition
+            .reason
+            .contains(REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX));
+        assert!(transition.reason.contains("path=/api/v2/import/reconcile"));
+        assert!(transition.reason.contains("bait_id=rel_2025_04_b7f2"));
+    }
+
+    #[test]
+    fn blocked_retry_transition_requires_rate_limited_state_and_prior_exposure() {
+        let no_prior = transition_to_blocked_from_repeated_same_bait_near_miss(
+            PolicyState::RateLimited,
+            "/api/v2/import/reconcile",
+            &BaitId("rel_2025_04_b7f2".to_string()),
+            false,
+        );
+        let suspicious = transition_to_blocked_from_repeated_same_bait_near_miss(
+            PolicyState::Suspicious,
+            "/api/v2/import/reconcile",
+            &BaitId("rel_2025_04_b7f2".to_string()),
+            true,
+        );
+
+        assert_eq!(no_prior, None);
+        assert_eq!(suspicious, None);
     }
 
     #[test]
