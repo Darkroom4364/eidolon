@@ -1773,8 +1773,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let surface_request = surface_request_meta(&request, &path);
     let session = effective_session_context(runtime, &request, &surface_request);
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
-    let discovery_surface_fanout =
-        update_discovery_surface_fanout_for_request(runtime, session.session_id, &surface_request)?;
+    let discovery_recon_state =
+        update_discovery_recon_state_for_request(runtime, session.session_id, &surface_request)?;
     if intervention_mode.interventions_enabled() {
         if let Some(transition) = policy::transition_to_suspicious_from_ingress_signals(
             policy_state,
@@ -1803,8 +1803,34 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             policy_state,
             &surface_request.path,
             &session.ingress_identity,
-            discovery_surface_fanout,
+            discovery_recon_state.fanout,
         ) {
+            write_debug(
+                runtime,
+                "policy_transition_selected",
+                Some(session.session_id),
+                json!({
+                    "from": transition.from,
+                    "to": transition.to,
+                    "reason": transition.reason.as_str(),
+                }),
+            )?;
+            set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+            write_event(
+                &runtime.event_log,
+                &policy::policy_changed_event(session.session_id, &transition),
+            )?;
+            policy_state = transition.to;
+        } else if let Some(transition) =
+            policy::transition_to_suspicious_from_aggregated_discovery_recon(
+                policy_state,
+                &surface_request.path,
+                &runtime.trusted_bait_soften_path_prefixes,
+                &session.ingress_identity,
+                &session.ingress_signals,
+                discovery_recon_state,
+            )
+        {
             write_debug(
                 runtime,
                 "policy_transition_selected",
@@ -1840,7 +1866,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "session_source": debug_session_source(session.source),
             "ingress_identity": &session.ingress_identity,
             "ingress_signals": &session.ingress_signals,
-            "discovery_surface_fanout": debug_discovery_surface_fanout(discovery_surface_fanout),
+            "discovery_surface_fanout": debug_discovery_surface_fanout(discovery_recon_state.fanout),
+            "discovery_request_count": discovery_recon_state.request_count,
             "policy_state": policy_state,
             "intervention_mode": debug_intervention_mode(intervention_mode),
         }),
@@ -2726,21 +2753,25 @@ fn clear_reality_escape_attempts_for_session(
     store.clear_reality_escape_attempts(session_id)
 }
 
-fn update_discovery_surface_fanout_for_request(
+fn update_discovery_recon_state_for_request(
     runtime: &ProxyRuntime,
     session_id: SessionId,
     request: &SurfaceRequestMeta,
-) -> io::Result<policy::DiscoverySurfaceFanout> {
+) -> io::Result<policy::DiscoveryReconState> {
     let mut store = runtime
         .policy_store
         .lock()
         .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
 
     let Some(kind) = discovery_surface_kind(runtime, request) else {
-        return Ok(store.record(session_id).discovery_surface_fanout);
+        let record = store.record(session_id);
+        return Ok(policy::DiscoveryReconState {
+            fanout: record.discovery_surface_fanout,
+            request_count: record.discovery_request_count,
+        });
     };
 
-    store.mark_discovery_surface(session_id, kind)
+    store.note_discovery_surface_request(session_id, kind)
 }
 
 fn controlled_reality_action(
@@ -6396,6 +6427,98 @@ mod tests {
         assert_eq!(
             request_debugs[1]["fields"]["discovery_surface_fanout"]["openapi_seen"],
             true
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(
+            surface_debugs[1]["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(surface_debugs[1]["fields"]["policy_state"], "suspicious");
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_repeated_discovery_to_suspicious() {
+        let event_log_path = unique_temp_path("aggregated-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_body = must_ok(
+            String::from_utf8(second_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert!(second_body.contains("X-Migration-Trace: rel_2025_04_b7f2"));
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("vendor_score=35")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 2);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
+            1
         );
 
         let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
