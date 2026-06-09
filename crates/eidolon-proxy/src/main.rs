@@ -6541,6 +6541,96 @@ mod tests {
     }
 
     #[test]
+    fn runtime_aggregates_medium_score_detection_backed_discovery_to_suspicious() {
+        let event_log_path = unique_temp_path("aggregated-detection-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-detection-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-detection-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+                    (
+                        session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                        "automation_likelihood_inverse",
+                    ),
+                    (session::INGRESS_DETECTION_IDS_HEADER_NAME, "3355446,445566"),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        let body = must_ok(String::from_utf8(response.body), "body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert!(body.contains("X-Migration-Trace: rel_2025_04_b7f2"));
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["policy_state"], "suspicious");
+        assert_eq!(request_event["kind"]["routing_decision"], "eidolon_owned");
+        assert_eq!(request_event["kind"]["ingress_signals"]["vendor_score"], 35);
+        assert_eq!(
+            request_event["kind"]["ingress_signals"]["detection_ids"][0],
+            "3355446"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_signals"]["detection_ids"][1],
+            "445566"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=2")));
+
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(request_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(request_debug["fields"]["query_present"], true);
+        assert_eq!(request_debug["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debug["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debug["fields"]["ingress_signals"]["detection_ids"][0],
+            "3355446"
+        );
+        assert_eq!(
+            request_debug["fields"]["ingress_signals"]["detection_ids"][1],
+            "445566"
+        );
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+    }
+
+    #[test]
     fn trusted_identity_is_not_promoted_to_suspicious_by_low_score_discovery_request() {
         let event_log_path = unique_temp_path("trusted-low-score-discovery-events.jsonl");
         let debug_log_path = unique_temp_path("trusted-low-score-discovery-debug.jsonl");
