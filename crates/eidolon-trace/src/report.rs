@@ -281,15 +281,27 @@ pub fn edge_decision_export_for_evidence(
 
     let (request_event, method, path, ingress_identity, ingress_signals, request_routing_decision) =
         latest_request;
-    let latest_policy_event = bundle.policy_events.last();
-    let policy_state = latest_policy_event
+    let latest_policy_reason_event = bundle
+        .policy_events
+        .iter()
+        .rev()
+        .find(|event| event.reason.is_some());
+    let latest_policy_routing_event = bundle
+        .policy_events
+        .iter()
+        .rev()
+        .find(|event| event.routing_decision.is_some());
+    let latest_policy_snapshot_event = latest_policy_reason_event
+        .or(latest_policy_routing_event)
+        .or(bundle.policy_events.last());
+    let policy_state = latest_policy_snapshot_event
         .map(|event| event.policy_state)
         .or(bundle.policy_state)
         .unwrap_or(request_event.event.policy_state);
-    let routing_decision = latest_policy_event
+    let routing_decision = latest_policy_routing_event
         .and_then(|event| event.routing_decision)
         .unwrap_or(request_routing_decision);
-    let reason = latest_policy_event
+    let reason = latest_policy_reason_event
         .and_then(|event| event.reason.clone())
         .unwrap_or_else(|| "latest request routing decision".to_string());
     let edge_recommendation =
@@ -309,7 +321,11 @@ pub fn edge_decision_export_for_evidence(
         },
         evidence: EdgeEvidenceRef {
             event_schema_version: request_event.event.schema_version,
-            event_ids: edge_export_event_ids(timeline, request_event, latest_policy_event),
+            event_ids: edge_export_event_ids(
+                timeline,
+                request_event,
+                [latest_policy_reason_event, latest_policy_routing_event],
+            ),
             bundle_ref: format!("session:{}", bundle.session_id.0),
         },
         edge_recommendation,
@@ -319,13 +335,15 @@ pub fn edge_decision_export_for_evidence(
 fn edge_export_event_ids(
     timeline: &SessionTimeline,
     request_event: &TimelineEvent,
-    latest_policy_event: Option<&crate::PolicyEventEvidence>,
+    policy_events: [Option<&crate::PolicyEventEvidence>; 2],
 ) -> Vec<uuid::Uuid> {
     let mut event_ids = vec![request_event.event.id];
 
-    if let Some(policy_event) = latest_policy_event {
+    for policy_event in policy_events.into_iter().flatten() {
         if let Some(timeline_event) = timeline_event_by_ref(timeline, policy_event.event_ref) {
-            if timeline_event.event.id != request_event.event.id {
+            if timeline_event.event.id != request_event.event.id
+                && !event_ids.contains(&timeline_event.event.id)
+            {
                 event_ids.push(timeline_event.event.id);
             }
         }
@@ -365,13 +383,15 @@ fn edge_recommendation_for(
             | RoutingDecision::RateLimited
             | RoutingDecision::EidolonOwned
     ) {
+        let mut reason_codes = vec![
+            "eidolon_runtime_enforcement".to_string(),
+            snake_case_debug(&routing_decision),
+        ];
+        reason_codes.extend(post_containment_block_reason_codes(policy_state, reason));
         return EdgeRecommendation {
             action: EdgeRecommendedAction::PreserveEidolonRouting,
             ttl_seconds: Some(300),
-            reason_codes: vec![
-                "eidolon_runtime_enforcement".to_string(),
-                snake_case_debug(&routing_decision),
-            ],
+            reason_codes,
         };
     }
 
@@ -388,6 +408,32 @@ fn edge_recommendation_for(
         ttl_seconds: None,
         reason_codes: vec![snake_case_debug(&routing_decision)],
     }
+}
+
+fn post_containment_block_reason_codes(policy_state: PolicyState, reason: &str) -> Vec<String> {
+    if policy_state != PolicyState::Blocked {
+        return Vec::new();
+    }
+
+    if reason.contains(
+        "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked",
+    ) {
+        return vec![
+            "post_containment_persistence".to_string(),
+            "controlled_reality_branch_escape".to_string(),
+        ];
+    }
+
+    if reason.contains(
+        "controlled-reality probe continued after depth-limit throttle and moved session to blocked",
+    ) {
+        return vec![
+            "post_containment_persistence".to_string(),
+            "controlled_reality_depth_limit".to_string(),
+        ];
+    }
+
+    Vec::new()
 }
 
 fn latest_ingress_signal_summary(timeline: &SessionTimeline) -> Option<String> {
@@ -1156,6 +1202,121 @@ mod tests {
             .edge_recommendation
             .reason_codes
             .contains(&"eidolon_runtime_enforcement".to_string()));
+    }
+
+    #[test]
+    fn edge_decision_export_groups_repeated_escape_block_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/api/v1/projects".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Blocked,
+                EventKind::PolicyChanged {
+                    from: PolicyState::ControlledReality,
+                    to: PolicyState::Blocked,
+                    reason: "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::ResponseServed {
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export.policy.reason.contains(
+            "controlled session repeatedly probed outside the controlled-reality branch"
+        ));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "eidolon_owned".to_string(),
+                "post_containment_persistence".to_string(),
+                "controlled_reality_branch_escape".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_groups_depth_limit_block_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Blocked,
+                EventKind::PolicyChanged {
+                    from: PolicyState::ControlledReality,
+                    to: PolicyState::Blocked,
+                    reason: "controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::ResponseServed {
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export
+            .policy
+            .reason
+            .contains("controlled-reality probe continued after depth-limit throttle"));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "eidolon_owned".to_string(),
+                "post_containment_persistence".to_string(),
+                "controlled_reality_depth_limit".to_string(),
+            ]
+        );
     }
 
     #[test]

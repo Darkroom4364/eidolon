@@ -315,6 +315,8 @@ jq -e '
   and $exports[0].edge_recommendation.action == "preserve_eidolon_routing"
   and (($exports[0].edge_recommendation.reason_codes // []) | index("eidolon_runtime_enforcement")) != null
   and (($exports[0].edge_recommendation.reason_codes // []) | index("eidolon_owned")) != null
+  and (($exports[0].edge_recommendation.reason_codes // []) | index("post_containment_persistence")) != null
+  and (($exports[0].edge_recommendation.reason_codes // []) | index("controlled_reality_branch_escape")) != null
 ' "$edge_export_file" >/dev/null \
   || fail "edge export did not preserve the new repeated escape runtime decision"
 
