@@ -35,6 +35,7 @@ examples/shield-lab/build-orbstack-images.sh
 examples/shield-lab/deploy-orbstack.sh
 examples/shield-lab/status-orbstack.sh
 examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
+examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh

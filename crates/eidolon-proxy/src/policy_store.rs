@@ -24,6 +24,8 @@ pub struct SessionPolicyRecord {
     pub reality_escape_attempt_count: u32,
     #[serde(default)]
     pub discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
+    #[serde(default)]
+    pub discovery_request_count: u32,
 }
 
 impl SessionPolicyRecord {
@@ -33,6 +35,7 @@ impl SessionPolicyRecord {
             controlled_reality_depth: 0,
             reality_escape_attempt_count: 0,
             discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout::default(),
+            discovery_request_count: 0,
         }
     }
 }
@@ -59,6 +62,8 @@ struct StoredSessionPolicy {
     reality_escape_attempt_count: u32,
     #[serde(default)]
     discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
+    #[serde(default)]
+    discovery_request_count: u32,
 }
 
 impl PolicyStateStore {
@@ -141,16 +146,20 @@ impl PolicyStateStore {
         self.persist()
     }
 
-    pub fn mark_discovery_surface(
+    pub fn note_discovery_surface_request(
         &mut self,
         session_id: SessionId,
         kind: crate::policy::DiscoverySurfaceKind,
-    ) -> io::Result<crate::policy::DiscoverySurfaceFanout> {
+    ) -> io::Result<crate::policy::DiscoveryReconState> {
         let mut record = self.record(session_id);
         record.discovery_surface_fanout = record.discovery_surface_fanout.mark(kind);
+        record.discovery_request_count = record.discovery_request_count.saturating_add(1);
         self.records.insert(session_id, record);
         self.persist()?;
-        Ok(record.discovery_surface_fanout)
+        Ok(crate::policy::DiscoveryReconState {
+            fanout: record.discovery_surface_fanout,
+            request_count: record.discovery_request_count,
+        })
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -167,6 +176,7 @@ impl PolicyStateStore {
                 controlled_reality_depth: record.controlled_reality_depth,
                 reality_escape_attempt_count: record.reality_escape_attempt_count,
                 discovery_surface_fanout: record.discovery_surface_fanout,
+                discovery_request_count: record.discovery_request_count,
             })
             .collect();
         sessions.sort_by_key(|record| record.session_id.0);
@@ -237,6 +247,7 @@ fn deserialize_records(
                     controlled_reality_depth: session.controlled_reality_depth,
                     reality_escape_attempt_count: session.reality_escape_attempt_count,
                     discovery_surface_fanout: session.discovery_surface_fanout,
+                    discovery_request_count: session.discovery_request_count,
                 },
             )
         })
@@ -438,32 +449,41 @@ mod tests {
     }
 
     #[test]
-    fn marks_and_persists_discovery_surface_fanout() {
+    fn notes_and_persists_discovery_recon_state() {
         let path = unique_temp_path("fanout");
         let session_id = SessionId::new();
 
         let mut store = must_ok(PolicyStateStore::open(&path), "store should open");
         assert_eq!(
             must_ok(
-                store.mark_discovery_surface(session_id, crate::policy::DiscoverySurfaceKind::Docs),
+                store.note_discovery_surface_request(
+                    session_id,
+                    crate::policy::DiscoverySurfaceKind::Docs
+                ),
                 "docs should persist"
             ),
-            crate::policy::DiscoverySurfaceFanout {
-                docs_seen: true,
-                openapi_seen: false,
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
             }
         );
         assert_eq!(
             must_ok(
-                store.mark_discovery_surface(
+                store.note_discovery_surface_request(
                     session_id,
                     crate::policy::DiscoverySurfaceKind::OpenApi
                 ),
                 "openapi should persist"
             ),
-            crate::policy::DiscoverySurfaceFanout {
-                docs_seen: true,
-                openapi_seen: true,
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: true,
+                },
+                request_count: 2,
             }
         );
 
@@ -475,6 +495,7 @@ mod tests {
                 openapi_seen: true,
             }
         );
+        assert_eq!(reopened.record(session_id).discovery_request_count, 2);
     }
 
     #[test]
@@ -493,5 +514,6 @@ mod tests {
             crate::policy::DiscoverySurfaceFanout::default()
         );
         assert_eq!(reopened.record(session_id).reality_escape_attempt_count, 0);
+        assert_eq!(reopened.record(session_id).discovery_request_count, 0);
     }
 }
