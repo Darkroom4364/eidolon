@@ -294,7 +294,9 @@ The seventh smoke proves the first `rate_limited -> blocked` slice: after one
 same-bait wrong-header retry has already moved the session into
 `rate_limited`, repeating that same near miss again moves the session into
 `blocked`, preserves the second unmatched bait-action observation, and exports
-the blocked Eidolon-owned decision.
+the blocked Eidolon-owned decision. That export now groups the decision under
+`pre_containment_persistence` with the detail code
+`same_bait_near_miss_retry`.
 
 The eighth smoke proves the first `rate_limited -> controlled_reality` slice:
 after a same-bait near miss has already throttled the session once, a confirmed

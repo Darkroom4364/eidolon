@@ -145,6 +145,9 @@ The current M5 slice is intentionally narrow:
 - one conservative `rate_limited -> blocked` path now exists for repeating
   that same-bait near miss again after Eidolon has already throttled the
   session once, keeping blocked rare and tied to explicit retry behavior
+- edge export now groups that pre-containment blocked path under the shared
+  `pre_containment_persistence` reason-code family with the detail code
+  `same_bait_near_miss_retry`
 - one conservative `rate_limited -> controlled_reality` path now exists for a
   confirmed same-session exact bait-derived action after throttling, so stronger
   runtime evidence still moves the session into containment instead of stopping

@@ -297,8 +297,9 @@ Status checklist:
   depth-limit persistence (`current branch only`)
 - [x] Post-containment blocked exports now use a shared grouped reason-code
   family with live OrbStack smoke coverage (`current branch only`)
+- [x] Pre-containment blocked exports now use a shared grouped reason-code
+  family with live OrbStack smoke coverage (`current branch only`)
 - [ ] Merge the current `feature/suspicious-discovery-fanout` branch
-- [ ] Normalize blocked/export taxonomy for the pre-containment blocked paths
 - [ ] Broaden the narrow hand-tuned transitions into a more general
   multi-signal aggregation plane
 - [ ] Add per-session signed polymorphic bait generation
