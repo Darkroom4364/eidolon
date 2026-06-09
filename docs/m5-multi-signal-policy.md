@@ -142,6 +142,9 @@ The current M5 slice is intentionally narrow:
   same-session, same-bait action near miss after prior exposure on
   `/api/v2/import/reconcile`; the unmatched bait-shaped action is preserved as
   evidence, but only already-suspicious sessions are throttled
+- near-miss matching on the shared reconcile path is now header-aware, so
+  `X-Migration-Trace` and `X-OpenAPI-Trace` requests are attributed to the
+  correct bait family instead of collapsing onto the first registered decoy
 
 That keeps the current containment invariants stable while giving `#175` a
 typed signal plane to build on.

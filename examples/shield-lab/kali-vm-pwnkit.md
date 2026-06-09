@@ -38,6 +38,7 @@ examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
 ```
 
 The expected host URLs are:

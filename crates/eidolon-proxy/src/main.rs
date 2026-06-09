@@ -2061,10 +2061,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             return client_stream.flush();
         }
 
-        if let Some(action_shape_match) = runtime
-            .bait_registry
-            .match_action_shape(&request.method, &surface_request.path)
-        {
+        if let Some(action_shape_match) = runtime.bait_registry.match_action_shape(
+            &request.method,
+            &surface_request.path,
+            header_pairs(&request.headers),
+        ) {
             let prior_same_bait_exposure = write_bait_action_near_miss_event(
                 runtime,
                 &session,
@@ -7292,6 +7293,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_missing_bait_header_on_shared_path_does_not_log_bait_action() {
+        let event_log_path = unique_temp_path("missing-bait-header-events.jsonl");
+        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("missing-bait-header-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &[]),
+        ));
+        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
+
+        assert_eq!(response.body, br#"{"mode":"upstream"}"#);
+        assert!(must_ok(
+            String::from_utf8(upstream_request),
+            "request should be utf8"
+        )
+        .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+        assert_eq!(events_of_type(&event_log_path, "bait_exposed").len(), 1);
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+        assert_eq!(
+            events_of_type(&event_log_path, "rate_limit_applied").len(),
+            0
+        );
+    }
+
+    #[test]
     fn runtime_rate_limits_suspicious_same_bait_near_miss_after_exposure() {
         let event_log_path = unique_temp_path("suspicious-near-miss-events.jsonl");
         let debug_log_path = unique_temp_path("suspicious-near-miss-debug.jsonl");
@@ -7348,6 +7384,79 @@ mod tests {
         let near_miss_debug = first_debug_event(&debug_log_path, "bait_action_near_miss");
         assert_eq!(near_miss_debug["fields"]["prior_same_bait_exposure"], true);
         let action_debug = first_debug_event(&debug_log_path, "bait_action_observed");
+        assert_eq!(action_debug["fields"]["matched_prior_exposure"], false);
+        assert_eq!(action_debug["fields"]["prior_same_bait_exposure"], true);
+    }
+
+    #[test]
+    fn runtime_rate_limits_suspicious_openapi_same_bait_near_miss_after_exposure() {
+        let event_log_path = unique_temp_path("suspicious-openapi-near-miss-events.jsonl");
+        let debug_log_path = unique_temp_path("suspicious-openapi-near-miss-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("suspicious-openapi-near-miss-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Suspicious);
+        let promotion_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/openapi.json", &cookie),
+        ));
+        let Ok(rewritten) = serde_json::from_slice::<Value>(&promotion_response.body) else {
+            panic!("body should be json");
+        };
+        assert_eq!(promotion_response.status, 200);
+        assert_eq!(
+            rewritten["paths"]["/api/v2/import/reconcile"]["post"]["parameters"][0]["name"],
+            "X-OpenAPI-Trace"
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-OpenAPI-Trace", "wrong")],
+            ),
+        ));
+
+        assert_eq!(response.status, 429);
+        assert_eq!(header_values(&response, "retry-after"), vec!["30"]);
+
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
+        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
+
+        let near_miss = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(near_miss["policy_state"], "suspicious");
+        assert_eq!(near_miss["kind"]["bait_id"], "openapi_reconcile_trace");
+        assert!(near_miss["kind"]["exposure_id"].is_null());
+
+        let policy_changed = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| event["kind"]["to"].as_str() == Some("rate_limited"))
+            .unwrap_or_else(|| panic!("rate-limited policy change should exist"));
+        assert_eq!(policy_changed["kind"]["from"], "suspicious");
+        assert_eq!(policy_changed["kind"]["to"], "rate_limited");
+
+        let request_seen = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("rate-limited request_seen should exist"));
+        assert_eq!(request_seen["policy_state"], "rate_limited");
+        assert_eq!(request_seen["kind"]["routing_decision"], "rate_limited");
+
+        let near_miss_debug = first_debug_event(&debug_log_path, "bait_action_near_miss");
+        assert_eq!(
+            near_miss_debug["fields"]["bait_id"],
+            "openapi_reconcile_trace"
+        );
+        assert_eq!(near_miss_debug["fields"]["prior_same_bait_exposure"], true);
+        let action_debug = first_debug_event(&debug_log_path, "bait_action_observed");
+        assert_eq!(action_debug["fields"]["bait_id"], "openapi_reconcile_trace");
         assert_eq!(action_debug["fields"]["matched_prior_exposure"], false);
         assert_eq!(action_debug["fields"]["prior_same_bait_exposure"], true);
     }

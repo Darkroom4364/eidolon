@@ -17,6 +17,7 @@ PROMOTION_PATH_PREFIX="${EIDOLON_SHIELD_SUSPICIOUS_RATE_LIMIT_PROMOTION_PATH_PRE
 ACTION_PATH="${EIDOLON_SHIELD_SUSPICIOUS_RATE_LIMIT_ACTION_PATH:-/api/v2/import/reconcile}"
 ACTION_PATH_PREFIX="${EIDOLON_SHIELD_SUSPICIOUS_RATE_LIMIT_ACTION_PATH_PREFIX:-/api/v2/import/reconcile}"
 EXPECTED_BAIT_MARKER="${EIDOLON_SHIELD_SUSPICIOUS_RATE_LIMIT_BAIT_MARKER:-X-Migration-Trace: rel_2025_04_b7f2}"
+EXPECTED_BAIT_ID="${EIDOLON_SHIELD_SUSPICIOUS_RATE_LIMIT_BAIT_ID:-rel_2025_04_b7f2}"
 NEAR_MISS_HEADER_NAME="${EIDOLON_SHIELD_SUSPICIOUS_RATE_LIMIT_HEADER_NAME:-X-Migration-Trace}"
 NEAR_MISS_HEADER_VALUE="${EIDOLON_SHIELD_SUSPICIOUS_RATE_LIMIT_HEADER_VALUE:-wrong}"
 EXPECTED_RETRY_AFTER="${EIDOLON_SHIELD_SUSPICIOUS_RATE_LIMIT_RETRY_AFTER:-30}"
@@ -134,7 +135,7 @@ curl_cmd -fsS \
 promotion_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$promotion_headers")"
 [[ "$promotion_http_code" == "200" ]] || fail "expected HTTP 200 from suspicious-rate-limit promotion request, got: ${promotion_http_code:-none}"
 grep -Fq "$EXPECTED_BAIT_MARKER" "$promotion_body" \
-  || fail "suspicious-rate-limit promotion request did not receive the baited docs surface"
+  || fail "suspicious-rate-limit promotion request did not receive the expected baited promotion surface"
 
 curl_cmd -sS \
   -X POST \
@@ -206,17 +207,18 @@ jq -e '
   .policy_state == "suspicious"
   and .kind.routing_decision == "eidolon_owned"
 ' <<<"$promotion_request_json" >/dev/null \
-  || fail "suspicious-rate-limit promotion request did not produce the expected suspicious owned docs routing"
+  || fail "suspicious-rate-limit promotion request did not produce the expected suspicious owned routing"
 
 near_miss_json="$(
   jq -c -e -s \
     --arg session_id "$session_id" \
-    --arg path "$ACTION_PATH_PREFIX" '
+    --arg path "$ACTION_PATH_PREFIX" \
+    --arg bait_id "$EXPECTED_BAIT_ID" '
       map(
         select(
           .session_id == $session_id
           and .kind.type == "bait_action_observed"
-          and .kind.bait_id == "rel_2025_04_b7f2"
+          and .kind.bait_id == $bait_id
           and (.kind.path // "") == $path
         )
       )
