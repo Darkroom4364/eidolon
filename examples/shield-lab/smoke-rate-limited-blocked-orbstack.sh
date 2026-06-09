@@ -311,9 +311,12 @@ jq -e '
   and $exports[0].request.path == "/api/v2/import/reconcile"
   and $exports[0].policy.state == "blocked"
   and $exports[0].policy.routing_decision == "eidolon_owned"
+  and ($exports[0].policy.reason | contains("rate-limited same-bait near miss retry moved session to blocked"))
   and $exports[0].edge_recommendation.action == "preserve_eidolon_routing"
   and (($exports[0].edge_recommendation.reason_codes // []) | index("eidolon_runtime_enforcement")) != null
   and (($exports[0].edge_recommendation.reason_codes // []) | index("eidolon_owned")) != null
+  and (($exports[0].edge_recommendation.reason_codes // []) | index("pre_containment_persistence")) != null
+  and (($exports[0].edge_recommendation.reason_codes // []) | index("same_bait_near_miss_retry")) != null
 ' "$edge_export_file" >/dev/null \
   || fail "edge export did not preserve the new blocked runtime decision"
 

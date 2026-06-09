@@ -387,7 +387,7 @@ fn edge_recommendation_for(
             "eidolon_runtime_enforcement".to_string(),
             snake_case_debug(&routing_decision),
         ];
-        reason_codes.extend(post_containment_block_reason_codes(policy_state, reason));
+        reason_codes.extend(grouped_block_reason_codes(policy_state, reason));
         return EdgeRecommendation {
             action: EdgeRecommendedAction::PreserveEidolonRouting,
             ttl_seconds: Some(300),
@@ -410,9 +410,16 @@ fn edge_recommendation_for(
     }
 }
 
-fn post_containment_block_reason_codes(policy_state: PolicyState, reason: &str) -> Vec<String> {
+fn grouped_block_reason_codes(policy_state: PolicyState, reason: &str) -> Vec<String> {
     if policy_state != PolicyState::Blocked {
         return Vec::new();
+    }
+
+    if reason.contains("rate-limited same-bait near miss retry moved session to blocked") {
+        return vec![
+            "pre_containment_persistence".to_string(),
+            "same_bait_near_miss_retry".to_string(),
+        ];
     }
 
     if reason.contains(
@@ -1257,6 +1264,64 @@ mod tests {
                 "eidolon_owned".to_string(),
                 "post_containment_persistence".to_string(),
                 "controlled_reality_branch_escape".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_groups_repeated_near_miss_block_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Blocked,
+                EventKind::PolicyChanged {
+                    from: PolicyState::RateLimited,
+                    to: PolicyState::Blocked,
+                    reason: "rate-limited same-bait near miss retry moved session to blocked: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::ResponseServed {
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export
+            .policy
+            .reason
+            .contains("rate-limited same-bait near miss retry moved session to blocked"));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "eidolon_owned".to_string(),
+                "pre_containment_persistence".to_string(),
+                "same_bait_near_miss_retry".to_string(),
             ]
         );
     }
