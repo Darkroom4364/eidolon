@@ -152,6 +152,10 @@ The current M5 slice is intentionally narrow:
 - one conservative `controlled_reality -> blocked` path now exists for repeated
   reality-escape attempts outside the configured controlled-reality branch,
   keeping automatic blocking tied to explicit persistence after containment
+- one adjacent `controlled_reality -> blocked` path now exists for continuing
+  to probe the same controlled branch after Eidolon has already depth-throttled
+  the session once, keeping the hard-fail tied to explicit post-containment
+  persistence rather than the first over-limit request
 - near-miss matching on the shared reconcile path is now header-aware, so
   `X-Migration-Trace` and `X-OpenAPI-Trace` requests are attributed to the
   correct bait family instead of collapsing onto the first registered decoy
