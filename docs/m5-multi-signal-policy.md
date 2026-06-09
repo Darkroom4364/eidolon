@@ -149,6 +149,10 @@ The current M5 slice is intentionally narrow:
   confirmed same-session exact bait-derived action after throttling, so stronger
   runtime evidence still moves the session into containment instead of stopping
   at a synthetic intercept
+- one conservative `controlled_reality -> blocked` path now exists for repeated
+  post-containment probing after Eidolon has already hit the configured
+  controlled-reality depth-limit throttle once, keeping automatic blocking tied
+  to explicit persistence after containment
 - near-miss matching on the shared reconcile path is now header-aware, so
   `X-Migration-Trace` and `X-OpenAPI-Trace` requests are attributed to the
   correct bait family instead of collapsing onto the first registered decoy

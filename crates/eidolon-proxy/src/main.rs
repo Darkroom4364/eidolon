@@ -1889,12 +1889,68 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             RoutingDecision::ProtectedUpstream => {
                 runtime.surface_controller.decide(&surface_request)
             }
-            RoutingDecision::ControlledReality => controlled_reality_action(
-                runtime,
-                session.session_id,
-                &surface_request,
-                decision.reason.clone(),
-            )?,
+            RoutingDecision::ControlledReality => {
+                let (action, transition) = controlled_reality_action(
+                    runtime,
+                    session.session_id,
+                    &surface_request,
+                    decision.reason.clone(),
+                )?;
+                if let Some(transition) = transition {
+                    write_debug(
+                        runtime,
+                        "policy_transition_selected",
+                        Some(session.session_id),
+                        json!({
+                            "from": transition.from,
+                            "to": transition.to,
+                            "reason": transition.reason.as_str(),
+                        }),
+                    )?;
+                    set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                    write_event(
+                        &runtime.event_log,
+                        &policy::policy_changed_event(session.session_id, &transition),
+                    )?;
+                    let blocked_decision = policy::PolicyDecision::new(
+                        transition.to,
+                        action.routing_decision(),
+                        transition.reason.clone(),
+                    );
+                    write_debug(
+                        runtime,
+                        "surface_action_selected",
+                        Some(session.session_id),
+                        json!({
+                            "policy_state": blocked_decision.policy_state,
+                            "policy_routing_decision": blocked_decision.routing_decision,
+                            "policy_reason": blocked_decision.reason.as_str(),
+                            "controller_surface_action": debug_surface_action(&action),
+                            "candidate_surface_action": debug_surface_action(&action),
+                            "surface_action": debug_surface_action(&action),
+                            "surface_requested_intervention": true,
+                            "trusted_ingress_softened_surface": false,
+                            "trusted_ingress_softening_reason": Value::Null,
+                            "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
+                        }),
+                    )?;
+                    let SurfaceAction::EidolonOwned { response } = action else {
+                        panic!("blocked controlled-reality action should be eidolon owned");
+                    };
+                    return write_direct_response(DirectResponseContext {
+                        client_stream,
+                        runtime,
+                        session: &session,
+                        request: &request,
+                        path: &path,
+                        decision: &blocked_decision,
+                        response,
+                        intervention_mode,
+                        surface_requested_intervention: true,
+                    });
+                }
+                action
+            }
             RoutingDecision::RateLimited => SurfaceAction::RateLimited {
                 reason: decision.reason.clone(),
                 response: rate_limited_response(
@@ -2014,14 +2070,40 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     &runtime.event_log,
                     &policy::policy_changed_event(session.session_id, &transition),
                 )?;
-                let action = controlled_reality_action(
+                let (action, controlled_transition) = controlled_reality_action(
                     runtime,
                     session.session_id,
                     &surface_request,
                     transition.reason.clone(),
                 )?;
-                effective_decision =
-                    direct_surface_decision(transition.to, &action, transition.reason);
+                effective_decision = if let Some(controlled_transition) = controlled_transition {
+                    write_debug(
+                        runtime,
+                        "policy_transition_selected",
+                        Some(session.session_id),
+                        json!({
+                            "from": controlled_transition.from,
+                            "to": controlled_transition.to,
+                            "reason": controlled_transition.reason.as_str(),
+                        }),
+                    )?;
+                    set_policy_state_for_session(
+                        runtime,
+                        session.session_id,
+                        controlled_transition.to,
+                    )?;
+                    write_event(
+                        &runtime.event_log,
+                        &policy::policy_changed_event(session.session_id, &controlled_transition),
+                    )?;
+                    policy::PolicyDecision::new(
+                        controlled_transition.to,
+                        action.routing_decision(),
+                        controlled_transition.reason.clone(),
+                    )
+                } else {
+                    direct_surface_decision(transition.to, &action, transition.reason)
+                };
                 write_event(
                     &runtime.event_log,
                     &policy::policy_intervention_event(session.session_id, &effective_decision),
@@ -2572,7 +2654,7 @@ fn controlled_reality_action(
     session_id: SessionId,
     request: &SurfaceRequestMeta,
     default_reason: String,
-) -> io::Result<SurfaceAction> {
+) -> io::Result<(SurfaceAction, Option<policy::PolicyTransition>)> {
     let depth = {
         let mut store = runtime
             .policy_store
@@ -2587,14 +2669,26 @@ fn controlled_reality_action(
         if !tarpit_delay.is_zero() {
             thread::sleep(tarpit_delay);
         }
-        let action = SurfaceAction::RateLimited {
-            reason: format!(
-                "controlled reality action depth {depth} exceeded limit {depth_limit}; tarpit delay {}ms",
-                tarpit_delay.as_millis()
-            ),
-            response: rate_limited_response(
-                runtime.controlled_reality_config.retry_after_seconds,
-            ),
+        let transition = policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+            PolicyState::ControlledReality,
+            &request.path,
+            depth,
+            depth_limit,
+        );
+        let action = if transition.is_some() {
+            SurfaceAction::EidolonOwned {
+                response: surface_text_response(403, "blocked by eidolon policy\n"),
+            }
+        } else {
+            SurfaceAction::RateLimited {
+                reason: format!(
+                    "controlled reality action depth {depth} exceeded limit {depth_limit}; tarpit delay {}ms",
+                    tarpit_delay.as_millis()
+                ),
+                response: rate_limited_response(
+                    runtime.controlled_reality_config.retry_after_seconds,
+                ),
+            }
         };
         write_debug(
             runtime,
@@ -2604,10 +2698,15 @@ fn controlled_reality_action(
                 "depth": depth,
                 "depth_limit": depth_limit,
                 "tarpit_ms": tarpit_delay.as_millis(),
+                "transition": transition.as_ref().map(|selected| json!({
+                    "from": selected.from,
+                    "to": selected.to,
+                    "reason": selected.reason.as_str(),
+                })),
                 "action": debug_surface_action(&action),
             }),
         )?;
-        return Ok(action);
+        return Ok((action, transition));
     }
 
     let mut action = runtime.controlled_reality.decide(request, depth);
@@ -2627,7 +2726,7 @@ fn controlled_reality_action(
         }),
     )?;
 
-    Ok(action)
+    Ok((action, None))
 }
 
 fn bait_exposure_for_direct_surface<'a>(
@@ -7922,6 +8021,111 @@ mod tests {
             .as_str()
             .expect("reason should be a string")
             .contains("exceeded limit 1; tarpit delay 0ms"));
+    }
+
+    #[test]
+    fn runtime_blocks_after_repeated_controlled_reality_depth_limit_probe() {
+        let event_log_path = unique_temp_path("controlled-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("controlled-blocked-debug.jsonl");
+        let mut runtime = test_runtime(
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
+            &event_log_path,
+            unique_temp_path("controlled-blocked-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.debug_log = Some(Arc::new(Mutex::new(must_ok(
+            FileDebugLogWriter::open(&debug_log_path),
+            "debug log should open",
+        ))));
+        runtime.controlled_reality_config = ControlledRealityConfig {
+            max_action_depth: 1,
+            tarpit_delay: Duration::from_millis(0),
+            retry_after_seconds: 7,
+        };
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/api/v2/import/reconcile", &cookie),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/api/v2/import/reconcile", &cookie),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/api/v2/import/reconcile", &cookie),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 429);
+        assert_eq!(header_values(&second_response, "retry-after"), vec!["7"]);
+        assert_eq!(third_response.status, 403);
+
+        let rate_limit = first_event_of_type(&event_log_path, "rate_limit_applied");
+        assert_eq!(rate_limit["policy_state"], "controlled_reality");
+        let blocked_change = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| {
+                event["kind"]["from"].as_str() == Some("controlled_reality")
+                    && event["kind"]["to"].as_str() == Some("blocked")
+            })
+            .unwrap_or_else(|| panic!("blocked policy change should exist"));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "controlled-reality probe continued after depth-limit throttle and moved session to blocked"
+            )));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("depth=3")));
+
+        let blocked_request = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("blocked request_seen should exist"));
+        assert_eq!(blocked_request["policy_state"], "blocked");
+        assert_eq!(blocked_request["kind"]["routing_decision"], "eidolon_owned");
+
+        let blocked_response = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .rfind(|event| event["policy_state"].as_str() == Some("blocked"))
+            .unwrap_or_else(|| panic!("blocked response should exist"));
+        assert_eq!(blocked_response["kind"]["status"], 403);
+        assert_eq!(
+            blocked_response["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+
+        let controlled_debug = debug_events(&debug_log_path, "controlled_reality_action_selected")
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("controlled reality debug should exist"));
+        assert_eq!(controlled_debug["fields"]["depth"], 3);
+        assert_eq!(controlled_debug["fields"]["depth_limit"], 1);
+        assert_eq!(
+            controlled_debug["fields"]["action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(controlled_debug["fields"]["transition"]["to"], "blocked");
+
+        let surface_debug = debug_events(&debug_log_path, "surface_action_selected")
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("surface debug should exist"));
+        assert_eq!(surface_debug["fields"]["policy_state"], "blocked");
+        assert_eq!(
+            surface_debug["fields"]["policy_routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
     }
 
     #[test]

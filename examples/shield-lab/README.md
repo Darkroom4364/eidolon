@@ -67,6 +67,7 @@ Keep out of the private repo:
   smoke-suspicious-openapi-rate-limit-orbstack.sh
   smoke-rate-limited-blocked-orbstack.sh
   smoke-rate-limited-controlled-reality-orbstack.sh
+  smoke-controlled-reality-blocked-orbstack.sh
   collect-kali-vm-sample.sh
   run-pwnkit-kali-vm.sh
   kali-vm-pwnkit.md
@@ -255,6 +256,7 @@ examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
 examples/shield-lab/smoke-rate-limited-blocked-orbstack.sh
 examples/shield-lab/smoke-rate-limited-controlled-reality-orbstack.sh
+examples/shield-lab/smoke-controlled-reality-blocked-orbstack.sh
 ```
 
 The second smoke proves the first M5 graduated-enforcement slice: one
@@ -297,6 +299,12 @@ after a same-bait near miss has already throttled the session once, a confirmed
 same-session exact bait-derived action on `/api/v2/import/reconcile` moves the
 session into `controlled_reality`, preserves the matched exposure evidence, and
 exports the contained runtime decision.
+
+The ninth smoke proves the first `controlled_reality -> blocked` slice: after a
+session has already entered containment, continuing to probe the same
+controlled branch past the configured depth-limit throttle first triggers the
+existing `429` tarpit and then moves the session into `blocked`, preserving the
+post-containment hard-fail in edge export.
 
 Create a `kind` cluster:
 
