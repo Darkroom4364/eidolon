@@ -30,7 +30,13 @@ const REPEATED_REALITY_ESCAPE_BLOCKED_REASON_PREFIX: &str =
 const AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND: &str = "automation_likelihood_inverse";
 const DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX: u16 = 20;
 const DISCOVERY_RECON_AGGREGATION_VENDOR_SCORE_MAX: u16 = 40;
-const DISCOVERY_RECON_AGGREGATION_MIN_WEAK_SIGNALS: u8 = 2;
+const DISCOVERY_RECON_AGGREGATION_SCORE_THRESHOLD: u8 = 3;
+const DISCOVERY_RECON_REPEATED_DISCOVERY_SCORE: u8 = 2;
+const DISCOVERY_RECON_QUERY_SEEN_SCORE: u8 = 1;
+const DISCOVERY_RECON_LEGACY_OPENAPI_QUERY_SCORE: u8 = 2;
+const DISCOVERY_RECON_LINKED_BAIT_SURFACE_SCORE: u8 = 2;
+const DISCOVERY_RECON_LINKED_BAIT_CLASS_FANOUT_BONUS: u8 = 1;
+const DISCOVERY_RECON_DETECTION_SIGNAL_SCORE: u8 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiscoveryReconState {
@@ -40,6 +46,17 @@ pub struct DiscoveryReconState {
     pub legacy_openapi_query_seen: bool,
     pub linked_bait_surface_seen: bool,
     pub linked_bait_surface_classes: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscoveryReconAggregationScore {
+    pub repeated_discovery_score: u8,
+    pub query_score: u8,
+    pub legacy_openapi_query_score: u8,
+    pub linked_bait_surface_score: u8,
+    pub linked_bait_class_fanout_bonus: u8,
+    pub detection_score: u8,
+    pub total: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,16 +325,8 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
         return None;
     }
     let detection_count = ingress_signals.detection_ids.len();
-    let detection_signal = detection_count > 0;
-    let repeated_discovery = recon_state.request_count >= 2;
-    let multi_linked_bait_surface_classes = recon_state.linked_bait_surface_classes >= 2;
-    let weak_signal_count = u8::from(repeated_discovery)
-        + u8::from(recon_state.query_seen)
-        + u8::from(recon_state.legacy_openapi_query_seen)
-        + u8::from(recon_state.linked_bait_surface_seen)
-        + u8::from(multi_linked_bait_surface_classes)
-        + u8::from(detection_signal);
-    if weak_signal_count < DISCOVERY_RECON_AGGREGATION_MIN_WEAK_SIGNALS {
+    let recon_score = aggregated_discovery_recon_score(ingress_signals, recon_state);
+    if recon_score.total < DISCOVERY_RECON_AGGREGATION_SCORE_THRESHOLD {
         return None;
     }
 
@@ -325,7 +334,7 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
         current_state,
         PolicyState::Suspicious,
         format!(
-            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} detection_count={detection_count} weak_signals={weak_signal_count}",
+            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} detection_score={} recon_score={} recon_threshold={DISCOVERY_RECON_AGGREGATION_SCORE_THRESHOLD}",
             snake_case_actor_kind(ingress_signals.actor_kind),
             recon_state.request_count,
             recon_state.fanout.distinct_surface_count(),
@@ -333,8 +342,71 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
             recon_state.legacy_openapi_query_seen,
             recon_state.linked_bait_surface_seen,
             recon_state.linked_bait_surface_classes,
+            recon_score.repeated_discovery_score,
+            recon_score.query_score,
+            recon_score.legacy_openapi_query_score,
+            recon_score.linked_bait_surface_score,
+            recon_score.linked_bait_class_fanout_bonus,
+            recon_score.detection_score,
+            recon_score.total,
         ),
     ))
+}
+
+pub fn aggregated_discovery_recon_score(
+    ingress_signals: &IngressAdvisorySignals,
+    recon_state: DiscoveryReconState,
+) -> DiscoveryReconAggregationScore {
+    let repeated_discovery_score = if recon_state.request_count >= 2 {
+        DISCOVERY_RECON_REPEATED_DISCOVERY_SCORE
+    } else {
+        0
+    };
+    let query_score = if recon_state.query_seen {
+        DISCOVERY_RECON_QUERY_SEEN_SCORE
+    } else {
+        0
+    };
+    let legacy_openapi_query_score = if recon_state.legacy_openapi_query_seen {
+        DISCOVERY_RECON_LEGACY_OPENAPI_QUERY_SCORE
+    } else {
+        0
+    };
+    let linked_bait_surface_score = if recon_state.linked_bait_surface_seen {
+        DISCOVERY_RECON_LINKED_BAIT_SURFACE_SCORE
+    } else {
+        0
+    };
+    let linked_bait_class_fanout_bonus = if recon_state.linked_bait_surface_classes >= 2 {
+        DISCOVERY_RECON_LINKED_BAIT_CLASS_FANOUT_BONUS
+    } else {
+        0
+    };
+    let detection_score = if ingress_signals.detection_ids.is_empty() {
+        0
+    } else {
+        DISCOVERY_RECON_DETECTION_SIGNAL_SCORE
+    };
+    let total = repeated_discovery_score
+        .saturating_add(query_score)
+        .saturating_add(legacy_openapi_query_score)
+        .saturating_add(linked_bait_surface_score)
+        .saturating_add(linked_bait_class_fanout_bonus)
+        .saturating_add(detection_score);
+
+    DiscoveryReconAggregationScore {
+        repeated_discovery_score,
+        query_score,
+        legacy_openapi_query_score,
+        linked_bait_surface_score,
+        linked_bait_class_fanout_bonus,
+        detection_score,
+        total,
+    }
+}
+
+pub fn discovery_recon_aggregation_score_threshold() -> u8 {
+    DISCOVERY_RECON_AGGREGATION_SCORE_THRESHOLD
 }
 
 pub fn transition_to_rate_limited_from_same_bait_near_miss(
@@ -866,11 +938,14 @@ mod tests {
             .contains("legacy_openapi_query_seen=false"));
         assert!(transition.reason.contains("linked_bait_surface_seen=false"));
         assert!(transition.reason.contains("detection_count=0"));
-        assert!(transition.reason.contains("weak_signals=2"));
+        assert!(transition.reason.contains("repeated_discovery_score=2"));
+        assert!(transition.reason.contains("query_score=1"));
+        assert!(transition.reason.contains("recon_score=3"));
+        assert!(transition.reason.contains("recon_threshold=3"));
     }
 
     #[test]
-    fn aggregated_discovery_recon_requires_multiple_weak_signals_and_medium_score() {
+    fn aggregated_discovery_recon_requires_threshold_score_and_medium_score() {
         let no_repetition = transition_to_suspicious_from_aggregated_discovery_recon(
             PolicyState::Observe,
             "/docs",
@@ -1012,7 +1087,9 @@ mod tests {
             .contains("legacy_openapi_query_seen=false"));
         assert!(transition.reason.contains("linked_bait_surface_seen=false"));
         assert!(transition.reason.contains("detection_count=2"));
-        assert!(transition.reason.contains("weak_signals=2"));
+        assert!(transition.reason.contains("query_score=1"));
+        assert!(transition.reason.contains("detection_score=2"));
+        assert!(transition.reason.contains("recon_score=3"));
     }
 
     #[test]
@@ -1052,7 +1129,9 @@ mod tests {
         assert!(transition.reason.contains("legacy_openapi_query_seen=true"));
         assert!(transition.reason.contains("linked_bait_surface_seen=false"));
         assert!(transition.reason.contains("detection_count=0"));
-        assert!(transition.reason.contains("weak_signals=2"));
+        assert!(transition.reason.contains("query_score=1"));
+        assert!(transition.reason.contains("legacy_openapi_query_score=2"));
+        assert!(transition.reason.contains("recon_score=3"));
     }
 
     #[test]
@@ -1095,7 +1174,9 @@ mod tests {
             .contains("legacy_openapi_query_seen=false"));
         assert!(transition.reason.contains("linked_bait_surface_seen=true"));
         assert!(transition.reason.contains("detection_count=0"));
-        assert!(transition.reason.contains("weak_signals=2"));
+        assert!(transition.reason.contains("query_score=1"));
+        assert!(transition.reason.contains("linked_bait_surface_score=2"));
+        assert!(transition.reason.contains("recon_score=3"));
     }
 
     #[test]
@@ -1163,7 +1244,9 @@ mod tests {
         assert!(transition.reason.contains("discovery_requests=1"));
         assert!(transition.reason.contains("query_seen=true"));
         assert!(transition.reason.contains("linked_bait_surface_seen=true"));
-        assert!(transition.reason.contains("weak_signals=2"));
+        assert!(transition.reason.contains("query_score=1"));
+        assert!(transition.reason.contains("linked_bait_surface_score=2"));
+        assert!(transition.reason.contains("recon_score=3"));
     }
 
     #[test]
@@ -1200,7 +1283,11 @@ mod tests {
         assert!(transition.reason.contains("query_seen=false"));
         assert!(transition.reason.contains("linked_bait_surface_seen=true"));
         assert!(transition.reason.contains("linked_bait_surface_classes=2"));
-        assert!(transition.reason.contains("weak_signals=2"));
+        assert!(transition.reason.contains("linked_bait_surface_score=2"));
+        assert!(transition
+            .reason
+            .contains("linked_bait_class_fanout_bonus=1"));
+        assert!(transition.reason.contains("recon_score=3"));
     }
 
     #[test]

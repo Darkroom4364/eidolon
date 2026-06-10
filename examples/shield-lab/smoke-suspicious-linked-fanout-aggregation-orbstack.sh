@@ -266,7 +266,10 @@ jq -e \
     and contains("linked_bait_surface_seen=true")
     and contains("linked_bait_surface_classes=2")
     and contains("detection_count=0")
-    and contains("weak_signals=2")
+    and contains("linked_bait_surface_score=2")
+    and contains("linked_bait_class_fanout_bonus=1")
+    and contains("recon_score=3")
+    and contains("recon_threshold=3")
   ' <<<"$policy_changed_json" >/dev/null \
   || fail "session ${session_id} suspicious transition reason did not preserve the linked-fanout aggregation signals"
 

@@ -187,6 +187,8 @@ jq -e \
     and ((.kind.reason // "") | contains("query_seen=true"))
     and ((.kind.reason // "") | contains("legacy_openapi_query_seen=true"))
     and ((.kind.reason // "") | contains("detection_count=0"))
+    and ((.kind.reason // "") | contains("legacy_openapi_query_score=2"))
+    and ((.kind.reason // "") | contains("recon_score=3"))
   ' <<<"$policy_changed_json" >/dev/null \
   || fail "session ${session_id} suspicious transition reason did not preserve the expected aggregated OpenAPI facts"
 
