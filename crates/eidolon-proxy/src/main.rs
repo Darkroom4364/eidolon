@@ -1443,16 +1443,28 @@ fn is_legacy_openapi_discovery_query(request: &SurfaceRequestMeta) -> bool {
         && request.query.as_deref() == Some(LEGACY_IMPORT_OPENAPI_QUERY)
 }
 
-fn is_linked_bait_surface_probe_request(
+fn linked_bait_surface_kind(
     runtime: &ProxyRuntime,
     request: &SurfaceRequestMeta,
-) -> bool {
-    request.method == "GET"
-        && runtime
-            .bait_registry
-            .baits()
-            .iter()
-            .any(|bait| bait.bait_class != BaitClass::OpenApi && bait.surface == request.path)
+) -> Option<policy::LinkedBaitSurfaceKind> {
+    if request.method != "GET" {
+        return None;
+    }
+
+    runtime
+        .bait_registry
+        .baits()
+        .iter()
+        .find(|bait| bait.bait_class != BaitClass::OpenApi && bait.surface == request.path)
+        .map(|_| {
+            if request.path.starts_with("/docs/") {
+                policy::LinkedBaitSurfaceKind::Docs
+            } else if request.path.starts_with("/assets/") {
+                policy::LinkedBaitSurfaceKind::Assets
+            } else {
+                policy::LinkedBaitSurfaceKind::Other
+            }
+        })
 }
 
 fn is_aggregated_discovery_recon_candidate_request(
@@ -1460,7 +1472,7 @@ fn is_aggregated_discovery_recon_candidate_request(
     request: &SurfaceRequestMeta,
 ) -> bool {
     discovery_surface_kind(runtime, request).is_some()
-        || is_linked_bait_surface_probe_request(runtime, request)
+        || linked_bait_surface_kind(runtime, request).is_some()
 }
 
 fn discovery_surface_kind(
@@ -1900,6 +1912,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 discovery_recon_state.legacy_openapi_query_seen,
             "discovery_linked_bait_surface_seen":
                 discovery_recon_state.linked_bait_surface_seen,
+            "discovery_linked_bait_surface_classes":
+                discovery_recon_state.linked_bait_surface_classes,
             "policy_state": policy_state,
             "intervention_mode": debug_intervention_mode(intervention_mode),
         }),
@@ -2804,8 +2818,8 @@ fn update_discovery_recon_state_for_request(
         );
     }
 
-    if is_linked_bait_surface_probe_request(runtime, request) {
-        return store.note_linked_bait_surface_request(session_id);
+    if let Some(kind) = linked_bait_surface_kind(runtime, request) {
+        return store.note_linked_bait_surface_request(session_id, kind);
     }
 
     let record = store.record(session_id);
@@ -2814,7 +2828,10 @@ fn update_discovery_recon_state_for_request(
         request_count: record.discovery_request_count,
         query_seen: record.discovery_query_seen,
         legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
-        linked_bait_surface_seen: record.discovery_linked_bait_surface_seen,
+        linked_bait_surface_seen: record.discovery_linked_bait_surface_fanout.any_seen(),
+        linked_bait_surface_classes: record
+            .discovery_linked_bait_surface_fanout
+            .distinct_surface_count(),
     })
 }
 
@@ -6862,6 +6879,9 @@ mod tests {
             .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
         assert!(policy_changed["kind"]["reason"]
             .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_classes=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
             .is_some_and(|reason| reason.contains("detection_count=0")));
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
@@ -6881,6 +6901,10 @@ mod tests {
         assert_eq!(
             request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
             true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
+            1
         );
 
         let surface_debug = debug_values(&debug_log_path)
@@ -6994,6 +7018,9 @@ mod tests {
             .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
         assert!(policy_changed["kind"]["reason"]
             .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_classes=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
             .is_some_and(|reason| reason.contains("detection_count=0")));
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
@@ -7016,6 +7043,10 @@ mod tests {
         assert_eq!(
             request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
             true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
+            1
         );
 
         let surface_debug = debug_values(&debug_log_path)
@@ -7128,6 +7159,9 @@ mod tests {
             .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
         assert!(policy_changed["kind"]["reason"]
             .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_classes=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
             .is_some_and(|reason| reason.contains("detection_count=0")));
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
@@ -7151,6 +7185,10 @@ mod tests {
             request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
             true
         );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
+            1
+        );
 
         let surface_debug = debug_values(&debug_log_path)
             .into_iter()
@@ -7173,6 +7211,163 @@ mod tests {
         let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(bait_exposed["kind"]["bait_id"], "js_worker_resume_trace");
         assert_eq!(bait_exposed["kind"]["surface"], "/assets/import-helper.js");
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_multiple_linked_bait_classes_to_suspicious() {
+        let event_log_path =
+            unique_temp_path("aggregated-multi-linked-classes-suspicious-events.jsonl");
+        let debug_log_path =
+            unique_temp_path("aggregated-multi-linked-classes-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-multi-linked-classes-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs/legacy-import", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/assets/import-helper.js", &cookie, &headers),
+        ));
+        let second_body = must_ok(
+            String::from_utf8(second_response.body),
+            "body should be utf8",
+        );
+        let third_body = must_ok(
+            String::from_utf8(third_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 200);
+        assert!(second_body.contains("X-Migration-Trace"));
+        assert!(third_body.contains("window.__eidolonImportWorker"));
+        assert!(third_body.contains("X-Import-Worker"));
+        assert!(third_body.contains("/api/v2/import/reconcile"));
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "observe");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["kind"]["path"], "/docs/legacy-import");
+        assert_eq!(request_events[2]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["path"],
+            "/assets/import-helper.js"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/assets/import-helper.js")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=false")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_classes=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=0")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("weak_signals=2")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "observe");
+        assert_eq!(request_debugs[1]["fields"]["path"], "/docs/legacy-import");
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], false);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
+            1
+        );
+        assert_eq!(request_debugs[2]["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            request_debugs[2]["fields"]["path"],
+            "/assets/import-helper.js"
+        );
+        assert_eq!(request_debugs[2]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[2]["fields"]["discovery_query_seen"], false);
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_linked_bait_surface_classes"],
+            2
+        );
+
+        let bait_exposed_events = events_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed_events.len(), 2);
+        assert_eq!(
+            bait_exposed_events[0]["kind"]["bait_id"],
+            "rel_2025_04_b7f2"
+        );
+        assert_eq!(
+            bait_exposed_events[1]["kind"]["bait_id"],
+            "js_worker_resume_trace"
+        );
+        assert_eq!(
+            bait_exposed_events[1]["kind"]["surface"],
+            "/assets/import-helper.js"
+        );
     }
 
     #[test]

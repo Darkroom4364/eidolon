@@ -39,12 +39,20 @@ pub struct DiscoveryReconState {
     pub query_seen: bool,
     pub legacy_openapi_query_seen: bool,
     pub linked_bait_surface_seen: bool,
+    pub linked_bait_surface_classes: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoverySurfaceKind {
     Docs,
     OpenApi,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkedBaitSurfaceKind {
+    Docs,
+    Assets,
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +84,36 @@ impl DiscoverySurfaceFanout {
             (false, true) => "/openapi.json",
             (false, false) => "none",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedBaitSurfaceFanout {
+    #[serde(default)]
+    pub docs_seen: bool,
+    #[serde(default)]
+    pub assets_seen: bool,
+    #[serde(default)]
+    pub other_seen: bool,
+}
+
+impl LinkedBaitSurfaceFanout {
+    pub fn mark(self, kind: LinkedBaitSurfaceKind) -> Self {
+        let mut next = self;
+        match kind {
+            LinkedBaitSurfaceKind::Docs => next.docs_seen = true,
+            LinkedBaitSurfaceKind::Assets => next.assets_seen = true,
+            LinkedBaitSurfaceKind::Other => next.other_seen = true,
+        }
+        next
+    }
+
+    pub fn any_seen(self) -> bool {
+        self.distinct_surface_count() > 0
+    }
+
+    pub fn distinct_surface_count(self) -> u8 {
+        u8::from(self.docs_seen) + u8::from(self.assets_seen) + u8::from(self.other_seen)
     }
 }
 
@@ -272,10 +310,12 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
     let detection_count = ingress_signals.detection_ids.len();
     let detection_signal = detection_count > 0;
     let repeated_discovery = recon_state.request_count >= 2;
+    let multi_linked_bait_surface_classes = recon_state.linked_bait_surface_classes >= 2;
     let weak_signal_count = u8::from(repeated_discovery)
         + u8::from(recon_state.query_seen)
         + u8::from(recon_state.legacy_openapi_query_seen)
         + u8::from(recon_state.linked_bait_surface_seen)
+        + u8::from(multi_linked_bait_surface_classes)
         + u8::from(detection_signal);
     if weak_signal_count < DISCOVERY_RECON_AGGREGATION_MIN_WEAK_SIGNALS {
         return None;
@@ -285,13 +325,14 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
         current_state,
         PolicyState::Suspicious,
         format!(
-            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} detection_count={detection_count} weak_signals={weak_signal_count}",
+            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} detection_count={detection_count} weak_signals={weak_signal_count}",
             snake_case_actor_kind(ingress_signals.actor_kind),
             recon_state.request_count,
             recon_state.fanout.distinct_surface_count(),
             recon_state.query_seen,
             recon_state.legacy_openapi_query_seen,
             recon_state.linked_bait_surface_seen,
+            recon_state.linked_bait_surface_classes,
         ),
     ))
 }
@@ -806,6 +847,7 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
             },
         ) else {
             panic!("aggregated discovery recon should transition to suspicious");
@@ -849,6 +891,7 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
             },
         );
         let no_query_signal = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -871,6 +914,7 @@ mod tests {
                 query_seen: false,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
             },
         );
         let stronger_direct_score = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -893,6 +937,7 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
             },
         );
         let trusted = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -919,6 +964,7 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
             },
         );
 
@@ -951,6 +997,7 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
             },
         ) else {
             panic!("detection-backed aggregated discovery recon should transition to suspicious");
@@ -990,6 +1037,7 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: true,
                 linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
             },
         ) else {
             panic!(
@@ -1029,6 +1077,7 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 1,
             },
         ) else {
             panic!(
@@ -1071,6 +1120,7 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 1,
             },
         );
 
@@ -1099,6 +1149,7 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 1,
             },
         ) else {
             panic!("hidden-route linked discovery recon should transition to suspicious");
@@ -1112,6 +1163,43 @@ mod tests {
         assert!(transition.reason.contains("discovery_requests=1"));
         assert!(transition.reason.contains("query_seen=true"));
         assert!(transition.reason.contains("linked_bait_surface_seen=true"));
+        assert!(transition.reason.contains("weak_signals=2"));
+    }
+
+    #[test]
+    fn aggregated_discovery_recon_multiple_linked_bait_classes_allow_followup_promotion() {
+        let Some(transition) = transition_to_suspicious_from_aggregated_discovery_recon(
+            PolicyState::Observe,
+            "/assets/import-helper.js",
+            true,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: false,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 2,
+            },
+        ) else {
+            panic!("multi-class linked discovery recon should transition to suspicious");
+        };
+
+        assert_eq!(transition.from, PolicyState::Observe);
+        assert_eq!(transition.to, PolicyState::Suspicious);
+        assert!(transition.reason.contains("path=/assets/import-helper.js"));
+        assert!(transition.reason.contains("query_seen=false"));
+        assert!(transition.reason.contains("linked_bait_surface_seen=true"));
+        assert!(transition.reason.contains("linked_bait_surface_classes=2"));
         assert!(transition.reason.contains("weak_signals=2"));
     }
 

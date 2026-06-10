@@ -67,6 +67,7 @@ Keep out of the private repo:
   smoke-suspicious-linked-bait-aggregation-orbstack.sh
   smoke-suspicious-hidden-route-aggregation-orbstack.sh
   smoke-suspicious-js-helper-aggregation-orbstack.sh
+  smoke-suspicious-linked-fanout-aggregation-orbstack.sh
   smoke-suspicious-openapi-orbstack.sh
   smoke-suspicious-discovery-fanout-orbstack.sh
   smoke-suspicious-rate-limit-orbstack.sh
@@ -260,6 +261,9 @@ examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-linked-bait-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-hidden-route-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-js-helper-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-linked-fanout-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
@@ -316,6 +320,14 @@ one medium-score query-bearing `/docs` discovery request stays in `observe`,
 but the same session's follow-up probe into `/assets/import-helper.js` now
 reaches the threshold through the earlier query-bearing recon plus the linked
 helper asset request itself.
+
+A linked-fanout aggregation smoke proves the next coarse target-side-only
+recon path: one medium-score `/docs` discovery request without a query string
+stays in `observe`, one same-session probe into `/docs/legacy-import` still
+stays in `observe`, and the follow-up probe into `/assets/import-helper.js`
+promotes only because the session has now churned across two linked bait
+classes. That keeps the signal target-side and makes the recon plane less
+dependent on query shape or edge-provided detections.
 
 A dedicated OpenAPI suspicious smoke proves the next `#175` slice on
 `/openapi.json`: one
