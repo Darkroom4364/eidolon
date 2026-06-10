@@ -291,6 +291,10 @@ Status checklist:
 - [x] Weighted recon suspicious-promotion scores now flow through `request_seen`
   audit events and edge export as structured `discovery_recon_score` data
   (`current branch only`)
+- [x] Weighted recon now has one conservative higher-threshold
+  `suspicious -> rate_limited` path for sustained medium-score top-level
+  discovery churn
+  (`current branch only`)
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs
   (`current branch only`)
