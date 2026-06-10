@@ -1812,6 +1812,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let session = effective_session_context(runtime, &request, &surface_request);
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
     let starting_policy_state = policy_state;
+    let mut policy_reason_override = None;
     let discovery_recon_state =
         update_discovery_recon_state_for_request(runtime, session.session_id, &surface_request)?;
     let discovery_recon_score =
@@ -1919,6 +1920,34 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
                 policy_state = transition.to;
             }
+        } else if starting_policy_state == PolicyState::RateLimited {
+            if let Some(transition) = policy::transition_to_blocked_from_repeated_discovery_recon(
+                policy_state,
+                &surface_request.path,
+                discovery_surface_kind(runtime, &surface_request).is_some(),
+                &session.ingress_identity,
+                &session.ingress_signals,
+                discovery_recon_state,
+            ) {
+                write_debug(
+                    runtime,
+                    "policy_transition_selected",
+                    Some(session.session_id),
+                    json!({
+                        "from": transition.from,
+                        "to": transition.to,
+                        "reason": transition.reason.as_str(),
+                    }),
+                )?;
+                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_changed_event(session.session_id, &transition),
+                )?;
+                discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
+                policy_reason_override = Some(transition.reason);
+                policy_state = transition.to;
+            }
         }
     }
     write_debug(
@@ -2005,7 +2034,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         }
     }
 
-    let decision = policy::decide_for_state(policy_state, intervention_mode);
+    let mut decision = policy::decide_for_state(policy_state, intervention_mode);
+    if let Some(reason) = policy_reason_override {
+        decision =
+            policy::PolicyDecision::new(decision.policy_state, decision.routing_decision, reason);
+    }
     let controller_surface_action = if intervention_mode.interventions_enabled() {
         match decision.routing_decision {
             RoutingDecision::ProtectedUpstream => {
@@ -3292,11 +3325,14 @@ fn direct_surface_decision(
         SurfaceAction::ProtectedUpstream => {
             policy::PolicyDecision::protected_upstream(policy_state, default_reason)
         }
-        SurfaceAction::EidolonOwned { .. } => policy::PolicyDecision::new(
-            policy_state,
-            RoutingDecision::EidolonOwned,
-            "surface controller served eidolon-owned response",
-        ),
+        SurfaceAction::EidolonOwned { .. } => {
+            let reason = if policy_state == PolicyState::Blocked {
+                default_reason
+            } else {
+                "surface controller served eidolon-owned response".to_string()
+            };
+            policy::PolicyDecision::new(policy_state, RoutingDecision::EidolonOwned, reason)
+        }
         SurfaceAction::ControlledReality { reason, .. } => policy::PolicyDecision::new(
             policy_state,
             RoutingDecision::ControlledReality,
@@ -7091,6 +7127,174 @@ mod tests {
         assert_eq!(
             surface_debugs[1]["fields"]["surface_action"]["type"],
             "rate_limited"
+        );
+    }
+
+    #[test]
+    fn runtime_blocks_after_rate_limited_legacy_openapi_recon_retry() {
+        let event_log_path = unique_temp_path("aggregated-openapi-recon-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-openapi-recon-blocked-debug.jsonl");
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-openapi-recon-blocked-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie(
+                "GET",
+                "/openapi.json?eidolon_surface=legacy-import",
+                &cookie,
+                &headers,
+            ),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 429);
+        assert_eq!(third_response.status, 403);
+        assert_eq!(header_values(&second_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[0]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(request_events[2]["policy_state"], "blocked");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+        let policy_decisions = events_of_type(&event_log_path, "policy_decision");
+        assert_eq!(policy_decisions.len(), 2);
+        assert!(policy_decisions[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason.contains("rate-limited discovery recon retry moved session to blocked")
+            }));
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 3);
+        assert_eq!(policy_changes[2]["kind"]["from"], "rate_limited");
+        assert_eq!(policy_changes[2]["kind"]["to"], "blocked");
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason.contains("rate-limited discovery recon retry moved session to blocked")
+            }));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/docs")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=3")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("distinct_surfaces=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_seen=true")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_score=1")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_score=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_block_threshold=5")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(request_debugs[2]["fields"]["policy_state"], "blocked");
+        assert_eq!(request_debugs[2]["fields"]["path"], "/docs");
+        assert_eq!(request_debugs[2]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[2]["fields"]["discovery_request_count"], 3);
+        assert_eq!(request_debugs[2]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_legacy_openapi_query_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["legacy_openapi_query_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[2]["fields"]["policy_state"], "blocked");
+        assert_eq!(
+            surface_debugs[2]["fields"]["policy_reason"],
+            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5"
+        );
+        assert_eq!(
+            surface_debugs[2]["fields"]["surface_action"]["type"],
+            "eidolon_owned"
         );
     }
 

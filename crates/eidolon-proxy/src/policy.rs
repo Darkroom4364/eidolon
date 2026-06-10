@@ -21,6 +21,8 @@ const DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX: &str =
     "multi-signal discovery recon aggregation promoted request to suspicious";
 const DISCOVERY_RECON_PERSISTENCE_RATE_LIMIT_REASON_PREFIX: &str =
     "suspicious discovery recon persistence moved session to rate limited";
+const DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX: &str =
+    "rate-limited discovery recon retry moved session to blocked";
 const SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX: &str =
     "suspicious same-bait near miss after exposure moved session to rate limited";
 const REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX: &str =
@@ -462,6 +464,70 @@ pub fn transition_to_rate_limited_from_suspicious_discovery_recon(
         PolicyState::RateLimited,
         format!(
             "{DISCOVERY_RECON_PERSISTENCE_RATE_LIMIT_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} detection_score={} recon_score={} recon_rate_limit_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
+            snake_case_actor_kind(ingress_signals.actor_kind),
+            recon_state.request_count,
+            recon_state.fanout.distinct_surface_count(),
+            recon_state.query_seen,
+            recon_state.legacy_openapi_query_seen,
+            recon_state.linked_bait_surface_seen,
+            recon_state.linked_bait_surface_classes,
+            recon_score.repeated_discovery_score,
+            recon_score.query_score,
+            recon_score.legacy_openapi_query_score,
+            recon_score.linked_bait_surface_score,
+            recon_score.linked_bait_class_fanout_bonus,
+            recon_score.detection_score,
+            recon_score.total,
+        ),
+    ))
+}
+
+pub fn transition_to_blocked_from_repeated_discovery_recon(
+    current_state: PolicyState,
+    path: &str,
+    path_is_top_level_discovery: bool,
+    ingress_identity: &IngressIdentity,
+    ingress_signals: &IngressAdvisorySignals,
+    recon_state: DiscoveryReconState,
+) -> Option<PolicyTransition> {
+    if current_state != PolicyState::RateLimited {
+        return None;
+    }
+    if ingress_identity::softens_bait_surface_exposure(ingress_identity) {
+        return None;
+    }
+    if !path_is_top_level_discovery {
+        return None;
+    }
+    if !matches!(
+        ingress_signals.actor_kind,
+        IngressActorKind::AutonomousAgent | IngressActorKind::AgenticBrowser
+    ) {
+        return None;
+    }
+    if ingress_signals.vendor_score_kind.as_deref()
+        != Some(AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND)
+    {
+        return None;
+    }
+    let vendor_score = ingress_signals.vendor_score?;
+    if vendor_score <= DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX
+        || vendor_score > DISCOVERY_RECON_AGGREGATION_VENDOR_SCORE_MAX
+    {
+        return None;
+    }
+
+    let detection_count = ingress_signals.detection_ids.len();
+    let recon_score = aggregated_discovery_recon_score(ingress_signals, recon_state);
+    if recon_score.total < DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD {
+        return None;
+    }
+
+    Some(PolicyTransition::new(
+        current_state,
+        PolicyState::Blocked,
+        format!(
+            "{DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} detection_score={} recon_score={} recon_block_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
             snake_case_actor_kind(ingress_signals.actor_kind),
             recon_state.request_count,
             recon_state.fanout.distinct_surface_count(),
@@ -1051,6 +1117,130 @@ mod tests {
         assert_eq!(no_top_level, None);
         assert_eq!(below_threshold, None);
         assert_eq!(observe, None);
+    }
+
+    #[test]
+    fn repeated_discovery_recon_after_rate_limit_promotes_to_blocked() {
+        let Some(transition) = transition_to_blocked_from_repeated_discovery_recon(
+            PolicyState::RateLimited,
+            "/docs",
+            true,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: true,
+                },
+                request_count: 3,
+                query_seen: true,
+                legacy_openapi_query_seen: true,
+                linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
+            },
+        ) else {
+            panic!("rate-limited discovery recon retry should transition to blocked");
+        };
+
+        assert_eq!(transition.from, PolicyState::RateLimited);
+        assert_eq!(transition.to, PolicyState::Blocked);
+        assert!(transition
+            .reason
+            .contains(DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX));
+        assert!(transition.reason.contains("path=/docs"));
+        assert!(transition.reason.contains("vendor_score=35"));
+        assert!(transition.reason.contains("discovery_requests=3"));
+        assert!(transition.reason.contains("distinct_surfaces=2"));
+        assert!(transition.reason.contains("query_seen=true"));
+        assert!(transition.reason.contains("legacy_openapi_query_seen=true"));
+        assert!(transition.reason.contains("detection_count=0"));
+        assert!(transition.reason.contains("repeated_discovery_score=2"));
+        assert!(transition.reason.contains("query_score=1"));
+        assert!(transition.reason.contains("legacy_openapi_query_score=2"));
+        assert!(transition.reason.contains("recon_score=5"));
+        assert!(transition.reason.contains("recon_block_threshold=5"));
+    }
+
+    #[test]
+    fn repeated_discovery_recon_block_requires_rate_limited_top_level_path_and_higher_score() {
+        let no_top_level = transition_to_blocked_from_repeated_discovery_recon(
+            PolicyState::RateLimited,
+            "/docs/legacy-import",
+            false,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: true,
+                },
+                request_count: 3,
+                query_seen: true,
+                legacy_openapi_query_seen: true,
+                linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
+            },
+        );
+        let below_threshold = transition_to_blocked_from_repeated_discovery_recon(
+            PolicyState::RateLimited,
+            "/docs",
+            true,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 3,
+                query_seen: false,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
+            },
+        );
+        let suspicious = transition_to_blocked_from_repeated_discovery_recon(
+            PolicyState::Suspicious,
+            "/docs",
+            true,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: true,
+                },
+                request_count: 3,
+                query_seen: true,
+                legacy_openapi_query_seen: true,
+                linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
+            },
+        );
+
+        assert_eq!(no_top_level, None);
+        assert_eq!(below_threshold, None);
+        assert_eq!(suspicious, None);
     }
 
     #[test]
