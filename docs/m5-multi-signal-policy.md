@@ -152,7 +152,11 @@ The current M5 slice is intentionally narrow:
   above promotion: an already-`suspicious` medium-score top-level discovery
   follow-up moves to `rate_limited` once the structured recon score reaches `5`
   from sustained discovery churn, without treating the request itself as a
-  bait-derived action
+  bait-derived action; that higher-threshold path is now also proven with the
+  blind decoy-write contributor in the score, so one query-bearing discovery
+  request plus a same-session unsafe probe to `/api/v2/import/reconcile`
+  without a bait header can still accumulate into a later throttled
+  top-level-discovery follow-up
 - one adjacent `rate_limited -> blocked` path now exists for repeating that
   same medium-score top-level discovery churn again after Eidolon has already
   throttled the session once, keeping the hard-fail tied to explicit

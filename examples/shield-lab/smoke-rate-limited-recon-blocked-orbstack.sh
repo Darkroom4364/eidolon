@@ -295,7 +295,7 @@ jq -e '
   .fields.policy_state == "blocked"
   and .fields.policy_routing_decision == "eidolon_owned"
   and .fields.surface_action.type == "eidolon_owned"
-  and .fields.policy_reason == "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5"
+  and .fields.policy_reason == "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 detection_score=0 recon_score=5 recon_block_threshold=5"
 ' <<<"$surface_debug_json" >/dev/null \
   || fail "session ${session_id} did not keep the blocked recon retry reason on the Eidolon-owned enforcement path"
 
