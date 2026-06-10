@@ -1811,10 +1811,12 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let surface_request = surface_request_meta(&request, &path);
     let session = effective_session_context(runtime, &request, &surface_request);
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
+    let starting_policy_state = policy_state;
     let discovery_recon_state =
         update_discovery_recon_state_for_request(runtime, session.session_id, &surface_request)?;
     let discovery_recon_score =
         policy::aggregated_discovery_recon_score(&session.ingress_signals, discovery_recon_state);
+    let mut discovery_recon_threshold = policy::discovery_recon_aggregation_score_threshold();
     if intervention_mode.interventions_enabled() {
         if let Some(transition) = policy::transition_to_suspicious_from_ingress_signals(
             policy_state,
@@ -1888,6 +1890,36 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             )?;
             policy_state = transition.to;
         }
+        if starting_policy_state == PolicyState::Suspicious {
+            if let Some(transition) =
+                policy::transition_to_rate_limited_from_suspicious_discovery_recon(
+                    policy_state,
+                    &surface_request.path,
+                    discovery_surface_kind(runtime, &surface_request).is_some(),
+                    &session.ingress_identity,
+                    &session.ingress_signals,
+                    discovery_recon_state,
+                )
+            {
+                write_debug(
+                    runtime,
+                    "policy_transition_selected",
+                    Some(session.session_id),
+                    json!({
+                        "from": transition.from,
+                        "to": transition.to,
+                        "reason": transition.reason.as_str(),
+                    }),
+                )?;
+                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_changed_event(session.session_id, &transition),
+                )?;
+                discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
+                policy_state = transition.to;
+            }
+        }
     }
     write_debug(
         runtime,
@@ -1927,7 +1959,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     discovery_recon_score.linked_bait_class_fanout_bonus,
                 "detection_score": discovery_recon_score.detection_score,
                 "total": discovery_recon_score.total,
-                "threshold": policy::discovery_recon_aggregation_score_threshold(),
+                "threshold": discovery_recon_threshold,
             },
             "policy_state": policy_state,
             "intervention_mode": debug_intervention_mode(intervention_mode),
@@ -1965,6 +1997,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 path: &path,
                 decision: &decision,
                 discovery_recon_score,
+                discovery_recon_threshold,
                 response,
                 intervention_mode,
                 surface_requested_intervention: true,
@@ -2034,6 +2067,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                         path: &path,
                         decision: &blocked_decision,
                         discovery_recon_score,
+                        discovery_recon_threshold,
                         response,
                         intervention_mode,
                         surface_requested_intervention: true,
@@ -2155,6 +2189,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             path: &path,
             decision: &blocked_decision,
             discovery_recon_score,
+            discovery_recon_threshold,
             response: blocked_response,
             intervention_mode,
             surface_requested_intervention: true,
@@ -2184,6 +2219,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     &session,
                     &effective_decision,
                     discovery_recon_score,
+                    discovery_recon_threshold,
                 ),
             )?;
             let action_exposure_id = write_bait_action_observed_event(
@@ -2369,6 +2405,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     path: &path,
                     decision: &effective_decision,
                     discovery_recon_score,
+                    discovery_recon_threshold,
                     response,
                     intervention_mode,
                     surface_requested_intervention: true,
@@ -2451,6 +2488,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     path: &path,
                     decision: &effective_decision,
                     discovery_recon_score,
+                    discovery_recon_threshold,
                     response: surface_text_response(403, "blocked by eidolon policy\n"),
                     intervention_mode,
                     surface_requested_intervention: true,
@@ -2473,6 +2511,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 &session,
                 &effective_decision,
                 discovery_recon_score,
+                discovery_recon_threshold,
             ),
             &effective_decision,
             intervention_mode,
@@ -2529,6 +2568,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             &session,
             &upstream_request_decision,
             discovery_recon_score,
+            discovery_recon_threshold,
         ),
     )?;
     if intervention_mode == InterventionMode::Disabled {
@@ -2734,6 +2774,7 @@ struct DirectResponseContext<'a> {
     path: &'a str,
     decision: &'a policy::PolicyDecision,
     discovery_recon_score: policy::DiscoveryReconAggregationScore,
+    discovery_recon_threshold: u8,
     response: SurfaceResponse,
     intervention_mode: InterventionMode,
     surface_requested_intervention: bool,
@@ -2748,6 +2789,7 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
         path,
         decision,
         discovery_recon_score,
+        discovery_recon_threshold,
         response,
         intervention_mode,
         surface_requested_intervention,
@@ -2755,7 +2797,14 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
 
     write_request_and_policy_events(
         runtime,
-        &request_seen_event(request, path, session, decision, discovery_recon_score),
+        &request_seen_event(
+            request,
+            path,
+            session,
+            decision,
+            discovery_recon_score,
+            discovery_recon_threshold,
+        ),
         decision,
         intervention_mode,
         surface_requested_intervention,
@@ -3313,6 +3362,7 @@ fn normalized_event_path(request: &HttpRequest) -> io::Result<String> {
 
 fn event_discovery_recon_score(
     score: policy::DiscoveryReconAggregationScore,
+    threshold: u8,
 ) -> DiscoveryReconScore {
     if score.total == 0 {
         return DiscoveryReconScore::default();
@@ -3326,7 +3376,7 @@ fn event_discovery_recon_score(
         linked_bait_class_fanout_bonus: score.linked_bait_class_fanout_bonus,
         detection_score: score.detection_score,
         total: score.total,
-        threshold: policy::discovery_recon_aggregation_score_threshold(),
+        threshold,
     }
 }
 
@@ -3336,6 +3386,7 @@ fn request_seen_event(
     session: &SessionContext,
     decision: &policy::PolicyDecision,
     discovery_recon_score: policy::DiscoveryReconAggregationScore,
+    discovery_recon_threshold: u8,
 ) -> Event {
     Event::new(
         session.session_id,
@@ -3347,7 +3398,10 @@ fn request_seen_event(
             safe_headers: safe_header_observations(&request.headers),
             ingress_identity: session.ingress_identity.clone(),
             ingress_signals: session.ingress_signals.clone(),
-            discovery_recon_score: event_discovery_recon_score(discovery_recon_score),
+            discovery_recon_score: event_discovery_recon_score(
+                discovery_recon_score,
+                discovery_recon_threshold,
+            ),
             routing_decision: decision.routing_decision,
         },
     )
@@ -6890,6 +6944,154 @@ mod tests {
         let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
         assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
+    }
+
+    #[test]
+    fn runtime_rate_limits_suspicious_legacy_openapi_recon_persistence() {
+        let event_log_path = unique_temp_path("aggregated-openapi-rate-limit-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-openapi-rate-limit-debug.jsonl");
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-openapi-rate-limit-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie(
+                "GET",
+                "/openapi.json?eidolon_surface=legacy-import",
+                &cookie,
+                &headers,
+            ),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 429);
+        assert_eq!(header_values(&second_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 2);
+        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
+        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["from"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["to"], "rate_limited");
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("suspicious discovery recon persistence moved session to rate limited")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/docs")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("distinct_surfaces=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_seen=true")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_score=1")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_score=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_rate_limit_threshold=5")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(request_debugs[1]["fields"]["path"], "/docs");
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 2);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_legacy_openapi_query_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["legacy_openapi_query_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[1]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(
+            surface_debugs[1]["fields"]["surface_action"]["type"],
+            "rate_limited"
+        );
     }
 
     #[test]

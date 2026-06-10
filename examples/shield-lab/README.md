@@ -73,6 +73,7 @@ Keep out of the private repo:
   smoke-suspicious-discovery-fanout-orbstack.sh
   smoke-suspicious-rate-limit-orbstack.sh
   smoke-suspicious-openapi-rate-limit-orbstack.sh
+  smoke-suspicious-openapi-recon-rate-limit-orbstack.sh
   smoke-rate-limited-blocked-orbstack.sh
   smoke-rate-limited-controlled-reality-orbstack.sh
   smoke-controlled-reality-blocked-orbstack.sh
@@ -270,6 +271,7 @@ examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-recon-rate-limit-orbstack.sh
 examples/shield-lab/smoke-rate-limited-blocked-orbstack.sh
 examples/shield-lab/smoke-rate-limited-controlled-reality-orbstack.sh
 examples/shield-lab/smoke-controlled-reality-blocked-orbstack.sh
@@ -338,6 +340,13 @@ request without a query string stays in `observe`, one same-session probe into
 `/assets/import-helper.js` promotes only because the session has now churned
 across two linked bait classes after starting from top-level OpenAPI
 discovery.
+
+An adjacent higher-threshold recon persistence smoke proves the first weighted
+`suspicious -> rate_limited` use of that same score: one medium-score
+`/openapi.json?eidolon_surface=legacy-import` request moves the session into
+`suspicious`, and a same-session top-level `/docs` follow-up then hits
+`rate_limited` once the weighted recon score reaches `5` from repeated
+discovery plus the earlier query-bearing legacy OpenAPI signal.
 
 A dedicated OpenAPI suspicious smoke proves the next `#175` slice on
 `/openapi.json`: one
