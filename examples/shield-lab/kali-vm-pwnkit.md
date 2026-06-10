@@ -39,6 +39,7 @@ examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-linked-bait-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-hidden-route-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh

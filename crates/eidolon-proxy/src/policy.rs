@@ -238,7 +238,7 @@ pub fn transition_to_suspicious_from_discovery_fanout(
 pub fn transition_to_suspicious_from_aggregated_discovery_recon(
     current_state: PolicyState,
     path: &str,
-    discovery_path_prefixes: &[String],
+    path_is_recon_candidate: bool,
     ingress_identity: &IngressIdentity,
     ingress_signals: &IngressAdvisorySignals,
     recon_state: DiscoveryReconState,
@@ -249,10 +249,7 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
     if ingress_identity::softens_bait_surface_exposure(ingress_identity) {
         return None;
     }
-    if !discovery_path_prefixes
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
-    {
+    if !path_is_recon_candidate {
         return None;
     }
     if !matches!(
@@ -792,7 +789,7 @@ mod tests {
         let Some(transition) = transition_to_suspicious_from_aggregated_discovery_recon(
             PolicyState::Observe,
             "/docs",
-            &["/docs".to_string(), "/openapi.json".to_string()],
+            true,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -835,7 +832,7 @@ mod tests {
         let no_repetition = transition_to_suspicious_from_aggregated_discovery_recon(
             PolicyState::Observe,
             "/docs",
-            &["/docs".to_string(), "/openapi.json".to_string()],
+            true,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -857,7 +854,7 @@ mod tests {
         let no_query_signal = transition_to_suspicious_from_aggregated_discovery_recon(
             PolicyState::Observe,
             "/docs",
-            &["/docs".to_string(), "/openapi.json".to_string()],
+            true,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -879,7 +876,7 @@ mod tests {
         let stronger_direct_score = transition_to_suspicious_from_aggregated_discovery_recon(
             PolicyState::Observe,
             "/docs",
-            &["/docs".to_string(), "/openapi.json".to_string()],
+            true,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -901,7 +898,7 @@ mod tests {
         let trusted = transition_to_suspicious_from_aggregated_discovery_recon(
             PolicyState::Observe,
             "/docs",
-            &["/docs".to_string(), "/openapi.json".to_string()],
+            true,
             &IngressIdentity {
                 source: eidolon_core::IngressIdentitySource::SignedAgent,
                 trust_tier: eidolon_core::IngressTrustTier::SignedAttested,
@@ -936,7 +933,7 @@ mod tests {
         let Some(transition) = transition_to_suspicious_from_aggregated_discovery_recon(
             PolicyState::Observe,
             "/docs",
-            &["/docs".to_string(), "/openapi.json".to_string()],
+            true,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -976,7 +973,7 @@ mod tests {
         let Some(transition) = transition_to_suspicious_from_aggregated_discovery_recon(
             PolicyState::Observe,
             "/openapi.json",
-            &["/docs".to_string(), "/openapi.json".to_string()],
+            true,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -1015,7 +1012,7 @@ mod tests {
         let Some(transition) = transition_to_suspicious_from_aggregated_discovery_recon(
             PolicyState::Observe,
             "/docs/legacy-import",
-            &["/docs".to_string(), "/openapi.json".to_string()],
+            true,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -1049,6 +1046,72 @@ mod tests {
             .contains("legacy_openapi_query_seen=false"));
         assert!(transition.reason.contains("linked_bait_surface_seen=true"));
         assert!(transition.reason.contains("detection_count=0"));
+        assert!(transition.reason.contains("weak_signals=2"));
+    }
+
+    #[test]
+    fn aggregated_discovery_recon_requires_top_level_or_linked_recon_path() {
+        let no_candidate = transition_to_suspicious_from_aggregated_discovery_recon(
+            PolicyState::Observe,
+            "/api/v2/import/reconcile",
+            false,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: true,
+            },
+        );
+
+        assert_eq!(no_candidate, None);
+    }
+
+    #[test]
+    fn aggregated_discovery_recon_hidden_route_followup_allows_promotion() {
+        let Some(transition) = transition_to_suspicious_from_aggregated_discovery_recon(
+            PolicyState::Observe,
+            "/customer/import-recovery-checklist",
+            true,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: true,
+            },
+        ) else {
+            panic!("hidden-route linked discovery recon should transition to suspicious");
+        };
+
+        assert_eq!(transition.from, PolicyState::Observe);
+        assert_eq!(transition.to, PolicyState::Suspicious);
+        assert!(transition
+            .reason
+            .contains("path=/customer/import-recovery-checklist"));
+        assert!(transition.reason.contains("discovery_requests=1"));
+        assert!(transition.reason.contains("query_seen=true"));
+        assert!(transition.reason.contains("linked_bait_surface_seen=true"));
         assert!(transition.reason.contains("weak_signals=2"));
     }
 

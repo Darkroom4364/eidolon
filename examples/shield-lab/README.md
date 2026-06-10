@@ -65,6 +65,7 @@ Keep out of the private repo:
   smoke-suspicious-detection-aggregation-orbstack.sh
   smoke-suspicious-openapi-aggregation-orbstack.sh
   smoke-suspicious-linked-bait-aggregation-orbstack.sh
+  smoke-suspicious-hidden-route-aggregation-orbstack.sh
   smoke-suspicious-openapi-orbstack.sh
   smoke-suspicious-discovery-fanout-orbstack.sh
   smoke-suspicious-rate-limit-orbstack.sh
@@ -301,6 +302,13 @@ follow-up probe into `/docs/legacy-import` reaches the threshold through the
 earlier query-bearing recon plus the linked bait-surface request itself,
 without depending on edge-provided detection IDs and without treating the
 follow-up as a confirmed bait-derived action.
+
+A hidden-route aggregation smoke proves the same path now works outside the
+top-level `/docs` and `/openapi.json` prefixes: one medium-score query-bearing
+`/docs` discovery request stays in `observe`, but the same session's follow-up
+probe into `/customer/import-recovery-checklist` now reaches the threshold
+through the earlier query-bearing recon plus the linked bait-surface request
+itself.
 
 A dedicated OpenAPI suspicious smoke proves the next `#175` slice on
 `/openapi.json`: one

@@ -14,7 +14,8 @@ LOCAL_STATE_DIR="${EIDOLON_SHIELD_LOCAL_STATE_DIR:-}"
 EDGE_EXPORT_BIN="${EIDOLON_EDGE_EXPORT_BIN:-}"
 FIRST_REQUEST_PATH="${EIDOLON_SHIELD_SUSPICIOUS_LINKED_BAIT_AGGREGATION_FIRST_PATH:-/docs?topic=imports}"
 SECOND_REQUEST_PATH="${EIDOLON_SHIELD_SUSPICIOUS_LINKED_BAIT_AGGREGATION_SECOND_PATH:-/docs/legacy-import}"
-REQUEST_PATH_PREFIX="${EIDOLON_SHIELD_SUSPICIOUS_LINKED_BAIT_AGGREGATION_PATH_PREFIX:-/docs}"
+FIRST_REQUEST_PATH_PREFIX="${EIDOLON_SHIELD_SUSPICIOUS_LINKED_BAIT_AGGREGATION_FIRST_PATH_PREFIX:-/docs}"
+SECOND_REQUEST_PATH_PREFIX="${EIDOLON_SHIELD_SUSPICIOUS_LINKED_BAIT_AGGREGATION_SECOND_PATH_PREFIX:-/docs}"
 FIRST_BAIT_MARKER="${EIDOLON_SHIELD_SUSPICIOUS_LINKED_BAIT_AGGREGATION_FIRST_BAIT_MARKER:-/docs/legacy-import}"
 SECOND_BAIT_MARKER="${EIDOLON_SHIELD_SUSPICIOUS_LINKED_BAIT_AGGREGATION_SECOND_BAIT_MARKER:-X-Migration-Trace: rel_2025_04_b7f2}"
 SECOND_ACTION_PATH_MARKER="${EIDOLON_SHIELD_SUSPICIOUS_LINKED_BAIT_AGGREGATION_SECOND_ACTION_PATH_MARKER:-/api/v2/import/reconcile}"
@@ -156,9 +157,9 @@ grep -Fq "$SECOND_ACTION_PATH_MARKER" "$second_body" \
   || fail "second linked-bait aggregation request did not preserve the expected bait action path"
 
 read_proxy_state_file events.jsonl > "$events_file"
-request_events_json="$(
+second_request_event_json="$(
   jq -c -e -s \
-    --arg path_prefix "$REQUEST_PATH_PREFIX" \
+    --arg path_prefix "$SECOND_REQUEST_PATH_PREFIX" \
     --arg actor_kind "$ACTOR_KIND" \
     --arg score_kind "$VENDOR_SCORE_KIND" \
     --argjson vendor_score "$VENDOR_SCORE" '
@@ -173,22 +174,49 @@ request_events_json="$(
           and (.kind.ingress_signals.vendor_score_kind // "") == $score_kind
         )
       )
-      | .[-2:]
+      | last
     ' "$events_file"
-)" || fail "could not find the linked-bait aggregation requests in the proxy event log"
+)" || fail "could not find the second linked-bait aggregation request in the proxy event log"
+
+session_id="$(jq -r '.session_id // empty' <<<"$second_request_event_json")"
+[[ -n "$session_id" ]] || fail "matching linked-bait aggregation second request had no session id"
+
+first_request_event_json="$(
+  jq -c -e -s \
+    --arg session_id "$session_id" \
+    --arg path_prefix "$FIRST_REQUEST_PATH_PREFIX" \
+    --arg actor_kind "$ACTOR_KIND" \
+    --arg score_kind "$VENDOR_SCORE_KIND" \
+    --argjson vendor_score "$VENDOR_SCORE" '
+      map(
+        select(
+          .session_id == $session_id
+          and .kind.type == "request_seen"
+          and (.kind.path // "" | startswith($path_prefix))
+          and .policy_state == "observe"
+          and .kind.routing_decision == "protected_upstream"
+          and (.kind.ingress_identity.source // "none") == "none"
+          and (.kind.ingress_identity.trust_tier // "none") == "none"
+          and (.kind.ingress_signals.actor_kind // "") == $actor_kind
+          and (.kind.ingress_signals.vendor_score // -1) == $vendor_score
+          and (.kind.ingress_signals.vendor_score_kind // "") == $score_kind
+        )
+      )
+      | last
+    ' "$events_file"
+)" || fail "session ${session_id} had no matching first linked-bait aggregation request"
 
 jq -e '
-  length == 2
-  and .[0].session_id == .[1].session_id
-  and .[0].policy_state == "observe"
-  and .[0].kind.routing_decision == "protected_upstream"
-  and .[1].policy_state == "suspicious"
-  and .[1].kind.routing_decision == "eidolon_owned"
-' <<<"$request_events_json" >/dev/null \
-  || fail "linked-bait aggregation request sequence did not preserve observe then suspicious"
+  .policy_state == "observe"
+  and .kind.routing_decision == "protected_upstream"
+' <<<"$first_request_event_json" >/dev/null \
+  || fail "linked-bait aggregation first request did not stay in observe"
 
-session_id="$(jq -r '.[1].session_id // empty' <<<"$request_events_json")"
-[[ -n "$session_id" ]] || fail "matching linked-bait aggregation requests had no session id"
+jq -e '
+  .policy_state == "suspicious"
+  and .kind.routing_decision == "eidolon_owned"
+' <<<"$second_request_event_json" >/dev/null \
+  || fail "linked-bait aggregation second request did not promote to suspicious"
 
 policy_changed_json="$(
   jq -c -e -s \
