@@ -148,6 +148,10 @@ The current M5 slice is intentionally narrow:
   follow-up moves to `rate_limited` once the structured recon score reaches `5`
   from sustained discovery churn, without treating the request itself as a
   bait-derived action
+- one adjacent `rate_limited -> blocked` path now exists for repeating that
+  same medium-score top-level discovery churn again after Eidolon has already
+  throttled the session once, keeping the hard-fail tied to explicit
+  persistence before any bait-derived action is confirmed
 - one adjacent aggregated `observe -> suspicious` path now exists for one
   query-bearing medium-score authenticated discovery request when authenticated
   detection IDs also contribute, so multiple weak advisory and recon facts can
@@ -189,6 +193,9 @@ The current M5 slice is intentionally narrow:
 - edge export now groups that pre-containment blocked path under the shared
   `pre_containment_persistence` reason-code family with the detail code
   `same_bait_near_miss_retry`
+- edge export now groups the adjacent recon-driven blocked retry under that
+  same `pre_containment_persistence` family with the detail code
+  `discovery_recon_retry`
 - one conservative `rate_limited -> controlled_reality` path now exists for a
   confirmed same-session exact bait-derived action after throttling, so stronger
   runtime evidence still moves the session into containment instead of stopping

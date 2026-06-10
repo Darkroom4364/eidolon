@@ -295,6 +295,9 @@ Status checklist:
   `suspicious -> rate_limited` path for sustained medium-score top-level
   discovery churn
   (`current branch only`)
+- [x] Weighted recon now has one adjacent `rate_limited -> blocked` path for
+  repeated medium-score top-level discovery churn after the first throttle
+  (`current branch only`)
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs
   (`current branch only`)

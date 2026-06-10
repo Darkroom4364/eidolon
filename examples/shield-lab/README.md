@@ -74,6 +74,7 @@ Keep out of the private repo:
   smoke-suspicious-rate-limit-orbstack.sh
   smoke-suspicious-openapi-rate-limit-orbstack.sh
   smoke-suspicious-openapi-recon-rate-limit-orbstack.sh
+  smoke-rate-limited-recon-blocked-orbstack.sh
   smoke-rate-limited-blocked-orbstack.sh
   smoke-rate-limited-controlled-reality-orbstack.sh
   smoke-controlled-reality-blocked-orbstack.sh
@@ -272,6 +273,7 @@ examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-rate-limited-recon-blocked-orbstack.sh
 examples/shield-lab/smoke-rate-limited-blocked-orbstack.sh
 examples/shield-lab/smoke-rate-limited-controlled-reality-orbstack.sh
 examples/shield-lab/smoke-controlled-reality-blocked-orbstack.sh
@@ -347,6 +349,12 @@ An adjacent higher-threshold recon persistence smoke proves the first weighted
 `suspicious`, and a same-session top-level `/docs` follow-up then hits
 `rate_limited` once the weighted recon score reaches `5` from repeated
 discovery plus the earlier query-bearing legacy OpenAPI signal.
+
+An adjacent recon-blocked smoke proves the next persistence step: after that
+same weighted recon path has already throttled the session once, repeating a
+same-session top-level discovery request moves the session into `blocked`,
+keeps the evidence target-side and structured, and exports the grouped
+`pre_containment_persistence` plus `discovery_recon_retry` reason codes.
 
 A dedicated OpenAPI suspicious smoke proves the next `#175` slice on
 `/openapi.json`: one
