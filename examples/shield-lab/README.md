@@ -265,6 +265,7 @@ examples/shield-lab/smoke-suspicious-decoy-write-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-decoy-write-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-suspicious-decoy-write-repeat-bonus-orbstack.sh
 examples/shield-lab/smoke-suspicious-linked-bait-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-hidden-route-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-js-helper-aggregation-orbstack.sh
@@ -308,6 +309,13 @@ contributor also feeds the next rung up: after the blind probe has already
 promoted the session to `suspicious`, one same-session top-level `/docs`
 follow-up now reaches the weighted recon threshold for `rate_limited` without
 requiring any exact bait-derived action.
+
+The adjacent repeated-decoy-write smoke proves the next refinement of that same
+non-discovery contributor: blind probes are now tracked as a small capped
+count, so a second same-session unsafe probe raises the structured
+`decoy_write_probe_score` from `2` to `3` without creating
+`bait_action_observed`, and a later top-level `/docs` follow-up reaches
+`rate_limited` at recon score `6` instead of `5`.
 
 The adjacent decoy-write recon-blocked smoke proves that the same non-discovery
 contributor carries one rung further too: after Eidolon has already throttled

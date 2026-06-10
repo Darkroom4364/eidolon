@@ -294,6 +294,8 @@ Status checklist:
 - [x] Weighted recon now has one conservative higher-threshold
   `suspicious -> rate_limited` path for sustained medium-score top-level
   discovery churn
+  and the blind decoy-write contributor is now a capped repeated-probe count,
+  not just a seen/not-seen bit
   (`current branch only`)
 - [x] Weighted recon now has one adjacent `rate_limited -> blocked` path for
   repeated medium-score top-level discovery churn after the first throttle
