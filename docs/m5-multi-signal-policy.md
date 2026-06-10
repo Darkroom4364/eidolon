@@ -154,6 +154,10 @@ The current M5 slice is intentionally narrow:
   bait classes, so a same-session move from `/docs/legacy-import` into
   `/assets/import-helper.js` can now promote without query-bearing discovery or
   edge-provided detections once the linked recon fanout itself is strong enough
+- one adjacent target-side aggregated `observe -> suspicious` path now exists
+  for one medium-score `/openapi.json` discovery request plus churn across two
+  linked bait classes, so the same linked recon fanout now works from the
+  OpenAPI side instead of assuming `/docs` is always the first discovery anchor
 - one conservative session-recon promotion now exists for same-session
   discovery-surface fanout across `/docs` and `/openapi.json`, while stronger
   trusted identities still suppress that low-confidence runtime promotion

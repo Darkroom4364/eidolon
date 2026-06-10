@@ -7371,6 +7371,200 @@ mod tests {
     }
 
     #[test]
+    fn runtime_aggregates_medium_score_openapi_anchored_linked_fanout_to_suspicious() {
+        let event_log_path =
+            unique_temp_path("aggregated-openapi-linked-fanout-suspicious-events.jsonl");
+        let debug_log_path =
+            unique_temp_path("aggregated-openapi-linked-fanout-suspicious-debug.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, upstream_handle) = spawn_upstream(json_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-openapi-linked-fanout-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/openapi.json", &cookie, &headers),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs/legacy-import", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/assets/import-helper.js", &cookie, &headers),
+        ));
+        let first_body: Value = must_ok(
+            serde_json::from_slice(&first_response.body),
+            "first body should be json",
+        );
+        let second_body = must_ok(
+            String::from_utf8(second_response.body),
+            "second body should be utf8",
+        );
+        let third_body = must_ok(
+            String::from_utf8(third_response.body),
+            "third body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 200);
+        assert_eq!(first_body["openapi"].as_str(), Some("3.0.3"));
+        assert_eq!(
+            first_body["paths"]["/api/v2/import/reconcile"]["post"]["parameters"][0]["name"],
+            "X-OpenAPI-Trace"
+        );
+        assert!(second_body.contains("X-Migration-Trace"));
+        assert!(third_body.contains("window.__eidolonImportWorker"));
+        assert!(third_body.contains("X-Import-Worker"));
+        assert!(third_body.contains("/api/v2/import/reconcile"));
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[0]["kind"]["path"], "/openapi.json");
+        assert_eq!(request_events[1]["policy_state"], "observe");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["kind"]["path"], "/docs/legacy-import");
+        assert_eq!(request_events[2]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["path"],
+            "/assets/import-helper.js"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/assets/import-helper.js")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=false")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_seen=false")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_classes=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=0")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("weak_signals=2")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(request_debugs[0]["fields"]["path"], "/openapi.json");
+        assert_eq!(
+            request_debugs[0]["fields"]["discovery_surface_fanout"]["docs_seen"],
+            false
+        );
+        assert_eq!(
+            request_debugs[0]["fields"]["discovery_surface_fanout"]["openapi_seen"],
+            true
+        );
+        assert_eq!(request_debugs[0]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[0]["fields"]["discovery_query_seen"], false);
+        assert_eq!(
+            request_debugs[0]["fields"]["discovery_linked_bait_surface_seen"],
+            false
+        );
+        assert_eq!(
+            request_debugs[0]["fields"]["discovery_linked_bait_surface_classes"],
+            0
+        );
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "observe");
+        assert_eq!(request_debugs[1]["fields"]["path"], "/docs/legacy-import");
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], false);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
+            1
+        );
+        assert_eq!(request_debugs[2]["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            request_debugs[2]["fields"]["path"],
+            "/assets/import-helper.js"
+        );
+        assert_eq!(request_debugs[2]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[2]["fields"]["discovery_query_seen"], false);
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_linked_bait_surface_classes"],
+            2
+        );
+
+        let bait_exposed_events = events_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed_events.len(), 3);
+        assert_eq!(
+            bait_exposed_events[0]["kind"]["bait_id"],
+            "openapi_reconcile_trace"
+        );
+        assert_eq!(bait_exposed_events[0]["kind"]["surface"], "/openapi.json");
+        assert_eq!(
+            bait_exposed_events[1]["kind"]["bait_id"],
+            "rel_2025_04_b7f2"
+        );
+        assert_eq!(
+            bait_exposed_events[2]["kind"]["bait_id"],
+            "js_worker_resume_trace"
+        );
+        assert_eq!(
+            bait_exposed_events[2]["kind"]["surface"],
+            "/assets/import-helper.js"
+        );
+    }
+
+    #[test]
     fn trusted_identity_is_not_promoted_to_suspicious_by_low_score_discovery_request() {
         let event_log_path = unique_temp_path("trusted-low-score-discovery-events.jsonl");
         let debug_log_path = unique_temp_path("trusted-low-score-discovery-debug.jsonl");

@@ -68,6 +68,7 @@ Keep out of the private repo:
   smoke-suspicious-hidden-route-aggregation-orbstack.sh
   smoke-suspicious-js-helper-aggregation-orbstack.sh
   smoke-suspicious-linked-fanout-aggregation-orbstack.sh
+  smoke-suspicious-openapi-linked-fanout-aggregation-orbstack.sh
   smoke-suspicious-openapi-orbstack.sh
   smoke-suspicious-discovery-fanout-orbstack.sh
   smoke-suspicious-rate-limit-orbstack.sh
@@ -264,6 +265,7 @@ examples/shield-lab/smoke-suspicious-linked-bait-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-hidden-route-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-js-helper-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-linked-fanout-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-linked-fanout-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
@@ -328,6 +330,14 @@ stays in `observe`, and the follow-up probe into `/assets/import-helper.js`
 promotes only because the session has now churned across two linked bait
 classes. That keeps the signal target-side and makes the recon plane less
 dependent on query shape or edge-provided detections.
+
+An adjacent OpenAPI-linked-fanout aggregation smoke proves the same coarse
+path is not anchored to `/docs`: one medium-score `/openapi.json` discovery
+request without a query string stays in `observe`, one same-session probe into
+`/docs/legacy-import` still stays in `observe`, and the follow-up probe into
+`/assets/import-helper.js` promotes only because the session has now churned
+across two linked bait classes after starting from top-level OpenAPI
+discovery.
 
 A dedicated OpenAPI suspicious smoke proves the next `#175` slice on
 `/openapi.json`: one
