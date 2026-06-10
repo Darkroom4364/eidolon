@@ -178,6 +178,38 @@ impl IngressAdvisorySignals {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryReconScore {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub repeated_discovery_score: u8,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub query_score: u8,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub legacy_openapi_query_score: u8,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub linked_bait_surface_score: u8,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub linked_bait_class_fanout_bonus: u8,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub detection_score: u8,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub total: u8,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub threshold: u8,
+}
+
+impl DiscoveryReconScore {
+    pub fn is_empty(&self) -> bool {
+        self.repeated_discovery_score == 0
+            && self.query_score == 0
+            && self.legacy_openapi_query_score == 0
+            && self.linked_bait_surface_score == 0
+            && self.linked_bait_class_fanout_bonus == 0
+            && self.detection_score == 0
+            && self.total == 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
@@ -189,6 +221,8 @@ pub enum EventKind {
         ingress_identity: IngressIdentity,
         #[serde(default, skip_serializing_if = "IngressAdvisorySignals::is_empty")]
         ingress_signals: IngressAdvisorySignals,
+        #[serde(default, skip_serializing_if = "DiscoveryReconScore::is_empty")]
+        discovery_recon_score: DiscoveryReconScore,
         routing_decision: RoutingDecision,
     },
     ResponseServed {
@@ -334,6 +368,8 @@ pub struct EidolonEdgeDecisionExport {
     pub ingress_identity: IngressIdentity,
     #[serde(default, skip_serializing_if = "IngressAdvisorySignals::is_empty")]
     pub ingress_signals: IngressAdvisorySignals,
+    #[serde(default, skip_serializing_if = "DiscoveryReconScore::is_empty")]
+    pub discovery_recon_score: DiscoveryReconScore,
     pub policy: EdgePolicySnapshot,
     pub evidence: EdgeEvidenceRef,
     pub edge_recommendation: EdgeRecommendation,
@@ -380,6 +416,7 @@ mod tests {
                 }],
                 ingress_identity: IngressIdentity::default(),
                 ingress_signals: IngressAdvisorySignals::default(),
+                discovery_recon_score: DiscoveryReconScore::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         );
@@ -445,11 +482,18 @@ mod tests {
                     detection_ids: vec!["3355446".to_string()],
                     edge_action: Some(EdgeRecommendedAction::Allow),
                 },
+                discovery_recon_score: DiscoveryReconScore {
+                    repeated_discovery_score: 2,
+                    query_score: 1,
+                    total: 3,
+                    threshold: 3,
+                    ..DiscoveryReconScore::default()
+                },
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         );
 
-        let serialized = serde_json::to_value(event).expect("event should serialize");
+        let serialized = must_ok(serde_json::to_value(event), "event should serialize");
 
         assert_eq!(
             serialized["kind"]["ingress_identity"]["source"],
@@ -473,6 +517,16 @@ mod tests {
             serialized["kind"]["ingress_signals"]["edge_action"],
             "allow"
         );
+        assert_eq!(
+            serialized["kind"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            serialized["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(serialized["kind"]["discovery_recon_score"]["total"], 3);
+        assert_eq!(serialized["kind"]["discovery_recon_score"]["threshold"], 3);
     }
 
     #[test]
@@ -533,6 +587,40 @@ mod tests {
             EventKind::RequestSeen {
                 ingress_signals, ..
             } => assert_eq!(ingress_signals, IngressAdvisorySignals::default()),
+            other => panic!("expected request_seen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_seen_event_deserializes_without_discovery_recon_score() {
+        let session_id = SessionId::new();
+        let event = json!({
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "id": Uuid::new_v4(),
+            "session_id": session_id,
+            "observed_at": Utc::now(),
+            "source": "proxy",
+            "policy_state": "observe",
+            "kind": {
+                "type": "request_seen",
+                "method": "GET",
+                "path": "/openapi.json",
+                "safe_headers": [],
+                "ingress_identity": {
+                    "source": "verified_bot",
+                    "trust_tier": "edge_verified"
+                },
+                "routing_decision": "protected_upstream"
+            }
+        });
+
+        let parsed: Event = must_ok(serde_json::from_value(event), "legacy event should parse");
+
+        match parsed.kind {
+            EventKind::RequestSeen {
+                discovery_recon_score,
+                ..
+            } => assert_eq!(discovery_recon_score, DiscoveryReconScore::default()),
             other => panic!("expected request_seen, got {other:?}"),
         }
     }
@@ -632,6 +720,13 @@ mod tests {
                 detection_ids: vec!["3355446".to_string()],
                 edge_action: Some(EdgeRecommendedAction::Allow),
             },
+            discovery_recon_score: DiscoveryReconScore {
+                detection_score: 2,
+                query_score: 1,
+                total: 3,
+                threshold: 3,
+                ..DiscoveryReconScore::default()
+            },
             policy: EdgePolicySnapshot {
                 state: PolicyState::Observe,
                 routing_decision: RoutingDecision::ProtectedUpstream,
@@ -662,5 +757,12 @@ mod tests {
         );
         assert_eq!(serialized["ingress_signals"]["vendor_score"], json!(12));
         assert_eq!(serialized["ingress_signals"]["edge_action"], json!("allow"));
+        assert_eq!(
+            serialized["discovery_recon_score"]["detection_score"],
+            json!(2)
+        );
+        assert_eq!(serialized["discovery_recon_score"]["query_score"], json!(1));
+        assert_eq!(serialized["discovery_recon_score"]["total"], json!(3));
+        assert_eq!(serialized["discovery_recon_score"]["threshold"], json!(3));
     }
 }

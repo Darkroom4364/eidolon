@@ -288,6 +288,9 @@ Status checklist:
   (`current branch only`)
 - [x] Aggregated suspicious-promotion paths now use an explicit weighted recon
   score instead of a flat weak-signal count (`current branch only`)
+- [x] Weighted recon suspicious-promotion scores now flow through `request_seen`
+  audit events and edge export as structured `discovery_recon_score` data
+  (`current branch only`)
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs
   (`current branch only`)

@@ -264,6 +264,10 @@ jq -e \
     and .[0].ingress_signals.actor_kind == $actor_kind
     and .[0].ingress_signals.vendor_score == $vendor_score
     and .[0].ingress_signals.vendor_score_kind == $score_kind
+    and .[0].discovery_recon_score.query_score == 1
+    and .[0].discovery_recon_score.legacy_openapi_query_score == 2
+    and .[0].discovery_recon_score.total == 3
+    and .[0].discovery_recon_score.threshold == 3
     and .[0].edge_recommendation.action == "preserve_eidolon_routing"
     and (.[0].edge_recommendation.reason_codes // []) == ["eidolon_runtime_enforcement", "eidolon_owned"]
   ' "$edge_export_file" >/dev/null \
