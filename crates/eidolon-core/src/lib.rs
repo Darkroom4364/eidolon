@@ -191,6 +191,8 @@ pub struct DiscoveryReconScore {
     #[serde(default, skip_serializing_if = "is_default")]
     pub linked_bait_class_fanout_bonus: u8,
     #[serde(default, skip_serializing_if = "is_default")]
+    pub decoy_write_probe_score: u8,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub detection_score: u8,
     #[serde(default, skip_serializing_if = "is_default")]
     pub total: u8,
@@ -205,6 +207,7 @@ impl DiscoveryReconScore {
             && self.legacy_openapi_query_score == 0
             && self.linked_bait_surface_score == 0
             && self.linked_bait_class_fanout_bonus == 0
+            && self.decoy_write_probe_score == 0
             && self.detection_score == 0
             && self.total == 0
     }

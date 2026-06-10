@@ -303,6 +303,9 @@ Status checklist:
   (`current branch only`)
 - [x] First target-side-only aggregated suspicious-promotion path exists for
   medium-score legacy-query OpenAPI discovery (`current branch only`)
+- [x] First target-side aggregated suspicious-promotion path exists for
+  medium-score query-bearing discovery plus a blind decoy write probe without
+  bait-derived attribution (`current branch only`)
 - [x] Adjacent target-side-only aggregated suspicious-promotion path exists for
   medium-score linked bait-surface follow-up after query-bearing discovery,
   including hidden-route and JS-helper follow-up outside the top-level
