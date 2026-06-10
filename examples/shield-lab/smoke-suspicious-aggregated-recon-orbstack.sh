@@ -213,7 +213,11 @@ jq -e \
   || fail "session ${session_id} suspicious transition reason did not preserve the medium advisory score"
 
 jq -e '
-    (.kind.reason // "") | contains("query_seen=true")
+    ((.kind.reason // "") | contains("query_seen=true"))
+    and ((.kind.reason // "") | contains("repeated_discovery_score=2"))
+    and ((.kind.reason // "") | contains("query_score=1"))
+    and ((.kind.reason // "") | contains("recon_score=3"))
+    and ((.kind.reason // "") | contains("recon_threshold=3"))
   ' <<<"$policy_changed_json" >/dev/null \
   || fail "session ${session_id} suspicious transition reason did not preserve the query-bearing recon signal"
 

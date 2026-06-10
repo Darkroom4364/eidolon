@@ -194,6 +194,8 @@ jq -e '
     ((.kind.reason // "") | contains("query_seen=true"))
     and ((.kind.reason // "") | contains("detection_count=2"))
     and ((.kind.reason // "") | contains("discovery_requests=1"))
+    and ((.kind.reason // "") | contains("detection_score=2"))
+    and ((.kind.reason // "") | contains("recon_score=3"))
   ' <<<"$policy_changed_json" >/dev/null \
   || fail "session ${session_id} suspicious transition reason did not preserve the expected aggregated detection facts"
 

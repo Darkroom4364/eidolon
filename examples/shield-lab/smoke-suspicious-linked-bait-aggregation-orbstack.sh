@@ -248,6 +248,8 @@ jq -e \
     and contains("query_seen=true")
     and contains("linked_bait_surface_seen=true")
     and contains("detection_count=0")
+    and contains("linked_bait_surface_score=2")
+    and contains("recon_score=3")
   ' <<<"$policy_changed_json" >/dev/null \
   || fail "session ${session_id} suspicious transition reason did not preserve the linked-bait aggregation signals"
 

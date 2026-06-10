@@ -135,6 +135,11 @@ The current M5 slice is intentionally narrow:
   has also shown query-bearing discovery recon, so one lower-confidence
   advisory signal plus two weaker recon contributors can promote without
   requiring a strong single-request score
+- those aggregated suspicious-promotion paths now run through a small weighted
+  recon score instead of a flat weak-signal count, so repeated discovery,
+  query-bearing recon, legacy OpenAPI query shape, linked bait traversal, and
+  authenticated detections can be tuned as explicit contributors without
+  collapsing identity, evidence, and enforcement together
 - one adjacent aggregated `observe -> suspicious` path now exists for one
   query-bearing medium-score authenticated discovery request when authenticated
   detection IDs also contribute, so multiple weak advisory and recon facts can

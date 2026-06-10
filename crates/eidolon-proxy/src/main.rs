@@ -1813,6 +1813,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
     let discovery_recon_state =
         update_discovery_recon_state_for_request(runtime, session.session_id, &surface_request)?;
+    let discovery_recon_score =
+        policy::aggregated_discovery_recon_score(&session.ingress_signals, discovery_recon_state);
     if intervention_mode.interventions_enabled() {
         if let Some(transition) = policy::transition_to_suspicious_from_ingress_signals(
             policy_state,
@@ -1914,6 +1916,19 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 discovery_recon_state.linked_bait_surface_seen,
             "discovery_linked_bait_surface_classes":
                 discovery_recon_state.linked_bait_surface_classes,
+            "discovery_recon_score": {
+                "repeated_discovery_score": discovery_recon_score.repeated_discovery_score,
+                "query_score": discovery_recon_score.query_score,
+                "legacy_openapi_query_score":
+                    discovery_recon_score.legacy_openapi_query_score,
+                "linked_bait_surface_score":
+                    discovery_recon_score.linked_bait_surface_score,
+                "linked_bait_class_fanout_bonus":
+                    discovery_recon_score.linked_bait_class_fanout_bonus,
+                "detection_score": discovery_recon_score.detection_score,
+                "total": discovery_recon_score.total,
+                "threshold": policy::discovery_recon_aggregation_score_threshold(),
+            },
             "policy_state": policy_state,
             "intervention_mode": debug_intervention_mode(intervention_mode),
         }),
@@ -6576,6 +6591,15 @@ mod tests {
         assert!(policy_changed["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_score=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -6596,6 +6620,14 @@ mod tests {
         assert_eq!(
             request_debugs[1]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
             1
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
         );
 
         let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
@@ -6676,6 +6708,12 @@ mod tests {
         assert!(policy_changed["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("detection_count=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
 
         let request_debug = first_debug_event(&debug_log_path, "request_received");
         assert_eq!(request_debug["fields"]["policy_state"], "suspicious");
@@ -6697,6 +6735,11 @@ mod tests {
         assert_eq!(
             request_debug["fields"]["ingress_signals"]["detection_ids"][1],
             "445566"
+        );
+        assert_eq!(request_debug["fields"]["discovery_recon_score"]["total"], 3);
+        assert_eq!(
+            request_debug["fields"]["discovery_recon_score"]["detection_score"],
+            2
         );
 
         let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
@@ -6772,6 +6815,12 @@ mod tests {
         assert!(policy_changed["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("detection_count=0")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
 
         let request_debug = first_debug_event(&debug_log_path, "request_received");
         assert_eq!(request_debug["fields"]["policy_state"], "suspicious");
@@ -6786,6 +6835,11 @@ mod tests {
         assert_eq!(
             request_debug["fields"]["discovery_linked_bait_surface_seen"],
             false
+        );
+        assert_eq!(request_debug["fields"]["discovery_recon_score"]["total"], 3);
+        assert_eq!(
+            request_debug["fields"]["discovery_recon_score"]["legacy_openapi_query_score"],
+            2
         );
 
         let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
@@ -6883,6 +6937,12 @@ mod tests {
         assert!(policy_changed["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("detection_count=0")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -6905,6 +6965,10 @@ mod tests {
         assert_eq!(
             request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
             1
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["total"],
+            3
         );
 
         let surface_debug = debug_values(&debug_log_path)
@@ -7320,7 +7384,13 @@ mod tests {
             .is_some_and(|reason| reason.contains("detection_count=0")));
         assert!(policy_changed["kind"]["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("weak_signals=2")));
+            .is_some_and(|reason| reason.contains("linked_bait_surface_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_class_fanout_bonus=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -7352,6 +7422,14 @@ mod tests {
         assert_eq!(
             request_debugs[2]["fields"]["discovery_linked_bait_surface_classes"],
             2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["linked_bait_class_fanout_bonus"],
+            1
         );
 
         let bait_exposed_events = events_of_type(&event_log_path, "bait_exposed");
@@ -7490,7 +7568,13 @@ mod tests {
             .is_some_and(|reason| reason.contains("detection_count=0")));
         assert!(policy_changed["kind"]["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("weak_signals=2")));
+            .is_some_and(|reason| reason.contains("linked_bait_surface_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_class_fanout_bonus=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -7541,6 +7625,14 @@ mod tests {
         assert_eq!(
             request_debugs[2]["fields"]["discovery_linked_bait_surface_classes"],
             2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["linked_bait_class_fanout_bonus"],
+            1
         );
 
         let bait_exposed_events = events_of_type(&event_log_path, "bait_exposed");
