@@ -15,8 +15,8 @@ use std::{
 
 use eidolon_bait::{docs_for_bait, BaitRegistry};
 use eidolon_core::{
-    Bait, BaitClass, BaitId, Event, EventKind, EventSource, ExposureId, PolicyState,
-    RoutingDecision, SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
+    Bait, BaitClass, BaitId, DiscoveryReconScore, Event, EventKind, EventSource, ExposureId,
+    PolicyState, RoutingDecision, SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
 };
 use eidolon_proxy::{
     controlled_reality::{
@@ -1964,6 +1964,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 request: &request,
                 path: &path,
                 decision: &decision,
+                discovery_recon_score,
                 response,
                 intervention_mode,
                 surface_requested_intervention: true,
@@ -2032,6 +2033,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                         request: &request,
                         path: &path,
                         decision: &blocked_decision,
+                        discovery_recon_score,
                         response,
                         intervention_mode,
                         surface_requested_intervention: true,
@@ -2152,6 +2154,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             request: &request,
             path: &path,
             decision: &blocked_decision,
+            discovery_recon_score,
             response: blocked_response,
             intervention_mode,
             surface_requested_intervention: true,
@@ -2175,7 +2178,13 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             );
             write_event(
                 &runtime.event_log,
-                &request_seen_event(&request, &path, &session, &effective_decision),
+                &request_seen_event(
+                    &request,
+                    &path,
+                    &session,
+                    &effective_decision,
+                    discovery_recon_score,
+                ),
             )?;
             let action_exposure_id = write_bait_action_observed_event(
                 runtime,
@@ -2359,6 +2368,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     request: &request,
                     path: &path,
                     decision: &effective_decision,
+                    discovery_recon_score,
                     response,
                     intervention_mode,
                     surface_requested_intervention: true,
@@ -2440,6 +2450,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     request: &request,
                     path: &path,
                     decision: &effective_decision,
+                    discovery_recon_score,
                     response: surface_text_response(403, "blocked by eidolon policy\n"),
                     intervention_mode,
                     surface_requested_intervention: true,
@@ -2456,9 +2467,13 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         );
         write_request_and_policy_events(
             runtime,
-            &request,
-            &path,
-            &session,
+            &request_seen_event(
+                &request,
+                &path,
+                &session,
+                &effective_decision,
+                discovery_recon_score,
+            ),
             &effective_decision,
             intervention_mode,
             surface_requested_intervention,
@@ -2508,7 +2523,13 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     );
     write_event(
         &runtime.event_log,
-        &request_seen_event(&request, &path, &session, &upstream_request_decision),
+        &request_seen_event(
+            &request,
+            &path,
+            &session,
+            &upstream_request_decision,
+            discovery_recon_score,
+        ),
     )?;
     if intervention_mode == InterventionMode::Disabled {
         write_event(
@@ -2712,6 +2733,7 @@ struct DirectResponseContext<'a> {
     request: &'a HttpRequest,
     path: &'a str,
     decision: &'a policy::PolicyDecision,
+    discovery_recon_score: policy::DiscoveryReconAggregationScore,
     response: SurfaceResponse,
     intervention_mode: InterventionMode,
     surface_requested_intervention: bool,
@@ -2725,6 +2747,7 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
         request,
         path,
         decision,
+        discovery_recon_score,
         response,
         intervention_mode,
         surface_requested_intervention,
@@ -2732,9 +2755,7 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
 
     write_request_and_policy_events(
         runtime,
-        request,
-        path,
-        session,
+        &request_seen_event(request, path, session, decision, discovery_recon_score),
         decision,
         intervention_mode,
         surface_requested_intervention,
@@ -3290,11 +3311,31 @@ fn normalized_event_path(request: &HttpRequest) -> io::Result<String> {
     Ok(normalize_request_target(&request.target)?.to_string())
 }
 
+fn event_discovery_recon_score(
+    score: policy::DiscoveryReconAggregationScore,
+) -> DiscoveryReconScore {
+    if score.total == 0 {
+        return DiscoveryReconScore::default();
+    }
+
+    DiscoveryReconScore {
+        repeated_discovery_score: score.repeated_discovery_score,
+        query_score: score.query_score,
+        legacy_openapi_query_score: score.legacy_openapi_query_score,
+        linked_bait_surface_score: score.linked_bait_surface_score,
+        linked_bait_class_fanout_bonus: score.linked_bait_class_fanout_bonus,
+        detection_score: score.detection_score,
+        total: score.total,
+        threshold: policy::discovery_recon_aggregation_score_threshold(),
+    }
+}
+
 fn request_seen_event(
     request: &HttpRequest,
     path: &str,
     session: &SessionContext,
     decision: &policy::PolicyDecision,
+    discovery_recon_score: policy::DiscoveryReconAggregationScore,
 ) -> Event {
     Event::new(
         session.session_id,
@@ -3306,6 +3347,7 @@ fn request_seen_event(
             safe_headers: safe_header_observations(&request.headers),
             ingress_identity: session.ingress_identity.clone(),
             ingress_signals: session.ingress_signals.clone(),
+            discovery_recon_score: event_discovery_recon_score(discovery_recon_score),
             routing_decision: decision.routing_decision,
         },
     )
@@ -3313,17 +3355,12 @@ fn request_seen_event(
 
 fn write_request_and_policy_events(
     runtime: &ProxyRuntime,
-    request: &HttpRequest,
-    path: &str,
-    session: &SessionContext,
+    request_event: &Event,
     decision: &policy::PolicyDecision,
     intervention_mode: InterventionMode,
     surface_requested_intervention: bool,
 ) -> io::Result<()> {
-    write_event(
-        &runtime.event_log,
-        &request_seen_event(request, path, session, decision),
-    )?;
+    write_event(&runtime.event_log, request_event)?;
 
     if intervention_mode == InterventionMode::Disabled
         || surface_requested_intervention
@@ -3331,7 +3368,7 @@ fn write_request_and_policy_events(
     {
         write_event(
             &runtime.event_log,
-            &policy::policy_intervention_event(session.session_id, decision),
+            &policy::policy_intervention_event(request_event.session_id, decision),
         )?;
     }
 
@@ -5881,6 +5918,7 @@ mod tests {
                     safe_headers: Vec::new(),
                     ingress_identity: Default::default(),
                     ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             ),

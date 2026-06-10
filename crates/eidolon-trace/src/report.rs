@@ -262,6 +262,7 @@ pub fn edge_decision_export_for_evidence(
             path,
             ingress_identity,
             ingress_signals,
+            discovery_recon_score,
             routing_decision,
             ..
         } = &event.event.kind
@@ -275,12 +276,20 @@ pub fn edge_decision_export_for_evidence(
             path.clone(),
             ingress_identity.clone(),
             ingress_signals.clone(),
+            discovery_recon_score.clone(),
             *routing_decision,
         ))
     })?;
 
-    let (request_event, method, path, ingress_identity, ingress_signals, request_routing_decision) =
-        latest_request;
+    let (
+        request_event,
+        method,
+        path,
+        ingress_identity,
+        ingress_signals,
+        discovery_recon_score,
+        request_routing_decision,
+    ) = latest_request;
     let latest_policy_reason_event = bundle
         .policy_events
         .iter()
@@ -314,6 +323,7 @@ pub fn edge_decision_export_for_evidence(
         request: EdgeRequestRef { method, path },
         ingress_identity,
         ingress_signals,
+        discovery_recon_score,
         policy: EdgePolicySnapshot {
             state: policy_state,
             routing_decision,
@@ -731,10 +741,10 @@ fn markdown_text(value: &str) -> String {
 mod tests {
     use chrono::{TimeDelta, TimeZone, Utc};
     use eidolon_core::{
-        BaitId, EdgeRecommendedAction, Event, EventKind, EventSource, ExposureId, IngressActorKind,
-        IngressAdvisorySignals, IngressIdentity, IngressIdentitySource, IngressTrustTier,
-        IngressVerificationStrength, PolicyState, RoutingDecision, SafeHeaderObservation,
-        SessionId, TRUSTED_INGRESS_CONTRACT_VERSION,
+        BaitId, DiscoveryReconScore, EdgeRecommendedAction, Event, EventKind, EventSource,
+        ExposureId, IngressActorKind, IngressAdvisorySignals, IngressIdentity,
+        IngressIdentitySource, IngressTrustTier, IngressVerificationStrength, PolicyState,
+        RoutingDecision, SafeHeaderObservation, SessionId, TRUSTED_INGRESS_CONTRACT_VERSION,
     };
 
     use crate::{evidence_bundle_for_timeline, TimelineEvent};
@@ -784,6 +794,7 @@ mod tests {
                 ],
                 ingress_identity: IngressIdentity::default(),
                 ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
                 routing_decision: RoutingDecision::EidolonOwned,
             },
         )
@@ -809,6 +820,13 @@ mod tests {
                     vendor_score_scale: Some("1-99".to_string()),
                     detection_ids: vec!["3355446".to_string()],
                     edge_action: Some(EdgeRecommendedAction::Allow),
+                },
+                discovery_recon_score: DiscoveryReconScore {
+                    detection_score: 2,
+                    query_score: 1,
+                    total: 3,
+                    threshold: 3,
+                    ..DiscoveryReconScore::default()
                 },
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
@@ -880,6 +898,7 @@ mod tests {
                 safe_headers: Vec::new(),
                 ingress_identity: IngressIdentity::default(),
                 ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
                 routing_decision,
             },
         )
@@ -1045,6 +1064,7 @@ mod tests {
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
                     ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             ),
@@ -1124,6 +1144,13 @@ mod tests {
                         detection_ids: vec!["3355446".to_string()],
                         edge_action: Some(EdgeRecommendedAction::Allow),
                     },
+                    discovery_recon_score: DiscoveryReconScore {
+                        detection_score: 2,
+                        query_score: 1,
+                        total: 3,
+                        threshold: 3,
+                        ..DiscoveryReconScore::default()
+                    },
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             ),
@@ -1154,6 +1181,10 @@ mod tests {
             export.ingress_signals.edge_action,
             Some(EdgeRecommendedAction::Allow)
         );
+        assert_eq!(export.discovery_recon_score.detection_score, 2);
+        assert_eq!(export.discovery_recon_score.query_score, 1);
+        assert_eq!(export.discovery_recon_score.total, 3);
+        assert_eq!(export.discovery_recon_score.threshold, 3);
         assert_eq!(
             export.edge_recommendation.action,
             EdgeRecommendedAction::Allow
@@ -1178,6 +1209,7 @@ mod tests {
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
                     ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ControlledReality,
                 },
             ),
@@ -1225,6 +1257,7 @@ mod tests {
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
                     ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
             ),
@@ -1282,6 +1315,7 @@ mod tests {
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
                     ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
             ),
@@ -1340,6 +1374,7 @@ mod tests {
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
                     ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
             ),

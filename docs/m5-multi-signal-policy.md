@@ -140,6 +140,9 @@ The current M5 slice is intentionally narrow:
   query-bearing recon, legacy OpenAPI query shape, linked bait traversal, and
   authenticated detections can be tuned as explicit contributors without
   collapsing identity, evidence, and enforcement together
+- that weighted recon score now rides in `request_seen` audit events and edge
+  export as structured `discovery_recon_score` fields, so operators do not need
+  to recover it from debug logs or freeform policy reasons
 - one adjacent aggregated `observe -> suspicious` path now exists for one
   query-bearing medium-score authenticated discovery request when authenticated
   detection IDs also contribute, so multiple weak advisory and recon facts can
