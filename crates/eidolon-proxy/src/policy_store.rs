@@ -31,7 +31,7 @@ pub struct SessionPolicyRecord {
     #[serde(default)]
     pub discovery_legacy_openapi_query_seen: bool,
     #[serde(default)]
-    pub discovery_linked_bait_surface_seen: bool,
+    pub discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout,
 }
 
 impl SessionPolicyRecord {
@@ -44,7 +44,7 @@ impl SessionPolicyRecord {
             discovery_request_count: 0,
             discovery_query_seen: false,
             discovery_legacy_openapi_query_seen: false,
-            discovery_linked_bait_surface_seen: false,
+            discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout::default(),
         }
     }
 }
@@ -78,6 +78,8 @@ struct StoredSessionPolicy {
     #[serde(default)]
     discovery_legacy_openapi_query_seen: bool,
     #[serde(default)]
+    discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout,
+    #[serde(default, skip_serializing)]
     discovery_linked_bait_surface_seen: bool,
 }
 
@@ -175,30 +177,20 @@ impl PolicyStateStore {
         record.discovery_legacy_openapi_query_seen |= legacy_openapi_query_seen;
         self.records.insert(session_id, record);
         self.persist()?;
-        Ok(crate::policy::DiscoveryReconState {
-            fanout: record.discovery_surface_fanout,
-            request_count: record.discovery_request_count,
-            query_seen: record.discovery_query_seen,
-            legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
-            linked_bait_surface_seen: record.discovery_linked_bait_surface_seen,
-        })
+        Ok(discovery_recon_state(record))
     }
 
     pub fn note_linked_bait_surface_request(
         &mut self,
         session_id: SessionId,
+        kind: crate::policy::LinkedBaitSurfaceKind,
     ) -> io::Result<crate::policy::DiscoveryReconState> {
         let mut record = self.record(session_id);
-        record.discovery_linked_bait_surface_seen = true;
+        record.discovery_linked_bait_surface_fanout =
+            record.discovery_linked_bait_surface_fanout.mark(kind);
         self.records.insert(session_id, record);
         self.persist()?;
-        Ok(crate::policy::DiscoveryReconState {
-            fanout: record.discovery_surface_fanout,
-            request_count: record.discovery_request_count,
-            query_seen: record.discovery_query_seen,
-            legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
-            linked_bait_surface_seen: record.discovery_linked_bait_surface_seen,
-        })
+        Ok(discovery_recon_state(record))
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -218,7 +210,8 @@ impl PolicyStateStore {
                 discovery_request_count: record.discovery_request_count,
                 discovery_query_seen: record.discovery_query_seen,
                 discovery_legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
-                discovery_linked_bait_surface_seen: record.discovery_linked_bait_surface_seen,
+                discovery_linked_bait_surface_fanout: record.discovery_linked_bait_surface_fanout,
+                discovery_linked_bait_surface_seen: false,
             })
             .collect();
         sessions.sort_by_key(|record| record.session_id.0);
@@ -254,6 +247,19 @@ impl PolicyStateStore {
     }
 }
 
+fn discovery_recon_state(record: SessionPolicyRecord) -> crate::policy::DiscoveryReconState {
+    crate::policy::DiscoveryReconState {
+        fanout: record.discovery_surface_fanout,
+        request_count: record.discovery_request_count,
+        query_seen: record.discovery_query_seen,
+        legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
+        linked_bait_surface_seen: record.discovery_linked_bait_surface_fanout.any_seen(),
+        linked_bait_surface_classes: record
+            .discovery_linked_bait_surface_fanout
+            .distinct_surface_count(),
+    }
+}
+
 fn deserialize_records(
     bytes: &[u8],
     path: &Path,
@@ -282,6 +288,16 @@ fn deserialize_records(
         .sessions
         .into_iter()
         .map(|session| {
+            let mut linked_bait_surface_fanout = session.discovery_linked_bait_surface_fanout;
+            if linked_bait_surface_fanout == crate::policy::LinkedBaitSurfaceFanout::default()
+                && session.discovery_linked_bait_surface_seen
+            {
+                linked_bait_surface_fanout = crate::policy::LinkedBaitSurfaceFanout {
+                    docs_seen: false,
+                    assets_seen: false,
+                    other_seen: true,
+                };
+            }
             (
                 session.session_id,
                 SessionPolicyRecord {
@@ -293,7 +309,7 @@ fn deserialize_records(
                     discovery_query_seen: session.discovery_query_seen,
                     discovery_legacy_openapi_query_seen: session
                         .discovery_legacy_openapi_query_seen,
-                    discovery_linked_bait_surface_seen: session.discovery_linked_bait_surface_seen,
+                    discovery_linked_bait_surface_fanout: linked_bait_surface_fanout,
                 },
             )
         })
@@ -519,11 +535,15 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
             }
         );
         assert_eq!(
             must_ok(
-                store.note_linked_bait_surface_request(session_id),
+                store.note_linked_bait_surface_request(
+                    session_id,
+                    crate::policy::LinkedBaitSurfaceKind::Docs,
+                ),
                 "linked bait surface should persist"
             ),
             crate::policy::DiscoveryReconState {
@@ -535,6 +555,27 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 1,
+            }
+        );
+        assert_eq!(
+            must_ok(
+                store.note_linked_bait_surface_request(
+                    session_id,
+                    crate::policy::LinkedBaitSurfaceKind::Assets,
+                ),
+                "second linked bait surface should persist"
+            ),
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 2,
             }
         );
         assert_eq!(
@@ -556,6 +597,7 @@ mod tests {
                 query_seen: true,
                 legacy_openapi_query_seen: true,
                 linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 2,
             }
         );
 
@@ -577,7 +619,14 @@ mod tests {
         assert!(
             reopened
                 .record(session_id)
-                .discovery_linked_bait_surface_seen
+                .discovery_linked_bait_surface_fanout
+                .docs_seen
+        );
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_linked_bait_surface_fanout
+                .assets_seen
         );
     }
 
@@ -604,10 +653,38 @@ mod tests {
                 .record(session_id)
                 .discovery_legacy_openapi_query_seen
         );
-        assert!(
-            !reopened
+        assert!(!reopened
+            .record(session_id)
+            .discovery_linked_bait_surface_fanout
+            .any_seen());
+    }
+
+    #[test]
+    fn older_store_with_legacy_linked_bait_seen_migrates_to_fanout() {
+        let path = unique_temp_path("legacy-linked-bait");
+        let session_id = SessionId::new();
+        let legacy = format!(
+            "{{\"schema_version\":1,\"sessions\":[{{\"session_id\":\"{}\",\"policy_state\":\"observe\",\"controlled_reality_depth\":0,\"discovery_linked_bait_surface_seen\":true}}]}}",
+            session_id.0
+        );
+        must_ok(
+            fs::write(&path, legacy),
+            "legacy linked-bait store should write",
+        );
+
+        let reopened = must_ok(
+            PolicyStateStore::open(&path),
+            "legacy linked-bait store should reopen",
+        );
+        assert_eq!(
+            reopened
                 .record(session_id)
-                .discovery_linked_bait_surface_seen
+                .discovery_linked_bait_surface_fanout,
+            crate::policy::LinkedBaitSurfaceFanout {
+                docs_seen: false,
+                assets_seen: false,
+                other_seen: true,
+            }
         );
     }
 }

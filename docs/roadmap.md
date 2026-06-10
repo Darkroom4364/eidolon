@@ -296,6 +296,11 @@ Status checklist:
   including hidden-route and JS-helper follow-up outside the top-level
   discovery prefixes
   (`current branch only`)
+- [x] Adjacent target-side-only aggregated suspicious-promotion path exists for
+  medium-score linked bait-class fanout after plain `/docs` discovery, so two
+  distinct linked follow-up classes can promote without query-bearing recon or
+  edge-provided detections
+  (`current branch only`)
 - [x] Same-session discovery fanout promotion across `/docs` and
   `/openapi.json` exists (`current branch only`)
 - [x] `suspicious -> rate_limited` exists for same-bait near misses
