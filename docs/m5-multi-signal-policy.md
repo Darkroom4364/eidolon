@@ -143,6 +143,11 @@ The current M5 slice is intentionally narrow:
   for one medium-score legacy-query OpenAPI discovery request, so multiple weak
   recon facts can promote on first contact without depending on edge-provided
   detection IDs
+- one adjacent target-side aggregated `observe -> suspicious` path now exists
+  for one medium-score linked bait-surface follow-up after query-bearing docs
+  discovery, so moving from top-level discovery into a linked docs bait surface
+  contributes as target-side recon without treating the follow-up as a
+  confirmed bait-derived action
 - one conservative session-recon promotion now exists for same-session
   discovery-surface fanout across `/docs` and `/openapi.json`, while stronger
   trusted identities still suppress that low-confidence runtime promotion

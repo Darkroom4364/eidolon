@@ -64,6 +64,7 @@ Keep out of the private repo:
   smoke-suspicious-aggregated-recon-orbstack.sh
   smoke-suspicious-detection-aggregation-orbstack.sh
   smoke-suspicious-openapi-aggregation-orbstack.sh
+  smoke-suspicious-linked-bait-aggregation-orbstack.sh
   smoke-suspicious-openapi-orbstack.sh
   smoke-suspicious-discovery-fanout-orbstack.sh
   smoke-suspicious-rate-limit-orbstack.sh
@@ -256,6 +257,7 @@ examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
 examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-linked-bait-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
@@ -292,13 +294,22 @@ first contact through the known legacy discovery query plus ordinary query
 presence, and is served from the stronger owned OpenAPI surface without
 depending on edge-provided detection IDs.
 
-The fifth smoke proves the next `#175` slice on `/openapi.json`: one
+A companion linked-bait aggregation smoke proves the next target-side-only
+aggregated `observe -> suspicious` path: one medium-score query-bearing
+`/docs` discovery request stays in `observe`, but the same session's
+follow-up probe into `/docs/legacy-import` reaches the threshold through the
+earlier query-bearing recon plus the linked bait-surface request itself,
+without depending on edge-provided detection IDs and without treating the
+follow-up as a confirmed bait-derived action.
+
+A dedicated OpenAPI suspicious smoke proves the next `#175` slice on
+`/openapi.json`: one
 authenticated advisory OpenAPI discovery request is promoted from `observe` to
 `suspicious`, is served from an Eidolon-owned OpenAPI surface instead of a
 rewritten upstream schema, and exports the same
 `preserve_eidolon_routing` recommendation.
 
-The sixth smoke proves the first session-recon promotion slice: one session
+A separate fanout smoke proves the first session-recon promotion slice: one session
 first requests `/docs` and then `/openapi.json`, gets promoted from `observe`
 to `suspicious` on the second request because it fanned out across both
 discovery surfaces, and is then served from the owned OpenAPI path with the

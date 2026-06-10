@@ -30,6 +30,8 @@ pub struct SessionPolicyRecord {
     pub discovery_query_seen: bool,
     #[serde(default)]
     pub discovery_legacy_openapi_query_seen: bool,
+    #[serde(default)]
+    pub discovery_linked_bait_surface_seen: bool,
 }
 
 impl SessionPolicyRecord {
@@ -42,6 +44,7 @@ impl SessionPolicyRecord {
             discovery_request_count: 0,
             discovery_query_seen: false,
             discovery_legacy_openapi_query_seen: false,
+            discovery_linked_bait_surface_seen: false,
         }
     }
 }
@@ -74,6 +77,8 @@ struct StoredSessionPolicy {
     discovery_query_seen: bool,
     #[serde(default)]
     discovery_legacy_openapi_query_seen: bool,
+    #[serde(default)]
+    discovery_linked_bait_surface_seen: bool,
 }
 
 impl PolicyStateStore {
@@ -175,6 +180,24 @@ impl PolicyStateStore {
             request_count: record.discovery_request_count,
             query_seen: record.discovery_query_seen,
             legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
+            linked_bait_surface_seen: record.discovery_linked_bait_surface_seen,
+        })
+    }
+
+    pub fn note_linked_bait_surface_request(
+        &mut self,
+        session_id: SessionId,
+    ) -> io::Result<crate::policy::DiscoveryReconState> {
+        let mut record = self.record(session_id);
+        record.discovery_linked_bait_surface_seen = true;
+        self.records.insert(session_id, record);
+        self.persist()?;
+        Ok(crate::policy::DiscoveryReconState {
+            fanout: record.discovery_surface_fanout,
+            request_count: record.discovery_request_count,
+            query_seen: record.discovery_query_seen,
+            legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
+            linked_bait_surface_seen: record.discovery_linked_bait_surface_seen,
         })
     }
 
@@ -195,6 +218,7 @@ impl PolicyStateStore {
                 discovery_request_count: record.discovery_request_count,
                 discovery_query_seen: record.discovery_query_seen,
                 discovery_legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
+                discovery_linked_bait_surface_seen: record.discovery_linked_bait_surface_seen,
             })
             .collect();
         sessions.sort_by_key(|record| record.session_id.0);
@@ -269,6 +293,7 @@ fn deserialize_records(
                     discovery_query_seen: session.discovery_query_seen,
                     discovery_legacy_openapi_query_seen: session
                         .discovery_legacy_openapi_query_seen,
+                    discovery_linked_bait_surface_seen: session.discovery_linked_bait_surface_seen,
                 },
             )
         })
@@ -493,6 +518,23 @@ mod tests {
                 request_count: 1,
                 query_seen: true,
                 legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: false,
+            }
+        );
+        assert_eq!(
+            must_ok(
+                store.note_linked_bait_surface_request(session_id),
+                "linked bait surface should persist"
+            ),
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: true,
             }
         );
         assert_eq!(
@@ -513,6 +555,7 @@ mod tests {
                 request_count: 2,
                 query_seen: true,
                 legacy_openapi_query_seen: true,
+                linked_bait_surface_seen: true,
             }
         );
 
@@ -530,6 +573,11 @@ mod tests {
             reopened
                 .record(session_id)
                 .discovery_legacy_openapi_query_seen
+        );
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_linked_bait_surface_seen
         );
     }
 
@@ -555,6 +603,11 @@ mod tests {
             !reopened
                 .record(session_id)
                 .discovery_legacy_openapi_query_seen
+        );
+        assert!(
+            !reopened
+                .record(session_id)
+                .discovery_linked_bait_surface_seen
         );
     }
 }
