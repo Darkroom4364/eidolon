@@ -1996,6 +1996,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 discovery_recon_state.linked_bait_surface_classes,
             "discovery_decoy_write_probe_seen":
                 discovery_recon_state.decoy_write_probe_seen,
+            "discovery_decoy_write_probe_count":
+                discovery_recon_state.decoy_write_probe_count,
             "discovery_recon_score": {
                 "repeated_discovery_score": discovery_recon_score.repeated_discovery_score,
                 "query_score": discovery_recon_score.query_score,
@@ -2975,7 +2977,8 @@ fn update_discovery_recon_state_for_request(
         linked_bait_surface_classes: record
             .discovery_linked_bait_surface_fanout
             .distinct_surface_count(),
-        decoy_write_probe_seen: record.discovery_decoy_write_probe_seen,
+        decoy_write_probe_seen: record.discovery_decoy_write_probe_count > 0,
+        decoy_write_probe_count: record.discovery_decoy_write_probe_count,
     })
 }
 
@@ -7164,12 +7167,207 @@ mod tests {
             true
         );
         assert_eq!(
+            request_debugs[1]["fields"]["discovery_decoy_write_probe_count"],
+            1
+        );
+        assert_eq!(
             request_debugs[1]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
             2
         );
         assert_eq!(
             request_debugs[1]["fields"]["discovery_recon_score"]["total"],
             3
+        );
+    }
+
+    #[test]
+    fn runtime_repeated_blind_decoy_write_probes_add_a_capped_bonus_without_bait_attribution() {
+        let event_log_path = unique_temp_path("aggregated-decoy-write-repeat-bonus-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-decoy-write-repeat-bonus-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream_sequence([
+            html_response(original),
+            json_response(r#"{"mode":"upstream"}"#),
+            json_response(r#"{"mode":"upstream"}"#),
+        ]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-decoy-write-repeat-bonus-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+        let fourth_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 200);
+        assert_eq!(fourth_response.status, 429);
+        assert_eq!(header_values(&fourth_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 4);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(request_events[2]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["total"],
+            4
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["threshold"],
+            3
+        );
+        assert_eq!(request_events[3]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_events[3]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["total"],
+            6
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 2);
+        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
+        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
+        assert!(policy_changes[0]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=1")));
+        assert!(policy_changes[0]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+        assert_eq!(policy_changes[1]["kind"]["from"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["to"], "rate_limited");
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=3")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=6")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 4);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_decoy_write_probe_count"],
+            1
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["path"],
+            "/api/v2/import/reconcile"
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_count"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            4
+        );
+        assert_eq!(request_debugs[3]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(request_debugs[3]["fields"]["path"], "/docs");
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_decoy_write_probe_count"],
+            2
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["total"],
+            6
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["threshold"],
+            5
         );
     }
 
@@ -7878,7 +8076,7 @@ mod tests {
         assert_eq!(surface_debugs[2]["fields"]["policy_state"], "blocked");
         assert_eq!(
             surface_debugs[2]["fields"]["policy_reason"],
-            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 detection_score=0 recon_score=5 recon_block_threshold=5"
+            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 detection_score=0 recon_score=5 recon_block_threshold=5"
         );
         assert_eq!(
             surface_debugs[2]["fields"]["surface_action"]["type"],

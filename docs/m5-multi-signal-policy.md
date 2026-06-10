@@ -157,6 +157,11 @@ The current M5 slice is intentionally narrow:
   request plus a same-session unsafe probe to `/api/v2/import/reconcile`
   without a bait header can still accumulate into a later throttled
   top-level-discovery follow-up
+- that blind decoy-write contributor is no longer a seen/not-seen bit; it is
+  now tracked as a small capped count, so a second same-session unsafe probe
+  raises the decoy-write recon component from `2` to `3` without creating
+  `bait_action_observed`, and the stronger score is visible in the same later
+  top-level discovery rate-limit path
 - one adjacent `rate_limited -> blocked` path now exists for repeating that
   same medium-score top-level discovery churn again after Eidolon has already
   throttled the session once, keeping the hard-fail tied to explicit
