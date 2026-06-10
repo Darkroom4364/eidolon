@@ -63,6 +63,7 @@ Keep out of the private repo:
   smoke-suspicious-promotion-orbstack.sh
   smoke-suspicious-aggregated-recon-orbstack.sh
   smoke-suspicious-detection-aggregation-orbstack.sh
+  smoke-suspicious-openapi-aggregation-orbstack.sh
   smoke-suspicious-openapi-orbstack.sh
   smoke-suspicious-discovery-fanout-orbstack.sh
   smoke-suspicious-rate-limit-orbstack.sh
@@ -254,6 +255,7 @@ examples/shield-lab/smoke-trusted-ingress-orbstack.sh
 examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
 examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
@@ -282,6 +284,13 @@ The fourth smoke proves the first advisory-assisted aggregated
 discovery request carries detection IDs from the trusted edge adapter, reaches
 the multi-signal threshold on first contact, and is served from the stronger
 owned docs surface.
+
+An adjacent OpenAPI aggregation smoke proves the first target-side-only
+aggregated `observe -> suspicious` path: one medium-score
+`/openapi.json?eidolon_surface=legacy-import` request reaches the threshold on
+first contact through the known legacy discovery query plus ordinary query
+presence, and is served from the stronger owned OpenAPI surface without
+depending on edge-provided detection IDs.
 
 The fifth smoke proves the next `#175` slice on `/openapi.json`: one
 authenticated advisory OpenAPI discovery request is promoted from `observe` to

@@ -28,6 +28,8 @@ pub struct SessionPolicyRecord {
     pub discovery_request_count: u32,
     #[serde(default)]
     pub discovery_query_seen: bool,
+    #[serde(default)]
+    pub discovery_legacy_openapi_query_seen: bool,
 }
 
 impl SessionPolicyRecord {
@@ -39,6 +41,7 @@ impl SessionPolicyRecord {
             discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout::default(),
             discovery_request_count: 0,
             discovery_query_seen: false,
+            discovery_legacy_openapi_query_seen: false,
         }
     }
 }
@@ -69,6 +72,8 @@ struct StoredSessionPolicy {
     discovery_request_count: u32,
     #[serde(default)]
     discovery_query_seen: bool,
+    #[serde(default)]
+    discovery_legacy_openapi_query_seen: bool,
 }
 
 impl PolicyStateStore {
@@ -156,17 +161,20 @@ impl PolicyStateStore {
         session_id: SessionId,
         kind: crate::policy::DiscoverySurfaceKind,
         query_present: bool,
+        legacy_openapi_query_seen: bool,
     ) -> io::Result<crate::policy::DiscoveryReconState> {
         let mut record = self.record(session_id);
         record.discovery_surface_fanout = record.discovery_surface_fanout.mark(kind);
         record.discovery_request_count = record.discovery_request_count.saturating_add(1);
         record.discovery_query_seen |= query_present;
+        record.discovery_legacy_openapi_query_seen |= legacy_openapi_query_seen;
         self.records.insert(session_id, record);
         self.persist()?;
         Ok(crate::policy::DiscoveryReconState {
             fanout: record.discovery_surface_fanout,
             request_count: record.discovery_request_count,
             query_seen: record.discovery_query_seen,
+            legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
         })
     }
 
@@ -186,6 +194,7 @@ impl PolicyStateStore {
                 discovery_surface_fanout: record.discovery_surface_fanout,
                 discovery_request_count: record.discovery_request_count,
                 discovery_query_seen: record.discovery_query_seen,
+                discovery_legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
             })
             .collect();
         sessions.sort_by_key(|record| record.session_id.0);
@@ -258,6 +267,8 @@ fn deserialize_records(
                     discovery_surface_fanout: session.discovery_surface_fanout,
                     discovery_request_count: session.discovery_request_count,
                     discovery_query_seen: session.discovery_query_seen,
+                    discovery_legacy_openapi_query_seen: session
+                        .discovery_legacy_openapi_query_seen,
                 },
             )
         })
@@ -470,6 +481,7 @@ mod tests {
                     session_id,
                     crate::policy::DiscoverySurfaceKind::Docs,
                     true,
+                    false,
                 ),
                 "docs should persist"
             ),
@@ -480,6 +492,7 @@ mod tests {
                 },
                 request_count: 1,
                 query_seen: true,
+                legacy_openapi_query_seen: false,
             }
         );
         assert_eq!(
@@ -487,7 +500,8 @@ mod tests {
                 store.note_discovery_surface_request(
                     session_id,
                     crate::policy::DiscoverySurfaceKind::OpenApi,
-                    false,
+                    true,
+                    true,
                 ),
                 "openapi should persist"
             ),
@@ -498,6 +512,7 @@ mod tests {
                 },
                 request_count: 2,
                 query_seen: true,
+                legacy_openapi_query_seen: true,
             }
         );
 
@@ -511,6 +526,11 @@ mod tests {
         );
         assert_eq!(reopened.record(session_id).discovery_request_count, 2);
         assert!(reopened.record(session_id).discovery_query_seen);
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_legacy_openapi_query_seen
+        );
     }
 
     #[test]
@@ -531,5 +551,10 @@ mod tests {
         assert_eq!(reopened.record(session_id).reality_escape_attempt_count, 0);
         assert_eq!(reopened.record(session_id).discovery_request_count, 0);
         assert!(!reopened.record(session_id).discovery_query_seen);
+        assert!(
+            !reopened
+                .record(session_id)
+                .discovery_legacy_openapi_query_seen
+        );
     }
 }

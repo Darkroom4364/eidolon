@@ -1437,6 +1437,12 @@ fn is_openapi_discovery_request(request: &SurfaceRequestMeta, bait: &Bait) -> bo
         )
 }
 
+fn is_legacy_openapi_discovery_query(request: &SurfaceRequestMeta) -> bool {
+    request.method == "GET"
+        && request.path == OPENAPI_DISCOVERY_TARGET
+        && request.query.as_deref() == Some(LEGACY_IMPORT_OPENAPI_QUERY)
+}
+
 fn discovery_surface_kind(
     runtime: &ProxyRuntime,
     request: &SurfaceRequestMeta,
@@ -1870,6 +1876,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 debug_discovery_surface_fanout(discovery_recon_state.fanout),
             "discovery_request_count": discovery_recon_state.request_count,
             "discovery_query_seen": discovery_recon_state.query_seen,
+            "discovery_legacy_openapi_query_seen":
+                discovery_recon_state.legacy_openapi_query_seen,
             "policy_state": policy_state,
             "intervention_mode": debug_intervention_mode(intervention_mode),
         }),
@@ -2771,10 +2779,16 @@ fn update_discovery_recon_state_for_request(
             fanout: record.discovery_surface_fanout,
             request_count: record.discovery_request_count,
             query_seen: record.discovery_query_seen,
+            legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
         });
     };
 
-    store.note_discovery_surface_request(session_id, kind, request.query.is_some())
+    store.note_discovery_surface_request(
+        session_id,
+        kind,
+        request.query.is_some(),
+        is_legacy_openapi_discovery_query(request),
+    )
 }
 
 fn controlled_reality_action(
@@ -6523,6 +6537,10 @@ mod tests {
         assert_eq!(request_debugs.len(), 2);
         assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 2);
         assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_legacy_openapi_query_seen"],
+            false
+        );
         assert_eq!(request_debugs[1]["fields"]["query_present"], false);
         assert_eq!(
             request_debugs[1]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
@@ -6614,6 +6632,10 @@ mod tests {
         assert_eq!(request_debug["fields"]["discovery_request_count"], 1);
         assert_eq!(request_debug["fields"]["discovery_query_seen"], true);
         assert_eq!(
+            request_debug["fields"]["discovery_legacy_openapi_query_seen"],
+            false
+        );
+        assert_eq!(
             request_debug["fields"]["ingress_signals"]["detection_ids"][0],
             "3355446"
         );
@@ -6628,6 +6650,92 @@ mod tests {
             "eidolon_owned"
         );
         assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_legacy_openapi_query_to_suspicious() {
+        let event_log_path = unique_temp_path("aggregated-openapi-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-openapi-suspicious-debug.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, _upstream_handle) = spawn_upstream(json_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-openapi-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/openapi.json?eidolon_surface=legacy-import",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+                    (
+                        session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                        "automation_likelihood_inverse",
+                    ),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        let body = must_ok(String::from_utf8(response.body), "body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert!(body.contains("X-OpenAPI-Trace"));
+        assert!(body.contains("/api/v2/import/reconcile"));
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["policy_state"], "suspicious");
+        assert_eq!(request_event["kind"]["routing_decision"], "eidolon_owned");
+        assert_eq!(request_event["kind"]["ingress_signals"]["vendor_score"], 35);
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=0")));
+
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(request_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(request_debug["fields"]["path"], "/openapi.json");
+        assert_eq!(request_debug["fields"]["query_present"], true);
+        assert_eq!(request_debug["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debug["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debug["fields"]["discovery_legacy_openapi_query_seen"],
+            true
+        );
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
+        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
     }
 
     #[test]

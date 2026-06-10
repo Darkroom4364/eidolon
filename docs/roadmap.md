@@ -289,6 +289,8 @@ Status checklist:
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs
   (`current branch only`)
+- [x] First target-side-only aggregated suspicious-promotion path exists for
+  medium-score legacy-query OpenAPI discovery (`current branch only`)
 - [x] Same-session discovery fanout promotion across `/docs` and
   `/openapi.json` exists (`current branch only`)
 - [x] `suspicious -> rate_limited` exists for same-bait near misses

@@ -37,6 +37,7 @@ pub struct DiscoveryReconState {
     pub fanout: DiscoverySurfaceFanout,
     pub request_count: u32,
     pub query_seen: bool,
+    pub legacy_openapi_query_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +276,7 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
     let repeated_discovery = recon_state.request_count >= 2;
     let weak_signal_count = u8::from(repeated_discovery)
         + u8::from(recon_state.query_seen)
+        + u8::from(recon_state.legacy_openapi_query_seen)
         + u8::from(detection_signal);
     if weak_signal_count < DISCOVERY_RECON_AGGREGATION_MIN_WEAK_SIGNALS {
         return None;
@@ -284,11 +286,12 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
         current_state,
         PolicyState::Suspicious,
         format!(
-            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} detection_count={detection_count} weak_signals={weak_signal_count}",
+            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} detection_count={detection_count} weak_signals={weak_signal_count}",
             snake_case_actor_kind(ingress_signals.actor_kind),
             recon_state.request_count,
             recon_state.fanout.distinct_surface_count(),
             recon_state.query_seen,
+            recon_state.legacy_openapi_query_seen,
         ),
     ))
 }
@@ -801,6 +804,7 @@ mod tests {
                 },
                 request_count: 2,
                 query_seen: true,
+                legacy_openapi_query_seen: false,
             },
         ) else {
             panic!("aggregated discovery recon should transition to suspicious");
@@ -814,6 +818,9 @@ mod tests {
         assert!(transition.reason.contains("vendor_score=35"));
         assert!(transition.reason.contains("discovery_requests=2"));
         assert!(transition.reason.contains("query_seen=true"));
+        assert!(transition
+            .reason
+            .contains("legacy_openapi_query_seen=false"));
         assert!(transition.reason.contains("detection_count=0"));
         assert!(transition.reason.contains("weak_signals=2"));
     }
@@ -838,6 +845,7 @@ mod tests {
                 },
                 request_count: 1,
                 query_seen: true,
+                legacy_openapi_query_seen: false,
             },
         );
         let no_query_signal = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -858,6 +866,7 @@ mod tests {
                 },
                 request_count: 2,
                 query_seen: false,
+                legacy_openapi_query_seen: false,
             },
         );
         let stronger_direct_score = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -878,6 +887,7 @@ mod tests {
                 },
                 request_count: 2,
                 query_seen: true,
+                legacy_openapi_query_seen: false,
             },
         );
         let trusted = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -902,6 +912,7 @@ mod tests {
                 },
                 request_count: 2,
                 query_seen: true,
+                legacy_openapi_query_seen: false,
             },
         );
 
@@ -932,6 +943,7 @@ mod tests {
                 },
                 request_count: 1,
                 query_seen: true,
+                legacy_openapi_query_seen: false,
             },
         ) else {
             panic!("detection-backed aggregated discovery recon should transition to suspicious");
@@ -941,7 +953,47 @@ mod tests {
         assert_eq!(transition.to, PolicyState::Suspicious);
         assert!(transition.reason.contains("discovery_requests=1"));
         assert!(transition.reason.contains("query_seen=true"));
+        assert!(transition
+            .reason
+            .contains("legacy_openapi_query_seen=false"));
         assert!(transition.reason.contains("detection_count=2"));
+        assert!(transition.reason.contains("weak_signals=2"));
+    }
+
+    #[test]
+    fn aggregated_discovery_recon_legacy_openapi_query_allows_first_request_promotion() {
+        let Some(transition) = transition_to_suspicious_from_aggregated_discovery_recon(
+            PolicyState::Observe,
+            "/openapi.json",
+            &["/docs".to_string(), "/openapi.json".to_string()],
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: false,
+                    openapi_seen: true,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: true,
+            },
+        ) else {
+            panic!(
+                "legacy-openapi-query aggregated discovery recon should transition to suspicious"
+            );
+        };
+
+        assert_eq!(transition.from, PolicyState::Observe);
+        assert_eq!(transition.to, PolicyState::Suspicious);
+        assert!(transition.reason.contains("discovery_requests=1"));
+        assert!(transition.reason.contains("query_seen=true"));
+        assert!(transition.reason.contains("legacy_openapi_query_seen=true"));
+        assert!(transition.reason.contains("detection_count=0"));
         assert!(transition.reason.contains("weak_signals=2"));
     }
 
