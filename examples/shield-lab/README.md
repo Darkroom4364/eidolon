@@ -275,6 +275,7 @@ examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
 examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-rate-limited-decoy-write-recon-blocked-orbstack.sh
 examples/shield-lab/smoke-rate-limited-recon-blocked-orbstack.sh
 examples/shield-lab/smoke-rate-limited-blocked-orbstack.sh
 examples/shield-lab/smoke-rate-limited-controlled-reality-orbstack.sh
@@ -307,6 +308,13 @@ contributor also feeds the next rung up: after the blind probe has already
 promoted the session to `suspicious`, one same-session top-level `/docs`
 follow-up now reaches the weighted recon threshold for `rate_limited` without
 requiring any exact bait-derived action.
+
+The adjacent decoy-write recon-blocked smoke proves that the same non-discovery
+contributor carries one rung further too: after Eidolon has already throttled
+that session once from weighted recon churn, repeating the same top-level
+discovery retry now moves the session into `blocked` while still preserving the
+important invariant that the blind probe created no `bait_action_observed`
+evidence.
 
 The fourth smoke proves the first advisory-assisted aggregated
 `observe -> suspicious` path: one query-bearing medium-score authenticated

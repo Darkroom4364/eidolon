@@ -160,7 +160,12 @@ The current M5 slice is intentionally narrow:
 - one adjacent `rate_limited -> blocked` path now exists for repeating that
   same medium-score top-level discovery churn again after Eidolon has already
   throttled the session once, keeping the hard-fail tied to explicit
-  persistence before any bait-derived action is confirmed
+  persistence before any bait-derived action is confirmed; that blocked retry
+  rung is now also proven with the blind decoy-write contributor in the score,
+  so the same session can move from one query-bearing discovery request, to an
+  unattributed unsafe probe, to `rate_limited`, and then to `blocked` on a
+  repeated top-level discovery retry without creating `bait_action_observed`
+  evidence
 - one adjacent aggregated `observe -> suspicious` path now exists for one
   query-bearing medium-score authenticated discovery request when authenticated
   detection IDs also contribute, so multiple weak advisory and recon facts can

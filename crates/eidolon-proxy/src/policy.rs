@@ -1188,6 +1188,54 @@ mod tests {
     }
 
     #[test]
+    fn repeated_discovery_recon_block_allows_blind_decoy_write_probe_contributor() {
+        let Some(transition) = transition_to_blocked_from_repeated_discovery_recon(
+            PolicyState::RateLimited,
+            "/docs",
+            true,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 3,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: true,
+            },
+        ) else {
+            panic!("rate-limited discovery recon retry should transition to blocked");
+        };
+
+        assert_eq!(transition.from, PolicyState::RateLimited);
+        assert_eq!(transition.to, PolicyState::Blocked);
+        assert!(transition
+            .reason
+            .contains(DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX));
+        assert!(transition.reason.contains("path=/docs"));
+        assert!(transition.reason.contains("vendor_score=35"));
+        assert!(transition.reason.contains("discovery_requests=3"));
+        assert!(transition.reason.contains("distinct_surfaces=1"));
+        assert!(transition.reason.contains("query_seen=true"));
+        assert!(transition.reason.contains("decoy_write_probe_seen=true"));
+        assert!(transition.reason.contains("detection_count=0"));
+        assert!(transition.reason.contains("repeated_discovery_score=2"));
+        assert!(transition.reason.contains("query_score=1"));
+        assert!(transition.reason.contains("decoy_write_probe_score=2"));
+        assert!(transition.reason.contains("recon_score=5"));
+        assert!(transition.reason.contains("recon_block_threshold=5"));
+    }
+
+    #[test]
     fn repeated_discovery_recon_block_requires_rate_limited_top_level_path_and_higher_score() {
         let no_top_level = transition_to_blocked_from_repeated_discovery_recon(
             PolicyState::RateLimited,
