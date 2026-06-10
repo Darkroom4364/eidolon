@@ -66,6 +66,7 @@ Keep out of the private repo:
   smoke-suspicious-openapi-aggregation-orbstack.sh
   smoke-suspicious-linked-bait-aggregation-orbstack.sh
   smoke-suspicious-hidden-route-aggregation-orbstack.sh
+  smoke-suspicious-js-helper-aggregation-orbstack.sh
   smoke-suspicious-openapi-orbstack.sh
   smoke-suspicious-discovery-fanout-orbstack.sh
   smoke-suspicious-rate-limit-orbstack.sh
@@ -309,6 +310,12 @@ top-level `/docs` and `/openapi.json` prefixes: one medium-score query-bearing
 probe into `/customer/import-recovery-checklist` now reaches the threshold
 through the earlier query-bearing recon plus the linked bait-surface request
 itself.
+
+A JS-helper aggregation smoke proves the same path for asset-linked discovery:
+one medium-score query-bearing `/docs` discovery request stays in `observe`,
+but the same session's follow-up probe into `/assets/import-helper.js` now
+reaches the threshold through the earlier query-bearing recon plus the linked
+helper asset request itself.
 
 A dedicated OpenAPI suspicious smoke proves the next `#175` slice on
 `/openapi.json`: one
