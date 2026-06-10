@@ -32,6 +32,8 @@ pub struct SessionPolicyRecord {
     pub discovery_legacy_openapi_query_seen: bool,
     #[serde(default)]
     pub discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout,
+    #[serde(default)]
+    pub discovery_decoy_write_probe_seen: bool,
 }
 
 impl SessionPolicyRecord {
@@ -45,6 +47,7 @@ impl SessionPolicyRecord {
             discovery_query_seen: false,
             discovery_legacy_openapi_query_seen: false,
             discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout::default(),
+            discovery_decoy_write_probe_seen: false,
         }
     }
 }
@@ -79,6 +82,8 @@ struct StoredSessionPolicy {
     discovery_legacy_openapi_query_seen: bool,
     #[serde(default)]
     discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout,
+    #[serde(default)]
+    discovery_decoy_write_probe_seen: bool,
     #[serde(default, skip_serializing)]
     discovery_linked_bait_surface_seen: bool,
 }
@@ -193,6 +198,17 @@ impl PolicyStateStore {
         Ok(discovery_recon_state(record))
     }
 
+    pub fn note_decoy_write_probe(
+        &mut self,
+        session_id: SessionId,
+    ) -> io::Result<crate::policy::DiscoveryReconState> {
+        let mut record = self.record(session_id);
+        record.discovery_decoy_write_probe_seen = true;
+        self.records.insert(session_id, record);
+        self.persist()?;
+        Ok(discovery_recon_state(record))
+    }
+
     fn persist(&self) -> io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -211,6 +227,7 @@ impl PolicyStateStore {
                 discovery_query_seen: record.discovery_query_seen,
                 discovery_legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
                 discovery_linked_bait_surface_fanout: record.discovery_linked_bait_surface_fanout,
+                discovery_decoy_write_probe_seen: record.discovery_decoy_write_probe_seen,
                 discovery_linked_bait_surface_seen: false,
             })
             .collect();
@@ -257,6 +274,7 @@ fn discovery_recon_state(record: SessionPolicyRecord) -> crate::policy::Discover
         linked_bait_surface_classes: record
             .discovery_linked_bait_surface_fanout
             .distinct_surface_count(),
+        decoy_write_probe_seen: record.discovery_decoy_write_probe_seen,
     }
 }
 
@@ -310,6 +328,7 @@ fn deserialize_records(
                     discovery_legacy_openapi_query_seen: session
                         .discovery_legacy_openapi_query_seen,
                     discovery_linked_bait_surface_fanout: linked_bait_surface_fanout,
+                    discovery_decoy_write_probe_seen: session.discovery_decoy_write_probe_seen,
                 },
             )
         })
@@ -536,6 +555,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             }
         );
         assert_eq!(
@@ -556,6 +576,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
                 linked_bait_surface_classes: 1,
+                decoy_write_probe_seen: false,
             }
         );
         assert_eq!(
@@ -576,6 +597,25 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
                 linked_bait_surface_classes: 2,
+                decoy_write_probe_seen: false,
+            }
+        );
+        assert_eq!(
+            must_ok(
+                store.note_decoy_write_probe(session_id),
+                "blind decoy write probe should persist"
+            ),
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 2,
+                decoy_write_probe_seen: true,
             }
         );
         assert_eq!(
@@ -598,6 +638,7 @@ mod tests {
                 legacy_openapi_query_seen: true,
                 linked_bait_surface_seen: true,
                 linked_bait_surface_classes: 2,
+                decoy_write_probe_seen: true,
             }
         );
 
@@ -628,6 +669,7 @@ mod tests {
                 .discovery_linked_bait_surface_fanout
                 .assets_seen
         );
+        assert!(reopened.record(session_id).discovery_decoy_write_probe_seen);
     }
 
     #[test]
@@ -653,6 +695,7 @@ mod tests {
                 .record(session_id)
                 .discovery_legacy_openapi_query_seen
         );
+        assert!(!reopened.record(session_id).discovery_decoy_write_probe_seen);
         assert!(!reopened
             .record(session_id)
             .discovery_linked_bait_surface_fanout

@@ -261,6 +261,7 @@ Validate those ingress-side runtime paths directly on the live OrbStack shield:
 examples/shield-lab/smoke-trusted-ingress-orbstack.sh
 examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
 examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
+examples/shield-lab/smoke-suspicious-decoy-write-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-linked-bait-aggregation-orbstack.sh
@@ -292,6 +293,13 @@ slice: a medium-score authenticated agentic discovery request stays in
 discovery recon, a second same-session discovery request moves into
 `suspicious` through multi-signal aggregation and serves the stronger owned
 docs surface.
+
+The adjacent blind-decoy-write smoke proves that the same weighted recon plane
+can now use one non-discovery contributor too: after a medium-score
+query-bearing docs request, a same-session unsafe probe to
+`/api/v2/import/reconcile` without any expected bait header can move the
+session into `suspicious`, while still preserving the important invariant that
+no `bait_action_observed` evidence is recorded for that probe.
 
 The fourth smoke proves the first advisory-assisted aggregated
 `observe -> suspicious` path: one query-bearing medium-score authenticated

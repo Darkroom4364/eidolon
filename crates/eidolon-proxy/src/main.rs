@@ -20,7 +20,7 @@ use eidolon_core::{
 };
 use eidolon_proxy::{
     controlled_reality::{
-        rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
+        is_decoy_write, rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
         DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
         MAX_TARPIT_DELAY,
     },
@@ -1467,12 +1467,29 @@ fn linked_bait_surface_kind(
         })
 }
 
+fn is_blind_decoy_write_probe(runtime: &ProxyRuntime, request: &SurfaceRequestMeta) -> bool {
+    if !is_decoy_write(request) {
+        return false;
+    }
+
+    let headers: Vec<(&str, &str)> = surface_header_pairs(&request.headers).collect();
+    runtime
+        .bait_registry
+        .match_action(&request.method, &request.path, headers.iter().copied())
+        .is_none()
+        && runtime
+            .bait_registry
+            .match_action_shape(&request.method, &request.path, headers.iter().copied())
+            .is_none()
+}
+
 fn is_aggregated_discovery_recon_candidate_request(
     runtime: &ProxyRuntime,
     request: &SurfaceRequestMeta,
 ) -> bool {
     discovery_surface_kind(runtime, request).is_some()
         || linked_bait_surface_kind(runtime, request).is_some()
+        || is_blind_decoy_write_probe(runtime, request)
 }
 
 fn discovery_surface_kind(
@@ -1977,6 +1994,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 discovery_recon_state.linked_bait_surface_seen,
             "discovery_linked_bait_surface_classes":
                 discovery_recon_state.linked_bait_surface_classes,
+            "discovery_decoy_write_probe_seen":
+                discovery_recon_state.decoy_write_probe_seen,
             "discovery_recon_score": {
                 "repeated_discovery_score": discovery_recon_score.repeated_discovery_score,
                 "query_score": discovery_recon_score.query_score,
@@ -1986,6 +2005,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     discovery_recon_score.linked_bait_surface_score,
                 "linked_bait_class_fanout_bonus":
                     discovery_recon_score.linked_bait_class_fanout_bonus,
+                "decoy_write_probe_score":
+                    discovery_recon_score.decoy_write_probe_score,
                 "detection_score": discovery_recon_score.detection_score,
                 "total": discovery_recon_score.total,
                 "threshold": discovery_recon_threshold,
@@ -2940,6 +2961,10 @@ fn update_discovery_recon_state_for_request(
         return store.note_linked_bait_surface_request(session_id, kind);
     }
 
+    if is_blind_decoy_write_probe(runtime, request) {
+        return store.note_decoy_write_probe(session_id);
+    }
+
     let record = store.record(session_id);
     Ok(policy::DiscoveryReconState {
         fanout: record.discovery_surface_fanout,
@@ -2950,6 +2975,7 @@ fn update_discovery_recon_state_for_request(
         linked_bait_surface_classes: record
             .discovery_linked_bait_surface_fanout
             .distinct_surface_count(),
+        decoy_write_probe_seen: record.discovery_decoy_write_probe_seen,
     })
 }
 
@@ -3276,6 +3302,12 @@ fn bait_action_synthetic_response() -> HttpResponse {
     surface_response_to_http(surface_text_response(202, "accepted\n"))
 }
 
+fn surface_header_pairs(headers: &[SurfaceHeader]) -> impl Iterator<Item = (&str, &str)> {
+    headers
+        .iter()
+        .map(|header| (header.name.as_str(), header.value.as_str()))
+}
+
 fn header_pairs(headers: &[HttpHeader]) -> impl Iterator<Item = (&str, &str)> {
     headers
         .iter()
@@ -3410,6 +3442,7 @@ fn event_discovery_recon_score(
         legacy_openapi_query_score: score.legacy_openapi_query_score,
         linked_bait_surface_score: score.linked_bait_surface_score,
         linked_bait_class_fanout_bonus: score.linked_bait_class_fanout_bonus,
+        decoy_write_probe_score: score.decoy_write_probe_score,
         detection_score: score.detection_score,
         total: score.total,
         threshold,
@@ -4756,6 +4789,49 @@ mod tests {
                 .expect("upstream response should write");
             stream.flush().expect("upstream response should flush");
             request
+        });
+        let upstream = must_ok(
+            parse_upstream(&format!("http://{addr}"), false),
+            "upstream target should parse",
+        );
+
+        (upstream, handle)
+    }
+
+    fn spawn_upstream_sequence(
+        responses: impl IntoIterator<Item = Vec<u8>>,
+    ) -> (UpstreamTarget, JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("upstream should bind");
+        let addr = listener.local_addr().expect("upstream should have address");
+        let responses: Vec<Vec<u8>> = responses.into_iter().collect();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::with_capacity(responses.len());
+
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("upstream should accept");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+
+                loop {
+                    let bytes_read = stream.read(&mut chunk).expect("upstream request read");
+                    if bytes_read == 0 {
+                        break;
+                    }
+
+                    request.extend_from_slice(&chunk[..bytes_read]);
+                    if find_header_end(&request).is_some() {
+                        break;
+                    }
+                }
+
+                stream
+                    .write_all(&response)
+                    .expect("upstream response should write");
+                stream.flush().expect("upstream response should flush");
+                requests.push(request);
+            }
+
+            requests
         });
         let upstream = must_ok(
             parse_upstream(&format!("http://{addr}"), false),
@@ -6983,6 +7059,121 @@ mod tests {
     }
 
     #[test]
+    fn runtime_aggregates_medium_score_blind_decoy_write_probe_to_suspicious_without_bait_attribution(
+    ) {
+        let event_log_path = unique_temp_path("aggregated-decoy-write-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-decoy-write-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) =
+            spawn_upstream_sequence([html_response(original), html_response(original)]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-decoy-write-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["threshold"],
+            3
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/api/v2/import/reconcile")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(
+            request_debugs[1]["fields"]["path"],
+            "/api/v2/import/reconcile"
+        );
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_decoy_write_probe_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["total"],
+            3
+        );
+    }
+
+    #[test]
     fn runtime_rate_limits_suspicious_legacy_openapi_recon_persistence() {
         let event_log_path = unique_temp_path("aggregated-openapi-rate-limit-events.jsonl");
         let debug_log_path = unique_temp_path("aggregated-openapi-rate-limit-debug.jsonl");
@@ -7290,7 +7481,7 @@ mod tests {
         assert_eq!(surface_debugs[2]["fields"]["policy_state"], "blocked");
         assert_eq!(
             surface_debugs[2]["fields"]["policy_reason"],
-            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5"
+            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 detection_score=0 recon_score=5 recon_block_threshold=5"
         );
         assert_eq!(
             surface_debugs[2]["fields"]["surface_action"]["type"],

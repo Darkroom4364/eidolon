@@ -143,6 +143,11 @@ The current M5 slice is intentionally narrow:
 - that weighted recon score now rides in `request_seen` audit events and edge
   export as structured `discovery_recon_score` fields, so operators do not need
   to recover it from debug logs or freeform policy reasons
+- one adjacent target-side aggregated `observe -> suspicious` path now exists
+  for one medium-score query-bearing docs request plus a blind unsafe probe to
+  `/api/v2/import/reconcile` without any expected bait header, so known decoy
+  write-path interest contributes as weak recon without creating
+  `bait_action_observed` evidence
 - that weighted recon score now has a first conservative higher-threshold use
   above promotion: an already-`suspicious` medium-score top-level discovery
   follow-up moves to `rate_limited` once the structured recon score reaches `5`

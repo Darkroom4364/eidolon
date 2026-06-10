@@ -41,6 +41,7 @@ const DISCOVERY_RECON_QUERY_SEEN_SCORE: u8 = 1;
 const DISCOVERY_RECON_LEGACY_OPENAPI_QUERY_SCORE: u8 = 2;
 const DISCOVERY_RECON_LINKED_BAIT_SURFACE_SCORE: u8 = 2;
 const DISCOVERY_RECON_LINKED_BAIT_CLASS_FANOUT_BONUS: u8 = 1;
+const DISCOVERY_RECON_DECOY_WRITE_PROBE_SCORE: u8 = 2;
 const DISCOVERY_RECON_DETECTION_SIGNAL_SCORE: u8 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -51,6 +52,7 @@ pub struct DiscoveryReconState {
     pub legacy_openapi_query_seen: bool,
     pub linked_bait_surface_seen: bool,
     pub linked_bait_surface_classes: u8,
+    pub decoy_write_probe_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,6 +62,7 @@ pub struct DiscoveryReconAggregationScore {
     pub legacy_openapi_query_score: u8,
     pub linked_bait_surface_score: u8,
     pub linked_bait_class_fanout_bonus: u8,
+    pub decoy_write_probe_score: u8,
     pub detection_score: u8,
     pub total: u8,
 }
@@ -339,7 +342,7 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
         current_state,
         PolicyState::Suspicious,
         format!(
-            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} detection_score={} recon_score={} recon_threshold={DISCOVERY_RECON_AGGREGATION_SCORE_THRESHOLD}",
+            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} decoy_write_probe_seen={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} decoy_write_probe_score={} detection_score={} recon_score={} recon_threshold={DISCOVERY_RECON_AGGREGATION_SCORE_THRESHOLD}",
             snake_case_actor_kind(ingress_signals.actor_kind),
             recon_state.request_count,
             recon_state.fanout.distinct_surface_count(),
@@ -347,11 +350,13 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
             recon_state.legacy_openapi_query_seen,
             recon_state.linked_bait_surface_seen,
             recon_state.linked_bait_surface_classes,
+            recon_state.decoy_write_probe_seen,
             recon_score.repeated_discovery_score,
             recon_score.query_score,
             recon_score.legacy_openapi_query_score,
             recon_score.linked_bait_surface_score,
             recon_score.linked_bait_class_fanout_bonus,
+            recon_score.decoy_write_probe_score,
             recon_score.detection_score,
             recon_score.total,
         ),
@@ -387,6 +392,11 @@ pub fn aggregated_discovery_recon_score(
     } else {
         0
     };
+    let decoy_write_probe_score = if recon_state.decoy_write_probe_seen {
+        DISCOVERY_RECON_DECOY_WRITE_PROBE_SCORE
+    } else {
+        0
+    };
     let detection_score = if ingress_signals.detection_ids.is_empty() {
         0
     } else {
@@ -397,6 +407,7 @@ pub fn aggregated_discovery_recon_score(
         .saturating_add(legacy_openapi_query_score)
         .saturating_add(linked_bait_surface_score)
         .saturating_add(linked_bait_class_fanout_bonus)
+        .saturating_add(decoy_write_probe_score)
         .saturating_add(detection_score);
 
     DiscoveryReconAggregationScore {
@@ -405,6 +416,7 @@ pub fn aggregated_discovery_recon_score(
         legacy_openapi_query_score,
         linked_bait_surface_score,
         linked_bait_class_fanout_bonus,
+        decoy_write_probe_score,
         detection_score,
         total,
     }
@@ -463,7 +475,7 @@ pub fn transition_to_rate_limited_from_suspicious_discovery_recon(
         current_state,
         PolicyState::RateLimited,
         format!(
-            "{DISCOVERY_RECON_PERSISTENCE_RATE_LIMIT_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} detection_score={} recon_score={} recon_rate_limit_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
+            "{DISCOVERY_RECON_PERSISTENCE_RATE_LIMIT_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} decoy_write_probe_seen={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} decoy_write_probe_score={} detection_score={} recon_score={} recon_rate_limit_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
             snake_case_actor_kind(ingress_signals.actor_kind),
             recon_state.request_count,
             recon_state.fanout.distinct_surface_count(),
@@ -471,11 +483,13 @@ pub fn transition_to_rate_limited_from_suspicious_discovery_recon(
             recon_state.legacy_openapi_query_seen,
             recon_state.linked_bait_surface_seen,
             recon_state.linked_bait_surface_classes,
+            recon_state.decoy_write_probe_seen,
             recon_score.repeated_discovery_score,
             recon_score.query_score,
             recon_score.legacy_openapi_query_score,
             recon_score.linked_bait_surface_score,
             recon_score.linked_bait_class_fanout_bonus,
+            recon_score.decoy_write_probe_score,
             recon_score.detection_score,
             recon_score.total,
         ),
@@ -527,7 +541,7 @@ pub fn transition_to_blocked_from_repeated_discovery_recon(
         current_state,
         PolicyState::Blocked,
         format!(
-            "{DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} detection_score={} recon_score={} recon_block_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
+            "{DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} decoy_write_probe_seen={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} decoy_write_probe_score={} detection_score={} recon_score={} recon_block_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
             snake_case_actor_kind(ingress_signals.actor_kind),
             recon_state.request_count,
             recon_state.fanout.distinct_surface_count(),
@@ -535,11 +549,13 @@ pub fn transition_to_blocked_from_repeated_discovery_recon(
             recon_state.legacy_openapi_query_seen,
             recon_state.linked_bait_surface_seen,
             recon_state.linked_bait_surface_classes,
+            recon_state.decoy_write_probe_seen,
             recon_score.repeated_discovery_score,
             recon_score.query_score,
             recon_score.legacy_openapi_query_score,
             recon_score.linked_bait_surface_score,
             recon_score.linked_bait_class_fanout_bonus,
+            recon_score.decoy_write_probe_score,
             recon_score.detection_score,
             recon_score.total,
         ),
@@ -1018,6 +1034,7 @@ mod tests {
                 legacy_openapi_query_seen: true,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         ) else {
             panic!("suspicious discovery recon persistence should transition to rate limited");
@@ -1065,6 +1082,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
                 linked_bait_surface_classes: 1,
+                decoy_write_probe_seen: false,
             },
         );
         let below_threshold = transition_to_rate_limited_from_suspicious_discovery_recon(
@@ -1088,6 +1106,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         );
         let observe = transition_to_rate_limited_from_suspicious_discovery_recon(
@@ -1111,6 +1130,7 @@ mod tests {
                 legacy_openapi_query_seen: true,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         );
 
@@ -1142,6 +1162,7 @@ mod tests {
                 legacy_openapi_query_seen: true,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         ) else {
             panic!("rate-limited discovery recon retry should transition to blocked");
@@ -1189,6 +1210,7 @@ mod tests {
                 legacy_openapi_query_seen: true,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         );
         let below_threshold = transition_to_blocked_from_repeated_discovery_recon(
@@ -1212,6 +1234,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         );
         let suspicious = transition_to_blocked_from_repeated_discovery_recon(
@@ -1235,6 +1258,7 @@ mod tests {
                 legacy_openapi_query_seen: true,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         );
 
@@ -1305,6 +1329,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         ) else {
             panic!("aggregated discovery recon should transition to suspicious");
@@ -1352,6 +1377,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         );
         let no_query_signal = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -1375,6 +1401,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         );
         let stronger_direct_score = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -1398,6 +1425,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         );
         let trusted = transition_to_suspicious_from_aggregated_discovery_recon(
@@ -1425,6 +1453,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         );
 
@@ -1458,6 +1487,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         ) else {
             panic!("detection-backed aggregated discovery recon should transition to suspicious");
@@ -1500,6 +1530,7 @@ mod tests {
                 legacy_openapi_query_seen: true,
                 linked_bait_surface_seen: false,
                 linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
             },
         ) else {
             panic!(
@@ -1542,6 +1573,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
                 linked_bait_surface_classes: 1,
+                decoy_write_probe_seen: false,
             },
         ) else {
             panic!(
@@ -1561,6 +1593,44 @@ mod tests {
         assert!(transition.reason.contains("detection_count=0"));
         assert!(transition.reason.contains("query_score=1"));
         assert!(transition.reason.contains("linked_bait_surface_score=2"));
+        assert!(transition.reason.contains("recon_score=3"));
+    }
+
+    #[test]
+    fn aggregated_discovery_recon_blind_decoy_write_probe_allows_followup_promotion() {
+        let Some(transition) = transition_to_suspicious_from_aggregated_discovery_recon(
+            PolicyState::Observe,
+            "/api/v2/import/reconcile",
+            true,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: true,
+            },
+        ) else {
+            panic!("blind decoy write probe should transition medium-score recon to suspicious");
+        };
+
+        assert_eq!(transition.from, PolicyState::Observe);
+        assert_eq!(transition.to, PolicyState::Suspicious);
+        assert!(transition.reason.contains("path=/api/v2/import/reconcile"));
+        assert!(transition.reason.contains("query_seen=true"));
+        assert!(transition.reason.contains("decoy_write_probe_seen=true"));
+        assert!(transition.reason.contains("decoy_write_probe_score=2"));
         assert!(transition.reason.contains("recon_score=3"));
     }
 
@@ -1587,6 +1657,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
                 linked_bait_surface_classes: 1,
+                decoy_write_probe_seen: false,
             },
         );
 
@@ -1616,6 +1687,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
                 linked_bait_surface_classes: 1,
+                decoy_write_probe_seen: false,
             },
         ) else {
             panic!("hidden-route linked discovery recon should transition to suspicious");
@@ -1657,6 +1729,7 @@ mod tests {
                 legacy_openapi_query_seen: false,
                 linked_bait_surface_seen: true,
                 linked_bait_surface_classes: 2,
+                decoy_write_probe_seen: false,
             },
         ) else {
             panic!("multi-class linked discovery recon should transition to suspicious");
