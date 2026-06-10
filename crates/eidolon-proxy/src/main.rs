@@ -7045,6 +7045,137 @@ mod tests {
     }
 
     #[test]
+    fn runtime_aggregates_medium_score_js_helper_probe_to_suspicious() {
+        let event_log_path = unique_temp_path("aggregated-js-helper-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-js-helper-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-js-helper-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/assets/import-helper.js", &cookie, &headers),
+        ));
+        let second_body = must_ok(
+            String::from_utf8(second_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert!(second_body.contains("window.__eidolonImportWorker"));
+        assert!(second_body.contains("X-Import-Worker"));
+        assert!(second_body.contains("worker_2026_05_c19b"));
+        assert!(second_body.contains("/api/v2/import/reconcile"));
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["path"],
+            "/assets/import-helper.js"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/assets/import-helper.js")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=0")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            request_debugs[1]["fields"]["path"],
+            "/assets/import-helper.js"
+        );
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_legacy_openapi_query_seen"],
+            false
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+
+        let surface_debug = debug_values(&debug_log_path)
+            .into_iter()
+            .rfind(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .expect("second request should record a surface action");
+        assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "js_worker_resume_trace");
+        assert_eq!(bait_exposed["kind"]["surface"], "/assets/import-helper.js");
+    }
+
+    #[test]
     fn trusted_identity_is_not_promoted_to_suspicious_by_low_score_discovery_request() {
         let event_log_path = unique_temp_path("trusted-low-score-discovery-events.jsonl");
         let debug_log_path = unique_temp_path("trusted-low-score-discovery-debug.jsonl");

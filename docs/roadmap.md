@@ -293,7 +293,8 @@ Status checklist:
   medium-score legacy-query OpenAPI discovery (`current branch only`)
 - [x] Adjacent target-side-only aggregated suspicious-promotion path exists for
   medium-score linked bait-surface follow-up after query-bearing discovery,
-  including hidden-route follow-up outside the top-level discovery prefixes
+  including hidden-route and JS-helper follow-up outside the top-level
+  discovery prefixes
   (`current branch only`)
 - [x] Same-session discovery fanout promotion across `/docs` and
   `/openapi.json` exists (`current branch only`)
