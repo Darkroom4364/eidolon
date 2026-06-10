@@ -301,6 +301,11 @@ Status checklist:
   distinct linked follow-up classes can promote without query-bearing recon or
   edge-provided detections
   (`current branch only`)
+- [x] Adjacent target-side-only aggregated suspicious-promotion path exists for
+  medium-score linked bait-class fanout after plain `/openapi.json` discovery,
+  so the same linked follow-up classes now promote from either top-level
+  discovery anchor
+  (`current branch only`)
 - [x] Same-session discovery fanout promotion across `/docs` and
   `/openapi.json` exists (`current branch only`)
 - [x] `suspicious -> rate_limited` exists for same-bait near misses
