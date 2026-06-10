@@ -264,6 +264,7 @@ examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 examples/shield-lab/smoke-suspicious-decoy-write-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-decoy-write-recon-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-linked-bait-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-hidden-route-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-js-helper-aggregation-orbstack.sh
@@ -300,6 +301,12 @@ query-bearing docs request, a same-session unsafe probe to
 `/api/v2/import/reconcile` without any expected bait header can move the
 session into `suspicious`, while still preserving the important invariant that
 no `bait_action_observed` evidence is recorded for that probe.
+
+The adjacent decoy-write rate-limit smoke proves that this non-discovery
+contributor also feeds the next rung up: after the blind probe has already
+promoted the session to `suspicious`, one same-session top-level `/docs`
+follow-up now reaches the weighted recon threshold for `rate_limited` without
+requiring any exact bait-derived action.
 
 The fourth smoke proves the first advisory-assisted aggregated
 `observe -> suspicious` path: one query-bearing medium-score authenticated
