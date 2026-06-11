@@ -316,6 +316,8 @@ pub fn edge_decision_export_for_evidence(
         .unwrap_or_else(|| "latest request routing decision".to_string());
     let edge_recommendation =
         edge_recommendation_for(policy_state, routing_decision, reason.as_str());
+    let pre_containment_persistence_class =
+        pre_containment_persistence_class_for(policy_state, reason.as_str());
 
     Some(EidolonEdgeDecisionExport {
         contract_version: TRUSTED_INGRESS_CONTRACT_VERSION.to_string(),
@@ -329,6 +331,7 @@ pub fn edge_decision_export_for_evidence(
             state: policy_state,
             routing_decision,
             reason,
+            pre_containment_persistence_class,
         },
         evidence: EdgeEvidenceRef {
             event_schema_version: request_event.event.schema_version,
@@ -462,6 +465,18 @@ fn grouped_enforcement_reason_codes(policy_state: PolicyState, reason: &str) -> 
     }
 
     Vec::new()
+}
+
+fn pre_containment_persistence_class_for(
+    policy_state: PolicyState,
+    reason: &str,
+) -> Option<PreContainmentPersistenceClass> {
+    matches!(
+        policy_state,
+        PolicyState::RateLimited | PolicyState::Blocked
+    )
+    .then(|| PreContainmentPersistenceClass::from_reason(reason))
+    .flatten()
 }
 
 fn latest_ingress_signal_summary(timeline: &SessionTimeline) -> Option<String> {
@@ -1317,6 +1332,10 @@ mod tests {
                 "discovery_recon".to_string(),
             ]
         );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::DiscoveryRecon)
+        );
     }
 
     #[test]
@@ -1370,6 +1389,10 @@ mod tests {
                 "pre_containment_persistence".to_string(),
                 "same_bait_near_miss".to_string(),
             ]
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::SameBaitNearMiss)
         );
     }
 
@@ -1488,6 +1511,10 @@ mod tests {
                 "same_bait_near_miss_retry".to_string(),
             ]
         );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::SameBaitNearMiss)
+        );
     }
 
     #[test]
@@ -1558,6 +1585,10 @@ mod tests {
                 "discovery_recon_retry".to_string(),
             ]
         );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::DiscoveryRecon)
+        );
     }
 
     #[test]
@@ -1627,6 +1658,10 @@ mod tests {
                 "pre_containment_persistence".to_string(),
                 "write_recon_retry".to_string(),
             ]
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::WriteRecon)
         );
     }
 

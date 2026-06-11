@@ -316,6 +316,9 @@ Status checklist:
   the same pre-containment persistence classifier
   and edge export now surfaces that same shared family for rate-limited
   sessions with class-level detail before sessions ever hit the blocked rung
+  and `EidolonEdgeDecisionExport.policy` now carries that pre-containment
+  persistence class as a structured field instead of forcing downstream
+  consumers to scrape `reason_codes`
   and edge export now distinguishes that direct blind write retry as
   `write_recon_retry` instead of the broader `discovery_recon_retry`
   and those pre-containment blocked detail codes now come from an explicit

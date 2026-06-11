@@ -219,7 +219,8 @@ impl DiscoveryReconScore {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PreContainmentPersistenceClass {
     DiscoveryRecon,
     WriteRecon,
@@ -484,6 +485,8 @@ pub struct EdgePolicySnapshot {
     pub state: PolicyState,
     pub routing_decision: RoutingDecision,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_containment_persistence_class: Option<PreContainmentPersistenceClass>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -915,6 +918,9 @@ mod tests {
                 state: PolicyState::Observe,
                 routing_decision: RoutingDecision::ProtectedUpstream,
                 reason: "trusted ingress identity suppressed bait surface intervention before runtime suspicion was established".to_string(),
+                pre_containment_persistence_class: Some(
+                    PreContainmentPersistenceClass::DiscoveryRecon,
+                ),
             },
             evidence: EdgeEvidenceRef {
                 event_schema_version: EVENT_SCHEMA_VERSION,
@@ -948,5 +954,9 @@ mod tests {
         assert_eq!(serialized["discovery_recon_score"]["query_score"], json!(1));
         assert_eq!(serialized["discovery_recon_score"]["total"], json!(3));
         assert_eq!(serialized["discovery_recon_score"]["threshold"], json!(3));
+        assert_eq!(
+            serialized["policy"]["pre_containment_persistence_class"],
+            json!("discovery_recon")
+        );
     }
 }

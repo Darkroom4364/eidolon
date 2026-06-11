@@ -233,6 +233,9 @@ The current M5 slice is intentionally narrow:
   rate-limited sessions too, with class-level detail like `discovery_recon`
   or `same_bait_near_miss`, so operators can group persistence before the
   blocked retry rung
+- edge export now also exposes that persistence class as a structured
+  `policy.pre_containment_persistence_class` field, so SIEM consumers do not
+  need to infer it from `edge_recommendation.reason_codes`
 - one conservative `rate_limited -> blocked` path now exists for repeating
   that same-bait near miss again after Eidolon has already throttled the
   session once, keeping blocked rare and tied to explicit retry behavior
