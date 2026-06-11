@@ -310,6 +310,9 @@ Status checklist:
   contributor in the score
   and authenticated detection IDs are now also proven through that same
   blocked rung for discovery-recon persistence
+  and the pre-containment weighted recon ladder now shares one explicit
+  runtime signal/persistence profile across its rate-limit and blocked rungs
+  instead of re-deriving those medium-score recon gates independently
   and repeated blind write-target fanout persistence can now also hit that
   same blocked rung directly after the second distinct unsafe probe caused
   rate limiting
