@@ -1,6 +1,7 @@
 use eidolon_core::{
     BaitId, Event, EventKind, EventSource, IngressActorKind, IngressAdvisorySignals,
-    IngressIdentity, PolicyState, PreContainmentPersistenceClass, RoutingDecision, SessionId,
+    IngressIdentity, PolicyState, PostContainmentPersistenceKind, PreContainmentPersistenceClass,
+    RoutingDecision, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -719,6 +720,13 @@ fn append_pre_containment_blocked_persistence_markers(
     )
 }
 
+fn append_post_containment_persistence_kind(
+    reason: String,
+    persistence_kind: PostContainmentPersistenceKind,
+) -> String {
+    format!("{reason} {}", persistence_kind.marker())
+}
+
 pub fn transition_to_blocked_from_repeated_controlled_reality_depth_limit(
     current_state: PolicyState,
     path: &str,
@@ -732,8 +740,11 @@ pub fn transition_to_blocked_from_repeated_controlled_reality_depth_limit(
     Some(PolicyTransition::new(
         current_state,
         PolicyState::Blocked,
-        format!(
+        append_post_containment_persistence_kind(
+            format!(
             "{REPEATED_CONTROLLED_REALITY_DEPTH_LIMIT_BLOCKED_REASON_PREFIX}: path={path} depth={depth} depth_limit={depth_limit}",
+            ),
+            PostContainmentPersistenceKind::ControlledRealityDepthLimit,
         ),
     ))
 }
@@ -750,8 +761,11 @@ pub fn transition_to_blocked_from_repeated_reality_escape_attempt(
     Some(PolicyTransition::new(
         current_state,
         PolicyState::Blocked,
-        format!(
+        append_post_containment_persistence_kind(
+            format!(
             "{REPEATED_REALITY_ESCAPE_BLOCKED_REASON_PREFIX}: path={path} attempt_count={attempt_count}",
+            ),
+            PostContainmentPersistenceKind::ControlledRealityBranchEscape,
         ),
     ))
 }
@@ -2195,6 +2209,9 @@ mod tests {
         assert!(transition.reason.contains("path=/api/v2/import/reconcile"));
         assert!(transition.reason.contains("depth=6"));
         assert!(transition.reason.contains("depth_limit=4"));
+        assert!(transition
+            .reason
+            .contains("post_containment_persistence_kind=controlled_reality_depth_limit"));
     }
 
     #[test]
@@ -2233,6 +2250,9 @@ mod tests {
             .contains(REPEATED_REALITY_ESCAPE_BLOCKED_REASON_PREFIX));
         assert!(transition.reason.contains("path=/api/v1/projects"));
         assert!(transition.reason.contains("attempt_count=2"));
+        assert!(transition
+            .reason
+            .contains("post_containment_persistence_kind=controlled_reality_branch_escape"));
     }
 
     #[test]

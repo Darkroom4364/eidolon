@@ -5,8 +5,10 @@ use uuid::Uuid;
 pub const EVENT_SCHEMA_VERSION: u16 = 2;
 pub const TRUSTED_INGRESS_CONTRACT_VERSION: &str = "2026-06-05.v1";
 pub const PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY: &str = "pre_containment_persistence";
+pub const POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY: &str = "post_containment_persistence";
 pub const PRE_CONTAINMENT_PERSISTENCE_CLASS_FIELD: &str = "persistence_class";
 pub const PRE_CONTAINMENT_PERSISTENCE_KIND_FIELD: &str = "persistence_kind";
+pub const POST_CONTAINMENT_PERSISTENCE_KIND_FIELD: &str = "post_containment_persistence_kind";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
@@ -354,6 +356,64 @@ impl PreContainmentPersistenceKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostContainmentPersistenceKind {
+    ControlledRealityBranchEscape,
+    ControlledRealityDepthLimit,
+}
+
+impl PostContainmentPersistenceKind {
+    pub const fn detail_code(self) -> &'static str {
+        match self {
+            Self::ControlledRealityBranchEscape => "controlled_reality_branch_escape",
+            Self::ControlledRealityDepthLimit => "controlled_reality_depth_limit",
+        }
+    }
+
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::ControlledRealityBranchEscape => {
+                "post_containment_persistence_kind=controlled_reality_branch_escape"
+            }
+            Self::ControlledRealityDepthLimit => {
+                "post_containment_persistence_kind=controlled_reality_depth_limit"
+            }
+        }
+    }
+
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        if let Some(detail_code) = reason
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("post_containment_persistence_kind="))
+        {
+            return Self::from_detail_code(detail_code);
+        }
+
+        if reason.contains(
+            "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked",
+        ) {
+            return Some(Self::ControlledRealityBranchEscape);
+        }
+
+        if reason.contains(
+            "controlled-reality probe continued after depth-limit throttle and moved session to blocked",
+        ) {
+            return Some(Self::ControlledRealityDepthLimit);
+        }
+
+        None
+    }
+
+    fn from_detail_code(detail_code: &str) -> Option<Self> {
+        match detail_code {
+            "controlled_reality_branch_escape" => Some(Self::ControlledRealityBranchEscape),
+            "controlled_reality_depth_limit" => Some(Self::ControlledRealityDepthLimit),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
@@ -490,6 +550,8 @@ pub struct EdgePolicySnapshot {
     pub pre_containment_persistence_class: Option<PreContainmentPersistenceClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_containment_persistence_kind: Option<PreContainmentPersistenceKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_containment_persistence_kind: Option<PostContainmentPersistenceKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -816,6 +878,16 @@ mod tests {
     }
 
     #[test]
+    fn post_containment_persistence_kind_parses_explicit_marker() {
+        let reason = "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects post_containment_persistence_kind=controlled_reality_branch_escape";
+
+        assert_eq!(
+            PostContainmentPersistenceKind::from_reason(reason),
+            Some(PostContainmentPersistenceKind::ControlledRealityBranchEscape)
+        );
+    }
+
+    #[test]
     fn policy_decision_event_serializes_actual_routing_decision() {
         let session_id = SessionId::new();
         let event = Event::new(
@@ -927,6 +999,9 @@ mod tests {
                 pre_containment_persistence_kind: Some(
                     PreContainmentPersistenceKind::DiscoveryReconRetry,
                 ),
+                post_containment_persistence_kind: Some(
+                    PostContainmentPersistenceKind::ControlledRealityDepthLimit,
+                ),
             },
             evidence: EdgeEvidenceRef {
                 event_schema_version: EVENT_SCHEMA_VERSION,
@@ -967,6 +1042,10 @@ mod tests {
         assert_eq!(
             serialized["policy"]["pre_containment_persistence_kind"],
             json!("discovery_recon_retry")
+        );
+        assert_eq!(
+            serialized["policy"]["post_containment_persistence_kind"],
+            json!("controlled_reality_depth_limit")
         );
     }
 }
