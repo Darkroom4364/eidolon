@@ -21,8 +21,8 @@ use eidolon_core::{
 use eidolon_proxy::{
     controlled_reality::{
         rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
-        DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
-        MAX_TARPIT_DELAY,
+        DECOY_RECONCILE_PATH, DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY,
+        MAX_CONTROLLED_REALITY_ACTION_DEPTH, MAX_TARPIT_DELAY,
     },
     debug_log::FileDebugLogWriter,
     event_log::FileEventLogWriter,
@@ -1468,8 +1468,15 @@ fn linked_bait_surface_kind(
 }
 
 fn is_blind_decoy_write_probe(runtime: &ProxyRuntime, request: &SurfaceRequestMeta) -> bool {
+    blind_decoy_write_probe_path_kind(runtime, request).is_some()
+}
+
+fn blind_decoy_write_probe_path_kind(
+    runtime: &ProxyRuntime,
+    request: &SurfaceRequestMeta,
+) -> Option<policy::DecoyWriteProbePathKind> {
     if !matches!(request.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
-        return false;
+        return None;
     }
 
     let headers: Vec<(&str, &str)> = surface_header_pairs(&request.headers).collect();
@@ -1482,15 +1489,21 @@ fn is_blind_decoy_write_probe(runtime: &ProxyRuntime, request: &SurfaceRequestMe
             .match_action_shape(&request.method, &request.path, headers.iter().copied())
             .is_some()
     {
-        return false;
+        return None;
     }
 
-    runtime.bait_registry.baits().iter().any(|bait| {
+    runtime.bait_registry.baits().iter().find(|bait| {
         bait.expected_action
             .method
             .eq_ignore_ascii_case(&request.method)
             && bait.expected_action.path == request.path
             && bait.expected_action.header_name.is_some()
+    })?;
+
+    Some(if request.path == DECOY_RECONCILE_PATH {
+        policy::DecoyWriteProbePathKind::Reconcile
+    } else {
+        policy::DecoyWriteProbePathKind::Other
     })
 }
 
@@ -2009,6 +2022,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 discovery_recon_state.decoy_write_probe_seen,
             "discovery_decoy_write_probe_count":
                 discovery_recon_state.decoy_write_probe_count,
+            "discovery_decoy_write_probe_path_classes":
+                discovery_recon_state.decoy_write_probe_path_classes,
             "discovery_recon_score": {
                 "repeated_discovery_score": discovery_recon_score.repeated_discovery_score,
                 "query_score": discovery_recon_score.query_score,
@@ -2020,6 +2035,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     discovery_recon_score.linked_bait_class_fanout_bonus,
                 "decoy_write_probe_score":
                     discovery_recon_score.decoy_write_probe_score,
+                "decoy_write_probe_path_fanout_bonus":
+                    discovery_recon_score.decoy_write_probe_path_fanout_bonus,
                 "detection_score": discovery_recon_score.detection_score,
                 "total": discovery_recon_score.total,
                 "threshold": discovery_recon_threshold,
@@ -2974,8 +2991,8 @@ fn update_discovery_recon_state_for_request(
         return store.note_linked_bait_surface_request(session_id, kind);
     }
 
-    if is_blind_decoy_write_probe(runtime, request) {
-        return store.note_decoy_write_probe(session_id);
+    if let Some(kind) = blind_decoy_write_probe_path_kind(runtime, request) {
+        return store.note_decoy_write_probe(session_id, kind);
     }
 
     let record = store.record(session_id);
@@ -2990,6 +3007,9 @@ fn update_discovery_recon_state_for_request(
             .distinct_surface_count(),
         decoy_write_probe_seen: record.discovery_decoy_write_probe_count > 0,
         decoy_write_probe_count: record.discovery_decoy_write_probe_count,
+        decoy_write_probe_path_classes: record
+            .discovery_decoy_write_probe_fanout
+            .distinct_path_count(),
     })
 }
 
@@ -3457,6 +3477,7 @@ fn event_discovery_recon_score(
         linked_bait_surface_score: score.linked_bait_surface_score,
         linked_bait_class_fanout_bonus: score.linked_bait_class_fanout_bonus,
         decoy_write_probe_score: score.decoy_write_probe_score,
+        decoy_write_probe_path_fanout_bonus: score.decoy_write_probe_path_fanout_bonus,
         detection_score: score.detection_score,
         total: score.total,
         threshold,
@@ -4775,6 +4796,39 @@ mod tests {
           "schema_version": 1,
           "profile_id": "alternate_write_probe",
           "baits": [
+            {
+              "id": "validate_import_trace",
+              "bait_class": "docs",
+              "surface": "/docs/import-validate",
+              "surface_kind": "docs",
+              "expected_action": {
+                "method": "POST",
+                "path": "/api/v2/import/validate",
+                "header_name": "X-Validation-Trace",
+                "header_value": "validate_2026_06_a17c"
+              }
+            }
+          ]
+        }"##
+    }
+
+    fn fanout_write_probe_profile_json() -> &'static str {
+        r##"{
+          "schema_version": 1,
+          "profile_id": "fanout_write_probe",
+          "baits": [
+            {
+              "id": "legacy_import_trace",
+              "bait_class": "docs",
+              "surface": "/docs/legacy-import",
+              "surface_kind": "docs",
+              "expected_action": {
+                "method": "POST",
+                "path": "/api/v2/import/reconcile",
+                "header_name": "X-Migration-Trace",
+                "header_value": "rel_2025_04_b7f2"
+              }
+            },
             {
               "id": "validate_import_trace",
               "bait_class": "docs",
@@ -7311,6 +7365,140 @@ mod tests {
     }
 
     #[test]
+    fn runtime_distinct_blind_write_probe_paths_add_a_fanout_bonus_without_bait_attribution() {
+        let path = write_bait_profile(fanout_write_probe_profile_json());
+        let loaded = load_bait_profile(&path).expect("fanout write profile should load");
+        let event_log_path = unique_temp_path("aggregated-decoy-write-fanout-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-decoy-write-fanout-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream_sequence([
+            html_response(original),
+            json_response(r#"{"mode":"reconcile"}"#),
+            json_response(r#"{"mode":"validate"}"#),
+        ]);
+        let mut runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("aggregated-decoy-write-fanout-control.txt"),
+            loaded,
+        );
+        runtime.debug_log = Some(Arc::new(Mutex::new(
+            FileDebugLogWriter::open(&debug_log_path).expect("debug log should open"),
+        )));
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
+        ));
+
+        let first_body = must_ok(
+            String::from_utf8(first_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert!(first_body.contains("/docs/legacy-import"));
+        assert!(first_body.contains("/docs/import-validate"));
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 200);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]
+                ["decoy_write_probe_path_fanout_bonus"],
+            Value::Null
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(request_events[2]["policy_state"], "suspicious");
+        assert_eq!(request_events[2]["kind"]["path"], "/api/v2/import/validate");
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]
+                ["decoy_write_probe_path_fanout_bonus"],
+            1
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["threshold"],
+            3
+        );
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 1);
+        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
+        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
+        assert!(policy_changes[0]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/api/v2/import/reconcile")));
+        assert!(policy_changes[0]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=1")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_count"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_path_classes"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]
+                ["decoy_write_probe_path_fanout_bonus"],
+            1
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+    }
+
+    #[test]
     fn runtime_repeated_blind_decoy_write_probes_add_a_capped_bonus_without_bait_attribution() {
         let event_log_path = unique_temp_path("aggregated-decoy-write-repeat-bonus-events.jsonl");
         let debug_log_path = unique_temp_path("aggregated-decoy-write-repeat-bonus-debug.jsonl");
@@ -8206,7 +8394,7 @@ mod tests {
         assert_eq!(surface_debugs[2]["fields"]["policy_state"], "blocked");
         assert_eq!(
             surface_debugs[2]["fields"]["policy_reason"],
-            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 detection_score=0 recon_score=5 recon_block_threshold=5"
+            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5"
         );
         assert_eq!(
             surface_debugs[2]["fields"]["surface_action"]["type"],

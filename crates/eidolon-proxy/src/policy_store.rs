@@ -34,6 +34,8 @@ pub struct SessionPolicyRecord {
     pub discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout,
     #[serde(default)]
     pub discovery_decoy_write_probe_count: u8,
+    #[serde(default)]
+    pub discovery_decoy_write_probe_fanout: crate::policy::DecoyWriteProbeFanout,
 }
 
 impl SessionPolicyRecord {
@@ -48,6 +50,7 @@ impl SessionPolicyRecord {
             discovery_legacy_openapi_query_seen: false,
             discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout::default(),
             discovery_decoy_write_probe_count: 0,
+            discovery_decoy_write_probe_fanout: crate::policy::DecoyWriteProbeFanout::default(),
         }
     }
 }
@@ -84,6 +87,8 @@ struct StoredSessionPolicy {
     discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout,
     #[serde(default)]
     discovery_decoy_write_probe_count: u8,
+    #[serde(default)]
+    discovery_decoy_write_probe_fanout: crate::policy::DecoyWriteProbeFanout,
     #[serde(default, skip_serializing)]
     discovery_decoy_write_probe_seen: bool,
     #[serde(default, skip_serializing)]
@@ -203,12 +208,15 @@ impl PolicyStateStore {
     pub fn note_decoy_write_probe(
         &mut self,
         session_id: SessionId,
+        kind: crate::policy::DecoyWriteProbePathKind,
     ) -> io::Result<crate::policy::DiscoveryReconState> {
         let mut record = self.record(session_id);
         record.discovery_decoy_write_probe_count = record
             .discovery_decoy_write_probe_count
             .saturating_add(1)
             .min(crate::policy::discovery_recon_decoy_write_probe_count_cap());
+        record.discovery_decoy_write_probe_fanout =
+            record.discovery_decoy_write_probe_fanout.mark(kind);
         self.records.insert(session_id, record);
         self.persist()?;
         Ok(discovery_recon_state(record))
@@ -233,6 +241,7 @@ impl PolicyStateStore {
                 discovery_legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
                 discovery_linked_bait_surface_fanout: record.discovery_linked_bait_surface_fanout,
                 discovery_decoy_write_probe_count: record.discovery_decoy_write_probe_count,
+                discovery_decoy_write_probe_fanout: record.discovery_decoy_write_probe_fanout,
                 discovery_decoy_write_probe_seen: false,
                 discovery_linked_bait_surface_seen: false,
             })
@@ -282,6 +291,9 @@ fn discovery_recon_state(record: SessionPolicyRecord) -> crate::policy::Discover
             .distinct_surface_count(),
         decoy_write_probe_seen: record.discovery_decoy_write_probe_count > 0,
         decoy_write_probe_count: record.discovery_decoy_write_probe_count,
+        decoy_write_probe_path_classes: record
+            .discovery_decoy_write_probe_fanout
+            .distinct_path_count(),
     }
 }
 
@@ -333,6 +345,15 @@ fn deserialize_records(
                     .discovery_decoy_write_probe_count
                     .min(crate::policy::discovery_recon_decoy_write_probe_count_cap())
             };
+            let mut discovery_decoy_write_probe_fanout = session.discovery_decoy_write_probe_fanout;
+            if discovery_decoy_write_probe_fanout == crate::policy::DecoyWriteProbeFanout::default()
+                && discovery_decoy_write_probe_count > 0
+            {
+                discovery_decoy_write_probe_fanout = crate::policy::DecoyWriteProbeFanout {
+                    reconcile_seen: false,
+                    other_seen: true,
+                };
+            }
             (
                 session.session_id,
                 SessionPolicyRecord {
@@ -346,6 +367,7 @@ fn deserialize_records(
                         .discovery_legacy_openapi_query_seen,
                     discovery_linked_bait_surface_fanout: linked_bait_surface_fanout,
                     discovery_decoy_write_probe_count,
+                    discovery_decoy_write_probe_fanout,
                 },
             )
         })
@@ -574,6 +596,7 @@ mod tests {
                 linked_bait_surface_classes: 0,
                 decoy_write_probe_seen: false,
                 decoy_write_probe_count: 0,
+                decoy_write_probe_path_classes: 0,
             }
         );
         assert_eq!(
@@ -596,6 +619,7 @@ mod tests {
                 linked_bait_surface_classes: 1,
                 decoy_write_probe_seen: false,
                 decoy_write_probe_count: 0,
+                decoy_write_probe_path_classes: 0,
             }
         );
         assert_eq!(
@@ -618,11 +642,15 @@ mod tests {
                 linked_bait_surface_classes: 2,
                 decoy_write_probe_seen: false,
                 decoy_write_probe_count: 0,
+                decoy_write_probe_path_classes: 0,
             }
         );
         assert_eq!(
             must_ok(
-                store.note_decoy_write_probe(session_id),
+                store.note_decoy_write_probe(
+                    session_id,
+                    crate::policy::DecoyWriteProbePathKind::Reconcile,
+                ),
                 "blind decoy write probe should persist"
             ),
             crate::policy::DiscoveryReconState {
@@ -637,11 +665,15 @@ mod tests {
                 linked_bait_surface_classes: 2,
                 decoy_write_probe_seen: true,
                 decoy_write_probe_count: 1,
+                decoy_write_probe_path_classes: 1,
             }
         );
         assert_eq!(
             must_ok(
-                store.note_decoy_write_probe(session_id),
+                store.note_decoy_write_probe(
+                    session_id,
+                    crate::policy::DecoyWriteProbePathKind::Other,
+                ),
                 "repeated blind decoy write probe should cap cleanly"
             ),
             crate::policy::DiscoveryReconState {
@@ -656,6 +688,7 @@ mod tests {
                 linked_bait_surface_classes: 2,
                 decoy_write_probe_seen: true,
                 decoy_write_probe_count: 2,
+                decoy_write_probe_path_classes: 2,
             }
         );
         assert_eq!(
@@ -680,6 +713,7 @@ mod tests {
                 linked_bait_surface_classes: 2,
                 decoy_write_probe_seen: true,
                 decoy_write_probe_count: 2,
+                decoy_write_probe_path_classes: 2,
             }
         );
 
@@ -715,6 +749,18 @@ mod tests {
                 .record(session_id)
                 .discovery_decoy_write_probe_count,
             2
+        );
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_decoy_write_probe_fanout
+                .reconcile_seen
+        );
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_decoy_write_probe_fanout
+                .other_seen
         );
     }
 
@@ -805,6 +851,12 @@ mod tests {
                 .record(session_id)
                 .discovery_decoy_write_probe_count,
             1
+        );
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_decoy_write_probe_fanout
+                .other_seen
         );
     }
 }
