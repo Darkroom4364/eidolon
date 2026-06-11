@@ -61,7 +61,26 @@ Keep out of the private repo:
   export-edge-decisions-orbstack.sh
   smoke-trusted-ingress-orbstack.sh
   smoke-suspicious-promotion-orbstack.sh
+  smoke-suspicious-aggregated-recon-orbstack.sh
+  smoke-suspicious-detection-aggregation-orbstack.sh
+  smoke-suspicious-detection-recon-rate-limit-orbstack.sh
+  smoke-rate-limited-detection-recon-blocked-orbstack.sh
+  smoke-suspicious-openapi-aggregation-orbstack.sh
+  smoke-suspicious-linked-bait-aggregation-orbstack.sh
+  smoke-suspicious-hidden-route-aggregation-orbstack.sh
+  smoke-suspicious-js-helper-aggregation-orbstack.sh
+  smoke-suspicious-linked-fanout-aggregation-orbstack.sh
+  smoke-suspicious-openapi-linked-fanout-aggregation-orbstack.sh
   smoke-suspicious-openapi-orbstack.sh
+  smoke-suspicious-discovery-fanout-orbstack.sh
+  smoke-suspicious-rate-limit-orbstack.sh
+  smoke-suspicious-openapi-rate-limit-orbstack.sh
+  smoke-suspicious-openapi-recon-rate-limit-orbstack.sh
+  smoke-rate-limited-recon-blocked-orbstack.sh
+  smoke-rate-limited-blocked-orbstack.sh
+  smoke-rate-limited-controlled-reality-orbstack.sh
+  smoke-controlled-reality-blocked-orbstack.sh
+  smoke-controlled-reality-depth-limit-blocked-orbstack.sh
   collect-kali-vm-sample.sh
   run-pwnkit-kali-vm.sh
   kali-vm-pwnkit.md
@@ -238,13 +257,35 @@ Treat those NodePorts as raw lab ingress only:
   shared secret so operators can smoke-test both the rejected raw path and the
   accepted authenticated path on the same deployment
 
-Validate those two ingress-side runtime paths directly on the live OrbStack
-shield:
+Validate those ingress-side runtime paths directly on the live OrbStack shield:
 
 ```sh
 examples/shield-lab/smoke-trusted-ingress-orbstack.sh
 examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
+examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
+examples/shield-lab/smoke-suspicious-decoy-write-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-detection-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-rate-limited-detection-recon-blocked-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-decoy-write-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-suspicious-decoy-write-repeat-bonus-orbstack.sh
+examples/shield-lab/smoke-suspicious-linked-bait-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-hidden-route-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-js-helper-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-linked-fanout-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-linked-fanout-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
+examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
+examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-rate-limited-decoy-write-recon-blocked-orbstack.sh
+examples/shield-lab/smoke-rate-limited-recon-blocked-orbstack.sh
+examples/shield-lab/smoke-rate-limited-blocked-orbstack.sh
+examples/shield-lab/smoke-rate-limited-controlled-reality-orbstack.sh
+examples/shield-lab/smoke-controlled-reality-blocked-orbstack.sh
+examples/shield-lab/smoke-controlled-reality-depth-limit-blocked-orbstack.sh
 ```
 
 The second smoke proves the first M5 graduated-enforcement slice: one
@@ -253,11 +294,165 @@ authenticated advisory discovery request is promoted from `observe` to
 exports the advisory signals with a `preserve_eidolon_routing` edge
 recommendation.
 
-The third smoke proves the next `#175` slice on `/openapi.json`: one
+The third smoke proves the first weaker aggregated `observe -> suspicious`
+slice: a medium-score authenticated agentic discovery request stays in
+`observe` on first contact, but after the session has shown query-bearing
+discovery recon, a second same-session discovery request moves into
+`suspicious` through multi-signal aggregation and serves the stronger owned
+docs surface.
+
+The adjacent blind-decoy-write smoke proves that the same weighted recon plane
+can now use one non-discovery contributor too: after a medium-score
+query-bearing docs request, a same-session unsafe probe to
+`/api/v2/import/reconcile` without any expected bait header can move the
+session into `suspicious`, while still preserving the important invariant that
+no `bait_action_observed` evidence is recorded for that probe.
+
+The adjacent decoy-write rate-limit smoke proves that this non-discovery
+contributor also feeds the next rung up: after the blind probe has already
+promoted the session to `suspicious`, one same-session top-level `/docs`
+follow-up now reaches the weighted recon threshold for `rate_limited` without
+requiring any exact bait-derived action.
+
+The adjacent repeated-decoy-write smoke proves the next refinement of that same
+non-discovery contributor: blind probes are now tracked as a small capped
+count, so a second same-session unsafe probe raises the structured
+`decoy_write_probe_score` from `2` to `3` without creating
+`bait_action_observed`, and a later top-level `/docs` follow-up reaches
+`rate_limited` at recon score `6` instead of `5`.
+
+The adjacent decoy-write recon-blocked smoke proves that the same non-discovery
+contributor carries one rung further too: after Eidolon has already throttled
+that session once from weighted recon churn, repeating the same top-level
+discovery retry now moves the session into `blocked` while still preserving the
+important invariant that the blind probe created no `bait_action_observed`
+evidence.
+
+The fourth smoke proves the first advisory-assisted aggregated
+`observe -> suspicious` path: one query-bearing medium-score authenticated
+discovery request carries detection IDs from the trusted edge adapter, reaches
+the multi-signal threshold on first contact, and is served from the stronger
+owned docs surface.
+
+The adjacent detection-backed recon-blocked smoke proves that the same
+advisory-assisted contributor carries through the next pre-containment rung
+too: after one same-session top-level `/docs` follow-up has already moved the
+session into `rate_limited`, a repeated `/docs` retry now moves it into
+`blocked`, while edge export preserves the authenticated detection IDs plus the
+structured `pre_containment_persistence_class=discovery_recon` and
+`pre_containment_persistence_kind=discovery_recon_retry` fields.
+
+An adjacent OpenAPI aggregation smoke proves the first target-side-only
+aggregated `observe -> suspicious` path: one medium-score
+`/openapi.json?eidolon_surface=legacy-import` request reaches the threshold on
+first contact through the known legacy discovery query plus ordinary query
+presence, and is served from the stronger owned OpenAPI surface without
+depending on edge-provided detection IDs.
+
+A companion linked-bait aggregation smoke proves the next target-side-only
+aggregated `observe -> suspicious` path: one medium-score query-bearing
+`/docs` discovery request stays in `observe`, but the same session's
+follow-up probe into `/docs/legacy-import` reaches the threshold through the
+earlier query-bearing recon plus the linked bait-surface request itself,
+without depending on edge-provided detection IDs and without treating the
+follow-up as a confirmed bait-derived action.
+
+A hidden-route aggregation smoke proves the same path now works outside the
+top-level `/docs` and `/openapi.json` prefixes: one medium-score query-bearing
+`/docs` discovery request stays in `observe`, but the same session's follow-up
+probe into `/customer/import-recovery-checklist` now reaches the threshold
+through the earlier query-bearing recon plus the linked bait-surface request
+itself.
+
+A JS-helper aggregation smoke proves the same path for asset-linked discovery:
+one medium-score query-bearing `/docs` discovery request stays in `observe`,
+but the same session's follow-up probe into `/assets/import-helper.js` now
+reaches the threshold through the earlier query-bearing recon plus the linked
+helper asset request itself.
+
+A linked-fanout aggregation smoke proves the next coarse target-side-only
+recon path: one medium-score `/docs` discovery request without a query string
+stays in `observe`, one same-session probe into `/docs/legacy-import` still
+stays in `observe`, and the follow-up probe into `/assets/import-helper.js`
+promotes only because the session has now churned across two linked bait
+classes. That keeps the signal target-side and makes the recon plane less
+dependent on query shape or edge-provided detections.
+
+An adjacent OpenAPI-linked-fanout aggregation smoke proves the same coarse
+path is not anchored to `/docs`: one medium-score `/openapi.json` discovery
+request without a query string stays in `observe`, one same-session probe into
+`/docs/legacy-import` still stays in `observe`, and the follow-up probe into
+`/assets/import-helper.js` promotes only because the session has now churned
+across two linked bait classes after starting from top-level OpenAPI
+discovery.
+
+An adjacent higher-threshold recon persistence smoke proves the first weighted
+`suspicious -> rate_limited` use of that same score: one medium-score
+`/openapi.json?eidolon_surface=legacy-import` request moves the session into
+`suspicious`, and a same-session top-level `/docs` follow-up then hits
+`rate_limited` once the weighted recon score reaches `5` from repeated
+discovery plus the earlier query-bearing legacy OpenAPI signal.
+
+An adjacent recon-blocked smoke proves the next persistence step: after that
+same weighted recon path has already throttled the session once, repeating a
+same-session top-level discovery request moves the session into `blocked`,
+keeps the evidence target-side and structured, and exports the grouped
+`pre_containment_persistence` plus `discovery_recon_retry` reason codes.
+
+A dedicated OpenAPI suspicious smoke proves the next `#175` slice on
+`/openapi.json`: one
 authenticated advisory OpenAPI discovery request is promoted from `observe` to
 `suspicious`, is served from an Eidolon-owned OpenAPI surface instead of a
 rewritten upstream schema, and exports the same
 `preserve_eidolon_routing` recommendation.
+
+A separate fanout smoke proves the first session-recon promotion slice: one session
+first requests `/docs` and then `/openapi.json`, gets promoted from `observe`
+to `suspicious` on the second request because it fanned out across both
+discovery surfaces, and is then served from the owned OpenAPI path with the
+same `preserve_eidolon_routing` export recommendation.
+
+The seventh smoke proves the first `suspicious -> rate_limited` slice: a session
+that was promoted on the owned docs surface and then performs a wrong-header
+same-bait near miss on `/api/v2/import/reconcile` is throttled with
+`Retry-After`, preserves unmatched bait-action evidence, and exports the
+`rate_limited` runtime decision.
+
+The eighth smoke proves the same rate-limit path for the owned OpenAPI bait:
+after a suspicious `/openapi.json` exposure, a wrong-value
+`X-OpenAPI-Trace` request on the shared reconcile path is attributed to the
+OpenAPI bait rather than the docs bait and is throttled the same way.
+
+The ninth smoke proves the first `rate_limited -> blocked` slice: after one
+same-bait wrong-header retry has already moved the session into
+`rate_limited`, repeating that same near miss again moves the session into
+`blocked`, preserves the second unmatched bait-action observation, and exports
+the blocked Eidolon-owned decision. That export now groups the decision under
+`pre_containment_persistence` with the detail code
+`same_bait_near_miss_retry`.
+
+The tenth smoke proves the first `rate_limited -> controlled_reality` slice:
+after a same-bait near miss has already throttled the session once, a confirmed
+same-session exact bait-derived action on `/api/v2/import/reconcile` moves the
+session into `controlled_reality`, preserves the matched exposure evidence, and
+exports the contained runtime decision.
+
+The eleventh smoke proves the first `controlled_reality -> blocked` slice tied to
+repeated reality-escape attempts: after a session has already entered
+containment, requesting a path outside the configured controlled-reality branch
+once records the escape signal, and repeating that same outside-branch probe
+moves the session into `blocked` with the hard-fail preserved in edge export.
+That export now groups the decision under
+`post_containment_persistence` with the detail code
+`controlled_reality_branch_escape`.
+
+The twelfth smoke proves the adjacent post-containment depth-limit path: after a
+session has already entered `controlled_reality`, continuing to probe the same
+contained branch past the first throttle moves the session from
+`controlled_reality` into `blocked`, preserving the depth-limit evidence and
+the final Eidolon-owned hard fail in edge export. That export uses the same
+`post_containment_persistence` family with the detail code
+`controlled_reality_depth_limit`.
 
 Create a `kind` cluster:
 

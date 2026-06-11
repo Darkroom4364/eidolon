@@ -20,6 +20,22 @@ pub struct PolicyStateStore {
 pub struct SessionPolicyRecord {
     pub policy_state: PolicyState,
     pub controlled_reality_depth: u32,
+    #[serde(default)]
+    pub reality_escape_attempt_count: u32,
+    #[serde(default)]
+    pub discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
+    #[serde(default)]
+    pub discovery_request_count: u32,
+    #[serde(default)]
+    pub discovery_query_seen: bool,
+    #[serde(default)]
+    pub discovery_legacy_openapi_query_seen: bool,
+    #[serde(default)]
+    pub discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout,
+    #[serde(default)]
+    pub discovery_decoy_write_probe_count: u8,
+    #[serde(default)]
+    pub discovery_decoy_write_probe_fanout: crate::policy::DecoyWriteProbeFanout,
 }
 
 impl SessionPolicyRecord {
@@ -27,6 +43,14 @@ impl SessionPolicyRecord {
         Self {
             policy_state,
             controlled_reality_depth: 0,
+            reality_escape_attempt_count: 0,
+            discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout::default(),
+            discovery_request_count: 0,
+            discovery_query_seen: false,
+            discovery_legacy_openapi_query_seen: false,
+            discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout::default(),
+            discovery_decoy_write_probe_count: 0,
+            discovery_decoy_write_probe_fanout: crate::policy::DecoyWriteProbeFanout::default(),
         }
     }
 }
@@ -49,6 +73,26 @@ struct StoredSessionPolicy {
     policy_state: PolicyState,
     #[serde(default)]
     controlled_reality_depth: u32,
+    #[serde(default)]
+    reality_escape_attempt_count: u32,
+    #[serde(default)]
+    discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
+    #[serde(default)]
+    discovery_request_count: u32,
+    #[serde(default)]
+    discovery_query_seen: bool,
+    #[serde(default)]
+    discovery_legacy_openapi_query_seen: bool,
+    #[serde(default)]
+    discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout,
+    #[serde(default)]
+    discovery_decoy_write_probe_count: u8,
+    #[serde(default)]
+    discovery_decoy_write_probe_fanout: crate::policy::DecoyWriteProbeFanout,
+    #[serde(default, skip_serializing)]
+    discovery_decoy_write_probe_seen: bool,
+    #[serde(default, skip_serializing)]
+    discovery_linked_bait_surface_seen: bool,
 }
 
 impl PolicyStateStore {
@@ -97,6 +141,7 @@ impl PolicyStateStore {
             record.policy_state = policy_state;
             if policy_state != PolicyState::ControlledReality {
                 record.controlled_reality_depth = 0;
+                record.reality_escape_attempt_count = 0;
             }
         }
         self.records.insert(session_id, record);
@@ -111,6 +156,72 @@ impl PolicyStateStore {
         Ok(record.controlled_reality_depth)
     }
 
+    pub fn note_reality_escape_attempt(&mut self, session_id: SessionId) -> io::Result<u32> {
+        let mut record = self.record(session_id);
+        record.reality_escape_attempt_count = record.reality_escape_attempt_count.saturating_add(1);
+        self.records.insert(session_id, record);
+        self.persist()?;
+        Ok(record.reality_escape_attempt_count)
+    }
+
+    pub fn clear_reality_escape_attempts(&mut self, session_id: SessionId) -> io::Result<()> {
+        let mut record = self.record(session_id);
+        if record.reality_escape_attempt_count == 0 {
+            return Ok(());
+        }
+
+        record.reality_escape_attempt_count = 0;
+        self.records.insert(session_id, record);
+        self.persist()
+    }
+
+    pub fn note_discovery_surface_request(
+        &mut self,
+        session_id: SessionId,
+        kind: crate::policy::DiscoverySurfaceKind,
+        query_present: bool,
+        legacy_openapi_query_seen: bool,
+    ) -> io::Result<crate::policy::DiscoveryReconState> {
+        let mut record = self.record(session_id);
+        record.discovery_surface_fanout = record.discovery_surface_fanout.mark(kind);
+        record.discovery_request_count = record.discovery_request_count.saturating_add(1);
+        record.discovery_query_seen |= query_present;
+        record.discovery_legacy_openapi_query_seen |= legacy_openapi_query_seen;
+        self.records.insert(session_id, record);
+        self.persist()?;
+        Ok(discovery_recon_state(record))
+    }
+
+    pub fn note_linked_bait_surface_request(
+        &mut self,
+        session_id: SessionId,
+        kind: crate::policy::LinkedBaitSurfaceKind,
+    ) -> io::Result<crate::policy::DiscoveryReconState> {
+        let mut record = self.record(session_id);
+        record.discovery_linked_bait_surface_fanout =
+            record.discovery_linked_bait_surface_fanout.mark(kind);
+        self.records.insert(session_id, record);
+        self.persist()?;
+        Ok(discovery_recon_state(record))
+    }
+
+    pub fn note_decoy_write_probe(
+        &mut self,
+        session_id: SessionId,
+        kind: crate::policy::DecoyWriteProbePathKind,
+    ) -> io::Result<crate::policy::DiscoveryReconState> {
+        let mut record = self.record(session_id);
+        record.discovery_decoy_write_probe_count = record
+            .discovery_decoy_write_probe_count
+            .saturating_add(1)
+            .min(crate::policy::discovery_recon_decoy_write_probe_count_cap());
+        record.discovery_decoy_write_probe_fanout =
+            record.discovery_decoy_write_probe_fanout.mark(kind);
+        self.records.insert(session_id, record);
+        self.persist()?;
+        Ok(discovery_recon_state(record))
+    }
+
     fn persist(&self) -> io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -123,6 +234,16 @@ impl PolicyStateStore {
                 session_id: *session_id,
                 policy_state: record.policy_state,
                 controlled_reality_depth: record.controlled_reality_depth,
+                reality_escape_attempt_count: record.reality_escape_attempt_count,
+                discovery_surface_fanout: record.discovery_surface_fanout,
+                discovery_request_count: record.discovery_request_count,
+                discovery_query_seen: record.discovery_query_seen,
+                discovery_legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
+                discovery_linked_bait_surface_fanout: record.discovery_linked_bait_surface_fanout,
+                discovery_decoy_write_probe_count: record.discovery_decoy_write_probe_count,
+                discovery_decoy_write_probe_fanout: record.discovery_decoy_write_probe_fanout,
+                discovery_decoy_write_probe_seen: false,
+                discovery_linked_bait_surface_seen: false,
             })
             .collect();
         sessions.sort_by_key(|record| record.session_id.0);
@@ -158,6 +279,24 @@ impl PolicyStateStore {
     }
 }
 
+fn discovery_recon_state(record: SessionPolicyRecord) -> crate::policy::DiscoveryReconState {
+    crate::policy::DiscoveryReconState {
+        fanout: record.discovery_surface_fanout,
+        request_count: record.discovery_request_count,
+        query_seen: record.discovery_query_seen,
+        legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
+        linked_bait_surface_seen: record.discovery_linked_bait_surface_fanout.any_seen(),
+        linked_bait_surface_classes: record
+            .discovery_linked_bait_surface_fanout
+            .distinct_surface_count(),
+        decoy_write_probe_seen: record.discovery_decoy_write_probe_count > 0,
+        decoy_write_probe_count: record.discovery_decoy_write_probe_count,
+        decoy_write_probe_path_classes: record
+            .discovery_decoy_write_probe_fanout
+            .distinct_path_count(),
+    }
+}
+
 fn deserialize_records(
     bytes: &[u8],
     path: &Path,
@@ -186,11 +325,49 @@ fn deserialize_records(
         .sessions
         .into_iter()
         .map(|session| {
+            let mut linked_bait_surface_fanout = session.discovery_linked_bait_surface_fanout;
+            if linked_bait_surface_fanout == crate::policy::LinkedBaitSurfaceFanout::default()
+                && session.discovery_linked_bait_surface_seen
+            {
+                linked_bait_surface_fanout = crate::policy::LinkedBaitSurfaceFanout {
+                    docs_seen: false,
+                    assets_seen: false,
+                    other_seen: true,
+                };
+            }
+            let discovery_decoy_write_probe_count = if session.discovery_decoy_write_probe_count
+                == 0
+                && session.discovery_decoy_write_probe_seen
+            {
+                1
+            } else {
+                session
+                    .discovery_decoy_write_probe_count
+                    .min(crate::policy::discovery_recon_decoy_write_probe_count_cap())
+            };
+            let mut discovery_decoy_write_probe_fanout = session.discovery_decoy_write_probe_fanout;
+            if discovery_decoy_write_probe_fanout == crate::policy::DecoyWriteProbeFanout::default()
+                && discovery_decoy_write_probe_count > 0
+            {
+                discovery_decoy_write_probe_fanout = crate::policy::DecoyWriteProbeFanout {
+                    reconcile_seen: false,
+                    other_seen: true,
+                };
+            }
             (
                 session.session_id,
                 SessionPolicyRecord {
                     policy_state: session.policy_state,
                     controlled_reality_depth: session.controlled_reality_depth,
+                    reality_escape_attempt_count: session.reality_escape_attempt_count,
+                    discovery_surface_fanout: session.discovery_surface_fanout,
+                    discovery_request_count: session.discovery_request_count,
+                    discovery_query_seen: session.discovery_query_seen,
+                    discovery_legacy_openapi_query_seen: session
+                        .discovery_legacy_openapi_query_seen,
+                    discovery_linked_bait_surface_fanout: linked_bait_surface_fanout,
+                    discovery_decoy_write_probe_count,
+                    discovery_decoy_write_probe_fanout,
                 },
             )
         })
@@ -346,6 +523,12 @@ mod tests {
             .expect("state should update");
         assert_eq!(
             store
+                .note_reality_escape_attempt(session_id)
+                .expect("escape attempts should increment"),
+            1
+        );
+        assert_eq!(
+            store
                 .increment_controlled_reality_depth(session_id)
                 .expect("depth should increment"),
             1
@@ -357,5 +540,323 @@ mod tests {
         let record = store.record(session_id);
         assert_eq!(record.policy_state, PolicyState::Observe);
         assert_eq!(record.controlled_reality_depth, 0);
+        assert_eq!(record.reality_escape_attempt_count, 0);
+    }
+
+    #[test]
+    fn reality_escape_attempts_increment_and_clear() {
+        let mut store = PolicyStateStore::in_memory();
+        let session_id = SessionId::new();
+
+        assert_eq!(
+            store
+                .note_reality_escape_attempt(session_id)
+                .expect("escape attempts should increment"),
+            1
+        );
+        assert_eq!(
+            store
+                .note_reality_escape_attempt(session_id)
+                .expect("escape attempts should increment"),
+            2
+        );
+        assert_eq!(store.record(session_id).reality_escape_attempt_count, 2);
+
+        store
+            .clear_reality_escape_attempts(session_id)
+            .expect("escape attempts should clear");
+        assert_eq!(store.record(session_id).reality_escape_attempt_count, 0);
+    }
+
+    #[test]
+    fn notes_and_persists_discovery_recon_state() {
+        let path = unique_temp_path("fanout");
+        let session_id = SessionId::new();
+
+        let mut store = must_ok(PolicyStateStore::open(&path), "store should open");
+        assert_eq!(
+            must_ok(
+                store.note_discovery_surface_request(
+                    session_id,
+                    crate::policy::DiscoverySurfaceKind::Docs,
+                    true,
+                    false,
+                ),
+                "docs should persist"
+            ),
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
+                decoy_write_probe_count: 0,
+                decoy_write_probe_path_classes: 0,
+            }
+        );
+        assert_eq!(
+            must_ok(
+                store.note_linked_bait_surface_request(
+                    session_id,
+                    crate::policy::LinkedBaitSurfaceKind::Docs,
+                ),
+                "linked bait surface should persist"
+            ),
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 1,
+                decoy_write_probe_seen: false,
+                decoy_write_probe_count: 0,
+                decoy_write_probe_path_classes: 0,
+            }
+        );
+        assert_eq!(
+            must_ok(
+                store.note_linked_bait_surface_request(
+                    session_id,
+                    crate::policy::LinkedBaitSurfaceKind::Assets,
+                ),
+                "second linked bait surface should persist"
+            ),
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 2,
+                decoy_write_probe_seen: false,
+                decoy_write_probe_count: 0,
+                decoy_write_probe_path_classes: 0,
+            }
+        );
+        assert_eq!(
+            must_ok(
+                store.note_decoy_write_probe(
+                    session_id,
+                    crate::policy::DecoyWriteProbePathKind::Reconcile,
+                ),
+                "blind decoy write probe should persist"
+            ),
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 2,
+                decoy_write_probe_seen: true,
+                decoy_write_probe_count: 1,
+                decoy_write_probe_path_classes: 1,
+            }
+        );
+        assert_eq!(
+            must_ok(
+                store.note_decoy_write_probe(
+                    session_id,
+                    crate::policy::DecoyWriteProbePathKind::Other,
+                ),
+                "repeated blind decoy write probe should cap cleanly"
+            ),
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 2,
+                decoy_write_probe_seen: true,
+                decoy_write_probe_count: 2,
+                decoy_write_probe_path_classes: 2,
+            }
+        );
+        assert_eq!(
+            must_ok(
+                store.note_discovery_surface_request(
+                    session_id,
+                    crate::policy::DiscoverySurfaceKind::OpenApi,
+                    true,
+                    true,
+                ),
+                "openapi should persist"
+            ),
+            crate::policy::DiscoveryReconState {
+                fanout: crate::policy::DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: true,
+                },
+                request_count: 2,
+                query_seen: true,
+                legacy_openapi_query_seen: true,
+                linked_bait_surface_seen: true,
+                linked_bait_surface_classes: 2,
+                decoy_write_probe_seen: true,
+                decoy_write_probe_count: 2,
+                decoy_write_probe_path_classes: 2,
+            }
+        );
+
+        let reopened = must_ok(PolicyStateStore::open(&path), "store should reopen");
+        assert_eq!(
+            reopened.record(session_id).discovery_surface_fanout,
+            crate::policy::DiscoverySurfaceFanout {
+                docs_seen: true,
+                openapi_seen: true,
+            }
+        );
+        assert_eq!(reopened.record(session_id).discovery_request_count, 2);
+        assert!(reopened.record(session_id).discovery_query_seen);
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_legacy_openapi_query_seen
+        );
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_linked_bait_surface_fanout
+                .docs_seen
+        );
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_linked_bait_surface_fanout
+                .assets_seen
+        );
+        assert_eq!(
+            reopened
+                .record(session_id)
+                .discovery_decoy_write_probe_count,
+            2
+        );
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_decoy_write_probe_fanout
+                .reconcile_seen
+        );
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_decoy_write_probe_fanout
+                .other_seen
+        );
+    }
+
+    #[test]
+    fn older_store_without_discovery_fanout_defaults_cleanly() {
+        let path = unique_temp_path("legacy-fanout");
+        let session_id = SessionId::new();
+        let legacy = format!(
+            "{{\"schema_version\":1,\"sessions\":[{{\"session_id\":\"{}\",\"policy_state\":\"observe\",\"controlled_reality_depth\":0}}]}}",
+            session_id.0
+        );
+        must_ok(fs::write(&path, legacy), "legacy store should write");
+
+        let reopened = must_ok(PolicyStateStore::open(&path), "legacy store should reopen");
+        assert_eq!(
+            reopened.record(session_id).discovery_surface_fanout,
+            crate::policy::DiscoverySurfaceFanout::default()
+        );
+        assert_eq!(reopened.record(session_id).reality_escape_attempt_count, 0);
+        assert_eq!(reopened.record(session_id).discovery_request_count, 0);
+        assert!(!reopened.record(session_id).discovery_query_seen);
+        assert!(
+            !reopened
+                .record(session_id)
+                .discovery_legacy_openapi_query_seen
+        );
+        assert_eq!(
+            reopened
+                .record(session_id)
+                .discovery_decoy_write_probe_count,
+            0
+        );
+        assert!(!reopened
+            .record(session_id)
+            .discovery_linked_bait_surface_fanout
+            .any_seen());
+    }
+
+    #[test]
+    fn older_store_with_legacy_linked_bait_seen_migrates_to_fanout() {
+        let path = unique_temp_path("legacy-linked-bait");
+        let session_id = SessionId::new();
+        let legacy = format!(
+            "{{\"schema_version\":1,\"sessions\":[{{\"session_id\":\"{}\",\"policy_state\":\"observe\",\"controlled_reality_depth\":0,\"discovery_linked_bait_surface_seen\":true}}]}}",
+            session_id.0
+        );
+        must_ok(
+            fs::write(&path, legacy),
+            "legacy linked-bait store should write",
+        );
+
+        let reopened = must_ok(
+            PolicyStateStore::open(&path),
+            "legacy linked-bait store should reopen",
+        );
+        assert_eq!(
+            reopened
+                .record(session_id)
+                .discovery_linked_bait_surface_fanout,
+            crate::policy::LinkedBaitSurfaceFanout {
+                docs_seen: false,
+                assets_seen: false,
+                other_seen: true,
+            }
+        );
+    }
+
+    #[test]
+    fn older_store_with_legacy_decoy_write_probe_seen_migrates_to_count() {
+        let path = unique_temp_path("legacy-decoy-write");
+        let session_id = SessionId::new();
+        let legacy = format!(
+            "{{\"schema_version\":1,\"sessions\":[{{\"session_id\":\"{}\",\"policy_state\":\"observe\",\"controlled_reality_depth\":0,\"discovery_decoy_write_probe_seen\":true}}]}}",
+            session_id.0
+        );
+        must_ok(
+            fs::write(&path, legacy),
+            "legacy decoy-write store should write",
+        );
+
+        let reopened = must_ok(
+            PolicyStateStore::open(&path),
+            "legacy decoy-write store should reopen",
+        );
+
+        assert_eq!(
+            reopened
+                .record(session_id)
+                .discovery_decoy_write_probe_count,
+            1
+        );
+        assert!(
+            reopened
+                .record(session_id)
+                .discovery_decoy_write_probe_fanout
+                .other_seen
+        );
     }
 }

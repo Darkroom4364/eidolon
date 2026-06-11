@@ -96,6 +96,7 @@ mod tests {
                 ],
                 ingress_identity: IngressIdentity::default(),
                 ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         )

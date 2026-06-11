@@ -2,8 +2,10 @@ use std::fmt::Write;
 
 use eidolon_core::{
     EdgeEvidenceRef, EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestRef,
-    EidolonEdgeDecisionExport, EventKind, IngressAdvisorySignals, PolicyState, RoutingDecision,
-    TRUSTED_INGRESS_CONTRACT_VERSION,
+    EidolonEdgeDecisionExport, EventKind, IngressAdvisorySignals, PolicyState,
+    PostContainmentPersistenceKind, PreContainmentPersistenceClass, PreContainmentPersistenceKind,
+    RoutingDecision, POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY,
+    PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY, TRUSTED_INGRESS_CONTRACT_VERSION,
 };
 
 use crate::evidence::trace_metric_summary_for_timeline;
@@ -262,6 +264,7 @@ pub fn edge_decision_export_for_evidence(
             path,
             ingress_identity,
             ingress_signals,
+            discovery_recon_score,
             routing_decision,
             ..
         } = &event.event.kind
@@ -275,25 +278,46 @@ pub fn edge_decision_export_for_evidence(
             path.clone(),
             ingress_identity.clone(),
             ingress_signals.clone(),
+            discovery_recon_score.clone(),
             *routing_decision,
         ))
     })?;
 
-    let (request_event, method, path, ingress_identity, ingress_signals, request_routing_decision) =
-        latest_request;
-    let latest_policy_event = bundle.policy_events.last();
-    let policy_state = latest_policy_event
+    let (
+        request_event,
+        method,
+        path,
+        ingress_identity,
+        ingress_signals,
+        discovery_recon_score,
+        request_routing_decision,
+    ) = latest_request;
+    let latest_policy_routing_event = bundle
+        .policy_events
+        .iter()
+        .rev()
+        .find(|event| event.routing_decision.is_some());
+    let fallback_policy_snapshot_event =
+        latest_policy_routing_event.or(bundle.policy_events.last());
+    let policy_state = fallback_policy_snapshot_event
         .map(|event| event.policy_state)
         .or(bundle.policy_state)
         .unwrap_or(request_event.event.policy_state);
-    let routing_decision = latest_policy_event
+    let latest_policy_reason_event = preferred_policy_reason_event(bundle, policy_state);
+    let routing_decision = latest_policy_routing_event
         .and_then(|event| event.routing_decision)
         .unwrap_or(request_routing_decision);
-    let reason = latest_policy_event
+    let reason = latest_policy_reason_event
         .and_then(|event| event.reason.clone())
         .unwrap_or_else(|| "latest request routing decision".to_string());
     let edge_recommendation =
         edge_recommendation_for(policy_state, routing_decision, reason.as_str());
+    let pre_containment_persistence_class =
+        pre_containment_persistence_class_for(policy_state, reason.as_str());
+    let pre_containment_persistence_kind =
+        pre_containment_persistence_kind_for(policy_state, reason.as_str());
+    let post_containment_persistence_kind =
+        post_containment_persistence_kind_for(policy_state, reason.as_str());
 
     Some(EidolonEdgeDecisionExport {
         contract_version: TRUSTED_INGRESS_CONTRACT_VERSION.to_string(),
@@ -302,14 +326,22 @@ pub fn edge_decision_export_for_evidence(
         request: EdgeRequestRef { method, path },
         ingress_identity,
         ingress_signals,
+        discovery_recon_score,
         policy: EdgePolicySnapshot {
             state: policy_state,
             routing_decision,
             reason,
+            pre_containment_persistence_class,
+            pre_containment_persistence_kind,
+            post_containment_persistence_kind,
         },
         evidence: EdgeEvidenceRef {
             event_schema_version: request_event.event.schema_version,
-            event_ids: edge_export_event_ids(timeline, request_event, latest_policy_event),
+            event_ids: edge_export_event_ids(
+                timeline,
+                request_event,
+                [latest_policy_reason_event, latest_policy_routing_event],
+            ),
             bundle_ref: format!("session:{}", bundle.session_id.0),
         },
         edge_recommendation,
@@ -319,13 +351,15 @@ pub fn edge_decision_export_for_evidence(
 fn edge_export_event_ids(
     timeline: &SessionTimeline,
     request_event: &TimelineEvent,
-    latest_policy_event: Option<&crate::PolicyEventEvidence>,
+    policy_events: [Option<&crate::PolicyEventEvidence>; 2],
 ) -> Vec<uuid::Uuid> {
     let mut event_ids = vec![request_event.event.id];
 
-    if let Some(policy_event) = latest_policy_event {
+    for policy_event in policy_events.into_iter().flatten() {
         if let Some(timeline_event) = timeline_event_by_ref(timeline, policy_event.event_ref) {
-            if timeline_event.event.id != request_event.event.id {
+            if timeline_event.event.id != request_event.event.id
+                && !event_ids.contains(&timeline_event.event.id)
+            {
                 event_ids.push(timeline_event.event.id);
             }
         }
@@ -365,13 +399,15 @@ fn edge_recommendation_for(
             | RoutingDecision::RateLimited
             | RoutingDecision::EidolonOwned
     ) {
+        let mut reason_codes = vec![
+            "eidolon_runtime_enforcement".to_string(),
+            snake_case_debug(&routing_decision),
+        ];
+        reason_codes.extend(grouped_enforcement_reason_codes(policy_state, reason));
         return EdgeRecommendation {
             action: EdgeRecommendedAction::PreserveEidolonRouting,
             ttl_seconds: Some(300),
-            reason_codes: vec![
-                "eidolon_runtime_enforcement".to_string(),
-                snake_case_debug(&routing_decision),
-            ],
+            reason_codes,
         };
     }
 
@@ -388,6 +424,103 @@ fn edge_recommendation_for(
         ttl_seconds: None,
         reason_codes: vec![snake_case_debug(&routing_decision)],
     }
+}
+
+fn grouped_enforcement_reason_codes(policy_state: PolicyState, reason: &str) -> Vec<String> {
+    if matches!(
+        policy_state,
+        PolicyState::RateLimited | PolicyState::Blocked
+    ) {
+        if policy_state == PolicyState::RateLimited {
+            if let Some(class) = PreContainmentPersistenceClass::from_reason(reason) {
+                return vec![
+                    PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
+                    class.code().to_string(),
+                ];
+            }
+        } else if let Some(kind) = PreContainmentPersistenceKind::from_reason(reason) {
+            return vec![
+                PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
+                kind.detail_code().to_string(),
+            ];
+        }
+    } else {
+        return Vec::new();
+    }
+
+    if let Some(kind) = PostContainmentPersistenceKind::from_reason(reason) {
+        return vec![
+            POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
+            kind.detail_code().to_string(),
+        ];
+    }
+
+    Vec::new()
+}
+
+fn pre_containment_persistence_class_for(
+    policy_state: PolicyState,
+    reason: &str,
+) -> Option<PreContainmentPersistenceClass> {
+    matches!(
+        policy_state,
+        PolicyState::RateLimited | PolicyState::Blocked
+    )
+    .then(|| PreContainmentPersistenceClass::from_reason(reason))
+    .flatten()
+}
+
+fn pre_containment_persistence_kind_for(
+    policy_state: PolicyState,
+    reason: &str,
+) -> Option<PreContainmentPersistenceKind> {
+    (policy_state == PolicyState::Blocked)
+        .then(|| PreContainmentPersistenceKind::from_reason(reason))
+        .flatten()
+}
+
+fn post_containment_persistence_kind_for(
+    policy_state: PolicyState,
+    reason: &str,
+) -> Option<PostContainmentPersistenceKind> {
+    (policy_state == PolicyState::Blocked)
+        .then(|| PostContainmentPersistenceKind::from_reason(reason))
+        .flatten()
+}
+
+fn preferred_policy_reason_event(
+    bundle: &EvidenceBundle,
+    policy_state: PolicyState,
+) -> Option<&crate::PolicyEventEvidence> {
+    if matches!(
+        policy_state,
+        PolicyState::RateLimited | PolicyState::Blocked
+    ) {
+        if let Some(event) = bundle.policy_events.iter().rev().find(|event| {
+            let Some(reason) = event.reason.as_deref() else {
+                return false;
+            };
+
+            match policy_state {
+                PolicyState::RateLimited => {
+                    PreContainmentPersistenceClass::from_reason(reason).is_some()
+                }
+                PolicyState::Blocked => {
+                    PreContainmentPersistenceKind::from_reason(reason).is_some()
+                        || PostContainmentPersistenceKind::from_reason(reason).is_some()
+                }
+                _ => false,
+            }
+        }) {
+            return Some(event);
+        }
+    }
+
+    bundle
+        .policy_events
+        .iter()
+        .rev()
+        .find(|event| event.reason.is_some())
 }
 
 fn latest_ingress_signal_summary(timeline: &SessionTimeline) -> Option<String> {
@@ -678,10 +811,10 @@ fn markdown_text(value: &str) -> String {
 mod tests {
     use chrono::{TimeDelta, TimeZone, Utc};
     use eidolon_core::{
-        BaitId, EdgeRecommendedAction, Event, EventKind, EventSource, ExposureId, IngressActorKind,
-        IngressAdvisorySignals, IngressIdentity, IngressIdentitySource, IngressTrustTier,
-        IngressVerificationStrength, PolicyState, RoutingDecision, SafeHeaderObservation,
-        SessionId, TRUSTED_INGRESS_CONTRACT_VERSION,
+        BaitId, DiscoveryReconScore, EdgeRecommendedAction, Event, EventKind, EventSource,
+        ExposureId, IngressActorKind, IngressAdvisorySignals, IngressIdentity,
+        IngressIdentitySource, IngressTrustTier, IngressVerificationStrength, PolicyState,
+        RoutingDecision, SafeHeaderObservation, SessionId, TRUSTED_INGRESS_CONTRACT_VERSION,
     };
 
     use crate::{evidence_bundle_for_timeline, TimelineEvent};
@@ -731,6 +864,7 @@ mod tests {
                 ],
                 ingress_identity: IngressIdentity::default(),
                 ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
                 routing_decision: RoutingDecision::EidolonOwned,
             },
         )
@@ -756,6 +890,13 @@ mod tests {
                     vendor_score_scale: Some("1-99".to_string()),
                     detection_ids: vec!["3355446".to_string()],
                     edge_action: Some(EdgeRecommendedAction::Allow),
+                },
+                discovery_recon_score: DiscoveryReconScore {
+                    detection_score: 2,
+                    query_score: 1,
+                    total: 3,
+                    threshold: 3,
+                    ..DiscoveryReconScore::default()
                 },
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
@@ -827,6 +968,7 @@ mod tests {
                 safe_headers: Vec::new(),
                 ingress_identity: IngressIdentity::default(),
                 ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
                 routing_decision,
             },
         )
@@ -992,6 +1134,7 @@ mod tests {
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
                     ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             ),
@@ -1071,6 +1214,13 @@ mod tests {
                         detection_ids: vec!["3355446".to_string()],
                         edge_action: Some(EdgeRecommendedAction::Allow),
                     },
+                    discovery_recon_score: DiscoveryReconScore {
+                        detection_score: 2,
+                        query_score: 1,
+                        total: 3,
+                        threshold: 3,
+                        ..DiscoveryReconScore::default()
+                    },
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             ),
@@ -1101,6 +1251,10 @@ mod tests {
             export.ingress_signals.edge_action,
             Some(EdgeRecommendedAction::Allow)
         );
+        assert_eq!(export.discovery_recon_score.detection_score, 2);
+        assert_eq!(export.discovery_recon_score.query_score, 1);
+        assert_eq!(export.discovery_recon_score.total, 3);
+        assert_eq!(export.discovery_recon_score.threshold, 3);
         assert_eq!(
             export.edge_recommendation.action,
             EdgeRecommendedAction::Allow
@@ -1125,6 +1279,7 @@ mod tests {
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
                     ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ControlledReality,
                 },
             ),
@@ -1156,6 +1311,566 @@ mod tests {
             .edge_recommendation
             .reason_codes
             .contains(&"eidolon_runtime_enforcement".to_string()));
+    }
+
+    #[test]
+    fn edge_decision_export_groups_rate_limited_discovery_recon_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: DiscoveryReconScore {
+                        repeated_discovery_score: 2,
+                        query_score: 1,
+                        legacy_openapi_query_score: 2,
+                        linked_bait_surface_score: 0,
+                        linked_bait_class_fanout_bonus: 0,
+                        decoy_write_probe_score: 0,
+                        decoy_write_probe_path_fanout_bonus: 0,
+                        detection_score: 0,
+                        total: 5,
+                        threshold: 5,
+                    },
+                    routing_decision: RoutingDecision::RateLimited,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::PolicyChanged {
+                    from: PolicyState::Suspicious,
+                    to: PolicyState::RateLimited,
+                    reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RateLimitApplied {
+                    reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "rate_limited".to_string(),
+                "pre_containment_persistence".to_string(),
+                "discovery_recon".to_string(),
+            ]
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::DiscoveryRecon)
+        );
+        assert_eq!(export.policy.pre_containment_persistence_kind, None);
+    }
+
+    #[test]
+    fn edge_decision_export_groups_rate_limited_same_bait_near_miss_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::RateLimited,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::PolicyChanged {
+                    from: PolicyState::Suspicious,
+                    to: PolicyState::RateLimited,
+                    reason: "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RateLimitApplied {
+                    reason: "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss".to_string(),
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "rate_limited".to_string(),
+                "pre_containment_persistence".to_string(),
+                "same_bait_near_miss".to_string(),
+            ]
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::SameBaitNearMiss)
+        );
+        assert_eq!(export.policy.pre_containment_persistence_kind, None);
+    }
+
+    #[test]
+    fn edge_decision_export_prefers_structured_rate_limit_reason_over_generic_policy_decision() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: IngressAdvisorySignals {
+                        actor_kind: eidolon_core::IngressActorKind::AgenticBrowser,
+                        vendor_score: Some(35),
+                        vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                        detection_ids: vec!["3355446".to_string(), "445566".to_string()],
+                        ..Default::default()
+                    },
+                    discovery_recon_score: DiscoveryReconScore {
+                        repeated_discovery_score: 2,
+                        query_score: 1,
+                        detection_score: 2,
+                        total: 5,
+                        threshold: 5,
+                        ..Default::default()
+                    },
+                    routing_decision: RoutingDecision::RateLimited,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::RateLimitApplied {
+                    reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=1 query_seen=true legacy_openapi_query_seen=false linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=2 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=0 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=2 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::PolicyDecision {
+                    routing_decision: RoutingDecision::RateLimited,
+                    reason: "rate limited policy throttles the request".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::ResponseServed {
+                    status: 429,
+                    routing_decision: RoutingDecision::RateLimited,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export
+            .policy
+            .reason
+            .contains("suspicious discovery recon persistence moved session to rate limited"));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "rate_limited".to_string(),
+                "pre_containment_persistence".to_string(),
+                "discovery_recon".to_string(),
+            ]
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::DiscoveryRecon)
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_groups_repeated_escape_block_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/api/v1/projects".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Blocked,
+                EventKind::PolicyChanged {
+                    from: PolicyState::ControlledReality,
+                    to: PolicyState::Blocked,
+                    reason: "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2 post_containment_persistence_kind=controlled_reality_branch_escape".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::ResponseServed {
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export.policy.reason.contains(
+            "controlled session repeatedly probed outside the controlled-reality branch"
+        ));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "eidolon_owned".to_string(),
+                "post_containment_persistence".to_string(),
+                "controlled_reality_branch_escape".to_string(),
+            ]
+        );
+        assert_eq!(
+            export.policy.post_containment_persistence_kind,
+            Some(PostContainmentPersistenceKind::ControlledRealityBranchEscape)
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_groups_repeated_near_miss_block_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Blocked,
+                EventKind::PolicyChanged {
+                    from: PolicyState::RateLimited,
+                    to: PolicyState::Blocked,
+                    reason: "rate-limited same-bait near miss retry moved session to blocked: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss persistence_kind=same_bait_near_miss_retry".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::ResponseServed {
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export
+            .policy
+            .reason
+            .contains("rate-limited same-bait near miss retry moved session to blocked"));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "eidolon_owned".to_string(),
+                "pre_containment_persistence".to_string(),
+                "same_bait_near_miss_retry".to_string(),
+            ]
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::SameBaitNearMiss)
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_kind,
+            Some(PreContainmentPersistenceKind::SameBaitNearMissRetry)
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_groups_repeated_discovery_recon_block_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: DiscoveryReconScore {
+                        repeated_discovery_score: 2,
+                        query_score: 1,
+                        legacy_openapi_query_score: 2,
+                        linked_bait_surface_score: 0,
+                        linked_bait_class_fanout_bonus: 0,
+                        decoy_write_probe_score: 0,
+                        decoy_write_probe_path_fanout_bonus: 0,
+                        detection_score: 0,
+                        total: 5,
+                        threshold: 5,
+                    },
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Blocked,
+                EventKind::PolicyChanged {
+                    from: PolicyState::RateLimited,
+                    to: PolicyState::Blocked,
+                    reason: "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_class=discovery_recon persistence_kind=discovery_recon_retry".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::ResponseServed {
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export
+            .policy
+            .reason
+            .contains("rate-limited discovery recon retry moved session to blocked"));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "eidolon_owned".to_string(),
+                "pre_containment_persistence".to_string(),
+                "discovery_recon_retry".to_string(),
+            ]
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::DiscoveryRecon)
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_kind,
+            Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_groups_blind_write_recon_block_into_write_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/validate".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: DiscoveryReconScore {
+                        repeated_discovery_score: 0,
+                        query_score: 1,
+                        legacy_openapi_query_score: 0,
+                        linked_bait_surface_score: 0,
+                        linked_bait_class_fanout_bonus: 0,
+                        decoy_write_probe_score: 3,
+                        decoy_write_probe_path_fanout_bonus: 1,
+                        detection_score: 0,
+                        total: 5,
+                        threshold: 5,
+                    },
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Blocked,
+                EventKind::PolicyChanged {
+                    from: PolicyState::RateLimited,
+                    to: PolicyState::Blocked,
+                    reason: "rate-limited discovery recon retry moved session to blocked: path=/api/v2/import/validate actor_kind=agentic_browser vendor_score=35 discovery_requests=1 distinct_surfaces=1 query_seen=true legacy_openapi_query_seen=false linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=true decoy_write_probe_count=2 decoy_write_probe_path_classes=2 detection_count=0 repeated_discovery_score=0 query_score=1 legacy_openapi_query_score=0 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=3 decoy_write_probe_path_fanout_bonus=1 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_class=write_recon persistence_kind=write_recon_retry".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::ResponseServed {
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export
+            .policy
+            .reason
+            .contains("rate-limited discovery recon retry moved session to blocked"));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "eidolon_owned".to_string(),
+                "pre_containment_persistence".to_string(),
+                "write_recon_retry".to_string(),
+            ]
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::WriteRecon)
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_kind,
+            Some(PreContainmentPersistenceKind::WriteReconRetry)
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_groups_depth_limit_block_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Blocked,
+                EventKind::PolicyChanged {
+                    from: PolicyState::ControlledReality,
+                    to: PolicyState::Blocked,
+                    reason: "controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4 post_containment_persistence_kind=controlled_reality_depth_limit".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::ResponseServed {
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export
+            .policy
+            .reason
+            .contains("controlled-reality probe continued after depth-limit throttle"));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "eidolon_owned".to_string(),
+                "post_containment_persistence".to_string(),
+                "controlled_reality_depth_limit".to_string(),
+            ]
+        );
+        assert_eq!(
+            export.policy.post_containment_persistence_kind,
+            Some(PostContainmentPersistenceKind::ControlledRealityDepthLimit)
+        );
     }
 
     #[test]
