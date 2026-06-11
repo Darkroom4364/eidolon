@@ -318,6 +318,8 @@ pub fn edge_decision_export_for_evidence(
         edge_recommendation_for(policy_state, routing_decision, reason.as_str());
     let pre_containment_persistence_class =
         pre_containment_persistence_class_for(policy_state, reason.as_str());
+    let pre_containment_persistence_kind =
+        pre_containment_persistence_kind_for(policy_state, reason.as_str());
 
     Some(EidolonEdgeDecisionExport {
         contract_version: TRUSTED_INGRESS_CONTRACT_VERSION.to_string(),
@@ -332,6 +334,7 @@ pub fn edge_decision_export_for_evidence(
             routing_decision,
             reason,
             pre_containment_persistence_class,
+            pre_containment_persistence_kind,
         },
         evidence: EdgeEvidenceRef {
             event_schema_version: request_event.event.schema_version,
@@ -477,6 +480,15 @@ fn pre_containment_persistence_class_for(
     )
     .then(|| PreContainmentPersistenceClass::from_reason(reason))
     .flatten()
+}
+
+fn pre_containment_persistence_kind_for(
+    policy_state: PolicyState,
+    reason: &str,
+) -> Option<PreContainmentPersistenceKind> {
+    (policy_state == PolicyState::Blocked)
+        .then(|| PreContainmentPersistenceKind::from_reason(reason))
+        .flatten()
 }
 
 fn latest_ingress_signal_summary(timeline: &SessionTimeline) -> Option<String> {
@@ -1336,6 +1348,7 @@ mod tests {
             export.policy.pre_containment_persistence_class,
             Some(PreContainmentPersistenceClass::DiscoveryRecon)
         );
+        assert_eq!(export.policy.pre_containment_persistence_kind, None);
     }
 
     #[test]
@@ -1394,6 +1407,7 @@ mod tests {
             export.policy.pre_containment_persistence_class,
             Some(PreContainmentPersistenceClass::SameBaitNearMiss)
         );
+        assert_eq!(export.policy.pre_containment_persistence_kind, None);
     }
 
     #[test]
@@ -1515,6 +1529,10 @@ mod tests {
             export.policy.pre_containment_persistence_class,
             Some(PreContainmentPersistenceClass::SameBaitNearMiss)
         );
+        assert_eq!(
+            export.policy.pre_containment_persistence_kind,
+            Some(PreContainmentPersistenceKind::SameBaitNearMissRetry)
+        );
     }
 
     #[test]
@@ -1589,6 +1607,10 @@ mod tests {
             export.policy.pre_containment_persistence_class,
             Some(PreContainmentPersistenceClass::DiscoveryRecon)
         );
+        assert_eq!(
+            export.policy.pre_containment_persistence_kind,
+            Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
+        );
     }
 
     #[test]
@@ -1662,6 +1684,10 @@ mod tests {
         assert_eq!(
             export.policy.pre_containment_persistence_class,
             Some(PreContainmentPersistenceClass::WriteRecon)
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_kind,
+            Some(PreContainmentPersistenceKind::WriteReconRetry)
         );
     }
 
