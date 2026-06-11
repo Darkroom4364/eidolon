@@ -334,6 +334,8 @@ Status checklist:
   (`current branch only`)
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs
+  and the same advisory detection input is now also proven on the
+  higher-threshold `suspicious -> rate_limited` weighted recon path
   (`current branch only`)
 - [x] First target-side-only aggregated suspicious-promotion path exists for
   medium-score legacy-query OpenAPI discovery (`current branch only`)

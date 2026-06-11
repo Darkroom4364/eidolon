@@ -292,23 +292,17 @@ pub fn edge_decision_export_for_evidence(
         discovery_recon_score,
         request_routing_decision,
     ) = latest_request;
-    let latest_policy_reason_event = bundle
-        .policy_events
-        .iter()
-        .rev()
-        .find(|event| event.reason.is_some());
     let latest_policy_routing_event = bundle
         .policy_events
         .iter()
         .rev()
         .find(|event| event.routing_decision.is_some());
-    let latest_policy_snapshot_event = latest_policy_reason_event
-        .or(latest_policy_routing_event)
-        .or(bundle.policy_events.last());
-    let policy_state = latest_policy_snapshot_event
+    let fallback_policy_snapshot_event = latest_policy_routing_event.or(bundle.policy_events.last());
+    let policy_state = fallback_policy_snapshot_event
         .map(|event| event.policy_state)
         .or(bundle.policy_state)
         .unwrap_or(request_event.event.policy_state);
+    let latest_policy_reason_event = preferred_policy_reason_event(bundle, policy_state);
     let routing_decision = latest_policy_routing_event
         .and_then(|event| event.routing_decision)
         .unwrap_or(request_routing_decision);
@@ -491,6 +485,38 @@ fn post_containment_persistence_kind_for(
     (policy_state == PolicyState::Blocked)
         .then(|| PostContainmentPersistenceKind::from_reason(reason))
         .flatten()
+}
+
+fn preferred_policy_reason_event(
+    bundle: &EvidenceBundle,
+    policy_state: PolicyState,
+) -> Option<&crate::PolicyEventEvidence> {
+    if matches!(policy_state, PolicyState::RateLimited | PolicyState::Blocked) {
+        if let Some(event) = bundle.policy_events.iter().rev().find(|event| {
+            let Some(reason) = event.reason.as_deref() else {
+                return false;
+            };
+
+            match policy_state {
+                PolicyState::RateLimited => {
+                    PreContainmentPersistenceClass::from_reason(reason).is_some()
+                }
+                PolicyState::Blocked => {
+                    PreContainmentPersistenceKind::from_reason(reason).is_some()
+                        || PostContainmentPersistenceKind::from_reason(reason).is_some()
+                }
+                _ => false,
+            }
+        }) {
+            return Some(event);
+        }
+    }
+
+    bundle
+        .policy_events
+        .iter()
+        .rev()
+        .find(|event| event.reason.is_some())
 }
 
 fn latest_ingress_signal_summary(timeline: &SessionTimeline) -> Option<String> {
@@ -1410,6 +1436,89 @@ mod tests {
             Some(PreContainmentPersistenceClass::SameBaitNearMiss)
         );
         assert_eq!(export.policy.pre_containment_persistence_kind, None);
+    }
+
+    #[test]
+    fn edge_decision_export_prefers_structured_rate_limit_reason_over_generic_policy_decision() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: IngressAdvisorySignals {
+                        actor_kind: eidolon_core::IngressActorKind::AgenticBrowser,
+                        vendor_score: Some(35),
+                        vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                        detection_ids: vec!["3355446".to_string(), "445566".to_string()],
+                        ..Default::default()
+                    },
+                    discovery_recon_score: DiscoveryReconScore {
+                        repeated_discovery_score: 2,
+                        query_score: 1,
+                        detection_score: 2,
+                        total: 5,
+                        threshold: 5,
+                        ..Default::default()
+                    },
+                    routing_decision: RoutingDecision::RateLimited,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::RateLimitApplied {
+                    reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=1 query_seen=true legacy_openapi_query_seen=false linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=2 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=0 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=2 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::PolicyDecision {
+                    routing_decision: RoutingDecision::RateLimited,
+                    reason: "rate limited policy throttles the request".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::ResponseServed {
+                    status: 429,
+                    routing_decision: RoutingDecision::RateLimited,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export
+            .policy
+            .reason
+            .contains("suspicious discovery recon persistence moved session to rate limited"));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "rate_limited".to_string(),
+                "pre_containment_persistence".to_string(),
+                "discovery_recon".to_string(),
+            ]
+        );
+        assert_eq!(
+            export.policy.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::DiscoveryRecon)
+        );
     }
 
     #[test]

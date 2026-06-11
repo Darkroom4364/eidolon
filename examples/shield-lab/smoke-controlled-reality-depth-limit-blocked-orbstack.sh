@@ -257,6 +257,12 @@ jq -e \
   ' <<<"$blocked_transition_json" >/dev/null \
   || fail "session ${session_id} blocked transition reason did not match the depth-limit persistence path"
 
+jq -e '
+  (.kind.reason // "")
+  | contains("post_containment_persistence_kind=controlled_reality_depth_limit")
+' <<<"$blocked_transition_json" >/dev/null \
+  || fail "session ${session_id} blocked transition reason did not preserve the structured depth-limit persistence marker"
+
 blocked_response_json="$(
   jq -c -e -s \
     --arg session_id "$session_id" '
@@ -328,6 +334,7 @@ jq -e '
   and (($exports[0].edge_recommendation.reason_codes // []) | index("eidolon_owned")) != null
   and (($exports[0].edge_recommendation.reason_codes // []) | index("post_containment_persistence")) != null
   and (($exports[0].edge_recommendation.reason_codes // []) | index("controlled_reality_depth_limit")) != null
+  and $exports[0].policy.post_containment_persistence_kind == "controlled_reality_depth_limit"
 ' "$edge_export_file" >/dev/null \
   || fail "edge export did not preserve the controlled-reality depth-limit blocked runtime decision"
 
