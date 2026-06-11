@@ -236,6 +236,11 @@ The current M5 slice is intentionally narrow:
 - edge export now also exposes that persistence class as a structured
   `policy.pre_containment_persistence_class` field, so SIEM consumers do not
   need to infer it from `edge_recommendation.reason_codes`
+- blocked pre-containment exports now also expose the retry detail as a
+  structured `policy.pre_containment_persistence_kind` field, so downstream
+  consumers can distinguish `discovery_recon_retry`,
+  `same_bait_near_miss_retry`, and `write_recon_retry` without scraping
+  `reason_codes`
 - one conservative `rate_limited -> blocked` path now exists for repeating
   that same-bait near miss again after Eidolon has already throttled the
   session once, keeping blocked rare and tied to explicit retry behavior

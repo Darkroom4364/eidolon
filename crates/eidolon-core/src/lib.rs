@@ -288,7 +288,8 @@ impl PreContainmentPersistenceClass {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PreContainmentPersistenceKind {
     DiscoveryReconRetry,
     WriteReconRetry,
@@ -487,6 +488,8 @@ pub struct EdgePolicySnapshot {
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_containment_persistence_class: Option<PreContainmentPersistenceClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_containment_persistence_kind: Option<PreContainmentPersistenceKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -921,6 +924,9 @@ mod tests {
                 pre_containment_persistence_class: Some(
                     PreContainmentPersistenceClass::DiscoveryRecon,
                 ),
+                pre_containment_persistence_kind: Some(
+                    PreContainmentPersistenceKind::DiscoveryReconRetry,
+                ),
             },
             evidence: EdgeEvidenceRef {
                 event_schema_version: EVENT_SCHEMA_VERSION,
@@ -957,6 +963,10 @@ mod tests {
         assert_eq!(
             serialized["policy"]["pre_containment_persistence_class"],
             json!("discovery_recon")
+        );
+        assert_eq!(
+            serialized["policy"]["pre_containment_persistence_kind"],
+            json!("discovery_recon_retry")
         );
     }
 }

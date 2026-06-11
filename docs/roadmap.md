@@ -319,6 +319,9 @@ Status checklist:
   and `EidolonEdgeDecisionExport.policy` now carries that pre-containment
   persistence class as a structured field instead of forcing downstream
   consumers to scrape `reason_codes`
+  and blocked pre-containment exports now also carry the retry detail as a
+  structured `pre_containment_persistence_kind` field instead of requiring
+  downstream consumers to scrape `reason_codes`
   and edge export now distinguishes that direct blind write retry as
   `write_recon_retry` instead of the broader `discovery_recon_retry`
   and those pre-containment blocked detail codes now come from an explicit
