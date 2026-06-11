@@ -311,10 +311,14 @@ Status checklist:
   and repeated blind write-target fanout persistence can now also hit that
   same blocked rung directly after the second distinct unsafe probe caused
   rate limiting
+  and the `suspicious -> rate_limited` rung now stamps a shared
+  `persistence_class` marker so the rate-limit and blocked transitions reuse
+  the same pre-containment persistence classifier
   and edge export now distinguishes that direct blind write retry as
   `write_recon_retry` instead of the broader `discovery_recon_retry`
   and those pre-containment blocked detail codes now come from an explicit
-  proxy-stamped persistence kind instead of report-side string heuristics
+  proxy-stamped `persistence_class` plus blocked-only `persistence_kind`
+  instead of report-side string heuristics
   (`current branch only`)
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs

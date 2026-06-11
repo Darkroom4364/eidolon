@@ -5,6 +5,7 @@ use uuid::Uuid;
 pub const EVENT_SCHEMA_VERSION: u16 = 2;
 pub const TRUSTED_INGRESS_CONTRACT_VERSION: &str = "2026-06-05.v1";
 pub const PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY: &str = "pre_containment_persistence";
+pub const PRE_CONTAINMENT_PERSISTENCE_CLASS_FIELD: &str = "persistence_class";
 pub const PRE_CONTAINMENT_PERSISTENCE_KIND_FIELD: &str = "persistence_kind";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -219,6 +220,48 @@ impl DiscoveryReconScore {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreContainmentPersistenceClass {
+    DiscoveryRecon,
+    WriteRecon,
+    SameBaitNearMiss,
+}
+
+impl PreContainmentPersistenceClass {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::DiscoveryRecon => "discovery_recon",
+            Self::WriteRecon => "write_recon",
+            Self::SameBaitNearMiss => "same_bait_near_miss",
+        }
+    }
+
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::DiscoveryRecon => "persistence_class=discovery_recon",
+            Self::WriteRecon => "persistence_class=write_recon",
+            Self::SameBaitNearMiss => "persistence_class=same_bait_near_miss",
+        }
+    }
+
+    pub const fn blocked_kind(self) -> PreContainmentPersistenceKind {
+        match self {
+            Self::DiscoveryRecon => PreContainmentPersistenceKind::DiscoveryReconRetry,
+            Self::WriteRecon => PreContainmentPersistenceKind::WriteReconRetry,
+            Self::SameBaitNearMiss => PreContainmentPersistenceKind::SameBaitNearMissRetry,
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "discovery_recon" => Some(Self::DiscoveryRecon),
+            "write_recon" => Some(Self::WriteRecon),
+            "same_bait_near_miss" => Some(Self::SameBaitNearMiss),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreContainmentPersistenceKind {
     DiscoveryReconRetry,
     WriteReconRetry,
@@ -248,6 +291,13 @@ impl PreContainmentPersistenceKind {
             .find_map(|field| field.strip_prefix("persistence_kind="))
         {
             return Self::from_detail_code(detail_code);
+        }
+        if let Some(class_code) = reason
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("persistence_class="))
+        {
+            return PreContainmentPersistenceClass::from_code(class_code)
+                .map(PreContainmentPersistenceClass::blocked_kind);
         }
 
         if reason.contains("rate-limited same-bait near miss retry moved session to blocked") {
@@ -708,6 +758,17 @@ mod tests {
         assert_eq!(
             PreContainmentPersistenceKind::from_reason(reason),
             Some(PreContainmentPersistenceKind::WriteReconRetry)
+        );
+    }
+
+    #[test]
+    fn pre_containment_persistence_kind_can_fall_back_to_class_marker() {
+        let reason =
+            "suspicious discovery recon persistence moved session to rate limited: path=/docs persistence_class=discovery_recon";
+
+        assert_eq!(
+            PreContainmentPersistenceKind::from_reason(reason),
+            Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
         );
     }
 
