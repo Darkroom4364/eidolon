@@ -308,6 +308,8 @@ Status checklist:
   repeated medium-score top-level discovery churn after the first throttle
   and that blocked rung is now also proven with the blind decoy-write
   contributor in the score
+  and authenticated detection IDs are now also proven through that same
+  blocked rung for discovery-recon persistence
   and repeated blind write-target fanout persistence can now also hit that
   same blocked rung directly after the second distinct unsafe probe caused
   rate limiting

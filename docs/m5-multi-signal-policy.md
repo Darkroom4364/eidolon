@@ -252,6 +252,10 @@ The current M5 slice is intentionally narrow:
 - edge export now groups the adjacent recon-driven blocked retry under that
   same `pre_containment_persistence` family with the detail code
   `discovery_recon_retry` from those same explicit reason markers
+- the authenticated `detection_ids` contributor is now proven across both the
+  `suspicious -> rate_limited` and `rate_limited -> blocked` discovery-recon
+  rungs, so advisory detections now influence more than first-contact
+  promotion
 - edge export now splits the direct blind write-target retry case out of that
   generic recon bucket: when a blocked decision comes from repeating the
   rate-limited blind unsafe write path itself, the shared family stays
