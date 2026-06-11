@@ -561,6 +561,7 @@ pub fn transition_to_blocked_from_repeated_discovery_recon(
     current_state: PolicyState,
     path: &str,
     path_is_top_level_discovery: bool,
+    path_is_blind_decoy_write_probe: bool,
     ingress_identity: &IngressIdentity,
     ingress_signals: &IngressAdvisorySignals,
     recon_state: DiscoveryReconState,
@@ -571,7 +572,7 @@ pub fn transition_to_blocked_from_repeated_discovery_recon(
     if ingress_identity::softens_bait_surface_exposure(ingress_identity) {
         return None;
     }
-    if !path_is_top_level_discovery {
+    if !path_is_top_level_discovery && !path_is_blind_decoy_write_probe {
         return None;
     }
     if !matches!(
@@ -1272,6 +1273,7 @@ mod tests {
             PolicyState::RateLimited,
             "/docs",
             true,
+            false,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -1322,6 +1324,7 @@ mod tests {
             PolicyState::RateLimited,
             "/docs",
             true,
+            false,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -1372,6 +1375,7 @@ mod tests {
             PolicyState::RateLimited,
             "/docs/legacy-import",
             false,
+            false,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -1398,6 +1402,7 @@ mod tests {
             PolicyState::RateLimited,
             "/docs",
             true,
+            false,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -1424,6 +1429,7 @@ mod tests {
             PolicyState::Suspicious,
             "/docs",
             true,
+            false,
             &IngressIdentity::default(),
             &IngressAdvisorySignals {
                 actor_kind: IngressActorKind::AgenticBrowser,
@@ -1450,6 +1456,57 @@ mod tests {
         assert_eq!(no_top_level, None);
         assert_eq!(below_threshold, None);
         assert_eq!(suspicious, None);
+    }
+
+    #[test]
+    fn repeated_discovery_recon_block_allows_blind_write_fanout_contributor() {
+        let Some(transition) = transition_to_blocked_from_repeated_discovery_recon(
+            PolicyState::RateLimited,
+            "/api/v2/import/validate",
+            false,
+            true,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: true,
+                decoy_write_probe_count: 2,
+                decoy_write_probe_path_classes: 2,
+            },
+        ) else {
+            panic!("blind-write fanout should transition rate-limited recon to blocked");
+        };
+
+        assert_eq!(transition.from, PolicyState::RateLimited);
+        assert_eq!(transition.to, PolicyState::Blocked);
+        assert!(transition.reason.contains("path=/api/v2/import/validate"));
+        assert!(transition.reason.contains("discovery_requests=1"));
+        assert!(transition.reason.contains("query_seen=true"));
+        assert!(transition.reason.contains("decoy_write_probe_count=2"));
+        assert!(transition
+            .reason
+            .contains("decoy_write_probe_path_classes=2"));
+        assert!(transition.reason.contains("repeated_discovery_score=0"));
+        assert!(transition.reason.contains("query_score=1"));
+        assert!(transition.reason.contains("decoy_write_probe_score=3"));
+        assert!(transition
+            .reason
+            .contains("decoy_write_probe_path_fanout_bonus=1"));
+        assert!(transition.reason.contains("recon_score=5"));
+        assert!(transition.reason.contains("recon_block_threshold=5"));
     }
 
     #[test]
