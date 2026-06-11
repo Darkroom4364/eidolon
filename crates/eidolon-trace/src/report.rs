@@ -433,6 +433,14 @@ fn grouped_block_reason_codes(policy_state: PolicyState, reason: &str) -> Vec<St
     }
 
     if reason.contains("rate-limited discovery recon retry moved session to blocked") {
+        if reason.contains("repeated_discovery_score=0")
+            && reason.contains("decoy_write_probe_path_fanout_bonus=1")
+        {
+            return vec![
+                "pre_containment_persistence".to_string(),
+                "write_recon_retry".to_string(),
+            ];
+        }
         return vec![
             "pre_containment_persistence".to_string(),
             "discovery_recon_retry".to_string(),
@@ -1433,6 +1441,76 @@ mod tests {
                 "eidolon_owned".to_string(),
                 "pre_containment_persistence".to_string(),
                 "discovery_recon_retry".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_groups_blind_write_recon_block_into_write_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/validate".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: DiscoveryReconScore {
+                        repeated_discovery_score: 0,
+                        query_score: 1,
+                        legacy_openapi_query_score: 0,
+                        linked_bait_surface_score: 0,
+                        linked_bait_class_fanout_bonus: 0,
+                        decoy_write_probe_score: 3,
+                        decoy_write_probe_path_fanout_bonus: 1,
+                        detection_score: 0,
+                        total: 5,
+                        threshold: 5,
+                    },
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Blocked,
+                EventKind::PolicyChanged {
+                    from: PolicyState::RateLimited,
+                    to: PolicyState::Blocked,
+                    reason: "rate-limited discovery recon retry moved session to blocked: path=/api/v2/import/validate actor_kind=agentic_browser vendor_score=35 discovery_requests=1 distinct_surfaces=1 query_seen=true legacy_openapi_query_seen=false linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=true decoy_write_probe_count=2 decoy_write_probe_path_classes=2 detection_count=0 repeated_discovery_score=0 query_score=1 legacy_openapi_query_score=0 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=3 decoy_write_probe_path_fanout_bonus=1 detection_score=0 recon_score=5 recon_block_threshold=5".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Blocked,
+                EventKind::ResponseServed {
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert!(export
+            .policy
+            .reason
+            .contains("rate-limited discovery recon retry moved session to blocked"));
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "eidolon_owned".to_string(),
+                "pre_containment_persistence".to_string(),
+                "write_recon_retry".to_string(),
             ]
         );
     }

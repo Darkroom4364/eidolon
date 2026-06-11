@@ -311,6 +311,8 @@ Status checklist:
   and repeated blind write-target fanout persistence can now also hit that
   same blocked rung directly after the second distinct unsafe probe caused
   rate limiting
+  and edge export now distinguishes that direct blind write retry as
+  `write_recon_retry` instead of the broader `discovery_recon_retry`
   (`current branch only`)
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs

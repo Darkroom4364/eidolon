@@ -236,6 +236,11 @@ The current M5 slice is intentionally narrow:
 - edge export now groups the adjacent recon-driven blocked retry under that
   same `pre_containment_persistence` family with the detail code
   `discovery_recon_retry`
+- edge export now splits the direct blind write-target retry case out of that
+  generic recon bucket: when a blocked decision comes from repeating the
+  rate-limited blind unsafe write path itself, the shared family stays
+  `pre_containment_persistence` but the detail code becomes
+  `write_recon_retry`
 - one conservative `rate_limited -> controlled_reality` path now exists for a
   confirmed same-session exact bait-derived action after throttling, so stronger
   runtime evidence still moves the session into containment instead of stopping
