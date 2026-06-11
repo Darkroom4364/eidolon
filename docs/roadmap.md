@@ -313,6 +313,8 @@ Status checklist:
   rate limiting
   and edge export now distinguishes that direct blind write retry as
   `write_recon_retry` instead of the broader `discovery_recon_retry`
+  and those pre-containment blocked detail codes now come from an explicit
+  proxy-stamped persistence kind instead of report-side string heuristics
   (`current branch only`)
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs

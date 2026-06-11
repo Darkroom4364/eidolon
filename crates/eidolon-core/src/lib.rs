@@ -4,6 +4,8 @@ use uuid::Uuid;
 
 pub const EVENT_SCHEMA_VERSION: u16 = 2;
 pub const TRUSTED_INGRESS_CONTRACT_VERSION: &str = "2026-06-05.v1";
+pub const PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY: &str = "pre_containment_persistence";
+pub const PRE_CONTAINMENT_PERSISTENCE_KIND_FIELD: &str = "persistence_kind";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
@@ -213,6 +215,64 @@ impl DiscoveryReconScore {
             && self.decoy_write_probe_path_fanout_bonus == 0
             && self.detection_score == 0
             && self.total == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreContainmentPersistenceKind {
+    DiscoveryReconRetry,
+    WriteReconRetry,
+    SameBaitNearMissRetry,
+}
+
+impl PreContainmentPersistenceKind {
+    pub const fn detail_code(self) -> &'static str {
+        match self {
+            Self::DiscoveryReconRetry => "discovery_recon_retry",
+            Self::WriteReconRetry => "write_recon_retry",
+            Self::SameBaitNearMissRetry => "same_bait_near_miss_retry",
+        }
+    }
+
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::DiscoveryReconRetry => "persistence_kind=discovery_recon_retry",
+            Self::WriteReconRetry => "persistence_kind=write_recon_retry",
+            Self::SameBaitNearMissRetry => "persistence_kind=same_bait_near_miss_retry",
+        }
+    }
+
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        if let Some(detail_code) = reason
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("persistence_kind="))
+        {
+            return Self::from_detail_code(detail_code);
+        }
+
+        if reason.contains("rate-limited same-bait near miss retry moved session to blocked") {
+            return Some(Self::SameBaitNearMissRetry);
+        }
+
+        if reason.contains("rate-limited discovery recon retry moved session to blocked") {
+            if reason.contains("repeated_discovery_score=0")
+                && reason.contains("decoy_write_probe_path_fanout_bonus=1")
+            {
+                return Some(Self::WriteReconRetry);
+            }
+            return Some(Self::DiscoveryReconRetry);
+        }
+
+        None
+    }
+
+    fn from_detail_code(detail_code: &str) -> Option<Self> {
+        match detail_code {
+            "discovery_recon_retry" => Some(Self::DiscoveryReconRetry),
+            "write_recon_retry" => Some(Self::WriteReconRetry),
+            "same_bait_near_miss_retry" => Some(Self::SameBaitNearMissRetry),
+            _ => None,
+        }
     }
 }
 
@@ -629,6 +689,26 @@ mod tests {
             } => assert_eq!(discovery_recon_score, DiscoveryReconScore::default()),
             other => panic!("expected request_seen, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pre_containment_persistence_kind_parses_explicit_marker() {
+        let reason = "rate-limited discovery recon retry moved session to blocked: path=/docs persistence_kind=discovery_recon_retry";
+
+        assert_eq!(
+            PreContainmentPersistenceKind::from_reason(reason),
+            Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
+        );
+    }
+
+    #[test]
+    fn pre_containment_persistence_kind_preserves_legacy_write_recon_fallback() {
+        let reason = "rate-limited discovery recon retry moved session to blocked: path=/api/v2/import/validate repeated_discovery_score=0 decoy_write_probe_path_fanout_bonus=1";
+
+        assert_eq!(
+            PreContainmentPersistenceKind::from_reason(reason),
+            Some(PreContainmentPersistenceKind::WriteReconRetry)
+        );
     }
 
     #[test]

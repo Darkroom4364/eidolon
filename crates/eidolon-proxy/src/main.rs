@@ -8427,6 +8427,9 @@ mod tests {
         assert!(policy_changes[2]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_score=5")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_kind=write_recon_retry")));
 
         assert_event_type_absent(&event_log_path, "bait_action_observed");
 
@@ -8648,7 +8651,7 @@ mod tests {
         assert_eq!(surface_debugs[2]["fields"]["policy_state"], "blocked");
         assert_eq!(
             surface_debugs[2]["fields"]["policy_reason"],
-            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5"
+            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_kind=discovery_recon_retry"
         );
         assert_eq!(
             surface_debugs[2]["fields"]["surface_action"]["type"],

@@ -232,10 +232,11 @@ The current M5 slice is intentionally narrow:
   session once, keeping blocked rare and tied to explicit retry behavior
 - edge export now groups that pre-containment blocked path under the shared
   `pre_containment_persistence` reason-code family with the detail code
-  `same_bait_near_miss_retry`
+  `same_bait_near_miss_retry`, and the proxy now stamps that persistence kind
+  directly into the blocked reason instead of relying on export-side heuristics
 - edge export now groups the adjacent recon-driven blocked retry under that
   same `pre_containment_persistence` family with the detail code
-  `discovery_recon_retry`
+  `discovery_recon_retry` from the same explicit reason marker
 - edge export now splits the direct blind write-target retry case out of that
   generic recon bucket: when a blocked decision comes from repeating the
   rate-limited blind unsafe write path itself, the shared family stays
