@@ -271,6 +271,10 @@ The current M5 slice is intentionally narrow:
 - edge export now groups both post-containment blocked paths under the shared
   `post_containment_persistence` reason-code family while preserving distinct
   detail codes for branch-escape versus depth-limit persistence
+- blocked post-containment exports now also expose that detail as a structured
+  `policy.post_containment_persistence_kind` field, so downstream consumers do
+  not need to infer `controlled_reality_branch_escape` versus
+  `controlled_reality_depth_limit` from `reason_codes`
 - near-miss matching on the shared reconcile path is now header-aware, so
   `X-Migration-Trace` and `X-OpenAPI-Trace` requests are attributed to the
   correct bait family instead of collapsing onto the first registered decoy

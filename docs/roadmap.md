@@ -327,6 +327,10 @@ Status checklist:
   and those pre-containment blocked detail codes now come from an explicit
   proxy-stamped `persistence_class` plus blocked-only `persistence_kind`
   instead of report-side string heuristics
+  and blocked post-containment exports now also carry a structured
+  `post_containment_persistence_kind` field for branch-escape versus
+  depth-limit persistence instead of forcing downstream consumers to scrape
+  `reason_codes`
   (`current branch only`)
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs

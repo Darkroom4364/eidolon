@@ -11241,6 +11241,10 @@ mod tests {
         assert!(blocked_change["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("depth=3")));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("post_containment_persistence_kind=controlled_reality_depth_limit")));
 
         let blocked_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()
@@ -11367,6 +11371,10 @@ mod tests {
             .is_some_and(|reason| reason.contains(
                 "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked"
             )));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("post_containment_persistence_kind=controlled_reality_branch_escape")));
 
         let blocked_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()

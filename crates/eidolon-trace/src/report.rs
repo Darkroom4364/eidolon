@@ -3,7 +3,8 @@ use std::fmt::Write;
 use eidolon_core::{
     EdgeEvidenceRef, EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestRef,
     EidolonEdgeDecisionExport, EventKind, IngressAdvisorySignals, PolicyState,
-    PreContainmentPersistenceClass, PreContainmentPersistenceKind, RoutingDecision,
+    PostContainmentPersistenceKind, PreContainmentPersistenceClass, PreContainmentPersistenceKind,
+    RoutingDecision, POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY,
     PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY, TRUSTED_INGRESS_CONTRACT_VERSION,
 };
 
@@ -320,6 +321,8 @@ pub fn edge_decision_export_for_evidence(
         pre_containment_persistence_class_for(policy_state, reason.as_str());
     let pre_containment_persistence_kind =
         pre_containment_persistence_kind_for(policy_state, reason.as_str());
+    let post_containment_persistence_kind =
+        post_containment_persistence_kind_for(policy_state, reason.as_str());
 
     Some(EidolonEdgeDecisionExport {
         contract_version: TRUSTED_INGRESS_CONTRACT_VERSION.to_string(),
@@ -335,6 +338,7 @@ pub fn edge_decision_export_for_evidence(
             reason,
             pre_containment_persistence_class,
             pre_containment_persistence_kind,
+            post_containment_persistence_kind,
         },
         evidence: EdgeEvidenceRef {
             event_schema_version: request_event.event.schema_version,
@@ -449,21 +453,10 @@ fn grouped_enforcement_reason_codes(policy_state: PolicyState, reason: &str) -> 
         return Vec::new();
     }
 
-    if reason.contains(
-        "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked",
-    ) {
+    if let Some(kind) = PostContainmentPersistenceKind::from_reason(reason) {
         return vec![
-            "post_containment_persistence".to_string(),
-            "controlled_reality_branch_escape".to_string(),
-        ];
-    }
-
-    if reason.contains(
-        "controlled-reality probe continued after depth-limit throttle and moved session to blocked",
-    ) {
-        return vec![
-            "post_containment_persistence".to_string(),
-            "controlled_reality_depth_limit".to_string(),
+            POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
+            kind.detail_code().to_string(),
         ];
     }
 
@@ -488,6 +481,15 @@ fn pre_containment_persistence_kind_for(
 ) -> Option<PreContainmentPersistenceKind> {
     (policy_state == PolicyState::Blocked)
         .then(|| PreContainmentPersistenceKind::from_reason(reason))
+        .flatten()
+}
+
+fn post_containment_persistence_kind_for(
+    policy_state: PolicyState,
+    reason: &str,
+) -> Option<PostContainmentPersistenceKind> {
+    (policy_state == PolicyState::Blocked)
+        .then(|| PostContainmentPersistenceKind::from_reason(reason))
         .flatten()
 }
 
@@ -1435,7 +1437,7 @@ mod tests {
                 EventKind::PolicyChanged {
                     from: PolicyState::ControlledReality,
                     to: PolicyState::Blocked,
-                    reason: "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2".to_string(),
+                    reason: "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2 post_containment_persistence_kind=controlled_reality_branch_escape".to_string(),
                 },
             ),
             Event::new(
@@ -1465,6 +1467,10 @@ mod tests {
                 "post_containment_persistence".to_string(),
                 "controlled_reality_branch_escape".to_string(),
             ]
+        );
+        assert_eq!(
+            export.policy.post_containment_persistence_kind,
+            Some(PostContainmentPersistenceKind::ControlledRealityBranchEscape)
         );
     }
 
@@ -1716,7 +1722,7 @@ mod tests {
                 EventKind::PolicyChanged {
                     from: PolicyState::ControlledReality,
                     to: PolicyState::Blocked,
-                    reason: "controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4".to_string(),
+                    reason: "controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4 post_containment_persistence_kind=controlled_reality_depth_limit".to_string(),
                 },
             ),
             Event::new(
@@ -1747,6 +1753,10 @@ mod tests {
                 "post_containment_persistence".to_string(),
                 "controlled_reality_depth_limit".to_string(),
             ]
+        );
+        assert_eq!(
+            export.policy.post_containment_persistence_kind,
+            Some(PostContainmentPersistenceKind::ControlledRealityDepthLimit)
         );
     }
 
