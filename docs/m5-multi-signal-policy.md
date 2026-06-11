@@ -256,6 +256,10 @@ The current M5 slice is intentionally narrow:
   `suspicious -> rate_limited` and `rate_limited -> blocked` discovery-recon
   rungs, so advisory detections now influence more than first-contact
   promotion
+- the pre-containment weighted recon ladder now shares one explicit runtime
+  signal/persistence profile for its rate-limit and blocked rungs, so those
+  two transitions no longer duplicate their own medium-score actor,
+  score-kind, vendor-score, and recon-classification gates independently
 - edge export now splits the direct blind write-target retry case out of that
   generic recon bucket: when a blocked decision comes from repeating the
   rate-limited blind unsafe write path itself, the shared family stays

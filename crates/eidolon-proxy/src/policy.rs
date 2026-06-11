@@ -75,6 +75,19 @@ pub struct DiscoveryReconAggregationScore {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiscoveryReconSignalProfile {
+    vendor_score: u16,
+    detection_count: usize,
+    recon_score: DiscoveryReconAggregationScore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiscoveryReconPersistenceProfile {
+    signal: DiscoveryReconSignalProfile,
+    persistence_class: PreContainmentPersistenceClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoverySurfaceKind {
     Docs,
     OpenApi,
@@ -351,25 +364,8 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
     if !path_is_recon_candidate {
         return None;
     }
-    if !matches!(
-        ingress_signals.actor_kind,
-        IngressActorKind::AutonomousAgent | IngressActorKind::AgenticBrowser
-    ) {
-        return None;
-    }
-    if ingress_signals.vendor_score_kind.as_deref()
-        != Some(AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND)
-    {
-        return None;
-    }
-    let vendor_score = ingress_signals.vendor_score?;
-    if vendor_score <= DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX
-        || vendor_score > DISCOVERY_RECON_AGGREGATION_VENDOR_SCORE_MAX
-    {
-        return None;
-    }
-    let detection_count = ingress_signals.detection_ids.len();
-    let recon_score = aggregated_discovery_recon_score(ingress_signals, recon_state);
+    let signal = discovery_recon_signal_profile(ingress_signals, recon_state)?;
+    let recon_score = signal.recon_score;
     if recon_score.total < DISCOVERY_RECON_AGGREGATION_SCORE_THRESHOLD
         || recon_score.total == recon_score.decoy_write_probe_score
     {
@@ -379,27 +375,14 @@ pub fn transition_to_suspicious_from_aggregated_discovery_recon(
     Some(PolicyTransition::new(
         current_state,
         PolicyState::Suspicious,
-        format!(
-            "{DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} decoy_write_probe_seen={} decoy_write_probe_count={} decoy_write_probe_path_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} decoy_write_probe_score={} decoy_write_probe_path_fanout_bonus={} detection_score={} recon_score={} recon_threshold={DISCOVERY_RECON_AGGREGATION_SCORE_THRESHOLD}",
-            snake_case_actor_kind(ingress_signals.actor_kind),
-            recon_state.request_count,
-            recon_state.fanout.distinct_surface_count(),
-            recon_state.query_seen,
-            recon_state.legacy_openapi_query_seen,
-            recon_state.linked_bait_surface_seen,
-            recon_state.linked_bait_surface_classes,
-            recon_state.decoy_write_probe_seen,
-            recon_state.decoy_write_probe_count,
-            recon_state.decoy_write_probe_path_classes,
-            recon_score.repeated_discovery_score,
-            recon_score.query_score,
-            recon_score.legacy_openapi_query_score,
-            recon_score.linked_bait_surface_score,
-            recon_score.linked_bait_class_fanout_bonus,
-            recon_score.decoy_write_probe_score,
-            recon_score.decoy_write_probe_path_fanout_bonus,
-            recon_score.detection_score,
-            recon_score.total,
+        format_discovery_recon_reason(
+            DISCOVERY_RECON_AGGREGATION_SUSPICIOUS_REASON_PREFIX,
+            "recon_threshold",
+            DISCOVERY_RECON_AGGREGATION_SCORE_THRESHOLD,
+            path,
+            ingress_signals.actor_kind,
+            signal,
+            recon_state,
         ),
     ))
 }
@@ -500,67 +483,32 @@ pub fn transition_to_rate_limited_from_suspicious_discovery_recon(
     if current_state != PolicyState::Suspicious {
         return None;
     }
-    if ingress_identity::softens_bait_surface_exposure(ingress_identity) {
-        return None;
-    }
-    if !path_is_top_level_discovery && !path_is_blind_decoy_write_probe {
-        return None;
-    }
-    if !matches!(
-        ingress_signals.actor_kind,
-        IngressActorKind::AutonomousAgent | IngressActorKind::AgenticBrowser
-    ) {
-        return None;
-    }
-    if ingress_signals.vendor_score_kind.as_deref()
-        != Some(AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND)
-    {
-        return None;
-    }
-    let vendor_score = ingress_signals.vendor_score?;
-    if vendor_score <= DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX
-        || vendor_score > DISCOVERY_RECON_AGGREGATION_VENDOR_SCORE_MAX
-    {
-        return None;
-    }
-
-    let detection_count = ingress_signals.detection_ids.len();
-    let recon_score = aggregated_discovery_recon_score(ingress_signals, recon_state);
+    let profile = discovery_recon_persistence_profile(
+        path_is_top_level_discovery,
+        path_is_blind_decoy_write_probe,
+        ingress_identity,
+        ingress_signals,
+        recon_state,
+    )?;
+    let recon_score = profile.signal.recon_score;
     if recon_score.total < DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD {
         return None;
     }
-    let persistence_class = pre_containment_persistence_class_for_recon(
-        path_is_top_level_discovery,
-        path_is_blind_decoy_write_probe,
-    )?;
 
     Some(PolicyTransition::new(
         current_state,
         PolicyState::RateLimited,
         append_pre_containment_persistence_class(
-            format!(
-                "{DISCOVERY_RECON_PERSISTENCE_RATE_LIMIT_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} decoy_write_probe_seen={} decoy_write_probe_count={} decoy_write_probe_path_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} decoy_write_probe_score={} decoy_write_probe_path_fanout_bonus={} detection_score={} recon_score={} recon_rate_limit_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
-                snake_case_actor_kind(ingress_signals.actor_kind),
-                recon_state.request_count,
-                recon_state.fanout.distinct_surface_count(),
-                recon_state.query_seen,
-                recon_state.legacy_openapi_query_seen,
-                recon_state.linked_bait_surface_seen,
-                recon_state.linked_bait_surface_classes,
-                recon_state.decoy_write_probe_seen,
-                recon_state.decoy_write_probe_count,
-                recon_state.decoy_write_probe_path_classes,
-                recon_score.repeated_discovery_score,
-                recon_score.query_score,
-                recon_score.legacy_openapi_query_score,
-                recon_score.linked_bait_surface_score,
-                recon_score.linked_bait_class_fanout_bonus,
-                recon_score.decoy_write_probe_score,
-                recon_score.decoy_write_probe_path_fanout_bonus,
-                recon_score.detection_score,
-                recon_score.total,
+            format_discovery_recon_reason(
+                DISCOVERY_RECON_PERSISTENCE_RATE_LIMIT_REASON_PREFIX,
+                "recon_rate_limit_threshold",
+                DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD,
+                path,
+                ingress_signals.actor_kind,
+                profile.signal,
+                recon_state,
             ),
-            persistence_class,
+            profile.persistence_class,
         ),
     ))
 }
@@ -577,67 +525,32 @@ pub fn transition_to_blocked_from_repeated_discovery_recon(
     if current_state != PolicyState::RateLimited {
         return None;
     }
-    if ingress_identity::softens_bait_surface_exposure(ingress_identity) {
-        return None;
-    }
-    if !path_is_top_level_discovery && !path_is_blind_decoy_write_probe {
-        return None;
-    }
-    if !matches!(
-        ingress_signals.actor_kind,
-        IngressActorKind::AutonomousAgent | IngressActorKind::AgenticBrowser
-    ) {
-        return None;
-    }
-    if ingress_signals.vendor_score_kind.as_deref()
-        != Some(AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND)
-    {
-        return None;
-    }
-    let vendor_score = ingress_signals.vendor_score?;
-    if vendor_score <= DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX
-        || vendor_score > DISCOVERY_RECON_AGGREGATION_VENDOR_SCORE_MAX
-    {
-        return None;
-    }
-
-    let detection_count = ingress_signals.detection_ids.len();
-    let recon_score = aggregated_discovery_recon_score(ingress_signals, recon_state);
+    let profile = discovery_recon_persistence_profile(
+        path_is_top_level_discovery,
+        path_is_blind_decoy_write_probe,
+        ingress_identity,
+        ingress_signals,
+        recon_state,
+    )?;
+    let recon_score = profile.signal.recon_score;
     if recon_score.total < DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD {
         return None;
     }
-    let persistence_class = pre_containment_persistence_class_for_recon(
-        path_is_top_level_discovery,
-        path_is_blind_decoy_write_probe,
-    )?;
 
     Some(PolicyTransition::new(
         current_state,
         PolicyState::Blocked,
         append_pre_containment_blocked_persistence_markers(
-            format!(
-                "{DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} decoy_write_probe_seen={} decoy_write_probe_count={} decoy_write_probe_path_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} decoy_write_probe_score={} decoy_write_probe_path_fanout_bonus={} detection_score={} recon_score={} recon_block_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
-                snake_case_actor_kind(ingress_signals.actor_kind),
-                recon_state.request_count,
-                recon_state.fanout.distinct_surface_count(),
-                recon_state.query_seen,
-                recon_state.legacy_openapi_query_seen,
-                recon_state.linked_bait_surface_seen,
-                recon_state.linked_bait_surface_classes,
-                recon_state.decoy_write_probe_seen,
-                recon_state.decoy_write_probe_count,
-                recon_state.decoy_write_probe_path_classes,
-                recon_score.repeated_discovery_score,
-                recon_score.query_score,
-                recon_score.legacy_openapi_query_score,
-                recon_score.linked_bait_surface_score,
-                recon_score.linked_bait_class_fanout_bonus,
-                recon_score.decoy_write_probe_score,
-                recon_score.decoy_write_probe_path_fanout_bonus,
-                recon_score.detection_score,
-                recon_score.total,
+            format_discovery_recon_reason(
+                DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX,
+                "recon_block_threshold",
+                DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD,
+                path,
+                ingress_signals.actor_kind,
+                profile.signal,
+                recon_state,
             ),
-            persistence_class,
+            profile.persistence_class,
         ),
     ))
 }
@@ -686,6 +599,93 @@ pub fn transition_to_blocked_from_repeated_same_bait_near_miss(
             PreContainmentPersistenceClass::SameBaitNearMiss,
         ),
     ))
+}
+
+fn discovery_recon_signal_profile(
+    ingress_signals: &IngressAdvisorySignals,
+    recon_state: DiscoveryReconState,
+) -> Option<DiscoveryReconSignalProfile> {
+    if !matches!(
+        ingress_signals.actor_kind,
+        IngressActorKind::AutonomousAgent | IngressActorKind::AgenticBrowser
+    ) {
+        return None;
+    }
+    if ingress_signals.vendor_score_kind.as_deref()
+        != Some(AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND)
+    {
+        return None;
+    }
+    let vendor_score = ingress_signals.vendor_score?;
+    if vendor_score <= DISCOVERY_SUSPICIOUS_VENDOR_SCORE_MAX
+        || vendor_score > DISCOVERY_RECON_AGGREGATION_VENDOR_SCORE_MAX
+    {
+        return None;
+    }
+
+    Some(DiscoveryReconSignalProfile {
+        vendor_score,
+        detection_count: ingress_signals.detection_ids.len(),
+        recon_score: aggregated_discovery_recon_score(ingress_signals, recon_state),
+    })
+}
+
+fn discovery_recon_persistence_profile(
+    path_is_top_level_discovery: bool,
+    path_is_blind_decoy_write_probe: bool,
+    ingress_identity: &IngressIdentity,
+    ingress_signals: &IngressAdvisorySignals,
+    recon_state: DiscoveryReconState,
+) -> Option<DiscoveryReconPersistenceProfile> {
+    if ingress_identity::softens_bait_surface_exposure(ingress_identity) {
+        return None;
+    }
+    if !path_is_top_level_discovery && !path_is_blind_decoy_write_probe {
+        return None;
+    }
+
+    Some(DiscoveryReconPersistenceProfile {
+        signal: discovery_recon_signal_profile(ingress_signals, recon_state)?,
+        persistence_class: pre_containment_persistence_class_for_recon(
+            path_is_top_level_discovery,
+            path_is_blind_decoy_write_probe,
+        )?,
+    })
+}
+
+fn format_discovery_recon_reason(
+    prefix: &str,
+    threshold_field: &str,
+    threshold: u8,
+    path: &str,
+    actor_kind: IngressActorKind,
+    signal: DiscoveryReconSignalProfile,
+    recon_state: DiscoveryReconState,
+) -> String {
+    format!(
+        "{prefix}: path={path} actor_kind={} vendor_score={} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} decoy_write_probe_seen={} decoy_write_probe_count={} decoy_write_probe_path_classes={} detection_count={} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} decoy_write_probe_score={} decoy_write_probe_path_fanout_bonus={} detection_score={} recon_score={} {threshold_field}={threshold}",
+        snake_case_actor_kind(actor_kind),
+        signal.vendor_score,
+        recon_state.request_count,
+        recon_state.fanout.distinct_surface_count(),
+        recon_state.query_seen,
+        recon_state.legacy_openapi_query_seen,
+        recon_state.linked_bait_surface_seen,
+        recon_state.linked_bait_surface_classes,
+        recon_state.decoy_write_probe_seen,
+        recon_state.decoy_write_probe_count,
+        recon_state.decoy_write_probe_path_classes,
+        signal.detection_count,
+        signal.recon_score.repeated_discovery_score,
+        signal.recon_score.query_score,
+        signal.recon_score.legacy_openapi_query_score,
+        signal.recon_score.linked_bait_surface_score,
+        signal.recon_score.linked_bait_class_fanout_bonus,
+        signal.recon_score.decoy_write_probe_score,
+        signal.recon_score.decoy_write_probe_path_fanout_bonus,
+        signal.recon_score.detection_score,
+        signal.recon_score.total,
+    )
 }
 
 fn pre_containment_persistence_class_for_recon(
@@ -2068,6 +2068,78 @@ mod tests {
         );
 
         assert_eq!(no_query_or_discovery, None);
+    }
+
+    #[test]
+    fn discovery_recon_persistence_profile_classifies_recon_path_kind() {
+        let discovery_profile = discovery_recon_persistence_profile(
+            true,
+            false,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                detection_ids: vec!["3355446".to_string(), "445566".to_string()],
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 2,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: false,
+                decoy_write_probe_count: 0,
+                decoy_write_probe_path_classes: 0,
+            },
+        )
+        .expect("top-level discovery path should classify as a persistence profile");
+        let write_profile = discovery_recon_persistence_profile(
+            false,
+            true,
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AgenticBrowser,
+                vendor_score: Some(35),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+            DiscoveryReconState {
+                fanout: DiscoverySurfaceFanout {
+                    docs_seen: true,
+                    openapi_seen: false,
+                },
+                request_count: 1,
+                query_seen: true,
+                legacy_openapi_query_seen: false,
+                linked_bait_surface_seen: false,
+                linked_bait_surface_classes: 0,
+                decoy_write_probe_seen: true,
+                decoy_write_probe_count: 2,
+                decoy_write_probe_path_classes: 2,
+            },
+        )
+        .expect("blind write path should classify as a persistence profile");
+
+        assert_eq!(
+            discovery_profile.persistence_class,
+            PreContainmentPersistenceClass::DiscoveryRecon
+        );
+        assert_eq!(discovery_profile.signal.vendor_score, 35);
+        assert_eq!(discovery_profile.signal.detection_count, 2);
+        assert_eq!(discovery_profile.signal.recon_score.total, 5);
+
+        assert_eq!(
+            write_profile.persistence_class,
+            PreContainmentPersistenceClass::WriteRecon
+        );
+        assert_eq!(write_profile.signal.detection_count, 0);
+        assert_eq!(write_profile.signal.recon_score.total, 5);
     }
 
     #[test]
