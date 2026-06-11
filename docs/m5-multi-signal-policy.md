@@ -178,6 +178,11 @@ The current M5 slice is intentionally narrow:
   `decoy_write_probe_score` plus `decoy_write_probe_path_fanout_bonus` is what
   reaches the recon persistence threshold of `5`, even before another
   top-level discovery follow-up happens
+- that same blind write-target fanout can now also drive the next hard-fail
+  rung directly: after Eidolon has already rate-limited the session on that
+  second distinct unsafe probe, repeating the blind probe again can move the
+  session to `blocked` under the same pre-containment persistence family,
+  without turning the request into `bait_action_observed`
 - one adjacent `rate_limited -> blocked` path now exists for repeating that
   same medium-score top-level discovery churn again after Eidolon has already
   throttled the session once, keeping the hard-fail tied to explicit
