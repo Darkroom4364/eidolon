@@ -3,8 +3,8 @@ use std::fmt::Write;
 use eidolon_core::{
     EdgeEvidenceRef, EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestRef,
     EidolonEdgeDecisionExport, EventKind, IngressAdvisorySignals, PolicyState,
-    PreContainmentPersistenceKind, RoutingDecision, PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY,
-    TRUSTED_INGRESS_CONTRACT_VERSION,
+    PreContainmentPersistenceClass, PreContainmentPersistenceKind, RoutingDecision,
+    PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY, TRUSTED_INGRESS_CONTRACT_VERSION,
 };
 
 use crate::evidence::trace_metric_summary_for_timeline;
@@ -398,7 +398,7 @@ fn edge_recommendation_for(
             "eidolon_runtime_enforcement".to_string(),
             snake_case_debug(&routing_decision),
         ];
-        reason_codes.extend(grouped_block_reason_codes(policy_state, reason));
+        reason_codes.extend(grouped_enforcement_reason_codes(policy_state, reason));
         return EdgeRecommendation {
             action: EdgeRecommendedAction::PreserveEidolonRouting,
             ttl_seconds: Some(300),
@@ -421,16 +421,26 @@ fn edge_recommendation_for(
     }
 }
 
-fn grouped_block_reason_codes(policy_state: PolicyState, reason: &str) -> Vec<String> {
-    if policy_state != PolicyState::Blocked {
+fn grouped_enforcement_reason_codes(policy_state: PolicyState, reason: &str) -> Vec<String> {
+    if matches!(
+        policy_state,
+        PolicyState::RateLimited | PolicyState::Blocked
+    ) {
+        if policy_state == PolicyState::RateLimited {
+            if let Some(class) = PreContainmentPersistenceClass::from_reason(reason) {
+                return vec![
+                    PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
+                    class.code().to_string(),
+                ];
+            }
+        } else if let Some(kind) = PreContainmentPersistenceKind::from_reason(reason) {
+            return vec![
+                PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
+                kind.detail_code().to_string(),
+            ];
+        }
+    } else {
         return Vec::new();
-    }
-
-    if let Some(kind) = PreContainmentPersistenceKind::from_reason(reason) {
-        return vec![
-            PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
-            kind.detail_code().to_string(),
-        ];
     }
 
     if reason.contains(
@@ -1242,6 +1252,125 @@ mod tests {
             .edge_recommendation
             .reason_codes
             .contains(&"eidolon_runtime_enforcement".to_string()));
+    }
+
+    #[test]
+    fn edge_decision_export_groups_rate_limited_discovery_recon_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: DiscoveryReconScore {
+                        repeated_discovery_score: 2,
+                        query_score: 1,
+                        legacy_openapi_query_score: 2,
+                        linked_bait_surface_score: 0,
+                        linked_bait_class_fanout_bonus: 0,
+                        decoy_write_probe_score: 0,
+                        decoy_write_probe_path_fanout_bonus: 0,
+                        detection_score: 0,
+                        total: 5,
+                        threshold: 5,
+                    },
+                    routing_decision: RoutingDecision::RateLimited,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::PolicyChanged {
+                    from: PolicyState::Suspicious,
+                    to: PolicyState::RateLimited,
+                    reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RateLimitApplied {
+                    reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "rate_limited".to_string(),
+                "pre_containment_persistence".to_string(),
+                "discovery_recon".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_groups_rate_limited_same_bait_near_miss_into_shared_family() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::RateLimited,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::PolicyChanged {
+                    from: PolicyState::Suspicious,
+                    to: PolicyState::RateLimited,
+                    reason: "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss".to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RateLimitApplied {
+                    reason: "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss".to_string(),
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(
+            export.edge_recommendation.reason_codes,
+            vec![
+                "eidolon_runtime_enforcement".to_string(),
+                "rate_limited".to_string(),
+                "pre_containment_persistence".to_string(),
+                "same_bait_near_miss".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -251,6 +251,32 @@ impl PreContainmentPersistenceClass {
         }
     }
 
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        if let Some(class_code) = reason
+            .split_ascii_whitespace()
+            .find_map(|field| field.strip_prefix("persistence_class="))
+        {
+            return Self::from_code(class_code);
+        }
+
+        if reason
+            .contains("suspicious same-bait near miss after exposure moved session to rate limited")
+            || reason.contains("rate-limited same-bait near miss retry moved session to blocked")
+        {
+            return Some(Self::SameBaitNearMiss);
+        }
+
+        if let Some(kind) = PreContainmentPersistenceKind::from_reason(reason) {
+            return Some(match kind {
+                PreContainmentPersistenceKind::DiscoveryReconRetry => Self::DiscoveryRecon,
+                PreContainmentPersistenceKind::WriteReconRetry => Self::WriteRecon,
+                PreContainmentPersistenceKind::SameBaitNearMissRetry => Self::SameBaitNearMiss,
+            });
+        }
+
+        None
+    }
+
     fn from_code(code: &str) -> Option<Self> {
         match code {
             "discovery_recon" => Some(Self::DiscoveryRecon),
@@ -769,6 +795,17 @@ mod tests {
         assert_eq!(
             PreContainmentPersistenceKind::from_reason(reason),
             Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
+        );
+    }
+
+    #[test]
+    fn pre_containment_persistence_class_parses_explicit_marker() {
+        let reason =
+            "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile persistence_class=same_bait_near_miss";
+
+        assert_eq!(
+            PreContainmentPersistenceClass::from_reason(reason),
+            Some(PreContainmentPersistenceClass::SameBaitNearMiss)
         );
     }
 
