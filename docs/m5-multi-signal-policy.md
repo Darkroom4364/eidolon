@@ -166,6 +166,12 @@ The current M5 slice is intentionally narrow:
   default reconcile route; it now applies to any constrained unsafe bait action
   path from the active bait profile when the request matches method/path but no
   expected bait header name is present
+- that generalized blind decoy-write contributor now also tracks a coarse
+  write-target fanout class, so probing both the canonical reconcile route and
+  a different constrained unsafe bait action path adds one more weak recon
+  point without creating `bait_action_observed`; the structured recon score and
+  debug/export path now surface that as
+  `decoy_write_probe_path_fanout_bonus`
 - one adjacent `rate_limited -> blocked` path now exists for repeating that
   same medium-score top-level discovery churn again after Eidolon has already
   throttled the session once, keeping the hard-fail tied to explicit
