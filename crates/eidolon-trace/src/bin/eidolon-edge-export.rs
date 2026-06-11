@@ -338,6 +338,7 @@ mod tests {
                     expires_at: None,
                 },
                 ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
             },
         );

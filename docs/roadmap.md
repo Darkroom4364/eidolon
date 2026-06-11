@@ -274,3 +274,114 @@ Issues:
 Current design note:
 
 - `docs/m5-multi-signal-policy.md`
+
+Status checklist:
+
+- [x] Design anchor exists in `docs/m5-multi-signal-policy.md` (`main`)
+- [x] Authenticated ingress advisory signals are captured, audited, and exported (`main`)
+- [x] Trusted ingress remains distinct from runtime suspicion (`main`)
+- [x] Narrow `observe -> suspicious` promotion exists for low-score authenticated
+  agentic discovery (`main`)
+- [x] Suspicious owned shaping exists for `/docs` and `/openapi.json` (`main`)
+- [x] First weak aggregated suspicious-promotion path exists for repeated
+  medium-score authenticated discovery plus query-bearing recon
+  (`current branch only`)
+- [x] Aggregated suspicious-promotion paths now use an explicit weighted recon
+  score instead of a flat weak-signal count (`current branch only`)
+- [x] Weighted recon suspicious-promotion scores now flow through `request_seen`
+  audit events and edge export as structured `discovery_recon_score` data
+  (`current branch only`)
+- [x] Weighted recon now has one conservative higher-threshold
+  `suspicious -> rate_limited` path for sustained medium-score top-level
+  discovery churn
+  and the blind decoy-write contributor is now a capped repeated-probe count,
+  and it now keys off constrained unsafe bait action paths from the active bait
+  profile instead of only the default reconcile route
+  and distinct unattributed write targets now add a coarse path-fanout bonus
+  in structured recon score/export
+  and that same fanout can now trigger the existing rate-limit threshold on the
+  second distinct blind probe for already-suspicious medium-score sessions,
+  without waiting for another top-level discovery request
+  not just a seen/not-seen bit
+  (`current branch only`)
+- [x] Weighted recon now has one adjacent `rate_limited -> blocked` path for
+  repeated medium-score top-level discovery churn after the first throttle
+  and that blocked rung is now also proven with the blind decoy-write
+  contributor in the score
+  and authenticated detection IDs are now also proven through that same
+  blocked rung for discovery-recon persistence
+  and the pre-containment weighted recon ladder now shares one explicit
+  runtime signal/persistence profile across its rate-limit and blocked rungs
+  instead of re-deriving those medium-score recon gates independently
+  and repeated blind write-target fanout persistence can now also hit that
+  same blocked rung directly after the second distinct unsafe probe caused
+  rate limiting
+  and the `suspicious -> rate_limited` rung now stamps a shared
+  `persistence_class` marker so the rate-limit and blocked transitions reuse
+  the same pre-containment persistence classifier
+  and edge export now surfaces that same shared family for rate-limited
+  sessions with class-level detail before sessions ever hit the blocked rung
+  and `EidolonEdgeDecisionExport.policy` now carries that pre-containment
+  persistence class as a structured field instead of forcing downstream
+  consumers to scrape `reason_codes`
+  and blocked pre-containment exports now also carry the retry detail as a
+  structured `pre_containment_persistence_kind` field instead of requiring
+  downstream consumers to scrape `reason_codes`
+  and edge export now distinguishes that direct blind write retry as
+  `write_recon_retry` instead of the broader `discovery_recon_retry`
+  and those pre-containment blocked detail codes now come from an explicit
+  proxy-stamped `persistence_class` plus blocked-only `persistence_kind`
+  instead of report-side string heuristics
+  and blocked post-containment exports now also carry a structured
+  `post_containment_persistence_kind` field for branch-escape versus
+  depth-limit persistence instead of forcing downstream consumers to scrape
+  `reason_codes`
+  (`current branch only`)
+- [x] First advisory-assisted aggregated suspicious-promotion path exists for
+  medium-score query-bearing discovery plus authenticated detection IDs
+  and the same advisory detection input is now also proven on the
+  higher-threshold `suspicious -> rate_limited` weighted recon path
+  (`current branch only`)
+- [x] First target-side-only aggregated suspicious-promotion path exists for
+  medium-score legacy-query OpenAPI discovery (`current branch only`)
+- [x] First target-side aggregated suspicious-promotion path exists for
+  medium-score query-bearing discovery plus a blind decoy write probe without
+  bait-derived attribution (`current branch only`)
+- [x] Adjacent target-side-only aggregated suspicious-promotion path exists for
+  medium-score linked bait-surface follow-up after query-bearing discovery,
+  including hidden-route and JS-helper follow-up outside the top-level
+  discovery prefixes
+  (`current branch only`)
+- [x] Adjacent target-side-only aggregated suspicious-promotion path exists for
+  medium-score linked bait-class fanout after plain `/docs` discovery, so two
+  distinct linked follow-up classes can promote without query-bearing recon or
+  edge-provided detections
+  (`current branch only`)
+- [x] Adjacent target-side-only aggregated suspicious-promotion path exists for
+  medium-score linked bait-class fanout after plain `/openapi.json` discovery,
+  so the same linked follow-up classes now promote from either top-level
+  discovery anchor
+  (`current branch only`)
+- [x] Same-session discovery fanout promotion across `/docs` and
+  `/openapi.json` exists (`current branch only`)
+- [x] `suspicious -> rate_limited` exists for same-bait near misses
+  (`current branch only`)
+- [x] `rate_limited -> blocked` exists for repeated same-bait near misses
+  (`current branch only`)
+- [x] `rate_limited -> controlled_reality` exists for exact bait-derived
+  follow-up actions (`current branch only`)
+- [x] `controlled_reality -> blocked` exists for repeated branch-escape
+  attempts (`current branch only`)
+- [x] `controlled_reality -> blocked` exists for repeated same-branch
+  depth-limit persistence (`current branch only`)
+- [x] Post-containment blocked exports now use a shared grouped reason-code
+  family with live OrbStack smoke coverage (`current branch only`)
+- [x] Pre-containment blocked exports now use a shared grouped reason-code
+  family with live OrbStack smoke coverage (`current branch only`)
+- [ ] Merge the current `feature/suspicious-discovery-fanout` branch
+- [ ] Broaden the narrow hand-tuned transitions into a more general
+  multi-signal aggregation plane
+- [ ] Add per-session signed polymorphic bait generation
+- [ ] Expand deployment-safe allowlists and verified crawler handling beyond
+  the current trusted-ingress slice
+- [ ] Prepare the external-readiness note and release checklist

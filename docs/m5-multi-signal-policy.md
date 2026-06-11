@@ -130,11 +130,165 @@ The current M5 slice is intentionally narrow:
   discovery-surface requests that combine a low inverse vendor score with an
   explicitly agentic actor kind, while stronger trusted identities still keep
   their low-confidence bait-softening behavior
+- one weaker aggregated `observe -> suspicious` path now exists for repeated
+  same-session medium-score authenticated discovery requests when the session
+  has also shown query-bearing discovery recon, so one lower-confidence
+  advisory signal plus two weaker recon contributors can promote without
+  requiring a strong single-request score
+- those aggregated suspicious-promotion paths now run through a small weighted
+  recon score instead of a flat weak-signal count, so repeated discovery,
+  query-bearing recon, legacy OpenAPI query shape, linked bait traversal, and
+  authenticated detections can be tuned as explicit contributors without
+  collapsing identity, evidence, and enforcement together
+- that weighted recon score now rides in `request_seen` audit events and edge
+  export as structured `discovery_recon_score` fields, so operators do not need
+  to recover it from debug logs or freeform policy reasons
+- one adjacent target-side aggregated `observe -> suspicious` path now exists
+  for one medium-score query-bearing docs request plus a blind unsafe probe to
+  `/api/v2/import/reconcile` without any expected bait header, so known decoy
+  write-path interest contributes as weak recon without creating
+  `bait_action_observed` evidence
+- that weighted recon score now has a first conservative higher-threshold use
+  above promotion: an already-`suspicious` medium-score top-level discovery
+  follow-up moves to `rate_limited` once the structured recon score reaches `5`
+  from sustained discovery churn, without treating the request itself as a
+  bait-derived action; that higher-threshold path is now also proven with the
+  blind decoy-write contributor in the score, so one query-bearing discovery
+  request plus a same-session unsafe probe to `/api/v2/import/reconcile`
+  without a bait header can still accumulate into a later throttled
+  top-level-discovery follow-up
+- that blind decoy-write contributor is no longer a seen/not-seen bit; it is
+  now tracked as a small capped count, so a second same-session unsafe probe
+  raises the decoy-write recon component from `2` to `3` without creating
+  `bait_action_observed`, and the stronger score is visible in the same later
+  top-level discovery rate-limit path
+- that blind decoy-write contributor is also no longer hard-wired to the
+  default reconcile route; it now applies to any constrained unsafe bait action
+  path from the active bait profile when the request matches method/path but no
+  expected bait header name is present
+- that generalized blind decoy-write contributor now also tracks a coarse
+  write-target fanout class, so probing both the canonical reconcile route and
+  a different constrained unsafe bait action path adds one more weak recon
+  point without creating `bait_action_observed`; the structured recon score and
+  debug/export path now surface that as
+  `decoy_write_probe_path_fanout_bonus`
+- that write-target fanout is no longer scorer-only: an already-`suspicious`
+  medium-score session can now move straight to `rate_limited` on the second
+  distinct blind unsafe probe when the existing `query_score` plus
+  `decoy_write_probe_score` plus `decoy_write_probe_path_fanout_bonus` is what
+  reaches the recon persistence threshold of `5`, even before another
+  top-level discovery follow-up happens
+- that same blind write-target fanout can now also drive the next hard-fail
+  rung directly: after Eidolon has already rate-limited the session on that
+  second distinct unsafe probe, repeating the blind probe again can move the
+  session to `blocked` under the same pre-containment persistence family,
+  without turning the request into `bait_action_observed`
+- one adjacent `rate_limited -> blocked` path now exists for repeating that
+  same medium-score top-level discovery churn again after Eidolon has already
+  throttled the session once, keeping the hard-fail tied to explicit
+  persistence before any bait-derived action is confirmed; that blocked retry
+  rung is now also proven with the blind decoy-write contributor in the score,
+  so the same session can move from one query-bearing discovery request, to an
+  unattributed unsafe probe, to `rate_limited`, and then to `blocked` on a
+  repeated top-level discovery retry without creating `bait_action_observed`
+  evidence
+- one adjacent aggregated `observe -> suspicious` path now exists for one
+  query-bearing medium-score authenticated discovery request when authenticated
+  detection IDs also contribute, so multiple weak advisory and recon facts can
+  promote on first contact without requiring a strong single-request score
+- one adjacent target-side aggregated `observe -> suspicious` path now exists
+  for one medium-score legacy-query OpenAPI discovery request, so multiple weak
+  recon facts can promote on first contact without depending on edge-provided
+  detection IDs
+- one adjacent target-side aggregated `observe -> suspicious` path now exists
+  for one medium-score linked bait-surface follow-up after query-bearing docs
+  discovery, so moving from top-level discovery into a linked bait surface like
+  `/docs/legacy-import`, `/customer/import-recovery-checklist`, or
+  `/assets/import-helper.js` contributes as target-side recon without treating
+  the follow-up as a confirmed bait-derived action
+- one adjacent target-side aggregated `observe -> suspicious` path now exists
+  for one medium-score `/docs` discovery request plus churn across two linked
+  bait classes, so a same-session move from `/docs/legacy-import` into
+  `/assets/import-helper.js` can now promote without query-bearing discovery or
+  edge-provided detections once the linked recon fanout itself is strong enough
+- one adjacent target-side aggregated `observe -> suspicious` path now exists
+  for one medium-score `/openapi.json` discovery request plus churn across two
+  linked bait classes, so the same linked recon fanout now works from the
+  OpenAPI side instead of assuming `/docs` is always the first discovery anchor
+- one conservative session-recon promotion now exists for same-session
+  discovery-surface fanout across `/docs` and `/openapi.json`, while stronger
+  trusted identities still suppress that low-confidence runtime promotion
 - suspicious `GET /docs` and `GET /openapi.json` discovery requests now receive
   Eidolon-owned bait surfaces instead of rewritten upstream discovery views,
   and those owned responses record normal bait exposure so same-session causal
   correlation still works while edge export recommends
   `preserve_eidolon_routing`
+- one conservative `suspicious -> rate_limited` path now exists for a
+  same-session, same-bait action near miss after prior exposure on
+  `/api/v2/import/reconcile`; the unmatched bait-shaped action is preserved as
+  evidence, but only already-suspicious sessions are throttled, and the
+  rate-limited reason now carries the shared pre-containment
+  `persistence_class`
+- edge export now carries that same `pre_containment_persistence` family for
+  rate-limited sessions too, with class-level detail like `discovery_recon`
+  or `same_bait_near_miss`, so operators can group persistence before the
+  blocked retry rung
+- edge export now also exposes that persistence class as a structured
+  `policy.pre_containment_persistence_class` field, so SIEM consumers do not
+  need to infer it from `edge_recommendation.reason_codes`
+- blocked pre-containment exports now also expose the retry detail as a
+  structured `policy.pre_containment_persistence_kind` field, so downstream
+  consumers can distinguish `discovery_recon_retry`,
+  `same_bait_near_miss_retry`, and `write_recon_retry` without scraping
+  `reason_codes`
+- one conservative `rate_limited -> blocked` path now exists for repeating
+  that same-bait near miss again after Eidolon has already throttled the
+  session once, keeping blocked rare and tied to explicit retry behavior
+- edge export now groups that pre-containment blocked path under the shared
+  `pre_containment_persistence` reason-code family with the detail code
+  `same_bait_near_miss_retry`, and the proxy now stamps both the shared
+  `persistence_class` and the blocked-only `persistence_kind` directly into the
+  blocked reason instead of relying on export-side heuristics
+- edge export now groups the adjacent recon-driven blocked retry under that
+  same `pre_containment_persistence` family with the detail code
+  `discovery_recon_retry` from those same explicit reason markers
+- the authenticated `detection_ids` contributor is now proven across both the
+  `suspicious -> rate_limited` and `rate_limited -> blocked` discovery-recon
+  rungs, so advisory detections now influence more than first-contact
+  promotion
+- the pre-containment weighted recon ladder now shares one explicit runtime
+  signal/persistence profile for its rate-limit and blocked rungs, so those
+  two transitions no longer duplicate their own medium-score actor,
+  score-kind, vendor-score, and recon-classification gates independently
+- edge export now splits the direct blind write-target retry case out of that
+  generic recon bucket: when a blocked decision comes from repeating the
+  rate-limited blind unsafe write path itself, the shared family stays
+  `pre_containment_persistence` but the detail code becomes
+  `write_recon_retry`
+- one conservative `rate_limited -> controlled_reality` path now exists for a
+  confirmed same-session exact bait-derived action after throttling, so stronger
+  runtime evidence still moves the session into containment instead of stopping
+  at a synthetic intercept
+- one conservative `controlled_reality -> blocked` path now exists for repeated
+  reality-escape attempts outside the configured controlled-reality branch,
+  keeping automatic blocking tied to explicit persistence after containment
+- one adjacent `controlled_reality -> blocked` path now exists for continuing
+  to probe the same controlled branch after Eidolon has already depth-throttled
+  the session once, keeping the hard-fail tied to explicit post-containment
+  persistence rather than the first over-limit request
+- edge export now groups both post-containment blocked paths under the shared
+  `post_containment_persistence` reason-code family while preserving distinct
+  detail codes for branch-escape versus depth-limit persistence
+- blocked post-containment exports now also expose that detail as a structured
+  `policy.post_containment_persistence_kind` field, so downstream consumers do
+  not need to infer `controlled_reality_branch_escape` versus
+  `controlled_reality_depth_limit` from `reason_codes`
+- advisory `detection_ids` are now also proven on the higher-threshold
+  `suspicious -> rate_limited` weighted recon path, not just the first
+  `observe -> suspicious` aggregation rung
+- near-miss matching on the shared reconcile path is now header-aware, so
+  `X-Migration-Trace` and `X-OpenAPI-Trace` requests are attributed to the
+  correct bait family instead of collapsing onto the first registered decoy
 
 That keeps the current containment invariants stable while giving `#175` a
 typed signal plane to build on.

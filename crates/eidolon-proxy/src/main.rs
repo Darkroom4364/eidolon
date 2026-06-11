@@ -15,14 +15,14 @@ use std::{
 
 use eidolon_bait::{docs_for_bait, BaitRegistry};
 use eidolon_core::{
-    Bait, BaitClass, BaitId, Event, EventKind, EventSource, ExposureId, PolicyState,
-    RoutingDecision, SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
+    Bait, BaitClass, BaitId, DiscoveryReconScore, Event, EventKind, EventSource, ExposureId,
+    PolicyState, RoutingDecision, SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
 };
 use eidolon_proxy::{
     controlled_reality::{
         rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
-        DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
-        MAX_TARPIT_DELAY,
+        DECOY_RECONCILE_PATH, DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY,
+        MAX_CONTROLLED_REALITY_ACTION_DEPTH, MAX_TARPIT_DELAY,
     },
     debug_log::FileDebugLogWriter,
     event_log::FileEventLogWriter,
@@ -1437,6 +1437,103 @@ fn is_openapi_discovery_request(request: &SurfaceRequestMeta, bait: &Bait) -> bo
         )
 }
 
+fn is_legacy_openapi_discovery_query(request: &SurfaceRequestMeta) -> bool {
+    request.method == "GET"
+        && request.path == OPENAPI_DISCOVERY_TARGET
+        && request.query.as_deref() == Some(LEGACY_IMPORT_OPENAPI_QUERY)
+}
+
+fn linked_bait_surface_kind(
+    runtime: &ProxyRuntime,
+    request: &SurfaceRequestMeta,
+) -> Option<policy::LinkedBaitSurfaceKind> {
+    if request.method != "GET" {
+        return None;
+    }
+
+    runtime
+        .bait_registry
+        .baits()
+        .iter()
+        .find(|bait| bait.bait_class != BaitClass::OpenApi && bait.surface == request.path)
+        .map(|_| {
+            if request.path.starts_with("/docs/") {
+                policy::LinkedBaitSurfaceKind::Docs
+            } else if request.path.starts_with("/assets/") {
+                policy::LinkedBaitSurfaceKind::Assets
+            } else {
+                policy::LinkedBaitSurfaceKind::Other
+            }
+        })
+}
+
+fn is_blind_decoy_write_probe(runtime: &ProxyRuntime, request: &SurfaceRequestMeta) -> bool {
+    blind_decoy_write_probe_path_kind(runtime, request).is_some()
+}
+
+fn blind_decoy_write_probe_path_kind(
+    runtime: &ProxyRuntime,
+    request: &SurfaceRequestMeta,
+) -> Option<policy::DecoyWriteProbePathKind> {
+    if !matches!(request.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        return None;
+    }
+
+    let headers: Vec<(&str, &str)> = surface_header_pairs(&request.headers).collect();
+    if runtime
+        .bait_registry
+        .match_action(&request.method, &request.path, headers.iter().copied())
+        .is_some()
+        || runtime
+            .bait_registry
+            .match_action_shape(&request.method, &request.path, headers.iter().copied())
+            .is_some()
+    {
+        return None;
+    }
+
+    runtime.bait_registry.baits().iter().find(|bait| {
+        bait.expected_action
+            .method
+            .eq_ignore_ascii_case(&request.method)
+            && bait.expected_action.path == request.path
+            && bait.expected_action.header_name.is_some()
+    })?;
+
+    Some(if request.path == DECOY_RECONCILE_PATH {
+        policy::DecoyWriteProbePathKind::Reconcile
+    } else {
+        policy::DecoyWriteProbePathKind::Other
+    })
+}
+
+fn is_aggregated_discovery_recon_candidate_request(
+    runtime: &ProxyRuntime,
+    request: &SurfaceRequestMeta,
+) -> bool {
+    discovery_surface_kind(runtime, request).is_some()
+        || linked_bait_surface_kind(runtime, request).is_some()
+        || is_blind_decoy_write_probe(runtime, request)
+}
+
+fn discovery_surface_kind(
+    runtime: &ProxyRuntime,
+    request: &SurfaceRequestMeta,
+) -> Option<policy::DiscoverySurfaceKind> {
+    if request.method != "GET" {
+        return None;
+    }
+    if request.path == DOCS_DISCOVERY_TARGET {
+        return Some(policy::DiscoverySurfaceKind::Docs);
+    }
+
+    runtime
+        .bait_registry
+        .bait_for_class(BaitClass::OpenApi)
+        .filter(|bait| is_openapi_discovery_request(request, bait))
+        .map(|_| policy::DiscoverySurfaceKind::OpenApi)
+}
+
 fn m3_docs_discovery_html(bait_registry: &BaitRegistry, content: &BaitContentOverrides) -> String {
     let heading = content
         .docs_discovery_heading
@@ -1755,6 +1852,13 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let surface_request = surface_request_meta(&request, &path);
     let session = effective_session_context(runtime, &request, &surface_request);
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
+    let starting_policy_state = policy_state;
+    let mut policy_reason_override = None;
+    let discovery_recon_state =
+        update_discovery_recon_state_for_request(runtime, session.session_id, &surface_request)?;
+    let discovery_recon_score =
+        policy::aggregated_discovery_recon_score(&session.ingress_signals, discovery_recon_state);
+    let mut discovery_recon_threshold = policy::discovery_recon_aggregation_score_threshold();
     if intervention_mode.interventions_enabled() {
         if let Some(transition) = policy::transition_to_suspicious_from_ingress_signals(
             policy_state,
@@ -1779,6 +1883,114 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 &policy::policy_changed_event(session.session_id, &transition),
             )?;
             policy_state = transition.to;
+        } else if let Some(transition) = policy::transition_to_suspicious_from_discovery_fanout(
+            policy_state,
+            &surface_request.path,
+            &session.ingress_identity,
+            discovery_recon_state.fanout,
+        ) {
+            write_debug(
+                runtime,
+                "policy_transition_selected",
+                Some(session.session_id),
+                json!({
+                    "from": transition.from,
+                    "to": transition.to,
+                    "reason": transition.reason.as_str(),
+                }),
+            )?;
+            set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+            write_event(
+                &runtime.event_log,
+                &policy::policy_changed_event(session.session_id, &transition),
+            )?;
+            policy_state = transition.to;
+        } else if let Some(transition) =
+            policy::transition_to_suspicious_from_aggregated_discovery_recon(
+                policy_state,
+                &surface_request.path,
+                is_aggregated_discovery_recon_candidate_request(runtime, &surface_request),
+                &session.ingress_identity,
+                &session.ingress_signals,
+                discovery_recon_state,
+            )
+        {
+            write_debug(
+                runtime,
+                "policy_transition_selected",
+                Some(session.session_id),
+                json!({
+                    "from": transition.from,
+                    "to": transition.to,
+                    "reason": transition.reason.as_str(),
+                }),
+            )?;
+            set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+            write_event(
+                &runtime.event_log,
+                &policy::policy_changed_event(session.session_id, &transition),
+            )?;
+            policy_state = transition.to;
+        }
+        if starting_policy_state == PolicyState::Suspicious {
+            if let Some(transition) =
+                policy::transition_to_rate_limited_from_suspicious_discovery_recon(
+                    policy_state,
+                    &surface_request.path,
+                    discovery_surface_kind(runtime, &surface_request).is_some(),
+                    blind_decoy_write_probe_path_kind(runtime, &surface_request).is_some(),
+                    &session.ingress_identity,
+                    &session.ingress_signals,
+                    discovery_recon_state,
+                )
+            {
+                write_debug(
+                    runtime,
+                    "policy_transition_selected",
+                    Some(session.session_id),
+                    json!({
+                        "from": transition.from,
+                        "to": transition.to,
+                        "reason": transition.reason.as_str(),
+                    }),
+                )?;
+                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_changed_event(session.session_id, &transition),
+                )?;
+                discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
+                policy_state = transition.to;
+            }
+        } else if starting_policy_state == PolicyState::RateLimited {
+            if let Some(transition) = policy::transition_to_blocked_from_repeated_discovery_recon(
+                policy_state,
+                &surface_request.path,
+                discovery_surface_kind(runtime, &surface_request).is_some(),
+                blind_decoy_write_probe_path_kind(runtime, &surface_request).is_some(),
+                &session.ingress_identity,
+                &session.ingress_signals,
+                discovery_recon_state,
+            ) {
+                write_debug(
+                    runtime,
+                    "policy_transition_selected",
+                    Some(session.session_id),
+                    json!({
+                        "from": transition.from,
+                        "to": transition.to,
+                        "reason": transition.reason.as_str(),
+                    }),
+                )?;
+                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_changed_event(session.session_id, &transition),
+                )?;
+                discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
+                policy_reason_override = Some(transition.reason);
+                policy_state = transition.to;
+            }
         }
     }
     write_debug(
@@ -1798,6 +2010,39 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "session_source": debug_session_source(session.source),
             "ingress_identity": &session.ingress_identity,
             "ingress_signals": &session.ingress_signals,
+            "discovery_surface_fanout":
+                debug_discovery_surface_fanout(discovery_recon_state.fanout),
+            "discovery_request_count": discovery_recon_state.request_count,
+            "discovery_query_seen": discovery_recon_state.query_seen,
+            "discovery_legacy_openapi_query_seen":
+                discovery_recon_state.legacy_openapi_query_seen,
+            "discovery_linked_bait_surface_seen":
+                discovery_recon_state.linked_bait_surface_seen,
+            "discovery_linked_bait_surface_classes":
+                discovery_recon_state.linked_bait_surface_classes,
+            "discovery_decoy_write_probe_seen":
+                discovery_recon_state.decoy_write_probe_seen,
+            "discovery_decoy_write_probe_count":
+                discovery_recon_state.decoy_write_probe_count,
+            "discovery_decoy_write_probe_path_classes":
+                discovery_recon_state.decoy_write_probe_path_classes,
+            "discovery_recon_score": {
+                "repeated_discovery_score": discovery_recon_score.repeated_discovery_score,
+                "query_score": discovery_recon_score.query_score,
+                "legacy_openapi_query_score":
+                    discovery_recon_score.legacy_openapi_query_score,
+                "linked_bait_surface_score":
+                    discovery_recon_score.linked_bait_surface_score,
+                "linked_bait_class_fanout_bonus":
+                    discovery_recon_score.linked_bait_class_fanout_bonus,
+                "decoy_write_probe_score":
+                    discovery_recon_score.decoy_write_probe_score,
+                "decoy_write_probe_path_fanout_bonus":
+                    discovery_recon_score.decoy_write_probe_path_fanout_bonus,
+                "detection_score": discovery_recon_score.detection_score,
+                "total": discovery_recon_score.total,
+                "threshold": discovery_recon_threshold,
+            },
             "policy_state": policy_state,
             "intervention_mode": debug_intervention_mode(intervention_mode),
         }),
@@ -1833,6 +2078,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 request: &request,
                 path: &path,
                 decision: &decision,
+                discovery_recon_score,
+                discovery_recon_threshold,
                 response,
                 intervention_mode,
                 surface_requested_intervention: true,
@@ -1840,18 +2087,80 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         }
     }
 
-    let decision = policy::decide_for_state(policy_state, intervention_mode);
+    let mut decision = policy::decide_for_state(policy_state, intervention_mode);
+    if let Some(reason) = policy_reason_override {
+        decision =
+            policy::PolicyDecision::new(decision.policy_state, decision.routing_decision, reason);
+    }
     let controller_surface_action = if intervention_mode.interventions_enabled() {
         match decision.routing_decision {
             RoutingDecision::ProtectedUpstream => {
                 runtime.surface_controller.decide(&surface_request)
             }
-            RoutingDecision::ControlledReality => controlled_reality_action(
-                runtime,
-                session.session_id,
-                &surface_request,
-                decision.reason.clone(),
-            )?,
+            RoutingDecision::ControlledReality => {
+                let (action, transition) = controlled_reality_action(
+                    runtime,
+                    session.session_id,
+                    &surface_request,
+                    decision.reason.clone(),
+                )?;
+                if let Some(transition) = transition {
+                    write_debug(
+                        runtime,
+                        "policy_transition_selected",
+                        Some(session.session_id),
+                        json!({
+                            "from": transition.from,
+                            "to": transition.to,
+                            "reason": transition.reason.as_str(),
+                        }),
+                    )?;
+                    set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                    write_event(
+                        &runtime.event_log,
+                        &policy::policy_changed_event(session.session_id, &transition),
+                    )?;
+                    let blocked_decision = policy::PolicyDecision::new(
+                        transition.to,
+                        action.routing_decision(),
+                        transition.reason.clone(),
+                    );
+                    write_debug(
+                        runtime,
+                        "surface_action_selected",
+                        Some(session.session_id),
+                        json!({
+                            "policy_state": blocked_decision.policy_state,
+                            "policy_routing_decision": blocked_decision.routing_decision,
+                            "policy_reason": blocked_decision.reason.as_str(),
+                            "controller_surface_action": debug_surface_action(&action),
+                            "candidate_surface_action": debug_surface_action(&action),
+                            "surface_action": debug_surface_action(&action),
+                            "surface_requested_intervention": true,
+                            "trusted_ingress_softened_surface": false,
+                            "trusted_ingress_softening_reason": Value::Null,
+                            "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
+                        }),
+                    )?;
+                    let SurfaceAction::EidolonOwned { response } = action else {
+                        panic!("blocked controlled-reality action should be eidolon owned");
+                    };
+                    return write_direct_response(DirectResponseContext {
+                        client_stream,
+                        runtime,
+                        session: &session,
+                        request: &request,
+                        path: &path,
+                        decision: &blocked_decision,
+                        discovery_recon_score,
+                        discovery_recon_threshold,
+                        response,
+                        intervention_mode,
+                        surface_requested_intervention: true,
+                    });
+                }
+                action
+            }
             RoutingDecision::RateLimited => SurfaceAction::RateLimited {
                 reason: decision.reason.clone(),
                 response: rate_limited_response(
@@ -1910,9 +2219,73 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
         }),
     )?;
+    if let Some(transition) = maybe_transition_to_blocked_from_reality_escape_attempt(
+        runtime,
+        &session,
+        &request,
+        &surface_request,
+        &effective_decision,
+    )? {
+        write_debug(
+            runtime,
+            "policy_transition_selected",
+            Some(session.session_id),
+            json!({
+                "from": transition.from,
+                "to": transition.to,
+                "reason": transition.reason.as_str(),
+            }),
+        )?;
+        set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+        write_event(
+            &runtime.event_log,
+            &policy::policy_changed_event(session.session_id, &transition),
+        )?;
+        let blocked_decision = policy::PolicyDecision::new(
+            transition.to,
+            RoutingDecision::EidolonOwned,
+            transition.reason.clone(),
+        );
+        let blocked_response = surface_text_response(403, "blocked by eidolon policy\n");
+        let blocked_surface_action = SurfaceAction::EidolonOwned {
+            response: blocked_response.clone(),
+        };
+        write_debug(
+            runtime,
+            "surface_action_selected",
+            Some(session.session_id),
+            json!({
+                "policy_state": blocked_decision.policy_state,
+                "policy_routing_decision": blocked_decision.routing_decision,
+                "policy_reason": blocked_decision.reason.as_str(),
+                "controller_surface_action": debug_surface_action(&controller_surface_action),
+                "candidate_surface_action": debug_surface_action(&candidate_surface_action),
+                "surface_action": debug_surface_action(&blocked_surface_action),
+                "surface_requested_intervention": true,
+                "trusted_ingress_softened_surface": false,
+                "trusted_ingress_softening_reason": Value::Null,
+                "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
+            }),
+        )?;
+        return write_direct_response(DirectResponseContext {
+            client_stream,
+            runtime,
+            session: &session,
+            request: &request,
+            path: &path,
+            decision: &blocked_decision,
+            discovery_recon_score,
+            discovery_recon_threshold,
+            response: blocked_response,
+            intervention_mode,
+            surface_requested_intervention: true,
+        });
+    }
 
     if intervention_mode.interventions_enabled()
-        && matches!(&surface_action, SurfaceAction::ProtectedUpstream)
+        && (matches!(&surface_action, SurfaceAction::ProtectedUpstream)
+            || (decision.policy_state == PolicyState::RateLimited
+                && matches!(&surface_action, SurfaceAction::RateLimited { .. })))
     {
         if let Some(action_match) = runtime.bait_registry.match_action(
             &request.method,
@@ -1926,7 +2299,14 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             );
             write_event(
                 &runtime.event_log,
-                &request_seen_event(&request, &path, &session, &effective_decision),
+                &request_seen_event(
+                    &request,
+                    &path,
+                    &session,
+                    &effective_decision,
+                    discovery_recon_score,
+                    discovery_recon_threshold,
+                ),
             )?;
             let action_exposure_id = write_bait_action_observed_event(
                 runtime,
@@ -1969,14 +2349,40 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     &runtime.event_log,
                     &policy::policy_changed_event(session.session_id, &transition),
                 )?;
-                let action = controlled_reality_action(
+                let (action, controlled_transition) = controlled_reality_action(
                     runtime,
                     session.session_id,
                     &surface_request,
                     transition.reason.clone(),
                 )?;
-                effective_decision =
-                    direct_surface_decision(transition.to, &action, transition.reason);
+                effective_decision = if let Some(controlled_transition) = controlled_transition {
+                    write_debug(
+                        runtime,
+                        "policy_transition_selected",
+                        Some(session.session_id),
+                        json!({
+                            "from": controlled_transition.from,
+                            "to": controlled_transition.to,
+                            "reason": controlled_transition.reason.as_str(),
+                        }),
+                    )?;
+                    set_policy_state_for_session(
+                        runtime,
+                        session.session_id,
+                        controlled_transition.to,
+                    )?;
+                    write_event(
+                        &runtime.event_log,
+                        &policy::policy_changed_event(session.session_id, &controlled_transition),
+                    )?;
+                    policy::PolicyDecision::new(
+                        controlled_transition.to,
+                        action.routing_decision(),
+                        controlled_transition.reason.clone(),
+                    )
+                } else {
+                    direct_surface_decision(transition.to, &action, transition.reason)
+                };
                 write_event(
                     &runtime.event_log,
                     &policy::policy_intervention_event(session.session_id, &effective_decision),
@@ -2019,6 +2425,164 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         }
     }
 
+    if intervention_mode.interventions_enabled()
+        && matches!(&surface_action, SurfaceAction::ProtectedUpstream)
+    {
+        if let Some(action_shape_match) = runtime.bait_registry.match_action_shape(
+            &request.method,
+            &surface_request.path,
+            header_pairs(&request.headers),
+        ) {
+            let prior_same_bait_exposure = write_bait_action_near_miss_event(
+                runtime,
+                &session,
+                decision.policy_state,
+                &action_shape_match.bait,
+                &request.method,
+                &surface_request.path,
+            )?;
+            write_debug(
+                runtime,
+                "bait_action_near_miss",
+                Some(session.session_id),
+                json!({
+                    "bait_id": &action_shape_match.bait.id,
+                    "method": request.method.as_str(),
+                    "path": debug_path(&surface_request.path),
+                    "query_present": surface_request.query.is_some(),
+                    "prior_same_bait_exposure": prior_same_bait_exposure,
+                }),
+            )?;
+
+            if let Some(transition) = policy::transition_to_rate_limited_from_same_bait_near_miss(
+                decision.policy_state,
+                &surface_request.path,
+                &action_shape_match.bait.id,
+                prior_same_bait_exposure,
+            ) {
+                write_debug(
+                    runtime,
+                    "policy_transition_selected",
+                    Some(session.session_id),
+                    json!({
+                        "from": transition.from,
+                        "to": transition.to,
+                        "reason": transition.reason.as_str(),
+                    }),
+                )?;
+                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_changed_event(session.session_id, &transition),
+                )?;
+                let response =
+                    rate_limited_response(runtime.controlled_reality_config.retry_after_seconds);
+                let action = SurfaceAction::RateLimited {
+                    reason: transition.reason.clone(),
+                    response: response.clone(),
+                };
+                effective_decision =
+                    direct_surface_decision(transition.to, &action, transition.reason);
+                return write_direct_response(DirectResponseContext {
+                    client_stream,
+                    runtime,
+                    session: &session,
+                    request: &request,
+                    path: &path,
+                    decision: &effective_decision,
+                    discovery_recon_score,
+                    discovery_recon_threshold,
+                    response,
+                    intervention_mode,
+                    surface_requested_intervention: true,
+                });
+            }
+        }
+    }
+
+    if intervention_mode.interventions_enabled()
+        && decision.policy_state == PolicyState::RateLimited
+        && matches!(&surface_action, SurfaceAction::RateLimited { .. })
+        && runtime
+            .bait_registry
+            .match_action(
+                &request.method,
+                &surface_request.path,
+                header_pairs(&request.headers),
+            )
+            .is_none()
+    {
+        if let Some(action_shape_match) = runtime.bait_registry.match_action_shape(
+            &request.method,
+            &surface_request.path,
+            header_pairs(&request.headers),
+        ) {
+            let prior_same_bait_exposure = write_bait_action_near_miss_event(
+                runtime,
+                &session,
+                decision.policy_state,
+                &action_shape_match.bait,
+                &request.method,
+                &surface_request.path,
+            )?;
+            write_debug(
+                runtime,
+                "bait_action_near_miss",
+                Some(session.session_id),
+                json!({
+                    "bait_id": &action_shape_match.bait.id,
+                    "method": request.method.as_str(),
+                    "path": debug_path(&surface_request.path),
+                    "query_present": surface_request.query.is_some(),
+                    "prior_same_bait_exposure": prior_same_bait_exposure,
+                }),
+            )?;
+
+            if let Some(transition) =
+                policy::transition_to_blocked_from_repeated_same_bait_near_miss(
+                    decision.policy_state,
+                    &surface_request.path,
+                    &action_shape_match.bait.id,
+                    prior_same_bait_exposure,
+                )
+            {
+                write_debug(
+                    runtime,
+                    "policy_transition_selected",
+                    Some(session.session_id),
+                    json!({
+                        "from": transition.from,
+                        "to": transition.to,
+                        "reason": transition.reason.as_str(),
+                    }),
+                )?;
+                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_changed_event(session.session_id, &transition),
+                )?;
+                effective_decision = policy::PolicyDecision::new(
+                    transition.to,
+                    RoutingDecision::EidolonOwned,
+                    transition.reason.clone(),
+                );
+                return write_direct_response(DirectResponseContext {
+                    client_stream,
+                    runtime,
+                    session: &session,
+                    request: &request,
+                    path: &path,
+                    decision: &effective_decision,
+                    discovery_recon_score,
+                    discovery_recon_threshold,
+                    response: surface_text_response(403, "blocked by eidolon policy\n"),
+                    intervention_mode,
+                    surface_requested_intervention: true,
+                });
+            }
+        }
+    }
+
     if let Some(mut response) = direct_surface_response(surface_action.clone()) {
         effective_decision = direct_surface_decision(
             decision.policy_state,
@@ -2027,19 +2591,17 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         );
         write_request_and_policy_events(
             runtime,
-            &request,
-            &path,
-            &session,
+            &request_seen_event(
+                &request,
+                &path,
+                &session,
+                &effective_decision,
+                discovery_recon_score,
+                discovery_recon_threshold,
+            ),
             &effective_decision,
             intervention_mode,
             surface_requested_intervention,
-        )?;
-        write_reality_escape_attempt_if_needed(
-            runtime,
-            &session,
-            &request,
-            &surface_request,
-            &effective_decision,
         )?;
         apply_response_headers(&mut response, &session);
         if let Some(bait) = bait_exposure_for_direct_surface(
@@ -2086,7 +2648,14 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     );
     write_event(
         &runtime.event_log,
-        &request_seen_event(&request, &path, &session, &upstream_request_decision),
+        &request_seen_event(
+            &request,
+            &path,
+            &session,
+            &upstream_request_decision,
+            discovery_recon_score,
+            discovery_recon_threshold,
+        ),
     )?;
     if intervention_mode == InterventionMode::Disabled {
         write_event(
@@ -2221,24 +2790,32 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     client_stream.flush()
 }
 
-fn write_reality_escape_attempt_if_needed(
+fn maybe_transition_to_blocked_from_reality_escape_attempt(
     runtime: &ProxyRuntime,
     session: &SessionContext,
     request: &HttpRequest,
     surface_request: &SurfaceRequestMeta,
     decision: &policy::PolicyDecision,
-) -> io::Result<()> {
+) -> io::Result<Option<policy::PolicyTransition>> {
+    if decision.policy_state != PolicyState::ControlledReality {
+        return Ok(None);
+    }
+    if runtime
+        .controlled_reality
+        .is_controlled_branch(surface_request)
+    {
+        clear_reality_escape_attempts_for_session(runtime, session.session_id)?;
+        return Ok(None);
+    }
     if decision.policy_state != PolicyState::ControlledReality
         || !matches!(
             decision.routing_decision,
             RoutingDecision::ControlledReality | RoutingDecision::RateLimited
         )
-        || runtime
-            .controlled_reality
-            .is_controlled_branch(surface_request)
     {
-        return Ok(());
+        return Ok(None);
     }
+    let attempt_count = note_reality_escape_attempt_for_session(runtime, session.session_id)?;
 
     write_debug(
         runtime,
@@ -2250,6 +2827,7 @@ fn write_reality_escape_attempt_if_needed(
             "query_present": surface_request.query.is_some(),
             "policy_state": decision.policy_state,
             "routing_decision": decision.routing_decision,
+            "attempt_count": attempt_count,
         }),
     )?;
 
@@ -2263,6 +2841,14 @@ fn write_reality_escape_attempt_if_needed(
             decision.routing_decision,
             "controlled session requested a path outside the configured controlled-reality branch",
         ),
+    )?;
+
+    Ok(
+        policy::transition_to_blocked_from_repeated_reality_escape_attempt(
+            decision.policy_state,
+            &surface_request.path,
+            attempt_count,
+        ),
     )
 }
 
@@ -2273,6 +2859,8 @@ struct DirectResponseContext<'a> {
     request: &'a HttpRequest,
     path: &'a str,
     decision: &'a policy::PolicyDecision,
+    discovery_recon_score: policy::DiscoveryReconAggregationScore,
+    discovery_recon_threshold: u8,
     response: SurfaceResponse,
     intervention_mode: InterventionMode,
     surface_requested_intervention: bool,
@@ -2286,6 +2874,8 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
         request,
         path,
         decision,
+        discovery_recon_score,
+        discovery_recon_threshold,
         response,
         intervention_mode,
         surface_requested_intervention,
@@ -2293,9 +2883,14 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
 
     write_request_and_policy_events(
         runtime,
-        request,
-        path,
-        session,
+        &request_seen_event(
+            request,
+            path,
+            session,
+            decision,
+            discovery_recon_score,
+            discovery_recon_threshold,
+        ),
         decision,
         intervention_mode,
         surface_requested_intervention,
@@ -2351,12 +2946,81 @@ fn set_policy_state_for_session(
     store.set_policy_state(session_id, policy_state)
 }
 
+fn note_reality_escape_attempt_for_session(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+) -> io::Result<u32> {
+    let mut store = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+
+    store.note_reality_escape_attempt(session_id)
+}
+
+fn clear_reality_escape_attempts_for_session(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+) -> io::Result<()> {
+    let mut store = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+
+    store.clear_reality_escape_attempts(session_id)
+}
+
+fn update_discovery_recon_state_for_request(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    request: &SurfaceRequestMeta,
+) -> io::Result<policy::DiscoveryReconState> {
+    let mut store = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+
+    if let Some(kind) = discovery_surface_kind(runtime, request) {
+        return store.note_discovery_surface_request(
+            session_id,
+            kind,
+            request.query.is_some(),
+            is_legacy_openapi_discovery_query(request),
+        );
+    }
+
+    if let Some(kind) = linked_bait_surface_kind(runtime, request) {
+        return store.note_linked_bait_surface_request(session_id, kind);
+    }
+
+    if let Some(kind) = blind_decoy_write_probe_path_kind(runtime, request) {
+        return store.note_decoy_write_probe(session_id, kind);
+    }
+
+    let record = store.record(session_id);
+    Ok(policy::DiscoveryReconState {
+        fanout: record.discovery_surface_fanout,
+        request_count: record.discovery_request_count,
+        query_seen: record.discovery_query_seen,
+        legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
+        linked_bait_surface_seen: record.discovery_linked_bait_surface_fanout.any_seen(),
+        linked_bait_surface_classes: record
+            .discovery_linked_bait_surface_fanout
+            .distinct_surface_count(),
+        decoy_write_probe_seen: record.discovery_decoy_write_probe_count > 0,
+        decoy_write_probe_count: record.discovery_decoy_write_probe_count,
+        decoy_write_probe_path_classes: record
+            .discovery_decoy_write_probe_fanout
+            .distinct_path_count(),
+    })
+}
+
 fn controlled_reality_action(
     runtime: &ProxyRuntime,
     session_id: SessionId,
     request: &SurfaceRequestMeta,
     default_reason: String,
-) -> io::Result<SurfaceAction> {
+) -> io::Result<(SurfaceAction, Option<policy::PolicyTransition>)> {
     let depth = {
         let mut store = runtime
             .policy_store
@@ -2371,14 +3035,26 @@ fn controlled_reality_action(
         if !tarpit_delay.is_zero() {
             thread::sleep(tarpit_delay);
         }
-        let action = SurfaceAction::RateLimited {
-            reason: format!(
-                "controlled reality action depth {depth} exceeded limit {depth_limit}; tarpit delay {}ms",
-                tarpit_delay.as_millis()
-            ),
-            response: rate_limited_response(
-                runtime.controlled_reality_config.retry_after_seconds,
-            ),
+        let transition = policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+            PolicyState::ControlledReality,
+            &request.path,
+            depth,
+            depth_limit,
+        );
+        let action = if transition.is_some() {
+            SurfaceAction::EidolonOwned {
+                response: surface_text_response(403, "blocked by eidolon policy\n"),
+            }
+        } else {
+            SurfaceAction::RateLimited {
+                reason: format!(
+                    "controlled reality action depth {depth} exceeded limit {depth_limit}; tarpit delay {}ms",
+                    tarpit_delay.as_millis()
+                ),
+                response: rate_limited_response(
+                    runtime.controlled_reality_config.retry_after_seconds,
+                ),
+            }
         };
         write_debug(
             runtime,
@@ -2388,10 +3064,15 @@ fn controlled_reality_action(
                 "depth": depth,
                 "depth_limit": depth_limit,
                 "tarpit_ms": tarpit_delay.as_millis(),
+                "transition": transition.as_ref().map(|selected| json!({
+                    "from": selected.from,
+                    "to": selected.to,
+                    "reason": selected.reason.as_str(),
+                })),
                 "action": debug_surface_action(&action),
             }),
         )?;
-        return Ok(action);
+        return Ok((action, transition));
     }
 
     let mut action = runtime.controlled_reality.decide(request, depth);
@@ -2411,7 +3092,7 @@ fn controlled_reality_action(
         }),
     )?;
 
-    Ok(action)
+    Ok((action, None))
 }
 
 fn bait_exposure_for_direct_surface<'a>(
@@ -2537,22 +3218,41 @@ fn write_bait_exposed_event(
     Ok(exposure_id)
 }
 
-fn write_bait_action_observed_event(
+fn bait_action_exposure_id(
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    bait_id: &BaitId,
+) -> io::Result<Option<ExposureId>> {
+    let exposures = runtime
+        .bait_exposures
+        .lock()
+        .map_err(|_| io::Error::other("bait exposure store lock poisoned"))?;
+
+    Ok(exposures.exposure_for_action(session.session_id, bait_id))
+}
+
+struct BaitActionObservation<'a> {
+    bait: &'a Bait,
+    method: &'a str,
+    path: &'a str,
+    exposure_id: Option<ExposureId>,
+    prior_same_bait_exposure: bool,
+}
+
+fn write_bait_action_observed_event_with_exposure(
     runtime: &ProxyRuntime,
     session: &SessionContext,
     policy_state: PolicyState,
-    bait: &Bait,
-    method: &str,
-    path: &str,
-) -> io::Result<Option<ExposureId>> {
-    let exposure_id = {
-        let exposures = runtime
-            .bait_exposures
-            .lock()
-            .map_err(|_| io::Error::other("bait exposure store lock poisoned"))?;
-        exposures.exposure_for_action(session.session_id, &bait.id)
-    };
-
+    observation: BaitActionObservation<'_>,
+) -> io::Result<()> {
+    let BaitActionObservation {
+        bait,
+        method,
+        path,
+        exposure_id,
+        prior_same_bait_exposure,
+    } = observation;
+    let matched_prior_exposure = exposure_id.is_some();
     write_event(
         &runtime.event_log,
         &Event::new(
@@ -2577,16 +3277,71 @@ fn write_bait_action_observed_event(
             "method": method,
             "path": debug_path(path),
             "query_present": debug_query_present(path),
-            "matched_prior_exposure": exposure_id.is_some(),
+            "matched_prior_exposure": matched_prior_exposure,
+            "prior_same_bait_exposure": prior_same_bait_exposure,
             "exposure_id": &exposure_id,
         }),
+    )
+}
+
+fn write_bait_action_observed_event(
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    policy_state: PolicyState,
+    bait: &Bait,
+    method: &str,
+    path: &str,
+) -> io::Result<Option<ExposureId>> {
+    let exposure_id = bait_action_exposure_id(runtime, session, &bait.id)?;
+    write_bait_action_observed_event_with_exposure(
+        runtime,
+        session,
+        policy_state,
+        BaitActionObservation {
+            bait,
+            method,
+            path,
+            exposure_id: exposure_id.clone(),
+            prior_same_bait_exposure: exposure_id.is_some(),
+        },
     )?;
 
     Ok(exposure_id)
 }
 
+fn write_bait_action_near_miss_event(
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    policy_state: PolicyState,
+    bait: &Bait,
+    method: &str,
+    path: &str,
+) -> io::Result<bool> {
+    let prior_same_bait_exposure = bait_action_exposure_id(runtime, session, &bait.id)?.is_some();
+    write_bait_action_observed_event_with_exposure(
+        runtime,
+        session,
+        policy_state,
+        BaitActionObservation {
+            bait,
+            method,
+            path,
+            exposure_id: None,
+            prior_same_bait_exposure,
+        },
+    )?;
+
+    Ok(prior_same_bait_exposure)
+}
+
 fn bait_action_synthetic_response() -> HttpResponse {
     surface_response_to_http(surface_text_response(202, "accepted\n"))
+}
+
+fn surface_header_pairs(headers: &[SurfaceHeader]) -> impl Iterator<Item = (&str, &str)> {
+    headers
+        .iter()
+        .map(|header| (header.name.as_str(), header.value.as_str()))
 }
 
 fn header_pairs(headers: &[HttpHeader]) -> impl Iterator<Item = (&str, &str)> {
@@ -2638,11 +3393,14 @@ fn direct_surface_decision(
         SurfaceAction::ProtectedUpstream => {
             policy::PolicyDecision::protected_upstream(policy_state, default_reason)
         }
-        SurfaceAction::EidolonOwned { .. } => policy::PolicyDecision::new(
-            policy_state,
-            RoutingDecision::EidolonOwned,
-            "surface controller served eidolon-owned response",
-        ),
+        SurfaceAction::EidolonOwned { .. } => {
+            let reason = if policy_state == PolicyState::Blocked {
+                default_reason
+            } else {
+                "surface controller served eidolon-owned response".to_string()
+            };
+            policy::PolicyDecision::new(policy_state, RoutingDecision::EidolonOwned, reason)
+        }
         SurfaceAction::ControlledReality { reason, .. } => policy::PolicyDecision::new(
             policy_state,
             RoutingDecision::ControlledReality,
@@ -2706,11 +3464,35 @@ fn normalized_event_path(request: &HttpRequest) -> io::Result<String> {
     Ok(normalize_request_target(&request.target)?.to_string())
 }
 
+fn event_discovery_recon_score(
+    score: policy::DiscoveryReconAggregationScore,
+    threshold: u8,
+) -> DiscoveryReconScore {
+    if score.total == 0 {
+        return DiscoveryReconScore::default();
+    }
+
+    DiscoveryReconScore {
+        repeated_discovery_score: score.repeated_discovery_score,
+        query_score: score.query_score,
+        legacy_openapi_query_score: score.legacy_openapi_query_score,
+        linked_bait_surface_score: score.linked_bait_surface_score,
+        linked_bait_class_fanout_bonus: score.linked_bait_class_fanout_bonus,
+        decoy_write_probe_score: score.decoy_write_probe_score,
+        decoy_write_probe_path_fanout_bonus: score.decoy_write_probe_path_fanout_bonus,
+        detection_score: score.detection_score,
+        total: score.total,
+        threshold,
+    }
+}
+
 fn request_seen_event(
     request: &HttpRequest,
     path: &str,
     session: &SessionContext,
     decision: &policy::PolicyDecision,
+    discovery_recon_score: policy::DiscoveryReconAggregationScore,
+    discovery_recon_threshold: u8,
 ) -> Event {
     Event::new(
         session.session_id,
@@ -2722,6 +3504,10 @@ fn request_seen_event(
             safe_headers: safe_header_observations(&request.headers),
             ingress_identity: session.ingress_identity.clone(),
             ingress_signals: session.ingress_signals.clone(),
+            discovery_recon_score: event_discovery_recon_score(
+                discovery_recon_score,
+                discovery_recon_threshold,
+            ),
             routing_decision: decision.routing_decision,
         },
     )
@@ -2729,17 +3515,12 @@ fn request_seen_event(
 
 fn write_request_and_policy_events(
     runtime: &ProxyRuntime,
-    request: &HttpRequest,
-    path: &str,
-    session: &SessionContext,
+    request_event: &Event,
     decision: &policy::PolicyDecision,
     intervention_mode: InterventionMode,
     surface_requested_intervention: bool,
 ) -> io::Result<()> {
-    write_event(
-        &runtime.event_log,
-        &request_seen_event(request, path, session, decision),
-    )?;
+    write_event(&runtime.event_log, request_event)?;
 
     if intervention_mode == InterventionMode::Disabled
         || surface_requested_intervention
@@ -2747,7 +3528,7 @@ fn write_request_and_policy_events(
     {
         write_event(
             &runtime.event_log,
-            &policy::policy_intervention_event(session.session_id, decision),
+            &policy::policy_intervention_event(request_event.session_id, decision),
         )?;
     }
 
@@ -2986,6 +3767,14 @@ fn debug_intervention_mode(mode: InterventionMode) -> &'static str {
         InterventionMode::Enabled => "enabled",
         InterventionMode::Disabled => "disabled",
     }
+}
+
+fn debug_discovery_surface_fanout(fanout: policy::DiscoverySurfaceFanout) -> Value {
+    json!({
+        "docs_seen": fanout.docs_seen,
+        "openapi_seen": fanout.openapi_seen,
+        "distinct_surfaces": fanout.distinct_surface_count(),
+    })
 }
 
 fn debug_response_fields(response: &HttpResponse) -> Value {
@@ -4004,6 +4793,60 @@ mod tests {
         }"##
     }
 
+    fn alternate_write_probe_profile_json() -> &'static str {
+        r##"{
+          "schema_version": 1,
+          "profile_id": "alternate_write_probe",
+          "baits": [
+            {
+              "id": "validate_import_trace",
+              "bait_class": "docs",
+              "surface": "/docs/import-validate",
+              "surface_kind": "docs",
+              "expected_action": {
+                "method": "POST",
+                "path": "/api/v2/import/validate",
+                "header_name": "X-Validation-Trace",
+                "header_value": "validate_2026_06_a17c"
+              }
+            }
+          ]
+        }"##
+    }
+
+    fn fanout_write_probe_profile_json() -> &'static str {
+        r##"{
+          "schema_version": 1,
+          "profile_id": "fanout_write_probe",
+          "baits": [
+            {
+              "id": "legacy_import_trace",
+              "bait_class": "docs",
+              "surface": "/docs/legacy-import",
+              "surface_kind": "docs",
+              "expected_action": {
+                "method": "POST",
+                "path": "/api/v2/import/reconcile",
+                "header_name": "X-Migration-Trace",
+                "header_value": "rel_2025_04_b7f2"
+              }
+            },
+            {
+              "id": "validate_import_trace",
+              "bait_class": "docs",
+              "surface": "/docs/import-validate",
+              "surface_kind": "docs",
+              "expected_action": {
+                "method": "POST",
+                "path": "/api/v2/import/validate",
+                "header_name": "X-Validation-Trace",
+                "header_value": "validate_2026_06_a17c"
+              }
+            }
+          ]
+        }"##
+    }
+
     fn set_runtime_policy_state(runtime: &ProxyRuntime, cookie: &str, policy_state: PolicyState) {
         let session_id =
             session::session_id_from_cookie_header(cookie).expect("cookie should contain session");
@@ -4037,6 +4880,49 @@ mod tests {
                 .expect("upstream response should write");
             stream.flush().expect("upstream response should flush");
             request
+        });
+        let upstream = must_ok(
+            parse_upstream(&format!("http://{addr}"), false),
+            "upstream target should parse",
+        );
+
+        (upstream, handle)
+    }
+
+    fn spawn_upstream_sequence(
+        responses: impl IntoIterator<Item = Vec<u8>>,
+    ) -> (UpstreamTarget, JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("upstream should bind");
+        let addr = listener.local_addr().expect("upstream should have address");
+        let responses: Vec<Vec<u8>> = responses.into_iter().collect();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::with_capacity(responses.len());
+
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("upstream should accept");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+
+                loop {
+                    let bytes_read = stream.read(&mut chunk).expect("upstream request read");
+                    if bytes_read == 0 {
+                        break;
+                    }
+
+                    request.extend_from_slice(&chunk[..bytes_read]);
+                    if find_header_end(&request).is_some() {
+                        break;
+                    }
+                }
+
+                stream
+                    .write_all(&response)
+                    .expect("upstream response should write");
+                stream.flush().expect("upstream response should flush");
+                requests.push(request);
+            }
+
+            requests
         });
         let upstream = must_ok(
             parse_upstream(&format!("http://{addr}"), false),
@@ -4196,6 +5082,13 @@ mod tests {
             .into_iter()
             .find(|event| event["event"].as_str() == Some(event_type))
             .unwrap_or_else(|| panic!("missing debug event `{event_type}`"))
+    }
+
+    fn debug_events(path: &Path, event_type: &str) -> Vec<Value> {
+        debug_values(path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some(event_type))
+            .collect()
     }
 
     fn events_of_type(path: &Path, event_type: &str) -> Vec<Value> {
@@ -5282,6 +6175,7 @@ mod tests {
                     safe_headers: Vec::new(),
                     ingress_identity: Default::default(),
                     ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             ),
@@ -5719,7 +6613,10 @@ mod tests {
         assert_eq!(bait_exposed["kind"]["bait_id"], "rel_2025_04_b7f2");
         assert_eq!(bait_exposed["kind"]["surface"], "/docs");
 
-        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        let surface_debug = debug_values(&debug_log_path)
+            .into_iter()
+            .rfind(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .expect("second request should record a surface action");
         assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
         assert_eq!(
             surface_debug["fields"]["controller_surface_action"]["type"],
@@ -5816,6 +6713,3113 @@ mod tests {
         assert_eq!(
             surface_debug["fields"]["trusted_ingress_softened_surface"],
             false
+        );
+    }
+
+    #[test]
+    fn runtime_promotes_discovery_surface_fanout_to_suspicious() {
+        let event_log_path = unique_temp_path("fanout-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("fanout-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("fanout-suspicious-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs?topic=imports", &cookie),
+        ));
+        let first_body = must_ok(
+            String::from_utf8(first_response.body),
+            "body should be utf8",
+        );
+        must_join(upstream_handle.join(), "upstream thread should join");
+
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/openapi.json", &cookie),
+        ));
+        let second_body: Value = must_ok(
+            serde_json::from_slice(&second_response.body),
+            "body should be json",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert!(first_body.contains("/docs/legacy-import"));
+        assert_eq!(second_response.status, 200);
+        assert_eq!(second_body["openapi"].as_str(), Some("3.0.3"));
+        assert!(second_body["paths"]["/api/v2/import/reconcile"].is_object());
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["kind"]["path"], "/openapi.json");
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "session recon discovery-surface fanout promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("distinct_surfaces=2")));
+
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
+        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_surface_fanout"]["docs_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_surface_fanout"]["openapi_seen"],
+            true
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(
+            surface_debugs[1]["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(surface_debugs[1]["fields"]["policy_state"], "suspicious");
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_repeated_discovery_to_suspicious() {
+        let event_log_path = unique_temp_path("aggregated-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+        let second_body = must_ok(
+            String::from_utf8(second_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert!(second_body.contains("X-Migration-Trace: rel_2025_04_b7f2"));
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("vendor_score=35")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_score=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 2);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_legacy_openapi_query_seen"],
+            false
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
+            false
+        );
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
+            1
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(
+            surface_debugs[1]["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(surface_debugs[1]["fields"]["policy_state"], "suspicious");
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_detection_backed_discovery_to_suspicious() {
+        let event_log_path = unique_temp_path("aggregated-detection-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-detection-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-detection-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+                    (
+                        session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                        "automation_likelihood_inverse",
+                    ),
+                    (session::INGRESS_DETECTION_IDS_HEADER_NAME, "3355446,445566"),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        let body = must_ok(String::from_utf8(response.body), "body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert!(body.contains("X-Migration-Trace: rel_2025_04_b7f2"));
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["policy_state"], "suspicious");
+        assert_eq!(request_event["kind"]["routing_decision"], "eidolon_owned");
+        assert_eq!(request_event["kind"]["ingress_signals"]["vendor_score"], 35);
+        assert_eq!(
+            request_event["kind"]["ingress_signals"]["detection_ids"][0],
+            "3355446"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_signals"]["detection_ids"][1],
+            "445566"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
+
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(request_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(request_debug["fields"]["query_present"], true);
+        assert_eq!(request_debug["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debug["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debug["fields"]["discovery_legacy_openapi_query_seen"],
+            false
+        );
+        assert_eq!(
+            request_debug["fields"]["discovery_linked_bait_surface_seen"],
+            false
+        );
+        assert_eq!(
+            request_debug["fields"]["ingress_signals"]["detection_ids"][0],
+            "3355446"
+        );
+        assert_eq!(
+            request_debug["fields"]["ingress_signals"]["detection_ids"][1],
+            "445566"
+        );
+        assert_eq!(request_debug["fields"]["discovery_recon_score"]["total"], 3);
+        assert_eq!(
+            request_debug["fields"]["discovery_recon_score"]["detection_score"],
+            2
+        );
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+    }
+
+    #[test]
+    fn runtime_rate_limits_suspicious_detection_backed_recon_persistence() {
+        let event_log_path = unique_temp_path("aggregated-detection-rate-limit-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-detection-rate-limit-debug.jsonl");
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-detection-rate-limit-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_DETECTION_IDS_HEADER_NAME, "3355446,445566"),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 429);
+        assert_eq!(header_values(&second_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "suspicious");
+        assert_eq!(request_events[1]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["ingress_signals"]["detection_ids"][0],
+            "3355446"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["ingress_signals"]["detection_ids"][1],
+            "445566"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["detection_score"],
+            2
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 2);
+        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
+        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["from"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["to"], "rate_limited");
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("suspicious discovery recon persistence moved session to rate limited")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/docs")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_score=1")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_score=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_rate_limit_threshold=5")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(request_debugs[1]["fields"]["path"], "/docs");
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 2);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["ingress_signals"]["detection_ids"][0],
+            "3355446"
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["ingress_signals"]["detection_ids"][1],
+            "445566"
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["detection_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[1]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(
+            surface_debugs[1]["fields"]["surface_action"]["type"],
+            "rate_limited"
+        );
+    }
+
+    #[test]
+    fn runtime_blocks_after_rate_limited_detection_backed_recon_retry() {
+        let event_log_path = unique_temp_path("aggregated-detection-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-detection-blocked-debug.jsonl");
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-detection-blocked-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_DETECTION_IDS_HEADER_NAME, "3355446,445566"),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 429);
+        assert_eq!(third_response.status, 403);
+        assert_eq!(header_values(&second_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[0]["policy_state"], "suspicious");
+        assert_eq!(request_events[1]["policy_state"], "rate_limited");
+        assert_eq!(request_events[2]["policy_state"], "blocked");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["ingress_signals"]["detection_ids"][0],
+            "3355446"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["ingress_signals"]["detection_ids"][1],
+            "445566"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["detection_score"],
+            2
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 3);
+        assert_eq!(policy_changes[2]["kind"]["from"], "rate_limited");
+        assert_eq!(policy_changes[2]["kind"]["to"], "blocked");
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason.contains("rate-limited discovery recon retry moved session to blocked")
+            }));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/docs")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=3")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_score=1")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_score=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_block_threshold=5")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_kind=discovery_recon_retry")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(request_debugs[2]["fields"]["policy_state"], "blocked");
+        assert_eq!(request_debugs[2]["fields"]["path"], "/docs");
+        assert_eq!(request_debugs[2]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[2]["fields"]["discovery_request_count"], 3);
+        assert_eq!(request_debugs[2]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[2]["fields"]["ingress_signals"]["detection_ids"][0],
+            "3355446"
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["ingress_signals"]["detection_ids"][1],
+            "445566"
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["detection_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[2]["fields"]["policy_state"], "blocked");
+        assert!(surface_debugs[2]["fields"]["policy_reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason.contains("rate-limited discovery recon retry moved session to blocked")
+            }));
+        assert!(surface_debugs[2]["fields"]["policy_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=2")));
+        assert!(surface_debugs[2]["fields"]["policy_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_score=2")));
+        assert!(surface_debugs[2]["fields"]["policy_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+        assert!(surface_debugs[2]["fields"]["policy_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_kind=discovery_recon_retry")));
+        assert_eq!(
+            surface_debugs[2]["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_legacy_openapi_query_to_suspicious() {
+        let event_log_path = unique_temp_path("aggregated-openapi-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-openapi-suspicious-debug.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, _upstream_handle) = spawn_upstream(json_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-openapi-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/openapi.json?eidolon_surface=legacy-import",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+                    (
+                        session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                        "automation_likelihood_inverse",
+                    ),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        let body = must_ok(String::from_utf8(response.body), "body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert!(body.contains("X-OpenAPI-Trace"));
+        assert!(body.contains("/api/v2/import/reconcile"));
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["policy_state"], "suspicious");
+        assert_eq!(request_event["kind"]["routing_decision"], "eidolon_owned");
+        assert_eq!(request_event["kind"]["ingress_signals"]["vendor_score"], 35);
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_seen=false")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=0")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
+
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(request_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(request_debug["fields"]["path"], "/openapi.json");
+        assert_eq!(request_debug["fields"]["query_present"], true);
+        assert_eq!(request_debug["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debug["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debug["fields"]["discovery_legacy_openapi_query_seen"],
+            true
+        );
+        assert_eq!(
+            request_debug["fields"]["discovery_linked_bait_surface_seen"],
+            false
+        );
+        assert_eq!(request_debug["fields"]["discovery_recon_score"]["total"], 3);
+        assert_eq!(
+            request_debug["fields"]["discovery_recon_score"]["legacy_openapi_query_score"],
+            2
+        );
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
+        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_blind_decoy_write_probe_to_suspicious_without_bait_attribution(
+    ) {
+        let event_log_path = unique_temp_path("aggregated-decoy-write-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-decoy-write-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) =
+            spawn_upstream_sequence([html_response(original), html_response(original)]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-decoy-write-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["threshold"],
+            3
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/api/v2/import/reconcile")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(
+            request_debugs[1]["fields"]["path"],
+            "/api/v2/import/reconcile"
+        );
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_decoy_write_probe_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_decoy_write_probe_count"],
+            1
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["total"],
+            3
+        );
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_blind_probe_on_alternate_write_path_to_suspicious() {
+        let path = write_bait_profile(alternate_write_probe_profile_json());
+        let loaded = load_bait_profile(&path).expect("alternate write profile should load");
+        let event_log_path = unique_temp_path("aggregated-alt-write-suspicious-events.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream_sequence([
+            html_response(original),
+            json_response(r#"{"mode":"validate"}"#),
+        ]);
+        let mut runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("aggregated-alt-write-suspicious-control.txt"),
+            loaded,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
+        ));
+
+        let first_body = must_ok(
+            String::from_utf8(first_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert!(first_body.contains("/docs/import-validate"));
+        assert_eq!(second_response.status, 200);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(request_events[1]["kind"]["path"], "/api/v2/import/validate");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["threshold"],
+            3
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/api/v2/import/validate")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+    }
+
+    #[test]
+    fn runtime_repeated_blind_decoy_write_probes_add_a_capped_bonus_without_bait_attribution() {
+        let event_log_path = unique_temp_path("aggregated-decoy-write-repeat-bonus-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-decoy-write-repeat-bonus-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream_sequence([
+            html_response(original),
+            json_response(r#"{"mode":"upstream"}"#),
+            json_response(r#"{"mode":"upstream"}"#),
+        ]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-decoy-write-repeat-bonus-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+        let fourth_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 200);
+        assert_eq!(fourth_response.status, 429);
+        assert_eq!(header_values(&fourth_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 4);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(request_events[2]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["total"],
+            4
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["threshold"],
+            3
+        );
+        assert_eq!(request_events[3]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_events[3]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["total"],
+            6
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 2);
+        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
+        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
+        assert!(policy_changes[0]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=1")));
+        assert!(policy_changes[0]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+        assert_eq!(policy_changes[1]["kind"]["from"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["to"], "rate_limited");
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=3")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=6")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 4);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_decoy_write_probe_count"],
+            1
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["path"],
+            "/api/v2/import/reconcile"
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_count"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            4
+        );
+        assert_eq!(request_debugs[3]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(request_debugs[3]["fields"]["path"], "/docs");
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_decoy_write_probe_count"],
+            2
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["total"],
+            6
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+    }
+
+    #[test]
+    fn runtime_rate_limits_suspicious_legacy_openapi_recon_persistence() {
+        let event_log_path = unique_temp_path("aggregated-openapi-rate-limit-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-openapi-rate-limit-debug.jsonl");
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-openapi-rate-limit-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie(
+                "GET",
+                "/openapi.json?eidolon_surface=legacy-import",
+                &cookie,
+                &headers,
+            ),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 429);
+        assert_eq!(header_values(&second_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 2);
+        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
+        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["from"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["to"], "rate_limited");
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("suspicious discovery recon persistence moved session to rate limited")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/docs")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("distinct_surfaces=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_seen=true")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_score=1")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_score=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_rate_limit_threshold=5")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(request_debugs[1]["fields"]["path"], "/docs");
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 2);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_legacy_openapi_query_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["legacy_openapi_query_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[1]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(
+            surface_debugs[1]["fields"]["surface_action"]["type"],
+            "rate_limited"
+        );
+    }
+
+    #[test]
+    fn runtime_rate_limits_suspicious_recon_persistence_after_blind_decoy_write_probe() {
+        let event_log_path = unique_temp_path("aggregated-decoy-write-rate-limit-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-decoy-write-rate-limit-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream_sequence([
+            html_response(original),
+            json_response(r#"{"mode":"upstream"}"#),
+        ]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-decoy-write-rate-limit-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 429);
+        assert_eq!(header_values(&third_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(request_events[2]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 2);
+        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
+        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["from"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["to"], "rate_limited");
+        assert!(policy_changes[0]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_seen=true")));
+        assert!(policy_changes[0]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("suspicious discovery recon persistence moved session to rate limited")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/docs")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_seen=true")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_score=1")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_rate_limit_threshold=5")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(request_debugs[2]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(request_debugs[2]["fields"]["path"], "/docs");
+        assert_eq!(request_debugs[2]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[2]["fields"]["discovery_request_count"], 2);
+        assert_eq!(request_debugs[2]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[2]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(
+            surface_debugs[2]["fields"]["surface_action"]["type"],
+            "rate_limited"
+        );
+    }
+
+    #[test]
+    fn runtime_rate_limits_suspicious_recon_on_second_distinct_blind_write_probe() {
+        let path = write_bait_profile(fanout_write_probe_profile_json());
+        let loaded = load_bait_profile(&path).expect("fanout write profile should load");
+        let event_log_path =
+            unique_temp_path("aggregated-decoy-write-fanout-rate-limit-events.jsonl");
+        let debug_log_path =
+            unique_temp_path("aggregated-decoy-write-fanout-rate-limit-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream_sequence([
+            html_response(original),
+            json_response(r#"{"mode":"reconcile"}"#),
+        ]);
+        let mut runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("aggregated-decoy-write-fanout-rate-limit-control.txt"),
+            loaded,
+        );
+        runtime.debug_log = Some(Arc::new(Mutex::new(
+            FileDebugLogWriter::open(&debug_log_path).expect("debug log should open"),
+        )));
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 429);
+        assert_eq!(header_values(&third_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[2]["policy_state"], "rate_limited");
+        assert_eq!(request_events[2]["kind"]["path"], "/api/v2/import/validate");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["repeated_discovery_score"],
+            Value::Null
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]
+                ["decoy_write_probe_path_fanout_bonus"],
+            1
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 2);
+        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
+        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["from"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["to"], "rate_limited");
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/api/v2/import/validate")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_path_classes=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=0")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=3")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_path_fanout_bonus=1")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(request_debugs[2]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_debugs[2]["fields"]["path"],
+            "/api/v2/import/validate"
+        );
+        assert_eq!(request_debugs[2]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[2]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[2]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_count"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_path_classes"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            0
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]
+                ["decoy_write_probe_path_fanout_bonus"],
+            1
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[2]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(
+            surface_debugs[2]["fields"]["surface_action"]["type"],
+            "rate_limited"
+        );
+    }
+
+    #[test]
+    fn runtime_blocks_after_rate_limited_decoy_write_recon_retry() {
+        let event_log_path = unique_temp_path("aggregated-decoy-write-recon-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-decoy-write-recon-blocked-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream_sequence([
+            html_response(original),
+            json_response(r#"{"mode":"upstream"}"#),
+        ]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-decoy-write-recon-blocked-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+        let fourth_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 429);
+        assert_eq!(fourth_response.status, 403);
+        assert_eq!(header_values(&third_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 4);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(request_events[2]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(request_events[3]["policy_state"], "blocked");
+        assert_eq!(
+            request_events[3]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_decisions = events_of_type(&event_log_path, "policy_decision");
+        assert_eq!(policy_decisions.len(), 2);
+        assert!(policy_decisions[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason.contains("rate-limited discovery recon retry moved session to blocked")
+            }));
+        assert!(policy_decisions[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_seen=true")));
+        assert!(policy_decisions[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 3);
+        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
+        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["from"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["to"], "rate_limited");
+        assert_eq!(policy_changes[2]["kind"]["from"], "rate_limited");
+        assert_eq!(policy_changes[2]["kind"]["to"], "blocked");
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason.contains("rate-limited discovery recon retry moved session to blocked")
+            }));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/docs")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=3")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("distinct_surfaces=1")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_seen=true")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_score=1")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_block_threshold=5")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 4);
+        assert_eq!(request_debugs[3]["fields"]["policy_state"], "blocked");
+        assert_eq!(request_debugs[3]["fields"]["path"], "/docs");
+        assert_eq!(request_debugs[3]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[3]["fields"]["discovery_request_count"], 3);
+        assert_eq!(request_debugs[3]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_decoy_write_probe_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
+            1
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[3]["fields"]["policy_state"], "blocked");
+        assert!(surface_debugs[3]["fields"]["policy_reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason.contains("rate-limited discovery recon retry moved session to blocked")
+            }));
+        assert!(surface_debugs[3]["fields"]["policy_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_seen=true")));
+        assert!(surface_debugs[3]["fields"]["policy_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+        assert_eq!(
+            surface_debugs[3]["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+    }
+
+    #[test]
+    fn runtime_blocks_after_rate_limited_blind_write_fanout_retry() {
+        let path = write_bait_profile(fanout_write_probe_profile_json());
+        let loaded = load_bait_profile(&path).expect("fanout write profile should load");
+        let event_log_path = unique_temp_path("aggregated-decoy-write-fanout-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-decoy-write-fanout-blocked-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream_sequence([
+            html_response(original),
+            json_response(r#"{"mode":"reconcile"}"#),
+        ]);
+        let mut runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("aggregated-decoy-write-fanout-blocked-control.txt"),
+            loaded,
+        );
+        runtime.debug_log = Some(Arc::new(Mutex::new(
+            FileDebugLogWriter::open(&debug_log_path).expect("debug log should open"),
+        )));
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
+        ));
+        let fourth_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 429);
+        assert_eq!(fourth_response.status, 403);
+        assert_eq!(header_values(&third_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 4);
+        assert_eq!(request_events[2]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(request_events[3]["policy_state"], "blocked");
+        assert_eq!(request_events[3]["kind"]["path"], "/api/v2/import/validate");
+        assert_eq!(
+            request_events[3]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["repeated_discovery_score"],
+            Value::Null
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]
+                ["decoy_write_probe_path_fanout_bonus"],
+            1
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_events[3]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_decisions = events_of_type(&event_log_path, "policy_decision");
+        assert_eq!(policy_decisions.len(), 2);
+        assert!(policy_decisions[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason.contains("rate-limited discovery recon retry moved session to blocked")
+            }));
+        assert!(policy_decisions[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=2")));
+        assert!(policy_decisions[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_path_classes=2")));
+        assert!(policy_decisions[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_path_fanout_bonus=1")));
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 3);
+        assert_eq!(policy_changes[1]["kind"]["to"], "rate_limited");
+        assert_eq!(policy_changes[2]["kind"]["from"], "rate_limited");
+        assert_eq!(policy_changes[2]["kind"]["to"], "blocked");
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/api/v2/import/validate")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_path_classes=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=0")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=3")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_path_fanout_bonus=1")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_kind=write_recon_retry")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_class=write_recon")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 4);
+        assert_eq!(request_debugs[3]["fields"]["policy_state"], "blocked");
+        assert_eq!(
+            request_debugs[3]["fields"]["path"],
+            "/api/v2/import/validate"
+        );
+        assert_eq!(request_debugs[3]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[3]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[3]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_decoy_write_probe_count"],
+            2
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_decoy_write_probe_path_classes"],
+            2
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            0
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]
+                ["decoy_write_probe_path_fanout_bonus"],
+            1
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[3]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[3]["fields"]["policy_state"], "blocked");
+        assert_eq!(
+            surface_debugs[3]["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+    }
+
+    #[test]
+    fn runtime_blocks_after_rate_limited_legacy_openapi_recon_retry() {
+        let event_log_path = unique_temp_path("aggregated-openapi-recon-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-openapi-recon-blocked-debug.jsonl");
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-openapi-recon-blocked-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie(
+                "GET",
+                "/openapi.json?eidolon_surface=legacy-import",
+                &cookie,
+                &headers,
+            ),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 429);
+        assert_eq!(third_response.status, 403);
+        assert_eq!(header_values(&second_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[0]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(request_events[2]["policy_state"], "blocked");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+        let policy_decisions = events_of_type(&event_log_path, "policy_decision");
+        assert_eq!(policy_decisions.len(), 2);
+        assert!(policy_decisions[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason.contains("rate-limited discovery recon retry moved session to blocked")
+            }));
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 3);
+        assert_eq!(policy_changes[2]["kind"]["from"], "rate_limited");
+        assert_eq!(policy_changes[2]["kind"]["to"], "blocked");
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason.contains("rate-limited discovery recon retry moved session to blocked")
+            }));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/docs")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=3")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("distinct_surfaces=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_seen=true")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_score=1")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_score=2")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+        assert!(policy_changes[2]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_block_threshold=5")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(request_debugs[2]["fields"]["policy_state"], "blocked");
+        assert_eq!(request_debugs[2]["fields"]["path"], "/docs");
+        assert_eq!(request_debugs[2]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[2]["fields"]["discovery_request_count"], 3);
+        assert_eq!(request_debugs[2]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_legacy_openapi_query_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_surface_fanout"]["distinct_surfaces"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["legacy_openapi_query_score"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[2]["fields"]["policy_state"], "blocked");
+        assert_eq!(
+            surface_debugs[2]["fields"]["policy_reason"],
+            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_class=discovery_recon persistence_kind=discovery_recon_retry"
+        );
+        assert_eq!(
+            surface_debugs[2]["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_linked_bait_surface_probe_to_suspicious() {
+        let event_log_path = unique_temp_path("aggregated-linked-bait-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-linked-bait-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-linked-bait-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/docs/legacy-import", &cookie, &headers),
+        ));
+        let second_body = must_ok(
+            String::from_utf8(second_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert!(second_body.contains("X-Migration-Trace"));
+        assert!(second_body.contains("/api/v2/import/reconcile"));
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["kind"]["path"], "/docs/legacy-import");
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/docs/legacy-import")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_classes=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=0")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "suspicious");
+        assert_eq!(request_debugs[1]["fields"]["path"], "/docs/legacy-import");
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_legacy_openapi_query_seen"],
+            false
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
+            1
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_recon_score"]["total"],
+            3
+        );
+
+        let surface_debug = debug_values(&debug_log_path)
+            .into_iter()
+            .rfind(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .expect("second request should record a surface action");
+        assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert_eq!(bait_exposed["kind"]["surface"], "/docs/legacy-import");
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_hidden_route_probe_to_suspicious() {
+        let event_log_path = unique_temp_path("aggregated-hidden-route-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-hidden-route-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-hidden-route-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/customer/import-recovery-checklist",
+                &cookie,
+                &headers,
+            ),
+        ));
+        let second_body = must_ok(
+            String::from_utf8(second_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert!(second_body.contains("X-Hidden-Route-Trace"));
+        assert!(second_body.contains("hidden_route_2026_05_d91c"));
+        assert!(second_body.contains("/api/v2/import/reconcile"));
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["path"],
+            "/customer/import-recovery-checklist"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/customer/import-recovery-checklist")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_classes=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=0")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            request_debugs[1]["fields"]["path"],
+            "/customer/import-recovery-checklist"
+        );
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_legacy_openapi_query_seen"],
+            false
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
+            1
+        );
+
+        let surface_debug = debug_values(&debug_log_path)
+            .into_iter()
+            .rfind(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .expect("second request should record a surface action");
+        assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "hidden_route_trace");
+        assert_eq!(
+            bait_exposed["kind"]["surface"],
+            "/customer/import-recovery-checklist"
+        );
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_js_helper_probe_to_suspicious() {
+        let event_log_path = unique_temp_path("aggregated-js-helper-suspicious-events.jsonl");
+        let debug_log_path = unique_temp_path("aggregated-js-helper-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-js-helper-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/assets/import-helper.js", &cookie, &headers),
+        ));
+        let second_body = must_ok(
+            String::from_utf8(second_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert!(second_body.contains("window.__eidolonImportWorker"));
+        assert!(second_body.contains("X-Import-Worker"));
+        assert!(second_body.contains("worker_2026_05_c19b"));
+        assert!(second_body.contains("/api/v2/import/reconcile"));
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["path"],
+            "/assets/import-helper.js"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/assets/import-helper.js")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_classes=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=0")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 2);
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            request_debugs[1]["fields"]["path"],
+            "/assets/import-helper.js"
+        );
+        assert_eq!(request_debugs[1]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[1]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_legacy_openapi_query_seen"],
+            false
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
+            1
+        );
+
+        let surface_debug = debug_values(&debug_log_path)
+            .into_iter()
+            .rfind(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .expect("second request should record a surface action");
+        assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            surface_debug["fields"]["candidate_surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "js_worker_resume_trace");
+        assert_eq!(bait_exposed["kind"]["surface"], "/assets/import-helper.js");
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_multiple_linked_bait_classes_to_suspicious() {
+        let event_log_path =
+            unique_temp_path("aggregated-multi-linked-classes-suspicious-events.jsonl");
+        let debug_log_path =
+            unique_temp_path("aggregated-multi-linked-classes-suspicious-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-multi-linked-classes-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs", &cookie, &headers),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs/legacy-import", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/assets/import-helper.js", &cookie, &headers),
+        ));
+        let second_body = must_ok(
+            String::from_utf8(second_response.body),
+            "body should be utf8",
+        );
+        let third_body = must_ok(
+            String::from_utf8(third_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 200);
+        assert!(second_body.contains("X-Migration-Trace"));
+        assert!(third_body.contains("window.__eidolonImportWorker"));
+        assert!(third_body.contains("X-Import-Worker"));
+        assert!(third_body.contains("/api/v2/import/reconcile"));
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "observe");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["kind"]["path"], "/docs/legacy-import");
+        assert_eq!(request_events[2]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["path"],
+            "/assets/import-helper.js"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/assets/import-helper.js")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=false")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_classes=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=0")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_class_fanout_bonus=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "observe");
+        assert_eq!(request_debugs[1]["fields"]["path"], "/docs/legacy-import");
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], false);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
+            1
+        );
+        assert_eq!(request_debugs[2]["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            request_debugs[2]["fields"]["path"],
+            "/assets/import-helper.js"
+        );
+        assert_eq!(request_debugs[2]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[2]["fields"]["discovery_query_seen"], false);
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_linked_bait_surface_classes"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["linked_bait_class_fanout_bonus"],
+            1
+        );
+
+        let bait_exposed_events = events_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed_events.len(), 2);
+        assert_eq!(
+            bait_exposed_events[0]["kind"]["bait_id"],
+            "rel_2025_04_b7f2"
+        );
+        assert_eq!(
+            bait_exposed_events[1]["kind"]["bait_id"],
+            "js_worker_resume_trace"
+        );
+        assert_eq!(
+            bait_exposed_events[1]["kind"]["surface"],
+            "/assets/import-helper.js"
+        );
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_openapi_anchored_linked_fanout_to_suspicious() {
+        let event_log_path =
+            unique_temp_path("aggregated-openapi-linked-fanout-suspicious-events.jsonl");
+        let debug_log_path =
+            unique_temp_path("aggregated-openapi-linked-fanout-suspicious-debug.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, upstream_handle) = spawn_upstream(json_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("aggregated-openapi-linked-fanout-suspicious-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/openapi.json", &cookie, &headers),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs/legacy-import", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("GET", "/assets/import-helper.js", &cookie, &headers),
+        ));
+        let first_body: Value = must_ok(
+            serde_json::from_slice(&first_response.body),
+            "first body should be json",
+        );
+        let second_body = must_ok(
+            String::from_utf8(second_response.body),
+            "second body should be utf8",
+        );
+        let third_body = must_ok(
+            String::from_utf8(third_response.body),
+            "third body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 200);
+        assert_eq!(first_body["openapi"].as_str(), Some("3.0.3"));
+        assert_eq!(
+            first_body["paths"]["/api/v2/import/reconcile"]["post"]["parameters"][0]["name"],
+            "X-OpenAPI-Trace"
+        );
+        assert!(second_body.contains("X-Migration-Trace"));
+        assert!(third_body.contains("window.__eidolonImportWorker"));
+        assert!(third_body.contains("X-Import-Worker"));
+        assert!(third_body.contains("/api/v2/import/reconcile"));
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[0]["kind"]["path"], "/openapi.json");
+        assert_eq!(request_events[1]["policy_state"], "observe");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(request_events[1]["kind"]["path"], "/docs/legacy-import");
+        assert_eq!(request_events[2]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["path"],
+            "/assets/import-helper.js"
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "multi-signal discovery recon aggregation promoted request to suspicious"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/assets/import-helper.js")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("discovery_requests=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=false")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("legacy_openapi_query_seen=false")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_classes=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("detection_count=0")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_surface_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("linked_bait_class_fanout_bonus=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(request_debugs[0]["fields"]["path"], "/openapi.json");
+        assert_eq!(
+            request_debugs[0]["fields"]["discovery_surface_fanout"]["docs_seen"],
+            false
+        );
+        assert_eq!(
+            request_debugs[0]["fields"]["discovery_surface_fanout"]["openapi_seen"],
+            true
+        );
+        assert_eq!(request_debugs[0]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[0]["fields"]["discovery_query_seen"], false);
+        assert_eq!(
+            request_debugs[0]["fields"]["discovery_linked_bait_surface_seen"],
+            false
+        );
+        assert_eq!(
+            request_debugs[0]["fields"]["discovery_linked_bait_surface_classes"],
+            0
+        );
+        assert_eq!(request_debugs[1]["fields"]["policy_state"], "observe");
+        assert_eq!(request_debugs[1]["fields"]["path"], "/docs/legacy-import");
+        assert_eq!(request_debugs[1]["fields"]["discovery_query_seen"], false);
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[1]["fields"]["discovery_linked_bait_surface_classes"],
+            1
+        );
+        assert_eq!(request_debugs[2]["fields"]["policy_state"], "suspicious");
+        assert_eq!(
+            request_debugs[2]["fields"]["path"],
+            "/assets/import-helper.js"
+        );
+        assert_eq!(request_debugs[2]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[2]["fields"]["discovery_query_seen"], false);
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_linked_bait_surface_seen"],
+            true
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_linked_bait_surface_classes"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["linked_bait_class_fanout_bonus"],
+            1
+        );
+
+        let bait_exposed_events = events_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed_events.len(), 3);
+        assert_eq!(
+            bait_exposed_events[0]["kind"]["bait_id"],
+            "openapi_reconcile_trace"
+        );
+        assert_eq!(bait_exposed_events[0]["kind"]["surface"], "/openapi.json");
+        assert_eq!(
+            bait_exposed_events[1]["kind"]["bait_id"],
+            "rel_2025_04_b7f2"
+        );
+        assert_eq!(
+            bait_exposed_events[2]["kind"]["bait_id"],
+            "js_worker_resume_trace"
+        );
+        assert_eq!(
+            bait_exposed_events[2]["kind"]["surface"],
+            "/assets/import-helper.js"
         );
     }
 
@@ -6948,7 +10952,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_wrong_bait_header_value_forwards_as_near_miss() {
+    fn runtime_wrong_bait_header_value_logs_unmatched_bait_action_and_forwards_upstream() {
         let event_log_path = unique_temp_path("near-miss-events.jsonl");
         let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
         let runtime = test_runtime_with_m1_controller(
@@ -6979,7 +10983,424 @@ mod tests {
         )
         .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
         assert_eq!(events_of_type(&event_log_path, "bait_exposed").len(), 1);
+        let near_miss = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(near_miss["policy_state"], "observe");
+        assert_eq!(near_miss["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert!(near_miss["kind"]["exposure_id"].is_null());
+        assert_eq!(
+            events_of_type(&event_log_path, "rate_limit_applied").len(),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_missing_bait_header_on_shared_path_does_not_log_bait_action() {
+        let event_log_path = unique_temp_path("missing-bait-header-events.jsonl");
+        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("missing-bait-header-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &[]),
+        ));
+        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
+
+        assert_eq!(response.body, br#"{"mode":"upstream"}"#);
+        assert!(must_ok(
+            String::from_utf8(upstream_request),
+            "request should be utf8"
+        )
+        .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+        assert_eq!(events_of_type(&event_log_path, "bait_exposed").len(), 1);
         assert_event_type_absent(&event_log_path, "bait_action_observed");
+        assert_eq!(
+            events_of_type(&event_log_path, "rate_limit_applied").len(),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_rate_limits_suspicious_same_bait_near_miss_after_exposure() {
+        let event_log_path = unique_temp_path("suspicious-near-miss-events.jsonl");
+        let debug_log_path = unique_temp_path("suspicious-near-miss-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("suspicious-near-miss-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Suspicious);
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "wrong")],
+            ),
+        ));
+
+        assert_eq!(response.status, 429);
+        assert_eq!(header_values(&response, "retry-after"), vec!["30"]);
+
+        let near_miss = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(near_miss["policy_state"], "suspicious");
+        assert_eq!(near_miss["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert!(near_miss["kind"]["exposure_id"].is_null());
+
+        let policy_changed = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| event["kind"]["to"].as_str() == Some("rate_limited"))
+            .unwrap_or_else(|| panic!("rate-limited policy change should exist"));
+        assert_eq!(policy_changed["kind"]["from"], "suspicious");
+        assert_eq!(policy_changed["kind"]["to"], "rate_limited");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "suspicious same-bait near miss after exposure moved session to rate limited"
+            )));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("persistence_class=same_bait_near_miss")));
+        let request_seen = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("rate-limited request_seen should exist"));
+        assert_eq!(request_seen["policy_state"], "rate_limited");
+        assert_eq!(request_seen["kind"]["routing_decision"], "rate_limited");
+        let rate_limit = first_event_of_type(&event_log_path, "rate_limit_applied");
+        assert_eq!(rate_limit["policy_state"], "rate_limited");
+
+        let near_miss_debug = first_debug_event(&debug_log_path, "bait_action_near_miss");
+        assert_eq!(near_miss_debug["fields"]["prior_same_bait_exposure"], true);
+        let action_debug = first_debug_event(&debug_log_path, "bait_action_observed");
+        assert_eq!(action_debug["fields"]["matched_prior_exposure"], false);
+        assert_eq!(action_debug["fields"]["prior_same_bait_exposure"], true);
+    }
+
+    #[test]
+    fn runtime_repeated_rate_limited_same_bait_near_miss_becomes_blocked() {
+        let event_log_path = unique_temp_path("blocked-near-miss-events.jsonl");
+        let debug_log_path = unique_temp_path("blocked-near-miss-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("blocked-near-miss-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Suspicious);
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "wrong")],
+            ),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "wrong")],
+            ),
+        ));
+
+        assert_eq!(first_response.status, 429);
+        assert_eq!(second_response.status, 403);
+
+        let blocked_change = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| {
+                event["kind"]["from"].as_str() == Some("rate_limited")
+                    && event["kind"]["to"].as_str() == Some("blocked")
+            })
+            .unwrap_or_else(|| panic!("blocked policy change should exist"));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("rate-limited same-bait near miss retry moved session to blocked")));
+
+        let blocked_request = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("blocked request_seen should exist"));
+        assert_eq!(blocked_request["policy_state"], "blocked");
+        assert_eq!(blocked_request["kind"]["routing_decision"], "eidolon_owned");
+
+        let bait_actions = events_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(bait_actions.len(), 2);
+        assert_eq!(bait_actions[1]["policy_state"], "rate_limited");
+        assert_eq!(bait_actions[1]["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert!(bait_actions[1]["kind"]["exposure_id"].is_null());
+
+        let blocked_response = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .rfind(|event| event["policy_state"].as_str() == Some("blocked"))
+            .unwrap_or_else(|| panic!("blocked response should exist"));
+        assert_eq!(
+            blocked_response["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(blocked_response["kind"]["status"], 403);
+
+        let surface_debugs = debug_events(&debug_log_path, "surface_action_selected");
+        let last_surface_debug = surface_debugs
+            .last()
+            .unwrap_or_else(|| panic!("surface debug should exist"));
+        assert_eq!(last_surface_debug["fields"]["policy_state"], "rate_limited");
+        assert_eq!(
+            last_surface_debug["fields"]["controller_surface_action"]["type"],
+            "rate_limited"
+        );
+        assert_eq!(
+            last_surface_debug["fields"]["surface_action"]["type"],
+            "rate_limited"
+        );
+
+        let near_miss_debugs = debug_events(&debug_log_path, "bait_action_near_miss");
+        assert_eq!(near_miss_debugs.len(), 2);
+        assert_eq!(
+            near_miss_debugs[1]["fields"]["prior_same_bait_exposure"],
+            true
+        );
+        let action_debugs = debug_events(&debug_log_path, "bait_action_observed");
+        assert_eq!(action_debugs.len(), 2);
+        assert_eq!(action_debugs[1]["fields"]["matched_prior_exposure"], false);
+        assert_eq!(action_debugs[1]["fields"]["prior_same_bait_exposure"], true);
+    }
+
+    #[test]
+    fn runtime_rate_limited_exact_bait_action_enters_controlled_reality() {
+        let event_log_path = unique_temp_path("rate-limited-exact-action-events.jsonl");
+        let debug_log_path = unique_temp_path("rate-limited-exact-action-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("rate-limited-exact-action-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        let exposure_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Suspicious);
+        let near_miss_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "wrong")],
+            ),
+        ));
+        let action_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-Migration-Trace", "rel_2025_04_b7f2")],
+            ),
+        ));
+
+        assert_eq!(exposure_response.status, 200);
+        assert_eq!(near_miss_response.status, 429);
+        assert_eq!(action_response.status, 202);
+        assert!(must_ok(
+            String::from_utf8(action_response.body),
+            "body should be utf8"
+        )
+        .contains(r#""write_committed":false"#));
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        let controlled_change = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| {
+                event["kind"]["from"].as_str() == Some("rate_limited")
+                    && event["kind"]["to"].as_str() == Some("controlled_reality")
+            })
+            .unwrap_or_else(|| panic!("controlled reality policy change should exist"));
+        assert!(controlled_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| {
+                reason
+                    .contains("confirmed bait-derived action moved session into controlled reality")
+            }));
+
+        let action_request = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("exact bait action request_seen should exist"));
+        assert_eq!(action_request["policy_state"], "rate_limited");
+        assert_eq!(action_request["kind"]["routing_decision"], "eidolon_owned");
+
+        let bait_actions = events_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(bait_actions.len(), 2);
+        assert_eq!(bait_actions[1]["policy_state"], "rate_limited");
+        assert_eq!(bait_actions[1]["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert_eq!(
+            bait_actions[1]["kind"]["exposure_id"],
+            exposure["kind"]["exposure_id"]
+        );
+
+        let controlled_entry = first_event_of_type(&event_log_path, "controlled_reality_entered");
+        assert_eq!(controlled_entry["policy_state"], "controlled_reality");
+
+        let controlled_response = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .rfind(|event| event["policy_state"].as_str() == Some("controlled_reality"))
+            .unwrap_or_else(|| panic!("controlled reality response should exist"));
+        assert_eq!(
+            controlled_response["kind"]["routing_decision"],
+            "controlled_reality"
+        );
+        assert_eq!(controlled_response["kind"]["status"], 202);
+
+        let action_debugs = debug_events(&debug_log_path, "bait_action_observed");
+        assert_eq!(action_debugs.len(), 2);
+        assert_eq!(action_debugs[1]["fields"]["matched_prior_exposure"], true);
+        assert_eq!(action_debugs[1]["fields"]["prior_same_bait_exposure"], true);
+
+        let controlled_debug = debug_events(&debug_log_path, "controlled_reality_action_selected")
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("controlled reality debug should exist"));
+        assert_eq!(controlled_debug["fields"]["depth"], 1);
+        assert_eq!(
+            controlled_debug["fields"]["action"]["type"],
+            "controlled_reality"
+        );
+    }
+
+    #[test]
+    fn runtime_rate_limited_request_without_bait_header_stays_rate_limited() {
+        let event_log_path = unique_temp_path("rate-limited-no-header-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("rate-limited-no-header-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::RateLimited);
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &[]),
+        ));
+
+        assert_eq!(response.status, 429);
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+        assert_eq!(
+            events_of_type(&event_log_path, "policy_changed")
+                .into_iter()
+                .filter(|event| event["kind"]["to"].as_str() == Some("blocked"))
+                .count(),
+            0
+        );
+        let request_seen = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("rate-limited request_seen should exist"));
+        assert_eq!(request_seen["policy_state"], "rate_limited");
+        assert_eq!(request_seen["kind"]["routing_decision"], "rate_limited");
+    }
+
+    #[test]
+    fn runtime_rate_limits_suspicious_openapi_same_bait_near_miss_after_exposure() {
+        let event_log_path = unique_temp_path("suspicious-openapi-near-miss-events.jsonl");
+        let debug_log_path = unique_temp_path("suspicious-openapi-near-miss-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("suspicious-openapi-near-miss-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Suspicious);
+        let promotion_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/openapi.json", &cookie),
+        ));
+        let Ok(rewritten) = serde_json::from_slice::<Value>(&promotion_response.body) else {
+            panic!("body should be json");
+        };
+        assert_eq!(promotion_response.status, 200);
+        assert_eq!(
+            rewritten["paths"]["/api/v2/import/reconcile"]["post"]["parameters"][0]["name"],
+            "X-OpenAPI-Trace"
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[("X-OpenAPI-Trace", "wrong")],
+            ),
+        ));
+
+        assert_eq!(response.status, 429);
+        assert_eq!(header_values(&response, "retry-after"), vec!["30"]);
+
+        let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
+        assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
+        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
+
+        let near_miss = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(near_miss["policy_state"], "suspicious");
+        assert_eq!(near_miss["kind"]["bait_id"], "openapi_reconcile_trace");
+        assert!(near_miss["kind"]["exposure_id"].is_null());
+
+        let policy_changed = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| event["kind"]["to"].as_str() == Some("rate_limited"))
+            .unwrap_or_else(|| panic!("rate-limited policy change should exist"));
+        assert_eq!(policy_changed["kind"]["from"], "suspicious");
+        assert_eq!(policy_changed["kind"]["to"], "rate_limited");
+
+        let request_seen = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("rate-limited request_seen should exist"));
+        assert_eq!(request_seen["policy_state"], "rate_limited");
+        assert_eq!(request_seen["kind"]["routing_decision"], "rate_limited");
+
+        let near_miss_debug = first_debug_event(&debug_log_path, "bait_action_near_miss");
+        assert_eq!(
+            near_miss_debug["fields"]["bait_id"],
+            "openapi_reconcile_trace"
+        );
+        assert_eq!(near_miss_debug["fields"]["prior_same_bait_exposure"], true);
+        let action_debug = first_debug_event(&debug_log_path, "bait_action_observed");
+        assert_eq!(action_debug["fields"]["bait_id"], "openapi_reconcile_trace");
+        assert_eq!(action_debug["fields"]["matched_prior_exposure"], false);
+        assert_eq!(action_debug["fields"]["prior_same_bait_exposure"], true);
     }
 
     #[test]
@@ -7114,6 +11535,115 @@ mod tests {
     }
 
     #[test]
+    fn runtime_blocks_after_repeated_controlled_reality_depth_limit_probe() {
+        let event_log_path = unique_temp_path("controlled-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("controlled-blocked-debug.jsonl");
+        let mut runtime = test_runtime(
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
+            &event_log_path,
+            unique_temp_path("controlled-blocked-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.debug_log = Some(Arc::new(Mutex::new(must_ok(
+            FileDebugLogWriter::open(&debug_log_path),
+            "debug log should open",
+        ))));
+        runtime.controlled_reality_config = ControlledRealityConfig {
+            max_action_depth: 1,
+            tarpit_delay: Duration::from_millis(0),
+            retry_after_seconds: 7,
+        };
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/api/v2/import/reconcile", &cookie),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/api/v2/import/reconcile", &cookie),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/api/v2/import/reconcile", &cookie),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 429);
+        assert_eq!(header_values(&second_response, "retry-after"), vec!["7"]);
+        assert_eq!(third_response.status, 403);
+
+        let rate_limit = first_event_of_type(&event_log_path, "rate_limit_applied");
+        assert_eq!(rate_limit["policy_state"], "controlled_reality");
+        let blocked_change = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| {
+                event["kind"]["from"].as_str() == Some("controlled_reality")
+                    && event["kind"]["to"].as_str() == Some("blocked")
+            })
+            .unwrap_or_else(|| panic!("blocked policy change should exist"));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "controlled-reality probe continued after depth-limit throttle and moved session to blocked"
+            )));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("depth=3")));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("post_containment_persistence_kind=controlled_reality_depth_limit")));
+
+        let blocked_request = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .unwrap_or_else(|| panic!("blocked request_seen should exist"));
+        assert_eq!(blocked_request["policy_state"], "blocked");
+        assert_eq!(blocked_request["kind"]["routing_decision"], "eidolon_owned");
+
+        let blocked_response = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .rfind(|event| event["policy_state"].as_str() == Some("blocked"))
+            .unwrap_or_else(|| panic!("blocked response should exist"));
+        assert_eq!(blocked_response["kind"]["status"], 403);
+        assert_eq!(
+            blocked_response["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+
+        let controlled_debug = debug_events(&debug_log_path, "controlled_reality_action_selected")
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("controlled reality debug should exist"));
+        assert_eq!(controlled_debug["fields"]["depth"], 3);
+        assert_eq!(controlled_debug["fields"]["depth_limit"], 1);
+        assert_eq!(
+            controlled_debug["fields"]["action"]["type"],
+            "eidolon_owned"
+        );
+        assert_eq!(controlled_debug["fields"]["transition"]["to"], "blocked");
+
+        let surface_debug = debug_events(&debug_log_path, "surface_action_selected")
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("surface debug should exist"));
+        assert_eq!(surface_debug["fields"]["policy_state"], "blocked");
+        assert_eq!(
+            surface_debug["fields"]["policy_routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
+    }
+
+    #[test]
     fn controlled_session_logs_escape_attempt_outside_configured_branch() {
         let event_log_path = unique_temp_path("controlled-escape-events.jsonl");
         let runtime = test_runtime(
@@ -7139,6 +11669,106 @@ mod tests {
         assert_eq!(escape["kind"]["method"], "GET");
         assert_eq!(escape["kind"]["path"], "/api/v1/projects");
         assert_eq!(escape["kind"]["routing_decision"], "controlled_reality");
+    }
+
+    #[test]
+    fn controlled_session_repeated_escape_attempt_becomes_blocked() {
+        let event_log_path = unique_temp_path("controlled-escape-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("controlled-escape-blocked-debug.jsonl");
+        let mut runtime = test_runtime(
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
+            &event_log_path,
+            unique_temp_path("controlled-escape-blocked-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.debug_log = Some(Arc::new(Mutex::new(must_ok(
+            FileDebugLogWriter::open(&debug_log_path),
+            "debug log should open",
+        ))));
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/api/v1/projects", &cookie),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/api/v1/projects", &cookie),
+        ));
+
+        assert_eq!(first_response.status, 404);
+        assert_eq!(second_response.status, 403);
+
+        let escape_attempts = events_of_type(&event_log_path, "reality_escape_attempt");
+        assert_eq!(escape_attempts.len(), 2);
+        assert_eq!(escape_attempts[1]["policy_state"], "controlled_reality");
+        assert_eq!(escape_attempts[1]["kind"]["path"], "/api/v1/projects");
+        assert_eq!(
+            escape_attempts[1]["kind"]["routing_decision"],
+            "controlled_reality"
+        );
+
+        let blocked_change = events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .find(|event| {
+                event["kind"]["from"].as_str() == Some("controlled_reality")
+                    && event["kind"]["to"].as_str() == Some("blocked")
+            })
+            .unwrap_or_else(|| panic!("blocked policy change should exist"));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(
+                "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked"
+            )));
+        assert!(blocked_change["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("post_containment_persistence_kind=controlled_reality_branch_escape")));
+
+        let blocked_request = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v1/projects"))
+            .unwrap_or_else(|| panic!("blocked request_seen should exist"));
+        assert_eq!(blocked_request["policy_state"], "blocked");
+        assert_eq!(blocked_request["kind"]["routing_decision"], "eidolon_owned");
+
+        let blocked_response = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .rfind(|event| event["policy_state"].as_str() == Some("blocked"))
+            .unwrap_or_else(|| panic!("blocked response should exist"));
+        assert_eq!(blocked_response["kind"]["status"], 403);
+        assert_eq!(
+            blocked_response["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+
+        let escape_debug = debug_events(&debug_log_path, "reality_escape_attempt")
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("reality escape debug should exist"));
+        assert_eq!(escape_debug["fields"]["attempt_count"], 2);
+        assert_eq!(
+            escape_debug["fields"]["routing_decision"],
+            "controlled_reality"
+        );
+
+        let surface_debug = debug_events(&debug_log_path, "surface_action_selected")
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("surface debug should exist"));
+        assert_eq!(surface_debug["fields"]["policy_state"], "blocked");
+        assert_eq!(
+            surface_debug["fields"]["policy_routing_decision"],
+            "eidolon_owned"
+        );
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "eidolon_owned"
+        );
     }
 
     #[test]

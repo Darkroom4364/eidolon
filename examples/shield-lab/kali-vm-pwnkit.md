@@ -35,7 +35,30 @@ examples/shield-lab/build-orbstack-images.sh
 examples/shield-lab/deploy-orbstack.sh
 examples/shield-lab/status-orbstack.sh
 examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
+examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
+examples/shield-lab/smoke-suspicious-decoy-write-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-detection-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-rate-limited-detection-recon-blocked-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-decoy-write-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-suspicious-decoy-write-repeat-bonus-orbstack.sh
+examples/shield-lab/smoke-rate-limited-decoy-write-recon-blocked-orbstack.sh
+examples/shield-lab/smoke-suspicious-linked-bait-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-hidden-route-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-js-helper-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-linked-fanout-aggregation-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-linked-fanout-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-orbstack.sh
+examples/shield-lab/smoke-suspicious-discovery-fanout-orbstack.sh
+examples/shield-lab/smoke-suspicious-rate-limit-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-rate-limit-orbstack.sh
+examples/shield-lab/smoke-suspicious-openapi-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-rate-limited-recon-blocked-orbstack.sh
+examples/shield-lab/smoke-rate-limited-blocked-orbstack.sh
+examples/shield-lab/smoke-rate-limited-controlled-reality-orbstack.sh
+examples/shield-lab/smoke-controlled-reality-blocked-orbstack.sh
+examples/shield-lab/smoke-controlled-reality-depth-limit-blocked-orbstack.sh
 ```
 
 The expected host URLs are:
