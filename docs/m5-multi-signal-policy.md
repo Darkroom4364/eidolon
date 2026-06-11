@@ -229,6 +229,10 @@ The current M5 slice is intentionally narrow:
   evidence, but only already-suspicious sessions are throttled, and the
   rate-limited reason now carries the shared pre-containment
   `persistence_class`
+- edge export now carries that same `pre_containment_persistence` family for
+  rate-limited sessions too, with class-level detail like `discovery_recon`
+  or `same_bait_near_miss`, so operators can group persistence before the
+  blocked retry rung
 - one conservative `rate_limited -> blocked` path now exists for repeating
   that same-bait near miss again after Eidolon has already throttled the
   session once, keeping blocked rare and tied to explicit retry behavior

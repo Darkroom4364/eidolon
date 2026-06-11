@@ -314,6 +314,8 @@ Status checklist:
   and the `suspicious -> rate_limited` rung now stamps a shared
   `persistence_class` marker so the rate-limit and blocked transitions reuse
   the same pre-containment persistence classifier
+  and edge export now surfaces that same shared family for rate-limited
+  sessions with class-level detail before sessions ever hit the blocked rung
   and edge export now distinguishes that direct blind write retry as
   `write_recon_retry` instead of the broader `discovery_recon_retry`
   and those pre-containment blocked detail codes now come from an explicit
