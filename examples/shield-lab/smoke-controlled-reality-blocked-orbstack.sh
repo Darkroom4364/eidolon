@@ -247,6 +247,12 @@ jq -e \
   ' <<<"$blocked_transition_json" >/dev/null \
   || fail "session ${session_id} blocked transition reason did not match the repeated escape path"
 
+jq -e '
+  (.kind.reason // "")
+  | contains("post_containment_persistence_kind=controlled_reality_branch_escape")
+' <<<"$blocked_transition_json" >/dev/null \
+  || fail "session ${session_id} blocked transition reason did not preserve the structured branch-escape persistence marker"
+
 blocked_response_json="$(
   jq -c -e -s \
     --arg session_id "$session_id" '
@@ -317,6 +323,7 @@ jq -e '
   and (($exports[0].edge_recommendation.reason_codes // []) | index("eidolon_owned")) != null
   and (($exports[0].edge_recommendation.reason_codes // []) | index("post_containment_persistence")) != null
   and (($exports[0].edge_recommendation.reason_codes // []) | index("controlled_reality_branch_escape")) != null
+  and $exports[0].policy.post_containment_persistence_kind == "controlled_reality_branch_escape"
 ' "$edge_export_file" >/dev/null \
   || fail "edge export did not preserve the new repeated escape runtime decision"
 
