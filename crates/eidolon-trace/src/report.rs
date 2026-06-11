@@ -2,7 +2,8 @@ use std::fmt::Write;
 
 use eidolon_core::{
     EdgeEvidenceRef, EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestRef,
-    EidolonEdgeDecisionExport, EventKind, IngressAdvisorySignals, PolicyState, RoutingDecision,
+    EidolonEdgeDecisionExport, EventKind, IngressAdvisorySignals, PolicyState,
+    PreContainmentPersistenceKind, RoutingDecision, PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY,
     TRUSTED_INGRESS_CONTRACT_VERSION,
 };
 
@@ -425,25 +426,10 @@ fn grouped_block_reason_codes(policy_state: PolicyState, reason: &str) -> Vec<St
         return Vec::new();
     }
 
-    if reason.contains("rate-limited same-bait near miss retry moved session to blocked") {
+    if let Some(kind) = PreContainmentPersistenceKind::from_reason(reason) {
         return vec![
-            "pre_containment_persistence".to_string(),
-            "same_bait_near_miss_retry".to_string(),
-        ];
-    }
-
-    if reason.contains("rate-limited discovery recon retry moved session to blocked") {
-        if reason.contains("repeated_discovery_score=0")
-            && reason.contains("decoy_write_probe_path_fanout_bonus=1")
-        {
-            return vec![
-                "pre_containment_persistence".to_string(),
-                "write_recon_retry".to_string(),
-            ];
-        }
-        return vec![
-            "pre_containment_persistence".to_string(),
-            "discovery_recon_retry".to_string(),
+            PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
+            kind.detail_code().to_string(),
         ];
     }
 
@@ -1341,7 +1327,7 @@ mod tests {
                 EventKind::PolicyChanged {
                     from: PolicyState::RateLimited,
                     to: PolicyState::Blocked,
-                    reason: "rate-limited same-bait near miss retry moved session to blocked: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2".to_string(),
+                    reason: "rate-limited same-bait near miss retry moved session to blocked: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_kind=same_bait_near_miss_retry".to_string(),
                 },
             ),
             Event::new(
@@ -1411,7 +1397,7 @@ mod tests {
                 EventKind::PolicyChanged {
                     from: PolicyState::RateLimited,
                     to: PolicyState::Blocked,
-                    reason: "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5".to_string(),
+                    reason: "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_kind=discovery_recon_retry".to_string(),
                 },
             ),
             Event::new(
@@ -1481,7 +1467,7 @@ mod tests {
                 EventKind::PolicyChanged {
                     from: PolicyState::RateLimited,
                     to: PolicyState::Blocked,
-                    reason: "rate-limited discovery recon retry moved session to blocked: path=/api/v2/import/validate actor_kind=agentic_browser vendor_score=35 discovery_requests=1 distinct_surfaces=1 query_seen=true legacy_openapi_query_seen=false linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=true decoy_write_probe_count=2 decoy_write_probe_path_classes=2 detection_count=0 repeated_discovery_score=0 query_score=1 legacy_openapi_query_score=0 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=3 decoy_write_probe_path_fanout_bonus=1 detection_score=0 recon_score=5 recon_block_threshold=5".to_string(),
+                    reason: "rate-limited discovery recon retry moved session to blocked: path=/api/v2/import/validate actor_kind=agentic_browser vendor_score=35 discovery_requests=1 distinct_surfaces=1 query_seen=true legacy_openapi_query_seen=false linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=true decoy_write_probe_count=2 decoy_write_probe_path_classes=2 detection_count=0 repeated_discovery_score=0 query_score=1 legacy_openapi_query_score=0 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=3 decoy_write_probe_path_fanout_bonus=1 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_kind=write_recon_retry".to_string(),
                 },
             ),
             Event::new(
