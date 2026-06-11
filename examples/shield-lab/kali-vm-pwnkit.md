@@ -39,6 +39,7 @@ examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 examples/shield-lab/smoke-suspicious-decoy-write-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-rate-limited-detection-recon-blocked-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-decoy-write-recon-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-decoy-write-repeat-bonus-orbstack.sh

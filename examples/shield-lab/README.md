@@ -64,6 +64,7 @@ Keep out of the private repo:
   smoke-suspicious-aggregated-recon-orbstack.sh
   smoke-suspicious-detection-aggregation-orbstack.sh
   smoke-suspicious-detection-recon-rate-limit-orbstack.sh
+  smoke-rate-limited-detection-recon-blocked-orbstack.sh
   smoke-suspicious-openapi-aggregation-orbstack.sh
   smoke-suspicious-linked-bait-aggregation-orbstack.sh
   smoke-suspicious-hidden-route-aggregation-orbstack.sh
@@ -265,6 +266,7 @@ examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 examples/shield-lab/smoke-suspicious-decoy-write-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-detection-recon-rate-limit-orbstack.sh
+examples/shield-lab/smoke-rate-limited-detection-recon-blocked-orbstack.sh
 examples/shield-lab/smoke-suspicious-openapi-aggregation-orbstack.sh
 examples/shield-lab/smoke-suspicious-decoy-write-recon-rate-limit-orbstack.sh
 examples/shield-lab/smoke-suspicious-decoy-write-repeat-bonus-orbstack.sh
@@ -331,6 +333,14 @@ The fourth smoke proves the first advisory-assisted aggregated
 discovery request carries detection IDs from the trusted edge adapter, reaches
 the multi-signal threshold on first contact, and is served from the stronger
 owned docs surface.
+
+The adjacent detection-backed recon-blocked smoke proves that the same
+advisory-assisted contributor carries through the next pre-containment rung
+too: after one same-session top-level `/docs` follow-up has already moved the
+session into `rate_limited`, a repeated `/docs` retry now moves it into
+`blocked`, while edge export preserves the authenticated detection IDs plus the
+structured `pre_containment_persistence_class=discovery_recon` and
+`pre_containment_persistence_kind=discovery_recon_retry` fields.
 
 An adjacent OpenAPI aggregation smoke proves the first target-side-only
 aggregated `observe -> suspicious` path: one medium-score

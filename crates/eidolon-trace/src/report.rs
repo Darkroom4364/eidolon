@@ -297,7 +297,8 @@ pub fn edge_decision_export_for_evidence(
         .iter()
         .rev()
         .find(|event| event.routing_decision.is_some());
-    let fallback_policy_snapshot_event = latest_policy_routing_event.or(bundle.policy_events.last());
+    let fallback_policy_snapshot_event =
+        latest_policy_routing_event.or(bundle.policy_events.last());
     let policy_state = fallback_policy_snapshot_event
         .map(|event| event.policy_state)
         .or(bundle.policy_state)
@@ -491,7 +492,10 @@ fn preferred_policy_reason_event(
     bundle: &EvidenceBundle,
     policy_state: PolicyState,
 ) -> Option<&crate::PolicyEventEvidence> {
-    if matches!(policy_state, PolicyState::RateLimited | PolicyState::Blocked) {
+    if matches!(
+        policy_state,
+        PolicyState::RateLimited | PolicyState::Blocked
+    ) {
         if let Some(event) = bundle.policy_events.iter().rev().find(|event| {
             let Some(reason) = event.reason.as_deref() else {
                 return false;
