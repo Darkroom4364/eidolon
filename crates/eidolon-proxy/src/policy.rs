@@ -1,6 +1,6 @@
 use eidolon_core::{
     BaitId, Event, EventKind, EventSource, IngressActorKind, IngressAdvisorySignals,
-    IngressIdentity, PolicyState, PreContainmentPersistenceKind, RoutingDecision, SessionId,
+    IngressIdentity, PolicyState, PreContainmentPersistenceClass, RoutingDecision, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -528,31 +528,38 @@ pub fn transition_to_rate_limited_from_suspicious_discovery_recon(
     if recon_score.total < DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD {
         return None;
     }
+    let persistence_class = pre_containment_persistence_class_for_recon(
+        path_is_top_level_discovery,
+        path_is_blind_decoy_write_probe,
+    )?;
 
     Some(PolicyTransition::new(
         current_state,
         PolicyState::RateLimited,
-        format!(
-            "{DISCOVERY_RECON_PERSISTENCE_RATE_LIMIT_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} decoy_write_probe_seen={} decoy_write_probe_count={} decoy_write_probe_path_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} decoy_write_probe_score={} decoy_write_probe_path_fanout_bonus={} detection_score={} recon_score={} recon_rate_limit_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
-            snake_case_actor_kind(ingress_signals.actor_kind),
-            recon_state.request_count,
-            recon_state.fanout.distinct_surface_count(),
-            recon_state.query_seen,
-            recon_state.legacy_openapi_query_seen,
-            recon_state.linked_bait_surface_seen,
-            recon_state.linked_bait_surface_classes,
-            recon_state.decoy_write_probe_seen,
-            recon_state.decoy_write_probe_count,
-            recon_state.decoy_write_probe_path_classes,
-            recon_score.repeated_discovery_score,
-            recon_score.query_score,
-            recon_score.legacy_openapi_query_score,
-            recon_score.linked_bait_surface_score,
-            recon_score.linked_bait_class_fanout_bonus,
-            recon_score.decoy_write_probe_score,
-            recon_score.decoy_write_probe_path_fanout_bonus,
-            recon_score.detection_score,
-            recon_score.total,
+        append_pre_containment_persistence_class(
+            format!(
+                "{DISCOVERY_RECON_PERSISTENCE_RATE_LIMIT_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} decoy_write_probe_seen={} decoy_write_probe_count={} decoy_write_probe_path_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} decoy_write_probe_score={} decoy_write_probe_path_fanout_bonus={} detection_score={} recon_score={} recon_rate_limit_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
+                snake_case_actor_kind(ingress_signals.actor_kind),
+                recon_state.request_count,
+                recon_state.fanout.distinct_surface_count(),
+                recon_state.query_seen,
+                recon_state.legacy_openapi_query_seen,
+                recon_state.linked_bait_surface_seen,
+                recon_state.linked_bait_surface_classes,
+                recon_state.decoy_write_probe_seen,
+                recon_state.decoy_write_probe_count,
+                recon_state.decoy_write_probe_path_classes,
+                recon_score.repeated_discovery_score,
+                recon_score.query_score,
+                recon_score.legacy_openapi_query_score,
+                recon_score.linked_bait_surface_score,
+                recon_score.linked_bait_class_fanout_bonus,
+                recon_score.decoy_write_probe_score,
+                recon_score.decoy_write_probe_path_fanout_bonus,
+                recon_score.detection_score,
+                recon_score.total,
+            ),
+            persistence_class,
         ),
     ))
 }
@@ -598,7 +605,7 @@ pub fn transition_to_blocked_from_repeated_discovery_recon(
     if recon_score.total < DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD {
         return None;
     }
-    let persistence_kind = pre_containment_persistence_kind_for_recon(
+    let persistence_class = pre_containment_persistence_class_for_recon(
         path_is_top_level_discovery,
         path_is_blind_decoy_write_probe,
     )?;
@@ -606,7 +613,7 @@ pub fn transition_to_blocked_from_repeated_discovery_recon(
     Some(PolicyTransition::new(
         current_state,
         PolicyState::Blocked,
-        append_pre_containment_persistence_kind(
+        append_pre_containment_blocked_persistence_markers(
             format!(
                 "{DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} discovery_requests={} distinct_surfaces={} query_seen={} legacy_openapi_query_seen={} linked_bait_surface_seen={} linked_bait_surface_classes={} decoy_write_probe_seen={} decoy_write_probe_count={} decoy_write_probe_path_classes={} detection_count={detection_count} repeated_discovery_score={} query_score={} legacy_openapi_query_score={} linked_bait_surface_score={} linked_bait_class_fanout_bonus={} decoy_write_probe_score={} decoy_write_probe_path_fanout_bonus={} detection_score={} recon_score={} recon_block_threshold={DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD}",
                 snake_case_actor_kind(ingress_signals.actor_kind),
@@ -629,7 +636,7 @@ pub fn transition_to_blocked_from_repeated_discovery_recon(
                 recon_score.detection_score,
                 recon_score.total,
             ),
-            persistence_kind,
+            persistence_class,
         ),
     ))
 }
@@ -647,9 +654,12 @@ pub fn transition_to_rate_limited_from_same_bait_near_miss(
     Some(PolicyTransition::new(
         current_state,
         PolicyState::RateLimited,
-        format!(
-            "{SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX}: path={path} bait_id={}",
-            bait_id.0
+        append_pre_containment_persistence_class(
+            format!(
+                "{SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX}: path={path} bait_id={}",
+                bait_id.0
+            ),
+            PreContainmentPersistenceClass::SameBaitNearMiss,
         ),
     ))
 }
@@ -667,34 +677,46 @@ pub fn transition_to_blocked_from_repeated_same_bait_near_miss(
     Some(PolicyTransition::new(
         current_state,
         PolicyState::Blocked,
-        append_pre_containment_persistence_kind(
+        append_pre_containment_blocked_persistence_markers(
             format!(
                 "{REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX}: path={path} bait_id={}",
                 bait_id.0
             ),
-            PreContainmentPersistenceKind::SameBaitNearMissRetry,
+            PreContainmentPersistenceClass::SameBaitNearMiss,
         ),
     ))
 }
 
-fn pre_containment_persistence_kind_for_recon(
+fn pre_containment_persistence_class_for_recon(
     path_is_top_level_discovery: bool,
     path_is_blind_decoy_write_probe: bool,
-) -> Option<PreContainmentPersistenceKind> {
+) -> Option<PreContainmentPersistenceClass> {
     if path_is_blind_decoy_write_probe {
-        return Some(PreContainmentPersistenceKind::WriteReconRetry);
+        return Some(PreContainmentPersistenceClass::WriteRecon);
     }
     if path_is_top_level_discovery {
-        return Some(PreContainmentPersistenceKind::DiscoveryReconRetry);
+        return Some(PreContainmentPersistenceClass::DiscoveryRecon);
     }
     None
 }
 
-fn append_pre_containment_persistence_kind(
+fn append_pre_containment_persistence_class(
     reason: String,
-    persistence_kind: PreContainmentPersistenceKind,
+    persistence_class: PreContainmentPersistenceClass,
 ) -> String {
-    format!("{reason} {}", persistence_kind.marker())
+    format!("{reason} {}", persistence_class.marker())
+}
+
+fn append_pre_containment_blocked_persistence_markers(
+    reason: String,
+    persistence_class: PreContainmentPersistenceClass,
+) -> String {
+    let persistence_kind = persistence_class.blocked_kind();
+    format!(
+        "{reason} {} {}",
+        persistence_class.marker(),
+        persistence_kind.marker()
+    )
 }
 
 pub fn transition_to_blocked_from_repeated_controlled_reality_depth_limit(
@@ -1085,6 +1107,9 @@ mod tests {
             .contains(SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX));
         assert!(transition.reason.contains("path=/api/v2/import/reconcile"));
         assert!(transition.reason.contains("bait_id=rel_2025_04_b7f2"));
+        assert!(transition
+            .reason
+            .contains("persistence_class=same_bait_near_miss"));
     }
 
     #[test]
@@ -1155,6 +1180,9 @@ mod tests {
         assert!(transition.reason.contains("legacy_openapi_query_score=2"));
         assert!(transition.reason.contains("recon_score=5"));
         assert!(transition.reason.contains("recon_rate_limit_threshold=5"));
+        assert!(transition
+            .reason
+            .contains("persistence_class=discovery_recon"));
     }
 
     #[test]
@@ -1295,6 +1323,7 @@ mod tests {
             .contains("decoy_write_probe_path_fanout_bonus=1"));
         assert!(transition.reason.contains("recon_score=5"));
         assert!(transition.reason.contains("recon_rate_limit_threshold=5"));
+        assert!(transition.reason.contains("persistence_class=write_recon"));
     }
 
     #[test]
@@ -1346,6 +1375,9 @@ mod tests {
         assert!(transition.reason.contains("legacy_openapi_query_score=2"));
         assert!(transition.reason.contains("recon_score=5"));
         assert!(transition.reason.contains("recon_block_threshold=5"));
+        assert!(transition
+            .reason
+            .contains("persistence_class=discovery_recon"));
         assert!(transition
             .reason
             .contains("persistence_kind=discovery_recon_retry"));
@@ -1400,6 +1432,9 @@ mod tests {
         assert!(transition.reason.contains("decoy_write_probe_score=2"));
         assert!(transition.reason.contains("recon_score=5"));
         assert!(transition.reason.contains("recon_block_threshold=5"));
+        assert!(transition
+            .reason
+            .contains("persistence_class=discovery_recon"));
         assert!(transition
             .reason
             .contains("persistence_kind=discovery_recon_retry"));
@@ -1543,6 +1578,7 @@ mod tests {
             .contains("decoy_write_probe_path_fanout_bonus=1"));
         assert!(transition.reason.contains("recon_score=5"));
         assert!(transition.reason.contains("recon_block_threshold=5"));
+        assert!(transition.reason.contains("persistence_class=write_recon"));
         assert!(transition
             .reason
             .contains("persistence_kind=write_recon_retry"));
@@ -1566,6 +1602,9 @@ mod tests {
             .contains(REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX));
         assert!(transition.reason.contains("path=/api/v2/import/reconcile"));
         assert!(transition.reason.contains("bait_id=rel_2025_04_b7f2"));
+        assert!(transition
+            .reason
+            .contains("persistence_class=same_bait_near_miss"));
         assert!(transition
             .reason
             .contains("persistence_kind=same_bait_near_miss_retry"));

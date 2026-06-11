@@ -226,17 +226,20 @@ The current M5 slice is intentionally narrow:
 - one conservative `suspicious -> rate_limited` path now exists for a
   same-session, same-bait action near miss after prior exposure on
   `/api/v2/import/reconcile`; the unmatched bait-shaped action is preserved as
-  evidence, but only already-suspicious sessions are throttled
+  evidence, but only already-suspicious sessions are throttled, and the
+  rate-limited reason now carries the shared pre-containment
+  `persistence_class`
 - one conservative `rate_limited -> blocked` path now exists for repeating
   that same-bait near miss again after Eidolon has already throttled the
   session once, keeping blocked rare and tied to explicit retry behavior
 - edge export now groups that pre-containment blocked path under the shared
   `pre_containment_persistence` reason-code family with the detail code
-  `same_bait_near_miss_retry`, and the proxy now stamps that persistence kind
-  directly into the blocked reason instead of relying on export-side heuristics
+  `same_bait_near_miss_retry`, and the proxy now stamps both the shared
+  `persistence_class` and the blocked-only `persistence_kind` directly into the
+  blocked reason instead of relying on export-side heuristics
 - edge export now groups the adjacent recon-driven blocked retry under that
   same `pre_containment_persistence` family with the detail code
-  `discovery_recon_retry` from the same explicit reason marker
+  `discovery_recon_retry` from those same explicit reason markers
 - edge export now splits the direct blind write-target retry case out of that
   generic recon bucket: when a blocked decision comes from repeating the
   rate-limited blind unsafe write path itself, the shared family stays
