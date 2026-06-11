@@ -172,6 +172,12 @@ The current M5 slice is intentionally narrow:
   point without creating `bait_action_observed`; the structured recon score and
   debug/export path now surface that as
   `decoy_write_probe_path_fanout_bonus`
+- that write-target fanout is no longer scorer-only: an already-`suspicious`
+  medium-score session can now move straight to `rate_limited` on the second
+  distinct blind unsafe probe when the existing `query_score` plus
+  `decoy_write_probe_score` plus `decoy_write_probe_path_fanout_bonus` is what
+  reaches the recon persistence threshold of `5`, even before another
+  top-level discovery follow-up happens
 - one adjacent `rate_limited -> blocked` path now exists for repeating that
   same medium-score top-level discovery churn again after Eidolon has already
   throttled the session once, keeping the hard-fail tied to explicit

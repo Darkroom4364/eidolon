@@ -299,6 +299,9 @@ Status checklist:
   profile instead of only the default reconcile route
   and distinct unattributed write targets now add a coarse path-fanout bonus
   in structured recon score/export
+  and that same fanout can now trigger the existing rate-limit threshold on the
+  second distinct blind probe for already-suspicious medium-score sessions,
+  without waiting for another top-level discovery request
   not just a seen/not-seen bit
   (`current branch only`)
 - [x] Weighted recon now has one adjacent `rate_limited -> blocked` path for

@@ -1938,6 +1938,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     policy_state,
                     &surface_request.path,
                     discovery_surface_kind(runtime, &surface_request).is_some(),
+                    blind_decoy_write_probe_path_kind(runtime, &surface_request).is_some(),
                     &session.ingress_identity,
                     &session.ingress_signals,
                     discovery_recon_state,
@@ -7365,140 +7366,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_distinct_blind_write_probe_paths_add_a_fanout_bonus_without_bait_attribution() {
-        let path = write_bait_profile(fanout_write_probe_profile_json());
-        let loaded = load_bait_profile(&path).expect("fanout write profile should load");
-        let event_log_path = unique_temp_path("aggregated-decoy-write-fanout-events.jsonl");
-        let debug_log_path = unique_temp_path("aggregated-decoy-write-fanout-debug.jsonl");
-        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
-        let (upstream, _upstream_handle) = spawn_upstream_sequence([
-            html_response(original),
-            json_response(r#"{"mode":"reconcile"}"#),
-            json_response(r#"{"mode":"validate"}"#),
-        ]);
-        let mut runtime = test_runtime_with_bait_profile(
-            upstream,
-            &event_log_path,
-            unique_temp_path("aggregated-decoy-write-fanout-control.txt"),
-            loaded,
-        );
-        runtime.debug_log = Some(Arc::new(Mutex::new(
-            FileDebugLogWriter::open(&debug_log_path).expect("debug log should open"),
-        )));
-        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
-        let cookie = cookie_header();
-        let headers = [
-            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
-            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
-            (
-                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
-                "automation_likelihood_inverse",
-            ),
-            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
-        ];
-
-        let first_response = parse_downstream_response(&run_runtime_request(
-            runtime.clone(),
-            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
-        ));
-        let second_response = parse_downstream_response(&run_runtime_request(
-            runtime.clone(),
-            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
-        ));
-        let third_response = parse_downstream_response(&run_runtime_request(
-            runtime,
-            &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
-        ));
-
-        let first_body = must_ok(
-            String::from_utf8(first_response.body),
-            "body should be utf8",
-        );
-
-        assert_eq!(first_response.status, 200);
-        assert!(first_body.contains("/docs/legacy-import"));
-        assert!(first_body.contains("/docs/import-validate"));
-        assert_eq!(second_response.status, 200);
-        assert_eq!(third_response.status, 200);
-
-        let request_events = events_of_type(&event_log_path, "request_seen");
-        assert_eq!(request_events.len(), 3);
-        assert_eq!(request_events[1]["policy_state"], "suspicious");
-        assert_eq!(
-            request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
-            2
-        );
-        assert_eq!(
-            request_events[1]["kind"]["discovery_recon_score"]
-                ["decoy_write_probe_path_fanout_bonus"],
-            Value::Null
-        );
-        assert_eq!(
-            request_events[1]["kind"]["discovery_recon_score"]["total"],
-            3
-        );
-        assert_eq!(request_events[2]["policy_state"], "suspicious");
-        assert_eq!(request_events[2]["kind"]["path"], "/api/v2/import/validate");
-        assert_eq!(
-            request_events[2]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
-            3
-        );
-        assert_eq!(
-            request_events[2]["kind"]["discovery_recon_score"]
-                ["decoy_write_probe_path_fanout_bonus"],
-            1
-        );
-        assert_eq!(
-            request_events[2]["kind"]["discovery_recon_score"]["total"],
-            5
-        );
-        assert_eq!(
-            request_events[2]["kind"]["discovery_recon_score"]["threshold"],
-            3
-        );
-
-        let policy_changes = events_of_type(&event_log_path, "policy_changed");
-        assert_eq!(policy_changes.len(), 1);
-        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
-        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
-        assert!(policy_changes[0]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("path=/api/v2/import/reconcile")));
-        assert!(policy_changes[0]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("decoy_write_probe_count=1")));
-
-        assert_event_type_absent(&event_log_path, "bait_action_observed");
-
-        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
-            .into_iter()
-            .filter(|event| event["event"].as_str() == Some("request_received"))
-            .collect();
-        assert_eq!(request_debugs.len(), 3);
-        assert_eq!(
-            request_debugs[2]["fields"]["discovery_decoy_write_probe_count"],
-            2
-        );
-        assert_eq!(
-            request_debugs[2]["fields"]["discovery_decoy_write_probe_path_classes"],
-            2
-        );
-        assert_eq!(
-            request_debugs[2]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
-            3
-        );
-        assert_eq!(
-            request_debugs[2]["fields"]["discovery_recon_score"]
-                ["decoy_write_probe_path_fanout_bonus"],
-            1
-        );
-        assert_eq!(
-            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
-            5
-        );
-    }
-
-    #[test]
     fn runtime_repeated_blind_decoy_write_probes_add_a_capped_bonus_without_bait_attribution() {
         let event_log_path = unique_temp_path("aggregated-decoy-write-repeat-bonus-events.jsonl");
         let debug_log_path = unique_temp_path("aggregated-decoy-write-repeat-bonus-debug.jsonl");
@@ -7995,6 +7862,188 @@ mod tests {
         assert_eq!(
             request_debugs[2]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
             2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let surface_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("surface_action_selected"))
+            .collect();
+        assert_eq!(surface_debugs[2]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(
+            surface_debugs[2]["fields"]["surface_action"]["type"],
+            "rate_limited"
+        );
+    }
+
+    #[test]
+    fn runtime_rate_limits_suspicious_recon_on_second_distinct_blind_write_probe() {
+        let path = write_bait_profile(fanout_write_probe_profile_json());
+        let loaded = load_bait_profile(&path).expect("fanout write profile should load");
+        let event_log_path =
+            unique_temp_path("aggregated-decoy-write-fanout-rate-limit-events.jsonl");
+        let debug_log_path =
+            unique_temp_path("aggregated-decoy-write-fanout-rate-limit-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream_sequence([
+            html_response(original),
+            json_response(r#"{"mode":"reconcile"}"#),
+        ]);
+        let mut runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("aggregated-decoy-write-fanout-rate-limit-control.txt"),
+            loaded,
+        );
+        runtime.debug_log = Some(Arc::new(Mutex::new(
+            FileDebugLogWriter::open(&debug_log_path).expect("debug log should open"),
+        )));
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
+        ));
+        let third_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
+        ));
+
+        assert_eq!(first_response.status, 200);
+        assert_eq!(second_response.status, 200);
+        assert_eq!(third_response.status, 429);
+        assert_eq!(header_values(&third_response, "retry-after"), vec!["30"]);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 3);
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[2]["policy_state"], "rate_limited");
+        assert_eq!(request_events[2]["kind"]["path"], "/api/v2/import/validate");
+        assert_eq!(
+            request_events[2]["kind"]["routing_decision"],
+            "rate_limited"
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["repeated_discovery_score"],
+            Value::Null
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]
+                ["decoy_write_probe_path_fanout_bonus"],
+            1
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["total"],
+            5
+        );
+        assert_eq!(
+            request_events[2]["kind"]["discovery_recon_score"]["threshold"],
+            5
+        );
+
+        let policy_changes = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changes.len(), 2);
+        assert_eq!(policy_changes[0]["kind"]["from"], "observe");
+        assert_eq!(policy_changes[0]["kind"]["to"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["from"], "suspicious");
+        assert_eq!(policy_changes[1]["kind"]["to"], "rate_limited");
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/api/v2/import/validate")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("query_seen=true")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_path_classes=2")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("repeated_discovery_score=0")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=3")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_path_fanout_bonus=1")));
+        assert!(policy_changes[1]["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=5")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+
+        let request_debugs: Vec<Value> = debug_values(&debug_log_path)
+            .into_iter()
+            .filter(|event| event["event"].as_str() == Some("request_received"))
+            .collect();
+        assert_eq!(request_debugs.len(), 3);
+        assert_eq!(request_debugs[2]["fields"]["policy_state"], "rate_limited");
+        assert_eq!(
+            request_debugs[2]["fields"]["path"],
+            "/api/v2/import/validate"
+        );
+        assert_eq!(request_debugs[2]["fields"]["query_present"], false);
+        assert_eq!(request_debugs[2]["fields"]["discovery_request_count"], 1);
+        assert_eq!(request_debugs[2]["fields"]["discovery_query_seen"], true);
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_count"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_decoy_write_probe_path_classes"],
+            2
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["repeated_discovery_score"],
+            0
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]["decoy_write_probe_score"],
+            3
+        );
+        assert_eq!(
+            request_debugs[2]["fields"]["discovery_recon_score"]
+                ["decoy_write_probe_path_fanout_bonus"],
+            1
         );
         assert_eq!(
             request_debugs[2]["fields"]["discovery_recon_score"]["total"],
