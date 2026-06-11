@@ -285,12 +285,12 @@ Status checklist:
 - [x] Suspicious owned shaping exists for `/docs` and `/openapi.json` (`main`)
 - [x] First weak aggregated suspicious-promotion path exists for repeated
   medium-score authenticated discovery plus query-bearing recon
-  (`current branch only`)
+  (`main`)
 - [x] Aggregated suspicious-promotion paths now use an explicit weighted recon
-  score instead of a flat weak-signal count (`current branch only`)
+  score instead of a flat weak-signal count (`main`)
 - [x] Weighted recon suspicious-promotion scores now flow through `request_seen`
   audit events and edge export as structured `discovery_recon_score` data
-  (`current branch only`)
+  (`main`)
 - [x] Weighted recon now has one conservative higher-threshold
   `suspicious -> rate_limited` path for sustained medium-score top-level
   discovery churn
@@ -303,7 +303,7 @@ Status checklist:
   second distinct blind probe for already-suspicious medium-score sessions,
   without waiting for another top-level discovery request
   not just a seen/not-seen bit
-  (`current branch only`)
+  (`main`)
 - [x] Weighted recon now has one adjacent `rate_limited -> blocked` path for
   repeated medium-score top-level discovery churn after the first throttle
   and that blocked rung is now also proven with the blind decoy-write
@@ -336,49 +336,50 @@ Status checklist:
   `post_containment_persistence_kind` field for branch-escape versus
   depth-limit persistence instead of forcing downstream consumers to scrape
   `reason_codes`
-  (`current branch only`)
+  (`main`)
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs
   and the same advisory detection input is now also proven on the
   higher-threshold `suspicious -> rate_limited` weighted recon path
-  (`current branch only`)
+  (`main`)
 - [x] First target-side-only aggregated suspicious-promotion path exists for
-  medium-score legacy-query OpenAPI discovery (`current branch only`)
+  medium-score legacy-query OpenAPI discovery (`main`)
 - [x] First target-side aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus a blind decoy write probe without
-  bait-derived attribution (`current branch only`)
+  bait-derived attribution (`main`)
 - [x] Adjacent target-side-only aggregated suspicious-promotion path exists for
   medium-score linked bait-surface follow-up after query-bearing discovery,
   including hidden-route and JS-helper follow-up outside the top-level
   discovery prefixes
-  (`current branch only`)
+  (`main`)
 - [x] Adjacent target-side-only aggregated suspicious-promotion path exists for
   medium-score linked bait-class fanout after plain `/docs` discovery, so two
   distinct linked follow-up classes can promote without query-bearing recon or
   edge-provided detections
-  (`current branch only`)
+  (`main`)
 - [x] Adjacent target-side-only aggregated suspicious-promotion path exists for
   medium-score linked bait-class fanout after plain `/openapi.json` discovery,
   so the same linked follow-up classes now promote from either top-level
   discovery anchor
-  (`current branch only`)
+  (`main`)
 - [x] Same-session discovery fanout promotion across `/docs` and
-  `/openapi.json` exists (`current branch only`)
+  `/openapi.json` exists (`main`)
 - [x] `suspicious -> rate_limited` exists for same-bait near misses
-  (`current branch only`)
+  (`main`)
 - [x] `rate_limited -> blocked` exists for repeated same-bait near misses
-  (`current branch only`)
+  (`main`)
 - [x] `rate_limited -> controlled_reality` exists for exact bait-derived
-  follow-up actions (`current branch only`)
+  follow-up actions (`main`)
 - [x] `controlled_reality -> blocked` exists for repeated branch-escape
-  attempts (`current branch only`)
+  attempts (`main`)
 - [x] `controlled_reality -> blocked` exists for repeated same-branch
-  depth-limit persistence (`current branch only`)
+  depth-limit persistence (`main`)
 - [x] Post-containment blocked exports now use a shared grouped reason-code
-  family with live OrbStack smoke coverage (`current branch only`)
+  family with live OrbStack smoke coverage (`main`)
 - [x] Pre-containment blocked exports now use a shared grouped reason-code
-  family with live OrbStack smoke coverage (`current branch only`)
-- [ ] Merge the current `feature/suspicious-discovery-fanout` branch
+  family with live OrbStack smoke coverage (`main`)
+- [x] First defensible `#175` runtime plane is merged on `main` and satisfies
+  the issue acceptance criteria (`main`)
 - [ ] Broaden the narrow hand-tuned transitions into a more general
   multi-signal aggregation plane
 - [ ] Add per-session signed polymorphic bait generation
