@@ -20,7 +20,7 @@ use eidolon_core::{
 };
 use eidolon_proxy::{
     controlled_reality::{
-        is_decoy_write, rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
+        rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
         DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
         MAX_TARPIT_DELAY,
     },
@@ -1468,19 +1468,30 @@ fn linked_bait_surface_kind(
 }
 
 fn is_blind_decoy_write_probe(runtime: &ProxyRuntime, request: &SurfaceRequestMeta) -> bool {
-    if !is_decoy_write(request) {
+    if !matches!(request.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
         return false;
     }
 
     let headers: Vec<(&str, &str)> = surface_header_pairs(&request.headers).collect();
-    runtime
+    if runtime
         .bait_registry
         .match_action(&request.method, &request.path, headers.iter().copied())
-        .is_none()
-        && runtime
+        .is_some()
+        || runtime
             .bait_registry
             .match_action_shape(&request.method, &request.path, headers.iter().copied())
-            .is_none()
+            .is_some()
+    {
+        return false;
+    }
+
+    runtime.bait_registry.baits().iter().any(|bait| {
+        bait.expected_action
+            .method
+            .eq_ignore_ascii_case(&request.method)
+            && bait.expected_action.path == request.path
+            && bait.expected_action.header_name.is_some()
+    })
 }
 
 fn is_aggregated_discovery_recon_candidate_request(
@@ -4759,6 +4770,27 @@ mod tests {
         }"##
     }
 
+    fn alternate_write_probe_profile_json() -> &'static str {
+        r##"{
+          "schema_version": 1,
+          "profile_id": "alternate_write_probe",
+          "baits": [
+            {
+              "id": "validate_import_trace",
+              "bait_class": "docs",
+              "surface": "/docs/import-validate",
+              "surface_kind": "docs",
+              "expected_action": {
+                "method": "POST",
+                "path": "/api/v2/import/validate",
+                "header_name": "X-Validation-Trace",
+                "header_value": "validate_2026_06_a17c"
+              }
+            }
+          ]
+        }"##
+    }
+
     fn set_runtime_policy_state(runtime: &ProxyRuntime, cookie: &str, policy_state: PolicyState) {
         let session_id =
             session::session_id_from_cookie_header(cookie).expect("cookie should contain session");
@@ -7178,6 +7210,104 @@ mod tests {
             request_debugs[1]["fields"]["discovery_recon_score"]["total"],
             3
         );
+    }
+
+    #[test]
+    fn runtime_aggregates_medium_score_blind_probe_on_alternate_write_path_to_suspicious() {
+        let path = write_bait_profile(alternate_write_probe_profile_json());
+        let loaded = load_bait_profile(&path).expect("alternate write profile should load");
+        let event_log_path = unique_temp_path("aggregated-alt-write-suspicious-events.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (upstream, _upstream_handle) = spawn_upstream_sequence([
+            html_response(original),
+            json_response(r#"{"mode":"validate"}"#),
+        ]);
+        let mut runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("aggregated-alt-write-suspicious-control.txt"),
+            loaded,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+        let cookie = cookie_header();
+        let headers = [
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+            (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "35"),
+            (
+                session::INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                "automation_likelihood_inverse",
+            ),
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+        ];
+
+        let first_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie, &headers),
+        ));
+        let second_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
+        ));
+
+        let first_body = must_ok(
+            String::from_utf8(first_response.body),
+            "body should be utf8",
+        );
+
+        assert_eq!(first_response.status, 200);
+        assert!(first_body.contains("/docs/import-validate"));
+        assert_eq!(second_response.status, 200);
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 2);
+        assert_eq!(request_events[0]["policy_state"], "observe");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(request_events[1]["policy_state"], "suspicious");
+        assert_eq!(request_events[1]["kind"]["path"], "/api/v2/import/validate");
+        assert_eq!(
+            request_events[1]["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["query_score"],
+            1
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
+            2
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["total"],
+            3
+        );
+        assert_eq!(
+            request_events[1]["kind"]["discovery_recon_score"]["threshold"],
+            3
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "suspicious");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path=/api/v2/import/validate")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_seen=true")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_count=1")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("recon_score=3")));
+
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
     }
 
     #[test]

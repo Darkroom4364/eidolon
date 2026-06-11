@@ -162,6 +162,10 @@ The current M5 slice is intentionally narrow:
   raises the decoy-write recon component from `2` to `3` without creating
   `bait_action_observed`, and the stronger score is visible in the same later
   top-level discovery rate-limit path
+- that blind decoy-write contributor is also no longer hard-wired to the
+  default reconcile route; it now applies to any constrained unsafe bait action
+  path from the active bait profile when the request matches method/path but no
+  expected bait header name is present
 - one adjacent `rate_limited -> blocked` path now exists for repeating that
   same medium-score top-level discovery churn again after Eidolon has already
   throttled the session once, keeping the hard-fail tied to explicit

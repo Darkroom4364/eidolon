@@ -295,6 +295,8 @@ Status checklist:
   `suspicious -> rate_limited` path for sustained medium-score top-level
   discovery churn
   and the blind decoy-write contributor is now a capped repeated-probe count,
+  and it now keys off constrained unsafe bait action paths from the active bait
+  profile instead of only the default reconcile route
   not just a seen/not-seen bit
   (`current branch only`)
 - [x] Weighted recon now has one adjacent `rate_limited -> blocked` path for
