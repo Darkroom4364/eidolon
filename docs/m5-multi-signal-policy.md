@@ -126,6 +126,10 @@ The current M5 slice is intentionally narrow:
 - those signals remain separate from ingress identity and from runtime evidence
 - reports and edge-decision export now preserve the latest authenticated
   advisory ingress signal snapshot when present
+- trusted ingress softening is now a two-level scope: the global configured
+  soften prefixes still define the outer boundary, and local allowlist entries
+  may optionally narrow that boundary with per-entry
+  `bait_soften_path_prefixes` for deployment-safe verified crawler handling
 - one conservative `observe -> suspicious` promotion now exists for authenticated
   discovery-surface requests that combine a low inverse vendor score with an
   explicitly agentic actor kind, while stronger trusted identities still keep

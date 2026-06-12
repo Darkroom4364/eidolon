@@ -9,6 +9,12 @@ pub struct IngressIdentityResolver {
     entries: Vec<TrustedIngressEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIngressTrust {
+    pub identity: IngressIdentity,
+    pub bait_soften_path_prefixes: Option<Vec<String>>,
+}
+
 impl IngressIdentityResolver {
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -18,7 +24,12 @@ impl IngressIdentityResolver {
         self.entries.is_empty()
     }
 
-    pub fn resolve<I, N, V>(&self, method: &str, path: &str, headers: I) -> Option<IngressIdentity>
+    pub fn resolve<I, N, V>(
+        &self,
+        method: &str,
+        path: &str,
+        headers: I,
+    ) -> Option<ResolvedIngressTrust>
     where
         I: IntoIterator<Item = (N, V)>,
         N: AsRef<str>,
@@ -33,7 +44,10 @@ impl IngressIdentityResolver {
         self.entries
             .iter()
             .find(|entry| entry.matches(&method, path, &headers))
-            .map(|entry| entry.identity.clone())
+            .map(|entry| ResolvedIngressTrust {
+                identity: entry.identity.clone(),
+                bait_soften_path_prefixes: entry.bait_soften_path_prefixes.clone(),
+            })
     }
 }
 
@@ -113,6 +127,7 @@ struct TrustedIngressEntry {
     identity: IngressIdentity,
     methods: Vec<String>,
     path_prefixes: Vec<String>,
+    bait_soften_path_prefixes: Option<Vec<String>>,
     required_headers: Vec<RequiredHeaderMatch>,
 }
 
@@ -186,6 +201,8 @@ struct RawTrustedIngressEntry {
     methods: Vec<String>,
     #[serde(default)]
     path_prefixes: Vec<String>,
+    #[serde(default)]
+    bait_soften_path_prefixes: Option<Vec<String>>,
     required_headers: Vec<RawRequiredHeaderMatch>,
 }
 
@@ -283,20 +300,17 @@ impl RawTrustedIngressEntry {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let path_prefixes = self
-            .path_prefixes
-            .into_iter()
-            .map(|prefix| {
-                let prefix = prefix.trim().to_string();
-                if prefix.is_empty() || !prefix.starts_with('/') {
-                    Err(IngressTrustConfigError::new(format!(
-                        "ingress trust config entry {index} path_prefixes must start with `/`"
-                    )))
-                } else {
-                    Ok(prefix)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let path_prefixes =
+            normalize_path_prefixes(self.path_prefixes, index, "path_prefixes", true)?;
+        let bait_soften_path_prefixes = match self.bait_soften_path_prefixes {
+            Some(prefixes) => Some(normalize_path_prefixes(
+                prefixes,
+                index,
+                "bait_soften_path_prefixes",
+                true,
+            )?),
+            None => None,
+        };
 
         let required_headers = self
             .required_headers
@@ -313,9 +327,39 @@ impl RawTrustedIngressEntry {
             },
             methods,
             path_prefixes,
+            bait_soften_path_prefixes,
             required_headers,
         })
     }
+}
+
+fn normalize_path_prefixes(
+    prefixes: Vec<String>,
+    index: usize,
+    field_name: &str,
+    allow_empty: bool,
+) -> Result<Vec<String>, IngressTrustConfigError> {
+    let prefixes = prefixes
+        .into_iter()
+        .map(|prefix| {
+            let prefix = prefix.trim().to_string();
+            if prefix.is_empty() || !prefix.starts_with('/') {
+                Err(IngressTrustConfigError::new(format!(
+                    "ingress trust config entry {index} {field_name} must start with `/`"
+                )))
+            } else {
+                Ok(prefix)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if !allow_empty && prefixes.is_empty() {
+        return Err(IngressTrustConfigError::new(format!(
+            "ingress trust config entry {index} {field_name} must not be empty"
+        )));
+    }
+
+    Ok(prefixes)
 }
 
 impl RawRequiredHeaderMatch {
@@ -388,7 +432,7 @@ mod tests {
         );
         let resolver = must_ok(resolver, "config should parse");
 
-        let identity = must_some(
+        let trust = must_some(
             resolver.resolve(
                 "GET",
                 "/docs/legacy-import",
@@ -398,9 +442,13 @@ mod tests {
         );
 
         assert_eq!(resolver.len(), 1);
-        assert_eq!(identity.source, IngressIdentitySource::OperatorOverride);
-        assert_eq!(identity.trust_tier, IngressTrustTier::Allowlisted);
-        assert_eq!(identity.label.as_deref(), Some("internal-crawler"));
+        assert_eq!(
+            trust.identity.source,
+            IngressIdentitySource::OperatorOverride
+        );
+        assert_eq!(trust.identity.trust_tier, IngressTrustTier::Allowlisted);
+        assert_eq!(trust.identity.label.as_deref(), Some("internal-crawler"));
+        assert!(trust.bait_soften_path_prefixes.is_none());
     }
 
     #[test]
@@ -467,13 +515,16 @@ mod tests {
         );
         let resolver = must_ok(resolver, "config should parse");
 
-        let identity = must_some(
+        let trust = must_some(
             resolver.resolve("GET", "/docs", [("X-Actor", "seed")]),
             "entry should match",
         );
 
-        assert_eq!(identity.source, IngressIdentitySource::OperatorOverride);
-        assert_eq!(identity.trust_tier, IngressTrustTier::Allowlisted);
+        assert_eq!(
+            trust.identity.source,
+            IngressIdentitySource::OperatorOverride
+        );
+        assert_eq!(trust.identity.trust_tier, IngressTrustTier::Allowlisted);
     }
 
     #[test]
@@ -496,18 +547,51 @@ mod tests {
         );
         let resolver = must_ok(resolver, "config should parse");
 
-        let identity = must_some(
+        let trust = must_some(
             resolver.resolve("GET", "/docs", [("X-Actor", "window")]),
             "entry should match",
         );
 
         assert_eq!(
-            identity.expires_at,
+            trust.identity.expires_at,
             Some(
                 Utc.with_ymd_and_hms(2026, 6, 5, 12, 0, 0)
                     .single()
                     .unwrap_or_else(|| panic!("timestamp should be valid"))
             )
+        );
+    }
+
+    #[test]
+    fn preserves_optional_bait_soften_scope() {
+        let resolver = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs", "/openapi.json"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+        let resolver = must_ok(resolver, "config should parse");
+
+        let trust = must_some(
+            resolver.resolve("GET", "/openapi.json", [("X-Actor", "docs-crawler")]),
+            "entry should match",
+        );
+
+        assert_eq!(
+            trust.bait_soften_path_prefixes,
+            Some(vec!["/docs".to_string()])
         );
     }
 
@@ -577,6 +661,31 @@ mod tests {
         assert!(bad_tier
             .to_string()
             .contains("trust_tier must not be `none`"));
+    }
+
+    #[test]
+    fn rejects_invalid_bait_soften_prefixes() {
+        let bad_scope = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "bad-scope",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "bait_soften_path_prefixes": ["docs"],
+                  "required_headers": [
+                    { "name": "X-Actor", "value": "bad" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect_err("invalid soften scope should fail");
+
+        assert!(bad_scope
+            .to_string()
+            .contains("bait_soften_path_prefixes must start with `/`"));
     }
 
     #[test]

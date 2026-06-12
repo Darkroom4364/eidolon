@@ -392,5 +392,7 @@ Status checklist:
   explicit negative controls
   (`current branch only`)
 - [ ] Expand deployment-safe allowlists and verified crawler handling beyond
-  the current trusted-ingress slice
+  the current trusted-ingress slice; per-entry local allowlist
+  `bait_soften_path_prefixes` now exist on the current branch as the first
+  deployment-safe narrowing primitive
 - [ ] Prepare the external-readiness note and release checklist
