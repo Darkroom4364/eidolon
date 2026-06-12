@@ -292,3 +292,10 @@ The current M5 slice is intentionally narrow:
 
 That keeps the current containment invariants stable while giving `#175` a
 typed signal plane to build on.
+
+The first defensible `#175` runtime plane is now merged on `main`. Confirmed
+bait action is no longer the only serious escalation primitive, reports and
+edge export explain which signals drove both pre-containment and
+post-containment decisions, and live OrbStack smokes cover multiple graduated
+paths below full controlled reality. Remaining work is broader M5
+generalization, not a missing `#175` baseline.
