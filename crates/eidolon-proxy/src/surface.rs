@@ -1,6 +1,6 @@
-use std::fmt;
+use std::{fmt, io};
 
-use eidolon_core::RoutingDecision;
+use eidolon_core::{RoutingDecision, SessionId};
 use serde_json::{Map, Value};
 
 pub const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
@@ -152,15 +152,23 @@ impl SurfaceAction {
 }
 
 pub trait SurfaceController {
-    fn decide(&self, request: &SurfaceRequestMeta) -> SurfaceAction;
+    fn decide(
+        &self,
+        request: &SurfaceRequestMeta,
+        session_id: SessionId,
+    ) -> io::Result<SurfaceAction>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProtectedUpstreamController;
 
 impl SurfaceController for ProtectedUpstreamController {
-    fn decide(&self, _request: &SurfaceRequestMeta) -> SurfaceAction {
-        SurfaceAction::ProtectedUpstream
+    fn decide(
+        &self,
+        _request: &SurfaceRequestMeta,
+        _session_id: SessionId,
+    ) -> io::Result<SurfaceAction> {
+        Ok(SurfaceAction::ProtectedUpstream)
     }
 }
 

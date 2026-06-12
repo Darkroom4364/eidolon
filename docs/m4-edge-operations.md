@@ -119,6 +119,8 @@ The live wrapper reads the proxy's PVC-backed `events.jsonl`, derives the latest
 `EidolonEdgeDecisionExport` snapshot per session, and can either:
 
 - print JSON/NDJSON
+- rank and trim to a top-N high-signal session slice
+- render a single-session markdown summary from the enriched export
 - write JSON to a file
 - POST each decision to a webhook or SIEM collector
 
@@ -128,6 +130,14 @@ Example:
 examples/shield-lab/export-edge-decisions-orbstack.sh \
   --format ndjson \
   --webhook-url https://collector.example.test/eidolon
+
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --top 10
+
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format markdown \
+  --session 11111111-1111-4111-8111-111111111111
 ```
 
 This is the current concrete M4 answer to "webhook/SIEM/WAF export" in the

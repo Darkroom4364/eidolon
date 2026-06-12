@@ -21,7 +21,7 @@ case "$*" in
     ;;
   "-n shield-system get deploy eidolon-shield-proxy -o json")
     cat <<'JSON'
-{"metadata":{"name":"eidolon-shield-proxy"},"spec":{"replicas":1},"status":{"readyReplicas":1,"availableReplicas":1}}
+{"metadata":{"name":"eidolon-shield-proxy"},"spec":{"replicas":1,"template":{"spec":{"containers":[{"args":["--owned-cluster-lab","--ingress-transport-auth-secret-file","/var/run/secrets/eidolon-trusted-ingress/transport-auth.txt","--bait-signing-secret-file","/var/run/secrets/eidolon-bait-signing/signing-secret.txt"]}]}}},"status":{"readyReplicas":1,"availableReplicas":1}}
 JSON
     ;;
   "-n shield-system get pods -l app.kubernetes.io/name=eidolon-shield-proxy -o json")
@@ -54,6 +54,11 @@ JSON
 {"metadata":{"name":"eidolon-shield-proxy-state"},"spec":{"storageClassName":"local-path","accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}},"status":{"phase":"Bound","capacity":{"storage":"1Gi"},"accessModes":["ReadWriteOnce"]}}
 JSON
     ;;
+  "-n shield-system get configmap eidolon-shield-bait-profile -o json")
+    cat <<'JSON'
+{"metadata":{"name":"eidolon-shield-bait-profile"},"data":{"bait-profile.json":"{\"profile_id\":\"orbstack_default_m3_catalog\",\"baits\":[{\"id\":\"rel_2025_04_b7f2\",\"surface\":\"/docs/legacy-import\",\"surface_kind\":\"docs\",\"expected_action\":{\"header_name\":\"X-Migration-Trace\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"mig\"}}},{\"id\":\"openapi_reconcile_trace\",\"surface\":\"/openapi.json\",\"surface_kind\":\"open_api\",\"expected_action\":{\"header_name\":\"X-OpenAPI-Trace\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"oapi\"}}},{\"id\":\"fake_service_token\",\"surface\":\"/docs/service-token\",\"surface_kind\":\"token\",\"expected_action\":{\"header_name\":\"X-Api-Key\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"svc\"}}}]}"}}
+JSON
+    ;;
   *)
     echo "unexpected kubectl invocation: $*" >&2
     exit 1
@@ -72,7 +77,82 @@ echo "unexpected curl invocation: $*" >&2
 exit 1
 SH
 
-  chmod +x "$dir/kubectl" "$dir/curl"
+  cat > "$dir/export-edge-decisions.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+output=""
+session=""
+min_coverage=""
+latest_mint_outcome=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output)
+      output="$2"
+      shift 2
+      ;;
+    --session)
+      session="$2"
+      shift 2
+      ;;
+    --min-polymorphic-coverage)
+      min_coverage="$2"
+      shift 2
+      ;;
+    --latest-mint-outcome)
+      latest_mint_outcome="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+selected='{"contract_version":"2026-06-12.v1","observed_at":"2026-06-04T00:00:00Z","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","request":{"method":"GET","path":"/openapi.json?token=secret"},"ingress_identity":{"source":"signed_agent","trust_tier":"signed_attested","label":"bundle-proof"},"ingress_signals":{"actor_kind":"assistant","vendor_score":42,"vendor_score_kind":"automation_likelihood_inverse","detection_ids":["det-123"]},"discovery_recon_score":{"query_score":1,"detection_score":2,"total":3,"threshold":3},"policy":{"state":"suspicious","routing_decision":"protected_upstream","reason":"aggregated recon signals moved session to suspicious"},"evidence":{"event_schema_version":2,"event_ids":["11111111-1111-1111-1111-111111111111"],"bundle_ref":"session:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"matched_session_value"}},"edge_recommendation":{"action":"observe","reason_codes":["suspicious_session"]},"deployment_context":{"bait_profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}]}}'
+selected_array="[$selected]"
+all_sessions='[{"contract_version":"2026-06-12.v1","observed_at":"2026-06-04T00:00:02Z","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","request":{"method":"POST","path":"/api/v2/import/reconcile?token=secret"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"controlled_reality","routing_decision":"controlled_reality","reason":"confirmed bait-derived action moved session into controlled reality"},"evidence":{"event_schema_version":2,"event_ids":["33333333-3333-3333-3333-333333333333"],"bundle_ref":"session:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},"edge_recommendation":{"action":"preserve_eidolon_routing","reason_codes":["eidolon_runtime_enforcement","controlled_reality"]},"deployment_context":{"bait_profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}]}},{"contract_version":"2026-06-12.v1","observed_at":"2026-06-04T00:00:00Z","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","request":{"method":"GET","path":"/openapi.json?token=secret"},"ingress_identity":{"source":"signed_agent","trust_tier":"signed_attested","label":"bundle-proof"},"ingress_signals":{"actor_kind":"assistant","vendor_score":42,"vendor_score_kind":"automation_likelihood_inverse","detection_ids":["det-123"]},"discovery_recon_score":{"query_score":1,"detection_score":2,"total":3,"threshold":3},"policy":{"state":"suspicious","routing_decision":"protected_upstream","reason":"aggregated recon signals moved session to suspicious"},"evidence":{"event_schema_version":2,"event_ids":["11111111-1111-1111-1111-111111111111"],"bundle_ref":"session:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"matched_session_value"}},"edge_recommendation":{"action":"observe","reason_codes":["suspicious_session"]},"deployment_context":{"bait_profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}]}}]'
+
+if [[ -n "$session" ]]; then
+  [[ "$session" == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" ]] || {
+    echo "unexpected session: $session" >&2
+    exit 1
+  }
+  rendered="$selected"
+else
+  rendered="$all_sessions"
+fi
+
+if [[ -n "$min_coverage" ]]; then
+  case "$min_coverage" in
+    1)
+      rendered="$selected_array"
+      ;;
+    *)
+      rendered='[]'
+      ;;
+  esac
+fi
+
+if [[ -n "$latest_mint_outcome" ]]; then
+  case "$latest_mint_outcome" in
+    matched_session_value)
+      rendered="$selected_array"
+      ;;
+    *)
+      rendered='[]'
+      ;;
+  esac
+fi
+
+if [[ -n "$output" ]]; then
+  printf '%s\n' "$rendered" > "$output"
+else
+  printf '%s\n' "$rendered"
+fi
+SH
+
+  chmod +x "$dir/kubectl" "$dir/curl" "$dir/export-edge-decisions.sh"
 }
 
 write_fixture_state() {
@@ -115,14 +195,19 @@ test_export_bundle_redacts_sensitive_values() {
 
   KUBECTL_BIN="$temp_dir/kubectl" \
     CURL_BIN="$temp_dir/curl" \
+    EIDOLON_SHIELD_EDGE_EXPORT_SCRIPT="$temp_dir/export-edge-decisions.sh" \
     EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
-    "$EXPORT_SCRIPT" "$bundle_dir" >/dev/null
+    "$EXPORT_SCRIPT" \
+    --session aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa \
+    "$bundle_dir" >/dev/null
 
   [[ -f "$bundle_dir/README.md" ]]
   [[ -f "$bundle_dir/cluster-status.json" ]]
+  [[ -f "$bundle_dir/edge-session-index.md" ]]
   [[ -f "$bundle_dir/events.redacted.jsonl" ]]
   [[ -f "$bundle_dir/debug.redacted.jsonl" ]]
   [[ -f "$bundle_dir/policy-state.redacted.json" ]]
+  [[ -f "$bundle_dir/selected-session-edge-summary.md" ]]
   [[ -f "$bundle_dir/SHA256SUMS" ]]
 
   ! rg -q 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa|11111111-1111-1111-1111-111111111111|22222222-2222-2222-2222-222222222222|secret|192.168.194.1:48090|http://eidolon-owned-demo-target' "$bundle_dir"
@@ -130,6 +215,8 @@ test_export_bundle_redacts_sensitive_values() {
   jq -e '
     .edge.url == "http://127.0.0.1:31080"
     and .proxy_state.status == "Bound"
+    and .bait_profile.profile_id == "orbstack_default_m3_catalog"
+    and (.bait_profile.polymorphic_baits | length) == 3
   ' "$bundle_dir/cluster-status.json" >/dev/null
 
   jq -e '
@@ -147,6 +234,36 @@ test_export_bundle_redacts_sensitive_values() {
   rg -q 'policy-state.redacted.json' "$bundle_dir/SHA256SUMS"
   rg -q 'Redacted event log lines: `2`' "$bundle_dir/README.md"
   rg -q 'Direct target URL: `http://127.0.0.1:31081` \(HTTP `200`\)' "$bundle_dir/README.md"
+  rg -q 'Bait profile: `orbstack_default_m3_catalog`' "$bundle_dir/README.md"
+  rg -q 'Active polymorphic bait surfaces: `3`' "$bundle_dir/README.md"
+  rg -q 'edge-session-index.md' "$bundle_dir/README.md"
+  rg -q 'selected-session-edge-summary.md' "$bundle_dir/README.md"
+  rg -q '`/docs/legacy-import` -> `X-Migration-Trace` \(`mig`, `session_hmac_sha256_v1`, bait id `rel_2025_04_b7f2`\)' "$bundle_dir/README.md"
+  rg -q '`/openapi.json` -> `X-OpenAPI-Trace` \(`oapi`, `session_hmac_sha256_v1`, bait id `openapi_reconcile_trace`\)' "$bundle_dir/README.md"
+  rg -q '`/docs/service-token` -> `X-Api-Key` \(`svc`, `session_hmac_sha256_v1`, bait id `fake_service_token`\)' "$bundle_dir/README.md"
+  rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
+  rg -q 'Exported sessions: `2`' "$bundle_dir/edge-session-index.md"
+  rg -q 'Minted Coverage' "$bundle_dir/edge-session-index.md"
+  rg -q 'Latest Mint Outcome' "$bundle_dir/edge-session-index.md"
+  rg -q '<redacted-1>' "$bundle_dir/edge-session-index.md"
+  rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
+  rg -q '`controlled_reality`' "$bundle_dir/edge-session-index.md"
+  rg -q '`suspicious`' "$bundle_dir/edge-session-index.md"
+  rg -q 'X-Api-Key' "$bundle_dir/edge-session-index.md"
+  rg -q '`matched_session_value` via `X-Api-Key`' "$bundle_dir/edge-session-index.md"
+  rg -q '`1/3`' "$bundle_dir/edge-session-index.md"
+  rg -q '`0/3`' "$bundle_dir/edge-session-index.md"
+  rg -q '^# Eidolon Edge Session Summary$' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q 'Session: `<redacted>`' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q 'Request: `GET /openapi.json\?<redacted>`' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q 'det-123' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q 'fake_service_token' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q 'Latest minted outcome: `matched_session_value` via `X-Api-Key` \[prefix `svc`, bait `fake_service_token`\]' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q 'Coverage: `1/3` active session-minted baits observed' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q 'Observed active minted baits: `fake_service_token`' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q 'Remaining active minted baits: `rel_2025_04_b7f2`, `openapi_reconcile_trace`' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q '/docs/legacy-import' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q '/docs/service-token' "$bundle_dir/selected-session-edge-summary.md"
 }
 
 test_export_refuses_non_empty_bundle_dir() {
@@ -174,7 +291,63 @@ test_export_refuses_non_empty_bundle_dir() {
   rg -q 'bundle directory must be empty' <<<"$output"
 }
 
+test_export_bundle_filters_edge_index_by_min_polymorphic_coverage() {
+  local temp_dir
+  local state_dir
+  local bundle_dir
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  bundle_dir="$temp_dir/bundle"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    EIDOLON_SHIELD_EDGE_EXPORT_SCRIPT="$temp_dir/export-edge-decisions.sh" \
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+    EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE=1 \
+    "$EXPORT_SCRIPT" \
+    "$bundle_dir" >/dev/null
+
+  rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
+  rg -q 'Exported sessions: `1`' "$bundle_dir/edge-session-index.md"
+  rg -q '<redacted-1>' "$bundle_dir/edge-session-index.md"
+  ! rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
+  rg -q '`matched_session_value` via `X-Api-Key`' "$bundle_dir/edge-session-index.md"
+  rg -q '`1/3`' "$bundle_dir/edge-session-index.md"
+}
+
+test_export_bundle_filters_edge_index_by_latest_mint_outcome() {
+  local temp_dir
+  local state_dir
+  local bundle_dir
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  bundle_dir="$temp_dir/bundle"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    EIDOLON_SHIELD_EDGE_EXPORT_SCRIPT="$temp_dir/export-edge-decisions.sh" \
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+    EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME=matched_session_value \
+    "$EXPORT_SCRIPT" \
+    "$bundle_dir" >/dev/null
+
+  rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
+  rg -q 'Exported sessions: `1`' "$bundle_dir/edge-session-index.md"
+  rg -q '<redacted-1>' "$bundle_dir/edge-session-index.md"
+  ! rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
+  rg -q 'Latest Mint Outcome' "$bundle_dir/edge-session-index.md"
+  rg -q '`matched_session_value` via `X-Api-Key`' "$bundle_dir/edge-session-index.md"
+}
+
 test_export_bundle_redacts_sensitive_values
 test_export_refuses_non_empty_bundle_dir
+test_export_bundle_filters_edge_index_by_min_polymorphic_coverage
+test_export_bundle_filters_edge_index_by_latest_mint_outcome
 
 printf 'shield-lab export checks passed\n'
