@@ -223,13 +223,20 @@ examples/shield-lab/bait-profiles/default-m3-catalog.json
 ```
 
 That profile preserves the built-in M3 bait catalog while making deployment
-profile provenance explicit. This is the preferred way to make the same
-external scanner face harder or different bait semantics without drifting this
-repo into scanner development.
+profile provenance explicit. It also enables session-minted docs,
+fake-service-token, and OpenAPI baits on `/docs/legacy-import`,
+`/docs/service-token`, and `/openapi.json`, so the default OrbStack lab now
+exercises per-session signed bait on docs, token, and discovery surfaces while
+keeping the surrounding shield-lab smoke matrix intact. This is the preferred
+way to make the same external scanner face harder or different bait semantics
+without drifting this repo into scanner development.
 
 The deploy script also patches the proxy pod template with the selected bait
 profile digest and waits for rollout status, so the next Kali run sees the
 profile you just selected instead of a stale mounted file.
+
+The same deploy step now creates a cluster-local bait-signing secret and mounts
+it into the proxy, which is required for any mint-enabled bait profile.
 
 That applies the `k8s/orbstack` overlay, which adds a dedicated
 `NodePort` service named `eidolon-shield-edge` for the proxy while keeping the
@@ -261,6 +268,9 @@ Validate those ingress-side runtime paths directly on the live OrbStack shield:
 
 ```sh
 examples/shield-lab/smoke-trusted-ingress-orbstack.sh
+examples/shield-lab/smoke-session-minted-legacy-import-orbstack.sh
+examples/shield-lab/smoke-session-minted-service-token-orbstack.sh
+examples/shield-lab/smoke-session-minted-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
 examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 examples/shield-lab/smoke-suspicious-decoy-write-aggregation-orbstack.sh
@@ -288,13 +298,47 @@ examples/shield-lab/smoke-controlled-reality-blocked-orbstack.sh
 examples/shield-lab/smoke-controlled-reality-depth-limit-blocked-orbstack.sh
 ```
 
-The second smoke proves the first M5 graduated-enforcement slice: one
+The legacy-import smoke proves the docs-side default-lab polymorphic bait
+slice: the owned `/docs/legacy-import` surface now mints a distinct
+`X-Migration-Trace` value per session, the same session sees a stable value
+across repeated exposures, a different session gets a different value, a
+cross-session replay stays uncorrelated and falls back to upstream behavior,
+and the exact action export preserves only safe mint metadata, not the value
+itself. Edge export now also records whether the latest minted legacy-import
+bait-shaped action carried a `matched_session_value` or a
+`session_value_mismatch`.
+
+The service-token smoke proves the token-side default-lab polymorphic bait
+slice: the `/docs/service-token` surface now mints a distinct `X-Api-Key`
+value per session, the same session sees a stable value across repeated
+exposures, a different session gets a different value, a cross-session replay
+stays uncorrelated and falls back to upstream behavior, and the exact action
+export preserves only safe mint metadata, not the value itself. Edge export now
+also records whether the latest minted bait-shaped action carried a
+`matched_session_value` or a `session_value_mismatch`.
+
+The OpenAPI mint smoke proves the discovery-side default-lab polymorphic
+slice: the owned `/openapi.json` surface now mints a distinct
+`X-OpenAPI-Trace` example per session, the same session sees a stable value
+across repeated discovery, a different session gets a different value, a
+cross-session replay stays uncorrelated and falls back to upstream behavior,
+and the exact action export again preserves only safe mint metadata, not the
+value itself. Edge export now also records whether the latest minted OpenAPI
+bait-shaped action carried a `matched_session_value` or a
+`session_value_mismatch`.
+
+The remaining hidden-route and JS-helper bait classes stay static on purpose as
+negative controls. They keep fixed header values across sessions even when bait
+signing is enabled, so the lab can still separate “session-minted polymorphism”
+from “ordinary static bait” during evaluation.
+
+The suspicious-promotion smoke proves the first M5 graduated-enforcement slice: one
 authenticated advisory discovery request is promoted from `observe` to
 `suspicious`, stays baited, is served from an Eidolon-owned docs surface, and
 exports the advisory signals with a `preserve_eidolon_routing` edge
 recommendation.
 
-The third smoke proves the first weaker aggregated `observe -> suspicious`
+The aggregated recon smoke proves the first weaker `observe -> suspicious`
 slice: a medium-score authenticated agentic discovery request stays in
 `observe` on first contact, but after the session has shown query-bearing
 discovery recon, a second same-session discovery request moves into
@@ -328,7 +372,7 @@ discovery retry now moves the session into `blocked` while still preserving the
 important invariant that the blind probe created no `bait_action_observed`
 evidence.
 
-The fourth smoke proves the first advisory-assisted aggregated
+The advisory-assisted aggregated smoke proves the first
 `observe -> suspicious` path: one query-bearing medium-score authenticated
 discovery request carries detection IDs from the trusted edge adapter, reaches
 the multi-signal threshold on first contact, and is served from the stronger
@@ -496,6 +540,10 @@ Check the live lab status:
 examples/shield-lab/status-orbstack.sh
 ```
 
+The status output now includes the active `polymorphic-baits` matrix from the
+live bait-profile ConfigMap, so operators can see which default surfaces are
+session-minted without manually opening the profile file.
+
 Smoke-check the trusted-ingress transport-auth path:
 
 ```sh
@@ -526,6 +574,26 @@ Export a redacted evidence bundle from the PVC-backed proxy state:
 examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 ```
 
+The exported bundle README now includes the active bait-profile id and the
+live polymorphic bait matrix from `cluster-status.json`, so offline review does
+not depend on access to the running cluster.
+
+Each bundle now also includes `edge-session-index.md`, a compact redacted
+session index rendered from the enriched edge export path, including a minted
+coverage column and latest mint-outcome column so operators can see how many
+active session-minted baits each session actually touched and whether the most
+recent minted bait-shaped action matched the same session or mismatched.
+
+If you already know the session you want to review, the same bundle export can
+also embed one redacted per-session edge summary rendered from the enriched edge
+export path:
+
+```sh
+examples/shield-lab/export-orbstack-evidence.sh \
+  --session 11111111-1111-4111-8111-111111111111 \
+  /private/tmp/eidolon-shield-bundle
+```
+
 Export host-side evidence, then copy a Kali scanner-side sample back onto the
 host with linked hashes:
 
@@ -544,9 +612,59 @@ Export live edge decisions as JSON or webhook events:
 
 ```sh
 examples/shield-lab/export-edge-decisions-orbstack.sh --format json
+examples/shield-lab/export-edge-decisions-orbstack.sh --format json --top 10
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --min-polymorphic-coverage 2
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --latest-mint-outcome session_value_mismatch
 examples/shield-lab/export-edge-decisions-orbstack.sh \
   --format ndjson \
   --webhook-url https://collector.example.test/eidolon
+```
+
+When the live bait-profile status is available, each exported decision now also
+includes `deployment_context`, which carries the active bait-profile id and the
+current polymorphic bait matrix alongside the session-level evidence. That same
+context now also includes a structured `polymorphic_bait_coverage` summary, so
+JSON consumers can see observed-vs-active minted bait coverage without
+comparing the two lists manually. When `evidence.latest_bait_header_value_mint`
+is present, the markdown summaries now also show whether the latest minted
+bait-shaped action was a `matched_session_value` or `session_value_mismatch`.
+
+`--top <N>` ranks sessions by enforcement severity and recency first, so
+operators can pull a compact high-signal slice before exporting a full bundle.
+`--min-polymorphic-coverage <N>` narrows that set further to sessions that
+observed at least `N` active session-minted bait surfaces. `--latest-mint-outcome
+<matched_session_value|session_value_mismatch>` narrows the export to sessions
+whose latest minted bait-shaped action either matched the same session or
+mismatched, which is useful for replay triage.
+
+If you want the bundle-local `edge-session-index.md` to keep only sessions that
+cross the same polymorphic threshold, set:
+
+```sh
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE=2 \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+```
+
+If you want the bundle-local `edge-session-index.md` to keep only sessions that
+share one latest minted outcome, set:
+
+```sh
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME=session_value_mismatch \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+```
+
+For a single-session operator summary that already combines session-level mint
+evidence with the active deployment polymorphic matrix and a coverage summary,
+render markdown from the same enriched export path:
+
+```sh
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format markdown \
+  --session 11111111-1111-4111-8111-111111111111
 ```
 
 Port forward the demo target:

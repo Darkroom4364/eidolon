@@ -13,10 +13,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use eidolon_bait::{docs_for_bait, BaitRegistry};
+use eidolon_bait::{docs_for_bait, render_bait_for_session, BaitRegistry};
 use eidolon_core::{
-    Bait, BaitClass, BaitId, DiscoveryReconScore, Event, EventKind, EventSource, ExposureId,
-    PolicyState, RoutingDecision, SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
+    Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, DiscoveryReconScore, Event, EventKind,
+    EventSource, ExposureId, HeaderValueMint, PolicyState, RoutingDecision, SafeHeaderObservation,
+    SessionId, EVENT_SCHEMA_VERSION,
 };
 use eidolon_proxy::{
     controlled_reality::{
@@ -155,6 +156,7 @@ struct ProxyConfig {
     event_log_path: PathBuf,
     debug_log_path: Option<PathBuf>,
     bait_profile_path: Option<PathBuf>,
+    bait_signing_secret_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
     trusted_bait_soften_path_prefixes: Vec<String>,
@@ -229,6 +231,14 @@ impl CliAction {
                         &mut builder.bait_profile_path,
                         flag,
                         parse_bait_profile_path(&value)?,
+                    )?;
+                }
+                "--bait-signing-secret-file" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.bait_signing_secret_path,
+                        flag,
+                        parse_bait_signing_secret_path(&value)?,
                     )?;
                 }
                 "--ingress-trust-config" => {
@@ -323,6 +333,7 @@ struct ConfigBuilder {
     event_log_path: Option<PathBuf>,
     debug_log_path: Option<PathBuf>,
     bait_profile_path: Option<PathBuf>,
+    bait_signing_secret_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
     trusted_bait_soften_path_prefixes: Vec<String>,
@@ -351,6 +362,7 @@ impl ConfigBuilder {
             },
             debug_log_path: self.debug_log_path,
             bait_profile_path: self.bait_profile_path,
+            bait_signing_secret_path: self.bait_signing_secret_path,
             ingress_trust_config_path: self.ingress_trust_config_path,
             ingress_transport_auth_secret_path: self.ingress_transport_auth_secret_path,
             trusted_bait_soften_path_prefixes: if self.trusted_bait_soften_path_prefixes.is_empty()
@@ -645,6 +657,18 @@ fn parse_bait_profile_path(raw: &str) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
+fn parse_bait_signing_secret_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = parse_file_path(raw, "bait signing secret")?;
+    if !path.is_file() {
+        return Err(ConfigError::new(format!(
+            "bait signing secret path must be an existing file: `{}`",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
 fn parse_ingress_trust_config_path(raw: &str) -> Result<PathBuf, ConfigError> {
     let path = parse_file_path(raw, "ingress trust config")?;
     if !path.is_file() {
@@ -670,12 +694,20 @@ fn parse_ingress_transport_auth_secret_path(raw: &str) -> Result<PathBuf, Config
 }
 
 fn load_ingress_transport_auth_secret(path: &Path) -> io::Result<Arc<str>> {
+    load_non_empty_secret(path, "ingress transport auth secret")
+}
+
+fn load_bait_signing_secret(path: &Path) -> io::Result<Arc<str>> {
+    load_non_empty_secret(path, "bait signing secret")
+}
+
+fn load_non_empty_secret(path: &Path, label: &str) -> io::Result<Arc<str>> {
     let secret = fs::read_to_string(path)?;
     let secret = secret.trim();
     if secret.is_empty() {
         return Err(invalid_data(format!(
-            "ingress transport auth secret file `{}` must not be empty",
-            path.display()
+            "{label} file `{}` must not be empty",
+            path.display(),
         )));
     }
 
@@ -865,6 +897,15 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         Some(path) => load_bait_profile(path).map_err(|error| invalid_data(error.to_string()))?,
         None => default_loaded_bait_profile(),
     };
+    let bait_signing_secret = match &config.bait_signing_secret_path {
+        Some(path) => Some(load_bait_signing_secret(path)?),
+        None => None,
+    };
+    if bait_profile_requires_signing_secret(&loaded_bait_profile) && bait_signing_secret.is_none() {
+        return Err(invalid_data(
+            "bait profile contains session-minted bait values but no bait signing secret file was configured",
+        ));
+    }
     let bait_profile_debug = bait_profile_debug_value(&loaded_bait_profile.metadata);
     let bait_registry = Arc::new(loaded_bait_profile.registry);
     let bait_content = loaded_bait_profile.content;
@@ -898,9 +939,11 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
             Arc::clone(&bait_registry),
             bait_content.clone(),
+            bait_signing_secret.clone(),
         )),
         ingress_identity_resolver: Arc::new(ingress_identity_resolver),
         ingress_transport_auth_secret,
+        bait_signing_secret: bait_signing_secret.clone(),
         trusted_bait_soften_path_prefixes: config.trusted_bait_soften_path_prefixes,
         bait_registry,
         bait_content,
@@ -919,6 +962,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 "retry_after_seconds": runtime.controlled_reality_config.retry_after_seconds,
             },
             "bait_profile": bait_profile_debug,
+            "bait_signing_enabled": bait_signing_secret.is_some(),
             "ingress_identity_rule_count": runtime.ingress_identity_resolver.len(),
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
             "trusted_bait_soften_path_prefixes": runtime.trusted_bait_soften_path_prefixes,
@@ -962,6 +1006,7 @@ struct ProxyRuntime {
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
     ingress_identity_resolver: Arc<IngressIdentityResolver>,
     ingress_transport_auth_secret: Option<Arc<str>>,
+    bait_signing_secret: Option<Arc<str>>,
     trusted_bait_soften_path_prefixes: Vec<String>,
     bait_registry: Arc<BaitRegistry>,
     bait_content: BaitContentOverrides,
@@ -1067,6 +1112,14 @@ struct LoadedBaitProfile {
     registry: BaitRegistry,
     content: BaitContentOverrides,
     metadata: Option<BaitProfileMetadata>,
+}
+
+fn bait_profile_requires_signing_secret(profile: &LoadedBaitProfile) -> bool {
+    profile
+        .registry
+        .baits()
+        .iter()
+        .any(|bait| bait.expected_action.header_value_mint.is_some())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -1279,6 +1332,10 @@ fn registry_from_profile_baits(baits: Vec<Bait>) -> Result<BaitRegistry, ConfigE
                 .header_value
                 .as_ref()
                 .map(|value| value.trim().to_string()),
+            bait.expected_action
+                .header_value_mint
+                .as_ref()
+                .map(action_mint_key),
         );
         if !actions.insert(action_key) {
             return Err(ConfigError::new(format!(
@@ -1306,14 +1363,51 @@ fn validate_bait(bait: &Bait) -> Result<(), ConfigError> {
         "bait.expected_action.header_value",
         bait.expected_action.header_value.as_deref(),
     )?;
+    validate_optional_header_value_mint(
+        "bait.expected_action.header_value_mint",
+        bait.expected_action.header_value_mint.as_ref(),
+    )?;
 
     if bait.expected_action.header_value.is_some() && bait.expected_action.header_name.is_none() {
         return Err(ConfigError::new(
             "bait expected action cannot require a header value without naming the header",
         ));
     }
+    if bait.expected_action.header_value_mint.is_some()
+        && bait.expected_action.header_name.is_none()
+    {
+        return Err(ConfigError::new(
+            "bait expected action cannot require a minted header value without naming the header",
+        ));
+    }
+    if bait.expected_action.header_value.is_some()
+        && bait.expected_action.header_value_mint.is_some()
+    {
+        return Err(ConfigError::new(
+            "bait expected action cannot set both a static header value and a minted header value",
+        ));
+    }
 
     Ok(())
+}
+
+fn action_mint_key(mint: &HeaderValueMint) -> (&'static str, String) {
+    (
+        match mint.kind {
+            eidolon_core::HeaderValueMintKind::SessionHmacSha256V1 => "session_hmac_sha256_v1",
+        },
+        mint.prefix.trim().to_string(),
+    )
+}
+
+fn validate_optional_header_value_mint(
+    label: &str,
+    mint: Option<&HeaderValueMint>,
+) -> Result<(), ConfigError> {
+    let Some(mint) = mint else {
+        return Ok(());
+    };
+    validate_non_empty(&format!("{label}.prefix"), &mint.prefix)
 }
 
 fn ensure_surface_overrides_reference_baits(
@@ -1372,16 +1466,19 @@ fn bait_profile_debug_value(metadata: &Option<BaitProfileMetadata>) -> Value {
 struct M1DemoSurfaceController {
     bait_registry: Arc<BaitRegistry>,
     content: BaitContentOverrides,
+    bait_signing_secret: Option<Arc<str>>,
 }
 
 impl M1DemoSurfaceController {
     fn with_content_overrides(
         bait_registry: Arc<BaitRegistry>,
         content: BaitContentOverrides,
+        bait_signing_secret: Option<Arc<str>>,
     ) -> Self {
         Self {
             bait_registry,
             content,
+            bait_signing_secret,
         }
     }
 
@@ -1391,40 +1488,53 @@ impl M1DemoSurfaceController {
 }
 
 impl SurfaceController for M1DemoSurfaceController {
-    fn decide(&self, request: &SurfaceRequestMeta) -> SurfaceAction {
+    fn decide(
+        &self,
+        request: &SurfaceRequestMeta,
+        session_id: SessionId,
+    ) -> io::Result<SurfaceAction> {
         if request.method == "GET" {
             if let Some(bait) = self.bait_registry.bait_for_surface(&request.path) {
                 if bait.bait_class != BaitClass::OpenApi {
-                    return SurfaceAction::EidolonOwned {
-                        response: bait_surface_response(bait, &self.content),
-                    };
+                    let bait = render_bait_for_session(
+                        bait,
+                        session_id,
+                        self.bait_signing_secret.as_deref(),
+                    )
+                    .map_err(|error| invalid_data(error.to_string()))?;
+                    return Ok(SurfaceAction::EidolonOwned {
+                        response: bait_surface_response(&bait, &self.content),
+                    });
                 }
             }
         }
 
         if request.method == "GET" && request.path == DOCS_DISCOVERY_TARGET {
-            return SurfaceAction::RewrittenUpstream {
+            return Ok(SurfaceAction::RewrittenUpstream {
                 plan: RewritePlan::html(HtmlInsertion::new(m3_docs_discovery_html(
                     &self.bait_registry,
                     &self.content,
                 ))),
-            };
+            });
         }
 
         if let Some(bait) = self.bait_for_class(BaitClass::OpenApi) {
             if !is_openapi_discovery_request(request, bait) {
-                return SurfaceAction::ProtectedUpstream;
+                return Ok(SurfaceAction::ProtectedUpstream);
             }
+            let bait =
+                render_bait_for_session(bait, session_id, self.bait_signing_secret.as_deref())
+                    .map_err(|error| invalid_data(error.to_string()))?;
 
-            return SurfaceAction::RewrittenUpstream {
+            return Ok(SurfaceAction::RewrittenUpstream {
                 plan: RewritePlan::openapi_paths(vec![openapi_path_insertion_for_bait(
-                    bait,
+                    &bait,
                     &self.content.openapi,
                 )]),
-            };
+            });
         }
 
-        SurfaceAction::ProtectedUpstream
+        Ok(SurfaceAction::ProtectedUpstream)
     }
 }
 
@@ -1467,12 +1577,17 @@ fn linked_bait_surface_kind(
         })
 }
 
-fn is_blind_decoy_write_probe(runtime: &ProxyRuntime, request: &SurfaceRequestMeta) -> bool {
-    blind_decoy_write_probe_path_kind(runtime, request).is_some()
+fn is_blind_decoy_write_probe(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    request: &SurfaceRequestMeta,
+) -> bool {
+    blind_decoy_write_probe_path_kind(runtime, session_id, request).is_some()
 }
 
 fn blind_decoy_write_probe_path_kind(
     runtime: &ProxyRuntime,
+    session_id: SessionId,
     request: &SurfaceRequestMeta,
 ) -> Option<policy::DecoyWriteProbePathKind> {
     if !matches!(request.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
@@ -1482,7 +1597,15 @@ fn blind_decoy_write_probe_path_kind(
     let headers: Vec<(&str, &str)> = surface_header_pairs(&request.headers).collect();
     if runtime
         .bait_registry
-        .match_action(&request.method, &request.path, headers.iter().copied())
+        .match_action_for_session(
+            &request.method,
+            &request.path,
+            headers.iter().copied(),
+            session_id,
+            runtime.bait_signing_secret.as_deref(),
+        )
+        .ok()
+        .flatten()
         .is_some()
         || runtime
             .bait_registry
@@ -1509,11 +1632,12 @@ fn blind_decoy_write_probe_path_kind(
 
 fn is_aggregated_discovery_recon_candidate_request(
     runtime: &ProxyRuntime,
+    session_id: SessionId,
     request: &SurfaceRequestMeta,
 ) -> bool {
     discovery_surface_kind(runtime, request).is_some()
         || linked_bait_surface_kind(runtime, request).is_some()
-        || is_blind_decoy_write_probe(runtime, request)
+        || is_blind_decoy_write_probe(runtime, session_id, request)
 }
 
 fn discovery_surface_kind(
@@ -1909,7 +2033,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             policy::transition_to_suspicious_from_aggregated_discovery_recon(
                 policy_state,
                 &surface_request.path,
-                is_aggregated_discovery_recon_candidate_request(runtime, &surface_request),
+                is_aggregated_discovery_recon_candidate_request(
+                    runtime,
+                    session.session_id,
+                    &surface_request,
+                ),
                 &session.ingress_identity,
                 &session.ingress_signals,
                 discovery_recon_state,
@@ -1938,7 +2066,12 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     policy_state,
                     &surface_request.path,
                     discovery_surface_kind(runtime, &surface_request).is_some(),
-                    blind_decoy_write_probe_path_kind(runtime, &surface_request).is_some(),
+                    blind_decoy_write_probe_path_kind(
+                        runtime,
+                        session.session_id,
+                        &surface_request,
+                    )
+                    .is_some(),
                     &session.ingress_identity,
                     &session.ingress_signals,
                     discovery_recon_state,
@@ -1967,7 +2100,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 policy_state,
                 &surface_request.path,
                 discovery_surface_kind(runtime, &surface_request).is_some(),
-                blind_decoy_write_probe_path_kind(runtime, &surface_request).is_some(),
+                blind_decoy_write_probe_path_kind(runtime, session.session_id, &surface_request)
+                    .is_some(),
                 &session.ingress_identity,
                 &session.ingress_signals,
                 discovery_recon_state,
@@ -2094,9 +2228,9 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     }
     let controller_surface_action = if intervention_mode.interventions_enabled() {
         match decision.routing_decision {
-            RoutingDecision::ProtectedUpstream => {
-                runtime.surface_controller.decide(&surface_request)
-            }
+            RoutingDecision::ProtectedUpstream => runtime
+                .surface_controller
+                .decide(&surface_request, session.session_id)?,
             RoutingDecision::ControlledReality => {
                 let (action, transition) = controlled_reality_action(
                     runtime,
@@ -2181,10 +2315,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     };
     let candidate_surface_action = strengthen_surface_action_for_suspicious_discovery(
         runtime,
+        session.session_id,
         decision.policy_state,
         &surface_request,
         controller_surface_action.clone(),
-    );
+    )?;
     let (surface_action, trusted_ingress_softening_reason) =
         maybe_soften_surface_action_for_trusted_ingress(
             &runtime.trusted_bait_soften_path_prefixes,
@@ -2287,11 +2422,17 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             || (decision.policy_state == PolicyState::RateLimited
                 && matches!(&surface_action, SurfaceAction::RateLimited { .. })))
     {
-        if let Some(action_match) = runtime.bait_registry.match_action(
-            &request.method,
-            &surface_request.path,
-            header_pairs(&request.headers),
-        ) {
+        if let Some(action_match) = runtime
+            .bait_registry
+            .match_action_for_session(
+                &request.method,
+                &surface_request.path,
+                header_pairs(&request.headers),
+                session.session_id,
+                runtime.bait_signing_secret.as_deref(),
+            )
+            .map_err(|error| invalid_data(error.to_string()))?
+        {
             effective_decision = policy::PolicyDecision::new(
                 decision.policy_state,
                 RoutingDecision::EidolonOwned,
@@ -2505,11 +2646,14 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         && matches!(&surface_action, SurfaceAction::RateLimited { .. })
         && runtime
             .bait_registry
-            .match_action(
+            .match_action_for_session(
                 &request.method,
                 &surface_request.path,
                 header_pairs(&request.headers),
+                session.session_id,
+                runtime.bait_signing_secret.as_deref(),
             )
+            .map_err(|error| invalid_data(error.to_string()))?
             .is_none()
     {
         if let Some(action_shape_match) = runtime.bait_registry.match_action_shape(
@@ -2993,7 +3137,7 @@ fn update_discovery_recon_state_for_request(
         return store.note_linked_bait_surface_request(session_id, kind);
     }
 
-    if let Some(kind) = blind_decoy_write_probe_path_kind(runtime, request) {
+    if let Some(kind) = blind_decoy_write_probe_path_kind(runtime, session_id, request) {
         return store.note_decoy_write_probe(session_id, kind);
     }
 
@@ -3120,10 +3264,11 @@ fn bait_exposure_for_direct_surface<'a>(
 
 fn strengthen_surface_action_for_suspicious_discovery(
     runtime: &ProxyRuntime,
+    session_id: SessionId,
     policy_state: PolicyState,
     surface_request: &SurfaceRequestMeta,
     controller_surface_action: SurfaceAction,
-) -> SurfaceAction {
+) -> io::Result<SurfaceAction> {
     if policy_state != PolicyState::Suspicious
         || surface_request.method != "GET"
         || !matches!(
@@ -3131,31 +3276,36 @@ fn strengthen_surface_action_for_suspicious_discovery(
             SurfaceAction::RewrittenUpstream { .. }
         )
     {
-        return controller_surface_action;
+        return Ok(controller_surface_action);
     }
 
     if surface_request.path == DOCS_DISCOVERY_TARGET {
         let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::Docs) else {
-            return controller_surface_action;
+            return Ok(controller_surface_action);
         };
+        let bait =
+            render_bait_for_session(bait, session_id, runtime.bait_signing_secret.as_deref())
+                .map_err(|error| invalid_data(error.to_string()))?;
 
-        return SurfaceAction::EidolonOwned {
-            response: bait_surface_response(bait, &runtime.bait_content),
-        };
+        return Ok(SurfaceAction::EidolonOwned {
+            response: bait_surface_response(&bait, &runtime.bait_content),
+        });
     }
 
     let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::OpenApi) else {
-        return controller_surface_action;
+        return Ok(controller_surface_action);
     };
     if surface_request.path != OPENAPI_DISCOVERY_TARGET
         || !is_openapi_discovery_request(surface_request, bait)
     {
-        return controller_surface_action;
+        return Ok(controller_surface_action);
     }
+    let bait = render_bait_for_session(bait, session_id, runtime.bait_signing_secret.as_deref())
+        .map_err(|error| invalid_data(error.to_string()))?;
 
-    SurfaceAction::EidolonOwned {
-        response: owned_openapi_discovery_response(bait, &runtime.bait_content.openapi),
-    }
+    Ok(SurfaceAction::EidolonOwned {
+        response: owned_openapi_discovery_response(&bait, &runtime.bait_content.openapi),
+    })
 }
 
 fn upstream_request_decision(
@@ -3197,6 +3347,7 @@ fn write_bait_exposed_event(
                 bait_id: bait.id.clone(),
                 exposure_id: exposure_id.clone(),
                 surface: redacted_event_target(&surface),
+                header_value_mint: bait.header_value_mint_audit(),
             },
         ),
     )?;
@@ -3237,6 +3388,7 @@ struct BaitActionObservation<'a> {
     path: &'a str,
     exposure_id: Option<ExposureId>,
     prior_same_bait_exposure: bool,
+    header_value_mint_status: Option<BaitHeaderValueMintStatus>,
 }
 
 fn write_bait_action_observed_event_with_exposure(
@@ -3251,6 +3403,7 @@ fn write_bait_action_observed_event_with_exposure(
         path,
         exposure_id,
         prior_same_bait_exposure,
+        header_value_mint_status,
     } = observation;
     let matched_prior_exposure = exposure_id.is_some();
     write_event(
@@ -3264,6 +3417,8 @@ fn write_bait_action_observed_event_with_exposure(
                 exposure_id: exposure_id.clone(),
                 method: method.to_string(),
                 path: redacted_event_target(path),
+                header_value_mint: bait.header_value_mint_audit(),
+                header_value_mint_status,
             },
         ),
     )?;
@@ -3303,6 +3458,9 @@ fn write_bait_action_observed_event(
             path,
             exposure_id: exposure_id.clone(),
             prior_same_bait_exposure: exposure_id.is_some(),
+            header_value_mint_status: bait
+                .header_value_mint_audit()
+                .map(|_| BaitHeaderValueMintStatus::MatchedSessionValue),
         },
     )?;
 
@@ -3328,6 +3486,9 @@ fn write_bait_action_near_miss_event(
             path,
             exposure_id: None,
             prior_same_bait_exposure,
+            header_value_mint_status: bait
+                .header_value_mint_audit()
+                .map(|_| BaitHeaderValueMintStatus::SessionValueMismatch),
         },
     )?;
 
@@ -4453,6 +4614,9 @@ Options:
                          internal decisions only; never emits debug data to HTTP clients
   --bait-profile <PATH> Lab-only JSON bait profile for M3 promotion experiments.
                          Defaults to the built-in M3 catalog
+  --bait-signing-secret-file <PATH>
+                         Shared-secret file used to mint and verify
+                         session-bound bait header values for mint-enabled profiles
   --ingress-trust-config <PATH>
                          JSON ingress trust config for local allowlists and trusted
                          automation claims
@@ -4511,8 +4675,12 @@ mod tests {
     }
 
     impl SurfaceController for StaticSurfaceController {
-        fn decide(&self, _request: &SurfaceRequestMeta) -> SurfaceAction {
-            self.action.clone()
+        fn decide(
+            &self,
+            _request: &SurfaceRequestMeta,
+            _session_id: SessionId,
+        ) -> io::Result<SurfaceAction> {
+            Ok(self.action.clone())
         }
     }
 
@@ -4597,6 +4765,15 @@ mod tests {
         path
     }
 
+    fn write_bait_signing_secret(contents: &str) -> PathBuf {
+        let path = unique_temp_path("bait-signing-secret.txt");
+        must_ok(
+            fs::write(&path, contents),
+            "bait signing secret should write",
+        );
+        path
+    }
+
     fn test_runtime(
         upstream: UpstreamTarget,
         event_log_path: &Path,
@@ -4631,6 +4808,7 @@ mod tests {
             surface_controller,
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
             bait_content: BaitContentOverrides::default(),
@@ -4675,9 +4853,11 @@ mod tests {
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
                 Arc::clone(&bait_registry),
                 BaitContentOverrides::default(),
+                None,
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
             bait_content: BaitContentOverrides::default(),
@@ -4705,9 +4885,11 @@ mod tests {
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
                 Arc::clone(&bait_registry),
                 BaitContentOverrides::default(),
+                None,
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
             bait_content: BaitContentOverrides::default(),
@@ -4720,6 +4902,7 @@ mod tests {
         event_log_path: &Path,
         intervention_control_path: PathBuf,
         loaded_profile: LoadedBaitProfile,
+        bait_signing_secret: Option<Arc<str>>,
     ) -> ProxyRuntime {
         let bait_registry = Arc::new(loaded_profile.registry);
         let bait_content = loaded_profile.content;
@@ -4736,9 +4919,11 @@ mod tests {
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
                 Arc::clone(&bait_registry),
                 bait_content.clone(),
+                bait_signing_secret.clone(),
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            bait_signing_secret,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
             bait_content,
@@ -4790,6 +4975,30 @@ mod tests {
               }
             }
           }
+        }"##
+    }
+
+    fn session_minted_profile_json() -> &'static str {
+        r##"{
+          "schema_version": 1,
+          "profile_id": "session_minted_trace",
+          "baits": [
+            {
+              "id": "minted_trace",
+              "bait_class": "docs",
+              "surface": "/docs/minted-trace",
+              "surface_kind": "docs",
+              "expected_action": {
+                "method": "POST",
+                "path": "/api/v2/import/reconcile",
+                "header_name": "X-Migration-Trace",
+                "header_value_mint": {
+                  "kind": "session_hmac_sha256_v1",
+                  "prefix": "minted"
+                }
+              }
+            }
+          ]
         }"##
     }
 
@@ -5166,6 +5375,7 @@ mod tests {
         assert_eq!(config.event_log_path, PathBuf::from(DEFAULT_EVENT_LOG));
         assert_eq!(config.debug_log_path, None);
         assert_eq!(config.bait_profile_path, None);
+        assert_eq!(config.bait_signing_secret_path, None);
         assert_eq!(config.ingress_trust_config_path, None);
         assert_eq!(config.ingress_transport_auth_secret_path, None);
         assert_eq!(
@@ -5190,6 +5400,7 @@ mod tests {
     #[test]
     fn parses_explicit_flags() {
         let bait_profile_path = unique_temp_path("bait-profile.json");
+        let bait_signing_secret_path = write_bait_signing_secret("mint-secret");
         let ingress_trust_config_path = unique_temp_path("ingress-trust-config.json");
         let ingress_transport_auth_secret_path = write_ingress_transport_auth_secret("edge-secret");
         must_ok(
@@ -5212,6 +5423,11 @@ mod tests {
             "/tmp/eidolon-debug-test.jsonl",
             "--bait-profile",
             path_str(&bait_profile_path, "bait profile path should be utf8"),
+            "--bait-signing-secret-file",
+            path_str(
+                &bait_signing_secret_path,
+                "bait signing secret path should be utf8",
+            ),
             "--ingress-trust-config",
             path_str(
                 &ingress_trust_config_path,
@@ -5255,6 +5471,10 @@ mod tests {
             Some(PathBuf::from("/tmp/eidolon-debug-test.jsonl"))
         );
         assert_eq!(config.bait_profile_path, Some(bait_profile_path));
+        assert_eq!(
+            config.bait_signing_secret_path,
+            Some(bait_signing_secret_path)
+        );
         assert_eq!(
             config.ingress_trust_config_path,
             Some(ingress_trust_config_path)
@@ -5613,6 +5833,79 @@ mod tests {
     }
 
     #[test]
+    fn committed_orbstack_default_profile_enables_session_minted_docs_token_and_openapi_baits() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/shield-lab/bait-profiles/default-m3-catalog.json");
+        let loaded = load_bait_profile(&path).expect("committed shield-lab profile should load");
+        let docs_bait = loaded
+            .registry
+            .bait_for_class(BaitClass::Docs)
+            .expect("docs bait should exist");
+        let openapi_bait = loaded
+            .registry
+            .bait_for_class(BaitClass::OpenApi)
+            .expect("OpenAPI bait should exist");
+        let fake_service_token = loaded
+            .registry
+            .bait_for_class(BaitClass::FakeCredentialToken)
+            .expect("fake service token bait should exist");
+
+        assert_eq!(
+            loaded
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.profile_id.as_str()),
+            Some("orbstack_default_m3_catalog")
+        );
+        assert_eq!(
+            loaded.registry.baits().len(),
+            BaitRegistry::m3_catalog().baits().len()
+        );
+        assert_eq!(docs_bait.surface, "/docs/legacy-import");
+        assert_eq!(
+            docs_bait.expected_action.header_name.as_deref(),
+            Some("X-Migration-Trace")
+        );
+        assert!(docs_bait.expected_action.header_value.is_none());
+        assert_eq!(
+            docs_bait
+                .expected_action
+                .header_value_mint
+                .as_ref()
+                .map(|mint| mint.prefix.as_str()),
+            Some("mig")
+        );
+        assert_eq!(fake_service_token.surface, "/docs/service-token");
+        assert_eq!(
+            fake_service_token.expected_action.header_name.as_deref(),
+            Some("X-Api-Key")
+        );
+        assert!(fake_service_token.expected_action.header_value.is_none());
+        assert_eq!(
+            fake_service_token
+                .expected_action
+                .header_value_mint
+                .as_ref()
+                .map(|mint| mint.prefix.as_str()),
+            Some("svc")
+        );
+        assert_eq!(openapi_bait.surface, "/openapi.json");
+        assert_eq!(
+            openapi_bait.expected_action.header_name.as_deref(),
+            Some("X-OpenAPI-Trace")
+        );
+        assert!(openapi_bait.expected_action.header_value.is_none());
+        assert_eq!(
+            openapi_bait
+                .expected_action
+                .header_value_mint
+                .as_ref()
+                .map(|mint| mint.prefix.as_str()),
+            Some("oapi")
+        );
+    }
+
+    #[test]
     fn bait_profile_rejects_surface_override_for_unknown_bait() {
         let path = write_bait_profile(
             r#"{
@@ -5715,6 +6008,49 @@ mod tests {
     }
 
     #[test]
+    fn bait_profile_rejects_static_and_minted_header_value_combination() {
+        let path = write_bait_profile(
+            r#"{
+              "schema_version": 1,
+              "profile_id": "invalid_minted_header_value",
+              "baits": [
+                {
+                  "id": "minted_trace",
+                  "bait_class": "docs",
+                  "surface": "/docs/minted-trace",
+                  "surface_kind": "docs",
+                  "expected_action": {
+                    "method": "POST",
+                    "path": "/api/v2/import/reconcile",
+                    "header_name": "X-Migration-Trace",
+                    "header_value": "static-trace",
+                    "header_value_mint": {
+                      "kind": "session_hmac_sha256_v1",
+                      "prefix": "minted"
+                    }
+                  }
+                }
+              ]
+            }"#,
+        );
+
+        let error = load_bait_profile(&path)
+            .expect_err("static and minted header values should be mutually exclusive");
+
+        assert!(error
+            .to_string()
+            .contains("cannot set both a static header value and a minted header value"));
+    }
+
+    #[test]
+    fn minted_bait_profile_requires_signing_secret() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("minted profile should load");
+
+        assert!(bait_profile_requires_signing_secret(&loaded));
+    }
+
+    #[test]
     fn javascript_bait_uses_json_escaped_values() {
         let bait = Bait {
             id: BaitId("js_escape".to_string()),
@@ -5726,6 +6062,7 @@ mod tests {
                 path: "/api/v2/import/\"resume\\next".to_string(),
                 header_name: Some("X-Trace\"Name".to_string()),
                 header_value: Some("line\\one\nline\"two".to_string()),
+                header_value_mint: None,
             },
         };
 
@@ -5762,6 +6099,7 @@ mod tests {
             &event_log_path,
             unique_temp_path("profile-surface-control.txt"),
             loaded.clone(),
+            None,
         );
 
         let surface_response = parse_downstream_response(&run_runtime_request(
@@ -5782,6 +6120,7 @@ mod tests {
             &openapi_event_log_path,
             unique_temp_path("profile-openapi-control.txt"),
             loaded,
+            None,
         );
 
         let openapi_response = parse_downstream_response(&run_runtime_request(
@@ -5817,6 +6156,231 @@ mod tests {
             "policy_decision",
             "rewritten_upstream",
         );
+    }
+
+    #[test]
+    fn runtime_session_minted_bait_surface_is_stable_per_session_and_verifies_action() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("minted profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait should exist")
+            .clone();
+        let signing_secret: Arc<str> = Arc::from("mint-secret");
+        let event_log_path = unique_temp_path("session-minted-bait-events.jsonl");
+        let runtime = test_runtime_with_bait_profile(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("session-minted-bait-control.txt"),
+            loaded,
+            Some(Arc::clone(&signing_secret)),
+        );
+        let session_a = SessionId::new();
+        let cookie_a = format!("eidolon_session={}", session_a.0);
+        let session_b = SessionId::new();
+        let cookie_b = format!("eidolon_session={}", session_b.0);
+        let rendered_a = render_bait_for_session(&bait, session_a, Some(signing_secret.as_ref()))
+            .expect("session A bait should render")
+            .into_owned();
+        let rendered_b = render_bait_for_session(&bait, session_b, Some(signing_secret.as_ref()))
+            .expect("session B bait should render")
+            .into_owned();
+        let header_name = rendered_a
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("minted bait should keep header name")
+            .to_string();
+        let header_value_a = rendered_a
+            .expected_action
+            .header_value
+            .clone()
+            .expect("session A bait should mint header value");
+        let header_value_b = rendered_b
+            .expected_action
+            .header_value
+            .clone()
+            .expect("session B bait should mint header value");
+
+        assert_ne!(header_value_a, header_value_b);
+
+        let response_a = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/minted-trace", &cookie_a),
+        ));
+        let response_a_repeat = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/minted-trace", &cookie_a),
+        ));
+        let response_b = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/minted-trace", &cookie_b),
+        ));
+
+        assert_eq!(response_a.status, 200);
+        assert_eq!(response_a_repeat.status, 200);
+        assert_eq!(response_b.status, 200);
+
+        let body_a = must_ok(String::from_utf8(response_a.body), "body should be utf8");
+        let body_a_repeat = must_ok(
+            String::from_utf8(response_a_repeat.body),
+            "body should be utf8",
+        );
+        let body_b = must_ok(String::from_utf8(response_b.body), "body should be utf8");
+
+        assert!(body_a.contains(&header_value_a));
+        assert!(body_a_repeat.contains(&header_value_a));
+        assert!(body_b.contains(&header_value_b));
+        assert!(!body_b.contains(&header_value_a));
+
+        let action_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                &bait.expected_action.path,
+                &cookie_a,
+                &[(&header_name, &header_value_a)],
+            ),
+        ));
+
+        assert_eq!(action_response.status, 202);
+        let action = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(action["kind"]["bait_id"], "minted_trace");
+        assert_eq!(
+            action["kind"]["header_value_mint"]["header_name"],
+            header_name
+        );
+        assert_eq!(
+            action["kind"]["header_value_mint"]["kind"],
+            "session_hmac_sha256_v1"
+        );
+        assert_eq!(action["kind"]["header_value_mint"]["prefix"], "minted");
+        assert!(!action.to_string().contains(&header_value_a));
+        let exposure = events_of_type(&event_log_path, "bait_exposed")
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event["kind"]["bait_id"] == "minted_trace"
+                    && event["session_id"] == action["session_id"]
+            })
+            .expect("same-session minted exposure should exist");
+        assert_eq!(
+            action["kind"]["exposure_id"],
+            exposure["kind"]["exposure_id"]
+        );
+        assert_eq!(
+            exposure["kind"]["header_value_mint"]["header_name"],
+            header_name
+        );
+        assert_eq!(exposure["kind"]["header_value_mint"]["prefix"], "minted");
+        assert!(!exposure.to_string().contains(&header_value_a));
+    }
+
+    #[test]
+    fn runtime_session_minted_bait_replay_from_other_session_is_not_correlated() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("minted profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait should exist")
+            .clone();
+        let signing_secret: Arc<str> = Arc::from("mint-secret");
+        let event_log_path = unique_temp_path("session-minted-bait-replay-events.jsonl");
+        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("session-minted-bait-replay-control.txt"),
+            loaded,
+            Some(Arc::clone(&signing_secret)),
+        );
+        let session_a = SessionId::new();
+        let cookie_a = format!("eidolon_session={}", session_a.0);
+        let session_b = SessionId::new();
+        let cookie_b = format!("eidolon_session={}", session_b.0);
+        let rendered_a = render_bait_for_session(&bait, session_a, Some(signing_secret.as_ref()))
+            .expect("session A bait should render")
+            .into_owned();
+        let header_name = rendered_a
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("minted bait should keep header name")
+            .to_string();
+        let header_value_a = rendered_a
+            .expected_action
+            .header_value
+            .clone()
+            .expect("session A bait should mint header value");
+
+        let exposure_a = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/minted-trace", &cookie_a),
+        ));
+        let exposure_b = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/minted-trace", &cookie_b),
+        ));
+        let replay_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                &bait.expected_action.path,
+                &cookie_b,
+                &[(&header_name, &header_value_a)],
+            ),
+        ));
+        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
+
+        assert_eq!(exposure_a.status, 200);
+        assert_eq!(exposure_b.status, 200);
+        assert_eq!(replay_response.body, br#"{"mode":"upstream"}"#);
+        assert!(must_ok(
+            String::from_utf8(upstream_request),
+            "request should be utf8"
+        )
+        .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+
+        let replay_action = events_of_type(&event_log_path, "bait_action_observed")
+            .into_iter()
+            .find(|event| event["session_id"] == session_b.0.to_string())
+            .expect("replayed minted bait action should be logged");
+        assert_eq!(replay_action["policy_state"], "observe");
+        assert_eq!(replay_action["kind"]["bait_id"], "minted_trace");
+        assert!(replay_action["kind"]["exposure_id"].is_null());
+        assert_eq!(
+            replay_action["kind"]["header_value_mint"]["header_name"],
+            header_name
+        );
+        assert_eq!(
+            replay_action["kind"]["header_value_mint"]["kind"],
+            "session_hmac_sha256_v1"
+        );
+        assert_eq!(
+            replay_action["kind"]["header_value_mint"]["prefix"],
+            "minted"
+        );
+        assert!(!replay_action.to_string().contains(&header_value_a));
+
+        let replay_request = events_of_type(&event_log_path, "request_seen")
+            .into_iter()
+            .find(|event| {
+                event["session_id"] == session_b.0.to_string()
+                    && event["kind"]["path"] == "/api/v2/import/reconcile"
+            })
+            .expect("replayed minted request_seen should exist");
+        assert_eq!(replay_request["policy_state"], "observe");
+        assert_eq!(
+            replay_request["kind"]["routing_decision"],
+            "protected_upstream"
+        );
+
+        assert!(!events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .any(|event| {
+                event["session_id"] == session_b.0.to_string()
+                    && event["kind"]["to"] == "controlled_reality"
+            }));
     }
 
     #[test]
@@ -6187,6 +6751,7 @@ mod tests {
                     bait_id: bait_id.clone(),
                     exposure_id: old_exposure_id,
                     surface: "/docs".to_string(),
+                    header_value_mint: None,
                 },
             ),
             Event::new(
@@ -6197,6 +6762,7 @@ mod tests {
                     bait_id: other_bait_id.clone(),
                     exposure_id: other_exposure_id.clone(),
                     surface: "/openapi.json".to_string(),
+                    header_value_mint: None,
                 },
             ),
             Event::new(
@@ -6207,6 +6773,7 @@ mod tests {
                     bait_id: bait_id.clone(),
                     exposure_id: new_exposure_id.clone(),
                     surface: "/docs".to_string(),
+                    header_value_mint: None,
                 },
             ),
         ];
@@ -6251,6 +6818,7 @@ mod tests {
                 bait_id: BaitId("schema-bait".to_string()),
                 exposure_id: ExposureId("schema-exposure".to_string()),
                 surface: "/docs".to_string(),
+                header_value_mint: None,
             },
         ))
         .expect("event should serialize");
@@ -7636,6 +8204,7 @@ mod tests {
             &event_log_path,
             unique_temp_path("aggregated-alt-write-suspicious-control.txt"),
             loaded,
+            None,
         );
         runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
         let cookie = cookie_header();
@@ -8261,6 +8830,7 @@ mod tests {
             &event_log_path,
             unique_temp_path("aggregated-decoy-write-fanout-rate-limit-control.txt"),
             loaded,
+            None,
         );
         runtime.debug_log = Some(Arc::new(Mutex::new(
             FileDebugLogWriter::open(&debug_log_path).expect("debug log should open"),
@@ -8659,6 +9229,7 @@ mod tests {
             &event_log_path,
             unique_temp_path("aggregated-decoy-write-fanout-blocked-control.txt"),
             loaded,
+            None,
         );
         runtime.debug_log = Some(Arc::new(Mutex::new(
             FileDebugLogWriter::open(&debug_log_path).expect("debug log should open"),
@@ -10804,6 +11375,7 @@ mod tests {
                         bait_id: bait.id.clone(),
                         exposure_id: restored_exposure_id.clone(),
                         surface: bait.surface.clone(),
+                        header_value_mint: None,
                     },
                 ))
                 .expect("bait exposure event should write");

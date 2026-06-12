@@ -6,6 +6,9 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 trusted_ingress_secret_name="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET_NAME:-eidolon-trusted-ingress}"
 trusted_ingress_secret_key="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET_KEY:-transport-auth.txt}"
 trusted_ingress_secret_literal="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET:-}"
+bait_signing_secret_name="${EIDOLON_SHIELD_BAIT_SIGNING_SECRET_NAME:-eidolon-bait-signing}"
+bait_signing_secret_key="${EIDOLON_SHIELD_BAIT_SIGNING_SECRET_KEY:-signing-secret.txt}"
+bait_signing_secret_literal="${EIDOLON_SHIELD_BAIT_SIGNING_SECRET:-}"
 bait_profile_configmap_name="eidolon-shield-bait-profile"
 bait_profile_key="bait-profile.json"
 bait_profile_rollout_annotation="eidolon.dev/bait-profile-sha256"
@@ -52,9 +55,11 @@ resolve_bait_profile_path() {
   bait_profile_sha256="$(compute_file_sha256 "$bait_profile_path")"
 }
 
-generate_trusted_ingress_secret() {
-  if [[ -n "$trusted_ingress_secret_literal" ]]; then
-    printf '%s' "$trusted_ingress_secret_literal"
+generate_secret_value() {
+  local explicit_literal="$1"
+
+  if [[ -n "$explicit_literal" ]]; then
+    printf '%s' "$explicit_literal"
     return
   fi
 
@@ -62,16 +67,19 @@ generate_trusted_ingress_secret() {
   openssl rand -hex 24
 }
 
-ensure_trusted_ingress_secret() {
+ensure_secret() {
+  local secret_name="$1"
+  local secret_key="$2"
+  local secret_literal="$3"
   local secret_value
 
-  if kubectl -n shield-system get secret "$trusted_ingress_secret_name" >/dev/null 2>&1; then
+  if kubectl -n shield-system get secret "$secret_name" >/dev/null 2>&1; then
     return
   fi
 
-  secret_value="$(generate_trusted_ingress_secret)"
-  kubectl -n shield-system create secret generic "$trusted_ingress_secret_name" \
-    --from-literal="${trusted_ingress_secret_key}=${secret_value}" >/dev/null
+  secret_value="$(generate_secret_value "$secret_literal")"
+  kubectl -n shield-system create secret generic "$secret_name" \
+    --from-literal="${secret_key}=${secret_value}" >/dev/null
 }
 
 apply_bait_profile_configmap() {
@@ -108,7 +116,8 @@ metadata:
 YAML
 
 resolve_bait_profile_path
-ensure_trusted_ingress_secret
+ensure_secret "$trusted_ingress_secret_name" "$trusted_ingress_secret_key" "$trusted_ingress_secret_literal"
+ensure_secret "$bait_signing_secret_name" "$bait_signing_secret_key" "$bait_signing_secret_literal"
 apply_bait_profile_configmap
 kubectl apply -k "${repo_root}/examples/shield-lab/k8s/orbstack"
 rollout_proxy_for_bait_profile
@@ -119,6 +128,7 @@ echo "Edge service:        kubectl -n shield-system get svc eidolon-shield-edge"
 echo "Demo target service: kubectl -n shield-targets get svc eidolon-owned-demo-target"
 echo "Direct edge service: kubectl -n shield-targets get svc eidolon-owned-demo-target-edge"
 echo "Trusted ingress:     kubectl -n shield-system get secret ${trusted_ingress_secret_name}"
+echo "Bait signing:        kubectl -n shield-system get secret ${bait_signing_secret_name}"
 echo "Bait profile:        ${bait_profile_path}"
 echo "Bait profile digest: ${bait_profile_sha256}"
 echo "Bait profile config: kubectl -n shield-system get configmap ${bait_profile_configmap_name}"

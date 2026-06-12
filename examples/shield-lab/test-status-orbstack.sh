@@ -21,7 +21,7 @@ case "$*" in
     ;;
   "-n shield-system get deploy eidolon-shield-proxy -o json")
     cat <<'JSON'
-{"metadata":{"name":"eidolon-shield-proxy"},"spec":{"replicas":1,"template":{"spec":{"containers":[{"args":["--owned-cluster-lab","--ingress-transport-auth-secret-file","/var/run/secrets/eidolon-trusted-ingress/transport-auth.txt"]}]}}},"status":{"readyReplicas":1,"availableReplicas":1}}
+{"metadata":{"name":"eidolon-shield-proxy"},"spec":{"replicas":1,"template":{"spec":{"containers":[{"args":["--owned-cluster-lab","--ingress-transport-auth-secret-file","/var/run/secrets/eidolon-trusted-ingress/transport-auth.txt","--bait-signing-secret-file","/var/run/secrets/eidolon-bait-signing/signing-secret.txt"]}]}}},"status":{"readyReplicas":1,"availableReplicas":1}}
 JSON
     ;;
   "-n shield-system get pods -l app.kubernetes.io/name=eidolon-shield-proxy -o json")
@@ -55,6 +55,11 @@ JSON
   "-n shield-system get pvc eidolon-shield-proxy-state -o json")
     cat <<'JSON'
 {"metadata":{"name":"eidolon-shield-proxy-state"},"spec":{"storageClassName":"local-path","accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}},"status":{"phase":"Bound","capacity":{"storage":"1Gi"},"accessModes":["ReadWriteOnce"]}}
+JSON
+    ;;
+  "-n shield-system get configmap eidolon-shield-bait-profile -o json")
+    cat <<'JSON'
+{"metadata":{"name":"eidolon-shield-bait-profile"},"data":{"bait-profile.json":"{\"profile_id\":\"orbstack_default_m3_catalog\",\"baits\":[{\"id\":\"rel_2025_04_b7f2\",\"surface\":\"/docs/legacy-import\",\"surface_kind\":\"docs\",\"expected_action\":{\"header_name\":\"X-Migration-Trace\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"mig\"}}},{\"id\":\"openapi_reconcile_trace\",\"surface\":\"/openapi.json\",\"surface_kind\":\"open_api\",\"expected_action\":{\"header_name\":\"X-OpenAPI-Trace\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"oapi\"}}},{\"id\":\"fake_service_token\",\"surface\":\"/docs/service-token\",\"surface_kind\":\"token\",\"expected_action\":{\"header_name\":\"X-Api-Key\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"svc\"}}}]}"}}
 JSON
     ;;
   *)
@@ -96,9 +101,18 @@ test_json_status_reports_edge_and_pvc() {
       and .direct_target_edge.reachable == true
       and .proxy.ready_replicas == 1
       and .proxy.trusted_ingress_transport_auth_enabled == true
+      and .proxy.bait_signing_enabled == true
       and .target.ready_replicas == 2
       and .proxy_state.status == "Bound"
       and .proxy_state.storage_class == "local-path"
+      and .bait_profile.profile_id == "orbstack_default_m3_catalog"
+      and (.bait_profile.polymorphic_baits | length) == 3
+      and .bait_profile.polymorphic_baits[0].bait_id == "rel_2025_04_b7f2"
+      and .bait_profile.polymorphic_baits[0].prefix == "mig"
+      and .bait_profile.polymorphic_baits[1].bait_id == "openapi_reconcile_trace"
+      and .bait_profile.polymorphic_baits[1].prefix == "oapi"
+      and .bait_profile.polymorphic_baits[2].bait_id == "fake_service_token"
+      and .bait_profile.polymorphic_baits[2].prefix == "svc"
     ' >/dev/null
 }
 
@@ -119,6 +133,8 @@ test_human_status_mentions_running_components() {
   rg -q 'direct-target: http://127.0.0.1:31081 \(HTTP 200, type=NodePort\)' <<<"$output"
   rg -q 'proxy: 1/1 ready' <<<"$output"
   rg -q 'trusted-ingress: transport-auth enabled' <<<"$output"
+  rg -q 'bait-signing: enabled' <<<"$output"
+  rg -q 'polymorphic-baits: /docs/legacy-import -> X-Migration-Trace \[mig\], /openapi.json -> X-OpenAPI-Trace \[oapi\], /docs/service-token -> X-Api-Key \[svc\]' <<<"$output"
   rg -q 'target: 2/2 ready' <<<"$output"
   rg -q 'proxy-state: Bound 1Gi \(local-path\)' <<<"$output"
 }

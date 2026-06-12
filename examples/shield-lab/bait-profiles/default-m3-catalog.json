@@ -1,5 +1,76 @@
 {
   "schema_version": 1,
   "profile_id": "orbstack_default_m3_catalog",
-  "hypothesis": "OrbStack Shield baseline profile that preserves the built-in M3 bait catalog while exposing explicit profile provenance for deployment-side validation."
+  "hypothesis": "OrbStack Shield baseline profile that preserves the built-in M3 bait catalog, enables session-minted docs, service-token, and OpenAPI baits for live #49 validation, and keeps deployment-side profile provenance explicit.",
+  "baits": [
+    {
+      "id": "rel_2025_04_b7f2",
+      "bait_class": "docs",
+      "surface": "/docs/legacy-import",
+      "surface_kind": "docs",
+      "expected_action": {
+        "method": "POST",
+        "path": "/api/v2/import/reconcile",
+        "header_name": "X-Migration-Trace",
+        "header_value_mint": {
+          "kind": "session_hmac_sha256_v1",
+          "prefix": "mig"
+        }
+      }
+    },
+    {
+      "id": "openapi_reconcile_trace",
+      "bait_class": "open_api",
+      "surface": "/openapi.json",
+      "surface_kind": "open_api",
+      "expected_action": {
+        "method": "POST",
+        "path": "/api/v2/import/reconcile",
+        "header_name": "X-OpenAPI-Trace",
+        "header_value_mint": {
+          "kind": "session_hmac_sha256_v1",
+          "prefix": "oapi"
+        }
+      }
+    },
+    {
+      "id": "hidden_route_trace",
+      "bait_class": "hidden_route",
+      "surface": "/customer/import-recovery-checklist",
+      "surface_kind": "route",
+      "expected_action": {
+        "method": "POST",
+        "path": "/api/v2/import/reconcile",
+        "header_name": "X-Hidden-Route-Trace",
+        "header_value": "hidden_route_2026_05_d91c"
+      }
+    },
+    {
+      "id": "fake_service_token",
+      "bait_class": "fake_credential_token",
+      "surface": "/docs/service-token",
+      "surface_kind": "token",
+      "expected_action": {
+        "method": "POST",
+        "path": "/api/v2/import/reconcile",
+        "header_name": "X-Api-Key",
+        "header_value_mint": {
+          "kind": "session_hmac_sha256_v1",
+          "prefix": "svc"
+        }
+      }
+    },
+    {
+      "id": "js_worker_resume_trace",
+      "bait_class": "js_discovered_route",
+      "surface": "/assets/import-helper.js",
+      "surface_kind": "route",
+      "expected_action": {
+        "method": "POST",
+        "path": "/api/v2/import/reconcile",
+        "header_name": "X-Import-Worker",
+        "header_value": "worker_2026_05_c19b"
+      }
+    }
+  ]
 }

@@ -138,6 +138,7 @@ mod tests {
                 bait_id: BaitId(bait_id.to_string()),
                 exposure_id: ExposureId(exposure_id.to_string()),
                 surface: "/docs/legacy-import".to_string(),
+                header_value_mint: None,
             },
         )
     }
@@ -156,6 +157,8 @@ mod tests {
                 exposure_id: exposure_id.map(|exposure_id| ExposureId(exposure_id.to_string())),
                 method: "POST".to_string(),
                 path: "/api/v2/import/reconcile".to_string(),
+                header_value_mint: None,
+                header_value_mint_status: None,
             },
         )
     }

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use eidolon_core::{BaitId, EventKind, ExposureId, PolicyState, RoutingDecision, Score, SessionId};
+use eidolon_core::{
+    BaitHeaderValueMintAudit, BaitHeaderValueMintStatus, BaitId, EventKind, ExposureId,
+    PolicyState, RoutingDecision, Score, SessionId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{SessionTimeline, TimelineEvent, TimelineEventRef};
@@ -32,6 +35,7 @@ pub struct BaitExposureEvidence {
     pub bait_id: BaitId,
     pub exposure_id: ExposureId,
     pub surface: String,
+    pub header_value_mint: Option<BaitHeaderValueMintAudit>,
     pub event_ref: TimelineEventRef,
 }
 
@@ -41,6 +45,8 @@ pub struct BaitActionEvidence {
     pub exposure_id: Option<ExposureId>,
     pub method: String,
     pub path: String,
+    pub header_value_mint: Option<BaitHeaderValueMintAudit>,
+    pub header_value_mint_status: Option<BaitHeaderValueMintStatus>,
     pub event_ref: TimelineEventRef,
     pub matched_exposure: Option<TimelineEventRef>,
     pub prior_same_bait_exposure: Option<TimelineEventRef>,
@@ -161,6 +167,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                 bait_id,
                 exposure_id,
                 surface,
+                header_value_mint,
             } => {
                 bundle.observed_surfaces.push(ObservedSurface {
                     surface: surface.clone(),
@@ -172,6 +179,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     bait_id: bait_id.clone(),
                     exposure_id: exposure_id.clone(),
                     surface: surface.clone(),
+                    header_value_mint: header_value_mint.clone(),
                     event_ref,
                 });
                 exact_exposures.insert((bait_id.clone(), exposure_id.clone()), event_ref);
@@ -182,6 +190,8 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                 exposure_id,
                 method,
                 path,
+                header_value_mint,
+                header_value_mint_status,
             } => {
                 let matched_exposure = exposure_id.as_ref().and_then(|exposure_id| {
                     exact_exposures
@@ -198,6 +208,8 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     exposure_id: exposure_id.clone(),
                     method: method.clone(),
                     path: path.clone(),
+                    header_value_mint: header_value_mint.clone(),
+                    header_value_mint_status: *header_value_mint_status,
                     event_ref,
                     matched_exposure,
                     prior_same_bait_exposure,
@@ -521,6 +533,7 @@ mod tests {
                 bait_id: BaitId("bait-1".to_string()),
                 exposure_id: ExposureId("exp-1".to_string()),
                 surface: "/docs/legacy-import".to_string(),
+                header_value_mint: None,
             },
         )
     }
@@ -535,6 +548,8 @@ mod tests {
                 exposure_id: exposure_id.map(|id| ExposureId(id.to_string())),
                 method: "POST".to_string(),
                 path: "/api/v2/import/reconcile".to_string(),
+                header_value_mint: None,
+                header_value_mint_status: None,
             },
         )
     }
