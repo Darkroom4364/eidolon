@@ -541,9 +541,11 @@ Check the live lab status:
 examples/shield-lab/status-orbstack.sh
 ```
 
-The status output now includes the active `polymorphic-baits` matrix from the
-live bait-profile ConfigMap, so operators can see which default surfaces are
-session-minted without manually opening the profile file.
+The status output now includes both the active `polymorphic-baits` matrix from
+the live bait-profile ConfigMap and any active `trusted-soften-scopes` from the
+mounted ingress-trust ConfigMap, so operators can see which default surfaces
+are session-minted and which trusted identities are allowed to narrow bait
+softening without manually opening either config file.
 
 Smoke-check the trusted-ingress transport-auth path:
 
@@ -592,9 +594,10 @@ Export a redacted evidence bundle from the PVC-backed proxy state:
 examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 ```
 
-The exported bundle README now includes the active bait-profile id and the
-live polymorphic bait matrix from `cluster-status.json`, so offline review does
-not depend on access to the running cluster.
+The exported bundle README now includes the active bait-profile id, the live
+polymorphic bait matrix, and any active trusted-ingress soften scopes from
+`cluster-status.json`, so offline review does not depend on access to the
+running cluster.
 
 Each bundle now also includes `edge-session-index.md`, a compact redacted
 session index rendered from the enriched edge export path, including a minted
@@ -643,13 +646,14 @@ examples/shield-lab/export-edge-decisions-orbstack.sh \
 ```
 
 When the live bait-profile status is available, each exported decision now also
-includes `deployment_context`, which carries the active bait-profile id and the
-current polymorphic bait matrix alongside the session-level evidence. That same
-context now also includes a structured `polymorphic_bait_coverage` summary, so
-JSON consumers can see observed-vs-active minted bait coverage without
-comparing the two lists manually. When `evidence.latest_bait_header_value_mint`
-is present, the markdown summaries now also show whether the latest minted
-bait-shaped action was a `matched_session_value` or `session_value_mismatch`.
+includes `deployment_context`, which carries the active bait-profile id, the
+current polymorphic bait matrix, and any active trusted-ingress soften scopes
+alongside the session-level evidence. That same context now also includes a
+structured `polymorphic_bait_coverage` summary, so JSON consumers can see
+observed-vs-active minted bait coverage without comparing the two lists
+manually. When `evidence.latest_bait_header_value_mint` is present, the
+markdown summaries now also show whether the latest minted bait-shaped action
+was a `matched_session_value` or `session_value_mismatch`.
 
 `--top <N>` ranks sessions by enforcement severity and recency first, so
 operators can pull a compact high-signal slice before exporting a full bundle.
@@ -676,8 +680,8 @@ EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME=session_value_mismatch \
 ```
 
 For a single-session operator summary that already combines session-level mint
-evidence with the active deployment polymorphic matrix and a coverage summary,
-render markdown from the same enriched export path:
+evidence with the active deployment polymorphic matrix, trusted soften scopes,
+and a coverage summary, render markdown from the same enriched export path:
 
 ```sh
 examples/shield-lab/export-edge-decisions-orbstack.sh \

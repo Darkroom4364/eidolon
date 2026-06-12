@@ -124,6 +124,11 @@ The live wrapper reads the proxy's PVC-backed `events.jsonl`, derives the latest
 - write JSON to a file
 - POST each decision to a webhook or SIEM collector
 
+When `status-orbstack.sh --json` is available, the live wrapper also enriches
+each export with deployment context, including the active polymorphic bait
+matrix and any active trusted-ingress soften scopes from the mounted
+ingress-trust config.
+
 Example:
 
 ```sh

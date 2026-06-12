@@ -19,7 +19,7 @@ write_fixture_state() {
 JSONL
 
   cat > "$dir/cluster-status.json" <<'JSON'
-{"bait_profile":{"profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}]}}
+{"bait_profile":{"profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}]},"ingress_trust":{"trusted_soften_scopes":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"]}]}}
 JSON
 }
 
@@ -95,12 +95,15 @@ test_exports_all_sessions_as_json_array() {
       and .evidence.latest_bait_header_value_mint.status == "matched_session_value"
       and .deployment_context.polymorphic_bait_coverage.active_bait_count == 3
       and .deployment_context.polymorphic_bait_coverage.observed_bait_count == 1
-      and .deployment_context.polymorphic_bait_coverage.observed_bait_ids == ["fake_service_token"])
+      and .deployment_context.polymorphic_bait_coverage.observed_bait_ids == ["fake_service_token"]
+      and .deployment_context.trusted_ingress_soften_scopes[0].label == "docs-crawler"
+      and .deployment_context.trusted_ingress_soften_scopes[0].bait_soften_path_prefixes == ["/docs"])
     and any(.[]; .session_id == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
       and .edge_recommendation.action == "preserve_eidolon_routing"
       and (.deployment_context.polymorphic_baits | length) == 3
       and .deployment_context.polymorphic_bait_coverage.active_bait_count == 3
-      and .deployment_context.polymorphic_bait_coverage.observed_bait_count == 0)
+      and .deployment_context.polymorphic_bait_coverage.observed_bait_count == 0
+      and .deployment_context.trusted_ingress_soften_scopes[0].source == "local_allowlist")
   ' <<<"$output" >/dev/null
 }
 
@@ -126,6 +129,7 @@ test_exports_one_session_as_ndjson() {
     and .deployment_context.polymorphic_baits[0].prefix == "mig"
     and .deployment_context.polymorphic_bait_coverage.active_bait_count == 3
     and .deployment_context.polymorphic_bait_coverage.observed_bait_count == 0
+    and .deployment_context.trusted_ingress_soften_scopes[0].path_prefixes == ["/docs", "/openapi.json"]
   ' <<<"$output" >/dev/null
 }
 
@@ -153,6 +157,7 @@ test_posts_each_export_to_webhook_and_writes_output_file() {
     length == 2
     and .[0].deployment_context.bait_profile_id == "orbstack_default_m3_catalog"
     and .[0].deployment_context.polymorphic_bait_coverage.active_bait_count == 3
+    and .[0].deployment_context.trusted_ingress_soften_scopes[0].trust_tier == "allowlisted"
   ' "$output_file" >/dev/null
   [[ "$(wc -l < "$webhook_log" | tr -d ' ')" -eq 2 ]]
   rg -q 'https://collector.example.test/eidolon' "$webhook_log"
@@ -254,6 +259,8 @@ test_renders_single_session_markdown_summary() {
   rg -q '/docs/legacy-import' <<<"$output"
   rg -q '/openapi.json' <<<"$output"
   rg -q '/docs/service-token' <<<"$output"
+  rg -q '## Active Trusted Ingress Softening' <<<"$output"
+  rg -q 'Scope `docs-crawler`: soften `/docs`; match `/docs`, `/openapi.json`; identity `local_allowlist` / `allowlisted`' <<<"$output"
 }
 
 test_markdown_requires_single_session_and_no_webhook() {

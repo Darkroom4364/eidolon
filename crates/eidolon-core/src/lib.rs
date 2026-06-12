@@ -649,6 +649,18 @@ pub struct EdgePolymorphicBaitCoverage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeTrustedIngressSoftenScope {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub source: IngressIdentitySource,
+    pub trust_tier: IngressTrustTier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bait_soften_path_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeDeploymentContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bait_profile_id: Option<String>,
@@ -656,6 +668,8 @@ pub struct EdgeDeploymentContext {
     pub polymorphic_baits: Vec<EdgeActivePolymorphicBait>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub polymorphic_bait_coverage: Option<EdgePolymorphicBaitCoverage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_ingress_soften_scopes: Vec<EdgeTrustedIngressSoftenScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1217,6 +1231,13 @@ mod tests {
                         BaitId("rel_2025_04_b7f2".to_string()),
                     ],
                 }),
+                trusted_ingress_soften_scopes: vec![EdgeTrustedIngressSoftenScope {
+                    label: Some("docs-crawler".to_string()),
+                    source: IngressIdentitySource::LocalAllowlist,
+                    trust_tier: IngressTrustTier::Allowlisted,
+                    path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                    bait_soften_path_prefixes: vec!["/docs".to_string()],
+                }],
             }),
         };
 
@@ -1271,6 +1292,19 @@ mod tests {
         assert_eq!(
             serialized["deployment_context"]["polymorphic_bait_coverage"]["observed_bait_ids"][0],
             json!("minted_trace")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["trusted_ingress_soften_scopes"][0]["label"],
+            json!("docs-crawler")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["trusted_ingress_soften_scopes"][0]["source"],
+            json!("local_allowlist")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["trusted_ingress_soften_scopes"][0]
+                ["bait_soften_path_prefixes"][0],
+            json!("/docs")
         );
         assert_eq!(
             serialized["policy"]["pre_containment_persistence_class"],
