@@ -199,6 +199,9 @@ examples/shield-lab/collect-kali-vm-sample.sh \
 - Do not let generic bot score alone create high trust.
 - Use verified or signed ingress identities to soften only configured discovery
   surfaces.
+- When using local allowlists for verified crawlers or accessibility tooling,
+  prefer per-entry soften scopes so one trusted actor can be limited to `/docs`
+  without automatically softening `/openapi.json`.
 - Keep `/docs` and `/openapi.json` softening scoped; do not globally exempt
   crawlers from containment.
 - Preserve audit of every softened request.

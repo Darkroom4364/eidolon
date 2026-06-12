@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "label": "docs-crawler",
+      "source": "local_allowlist",
+      "trust_tier": "allowlisted",
+      "methods": ["GET"],
+      "path_prefixes": ["/docs", "/openapi.json"],
+      "bait_soften_path_prefixes": ["/docs"],
+      "required_headers": [
+        {
+          "name": "X-Eidolon-Trusted-Actor",
+          "value": "docs-crawler"
+        }
+      ]
+    }
+  ]
+}

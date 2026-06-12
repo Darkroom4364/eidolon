@@ -66,6 +66,7 @@ pub struct SessionContext {
     pub source: SessionSource,
     pub ingress_identity: IngressIdentity,
     pub ingress_signals: IngressAdvisorySignals,
+    pub trusted_bait_soften_path_prefixes: Option<Vec<String>>,
 }
 
 impl SessionContext {
@@ -116,6 +117,7 @@ where
             source: SessionSource::Cookie,
             ingress_identity,
             ingress_signals,
+            trusted_bait_soften_path_prefixes: None,
         }
     } else {
         SessionContext {
@@ -123,6 +125,7 @@ where
             source: SessionSource::Generated,
             ingress_identity,
             ingress_signals,
+            trusted_bait_soften_path_prefixes: None,
         }
     }
 }

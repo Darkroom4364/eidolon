@@ -14,6 +14,11 @@ bait_profile_key="bait-profile.json"
 bait_profile_rollout_annotation="eidolon.dev/bait-profile-sha256"
 bait_profile_path="${EIDOLON_SHIELD_BAIT_PROFILE_PATH:-${repo_root}/examples/shield-lab/bait-profiles/default-m3-catalog.json}"
 bait_profile_sha256=""
+ingress_trust_configmap_name="eidolon-shield-ingress-trust-config"
+ingress_trust_config_key="ingress-trust.json"
+ingress_trust_rollout_annotation="eidolon.dev/ingress-trust-sha256"
+ingress_trust_config_path="${EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH:-${repo_root}/examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-only.json}"
+ingress_trust_config_sha256=""
 
 require_command() {
   local command_name="$1"
@@ -55,6 +60,16 @@ resolve_bait_profile_path() {
   bait_profile_sha256="$(compute_file_sha256 "$bait_profile_path")"
 }
 
+resolve_ingress_trust_config_path() {
+  if [[ ! -f "$ingress_trust_config_path" ]]; then
+    echo "ingress trust config not found: ${ingress_trust_config_path}" >&2
+    exit 1
+  fi
+
+  ingress_trust_config_path="$(canonical_file_path "$ingress_trust_config_path")"
+  ingress_trust_config_sha256="$(compute_file_sha256 "$ingress_trust_config_path")"
+}
+
 generate_secret_value() {
   local explicit_literal="$1"
 
@@ -88,10 +103,16 @@ apply_bait_profile_configmap() {
     --dry-run=client -o yaml | kubectl apply -f -
 }
 
+apply_ingress_trust_configmap() {
+  kubectl -n shield-system create configmap "$ingress_trust_configmap_name" \
+    --from-file="${ingress_trust_config_key}=${ingress_trust_config_path}" \
+    --dry-run=client -o yaml | kubectl apply -f -
+}
+
 rollout_proxy_for_bait_profile() {
   kubectl -n shield-system patch deployment eidolon-shield-proxy \
     --type merge \
-    -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"${bait_profile_rollout_annotation}\":\"${bait_profile_sha256}\"}}}}}" >/dev/null
+    -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"${bait_profile_rollout_annotation}\":\"${bait_profile_sha256}\",\"${ingress_trust_rollout_annotation}\":\"${ingress_trust_config_sha256}\"}}}}}" >/dev/null
   kubectl -n shield-system rollout status deployment/eidolon-shield-proxy >/dev/null
 }
 
@@ -116,9 +137,11 @@ metadata:
 YAML
 
 resolve_bait_profile_path
+resolve_ingress_trust_config_path
 ensure_secret "$trusted_ingress_secret_name" "$trusted_ingress_secret_key" "$trusted_ingress_secret_literal"
 ensure_secret "$bait_signing_secret_name" "$bait_signing_secret_key" "$bait_signing_secret_literal"
 apply_bait_profile_configmap
+apply_ingress_trust_configmap
 kubectl apply -k "${repo_root}/examples/shield-lab/k8s/orbstack"
 rollout_proxy_for_bait_profile
 
@@ -132,5 +155,8 @@ echo "Bait signing:        kubectl -n shield-system get secret ${bait_signing_se
 echo "Bait profile:        ${bait_profile_path}"
 echo "Bait profile digest: ${bait_profile_sha256}"
 echo "Bait profile config: kubectl -n shield-system get configmap ${bait_profile_configmap_name}"
+echo "Ingress trust:       ${ingress_trust_config_path}"
+echo "Ingress trust digest:${ingress_trust_config_sha256}"
+echo "Ingress trust config:kubectl -n shield-system get configmap ${ingress_trust_configmap_name}"
 echo "Shield URL:          http://127.0.0.1:31080"
 echo "Direct URL:          http://127.0.0.1:31081"

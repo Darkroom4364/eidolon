@@ -60,6 +60,7 @@ Keep out of the private repo:
   export-orbstack-evidence.sh
   export-edge-decisions-orbstack.sh
   smoke-trusted-ingress-orbstack.sh
+  smoke-trusted-ingress-scoped-softening-orbstack.sh
   smoke-suspicious-promotion-orbstack.sh
   smoke-suspicious-aggregated-recon-orbstack.sh
   smoke-suspicious-detection-aggregation-orbstack.sh
@@ -549,6 +550,23 @@ Smoke-check the trusted-ingress transport-auth path:
 ```sh
 examples/shield-lab/smoke-trusted-ingress-orbstack.sh
 ```
+
+Smoke-check the local allowlist soften-scope path:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-scoped-softening-orbstack.sh
+```
+
+The default OrbStack deploy now also mounts a lab-local ingress-trust config at:
+
+```text
+examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-only.json
+```
+
+That default entry trusts `X-Eidolon-Trusted-Actor: docs-crawler` for
+`/docs` and `/openapi.json`, but narrows bait softening to `/docs` only. The
+scoped smoke proves that `/docs` is softened while `/openapi.json` stays baited
+for that same local allowlist actor.
 
 Summarize live shield metrics:
 
