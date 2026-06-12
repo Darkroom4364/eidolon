@@ -31,6 +31,8 @@ spec:
             - $(EIDOLON_DEBUG_LOG_PATH)
             - --bait-profile
             - /etc/eidolon/bait-profile.json
+            - --bait-signing-secret-file
+            - /var/run/secrets/eidolon-bait-signing/signing-secret.txt
             - --intervention-control
             - $(EIDOLON_INTERVENTION_CONTROL_PATH)
             - --policy-state
@@ -75,6 +77,9 @@ spec:
             - name: eidolon-bait-profile
               mountPath: /etc/eidolon
               readOnly: true
+            - name: eidolon-bait-signing
+              mountPath: /var/run/secrets/eidolon-bait-signing
+              readOnly: true
           readinessProbe:
             tcpSocket:
               port: http
@@ -95,6 +100,9 @@ spec:
             items:
               - key: bait-profile.json
                 path: bait-profile.json
+        - name: eidolon-bait-signing
+          secret:
+            secretName: eidolon-bait-signing
 ---
 apiVersion: v1
 kind: Service

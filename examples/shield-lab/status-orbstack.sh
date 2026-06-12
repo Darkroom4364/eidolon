@@ -69,6 +69,13 @@ target_pods_json="$(kubectl_cmd -n shield-targets get pods -l app.kubernetes.io/
 edge_svc_json="$(kubectl_cmd -n shield-system get svc eidolon-shield-edge -o json)"
 target_edge_svc_json="$(kubectl_cmd -n shield-targets get svc eidolon-owned-demo-target-edge -o json)"
 pvc_json="$(kubectl_cmd -n shield-system get pvc eidolon-shield-proxy-state -o json)"
+bait_profile_configmap_json='{}'
+
+if configmap_json="$(
+  kubectl_cmd -n shield-system get configmap eidolon-shield-bait-profile -o json 2>/dev/null
+)"; then
+  bait_profile_configmap_json="$configmap_json"
+fi
 
 edge_node_port="$(jq -r '.spec.ports[] | select(.name == "http") | (.nodePort // empty)' <<<"$edge_svc_json")"
 edge_service_type="$(jq -r '.spec.type' <<<"$edge_svc_json")"
@@ -114,7 +121,28 @@ status_json="$(jq -n \
   --argjson edge_svc "$edge_svc_json" \
   --argjson target_edge_svc "$target_edge_svc_json" \
   --argjson pvc "$pvc_json" \
+  --argjson bait_profile_configmap "$bait_profile_configmap_json" \
   '
+    def bait_profile_document:
+      ($bait_profile_configmap.data["bait-profile.json"]? // null) as $raw
+      | if ($raw | type) == "string" then
+          ($raw | fromjson?)
+        else
+          null
+        end;
+    def polymorphic_baits:
+      [
+        (bait_profile_document.baits // [])[]
+        | select((.expected_action.header_value_mint // null) != null)
+        | {
+            bait_id: .id,
+            surface: .surface,
+            surface_kind: .surface_kind,
+            header_name: .expected_action.header_name,
+            kind: .expected_action.header_value_mint.kind,
+            prefix: .expected_action.header_value_mint.prefix
+          }
+      ];
     {
       generated_at: $generated_at,
       context: $context,
@@ -161,6 +189,12 @@ status_json="$(jq -n \
             . == "--ingress-transport-auth-secret-file"
           )
         ),
+        bait_signing_enabled: (
+          any(
+            (($proxy_deploy.spec.template.spec.containers // [])[]?.args // [])[];
+            . == "--bait-signing-secret-file"
+          )
+        ),
         pvc_claim: ($pvc.metadata.name // null)
       },
       target: {
@@ -178,6 +212,11 @@ status_json="$(jq -n \
         requested_storage: ($pvc.spec.resources.requests.storage // null),
         bound_storage: ($pvc.status.capacity.storage // null),
         access_modes: ($pvc.status.accessModes // $pvc.spec.accessModes // [])
+      },
+      bait_profile: {
+        configmap_name: ($bait_profile_configmap.metadata.name // null),
+        profile_id: (bait_profile_document.profile_id // null),
+        polymorphic_baits: polymorphic_baits
       }
     }
   ')"
@@ -210,6 +249,18 @@ jq -r '
   ),
   "proxy: \(.proxy.ready_replicas)/\(.proxy.replicas) ready, pods=\(.proxy.pod_names | join(", "))",
   "trusted-ingress: transport-auth " + (if .proxy.trusted_ingress_transport_auth_enabled then "enabled" else "disabled" end),
+  "bait-signing: " + (if .proxy.bait_signing_enabled then "enabled" else "disabled" end),
+  (
+    if (.bait_profile.polymorphic_baits | length) == 0 then
+      "polymorphic-baits: none"
+    else
+      "polymorphic-baits: " + (
+        .bait_profile.polymorphic_baits
+        | map("\(.surface) -> \(.header_name) [\(.prefix)]")
+        | join(", ")
+      )
+    end
+  ),
   "target: \(.target.ready_replicas)/\(.target.replicas) ready, pods=\(.target.pod_names | join(", "))",
   "proxy-state: \(.proxy_state.status) \(.proxy_state.bound_storage // .proxy_state.requested_storage // "unknown") (\(.proxy_state.storage_class // "no-storage-class"))"
 ' <<<"$status_json"

@@ -20,6 +20,8 @@ spec:
             - $(EIDOLON_DEBUG_LOG_PATH)
             - --bait-profile
             - /etc/eidolon/bait-profile.json
+            - --bait-signing-secret-file
+            - /var/run/secrets/eidolon-bait-signing/signing-secret.txt
             - --intervention-control
             - $(EIDOLON_INTERVENTION_CONTROL_PATH)
             - --policy-state
