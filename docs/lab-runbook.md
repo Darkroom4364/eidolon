@@ -303,7 +303,10 @@ Expected event properties:
 
 For the live OrbStack lab, `examples/shield-lab/status-orbstack.sh --json`
 now also exposes the active polymorphic bait matrix from the mounted bait
-profile, including bait id, surface, header name, mint kind, and prefix.
+profile, including bait id, surface, header name, mint kind, and prefix. It
+also exposes any active trusted-ingress soften scopes from the mounted
+ingress-trust config, including the narrower `bait_soften_path_prefixes` that
+actually apply for that trusted identity.
 
 The paired bundle exporter, `examples/shield-lab/export-orbstack-evidence.sh`,
 now emits a compact `edge-session-index.md` by default and can optionally
@@ -314,7 +317,10 @@ artifacts now also surface observed-vs-active session-minted bait coverage so
 operators can tell quickly which active polymorphic surfaces a session
 actually touched, and the markdown summaries now also show the latest minted
 header outcome as `matched_session_value` or `session_value_mismatch` when
-available. For live export triage, `export-edge-decisions-orbstack.sh`
+available. The same deployment context now also carries active trusted-ingress
+soften scopes into the JSON and markdown export path, so offline review can
+see which trusted identities were allowed to narrow bait softening during that
+run. For live export triage, `export-edge-decisions-orbstack.sh`
 also supports `--min-polymorphic-coverage <N>`, and the bundle index supports
 the matching `EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE`
 environment override. The same live export path also supports

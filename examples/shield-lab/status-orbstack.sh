@@ -70,11 +70,18 @@ edge_svc_json="$(kubectl_cmd -n shield-system get svc eidolon-shield-edge -o jso
 target_edge_svc_json="$(kubectl_cmd -n shield-targets get svc eidolon-owned-demo-target-edge -o json)"
 pvc_json="$(kubectl_cmd -n shield-system get pvc eidolon-shield-proxy-state -o json)"
 bait_profile_configmap_json='{}'
+ingress_trust_configmap_json='{}'
 
 if configmap_json="$(
   kubectl_cmd -n shield-system get configmap eidolon-shield-bait-profile -o json 2>/dev/null
 )"; then
   bait_profile_configmap_json="$configmap_json"
+fi
+
+if configmap_json="$(
+  kubectl_cmd -n shield-system get configmap eidolon-shield-ingress-trust-config -o json 2>/dev/null
+)"; then
+  ingress_trust_configmap_json="$configmap_json"
 fi
 
 edge_node_port="$(jq -r '.spec.ports[] | select(.name == "http") | (.nodePort // empty)' <<<"$edge_svc_json")"
@@ -122,9 +129,17 @@ status_json="$(jq -n \
   --argjson target_edge_svc "$target_edge_svc_json" \
   --argjson pvc "$pvc_json" \
   --argjson bait_profile_configmap "$bait_profile_configmap_json" \
+  --argjson ingress_trust_configmap "$ingress_trust_configmap_json" \
   '
     def bait_profile_document:
       ($bait_profile_configmap.data["bait-profile.json"]? // null) as $raw
+      | if ($raw | type) == "string" then
+          ($raw | fromjson?)
+        else
+          null
+        end;
+    def ingress_trust_document:
+      ($ingress_trust_configmap.data["ingress-trust.json"]? // null) as $raw
       | if ($raw | type) == "string" then
           ($raw | fromjson?)
         else
@@ -141,6 +156,18 @@ status_json="$(jq -n \
             header_name: .expected_action.header_name,
             kind: .expected_action.header_value_mint.kind,
             prefix: .expected_action.header_value_mint.prefix
+          }
+      ];
+    def trusted_soften_scopes:
+      [
+        (ingress_trust_document.entries // [])[]
+        | select(((.bait_soften_path_prefixes // []) | length) > 0)
+        | {
+            label: (.label // null),
+            source: .source,
+            trust_tier: .trust_tier,
+            path_prefixes: (.path_prefixes // []),
+            bait_soften_path_prefixes: (.bait_soften_path_prefixes // [])
           }
       ];
     {
@@ -217,6 +244,10 @@ status_json="$(jq -n \
         configmap_name: ($bait_profile_configmap.metadata.name // null),
         profile_id: (bait_profile_document.profile_id // null),
         polymorphic_baits: polymorphic_baits
+      },
+      ingress_trust: {
+        configmap_name: ($ingress_trust_configmap.metadata.name // null),
+        trusted_soften_scopes: trusted_soften_scopes
       }
     }
   ')"
@@ -249,6 +280,30 @@ jq -r '
   ),
   "proxy: \(.proxy.ready_replicas)/\(.proxy.replicas) ready, pods=\(.proxy.pod_names | join(", "))",
   "trusted-ingress: transport-auth " + (if .proxy.trusted_ingress_transport_auth_enabled then "enabled" else "disabled" end),
+  (
+    if (.ingress_trust.trusted_soften_scopes | length) == 0 then
+      "trusted-soften-scopes: none"
+    else
+      "trusted-soften-scopes: " + (
+        .ingress_trust.trusted_soften_scopes
+        | map(
+            ((.label // (.source + "/" + .trust_tier)))
+            + " -> "
+            + (.bait_soften_path_prefixes | join(", "))
+            + " (match "
+            + (
+                if (.path_prefixes | length) == 0 then
+                  "all"
+                else
+                  (.path_prefixes | join(", "))
+                end
+              )
+            + ")"
+          )
+        | join(", ")
+      )
+    end
+  ),
   "bait-signing: " + (if .proxy.bait_signing_enabled then "enabled" else "disabled" end),
   (
     if (.bait_profile.polymorphic_baits | length) == 0 then

@@ -395,6 +395,7 @@ render_selected_session_summary() {
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
+    | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
     | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
     | (recon_component_lines($score)) as $recon_components
     | [
@@ -534,6 +535,38 @@ render_selected_session_summary() {
             + ", bait "
             + code(.bait_id)
             + "]"
+        ),
+        "",
+        "## Active Trusted Ingress Softening",
+        (if ($active_trusted_soften_scopes | length) == 0 then
+          "- No active trusted-ingress soften scopes."
+        else
+          empty
+        end),
+        (
+          $active_trusted_soften_scopes[]
+          | "- Scope "
+            + code((.label // (.source + "/" + .trust_tier)))
+            + ": soften "
+            + (
+                if ((.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  ((.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if ((.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  ((.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; identity "
+            + code(.source)
+            + " / "
+            + code(.trust_tier)
         )
       ]
     | map(select(. != ""))
@@ -567,6 +600,7 @@ write_readme() {
   local pvc_status
   local bait_profile_id
   local polymorphic_bait_count
+  local trusted_soften_scope_count
   edge_url="$(jq -r '.edge.url // "unavailable"' "$BUNDLE_DIR/cluster-status.json")"
   edge_status="$(jq -r 'if .edge.http_status == null then "unreachable" else (.edge.http_status | tostring) end' "$BUNDLE_DIR/cluster-status.json")"
   direct_url="$(jq -r '.direct_target_edge.url // "unavailable"' "$BUNDLE_DIR/cluster-status.json")"
@@ -576,6 +610,7 @@ write_readme() {
   pvc_status="$(jq -r '.proxy_state.status // "unknown"' "$BUNDLE_DIR/cluster-status.json")"
   bait_profile_id="$(jq -r '.bait_profile.profile_id // "unknown"' "$BUNDLE_DIR/cluster-status.json")"
   polymorphic_bait_count="$(jq -r '(.bait_profile.polymorphic_baits // []) | length' "$BUNDLE_DIR/cluster-status.json")"
+  trusted_soften_scope_count="$(jq -r '(.ingress_trust.trusted_soften_scopes // []) | length' "$BUNDLE_DIR/cluster-status.json")"
 
   {
     printf '# OrbStack Shield Evidence Bundle\n\n'
@@ -590,6 +625,7 @@ write_readme() {
     printf -- '- Proxy state PVC: `%s`\n' "$pvc_status"
     printf -- '- Bait profile: `%s`\n' "$bait_profile_id"
     printf -- '- Active polymorphic bait surfaces: `%s`\n' "$polymorphic_bait_count"
+    printf -- '- Trusted ingress soften scopes: `%s`\n' "$trusted_soften_scope_count"
     printf -- '- Redacted event log lines: `%s`\n' "$event_count"
     printf -- '- Redacted debug log lines: `%s`\n' "$debug_count"
     printf -- '- Redacted persisted policy sessions: `%s`\n\n' "$policy_session_count"
@@ -603,8 +639,34 @@ write_readme() {
       ' "$BUNDLE_DIR/cluster-status.json"
       printf '\n'
     fi
+    printf '## Active Trusted Ingress Softening\n\n'
+    if [[ "$trusted_soften_scope_count" -eq 0 ]]; then
+      printf 'No active trusted-ingress soften scopes were exported in `cluster-status.json`.\n\n'
+    else
+      jq -r '
+        (.ingress_trust.trusted_soften_scopes // [])[]
+        | "- `\(.label // (.source + "/" + .trust_tier))`: soften "
+          + (
+              if ((.bait_soften_path_prefixes // []) | length) == 0 then
+                "`none`"
+              else
+                ((.bait_soften_path_prefixes // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + "; match "
+          + (
+              if ((.path_prefixes // []) | length) == 0 then
+                "`all`"
+              else
+                ((.path_prefixes // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + "; identity `\(.source)` / `\(.trust_tier)`"
+      ' "$BUNDLE_DIR/cluster-status.json"
+      printf '\n'
+    fi
     printf '## Included files\n\n'
-    printf -- '- `cluster-status.json`: current cluster-facing operator status, including the active polymorphic bait matrix when available.\n'
+    printf -- '- `cluster-status.json`: current cluster-facing operator status, including the active polymorphic bait matrix and trusted-ingress soften scopes when available.\n'
     if [[ -f "$BUNDLE_DIR/edge-session-index.md" ]]; then
       printf -- '- `edge-session-index.md`: compact redacted summary of every exported session from the enriched edge export path.\n'
     fi

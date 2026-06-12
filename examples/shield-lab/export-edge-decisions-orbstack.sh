@@ -273,6 +273,7 @@ render_markdown_export() {
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
+    | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
     | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
     | (recon_component_lines($score)) as $recon_components
     | [
@@ -410,6 +411,38 @@ render_markdown_export() {
             + ", bait "
             + code(.bait_id)
             + "]"
+        ),
+        "",
+        "## Active Trusted Ingress Softening",
+        (if ($active_trusted_soften_scopes | length) == 0 then
+          "- No active trusted-ingress soften scopes."
+        else
+          empty
+        end),
+        (
+          $active_trusted_soften_scopes[]
+          | "- Scope "
+            + code((.label // (.source + "/" + .trust_tier)))
+            + ": soften "
+            + (
+                if ((.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  ((.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if ((.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  ((.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; identity "
+            + code(.source)
+            + " / "
+            + code(.trust_tier)
         )
       ]
     | map(select(. != ""))
@@ -547,7 +580,8 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
   deployment_context_json="$(
     jq -c '
       if (.bait_profile.profile_id // null) == null
-         and ((.bait_profile.polymorphic_baits // []) | length) == 0 then
+         and ((.bait_profile.polymorphic_baits // []) | length) == 0
+         and ((.ingress_trust.trusted_soften_scopes // []) | length) == 0 then
         null
       else
         {
@@ -561,6 +595,16 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
                 header_name,
                 kind,
                 prefix
+              }
+          ],
+          trusted_ingress_soften_scopes: [
+            (.ingress_trust.trusted_soften_scopes // [])[]
+            | {
+                label,
+                source,
+                trust_tier,
+                path_prefixes,
+                bait_soften_path_prefixes
               }
           ]
         }
