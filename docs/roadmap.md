@@ -382,7 +382,15 @@ Status checklist:
   the issue acceptance criteria (`main`)
 - [ ] Broaden the narrow hand-tuned transitions into a more general
   multi-signal aggregation plane
-- [ ] Add per-session signed polymorphic bait generation
+- [x] Per-session signed polymorphic bait generation now exists on
+  `feature/polymorphic-bait-session-hmac`: HMAC-minted bait values verify
+  deterministically, default OrbStack enables session-minted docs, OpenAPI,
+  and service-token surfaces, replay mismatches are audited and exported as
+  structured `matched_session_value` versus `session_value_mismatch`
+  outcomes, operator exports can filter by minted coverage and latest outcome,
+  and the remaining hidden-route and JS-helper bait classes stay static as
+  explicit negative controls
+  (`current branch only`)
 - [ ] Expand deployment-safe allowlists and verified crawler handling beyond
   the current trusted-ingress slice
 - [ ] Prepare the external-readiness note and release checklist

@@ -253,20 +253,44 @@ M3 catalog support adds five deterministic Lab-only bait classes. This smoke val
 
 Current catalog:
 
-- docs bait: `GET /docs/legacy-import`, then `POST /api/v2/import/reconcile` with `X-Migration-Trace: rel_2025_04_b7f2`
-- OpenAPI bait: `GET /openapi.json`, then `POST /api/v2/import/reconcile` with `X-OpenAPI-Trace: openapi_2026_05_f3a1`
+- docs bait: `GET /docs/legacy-import`, extract the session-minted `X-Migration-Trace` value from the rendered bait surface, then `POST /api/v2/import/reconcile` with that same-session value. Replaying another session's minted `X-Migration-Trace` should stay uncorrelated and fall back to upstream behavior, and edge export should mark the latest minted outcome as `session_value_mismatch`.
+- OpenAPI bait: `GET /openapi.json`, extract the session-minted `X-OpenAPI-Trace` value from the rendered schema example, then `POST /api/v2/import/reconcile` with that same-session value. Replaying another session's minted `X-OpenAPI-Trace` should stay uncorrelated and fall back to upstream behavior, and edge export should mark the latest minted outcome as `session_value_mismatch`.
 - hidden route bait: `GET /customer/import-recovery-checklist`, then `POST /api/v2/import/reconcile` with `X-Hidden-Route-Trace: hidden_route_2026_05_d91c`
-- fake credential/token bait: `GET /docs/service-token`, then `POST /api/v2/import/reconcile` with `X-Api-Key: eidolon_lab_token_2026_05_7e2a`
+- fake credential/token bait: `GET /docs/service-token`, extract the session-minted `X-Api-Key` value from the rendered bait surface, then `POST /api/v2/import/reconcile` with that same-session value. Replaying another session's minted `X-Api-Key` should stay uncorrelated and fall back to upstream behavior, and edge export should mark the latest minted outcome as `session_value_mismatch`.
 - JS-discovered route bait: `GET /assets/import-helper.js`, then `POST /api/v2/import/reconcile` with `X-Import-Worker: worker_2026_05_c19b`
+
+The hidden-route and JS-helper bait classes remain static negative controls on
+purpose. They should not vary across sessions even when bait signing is
+enabled, which keeps a stable comparison point inside the same default lab
+profile.
 
 Each smoke should use one fresh cookie jar per bait class so exposure and action share a session:
 
 ```sh
-rm -f /tmp/eidolon-m3-cookies.txt
-curl -i -c /tmp/eidolon-m3-cookies.txt \
-  http://127.0.0.1:8080/docs/service-token
-curl -i -b /tmp/eidolon-m3-cookies.txt \
-  -H 'X-Api-Key: eidolon_lab_token_2026_05_7e2a' \
+rm -f /tmp/eidolon-m3-docs-cookies.txt
+minted_migration_trace="$(curl -fsS -c /tmp/eidolon-m3-docs-cookies.txt \
+  http://127.0.0.1:8080/docs/legacy-import \
+  | rg -o 'mig_[0-9a-f]+' -m 1)"
+curl -i -b /tmp/eidolon-m3-docs-cookies.txt \
+  -H "X-Migration-Trace: ${minted_migration_trace}" \
+  -X POST http://127.0.0.1:8080/api/v2/import/reconcile
+
+rm -f /tmp/eidolon-m3-token-cookies.txt
+minted_api_key="$(curl -fsS -c /tmp/eidolon-m3-token-cookies.txt \
+  http://127.0.0.1:8080/docs/service-token \
+  | rg -o 'svc_[0-9a-f]+' -m 1)"
+curl -i -b /tmp/eidolon-m3-token-cookies.txt \
+  -H "X-Api-Key: ${minted_api_key}" \
+  -X POST http://127.0.0.1:8080/api/v2/import/reconcile
+
+rm -f /tmp/eidolon-m3-openapi-cookies.txt
+minted_openapi_trace="$(curl -fsS -c /tmp/eidolon-m3-openapi-cookies.txt \
+  http://127.0.0.1:8080/openapi.json \
+  | jq -r '.paths["/api/v2/import/reconcile"].post.parameters[]
+    | select(.name == "X-OpenAPI-Trace")
+    | .schema.example')"
+curl -i -b /tmp/eidolon-m3-openapi-cookies.txt \
+  -H "X-OpenAPI-Trace: ${minted_openapi_trace}" \
   -X POST http://127.0.0.1:8080/api/v2/import/reconcile
 ```
 
@@ -276,6 +300,27 @@ Expected event properties:
 - each matching same-session action emits `bait_action_observed` with the matching exposure identifier
 - wrong headers, wrong sessions, and ordinary `/api/v1/*` traffic remain negative controls
 - matched bait actions are synthetic and are not forwarded to the protected upstream while interventions are enabled
+
+For the live OrbStack lab, `examples/shield-lab/status-orbstack.sh --json`
+now also exposes the active polymorphic bait matrix from the mounted bait
+profile, including bait id, surface, header name, mint kind, and prefix.
+
+The paired bundle exporter, `examples/shield-lab/export-orbstack-evidence.sh`,
+now emits a compact `edge-session-index.md` by default and can optionally
+embed one redacted per-session edge summary via `--session <UUID>`, so offline
+evidence bundles can carry both the deployment polymorphic matrix and
+ready-made session summaries from the enriched edge export path. Those
+artifacts now also surface observed-vs-active session-minted bait coverage so
+operators can tell quickly which active polymorphic surfaces a session
+actually touched, and the markdown summaries now also show the latest minted
+header outcome as `matched_session_value` or `session_value_mismatch` when
+available. For live export triage, `export-edge-decisions-orbstack.sh`
+also supports `--min-polymorphic-coverage <N>`, and the bundle index supports
+the matching `EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE`
+environment override. The same live export path also supports
+`--latest-mint-outcome <matched_session_value|session_value_mismatch>`, and the
+bundle index supports the matching
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME` environment override.
 
 ## M3 Scripted Bakeoff Runner
 

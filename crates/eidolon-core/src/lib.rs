@@ -53,12 +53,40 @@ pub enum BaitClass {
     JsDiscoveredRoute,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderValueMintKind {
+    SessionHmacSha256V1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderValueMint {
+    pub kind: HeaderValueMintKind,
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaitHeaderValueMintAudit {
+    pub header_name: String,
+    pub kind: HeaderValueMintKind,
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaitHeaderValueMintStatus {
+    MatchedSessionValue,
+    SessionValueMismatch,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExpectedAction {
     pub method: String,
     pub path: String,
     pub header_name: Option<String>,
     pub header_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_value_mint: Option<HeaderValueMint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +97,18 @@ pub struct Bait {
     pub surface: String,
     pub surface_kind: SurfaceKind,
     pub expected_action: ExpectedAction,
+}
+
+impl Bait {
+    pub fn header_value_mint_audit(&self) -> Option<BaitHeaderValueMintAudit> {
+        let mint = self.expected_action.header_value_mint.as_ref()?;
+        let header_name = self.expected_action.header_name.clone()?;
+        Some(BaitHeaderValueMintAudit {
+            header_name,
+            kind: mint.kind,
+            prefix: mint.prefix.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,12 +477,18 @@ pub enum EventKind {
         bait_id: BaitId,
         exposure_id: ExposureId,
         surface: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        header_value_mint: Option<BaitHeaderValueMintAudit>,
     },
     BaitActionObserved {
         bait_id: BaitId,
         exposure_id: Option<ExposureId>,
         method: String,
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        header_value_mint: Option<BaitHeaderValueMintAudit>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        header_value_mint_status: Option<BaitHeaderValueMintStatus>,
     },
     PolicyChanged {
         from: PolicyState,
@@ -559,6 +605,57 @@ pub struct EdgeEvidenceRef {
     pub event_schema_version: u16,
     pub event_ids: Vec<Uuid>,
     pub bundle_ref: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bait_header_value_mints: Vec<EdgeBaitHeaderValueMintAudit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_bait_header_value_mint: Option<EdgeObservedBaitHeaderValueMint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeBaitHeaderValueMintAudit {
+    pub bait_id: BaitId,
+    pub header_name: String,
+    pub kind: HeaderValueMintKind,
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeObservedBaitHeaderValueMint {
+    pub bait_id: BaitId,
+    pub header_name: String,
+    pub kind: HeaderValueMintKind,
+    pub prefix: String,
+    pub status: BaitHeaderValueMintStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeActivePolymorphicBait {
+    pub bait_id: BaitId,
+    pub surface: String,
+    pub surface_kind: SurfaceKind,
+    pub header_name: String,
+    pub kind: HeaderValueMintKind,
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgePolymorphicBaitCoverage {
+    pub active_bait_count: u16,
+    pub observed_bait_count: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_bait_ids: Vec<BaitId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unobserved_bait_ids: Vec<BaitId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeDeploymentContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bait_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub polymorphic_baits: Vec<EdgeActivePolymorphicBait>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polymorphic_bait_coverage: Option<EdgePolymorphicBaitCoverage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -583,6 +680,8 @@ pub struct EidolonEdgeDecisionExport {
     pub policy: EdgePolicySnapshot,
     pub evidence: EdgeEvidenceRef,
     pub edge_recommendation: EdgeRecommendation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_context: Option<EdgeDeploymentContext>,
 }
 
 fn is_default<T>(value: &T) -> bool
@@ -927,6 +1026,7 @@ mod tests {
                 path: "/api/v2/import/reconcile".to_string(),
                 header_name: Some("X-Migration-Trace".to_string()),
                 header_value: Some("rel_2025_04_b7f2".to_string()),
+                header_value_mint: None,
             },
         };
 
@@ -952,6 +1052,78 @@ mod tests {
         .expect("older bait record should parse");
 
         assert_eq!(bait.bait_class, BaitClass::Docs);
+    }
+
+    #[test]
+    fn bait_exposed_event_deserializes_without_header_value_mint() {
+        let session_id = SessionId::new();
+        let event = json!({
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "id": Uuid::new_v4(),
+            "session_id": session_id,
+            "observed_at": Utc::now(),
+            "source": "surface_controller",
+            "policy_state": "observe",
+            "kind": {
+                "type": "bait_exposed",
+                "bait_id": "older-bait",
+                "exposure_id": "exp-older",
+                "surface": "/docs/older"
+            }
+        });
+
+        let parsed: Event = must_ok(
+            serde_json::from_value(event),
+            "legacy bait event should parse",
+        );
+
+        match parsed.kind {
+            EventKind::BaitExposed {
+                header_value_mint, ..
+            } => assert_eq!(header_value_mint, None),
+            other => panic!("expected bait_exposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bait_action_event_serializes_header_value_mint_without_header_value() {
+        let session_id = SessionId::new();
+        let event = Event::new(
+            session_id,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: BaitId("minted-trace".to_string()),
+                exposure_id: Some(ExposureId("exp-minted".to_string())),
+                method: "POST".to_string(),
+                path: "/api/v2/import/reconcile".to_string(),
+                header_value_mint: Some(BaitHeaderValueMintAudit {
+                    header_name: "X-Minted-Trace".to_string(),
+                    kind: HeaderValueMintKind::SessionHmacSha256V1,
+                    prefix: "minted".to_string(),
+                }),
+                header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            },
+        );
+
+        let serialized = must_ok(serde_json::to_value(event), "minted event should serialize");
+
+        assert_eq!(
+            serialized["kind"]["header_value_mint"]["header_name"],
+            json!("X-Minted-Trace")
+        );
+        assert_eq!(
+            serialized["kind"]["header_value_mint"]["kind"],
+            json!("session_hmac_sha256_v1")
+        );
+        assert_eq!(
+            serialized["kind"]["header_value_mint"]["prefix"],
+            json!("minted")
+        );
+        assert_eq!(
+            serialized["kind"]["header_value_mint_status"],
+            json!("matched_session_value")
+        );
     }
 
     #[test]
@@ -1007,12 +1179,45 @@ mod tests {
                 event_schema_version: EVENT_SCHEMA_VERSION,
                 event_ids: vec![Uuid::new_v4()],
                 bundle_ref: "session:ref".to_string(),
+                bait_header_value_mints: vec![EdgeBaitHeaderValueMintAudit {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    header_name: "X-Minted-Trace".to_string(),
+                    kind: HeaderValueMintKind::SessionHmacSha256V1,
+                    prefix: "minted".to_string(),
+                }],
+                latest_bait_header_value_mint: Some(EdgeObservedBaitHeaderValueMint {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    header_name: "X-Minted-Trace".to_string(),
+                    kind: HeaderValueMintKind::SessionHmacSha256V1,
+                    prefix: "minted".to_string(),
+                    status: BaitHeaderValueMintStatus::SessionValueMismatch,
+                }),
             },
             edge_recommendation: EdgeRecommendation {
                 action: EdgeRecommendedAction::Allow,
                 ttl_seconds: Some(300),
                 reason_codes: vec!["trusted_identity".to_string(), "bait_softened".to_string()],
             },
+            deployment_context: Some(EdgeDeploymentContext {
+                bait_profile_id: Some("orbstack_default_m3_catalog".to_string()),
+                polymorphic_baits: vec![EdgeActivePolymorphicBait {
+                    bait_id: BaitId("openapi_reconcile_trace".to_string()),
+                    surface: "/openapi.json".to_string(),
+                    surface_kind: SurfaceKind::OpenApi,
+                    header_name: "X-OpenAPI-Trace".to_string(),
+                    kind: HeaderValueMintKind::SessionHmacSha256V1,
+                    prefix: "oapi".to_string(),
+                }],
+                polymorphic_bait_coverage: Some(EdgePolymorphicBaitCoverage {
+                    active_bait_count: 3,
+                    observed_bait_count: 1,
+                    observed_bait_ids: vec![BaitId("minted_trace".to_string())],
+                    unobserved_bait_ids: vec![
+                        BaitId("openapi_reconcile_trace".to_string()),
+                        BaitId("rel_2025_04_b7f2".to_string()),
+                    ],
+                }),
+            }),
         };
 
         let serialized = must_ok(serde_json::to_value(export), "edge export should serialize");
@@ -1035,6 +1240,38 @@ mod tests {
         assert_eq!(serialized["discovery_recon_score"]["query_score"], json!(1));
         assert_eq!(serialized["discovery_recon_score"]["total"], json!(3));
         assert_eq!(serialized["discovery_recon_score"]["threshold"], json!(3));
+        assert_eq!(
+            serialized["evidence"]["bait_header_value_mints"][0]["header_name"],
+            json!("X-Minted-Trace")
+        );
+        assert_eq!(
+            serialized["evidence"]["bait_header_value_mints"][0]["kind"],
+            json!("session_hmac_sha256_v1")
+        );
+        assert_eq!(
+            serialized["evidence"]["latest_bait_header_value_mint"]["status"],
+            json!("session_value_mismatch")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["bait_profile_id"],
+            json!("orbstack_default_m3_catalog")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["polymorphic_baits"][0]["surface_kind"],
+            json!("open_api")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["polymorphic_bait_coverage"]["active_bait_count"],
+            json!(3)
+        );
+        assert_eq!(
+            serialized["deployment_context"]["polymorphic_bait_coverage"]["observed_bait_count"],
+            json!(1)
+        );
+        assert_eq!(
+            serialized["deployment_context"]["polymorphic_bait_coverage"]["observed_bait_ids"][0],
+            json!("minted_trace")
+        );
         assert_eq!(
             serialized["policy"]["pre_containment_persistence_class"],
             json!("discovery_recon")

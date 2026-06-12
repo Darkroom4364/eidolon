@@ -1,4 +1,10 @@
-use eidolon_core::{Bait, BaitClass, BaitId, ExpectedAction, SurfaceKind};
+use std::{borrow::Cow, error::Error, fmt};
+
+use eidolon_core::{
+    Bait, BaitClass, BaitId, ExpectedAction, HeaderValueMintKind, SessionId, SurfaceKind,
+};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 pub const DECOY_RECONCILE_PATH: &str = "/api/v2/import/reconcile";
 
@@ -87,6 +93,7 @@ impl BasicBaitTemplate {
                 path,
                 header_name: Some(self.header_name.clone()),
                 header_value: Some(self.header_value.clone()),
+                header_value_mint: None,
             },
         }
     }
@@ -160,6 +167,31 @@ impl BaitRegistry {
             .map(|bait| BaitActionMatch { bait })
     }
 
+    pub fn match_action_for_session<'a, I>(
+        &self,
+        method: &str,
+        path: &str,
+        headers: I,
+        session_id: SessionId,
+        signing_secret: Option<&str>,
+    ) -> Result<Option<BaitActionMatch>, BaitValueError>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let headers: Vec<(&str, &str)> = headers.into_iter().collect();
+
+        for bait in &self.baits {
+            let rendered = render_bait_for_session(bait, session_id, signing_secret)?;
+            if exact_action_matches(&rendered.expected_action, method, path, &headers) {
+                return Ok(Some(BaitActionMatch {
+                    bait: rendered.into_owned(),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Returns the first registered bait whose method and path match the request
     /// and whose expected header name is present, even if the value is wrong.
     ///
@@ -200,6 +232,25 @@ pub fn m3_baits() -> Vec<Bait> {
 pub struct BaitActionMatch {
     pub bait: Bait,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaitValueError {
+    MissingSigningSecret { bait_id: BaitId },
+}
+
+impl fmt::Display for BaitValueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSigningSecret { bait_id } => write!(
+                formatter,
+                "bait `{}` requires a bait signing secret but none was configured",
+                bait_id.0
+            ),
+        }
+    }
+}
+
+impl Error for BaitValueError {}
 
 fn action_shape_matches(
     expected: &ExpectedAction,
@@ -253,9 +304,111 @@ pub fn docs_for_bait(bait: &Bait) -> String {
     )
 }
 
+pub fn render_bait_for_session<'a>(
+    bait: &'a Bait,
+    session_id: SessionId,
+    signing_secret: Option<&str>,
+) -> Result<Cow<'a, Bait>, BaitValueError> {
+    let Some(mint) = bait.expected_action.header_value_mint.as_ref() else {
+        return Ok(Cow::Borrowed(bait));
+    };
+    let Some(header_name) = bait.expected_action.header_name.as_deref() else {
+        return Ok(Cow::Borrowed(bait));
+    };
+    let Some(signing_secret) = signing_secret
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(BaitValueError::MissingSigningSecret {
+            bait_id: bait.id.clone(),
+        });
+    };
+
+    let mut rendered = bait.clone();
+    rendered.expected_action.header_value = Some(mint_header_value(
+        bait,
+        mint,
+        session_id,
+        signing_secret,
+        header_name,
+    ));
+    Ok(Cow::Owned(rendered))
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn mint_header_value(
+    bait: &Bait,
+    mint: &eidolon_core::HeaderValueMint,
+    session_id: SessionId,
+    signing_secret: &str,
+    header_name: &str,
+) -> String {
+    match mint.kind {
+        HeaderValueMintKind::SessionHmacSha256V1 => {
+            let mut mac = match HmacSha256::new_from_slice(signing_secret.as_bytes()) {
+                Ok(mac) => mac,
+                Err(_error) => unreachable!("hmac accepts any key length"),
+            };
+            mac.update(b"eidolon-bait-header-v1");
+            mac.update(b"\0");
+            mac.update(session_id.0.as_bytes().as_ref());
+            mac.update(b"\0");
+            mac.update(bait.id.0.as_bytes());
+            mac.update(b"\0");
+            mac.update(bait.expected_action.method.to_ascii_uppercase().as_bytes());
+            mac.update(b"\0");
+            mac.update(bait.expected_action.path.as_bytes());
+            mac.update(b"\0");
+            mac.update(header_name.to_ascii_lowercase().as_bytes());
+            let tag = mac.finalize().into_bytes();
+
+            format!("{}_{}", mint.prefix, hex_prefix(&tag, 12))
+        }
+    }
+}
+
+fn hex_prefix(bytes: &[u8], limit: usize) -> String {
+    let mut output = String::with_capacity(limit * 2);
+    for byte in bytes.iter().take(limit) {
+        let high = byte >> 4;
+        let low = byte & 0x0f;
+        output.push(nibble_to_hex(high));
+        output.push(nibble_to_hex(low));
+    }
+    output
+}
+
+fn nibble_to_hex(value: u8) -> char {
+    match value {
+        0..=9 => (b'0' + value) as char,
+        10..=15 => (b'a' + (value - 10)) as char,
+        _ => unreachable!("nibble must be <= 15"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session_minted_bait() -> Bait {
+        Bait {
+            id: BaitId("minted_trace".to_string()),
+            bait_class: BaitClass::Docs,
+            surface: "/docs/minted-trace".to_string(),
+            surface_kind: SurfaceKind::Docs,
+            expected_action: ExpectedAction {
+                method: "POST".to_string(),
+                path: DECOY_RECONCILE_PATH.to_string(),
+                header_name: Some("X-Migration-Trace".to_string()),
+                header_value: None,
+                header_value_mint: Some(eidolon_core::HeaderValueMint {
+                    kind: HeaderValueMintKind::SessionHmacSha256V1,
+                    prefix: "minted".to_string(),
+                }),
+            },
+        }
+    }
 
     fn demo_registry() -> BaitRegistry {
         BaitRegistry::m1_demo()
@@ -405,6 +558,7 @@ mod tests {
                 path: "/api/no-header".to_string(),
                 header_name: None,
                 header_value: None,
+                header_value_mint: None,
             },
         });
 
@@ -429,6 +583,7 @@ mod tests {
                 path: "/api/value-only".to_string(),
                 header_name: None,
                 header_value: Some("shared-secret".to_string()),
+                header_value_mint: None,
             },
         });
 
@@ -452,6 +607,7 @@ mod tests {
                     path: "/api/duplicate".to_string(),
                     header_name: None,
                     header_value: None,
+                    header_value_mint: None,
                 },
             });
         }
@@ -482,6 +638,7 @@ mod tests {
                 path: "/api/v2/fallback".to_string(),
                 header_name: None,
                 header_value: None,
+                header_value_mint: None,
             },
         };
 
@@ -580,5 +737,180 @@ mod tests {
         assert!(docs.contains("compatibility gate only"));
         assert!(docs.contains("X-Migration-Trace: rel_2025_04_b7f2"));
         assert!(docs.contains("POST /api/v2/import/reconcile"));
+    }
+
+    #[test]
+    fn render_bait_for_session_mints_stable_value_per_session() {
+        let bait = session_minted_bait();
+        let session_id = SessionId::new();
+
+        let first = render_bait_for_session(&bait, session_id, Some("mint-secret"))
+            .expect("minted bait should render")
+            .into_owned();
+        let second = render_bait_for_session(&bait, session_id, Some("mint-secret"))
+            .expect("minted bait should render")
+            .into_owned();
+
+        assert_eq!(
+            first.expected_action.header_value,
+            second.expected_action.header_value
+        );
+        assert!(first
+            .expected_action
+            .header_value
+            .as_deref()
+            .is_some_and(|value| value.starts_with("minted_")));
+    }
+
+    #[test]
+    fn render_bait_for_session_changes_value_across_sessions() {
+        let bait = session_minted_bait();
+
+        let first = render_bait_for_session(&bait, SessionId::new(), Some("mint-secret"))
+            .expect("minted bait should render")
+            .into_owned();
+        let second = render_bait_for_session(&bait, SessionId::new(), Some("mint-secret"))
+            .expect("minted bait should render")
+            .into_owned();
+
+        assert_ne!(
+            first.expected_action.header_value,
+            second.expected_action.header_value
+        );
+    }
+
+    #[test]
+    fn render_bait_for_session_requires_signing_secret_for_minted_baits() {
+        let bait = session_minted_bait();
+
+        let error = render_bait_for_session(&bait, SessionId::new(), None)
+            .expect_err("minted bait should require a signing secret");
+
+        assert!(error.to_string().contains("requires a bait signing secret"));
+    }
+
+    #[test]
+    fn render_bait_for_session_keeps_static_negative_control_stable() {
+        let bait = BasicBaitTemplate::hidden_route_demo().to_bait();
+
+        let first = render_bait_for_session(&bait, SessionId::new(), Some("mint-secret"))
+            .expect("static bait should render")
+            .into_owned();
+        let second = render_bait_for_session(&bait, SessionId::new(), Some("mint-secret"))
+            .expect("static bait should render")
+            .into_owned();
+
+        assert_eq!(
+            first.expected_action.header_name,
+            second.expected_action.header_name
+        );
+        assert_eq!(
+            first.expected_action.header_value,
+            second.expected_action.header_value
+        );
+        assert_eq!(
+            first.expected_action.header_value.as_deref(),
+            Some("hidden_route_2026_05_d91c")
+        );
+        assert!(first.expected_action.header_value_mint.is_none());
+        assert!(second.expected_action.header_value_mint.is_none());
+    }
+
+    #[test]
+    fn match_action_for_session_preserves_static_negative_control_behavior() {
+        let bait = BasicBaitTemplate::hidden_route_demo().to_bait();
+        let mut registry = BaitRegistry::new();
+        registry.add(bait);
+
+        let matched = registry
+            .match_action_for_session(
+                "POST",
+                DECOY_RECONCILE_PATH,
+                [("X-Hidden-Route-Trace", "hidden_route_2026_05_d91c")],
+                SessionId::new(),
+                Some("mint-secret"),
+            )
+            .expect("static control should verify without session-specific minting");
+
+        assert_eq!(
+            matched.map(|matched| matched.bait.id),
+            Some(BaitId("hidden_route_trace".to_string()))
+        );
+    }
+
+    #[test]
+    fn match_action_for_session_verifies_minted_header_value() {
+        let bait = session_minted_bait();
+        let mut registry = BaitRegistry::new();
+        registry.add(bait.clone());
+        let session_id = SessionId::new();
+        let rendered = render_bait_for_session(&bait, session_id, Some("mint-secret"))
+            .expect("minted bait should render")
+            .into_owned();
+        let header_name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("minted bait should keep header name");
+        let header_value = rendered
+            .expected_action
+            .header_value
+            .as_deref()
+            .expect("minted bait should produce header value");
+
+        let matched = registry
+            .match_action_for_session(
+                "POST",
+                DECOY_RECONCILE_PATH,
+                [(header_name, header_value)],
+                session_id,
+                Some("mint-secret"),
+            )
+            .expect("minted action should verify");
+
+        assert_eq!(
+            matched.map(|matched| matched.bait.id),
+            Some(BaitId("minted_trace".to_string()))
+        );
+    }
+
+    #[test]
+    fn match_action_for_session_rejects_minted_header_value_from_other_session() {
+        let bait = session_minted_bait();
+        let mut registry = BaitRegistry::new();
+        registry.add(bait.clone());
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        let rendered = render_bait_for_session(&bait, session_a, Some("mint-secret"))
+            .expect("minted bait should render")
+            .into_owned();
+        let header_name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("minted bait should keep header name");
+        let header_value = rendered
+            .expected_action
+            .header_value
+            .as_deref()
+            .expect("minted bait should produce header value");
+
+        let matched = registry
+            .match_action_for_session(
+                "POST",
+                DECOY_RECONCILE_PATH,
+                [(header_name, header_value)],
+                session_b,
+                Some("mint-secret"),
+            )
+            .expect("cross-session replay should not error");
+
+        assert_eq!(matched, None);
+        assert_eq!(
+            registry
+                .match_action_shape("POST", DECOY_RECONCILE_PATH, [(header_name, header_value)])
+                .map(|matched| matched.bait.id),
+            Some(BaitId("minted_trace".to_string()))
+        );
     }
 }

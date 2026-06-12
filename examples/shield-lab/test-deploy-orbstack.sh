@@ -91,6 +91,7 @@ test_uses_explicit_bait_profile_configmap() {
   rg -q "Bait profile:        $(cd "$temp_dir" && pwd -P)/profile.json" <<<"$output"
   rg -q 'Bait profile digest: fixture-digest' <<<"$output"
   rg -q 'create configmap eidolon-shield-bait-profile' "$temp_dir/kubectl.log"
+  rg -q 'create secret generic eidolon-bait-signing' "$temp_dir/kubectl.log"
   rg -q -- "--from-file=bait-profile.json=$(cd "$temp_dir" && pwd -P)/profile.json" \
     "$temp_dir/kubectl.log"
   rg -q 'apply -k .*/examples/shield-lab/k8s/orbstack' "$temp_dir/kubectl.log"
@@ -98,6 +99,7 @@ test_uses_explicit_bait_profile_configmap() {
   rg -q 'eidolon.dev/bait-profile-sha256' "$temp_dir/kubectl.log"
   rg -q 'fixture-digest' "$temp_dir/kubectl.log"
   rg -q 'rollout status deployment/eidolon-shield-proxy' "$temp_dir/kubectl.log"
+  rg -q 'Bait signing:        kubectl -n shield-system get secret eidolon-bait-signing' <<<"$output"
 }
 
 test_rejects_missing_bait_profile() {
