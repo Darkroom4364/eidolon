@@ -1958,7 +1958,9 @@ fn is_success_status(status: u16) -> bool {
 fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io::Result<()> {
     configure_client_stream(&client_stream)?;
 
-    let client_peer = client_stream.peer_addr().ok().map(|addr| addr.to_string());
+    let client_peer_addr = client_stream.peer_addr().ok();
+    let client_peer = client_peer_addr.as_ref().map(ToString::to_string);
+    let client_peer_ip = client_peer_addr.map(|addr| addr.ip());
     let Some(request) = read_http_request(&mut client_stream)? else {
         write_debug(
             runtime,
@@ -1974,7 +1976,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
     let path = normalized_event_path(&request)?;
     let surface_request = surface_request_meta(&request, &path);
-    let session = effective_session_context(runtime, &request, &surface_request);
+    let session = effective_session_context(runtime, &request, &surface_request, client_peer_ip);
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
     let starting_policy_state = policy_state;
     let mut policy_reason_override = None;
@@ -3764,6 +3766,7 @@ fn effective_session_context(
     runtime: &ProxyRuntime,
     request: &HttpRequest,
     surface_request: &SurfaceRequestMeta,
+    client_peer_ip: Option<IpAddr>,
 ) -> SessionContext {
     let headers: Vec<(&str, &str)> = header_pairs(&request.headers).collect();
     let mut session = session::derive_session_from_headers(headers.iter().copied());
@@ -3778,6 +3781,7 @@ fn effective_session_context(
     let local_trust = runtime.ingress_identity_resolver.resolve(
         &request.method,
         &surface_request.path,
+        client_peer_ip,
         headers.iter().copied(),
     );
     let merged_identity = ingress_identity::merge_ingress_identity(
@@ -11106,6 +11110,148 @@ mod tests {
         assert_eq!(
             openapi_surface_debug["fields"]["trusted_ingress_local_soften_path_prefixes"],
             json!(["/docs"])
+        );
+    }
+
+    #[test]
+    fn local_allowlist_source_cidrs_must_match_client_peer() {
+        let loopback_config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "source_cidrs": ["127.0.0.1"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let loopback_event_log_path = unique_temp_path("trusted-source-cidr-loopback-events.jsonl");
+        let loopback_debug_log_path = unique_temp_path("trusted-source-cidr-loopback-debug.jsonl");
+        let loopback_original =
+            r#"<!doctype html><html><body><main>docs source scope</main></body></html>"#;
+        let (loopback_upstream, loopback_upstream_handle) =
+            spawn_upstream(html_response(loopback_original));
+        let mut loopback_runtime = test_runtime_with_m1_controller_and_debug_log(
+            loopback_upstream,
+            &loopback_event_log_path,
+            &loopback_debug_log_path,
+            unique_temp_path("trusted-source-cidr-loopback-control.txt"),
+        );
+        loopback_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&loopback_config_path),
+            "ingress trust config should load",
+        ));
+
+        let loopback_response = parse_downstream_response(&run_runtime_request(
+            loopback_runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        loopback_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let loopback_body = String::from_utf8(loopback_response.body).expect("body should be utf8");
+
+        assert_eq!(loopback_response.status, 200);
+        assert_eq!(loopback_body, loopback_original);
+        let loopback_request_event = first_event_of_type(&loopback_event_log_path, "request_seen");
+        assert_eq!(
+            loopback_request_event["kind"]["ingress_identity"]["source"],
+            "local_allowlist"
+        );
+        assert_eq!(
+            loopback_request_event["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-crawler"
+        );
+        assert_event_type_absent(&loopback_event_log_path, "bait_exposed");
+
+        let disallowed_config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "source_cidrs": ["10.0.0.0/8"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let disallowed_event_log_path =
+            unique_temp_path("trusted-source-cidr-disallowed-events.jsonl");
+        let disallowed_debug_log_path =
+            unique_temp_path("trusted-source-cidr-disallowed-debug.jsonl");
+        let disallowed_original =
+            r#"<!doctype html><html><body><main>docs source scope disallowed</main></body></html>"#;
+        let (disallowed_upstream, disallowed_upstream_handle) =
+            spawn_upstream(html_response(disallowed_original));
+        let mut disallowed_runtime = test_runtime_with_m1_controller_and_debug_log(
+            disallowed_upstream,
+            &disallowed_event_log_path,
+            &disallowed_debug_log_path,
+            unique_temp_path("trusted-source-cidr-disallowed-control.txt"),
+        );
+        disallowed_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&disallowed_config_path),
+            "ingress trust config should load",
+        ));
+
+        let disallowed_response = parse_downstream_response(&run_runtime_request(
+            disallowed_runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        disallowed_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let disallowed_body =
+            String::from_utf8(disallowed_response.body).expect("body should be utf8");
+
+        assert_eq!(disallowed_response.status, 200);
+        assert_ne!(disallowed_body, disallowed_original);
+        let disallowed_request_event =
+            first_event_of_type(&disallowed_event_log_path, "request_seen");
+        assert_eq!(
+            disallowed_request_event["kind"]["ingress_identity"]["source"],
+            "none"
+        );
+        assert!(disallowed_request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        assert_event_routing(
+            &disallowed_event_log_path,
+            "policy_decision",
+            "rewritten_upstream",
+        );
+        let disallowed_surface_debug =
+            first_debug_event(&disallowed_debug_log_path, "surface_action_selected");
+        assert_eq!(
+            disallowed_surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
         );
     }
 

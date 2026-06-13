@@ -10,5 +10,6 @@ rust-version.workspace = true
 chrono.workspace = true
 eidolon-bait = { path = "../eidolon-bait" }
 eidolon-core = { path = "../eidolon-core" }
+ipnet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
