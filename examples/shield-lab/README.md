@@ -545,7 +545,9 @@ The status output now includes both the active `polymorphic-baits` matrix from
 the live bait-profile ConfigMap and any active `trusted-soften-scopes` from the
 mounted ingress-trust ConfigMap, so operators can see which default surfaces
 are session-minted and which trusted identities are allowed to narrow bait
-softening without manually opening either config file.
+softening without manually opening either config file. When configured, those
+trusted soften scopes now also surface their `source_cidrs`, so network-bound
+allowlist narrowing is visible alongside path-bound narrowing.
 
 Smoke-check the trusted-ingress transport-auth path:
 
@@ -673,6 +675,10 @@ current request path was inside the narrower soften subset. The export evidence
 now also carries `trusted_ingress_soften_histories`, so later contained
 sessions still show which trusted soften scopes were seen earlier in the same
 session and whether they covered both softened and unsoftened paths. When
+configured, the same deployment and session-level trusted soften context now
+also includes `source_cidrs`, so operators can distinguish path-only
+allowlisting from network-bound allowlisting in both live and offline review.
+When
 `evidence.latest_bait_header_value_mint` is present, the markdown summaries now
 also show whether the latest minted bait-shaped action was a
 `matched_session_value` or `session_value_mismatch`.

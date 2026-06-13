@@ -167,7 +167,8 @@ status_json="$(jq -n \
             source: .source,
             trust_tier: .trust_tier,
             path_prefixes: (.path_prefixes // []),
-            bait_soften_path_prefixes: (.bait_soften_path_prefixes // [])
+            bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
+            source_cidrs: (.source_cidrs // [])
           }
       ];
     {
@@ -296,6 +297,14 @@ jq -r '
                   "all"
                 else
                   (.path_prefixes | join(", "))
+                end
+              )
+            + "; source "
+            + (
+                if (.source_cidrs | length) == 0 then
+                  "any"
+                else
+                  (.source_cidrs | join(", "))
                 end
               )
             + ")"

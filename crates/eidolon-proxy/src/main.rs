@@ -3803,6 +3803,7 @@ fn effective_session_context(
                 .iter()
                 .any(|prefix| surface_request.path.starts_with(prefix)),
             bait_soften_path_prefixes,
+            source_cidrs: trust.source_cidrs.clone().unwrap_or_default(),
         })
     });
     session.trusted_bait_soften_path_prefixes = session
