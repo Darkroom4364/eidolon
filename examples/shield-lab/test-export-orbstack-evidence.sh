@@ -92,6 +92,8 @@ min_coverage=""
 latest_mint_outcome=""
 trusted_soften_label=""
 trusted_soften_path_softened=""
+trusted_soften_history_label=""
+trusted_soften_history_path_softened=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output)
@@ -116,6 +118,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --trusted-soften-path-softened)
       trusted_soften_path_softened="$2"
+      shift 2
+      ;;
+    --trusted-soften-history-label)
+      trusted_soften_history_label="$2"
+      shift 2
+      ;;
+    --trusted-soften-history-path-softened)
+      trusted_soften_history_path_softened="$2"
       shift 2
       ;;
     *)
@@ -175,6 +185,28 @@ if [[ -n "$trusted_soften_path_softened" ]]; then
   case "$trusted_soften_path_softened" in
     false)
       rendered="$selected_array"
+      ;;
+    *)
+      rendered='[]'
+      ;;
+  esac
+fi
+
+if [[ -n "$trusted_soften_history_label" ]]; then
+  case "$trusted_soften_history_label" in
+    docs-crawler)
+      rendered="$selected_array"
+      ;;
+    *)
+      rendered='[]'
+      ;;
+  esac
+fi
+
+if [[ -n "$trusted_soften_history_path_softened" ]]; then
+  case "$trusted_soften_history_path_softened" in
+    false)
+      rendered='[{"contract_version":"2026-06-12.v1","observed_at":"2026-06-04T00:00:02Z","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","request":{"method":"POST","path":"/api/v2/import/reconcile?token=secret"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"controlled_reality","routing_decision":"controlled_reality","reason":"confirmed bait-derived action moved session into controlled reality"},"evidence":{"event_schema_version":2,"event_ids":["33333333-3333-3333-3333-333333333333"],"bundle_ref":"session:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","trusted_ingress_soften_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"saw_request_path_softened":true,"saw_request_path_unsoftened":true}]},"edge_recommendation":{"action":"preserve_eidolon_routing","reason_codes":["eidolon_runtime_enforcement","controlled_reality"]},"deployment_context":{"bait_profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"trusted_ingress_soften_scopes":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"]}]}}]'
       ;;
     *)
       rendered='[]'
@@ -445,11 +477,63 @@ test_export_bundle_filters_edge_index_by_trusted_soften_path_softened() {
   ! rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
 }
 
+test_export_bundle_filters_edge_index_by_trusted_soften_history_label() {
+  local temp_dir
+  local state_dir
+  local bundle_dir
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  bundle_dir="$temp_dir/bundle"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    EIDOLON_SHIELD_EDGE_EXPORT_SCRIPT="$temp_dir/export-edge-decisions.sh" \
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+    EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL=docs-crawler \
+    "$EXPORT_SCRIPT" \
+    "$bundle_dir" >/dev/null
+
+  rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
+  rg -q 'Exported sessions: `1`' "$bundle_dir/edge-session-index.md"
+  rg -q '`docs-crawler` \(soften `/docs`; path softened `false`\)' "$bundle_dir/edge-session-index.md"
+  ! rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
+}
+
+test_export_bundle_filters_edge_index_by_trusted_soften_history_path_softened() {
+  local temp_dir
+  local state_dir
+  local bundle_dir
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  bundle_dir="$temp_dir/bundle"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    EIDOLON_SHIELD_EDGE_EXPORT_SCRIPT="$temp_dir/export-edge-decisions.sh" \
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+    EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED=false \
+    "$EXPORT_SCRIPT" \
+    "$bundle_dir" >/dev/null
+
+  rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
+  rg -q 'Exported sessions: `1`' "$bundle_dir/edge-session-index.md"
+  rg -q '`docs-crawler` \[softened `true`, unsoftened `true`\]' "$bundle_dir/edge-session-index.md"
+  ! rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
+}
+
 test_export_bundle_redacts_sensitive_values
 test_export_refuses_non_empty_bundle_dir
 test_export_bundle_filters_edge_index_by_min_polymorphic_coverage
 test_export_bundle_filters_edge_index_by_latest_mint_outcome
 test_export_bundle_filters_edge_index_by_trusted_soften_label
 test_export_bundle_filters_edge_index_by_trusted_soften_path_softened
+test_export_bundle_filters_edge_index_by_trusted_soften_history_label
+test_export_bundle_filters_edge_index_by_trusted_soften_history_path_softened
 
 printf 'shield-lab export checks passed\n'

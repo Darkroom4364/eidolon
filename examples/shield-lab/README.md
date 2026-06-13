@@ -687,6 +687,10 @@ mismatched, which is useful for replay triage. `--trusted-soften-label <label>`
 narrows the export to sessions that actually matched one local trusted soften
 scope, and `--trusted-soften-path-softened <true|false>` splits those sessions
 into requests that were or were not inside that narrower bait-soften subset.
+For post-containment review, `--trusted-soften-history-label <label>` and
+`--trusted-soften-history-path-softened <true|false>` do the same thing against
+the session-level trusted soften history, so contained sessions still show up
+even when the final request itself is no longer trusted.
 
 If you want the bundle-local `edge-session-index.md` to keep only sessions that
 cross the same polymorphic threshold, set:
@@ -712,6 +716,17 @@ narrower soften subset, set:
 EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL=docs-crawler \
   examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED=false \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+```
+
+If you want the bundle-local `edge-session-index.md` to keep only sessions that
+matched one trusted soften history label or saw one unsoftened request earlier
+in the session, set:
+
+```sh
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL=docs-crawler \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED=false \
   examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 ```
 

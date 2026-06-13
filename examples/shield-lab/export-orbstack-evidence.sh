@@ -14,6 +14,8 @@ SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_
 SESSION_INDEX_LATEST_MINT_OUTCOME="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME:-}"
 SESSION_INDEX_TRUSTED_SOFTEN_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL:-}"
 SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED:-}"
+SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL:-}"
+SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED:-}"
 SELECTED_SESSION_ID=""
 BUNDLE_DIR=""
 
@@ -52,6 +54,13 @@ Environment:
                          Keep only sessions whose matched trusted-ingress
                          soften scope recorded `true` or `false` for request
                          path softening.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL
+                         Keep only sessions whose trusted-ingress soften
+                         history includes the given label.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED
+                         Keep only sessions whose trusted-ingress soften
+                         history includes at least one request with `true` or
+                         `false` path softening.
 USAGE
 }
 
@@ -363,6 +372,18 @@ write_edge_session_index() {
       "$SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED"
     )
   fi
+  if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL" ]]; then
+    edge_export_args+=(
+      --trusted-soften-history-label
+      "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" ]]; then
+    edge_export_args+=(
+      --trusted-soften-history-path-softened
+      "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED"
+    )
+  fi
 
   if ! run_bundle_edge_export "${edge_export_args[@]}" > /dev/null 2>"$export_error"; then
     if grep -q 'contains no request_seen sessions to export' "$export_error"; then
@@ -378,6 +399,12 @@ write_edge_session_index() {
       return 0
     fi
     if grep -q 'no edge decision exports matched --trusted-soften-path-softened' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --trusted-soften-history-label' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --trusted-soften-history-path-softened' "$export_error"; then
       return 0
     fi
     cat "$export_error" >&2
@@ -850,6 +877,16 @@ if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
       ;;
     *)
       fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED must be true or false"
+      ;;
+  esac
+fi
+
+if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" ]]; then
+  case "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" in
+    true|false)
+      ;;
+    *)
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED must be true or false"
       ;;
   esac
 fi
