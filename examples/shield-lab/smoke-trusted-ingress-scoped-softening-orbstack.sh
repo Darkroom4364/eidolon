@@ -14,6 +14,7 @@ OPENAPI_PATH="${EIDOLON_SHIELD_TRUSTED_SCOPE_OPENAPI_PATH:-/openapi.json}"
 DOCS_BAIT_MARKER="${EIDOLON_SHIELD_TRUSTED_SCOPE_DOCS_BAIT_MARKER:-X-Migration-Trace: }"
 OPENAPI_BAIT_PATH="${EIDOLON_SHIELD_TRUSTED_SCOPE_OPENAPI_BAIT_PATH:-/api/v2/import/reconcile}"
 EXPECTED_LOCAL_SOFTEN_PREFIX="${EIDOLON_SHIELD_TRUSTED_SCOPE_LOCAL_PREFIX:-/docs}"
+EXPECTED_SOURCE_CIDR="${EIDOLON_SHIELD_TRUSTED_SCOPE_SOURCE_CIDR:-192.168.194.1/32}"
 
 usage() {
   cat <<'USAGE'
@@ -143,12 +144,18 @@ docs_surface_debug="$(
 )" || fail "trusted docs session ${docs_session_id} had no surface_action_selected debug record"
 
 jq -e \
+  --arg expected_source_cidr "$EXPECTED_SOURCE_CIDR" \
   --arg local_prefix "$EXPECTED_LOCAL_SOFTEN_PREFIX" '
+    (.kind.trusted_ingress_soften_match.source_cidrs // []) == [$expected_source_cidr]
+    and
     .fields.surface_action.type == "protected_upstream"
     and .fields.trusted_ingress_softened_surface == true
     and (.fields.trusted_ingress_local_soften_path_prefixes // []) == [$local_prefix]
-  ' <<<"$docs_surface_debug" >/dev/null \
-  || fail "trusted docs session ${docs_session_id} did not record scoped docs softening"
+  ' <<<"$(jq -n \
+    --argjson event "$docs_request_json" \
+    --argjson debug "$docs_surface_debug" \
+    '{kind: $event.kind, fields: $debug.fields}')" >/dev/null \
+  || fail "trusted docs session ${docs_session_id} did not record scoped docs softening with the expected source CIDR"
 
 openapi_request_json="$(
   jq -c -e -s \
@@ -179,12 +186,18 @@ openapi_surface_debug="$(
 )" || fail "trusted openapi session ${openapi_session_id} had no surface_action_selected debug record"
 
 jq -e \
+  --arg expected_source_cidr "$EXPECTED_SOURCE_CIDR" \
   --arg local_prefix "$EXPECTED_LOCAL_SOFTEN_PREFIX" '
+    (.kind.trusted_ingress_soften_match.source_cidrs // []) == [$expected_source_cidr]
+    and
     .fields.candidate_surface_action.type == "rewritten_upstream"
     and .fields.surface_action.type == "rewritten_upstream"
     and .fields.trusted_ingress_softened_surface == false
     and (.fields.trusted_ingress_local_soften_path_prefixes // []) == [$local_prefix]
-  ' <<<"$openapi_surface_debug" >/dev/null \
-  || fail "trusted openapi session ${openapi_session_id} did not preserve the scoped baited surface"
+  ' <<<"$(jq -n \
+    --argjson event "$openapi_request_json" \
+    --argjson debug "$openapi_surface_debug" \
+    '{kind: $event.kind, fields: $debug.fields}')" >/dev/null \
+  || fail "trusted openapi session ${openapi_session_id} did not preserve the scoped baited surface with the expected source CIDR"
 
-echo "trusted-ingress scoped softening smoke ok: docs session ${docs_session_id} softened only on /docs, openapi session ${openapi_session_id} stayed baited"
+echo "trusted-ingress scoped softening smoke ok: docs session ${docs_session_id} softened only on /docs from ${EXPECTED_SOURCE_CIDR}, openapi session ${openapi_session_id} stayed baited"

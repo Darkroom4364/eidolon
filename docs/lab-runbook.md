@@ -306,9 +306,11 @@ now also exposes the active polymorphic bait matrix from the mounted bait
 profile, including bait id, surface, header name, mint kind, and prefix. It
 also exposes any active trusted-ingress soften scopes from the mounted
 ingress-trust config, including the narrower `bait_soften_path_prefixes` that
-actually apply for that trusted identity. When configured, those scope records
-now also carry `source_cidrs`, so deployment-safe network narrowing is visible
-in the same operator view.
+actually apply for that trusted identity. The default lab config now uses that
+field for the docs crawler entry with OrbStack's NodePort gateway
+`192.168.194.1/32`, and when configured
+those scope records carry `source_cidrs`, so deployment-safe network narrowing
+is visible in the same operator view.
 
 The paired bundle exporter, `examples/shield-lab/export-orbstack-evidence.sh`,
 now emits a compact `edge-session-index.md` by default and can optionally

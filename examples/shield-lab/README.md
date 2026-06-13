@@ -575,11 +575,13 @@ examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-only.json
 ```
 
 That default entry trusts `X-Eidolon-Trusted-Actor: docs-crawler` for
-`/docs` and `/openapi.json`, but narrows bait softening to `/docs` only. The
-scoped smoke proves that `/docs` is softened while `/openapi.json` stays baited
-for that same local allowlist actor. The containment smoke then proves that a
-session starting in that trusted softened path still enters controlled reality
-on a later same-session exact OpenAPI bait action.
+`/docs` and `/openapi.json`, narrows bait softening to `/docs` only, and also
+requires the direct peer to be inside OrbStack's NodePort gateway
+`192.168.194.1/32`. The scoped smoke proves
+that `/docs` is softened while `/openapi.json` stays baited for that same local
+allowlist actor and loopback-bound source. The containment smoke then proves
+that a session starting in that trusted softened path still enters controlled
+reality on a later same-session exact OpenAPI bait action.
 
 Summarize live shield metrics:
 
