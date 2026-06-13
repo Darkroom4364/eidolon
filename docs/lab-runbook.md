@@ -323,7 +323,10 @@ see which trusted identities were allowed to narrow bait softening during that
 run. When a request actually matched one of those scopes, the enriched edge
 export now also carries a session-level trusted soften match with the matched
 label and whether that specific request path was inside the narrower soften
-subset. For live export triage, `export-edge-decisions-orbstack.sh`
+subset. The same export evidence now also preserves trusted soften history
+across the full session, so a later contained request can still show which
+trusted soften scope was seen earlier and whether it covered both softened and
+unsoftened paths. For live export triage, `export-edge-decisions-orbstack.sh`
 also supports `--min-polymorphic-coverage <N>`, and the bundle index supports
 the matching `EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE`
 environment override. The same live export path also supports

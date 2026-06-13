@@ -669,7 +669,10 @@ observed-vs-active minted bait coverage without comparing the two lists
 manually. When a request actually matched one of the local trusted soften
 entries, the export now also carries a session-level
 `trusted_ingress_soften_match` with the matched label/scope and whether the
-current request path was inside the narrower soften subset. When
+current request path was inside the narrower soften subset. The export evidence
+now also carries `trusted_ingress_soften_histories`, so later contained
+sessions still show which trusted soften scopes were seen earlier in the same
+session and whether they covered both softened and unsoftened paths. When
 `evidence.latest_bait_header_value_mint` is present, the markdown summaries now
 also show whether the latest minted bait-shaped action was a
 `matched_session_value` or `session_value_mismatch`.

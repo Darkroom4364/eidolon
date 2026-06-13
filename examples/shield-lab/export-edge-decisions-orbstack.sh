@@ -294,6 +294,21 @@ render_markdown_export() {
         + code(.trust_tier // "none")
         + (if (.label // null) != null then " (" + code(.label) + ")" else "" end)
       end;
+    def trusted_soften_history_summary($histories):
+      if ($histories | length) == 0 then
+        empty
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " [softened "
+             + code(.saw_request_path_softened)
+             + ", unsoftened "
+             + code(.saw_request_path_unsoftened)
+             + "]"
+           )
+         | join(", "))
+      end;
     def recon_component_lines($score):
       [
         optional_line("repeated_discovery_score"; ($score.repeated_discovery_score // 0 | if . > 0 then code(.) else empty end)),
@@ -313,6 +328,7 @@ render_markdown_export() {
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
+    | ($export.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
     | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
     | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
@@ -398,6 +414,7 @@ render_markdown_export() {
             empty
           end
         )),
+        optional_line("Trusted soften history"; trusted_soften_history_summary($trusted_soften_histories)),
         "",
         "## Structured Recon Score",
         (if ($score.total // 0) > 0 then
