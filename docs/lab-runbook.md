@@ -367,6 +367,13 @@ That smoke proves the docs crawler header alone is not enough: the same request
 stays baited when the configured local allowlist source CIDR does not match the
 direct OrbStack peer.
 
+For the adjacent freshness proof, redeploy the lab with
+`examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-expired.json`
+and run
+`examples/shield-lab/smoke-trusted-ingress-expired-local-entry-orbstack.sh`.
+That smoke proves the same request stays baited when the local allowlist entry
+itself has expired, even though the header and source CIDR still line up.
+
 For explicit trusted-ingress freshness, run
 `examples/shield-lab/smoke-trusted-ingress-expired-claim-orbstack.sh`. That
 smoke proves a transport-authenticated but expired explicit claim is still
