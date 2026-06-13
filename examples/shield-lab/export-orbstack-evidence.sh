@@ -741,6 +741,13 @@ render_selected_session_summary() {
                   ((.source_cidrs // []) | map(code(.)) | join(", "))
                 end
               )
+            + (
+                if (.expires_at // null) == null then
+                  ""
+                else
+                  "; expires " + code(.expires_at)
+                end
+              )
             + "; identity "
             + code(.source)
             + " / "
@@ -845,6 +852,13 @@ write_readme() {
                 "`any`"
               else
                 ((.source_cidrs // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + (
+              if (.expires_at // null) == null then
+                ""
+              else
+                "; expires `" + .expires_at + "`"
               end
             )
           + "; identity `\(.source)` / `\(.trust_tier)`"

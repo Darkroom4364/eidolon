@@ -602,6 +602,13 @@ render_markdown_export() {
                   ((.source_cidrs // []) | map(code(.)) | join(", "))
                 end
               )
+            + (
+                if (.expires_at // null) == null then
+                  ""
+                else
+                  "; expires " + code(.expires_at)
+                end
+              )
             + "; identity "
             + code(.source)
             + " / "
@@ -806,6 +813,7 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
                 label,
                 source,
                 trust_tier,
+                expires_at,
                 path_prefixes,
                 bait_soften_path_prefixes,
                 source_cidrs

@@ -21,7 +21,7 @@ write_fixture_state() {
 JSONL
 
   cat > "$dir/cluster-status.json" <<'JSON'
-{"bait_profile":{"profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}]},"ingress_trust":{"trusted_soften_scopes":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"source_cidrs":["192.168.194.1/32"]}]}}
+{"bait_profile":{"profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}]},"ingress_trust":{"trusted_soften_scopes":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","expires_at":"2999-06-05T12:00:00Z","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"source_cidrs":["192.168.194.1/32"]}]}}
 JSON
 }
 
@@ -105,7 +105,8 @@ test_exports_all_sessions_as_json_array() {
       and .trusted_ingress_soften_match.source_cidrs == ["192.168.194.1/32"]
       and .deployment_context.trusted_ingress_soften_scopes[0].label == "docs-crawler"
       and .deployment_context.trusted_ingress_soften_scopes[0].bait_soften_path_prefixes == ["/docs"]
-      and .deployment_context.trusted_ingress_soften_scopes[0].source_cidrs == ["192.168.194.1/32"])
+      and .deployment_context.trusted_ingress_soften_scopes[0].source_cidrs == ["192.168.194.1/32"]
+      and .deployment_context.trusted_ingress_soften_scopes[0].expires_at == "2999-06-05T12:00:00Z")
     and any(.[]; .session_id == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
       and .edge_recommendation.action == "preserve_eidolon_routing"
       and (.deployment_context.polymorphic_baits | length) == 3
@@ -369,7 +370,7 @@ test_renders_single_session_markdown_summary() {
   rg -q 'Trusted soften scope: soften `/docs`; match `/docs`, `/openapi.json`; source `192.168.194.1/32`; request path softened `true`' <<<"$output"
   rg -q 'Trusted soften history: `docs-crawler` \[softened `true`, unsoftened `false`, source `192.168.194.1/32`\]' <<<"$output"
   rg -q '## Active Trusted Ingress Softening' <<<"$output"
-  rg -q 'Scope `docs-crawler`: soften `/docs`; match `/docs`, `/openapi.json`; source `192.168.194.1/32`; identity `local_allowlist` / `allowlisted`' <<<"$output"
+  rg -q 'Scope `docs-crawler`: soften `/docs`; match `/docs`, `/openapi.json`; source `192.168.194.1/32`; expires `2999-06-05T12:00:00Z`; identity `local_allowlist` / `allowlisted`' <<<"$output"
 }
 
 test_renders_trusted_soften_history_when_current_match_is_absent() {
