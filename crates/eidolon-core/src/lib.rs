@@ -463,6 +463,8 @@ pub enum EventKind {
         safe_headers: Vec<SafeHeaderObservation>,
         #[serde(default)]
         ingress_identity: IngressIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
         #[serde(default, skip_serializing_if = "IngressAdvisorySignals::is_empty")]
         ingress_signals: IngressAdvisorySignals,
         #[serde(default, skip_serializing_if = "DiscoveryReconScore::is_empty")]
@@ -606,6 +608,8 @@ pub struct EdgeEvidenceRef {
     pub event_ids: Vec<Uuid>,
     pub bundle_ref: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_ingress_soften_histories: Vec<EdgeTrustedIngressSoftenHistory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_header_value_mints: Vec<EdgeBaitHeaderValueMintAudit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_bait_header_value_mint: Option<EdgeObservedBaitHeaderValueMint>,
@@ -649,6 +653,45 @@ pub struct EdgePolymorphicBaitCoverage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeTrustedIngressSoftenScope {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub source: IngressIdentitySource,
+    pub trust_tier: IngressTrustTier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bait_soften_path_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedIngressSoftenMatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub source: IngressIdentitySource,
+    pub trust_tier: IngressTrustTier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bait_soften_path_prefixes: Vec<String>,
+    pub request_path_softened: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeTrustedIngressSoftenHistory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub source: IngressIdentitySource,
+    pub trust_tier: IngressTrustTier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bait_soften_path_prefixes: Vec<String>,
+    pub saw_request_path_softened: bool,
+    pub saw_request_path_unsoftened: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeDeploymentContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bait_profile_id: Option<String>,
@@ -656,6 +699,8 @@ pub struct EdgeDeploymentContext {
     pub polymorphic_baits: Vec<EdgeActivePolymorphicBait>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub polymorphic_bait_coverage: Option<EdgePolymorphicBaitCoverage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_ingress_soften_scopes: Vec<EdgeTrustedIngressSoftenScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -673,6 +718,8 @@ pub struct EidolonEdgeDecisionExport {
     pub session_id: SessionId,
     pub request: EdgeRequestRef,
     pub ingress_identity: IngressIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
     #[serde(default, skip_serializing_if = "IngressAdvisorySignals::is_empty")]
     pub ingress_signals: IngressAdvisorySignals,
     #[serde(default, skip_serializing_if = "DiscoveryReconScore::is_empty")]
@@ -724,6 +771,7 @@ mod tests {
                     present: true,
                 }],
                 ingress_identity: IngressIdentity::default(),
+                trusted_ingress_soften_match: None,
                 ingress_signals: IngressAdvisorySignals::default(),
                 discovery_recon_score: DiscoveryReconScore::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
@@ -780,6 +828,14 @@ mod tests {
                     label: Some("googlebot".to_string()),
                     expires_at: None,
                 },
+                trusted_ingress_soften_match: Some(TrustedIngressSoftenMatch {
+                    label: Some("docs-crawler".to_string()),
+                    source: IngressIdentitySource::LocalAllowlist,
+                    trust_tier: IngressTrustTier::Allowlisted,
+                    path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                    bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    request_path_softened: false,
+                }),
                 ingress_signals: IngressAdvisorySignals {
                     verification_strength: IngressVerificationStrength::High,
                     actor_kind: IngressActorKind::Crawler,
@@ -813,6 +869,14 @@ mod tests {
             "edge_verified"
         );
         assert_eq!(serialized["kind"]["ingress_identity"]["label"], "googlebot");
+        assert_eq!(
+            serialized["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            serialized["kind"]["trusted_ingress_soften_match"]["request_path_softened"],
+            false
+        );
         assert_eq!(
             serialized["kind"]["ingress_signals"]["verification_strength"],
             "high"
@@ -1143,6 +1207,14 @@ mod tests {
                 label: Some("googlebot".to_string()),
                 expires_at: None,
             },
+            trusted_ingress_soften_match: Some(TrustedIngressSoftenMatch {
+                label: Some("docs-crawler".to_string()),
+                source: IngressIdentitySource::LocalAllowlist,
+                trust_tier: IngressTrustTier::Allowlisted,
+                path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                bait_soften_path_prefixes: vec!["/docs".to_string()],
+                request_path_softened: false,
+            }),
             ingress_signals: IngressAdvisorySignals {
                 verification_strength: IngressVerificationStrength::High,
                 actor_kind: IngressActorKind::Crawler,
@@ -1179,6 +1251,15 @@ mod tests {
                 event_schema_version: EVENT_SCHEMA_VERSION,
                 event_ids: vec![Uuid::new_v4()],
                 bundle_ref: "session:ref".to_string(),
+                trusted_ingress_soften_histories: vec![EdgeTrustedIngressSoftenHistory {
+                    label: Some("docs-crawler".to_string()),
+                    source: IngressIdentitySource::LocalAllowlist,
+                    trust_tier: IngressTrustTier::Allowlisted,
+                    path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                    bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    saw_request_path_softened: true,
+                    saw_request_path_unsoftened: true,
+                }],
                 bait_header_value_mints: vec![EdgeBaitHeaderValueMintAudit {
                     bait_id: BaitId("minted_trace".to_string()),
                     header_name: "X-Minted-Trace".to_string(),
@@ -1217,6 +1298,13 @@ mod tests {
                         BaitId("rel_2025_04_b7f2".to_string()),
                     ],
                 }),
+                trusted_ingress_soften_scopes: vec![EdgeTrustedIngressSoftenScope {
+                    label: Some("docs-crawler".to_string()),
+                    source: IngressIdentitySource::LocalAllowlist,
+                    trust_tier: IngressTrustTier::Allowlisted,
+                    path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                    bait_soften_path_prefixes: vec!["/docs".to_string()],
+                }],
             }),
         };
 
@@ -1231,6 +1319,14 @@ mod tests {
             serialized["ingress_identity"]["trust_tier"],
             json!("edge_verified")
         );
+        assert_eq!(
+            serialized["trusted_ingress_soften_match"]["label"],
+            json!("docs-crawler")
+        );
+        assert_eq!(
+            serialized["trusted_ingress_soften_match"]["request_path_softened"],
+            json!(false)
+        );
         assert_eq!(serialized["ingress_signals"]["vendor_score"], json!(12));
         assert_eq!(serialized["ingress_signals"]["edge_action"], json!("allow"));
         assert_eq!(
@@ -1240,6 +1336,20 @@ mod tests {
         assert_eq!(serialized["discovery_recon_score"]["query_score"], json!(1));
         assert_eq!(serialized["discovery_recon_score"]["total"], json!(3));
         assert_eq!(serialized["discovery_recon_score"]["threshold"], json!(3));
+        assert_eq!(
+            serialized["evidence"]["trusted_ingress_soften_histories"][0]["label"],
+            json!("docs-crawler")
+        );
+        assert_eq!(
+            serialized["evidence"]["trusted_ingress_soften_histories"][0]
+                ["saw_request_path_softened"],
+            json!(true)
+        );
+        assert_eq!(
+            serialized["evidence"]["trusted_ingress_soften_histories"][0]
+                ["saw_request_path_unsoftened"],
+            json!(true)
+        );
         assert_eq!(
             serialized["evidence"]["bait_header_value_mints"][0]["header_name"],
             json!("X-Minted-Trace")
@@ -1271,6 +1381,19 @@ mod tests {
         assert_eq!(
             serialized["deployment_context"]["polymorphic_bait_coverage"]["observed_bait_ids"][0],
             json!("minted_trace")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["trusted_ingress_soften_scopes"][0]["label"],
+            json!("docs-crawler")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["trusted_ingress_soften_scopes"][0]["source"],
+            json!("local_allowlist")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["trusted_ingress_soften_scopes"][0]
+                ["bait_soften_path_prefixes"][0],
+            json!("/docs")
         );
         assert_eq!(
             serialized["policy"]["pre_containment_persistence_class"],

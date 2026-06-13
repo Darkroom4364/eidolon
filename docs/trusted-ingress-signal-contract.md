@@ -253,6 +253,11 @@ Current runtime policy:
 - default scope:
   - `/docs`
   - `/openapi.json`
+- local allowlist entries may now carry optional
+  `bait_soften_path_prefixes` that narrow this scope for that specific trusted
+  actor
+- local allowlist scopes do not widen the global soften list; they only
+  intersect with it
 - strong trusted identities do not suppress unrelated bait surfaces outside that
   scope
 

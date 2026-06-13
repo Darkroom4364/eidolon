@@ -2144,6 +2144,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "session_source": debug_session_source(session.source),
             "ingress_identity": &session.ingress_identity,
             "ingress_signals": &session.ingress_signals,
+            "trusted_ingress_local_soften_path_prefixes":
+                &session.trusted_bait_soften_path_prefixes,
             "discovery_surface_fanout":
                 debug_discovery_surface_fanout(discovery_recon_state.fanout),
             "discovery_request_count": discovery_recon_state.request_count,
@@ -2274,6 +2276,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                             "trusted_ingress_softened_surface": false,
                             "trusted_ingress_softening_reason": Value::Null,
                             "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
+                            "trusted_ingress_local_soften_path_prefixes":
+                                &session.trusted_bait_soften_path_prefixes,
                         }),
                     )?;
                     let SurfaceAction::EidolonOwned { response } = action else {
@@ -2352,6 +2356,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "trusted_ingress_softened_surface": trusted_ingress_softening_reason.is_some(),
             "trusted_ingress_softening_reason": trusted_ingress_softening_reason,
             "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
+            "trusted_ingress_local_soften_path_prefixes":
+                &session.trusted_bait_soften_path_prefixes,
         }),
     )?;
     if let Some(transition) = maybe_transition_to_blocked_from_reality_escape_attempt(
@@ -2400,6 +2406,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 "trusted_ingress_softened_surface": false,
                 "trusted_ingress_softening_reason": Value::Null,
                 "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
+                "trusted_ingress_local_soften_path_prefixes":
+                    &session.trusted_bait_soften_path_prefixes,
             }),
         )?;
         return write_direct_response(DirectResponseContext {
@@ -3664,6 +3672,7 @@ fn request_seen_event(
             path: redacted_event_target(path),
             safe_headers: safe_header_observations(&request.headers),
             ingress_identity: session.ingress_identity.clone(),
+            trusted_ingress_soften_match: session.trusted_ingress_soften_match.clone(),
             ingress_signals: session.ingress_signals.clone(),
             discovery_recon_score: event_discovery_recon_score(
                 discovery_recon_score,
@@ -3766,13 +3775,37 @@ fn effective_session_context(
         headers.iter().copied(),
         runtime.ingress_transport_auth_secret.as_deref(),
     );
-    let local_identity = runtime.ingress_identity_resolver.resolve(
+    let local_trust = runtime.ingress_identity_resolver.resolve(
         &request.method,
         &surface_request.path,
         headers.iter().copied(),
     );
-    session.ingress_identity =
-        ingress_identity::merge_ingress_identity(session.ingress_identity, local_identity);
+    let merged_identity = ingress_identity::merge_ingress_identity(
+        session.ingress_identity.clone(),
+        local_trust.as_ref().map(|trust| trust.identity.clone()),
+    );
+    session.trusted_ingress_soften_match = local_trust.as_ref().and_then(|trust| {
+        if merged_identity != trust.identity {
+            return None;
+        }
+
+        let bait_soften_path_prefixes = trust.bait_soften_path_prefixes.clone()?;
+        Some(eidolon_core::TrustedIngressSoftenMatch {
+            label: trust.identity.label.clone(),
+            source: trust.identity.source,
+            trust_tier: trust.identity.trust_tier,
+            path_prefixes: trust.path_prefixes.clone(),
+            request_path_softened: bait_soften_path_prefixes
+                .iter()
+                .any(|prefix| surface_request.path.starts_with(prefix)),
+            bait_soften_path_prefixes,
+        })
+    });
+    session.trusted_bait_soften_path_prefixes = session
+        .trusted_ingress_soften_match
+        .as_ref()
+        .map(|scope| scope.bait_soften_path_prefixes.clone());
+    session.ingress_identity = merged_identity;
 
     session
 }
@@ -3798,6 +3831,14 @@ fn maybe_soften_surface_action_for_trusted_ingress(
         .any(|prefix| surface_request.path.starts_with(prefix))
     {
         return (surface_action, None);
+    }
+    if let Some(local_soften_path_prefixes) = &session.trusted_bait_soften_path_prefixes {
+        if !local_soften_path_prefixes
+            .iter()
+            .any(|prefix| surface_request.path.starts_with(prefix))
+        {
+            return (surface_action, None);
+        }
     }
     if !matches!(
         &surface_action,
@@ -6738,6 +6779,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: Default::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
@@ -10929,6 +10971,141 @@ mod tests {
         assert_eq!(
             surface_debug["fields"]["trusted_ingress_softened_surface"],
             false
+        );
+    }
+
+    #[test]
+    fn local_allowlist_softening_scope_can_narrow_global_prefixes() {
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs", "/openapi.json"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let docs_event_log_path = unique_temp_path("scoped-trusted-docs-events.jsonl");
+        let docs_debug_log_path = unique_temp_path("scoped-trusted-docs-debug.jsonl");
+        let docs_original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
+        let (docs_upstream, docs_upstream_handle) = spawn_upstream(html_response(docs_original));
+        let mut docs_runtime = test_runtime_with_m1_controller_and_debug_log(
+            docs_upstream,
+            &docs_event_log_path,
+            &docs_debug_log_path,
+            unique_temp_path("scoped-trusted-docs-control.txt"),
+        );
+        docs_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let docs_response = parse_downstream_response(&run_runtime_request(
+            docs_runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        docs_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let docs_body = String::from_utf8(docs_response.body).expect("body should be utf8");
+
+        assert_eq!(docs_response.status, 200);
+        assert_eq!(docs_body, docs_original);
+        assert_event_routing(&docs_event_log_path, "request_seen", "protected_upstream");
+        let docs_request_event = first_event_of_type(&docs_event_log_path, "request_seen");
+        assert_eq!(
+            docs_request_event["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            docs_request_event["kind"]["trusted_ingress_soften_match"]["request_path_softened"],
+            true
+        );
+        assert_event_type_absent(&docs_event_log_path, "bait_exposed");
+        let docs_surface_debug = first_debug_event(&docs_debug_log_path, "surface_action_selected");
+        assert_eq!(
+            docs_surface_debug["fields"]["trusted_ingress_softened_surface"],
+            true
+        );
+        assert_eq!(
+            docs_surface_debug["fields"]["trusted_ingress_local_soften_path_prefixes"],
+            json!(["/docs"])
+        );
+
+        let openapi_event_log_path = unique_temp_path("scoped-trusted-openapi-events.jsonl");
+        let openapi_debug_log_path = unique_temp_path("scoped-trusted-openapi-debug.jsonl");
+        let openapi_original =
+            r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (openapi_upstream, openapi_upstream_handle) =
+            spawn_upstream(json_response(openapi_original));
+        let mut openapi_runtime = test_runtime_with_m1_controller_and_debug_log(
+            openapi_upstream,
+            &openapi_event_log_path,
+            &openapi_debug_log_path,
+            unique_temp_path("scoped-trusted-openapi-control.txt"),
+        );
+        openapi_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let openapi_response = parse_downstream_response(&run_runtime_request(
+            openapi_runtime,
+            &request_with_cookie(
+                "GET",
+                "/openapi.json",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        openapi_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let openapi_body: Value =
+            serde_json::from_slice(&openapi_response.body).expect("body should be json");
+
+        assert_eq!(openapi_response.status, 200);
+        assert!(openapi_body["paths"]["/api/v2/import/reconcile"].is_object());
+        let openapi_request_event = first_event_of_type(&openapi_event_log_path, "request_seen");
+        assert_eq!(
+            openapi_request_event["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            openapi_request_event["kind"]["trusted_ingress_soften_match"]["request_path_softened"],
+            false
+        );
+        assert_event_routing(
+            &openapi_event_log_path,
+            "policy_decision",
+            "rewritten_upstream",
+        );
+        let exposure = first_event_of_type(&openapi_event_log_path, "bait_exposed");
+        assert_eq!(exposure["kind"]["surface"], "/openapi.json");
+        let openapi_surface_debug =
+            first_debug_event(&openapi_debug_log_path, "surface_action_selected");
+        assert_eq!(
+            openapi_surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+        assert_eq!(
+            openapi_surface_debug["fields"]["trusted_ingress_local_soften_path_prefixes"],
+            json!(["/docs"])
         );
     }
 
