@@ -559,6 +559,13 @@ Smoke-check the local allowlist soften-scope path:
 examples/shield-lab/smoke-trusted-ingress-scoped-softening-orbstack.sh
 ```
 
+Smoke-check that the same trusted allowlisted session still gets contained once
+runtime evidence becomes strong:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-contained-openapi-orbstack.sh
+```
+
 The default OrbStack deploy now also mounts a lab-local ingress-trust config at:
 
 ```text
@@ -568,7 +575,9 @@ examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-only.json
 That default entry trusts `X-Eidolon-Trusted-Actor: docs-crawler` for
 `/docs` and `/openapi.json`, but narrows bait softening to `/docs` only. The
 scoped smoke proves that `/docs` is softened while `/openapi.json` stays baited
-for that same local allowlist actor.
+for that same local allowlist actor. The containment smoke then proves that a
+session starting in that trusted softened path still enters controlled reality
+on a later same-session exact OpenAPI bait action.
 
 Summarize live shield metrics:
 

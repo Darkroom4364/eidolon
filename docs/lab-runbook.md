@@ -336,6 +336,11 @@ requests that actually matched one local trusted soften scope, and the bundle
 index supports the matching
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL` and
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED` overrides.
+For the runtime invariant itself, the OrbStack smoke
+`examples/shield-lab/smoke-trusted-ingress-contained-openapi-orbstack.sh`
+proves that a session can start in the trusted `/docs` soften scope, still
+receive the baited `/openapi.json` surface, and later enter controlled reality
+on the same-session exact OpenAPI bait action.
 
 ## M3 Scripted Bakeoff Runner
 
