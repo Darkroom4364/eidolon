@@ -56,9 +56,9 @@ if [[ ! -f "$events" ]]; then
 fi
 
 if [[ "$session" == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" ]]; then
-  printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:00Z","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","request":{"method":"GET","path":"/docs/service-token"},"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"request_path_softened":true},"policy":{"state":"observe","routing_decision":"protected_upstream","reason":"trusted ingress identity suppressed bait surface intervention before runtime suspicion was established"},"evidence":{"event_schema_version":2,"event_ids":["11111111-1111-1111-1111-111111111111"],"bundle_ref":"session:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"matched_session_value"}},"edge_recommendation":{"action":"allow","ttl_seconds":300,"reason_codes":["trusted_identity","bait_softened"]}}'
+  printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:00Z","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","request":{"method":"GET","path":"/docs/service-token"},"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"request_path_softened":true},"policy":{"state":"observe","routing_decision":"protected_upstream","reason":"trusted ingress identity suppressed bait surface intervention before runtime suspicion was established"},"evidence":{"event_schema_version":2,"event_ids":["11111111-1111-1111-1111-111111111111"],"bundle_ref":"session:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","trusted_ingress_soften_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"saw_request_path_softened":true,"saw_request_path_unsoftened":false}],"bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"matched_session_value"}},"edge_recommendation":{"action":"allow","ttl_seconds":300,"reason_codes":["trusted_identity","bait_softened"]}}'
 elif [[ "$session" == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" ]]; then
-  printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:01:00Z","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","request":{"method":"POST","path":"/api/v2/import/reconcile"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"controlled_reality","routing_decision":"controlled_reality","reason":"confirmed bait-derived action moved session into controlled reality","post_containment_persistence_kind":"controlled_reality_branch_escape"},"evidence":{"event_schema_version":2,"event_ids":["33333333-3333-3333-3333-333333333333"],"bundle_ref":"session:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},"edge_recommendation":{"action":"preserve_eidolon_routing","ttl_seconds":300,"reason_codes":["eidolon_runtime_enforcement","controlled_reality"]}}'
+  printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:01:00Z","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","request":{"method":"POST","path":"/api/v2/import/reconcile"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"controlled_reality","routing_decision":"controlled_reality","reason":"confirmed bait-derived action moved session into controlled reality","post_containment_persistence_kind":"controlled_reality_branch_escape"},"evidence":{"event_schema_version":2,"event_ids":["33333333-3333-3333-3333-333333333333"],"bundle_ref":"session:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","trusted_ingress_soften_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"saw_request_path_softened":true,"saw_request_path_unsoftened":true}]},"edge_recommendation":{"action":"preserve_eidolon_routing","ttl_seconds":300,"reason_codes":["eidolon_runtime_enforcement","controlled_reality"]}}'
 elif [[ "$session" == "cccccccc-cccc-cccc-cccc-cccccccccccc" ]]; then
   printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:30Z","session_id":"cccccccc-cccc-cccc-cccc-cccccccccccc","request":{"method":"GET","path":"/openapi.json"},"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"request_path_softened":false},"policy":{"state":"observe","routing_decision":"rewritten_upstream","reason":"surface controller rewrote upstream response"},"evidence":{"event_schema_version":2,"event_ids":["55555555-5555-5555-5555-555555555555"],"bundle_ref":"session:cccccccc-cccc-cccc-cccc-cccccccccccc"},"edge_recommendation":{"action":"observe","reason_codes":["rewritten_upstream"]}}'
 else
@@ -317,8 +317,30 @@ test_renders_single_session_markdown_summary() {
   rg -q '/docs/service-token' <<<"$output"
   rg -q 'Trusted soften match: `docs-crawler` \(`local_allowlist` / `allowlisted`\)' <<<"$output"
   rg -q 'Trusted soften scope: soften `/docs`; match `/docs`, `/openapi.json`; request path softened `true`' <<<"$output"
+  rg -q 'Trusted soften history: `docs-crawler` \[softened `true`, unsoftened `false`\]' <<<"$output"
   rg -q '## Active Trusted Ingress Softening' <<<"$output"
   rg -q 'Scope `docs-crawler`: soften `/docs`; match `/docs`, `/openapi.json`; identity `local_allowlist` / `allowlisted`' <<<"$output"
+}
+
+test_renders_trusted_soften_history_when_current_match_is_absent() {
+  local temp_dir state_dir output
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
+      --format markdown \
+      --session bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb
+  )"
+
+  ! rg -q 'Trusted soften match:' <<<"$output"
+  rg -q 'Trusted soften history: `docs-crawler` \[softened `true`, unsoftened `true`\]' <<<"$output"
+  rg -q 'Policy state: `controlled_reality`' <<<"$output"
 }
 
 test_markdown_requires_single_session_and_no_webhook() {
@@ -496,6 +518,7 @@ test_filters_sessions_by_latest_mint_outcome
 test_filters_sessions_by_trusted_soften_label
 test_filters_sessions_by_trusted_soften_path_softened
 test_renders_single_session_markdown_summary
+test_renders_trusted_soften_history_when_current_match_is_absent
 test_markdown_requires_single_session_and_no_webhook
 test_top_rejects_invalid_combinations
 test_fails_when_no_sessions_match_min_polymorphic_coverage

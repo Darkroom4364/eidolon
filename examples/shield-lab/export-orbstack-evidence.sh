@@ -197,6 +197,27 @@ render_edge_session_index() {
         + code($match.request_path_softened)
         + ")"
       end;
+    def trusted_soften_history_summary($histories):
+      if ($histories | length) == 0 then
+        code("none")
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " [softened "
+             + code(.saw_request_path_softened)
+             + ", unsoftened "
+             + code(.saw_request_path_unsoftened)
+             + "]"
+           )
+         | join(", "))
+      end;
+    def trusted_soften_context_summary($match; $histories):
+      if $match != null then
+        trusted_soften_summary($match)
+      else
+        trusted_soften_history_summary($histories)
+      end;
     def severity_rank($state):
       if $state == "blocked" then 5
       elif $state == "controlled_reality" then 4
@@ -244,7 +265,7 @@ render_edge_session_index() {
           end
         ),
         "",
-        "| Session | Observed | Request | Policy | Action | Trusted Soften Match | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
+        "| Session | Observed | Request | Policy | Action | Trusted Soften Context | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         (
           $shown
@@ -253,6 +274,7 @@ render_edge_session_index() {
           | ($value.deployment_context // {}) as $deployment
           | ($value.evidence.bait_header_value_mints // []) as $mint_audits
           | ($value.evidence.latest_bait_header_value_mint // null) as $latest_mint
+          | ($value.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
           | ($value.trusted_ingress_soften_match // null) as $trusted_soften_match
           | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
           | "| "
@@ -266,7 +288,7 @@ render_edge_session_index() {
             + " | "
             + code($value.edge_recommendation.action)
             + " | "
-            + trusted_soften_summary($trusted_soften_match)
+            + trusted_soften_context_summary($trusted_soften_match; $trusted_soften_histories)
             + " | "
             + (
                 if ($mint_audits | length) == 0 then
@@ -423,6 +445,21 @@ render_selected_session_summary() {
         + code(.trust_tier // "none")
         + (if (.label // null) != null then " (" + code(.label) + ")" else "" end)
       end;
+    def trusted_soften_history_summary($histories):
+      if ($histories | length) == 0 then
+        empty
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " [softened "
+             + code(.saw_request_path_softened)
+             + ", unsoftened "
+             + code(.saw_request_path_unsoftened)
+             + "]"
+           )
+         | join(", "))
+      end;
     def recon_component_lines($score):
       [
         optional_line("repeated_discovery_score"; ($score.repeated_discovery_score // 0 | if . > 0 then code(.) else empty end)),
@@ -442,6 +479,7 @@ render_selected_session_summary() {
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
+    | ($export.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
     | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
     | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
@@ -529,6 +567,7 @@ render_selected_session_summary() {
             empty
           end
         )),
+        optional_line("Trusted soften history"; trusted_soften_history_summary($trusted_soften_histories)),
         "",
         "## Structured Recon Score",
         (if ($score.total // 0) > 0 then

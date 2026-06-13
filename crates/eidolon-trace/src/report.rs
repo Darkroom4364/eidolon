@@ -3,11 +3,11 @@ use std::fmt::Write;
 use eidolon_core::{
     BaitHeaderValueMintAudit, BaitHeaderValueMintStatus, EdgeBaitHeaderValueMintAudit,
     EdgeEvidenceRef, EdgeObservedBaitHeaderValueMint, EdgePolicySnapshot, EdgeRecommendation,
-    EdgeRecommendedAction, EdgeRequestRef, EidolonEdgeDecisionExport, EventKind,
-    IngressAdvisorySignals, PolicyState, PostContainmentPersistenceKind,
-    PreContainmentPersistenceClass, PreContainmentPersistenceKind, RoutingDecision,
-    POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY, PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY,
-    TRUSTED_INGRESS_CONTRACT_VERSION,
+    EdgeRecommendedAction, EdgeRequestRef, EdgeTrustedIngressSoftenHistory,
+    EidolonEdgeDecisionExport, EventKind, IngressAdvisorySignals, PolicyState,
+    PostContainmentPersistenceKind, PreContainmentPersistenceClass, PreContainmentPersistenceKind,
+    RoutingDecision, POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY,
+    PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY, TRUSTED_INGRESS_CONTRACT_VERSION,
 };
 
 use crate::evidence::trace_metric_summary_for_timeline;
@@ -351,6 +351,7 @@ pub fn edge_decision_export_for_evidence(
                 [latest_policy_reason_event, latest_policy_routing_event],
             ),
             bundle_ref: format!("session:{}", bundle.session_id.0),
+            trusted_ingress_soften_histories: edge_trusted_ingress_soften_histories(timeline),
             bait_header_value_mints: edge_bait_header_value_mints(bundle),
             latest_bait_header_value_mint: latest_request_bait_action
                 .and_then(edge_observed_bait_header_value_mint),
@@ -383,6 +384,49 @@ fn edge_bait_header_value_mints(bundle: &EvidenceBundle) -> Vec<EdgeBaitHeaderVa
     }
 
     audits
+}
+
+fn edge_trusted_ingress_soften_histories(
+    timeline: &SessionTimeline,
+) -> Vec<EdgeTrustedIngressSoftenHistory> {
+    let mut histories: Vec<EdgeTrustedIngressSoftenHistory> = Vec::new();
+
+    for timeline_event in &timeline.events {
+        let EventKind::RequestSeen {
+            trusted_ingress_soften_match: Some(trusted_match),
+            ..
+        } = &timeline_event.event.kind
+        else {
+            continue;
+        };
+
+        if let Some(existing) = histories.iter_mut().find(|history| {
+            history.label == trusted_match.label
+                && history.source == trusted_match.source
+                && history.trust_tier == trusted_match.trust_tier
+                && history.path_prefixes == trusted_match.path_prefixes
+                && history.bait_soften_path_prefixes == trusted_match.bait_soften_path_prefixes
+        }) {
+            if trusted_match.request_path_softened {
+                existing.saw_request_path_softened = true;
+            } else {
+                existing.saw_request_path_unsoftened = true;
+            }
+            continue;
+        }
+
+        histories.push(EdgeTrustedIngressSoftenHistory {
+            label: trusted_match.label.clone(),
+            source: trusted_match.source,
+            trust_tier: trusted_match.trust_tier,
+            path_prefixes: trusted_match.path_prefixes.clone(),
+            bait_soften_path_prefixes: trusted_match.bait_soften_path_prefixes.clone(),
+            saw_request_path_softened: trusted_match.request_path_softened,
+            saw_request_path_unsoftened: !trusted_match.request_path_softened,
+        });
+    }
+
+    histories
 }
 
 fn push_edge_bait_header_value_mint(
@@ -1463,6 +1507,15 @@ mod tests {
         assert_eq!(export.discovery_recon_score.query_score, 1);
         assert_eq!(export.discovery_recon_score.total, 3);
         assert_eq!(export.discovery_recon_score.threshold, 3);
+        assert_eq!(export.evidence.trusted_ingress_soften_histories.len(), 1);
+        assert_eq!(
+            export.evidence.trusted_ingress_soften_histories[0]
+                .label
+                .as_deref(),
+            Some("internal-crawler")
+        );
+        assert!(export.evidence.trusted_ingress_soften_histories[0].saw_request_path_softened);
+        assert!(!export.evidence.trusted_ingress_soften_histories[0].saw_request_path_unsoftened);
         assert_eq!(
             export.edge_recommendation.action,
             EdgeRecommendedAction::Allow
@@ -1520,6 +1573,147 @@ mod tests {
             .edge_recommendation
             .reason_codes
             .contains(&"eidolon_runtime_enforcement".to_string()));
+    }
+
+    #[test]
+    fn edge_decision_export_preserves_trusted_soften_history_after_containment() {
+        let session_id = SessionId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs?topic=imports".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity {
+                        source: IngressIdentitySource::LocalAllowlist,
+                        trust_tier: IngressTrustTier::Allowlisted,
+                        label: Some("docs-crawler".to_string()),
+                        expires_at: None,
+                    },
+                    trusted_ingress_soften_match: Some(eidolon_core::TrustedIngressSoftenMatch {
+                        label: Some("docs-crawler".to_string()),
+                        source: IngressIdentitySource::LocalAllowlist,
+                        trust_tier: IngressTrustTier::Allowlisted,
+                        path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                        bait_soften_path_prefixes: vec!["/docs".to_string()],
+                        request_path_softened: true,
+                    }),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: DiscoveryReconScore {
+                        query_score: 1,
+                        total: 1,
+                        threshold: 3,
+                        ..DiscoveryReconScore::default()
+                    },
+                    routing_decision: RoutingDecision::ProtectedUpstream,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/openapi.json".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity {
+                        source: IngressIdentitySource::LocalAllowlist,
+                        trust_tier: IngressTrustTier::Allowlisted,
+                        label: Some("docs-crawler".to_string()),
+                        expires_at: None,
+                    },
+                    trusted_ingress_soften_match: Some(eidolon_core::TrustedIngressSoftenMatch {
+                        label: Some("docs-crawler".to_string()),
+                        source: IngressIdentitySource::LocalAllowlist,
+                        trust_tier: IngressTrustTier::Allowlisted,
+                        path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                        bait_soften_path_prefixes: vec!["/docs".to_string()],
+                        request_path_softened: false,
+                    }),
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: DiscoveryReconScore {
+                        repeated_discovery_score: 2,
+                        query_score: 1,
+                        total: 3,
+                        threshold: 3,
+                        ..DiscoveryReconScore::default()
+                    },
+                    routing_decision: RoutingDecision::ProtectedUpstream,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Suspicious,
+                EventKind::PolicyChanged {
+                    from: PolicyState::Observe,
+                    to: PolicyState::Suspicious,
+                    reason: "session recon discovery-surface fanout promoted request to suspicious"
+                        .to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Suspicious,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: DiscoveryReconScore {
+                        repeated_discovery_score: 2,
+                        query_score: 1,
+                        total: 3,
+                        threshold: 3,
+                        ..DiscoveryReconScore::default()
+                    },
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::ControlledReality,
+                EventKind::PolicyChanged {
+                    from: PolicyState::Suspicious,
+                    to: PolicyState::ControlledReality,
+                    reason: "confirmed bait-derived action moved session into controlled reality"
+                        .to_string(),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::ControlledReality,
+                EventKind::ResponseServed {
+                    status: 202,
+                    routing_decision: RoutingDecision::ControlledReality,
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(export.policy.state, PolicyState::ControlledReality);
+        assert!(export.trusted_ingress_soften_match.is_none());
+        assert_eq!(export.evidence.trusted_ingress_soften_histories.len(), 1);
+        assert_eq!(
+            export.evidence.trusted_ingress_soften_histories[0]
+                .label
+                .as_deref(),
+            Some("docs-crawler")
+        );
+        assert!(export.evidence.trusted_ingress_soften_histories[0].saw_request_path_softened);
+        assert!(export.evidence.trusted_ingress_soften_histories[0].saw_request_path_unsoftened);
     }
 
     #[test]
