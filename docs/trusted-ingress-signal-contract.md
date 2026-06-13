@@ -205,6 +205,7 @@ The current local config supports:
 - optional expiry
 - method scope
 - path-prefix scope
+- optional source CIDR scope, matched against the proxy's direct TCP peer
 - required header matchers
 
 That config is an operator-controlled trust source and participates in the same
@@ -256,6 +257,9 @@ Current runtime policy:
 - local allowlist entries may now carry optional
   `bait_soften_path_prefixes` that narrow this scope for that specific trusted
   actor
+- local allowlist entries may also carry optional `source_cidrs` so verified
+  crawler or partner automation matches can be bound to expected source
+  networks instead of header/path shape alone
 - local allowlist scopes do not widen the global soften list; they only
   intersect with it
 - strong trusted identities do not suppress unrelated bait surfaces outside that

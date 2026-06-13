@@ -1,7 +1,8 @@
-use std::{fmt, fs, path::Path};
+use std::{fmt, fs, net::IpAddr, path::Path};
 
 use chrono::{DateTime, Utc};
 use eidolon_core::{IngressIdentity, IngressIdentitySource, IngressTrustTier};
+use ipnet::IpNet;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -29,6 +30,7 @@ impl IngressIdentityResolver {
         &self,
         method: &str,
         path: &str,
+        client_ip: Option<IpAddr>,
         headers: I,
     ) -> Option<ResolvedIngressTrust>
     where
@@ -44,7 +46,7 @@ impl IngressIdentityResolver {
 
         self.entries
             .iter()
-            .find(|entry| entry.matches(&method, path, &headers))
+            .find(|entry| entry.matches(&method, path, client_ip, &headers))
             .map(|entry| ResolvedIngressTrust {
                 identity: entry.identity.clone(),
                 path_prefixes: entry.path_prefixes.clone(),
@@ -130,11 +132,18 @@ struct TrustedIngressEntry {
     methods: Vec<String>,
     path_prefixes: Vec<String>,
     bait_soften_path_prefixes: Option<Vec<String>>,
+    source_cidrs: Option<Vec<IpNet>>,
     required_headers: Vec<RequiredHeaderMatch>,
 }
 
 impl TrustedIngressEntry {
-    fn matches(&self, method: &str, path: &str, headers: &[(String, String)]) -> bool {
+    fn matches(
+        &self,
+        method: &str,
+        path: &str,
+        client_ip: Option<IpAddr>,
+        headers: &[(String, String)],
+    ) -> bool {
         if !self.methods.is_empty() && !self.methods.iter().any(|candidate| candidate == method) {
             return false;
         }
@@ -146,6 +155,15 @@ impl TrustedIngressEntry {
                 .any(|prefix| path.starts_with(prefix))
         {
             return false;
+        }
+
+        if let Some(source_cidrs) = &self.source_cidrs {
+            let Some(client_ip) = client_ip else {
+                return false;
+            };
+            if !source_cidrs.iter().any(|cidr| cidr.contains(&client_ip)) {
+                return false;
+            }
         }
 
         self.required_headers.iter().all(|required| {
@@ -205,6 +223,8 @@ struct RawTrustedIngressEntry {
     path_prefixes: Vec<String>,
     #[serde(default)]
     bait_soften_path_prefixes: Option<Vec<String>>,
+    #[serde(default)]
+    source_cidrs: Vec<String>,
     required_headers: Vec<RawRequiredHeaderMatch>,
 }
 
@@ -313,6 +333,7 @@ impl RawTrustedIngressEntry {
             )?),
             None => None,
         };
+        let source_cidrs = normalize_source_cidrs(self.source_cidrs, index)?;
 
         let required_headers = self
             .required_headers
@@ -330,6 +351,7 @@ impl RawTrustedIngressEntry {
             methods,
             path_prefixes,
             bait_soften_path_prefixes,
+            source_cidrs,
             required_headers,
         })
     }
@@ -362,6 +384,37 @@ fn normalize_path_prefixes(
     }
 
     Ok(prefixes)
+}
+
+fn normalize_source_cidrs(
+    source_cidrs: Vec<String>,
+    index: usize,
+) -> Result<Option<Vec<IpNet>>, IngressTrustConfigError> {
+    if source_cidrs.is_empty() {
+        return Ok(None);
+    }
+
+    let source_cidrs = source_cidrs
+        .into_iter()
+        .map(|cidr| {
+            let cidr = cidr.trim();
+            if cidr.is_empty() {
+                return Err(IngressTrustConfigError::new(format!(
+                    "ingress trust config entry {index} source_cidrs must not contain empty values"
+                )));
+            }
+
+            cidr.parse::<IpNet>()
+                .or_else(|_| cidr.parse::<IpAddr>().map(IpNet::from))
+                .map_err(|error| {
+                    IngressTrustConfigError::new(format!(
+                        "ingress trust config entry {index} source_cidrs value `{cidr}` is invalid: {error}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Some(source_cidrs))
 }
 
 impl RawRequiredHeaderMatch {
@@ -438,6 +491,7 @@ mod tests {
             resolver.resolve(
                 "GET",
                 "/docs/legacy-import",
+                None,
                 [("X-Eidolon-Trusted-Actor", "internal-crawler")],
             ),
             "entry should match",
@@ -478,6 +532,7 @@ mod tests {
             .resolve(
                 "POST",
                 "/docs/legacy-import",
+                None,
                 [("X-Eidolon-Trusted-Actor", "internal-crawler")],
             )
             .is_none());
@@ -485,6 +540,7 @@ mod tests {
             .resolve(
                 "GET",
                 "/health",
+                None,
                 [("X-Eidolon-Trusted-Actor", "internal-crawler")],
             )
             .is_none());
@@ -518,7 +574,7 @@ mod tests {
         let resolver = must_ok(resolver, "config should parse");
 
         let trust = must_some(
-            resolver.resolve("GET", "/docs", [("X-Actor", "seed")]),
+            resolver.resolve("GET", "/docs", None, [("X-Actor", "seed")]),
             "entry should match",
         );
 
@@ -550,7 +606,7 @@ mod tests {
         let resolver = must_ok(resolver, "config should parse");
 
         let trust = must_some(
-            resolver.resolve("GET", "/docs", [("X-Actor", "window")]),
+            resolver.resolve("GET", "/docs", None, [("X-Actor", "window")]),
             "entry should match",
         );
 
@@ -587,7 +643,7 @@ mod tests {
         let resolver = must_ok(resolver, "config should parse");
 
         let trust = must_some(
-            resolver.resolve("GET", "/openapi.json", [("X-Actor", "docs-crawler")]),
+            resolver.resolve("GET", "/openapi.json", None, [("X-Actor", "docs-crawler")]),
             "entry should match",
         );
 
@@ -688,6 +744,80 @@ mod tests {
         assert!(bad_scope
             .to_string()
             .contains("bait_soften_path_prefixes must start with `/`"));
+    }
+
+    #[test]
+    fn source_cidrs_can_gate_local_trust_matches() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "entries": [
+                    {
+                      "label": "docs-crawler",
+                      "source": "local_allowlist",
+                      "trust_tier": "allowlisted",
+                      "path_prefixes": ["/docs"],
+                      "source_cidrs": ["127.0.0.1", "10.0.0.0/8"],
+                      "required_headers": [
+                        { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                      ]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/docs",
+                Some("127.0.0.1".parse().expect("loopback ip should parse")),
+                [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            )
+            .is_some());
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/docs",
+                Some("192.168.1.20".parse().expect("private ip should parse")),
+                [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            )
+            .is_none());
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/docs",
+                None,
+                [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_source_cidrs() {
+        let error = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "bad-source-cidr",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "source_cidrs": ["bad-cidr"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect_err("invalid source_cidrs should fail");
+
+        assert!(error
+            .to_string()
+            .contains("source_cidrs value `bad-cidr` is invalid"));
     }
 
     #[test]

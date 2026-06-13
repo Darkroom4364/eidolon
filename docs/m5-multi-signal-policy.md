@@ -130,6 +130,9 @@ The current M5 slice is intentionally narrow:
   soften prefixes still define the outer boundary, and local allowlist entries
   may optionally narrow that boundary with per-entry
   `bait_soften_path_prefixes` for deployment-safe verified crawler handling
+- local allowlist entries may also optionally carry `source_cidrs`, matched
+  against the proxy's direct TCP peer, so deployment-safe verified crawler
+  handling does not rely only on path and header shape
 - one conservative `observe -> suspicious` promotion now exists for authenticated
   discovery-surface requests that combine a low inverse vendor score with an
   explicitly agentic actor kind, while stronger trusted identities still keep

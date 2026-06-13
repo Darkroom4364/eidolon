@@ -393,6 +393,7 @@ Status checklist:
   (`current branch only`)
 - [ ] Expand deployment-safe allowlists and verified crawler handling beyond
   the current trusted-ingress slice; per-entry local allowlist
-  `bait_soften_path_prefixes` now exist on the current branch as the first
-  deployment-safe narrowing primitive
+  `bait_soften_path_prefixes` now exist on `main` and optional per-entry
+  `source_cidrs` now exist on the current branch as narrower deployment-safe
+  trust primitives
 - [ ] Prepare the external-readiness note and release checklist
