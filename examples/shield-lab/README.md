@@ -545,7 +545,9 @@ The status output now includes both the active `polymorphic-baits` matrix from
 the live bait-profile ConfigMap and any active `trusted-soften-scopes` from the
 mounted ingress-trust ConfigMap, so operators can see which default surfaces
 are session-minted and which trusted identities are allowed to narrow bait
-softening without manually opening either config file.
+softening without manually opening either config file. When configured, those
+trusted soften scopes now also surface their `source_cidrs`, so network-bound
+allowlist narrowing is visible alongside path-bound narrowing.
 
 Smoke-check the trusted-ingress transport-auth path:
 
@@ -573,11 +575,26 @@ examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-only.json
 ```
 
 That default entry trusts `X-Eidolon-Trusted-Actor: docs-crawler` for
-`/docs` and `/openapi.json`, but narrows bait softening to `/docs` only. The
-scoped smoke proves that `/docs` is softened while `/openapi.json` stays baited
-for that same local allowlist actor. The containment smoke then proves that a
-session starting in that trusted softened path still enters controlled reality
-on a later same-session exact OpenAPI bait action.
+`/docs` and `/openapi.json`, narrows bait softening to `/docs` only, and also
+requires the direct peer to be inside OrbStack's NodePort gateway
+`192.168.194.1/32`. The scoped smoke proves
+that `/docs` is softened while `/openapi.json` stays baited for that same local
+allowlist actor and loopback-bound source. The containment smoke then proves
+that a session starting in that trusted softened path still enters controlled
+reality on a later same-session exact OpenAPI bait action.
+
+If you want to prove the negative side of the gate, redeploy with the checked-in
+mismatched-source example and run the paired smoke:
+
+```sh
+EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH=examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-mismatched-source.json \
+  examples/shield-lab/deploy-orbstack.sh
+examples/shield-lab/smoke-trusted-ingress-source-cidr-gate-orbstack.sh
+```
+
+That path proves the same trusted actor still receives the baited `/docs`
+surface when the local allowlist source CIDR does not match the direct OrbStack
+peer.
 
 Summarize live shield metrics:
 
@@ -673,6 +690,10 @@ current request path was inside the narrower soften subset. The export evidence
 now also carries `trusted_ingress_soften_histories`, so later contained
 sessions still show which trusted soften scopes were seen earlier in the same
 session and whether they covered both softened and unsoftened paths. When
+configured, the same deployment and session-level trusted soften context now
+also includes `source_cidrs`, so operators can distinguish path-only
+allowlisting from network-bound allowlisting in both live and offline review.
+When
 `evidence.latest_bait_header_value_mint` is present, the markdown summaries now
 also show whether the latest minted bait-shaped action was a
 `matched_session_value` or `session_value_mismatch`.

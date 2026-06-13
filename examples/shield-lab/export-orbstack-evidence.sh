@@ -217,6 +217,14 @@ render_edge_session_index() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", source "
+             + (
+                 if ((.source_cidrs // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
              + "]"
            )
          | join(", "))
@@ -483,6 +491,14 @@ render_selected_session_summary() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", source "
+             + (
+                 if ((.source_cidrs // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
              + "]"
            )
          | join(", "))
@@ -586,6 +602,14 @@ render_selected_session_summary() {
                   code("all")
                 else
                   (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; source "
+            + (
+                if (($trusted_soften_match.source_cidrs // []) | length) == 0 then
+                  code("any")
+                else
+                  (($trusted_soften_match.source_cidrs // []) | map(code(.)) | join(", "))
                 end
               )
             + "; request path softened "
@@ -709,6 +733,14 @@ render_selected_session_summary() {
                   ((.path_prefixes // []) | map(code(.)) | join(", "))
                 end
               )
+            + "; source "
+            + (
+                if ((.source_cidrs // []) | length) == 0 then
+                  code("any")
+                else
+                  ((.source_cidrs // []) | map(code(.)) | join(", "))
+                end
+              )
             + "; identity "
             + code(.source)
             + " / "
@@ -805,6 +837,14 @@ write_readme() {
                 "`all`"
               else
                 ((.path_prefixes // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + "; source "
+          + (
+              if ((.source_cidrs // []) | length) == 0 then
+                "`any`"
+              else
+                ((.source_cidrs // []) | map("`" + . + "`") | join(", "))
               end
             )
           + "; identity `\(.source)` / `\(.trust_tier)`"
