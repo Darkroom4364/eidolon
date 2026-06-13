@@ -149,6 +149,14 @@ impl TrustedIngressEntry {
         client_ip: Option<IpAddr>,
         headers: &[(String, String)],
     ) -> bool {
+        if self
+            .identity
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= Utc::now())
+        {
+            return false;
+        }
+
         if !self.methods.is_empty() && !self.methods.iter().any(|candidate| candidate == method) {
             return false;
         }
@@ -600,7 +608,7 @@ mod tests {
                   "label": "operator-window",
                   "source": "operator_override",
                   "trust_tier": "allowlisted",
-                  "expires_at": "2026-06-05T12:00:00Z",
+                  "expires_at": "2999-06-05T12:00:00Z",
                   "required_headers": [
                     { "name": "X-Actor", "value": "window" }
                   ]
@@ -618,10 +626,38 @@ mod tests {
         assert_eq!(
             trust.identity.expires_at,
             Some(
-                Utc.with_ymd_and_hms(2026, 6, 5, 12, 0, 0)
+                Utc.with_ymd_and_hms(2999, 6, 5, 12, 0, 0)
                     .single()
                     .unwrap_or_else(|| panic!("timestamp should be valid"))
             )
+        );
+    }
+
+    #[test]
+    fn expired_entries_do_not_match() {
+        let resolver = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "operator-window",
+                  "source": "operator_override",
+                  "trust_tier": "allowlisted",
+                  "expires_at": "2000-01-01T00:00:00Z",
+                  "required_headers": [
+                    { "name": "X-Actor", "value": "window" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+        let resolver = must_ok(resolver, "config should parse");
+
+        assert!(
+            resolver
+                .resolve("GET", "/docs", None, [("X-Actor", "window")])
+                .is_none(),
+            "expired trust entries should not match",
         );
     }
 

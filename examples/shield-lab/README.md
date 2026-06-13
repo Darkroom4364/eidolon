@@ -555,6 +555,13 @@ Smoke-check the trusted-ingress transport-auth path:
 examples/shield-lab/smoke-trusted-ingress-orbstack.sh
 ```
 
+Smoke-check that an authenticated but expired explicit ingress identity no
+longer softens bait:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-expired-claim-orbstack.sh
+```
+
 Smoke-check the local allowlist soften-scope path:
 
 ```sh
