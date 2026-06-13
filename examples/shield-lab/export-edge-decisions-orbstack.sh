@@ -354,6 +354,14 @@ render_markdown_export() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", source "
+             + (
+                 if ((.source_cidrs // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
              + "]"
            )
          | join(", "))
@@ -455,6 +463,14 @@ render_markdown_export() {
                   code("all")
                 else
                   (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; source "
+            + (
+                if (($trusted_soften_match.source_cidrs // []) | length) == 0 then
+                  code("any")
+                else
+                  (($trusted_soften_match.source_cidrs // []) | map(code(.)) | join(", "))
                 end
               )
             + "; request path softened "
@@ -576,6 +592,14 @@ render_markdown_export() {
                   code("all")
                 else
                   ((.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; source "
+            + (
+                if ((.source_cidrs // []) | length) == 0 then
+                  code("any")
+                else
+                  ((.source_cidrs // []) | map(code(.)) | join(", "))
                 end
               )
             + "; identity "
@@ -783,7 +807,8 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
                 source,
                 trust_tier,
                 path_prefixes,
-                bait_soften_path_prefixes
+                bait_soften_path_prefixes,
+                source_cidrs
               }
           ]
         }

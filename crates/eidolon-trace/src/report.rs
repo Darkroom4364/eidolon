@@ -406,6 +406,7 @@ fn edge_trusted_ingress_soften_histories(
                 && history.trust_tier == trusted_match.trust_tier
                 && history.path_prefixes == trusted_match.path_prefixes
                 && history.bait_soften_path_prefixes == trusted_match.bait_soften_path_prefixes
+                && history.source_cidrs == trusted_match.source_cidrs
         }) {
             if trusted_match.request_path_softened {
                 existing.saw_request_path_softened = true;
@@ -421,6 +422,7 @@ fn edge_trusted_ingress_soften_histories(
             trust_tier: trusted_match.trust_tier,
             path_prefixes: trusted_match.path_prefixes.clone(),
             bait_soften_path_prefixes: trusted_match.bait_soften_path_prefixes.clone(),
+            source_cidrs: trusted_match.source_cidrs.clone(),
             saw_request_path_softened: trusted_match.request_path_softened,
             saw_request_path_unsoftened: !trusted_match.request_path_softened,
         });
@@ -1439,6 +1441,7 @@ mod tests {
                         trust_tier: IngressTrustTier::Allowlisted,
                         path_prefixes: vec!["/docs".to_string()],
                         bait_soften_path_prefixes: vec!["/docs".to_string()],
+                        source_cidrs: vec!["127.0.0.1/32".to_string()],
                         request_path_softened: true,
                     }),
                     ingress_signals: IngressAdvisorySignals {
@@ -1599,6 +1602,7 @@ mod tests {
                         trust_tier: IngressTrustTier::Allowlisted,
                         path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                         bait_soften_path_prefixes: vec!["/docs".to_string()],
+                        source_cidrs: vec!["127.0.0.1/32".to_string()],
                         request_path_softened: true,
                     }),
                     ingress_signals: Default::default(),
@@ -1631,6 +1635,7 @@ mod tests {
                         trust_tier: IngressTrustTier::Allowlisted,
                         path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                         bait_soften_path_prefixes: vec!["/docs".to_string()],
+                        source_cidrs: vec!["127.0.0.1/32".to_string()],
                         request_path_softened: false,
                     }),
                     ingress_signals: Default::default(),
