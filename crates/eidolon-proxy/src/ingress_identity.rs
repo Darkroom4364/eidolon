@@ -12,6 +12,7 @@ pub struct IngressIdentityResolver {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedIngressTrust {
     pub identity: IngressIdentity,
+    pub path_prefixes: Vec<String>,
     pub bait_soften_path_prefixes: Option<Vec<String>>,
 }
 
@@ -46,6 +47,7 @@ impl IngressIdentityResolver {
             .find(|entry| entry.matches(&method, path, &headers))
             .map(|entry| ResolvedIngressTrust {
                 identity: entry.identity.clone(),
+                path_prefixes: entry.path_prefixes.clone(),
                 bait_soften_path_prefixes: entry.bait_soften_path_prefixes.clone(),
             })
     }

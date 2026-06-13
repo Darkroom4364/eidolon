@@ -270,6 +270,7 @@ render_markdown_export() {
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
     | ($export.deployment_context // {}) as $deployment
+    | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
@@ -325,6 +326,38 @@ render_markdown_export() {
           end
         )),
         optional_line("Ingress edge action hint"; (($signals.edge_action // null) | if . != null then code(.) else empty end)),
+        optional_line("Trusted soften match"; (
+          if $trusted_soften_match != null then
+            code($trusted_soften_match.label // ($trusted_soften_match.source + "/" + $trusted_soften_match.trust_tier))
+            + " (" + code($trusted_soften_match.source) + " / " + code($trusted_soften_match.trust_tier) + ")"
+          else
+            empty
+          end
+        )),
+        optional_line("Trusted soften scope"; (
+          if $trusted_soften_match != null then
+            "soften "
+            + (
+                if (($trusted_soften_match.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  (($trusted_soften_match.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if (($trusted_soften_match.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; request path softened "
+            + code($trusted_soften_match.request_path_softened)
+          else
+            empty
+          end
+        )),
         "",
         "## Structured Recon Score",
         (if ($score.total // 0) > 0 then
