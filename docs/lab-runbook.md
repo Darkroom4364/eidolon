@@ -359,6 +359,14 @@ proves that a session can start in the trusted `/docs` soften scope, still
 receive the baited `/openapi.json` surface, and later enter controlled reality
 on the same-session exact OpenAPI bait action.
 
+For the opposite proof, redeploy the lab with
+`examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-mismatched-source.json`
+and run
+`examples/shield-lab/smoke-trusted-ingress-source-cidr-gate-orbstack.sh`.
+That smoke proves the docs crawler header alone is not enough: the same request
+stays baited when the configured local allowlist source CIDR does not match the
+direct OrbStack peer.
+
 ## M3 Scripted Bakeoff Runner
 
 The scripted M3 runner creates the first comparable artifact shape across the four static controls and Eidolon MVP. It is runner plumbing for M3, not the final empirical uniqueness result. Final M3 still requires authorized agentic or scanner runs and proxy trace artifacts.

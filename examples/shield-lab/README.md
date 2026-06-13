@@ -583,6 +583,19 @@ allowlist actor and loopback-bound source. The containment smoke then proves
 that a session starting in that trusted softened path still enters controlled
 reality on a later same-session exact OpenAPI bait action.
 
+If you want to prove the negative side of the gate, redeploy with the checked-in
+mismatched-source example and run the paired smoke:
+
+```sh
+EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH=examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-mismatched-source.json \
+  examples/shield-lab/deploy-orbstack.sh
+examples/shield-lab/smoke-trusted-ingress-source-cidr-gate-orbstack.sh
+```
+
+That path proves the same trusted actor still receives the baited `/docs`
+surface when the local allowlist source CIDR does not match the direct OrbStack
+peer.
+
 Summarize live shield metrics:
 
 ```sh
