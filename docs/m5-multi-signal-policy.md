@@ -133,6 +133,9 @@ The current M5 slice is intentionally narrow:
 - local allowlist entries may also optionally carry `source_cidrs`, matched
   against the proxy's direct TCP peer, so deployment-safe verified crawler
   handling does not rely only on path and header shape
+- stale explicit trusted-ingress claims now degrade to `weakly_asserted`, and
+  stale local ingress-trust config entries stop matching entirely, so
+  deployment-safe trust windows do not silently stay strong after expiry
 - one conservative `observe -> suspicious` promotion now exists for authenticated
   discovery-surface requests that combine a low inverse vendor score with an
   explicitly agentic actor kind, while stronger trusted identities still keep

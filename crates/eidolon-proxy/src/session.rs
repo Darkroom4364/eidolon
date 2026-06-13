@@ -165,12 +165,15 @@ where
     }
 
     match (source, trust_tier) {
-        (Some(source), Some(trust_tier)) => IngressIdentity {
-            source,
-            trust_tier,
-            label,
-            expires_at,
-        },
+        (Some(source), Some(trust_tier)) => stale_ingress_identity_to_weakly_asserted(
+            IngressIdentity {
+                source,
+                trust_tier,
+                label,
+                expires_at,
+            },
+            Utc::now(),
+        ),
         _ => IngressIdentity::default(),
     }
 }
@@ -416,6 +419,29 @@ fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
         .map(|value| value.with_timezone(&Utc))
 }
 
+fn stale_ingress_identity_to_weakly_asserted(
+    mut identity: IngressIdentity,
+    now: DateTime<Utc>,
+) -> IngressIdentity {
+    let Some(expires_at) = identity.expires_at else {
+        return identity;
+    };
+    if expires_at > now {
+        return identity;
+    }
+
+    if matches!(
+        identity.trust_tier,
+        IngressTrustTier::Allowlisted
+            | IngressTrustTier::EdgeVerified
+            | IngressTrustTier::SignedAttested
+    ) {
+        identity.trust_tier = IngressTrustTier::WeaklyAsserted;
+    }
+
+    identity
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,7 +544,7 @@ mod tests {
             (INGRESS_IDENTITY_LABEL_HEADER_NAME, "internal-crawler"),
             (
                 INGRESS_IDENTITY_EXPIRES_AT_HEADER_NAME,
-                "2026-06-04T12:00:00Z",
+                "2999-06-04T12:00:00Z",
             ),
         ]);
 
@@ -530,7 +556,7 @@ mod tests {
                 trust_tier: IngressTrustTier::Allowlisted,
                 label: Some("internal-crawler".to_string()),
                 expires_at: Some(
-                    DateTime::parse_from_rfc3339("2026-06-04T12:00:00Z")
+                    DateTime::parse_from_rfc3339("2999-06-04T12:00:00Z")
                         .expect("timestamp should parse")
                         .with_timezone(&Utc),
                 ),
@@ -623,6 +649,35 @@ mod tests {
         assert_eq!(identity.source, IngressIdentitySource::SignedAgent);
         assert_eq!(identity.trust_tier, IngressTrustTier::SignedAttested);
         assert_eq!(identity.label.as_deref(), Some("edge-signed-agent"));
+    }
+
+    #[test]
+    fn stale_authenticated_ingress_identity_degrades_to_weakly_asserted() {
+        let identity = authenticated_ingress_identity_from_headers(
+            [
+                (INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+                (INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+                (INGRESS_IDENTITY_LABEL_HEADER_NAME, "edge-signed-agent"),
+                (
+                    INGRESS_IDENTITY_EXPIRES_AT_HEADER_NAME,
+                    "2000-01-01T00:00:00Z",
+                ),
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            ],
+            Some("edge-secret"),
+        );
+
+        assert_eq!(identity.source, IngressIdentitySource::SignedAgent);
+        assert_eq!(identity.trust_tier, IngressTrustTier::WeaklyAsserted);
+        assert_eq!(identity.label.as_deref(), Some("edge-signed-agent"));
+        assert_eq!(
+            identity.expires_at,
+            Some(
+                DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                    .expect("timestamp should parse")
+                    .with_timezone(&Utc),
+            )
+        );
     }
 
     #[test]

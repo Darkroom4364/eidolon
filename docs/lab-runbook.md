@@ -367,6 +367,12 @@ That smoke proves the docs crawler header alone is not enough: the same request
 stays baited when the configured local allowlist source CIDR does not match the
 direct OrbStack peer.
 
+For explicit trusted-ingress freshness, run
+`examples/shield-lab/smoke-trusted-ingress-expired-claim-orbstack.sh`. That
+smoke proves a transport-authenticated but expired explicit claim is still
+recorded, but only as `weakly_asserted`, and the baited OpenAPI surface stays
+active.
+
 ## M3 Scripted Bakeoff Runner
 
 The scripted M3 runner creates the first comparable artifact shape across the four static controls and Eidolon MVP. It is runner plumbing for M3, not the final empirical uniqueness result. Final M3 still requires authorized agentic or scanner runs and proxy trace artifacts.
