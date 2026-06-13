@@ -15,6 +15,7 @@ pub struct ResolvedIngressTrust {
     pub identity: IngressIdentity,
     pub path_prefixes: Vec<String>,
     pub bait_soften_path_prefixes: Option<Vec<String>>,
+    pub source_cidrs: Option<Vec<String>>,
 }
 
 impl IngressIdentityResolver {
@@ -51,6 +52,10 @@ impl IngressIdentityResolver {
                 identity: entry.identity.clone(),
                 path_prefixes: entry.path_prefixes.clone(),
                 bait_soften_path_prefixes: entry.bait_soften_path_prefixes.clone(),
+                source_cidrs: entry
+                    .source_cidrs
+                    .as_ref()
+                    .map(|cidrs| cidrs.iter().map(ToString::to_string).collect()),
             })
     }
 }
