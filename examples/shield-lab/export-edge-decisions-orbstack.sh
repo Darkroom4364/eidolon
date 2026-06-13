@@ -17,6 +17,8 @@ MIN_POLYMORPHIC_COVERAGE=""
 LATEST_MINT_OUTCOME=""
 TRUSTED_SOFTEN_LABEL=""
 TRUSTED_SOFTEN_PATH_SOFTENED=""
+TRUSTED_SOFTEN_HISTORY_LABEL=""
+TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED=""
 WEBHOOK_URL=""
 OUTPUT_PATH=""
 
@@ -46,6 +48,13 @@ Options:
                          Keep only sessions whose matched trusted-ingress
                          soften scope recorded the given request-path softened
                          status.
+  --trusted-soften-history-label <label>
+                         Keep only sessions whose trusted-ingress soften
+                         history includes the given label.
+  --trusted-soften-history-path-softened <true|false>
+                         Keep only sessions whose trusted-ingress soften
+                         history includes at least one request with the given
+                         softened or unsoftened status.
   --webhook-url <URL>    POST each export to this webhook as application/json.
   --output <PATH>        Write exports to a file instead of stdout.
   -h, --help             Show this help text.
@@ -246,6 +255,46 @@ filter_by_trusted_soften_path_softened() {
       select(
         (.trusted_ingress_soften_match // null) != null
         and ((.trusted_ingress_soften_match.request_path_softened // false) == $path_softened)
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_trusted_soften_history_label() {
+  local input_file="$1"
+  local output_file="$2"
+  local label="$3"
+
+  jq -s -c --arg label "$label" '
+    map(
+      select(
+        any(
+          (.evidence.trusted_ingress_soften_histories // [])[];
+          (.label // "") == $label
+        )
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_trusted_soften_history_path_softened() {
+  local input_file="$1"
+  local output_file="$2"
+  local path_softened="$3"
+
+  jq -s -c --argjson path_softened "$path_softened" '
+    map(
+      select(
+        any(
+          (.evidence.trusted_ingress_soften_histories // [])[];
+          if $path_softened then
+            (.saw_request_path_softened // false)
+          else
+            (.saw_request_path_unsoftened // false)
+          end
+        )
       )
     )
     | .[]
@@ -577,6 +626,16 @@ while [[ $# -gt 0 ]]; do
       TRUSTED_SOFTEN_PATH_SOFTENED="$2"
       shift 2
       ;;
+    --trusted-soften-history-label)
+      [[ $# -ge 2 ]] || fail "missing value for --trusted-soften-history-label"
+      TRUSTED_SOFTEN_HISTORY_LABEL="$2"
+      shift 2
+      ;;
+    --trusted-soften-history-path-softened)
+      [[ $# -ge 2 ]] || fail "missing value for --trusted-soften-history-path-softened"
+      TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED="$2"
+      shift 2
+      ;;
     --webhook-url)
       [[ $# -ge 2 ]] || fail "missing value for --webhook-url"
       WEBHOOK_URL="$2"
@@ -637,6 +696,16 @@ if [[ -n "$TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
       ;;
     *)
       fail "--trusted-soften-path-softened must be true or false"
+      ;;
+  esac
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" ]]; then
+  case "$TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" in
+    true|false)
+      ;;
+    *)
+      fail "--trusted-soften-history-path-softened must be true or false"
       ;;
   esac
 fi
@@ -796,6 +865,30 @@ if [[ -n "$TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
   rendered_ndjson="$filtered_ndjson"
   if [[ ! -s "$rendered_ndjson" ]]; then
     fail "no edge decision exports matched --trusted-soften-path-softened ${TRUSTED_SOFTEN_PATH_SOFTENED}"
+  fi
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_HISTORY_LABEL" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.trusted-soften-history-label-filtered.ndjson"
+  filter_by_trusted_soften_history_label \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$TRUSTED_SOFTEN_HISTORY_LABEL"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --trusted-soften-history-label ${TRUSTED_SOFTEN_HISTORY_LABEL}"
+  fi
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.trusted-soften-history-path-filtered.ndjson"
+  filter_by_trusted_soften_history_path_softened \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --trusted-soften-history-path-softened ${TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED}"
   fi
 fi
 

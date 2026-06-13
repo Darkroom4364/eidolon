@@ -286,6 +286,52 @@ test_filters_sessions_by_trusted_soften_path_softened() {
   ' <<<"$output" >/dev/null
 }
 
+test_filters_sessions_by_trusted_soften_history_label() {
+  local temp_dir state_dir output
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
+      --trusted-soften-history-label docs-crawler
+  )"
+
+  jq -e '
+    length == 2
+    and any(.[]; .session_id == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+      and .evidence.trusted_ingress_soften_histories[0].saw_request_path_softened == true)
+    and any(.[]; .session_id == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+      and .evidence.trusted_ingress_soften_histories[0].saw_request_path_unsoftened == true)
+  ' <<<"$output" >/dev/null
+}
+
+test_filters_sessions_by_trusted_soften_history_path_softened() {
+  local temp_dir state_dir output
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
+      --trusted-soften-history-path-softened false
+  )"
+
+  jq -e '
+    length == 1
+    and .[0].session_id == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    and .[0].evidence.trusted_ingress_soften_histories[0].saw_request_path_unsoftened == true
+  ' <<<"$output" >/dev/null
+}
+
 test_renders_single_session_markdown_summary() {
   local temp_dir state_dir output
   temp_dir="$(new_temp_dir)"
@@ -431,6 +477,17 @@ test_top_rejects_invalid_combinations() {
     EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
       EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
       "$EXPORT_SCRIPT" \
+      --trusted-soften-history-path-softened maybe 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q -- '--trusted-soften-history-path-softened must be true or false' <<<"$output"
+
+  status=0
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
       --top 1 \
       --session aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa 2>&1
   )" || status="$?"
@@ -487,6 +544,17 @@ test_fails_when_no_sessions_match_trusted_soften_filters() {
 
   [[ "$status" -eq 2 ]]
   rg -q 'no edge decision exports matched --trusted-soften-label googlebot' <<<"$output"
+
+  status=0
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
+      --trusted-soften-history-label missing-crawler 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'no edge decision exports matched --trusted-soften-history-label missing-crawler' <<<"$output"
 }
 
 test_fails_when_no_request_seen_sessions_exist() {
@@ -517,6 +585,8 @@ test_filters_sessions_by_min_polymorphic_coverage
 test_filters_sessions_by_latest_mint_outcome
 test_filters_sessions_by_trusted_soften_label
 test_filters_sessions_by_trusted_soften_path_softened
+test_filters_sessions_by_trusted_soften_history_label
+test_filters_sessions_by_trusted_soften_history_path_softened
 test_renders_single_session_markdown_summary
 test_renders_trusted_soften_history_when_current_match_is_absent
 test_markdown_requires_single_session_and_no_webhook
