@@ -171,6 +171,23 @@ render_edge_session_index() {
             unobserved_bait_ids: ($active_ids | map(. as $bait_id | select($observed_active_ids | index($bait_id) == null)))
           }
       end;
+    def trusted_soften_summary($match):
+      if $match == null then
+        code("none")
+      else
+        code($match.label // ($match.source + "/" + $match.trust_tier))
+        + " (soften "
+        + (
+            if (($match.bait_soften_path_prefixes // []) | length) == 0 then
+              code("none")
+            else
+              (($match.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+            end
+          )
+        + "; path softened "
+        + code($match.request_path_softened)
+        + ")"
+      end;
     def severity_rank($state):
       if $state == "blocked" then 5
       elif $state == "controlled_reality" then 4
@@ -218,8 +235,8 @@ render_edge_session_index() {
           end
         ),
         "",
-        "| Session | Observed | Request | Policy | Action | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Session | Observed | Request | Policy | Action | Trusted Soften Match | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         (
           $shown
           | to_entries[]
@@ -227,6 +244,7 @@ render_edge_session_index() {
           | ($value.deployment_context // {}) as $deployment
           | ($value.evidence.bait_header_value_mints // []) as $mint_audits
           | ($value.evidence.latest_bait_header_value_mint // null) as $latest_mint
+          | ($value.trusted_ingress_soften_match // null) as $trusted_soften_match
           | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
           | "| "
             + code("<redacted-" + ((.key + 1) | tostring) + ">")
@@ -238,6 +256,8 @@ render_edge_session_index() {
             + code($value.policy.state)
             + " | "
             + code($value.edge_recommendation.action)
+            + " | "
+            + trusted_soften_summary($trusted_soften_match)
             + " | "
             + (
                 if ($mint_audits | length) == 0 then
@@ -392,6 +412,7 @@ render_selected_session_summary() {
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
     | ($export.deployment_context // {}) as $deployment
+    | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
@@ -449,6 +470,38 @@ render_selected_session_summary() {
           end
         )),
         optional_line("Ingress edge action hint"; (($signals.edge_action // null) | if . != null then code(.) else empty end)),
+        optional_line("Trusted soften match"; (
+          if $trusted_soften_match != null then
+            code($trusted_soften_match.label // ($trusted_soften_match.source + "/" + $trusted_soften_match.trust_tier))
+            + " (" + code($trusted_soften_match.source) + " / " + code($trusted_soften_match.trust_tier) + ")"
+          else
+            empty
+          end
+        )),
+        optional_line("Trusted soften scope"; (
+          if $trusted_soften_match != null then
+            "soften "
+            + (
+                if (($trusted_soften_match.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  (($trusted_soften_match.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if (($trusted_soften_match.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; request path softened "
+            + code($trusted_soften_match.request_path_softened)
+          else
+            empty
+          end
+        )),
         "",
         "## Structured Recon Score",
         (if ($score.total // 0) > 0 then

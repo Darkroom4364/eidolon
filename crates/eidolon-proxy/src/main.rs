@@ -3672,6 +3672,7 @@ fn request_seen_event(
             path: redacted_event_target(path),
             safe_headers: safe_header_observations(&request.headers),
             ingress_identity: session.ingress_identity.clone(),
+            trusted_ingress_soften_match: session.trusted_ingress_soften_match.clone(),
             ingress_signals: session.ingress_signals.clone(),
             discovery_recon_score: event_discovery_recon_score(
                 discovery_recon_score,
@@ -3783,13 +3784,27 @@ fn effective_session_context(
         session.ingress_identity.clone(),
         local_trust.as_ref().map(|trust| trust.identity.clone()),
     );
-    session.trusted_bait_soften_path_prefixes = local_trust.and_then(|trust| {
-        if merged_identity == trust.identity {
-            trust.bait_soften_path_prefixes
-        } else {
-            None
+    session.trusted_ingress_soften_match = local_trust.as_ref().and_then(|trust| {
+        if merged_identity != trust.identity {
+            return None;
         }
+
+        let bait_soften_path_prefixes = trust.bait_soften_path_prefixes.clone()?;
+        Some(eidolon_core::TrustedIngressSoftenMatch {
+            label: trust.identity.label.clone(),
+            source: trust.identity.source,
+            trust_tier: trust.identity.trust_tier,
+            path_prefixes: trust.path_prefixes.clone(),
+            request_path_softened: bait_soften_path_prefixes
+                .iter()
+                .any(|prefix| surface_request.path.starts_with(prefix)),
+            bait_soften_path_prefixes,
+        })
     });
+    session.trusted_bait_soften_path_prefixes = session
+        .trusted_ingress_soften_match
+        .as_ref()
+        .map(|scope| scope.bait_soften_path_prefixes.clone());
     session.ingress_identity = merged_identity;
 
     session
@@ -6764,6 +6779,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: Default::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
@@ -11011,6 +11027,15 @@ mod tests {
         assert_eq!(docs_response.status, 200);
         assert_eq!(docs_body, docs_original);
         assert_event_routing(&docs_event_log_path, "request_seen", "protected_upstream");
+        let docs_request_event = first_event_of_type(&docs_event_log_path, "request_seen");
+        assert_eq!(
+            docs_request_event["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            docs_request_event["kind"]["trusted_ingress_soften_match"]["request_path_softened"],
+            true
+        );
         assert_event_type_absent(&docs_event_log_path, "bait_exposed");
         let docs_surface_debug = first_debug_event(&docs_debug_log_path, "surface_action_selected");
         assert_eq!(
@@ -11056,6 +11081,15 @@ mod tests {
 
         assert_eq!(openapi_response.status, 200);
         assert!(openapi_body["paths"]["/api/v2/import/reconcile"].is_object());
+        let openapi_request_event = first_event_of_type(&openapi_event_log_path, "request_seen");
+        assert_eq!(
+            openapi_request_event["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            openapi_request_event["kind"]["trusted_ingress_soften_match"]["request_path_softened"],
+            false
+        );
         assert_event_routing(
             &openapi_event_log_path,
             "policy_decision",

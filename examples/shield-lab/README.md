@@ -651,9 +651,13 @@ current polymorphic bait matrix, and any active trusted-ingress soften scopes
 alongside the session-level evidence. That same context now also includes a
 structured `polymorphic_bait_coverage` summary, so JSON consumers can see
 observed-vs-active minted bait coverage without comparing the two lists
-manually. When `evidence.latest_bait_header_value_mint` is present, the
-markdown summaries now also show whether the latest minted bait-shaped action
-was a `matched_session_value` or `session_value_mismatch`.
+manually. When a request actually matched one of the local trusted soften
+entries, the export now also carries a session-level
+`trusted_ingress_soften_match` with the matched label/scope and whether the
+current request path was inside the narrower soften subset. When
+`evidence.latest_bait_header_value_mint` is present, the markdown summaries now
+also show whether the latest minted bait-shaped action was a
+`matched_session_value` or `session_value_mismatch`.
 
 `--top <N>` ranks sessions by enforcement severity and recency first, so
 operators can pull a compact high-signal slice before exporting a full bundle.
@@ -681,7 +685,8 @@ EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME=session_value_mismatch \
 
 For a single-session operator summary that already combines session-level mint
 evidence with the active deployment polymorphic matrix, trusted soften scopes,
-and a coverage summary, render markdown from the same enriched export path:
+matched trusted soften context, and a coverage summary, render markdown from
+the same enriched export path:
 
 ```sh
 examples/shield-lab/export-edge-decisions-orbstack.sh \

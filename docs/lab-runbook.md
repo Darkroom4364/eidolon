@@ -320,7 +320,10 @@ header outcome as `matched_session_value` or `session_value_mismatch` when
 available. The same deployment context now also carries active trusted-ingress
 soften scopes into the JSON and markdown export path, so offline review can
 see which trusted identities were allowed to narrow bait softening during that
-run. For live export triage, `export-edge-decisions-orbstack.sh`
+run. When a request actually matched one of those scopes, the enriched edge
+export now also carries a session-level trusted soften match with the matched
+label and whether that specific request path was inside the narrower soften
+subset. For live export triage, `export-edge-decisions-orbstack.sh`
 also supports `--min-polymorphic-coverage <N>`, and the bundle index supports
 the matching `EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE`
 environment override. The same live export path also supports

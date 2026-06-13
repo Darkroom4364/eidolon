@@ -265,6 +265,7 @@ pub fn edge_decision_export_for_evidence(
             method,
             path,
             ingress_identity,
+            trusted_ingress_soften_match,
             ingress_signals,
             discovery_recon_score,
             routing_decision,
@@ -279,6 +280,7 @@ pub fn edge_decision_export_for_evidence(
             method.clone(),
             path.clone(),
             ingress_identity.clone(),
+            trusted_ingress_soften_match.clone(),
             ingress_signals.clone(),
             discovery_recon_score.clone(),
             *routing_decision,
@@ -290,6 +292,7 @@ pub fn edge_decision_export_for_evidence(
         method,
         path,
         ingress_identity,
+        trusted_ingress_soften_match,
         ingress_signals,
         discovery_recon_score,
         request_routing_decision,
@@ -328,6 +331,7 @@ pub fn edge_decision_export_for_evidence(
         session_id: bundle.session_id,
         request: EdgeRequestRef { method, path },
         ingress_identity,
+        trusted_ingress_soften_match,
         ingress_signals,
         discovery_recon_score,
         policy: EdgePolicySnapshot {
@@ -1020,6 +1024,7 @@ mod tests {
                     },
                 ],
                 ingress_identity: IngressIdentity::default(),
+                trusted_ingress_soften_match: None,
                 ingress_signals: Default::default(),
                 discovery_recon_score: Default::default(),
                 routing_decision: RoutingDecision::EidolonOwned,
@@ -1037,6 +1042,7 @@ mod tests {
                 path: "/openapi.json".to_string(),
                 safe_headers: Vec::new(),
                 ingress_identity: IngressIdentity::default(),
+                trusted_ingress_soften_match: None,
                 ingress_signals: IngressAdvisorySignals {
                     verification_strength: IngressVerificationStrength::Cryptographic,
                     actor_kind: IngressActorKind::AgenticBrowser,
@@ -1127,6 +1133,7 @@ mod tests {
                 path: "/admin/decoy".to_string(),
                 safe_headers: Vec::new(),
                 ingress_identity: IngressIdentity::default(),
+                trusted_ingress_soften_match: None,
                 ingress_signals: Default::default(),
                 discovery_recon_score: Default::default(),
                 routing_decision,
@@ -1293,6 +1300,7 @@ mod tests {
                             .to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
@@ -1318,6 +1326,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ControlledReality,
@@ -1380,6 +1389,14 @@ mod tests {
                         label: Some("internal-crawler".to_string()),
                         expires_at: None,
                     },
+                    trusted_ingress_soften_match: Some(eidolon_core::TrustedIngressSoftenMatch {
+                        label: Some("internal-crawler".to_string()),
+                        source: IngressIdentitySource::LocalAllowlist,
+                        trust_tier: IngressTrustTier::Allowlisted,
+                        path_prefixes: vec!["/docs".to_string()],
+                        bait_soften_path_prefixes: vec!["/docs".to_string()],
+                        request_path_softened: true,
+                    }),
                     ingress_signals: IngressAdvisorySignals {
                         verification_strength: IngressVerificationStrength::High,
                         actor_kind: IngressActorKind::Crawler,
@@ -1423,6 +1440,20 @@ mod tests {
             export.ingress_identity.label.as_deref(),
             Some("internal-crawler")
         );
+        assert_eq!(
+            export
+                .trusted_ingress_soften_match
+                .as_ref()
+                .and_then(|scope| scope.label.as_deref()),
+            Some("internal-crawler")
+        );
+        assert_eq!(
+            export
+                .trusted_ingress_soften_match
+                .as_ref()
+                .map(|scope| scope.request_path_softened),
+            Some(true)
+        );
         assert_eq!(export.ingress_signals.vendor_score, Some(12));
         assert_eq!(
             export.ingress_signals.edge_action,
@@ -1455,6 +1486,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ControlledReality,
@@ -1508,6 +1540,7 @@ mod tests {
                     path: "/docs/minted-trace".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
@@ -1533,6 +1566,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ControlledReality,
@@ -1599,6 +1633,7 @@ mod tests {
                     path: "/docs/minted-trace".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
@@ -1637,6 +1672,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
@@ -1677,6 +1713,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: DiscoveryReconScore {
                         repeated_discovery_score: 2,
@@ -1747,6 +1784,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::RateLimited,
@@ -1806,6 +1844,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: IngressAdvisorySignals {
                         actor_kind: eidolon_core::IngressActorKind::AgenticBrowser,
                         vendor_score: Some(35),
@@ -1889,6 +1928,7 @@ mod tests {
                     path: "/api/v1/projects".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::EidolonOwned,
@@ -1951,6 +1991,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::EidolonOwned,
@@ -2018,6 +2059,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: DiscoveryReconScore {
                         repeated_discovery_score: 2,
@@ -2096,6 +2138,7 @@ mod tests {
                     path: "/api/v2/import/validate".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: DiscoveryReconScore {
                         repeated_discovery_score: 0,
@@ -2174,6 +2217,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::EidolonOwned,

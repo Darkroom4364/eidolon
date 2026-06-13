@@ -463,6 +463,8 @@ pub enum EventKind {
         safe_headers: Vec<SafeHeaderObservation>,
         #[serde(default)]
         ingress_identity: IngressIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
         #[serde(default, skip_serializing_if = "IngressAdvisorySignals::is_empty")]
         ingress_signals: IngressAdvisorySignals,
         #[serde(default, skip_serializing_if = "DiscoveryReconScore::is_empty")]
@@ -661,6 +663,19 @@ pub struct EdgeTrustedIngressSoftenScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedIngressSoftenMatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub source: IngressIdentitySource,
+    pub trust_tier: IngressTrustTier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bait_soften_path_prefixes: Vec<String>,
+    pub request_path_softened: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeDeploymentContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bait_profile_id: Option<String>,
@@ -687,6 +702,8 @@ pub struct EidolonEdgeDecisionExport {
     pub session_id: SessionId,
     pub request: EdgeRequestRef,
     pub ingress_identity: IngressIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
     #[serde(default, skip_serializing_if = "IngressAdvisorySignals::is_empty")]
     pub ingress_signals: IngressAdvisorySignals,
     #[serde(default, skip_serializing_if = "DiscoveryReconScore::is_empty")]
@@ -738,6 +755,7 @@ mod tests {
                     present: true,
                 }],
                 ingress_identity: IngressIdentity::default(),
+                trusted_ingress_soften_match: None,
                 ingress_signals: IngressAdvisorySignals::default(),
                 discovery_recon_score: DiscoveryReconScore::default(),
                 routing_decision: RoutingDecision::ProtectedUpstream,
@@ -794,6 +812,14 @@ mod tests {
                     label: Some("googlebot".to_string()),
                     expires_at: None,
                 },
+                trusted_ingress_soften_match: Some(TrustedIngressSoftenMatch {
+                    label: Some("docs-crawler".to_string()),
+                    source: IngressIdentitySource::LocalAllowlist,
+                    trust_tier: IngressTrustTier::Allowlisted,
+                    path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                    bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    request_path_softened: false,
+                }),
                 ingress_signals: IngressAdvisorySignals {
                     verification_strength: IngressVerificationStrength::High,
                     actor_kind: IngressActorKind::Crawler,
@@ -827,6 +853,14 @@ mod tests {
             "edge_verified"
         );
         assert_eq!(serialized["kind"]["ingress_identity"]["label"], "googlebot");
+        assert_eq!(
+            serialized["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            serialized["kind"]["trusted_ingress_soften_match"]["request_path_softened"],
+            false
+        );
         assert_eq!(
             serialized["kind"]["ingress_signals"]["verification_strength"],
             "high"
@@ -1157,6 +1191,14 @@ mod tests {
                 label: Some("googlebot".to_string()),
                 expires_at: None,
             },
+            trusted_ingress_soften_match: Some(TrustedIngressSoftenMatch {
+                label: Some("docs-crawler".to_string()),
+                source: IngressIdentitySource::LocalAllowlist,
+                trust_tier: IngressTrustTier::Allowlisted,
+                path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                bait_soften_path_prefixes: vec!["/docs".to_string()],
+                request_path_softened: false,
+            }),
             ingress_signals: IngressAdvisorySignals {
                 verification_strength: IngressVerificationStrength::High,
                 actor_kind: IngressActorKind::Crawler,
@@ -1251,6 +1293,14 @@ mod tests {
         assert_eq!(
             serialized["ingress_identity"]["trust_tier"],
             json!("edge_verified")
+        );
+        assert_eq!(
+            serialized["trusted_ingress_soften_match"]["label"],
+            json!("docs-crawler")
+        );
+        assert_eq!(
+            serialized["trusted_ingress_soften_match"]["request_path_softened"],
+            json!(false)
         );
         assert_eq!(serialized["ingress_signals"]["vendor_score"], json!(12));
         assert_eq!(serialized["ingress_signals"]["edge_action"], json!("allow"));

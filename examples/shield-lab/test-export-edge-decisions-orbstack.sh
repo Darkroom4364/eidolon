@@ -54,7 +54,7 @@ if [[ ! -f "$events" ]]; then
 fi
 
 if [[ "$session" == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" ]]; then
-  printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:00Z","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","request":{"method":"GET","path":"/docs/service-token"},"ingress_identity":{"source":"verified_bot","trust_tier":"edge_verified","label":"googlebot"},"policy":{"state":"observe","routing_decision":"protected_upstream","reason":"trusted ingress identity suppressed bait surface intervention before runtime suspicion was established"},"evidence":{"event_schema_version":2,"event_ids":["11111111-1111-1111-1111-111111111111"],"bundle_ref":"session:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"matched_session_value"}},"edge_recommendation":{"action":"allow","ttl_seconds":300,"reason_codes":["trusted_identity","bait_softened"]}}'
+  printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:00Z","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","request":{"method":"GET","path":"/docs/service-token"},"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"request_path_softened":true},"policy":{"state":"observe","routing_decision":"protected_upstream","reason":"trusted ingress identity suppressed bait surface intervention before runtime suspicion was established"},"evidence":{"event_schema_version":2,"event_ids":["11111111-1111-1111-1111-111111111111"],"bundle_ref":"session:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"matched_session_value"}},"edge_recommendation":{"action":"allow","ttl_seconds":300,"reason_codes":["trusted_identity","bait_softened"]}}'
 elif [[ "$session" == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" ]]; then
   printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:01:00Z","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","request":{"method":"POST","path":"/api/v2/import/reconcile"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"controlled_reality","routing_decision":"controlled_reality","reason":"confirmed bait-derived action moved session into controlled reality","post_containment_persistence_kind":"controlled_reality_branch_escape"},"evidence":{"event_schema_version":2,"event_ids":["33333333-3333-3333-3333-333333333333"],"bundle_ref":"session:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},"edge_recommendation":{"action":"preserve_eidolon_routing","ttl_seconds":300,"reason_codes":["eidolon_runtime_enforcement","controlled_reality"]}}'
 else
@@ -96,6 +96,8 @@ test_exports_all_sessions_as_json_array() {
       and .deployment_context.polymorphic_bait_coverage.active_bait_count == 3
       and .deployment_context.polymorphic_bait_coverage.observed_bait_count == 1
       and .deployment_context.polymorphic_bait_coverage.observed_bait_ids == ["fake_service_token"]
+      and .trusted_ingress_soften_match.label == "docs-crawler"
+      and .trusted_ingress_soften_match.request_path_softened == true
       and .deployment_context.trusted_ingress_soften_scopes[0].label == "docs-crawler"
       and .deployment_context.trusted_ingress_soften_scopes[0].bait_soften_path_prefixes == ["/docs"])
     and any(.[]; .session_id == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -259,6 +261,8 @@ test_renders_single_session_markdown_summary() {
   rg -q '/docs/legacy-import' <<<"$output"
   rg -q '/openapi.json' <<<"$output"
   rg -q '/docs/service-token' <<<"$output"
+  rg -q 'Trusted soften match: `docs-crawler` \(`local_allowlist` / `allowlisted`\)' <<<"$output"
+  rg -q 'Trusted soften scope: soften `/docs`; match `/docs`, `/openapi.json`; request path softened `true`' <<<"$output"
   rg -q '## Active Trusted Ingress Softening' <<<"$output"
   rg -q 'Scope `docs-crawler`: soften `/docs`; match `/docs`, `/openapi.json`; identity `local_allowlist` / `allowlisted`' <<<"$output"
 }
