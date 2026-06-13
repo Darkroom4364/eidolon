@@ -659,6 +659,8 @@ pub struct EdgeTrustedIngressSoftenScope {
     pub label: Option<String>,
     pub source: IngressIdentitySource,
     pub trust_tier: IngressTrustTier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1312,6 +1314,7 @@ mod tests {
                     label: Some("docs-crawler".to_string()),
                     source: IngressIdentitySource::LocalAllowlist,
                     trust_tier: IngressTrustTier::Allowlisted,
+                    expires_at: None,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
