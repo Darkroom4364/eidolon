@@ -15,6 +15,10 @@ SESSION_ID=""
 TOP_LIMIT=""
 MIN_POLYMORPHIC_COVERAGE=""
 LATEST_MINT_OUTCOME=""
+TRUSTED_SOFTEN_LABEL=""
+TRUSTED_SOFTEN_PATH_SOFTENED=""
+TRUSTED_SOFTEN_HISTORY_LABEL=""
+TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED=""
 WEBHOOK_URL=""
 OUTPUT_PATH=""
 
@@ -37,6 +41,20 @@ Options:
   --latest-mint-outcome <matched_session_value|session_value_mismatch>
                          Keep only sessions whose latest exported minted bait
                          outcome matches the given status.
+  --trusted-soften-label <label>
+                         Keep only sessions whose matched trusted-ingress
+                         soften scope label matches the given value.
+  --trusted-soften-path-softened <true|false>
+                         Keep only sessions whose matched trusted-ingress
+                         soften scope recorded the given request-path softened
+                         status.
+  --trusted-soften-history-label <label>
+                         Keep only sessions whose trusted-ingress soften
+                         history includes the given label.
+  --trusted-soften-history-path-softened <true|false>
+                         Keep only sessions whose trusted-ingress soften
+                         history includes at least one request with the given
+                         softened or unsoftened status.
   --webhook-url <URL>    POST each export to this webhook as application/json.
   --output <PATH>        Write exports to a file instead of stdout.
   -h, --help             Show this help text.
@@ -212,6 +230,77 @@ filter_by_latest_mint_outcome() {
   ' "$input_file" > "$output_file"
 }
 
+filter_by_trusted_soften_label() {
+  local input_file="$1"
+  local output_file="$2"
+  local label="$3"
+
+  jq -s -c --arg label "$label" '
+    map(
+      select(
+        (.trusted_ingress_soften_match.label // "") == $label
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_trusted_soften_path_softened() {
+  local input_file="$1"
+  local output_file="$2"
+  local path_softened="$3"
+
+  jq -s -c --argjson path_softened "$path_softened" '
+    map(
+      select(
+        (.trusted_ingress_soften_match // null) != null
+        and ((.trusted_ingress_soften_match.request_path_softened // false) == $path_softened)
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_trusted_soften_history_label() {
+  local input_file="$1"
+  local output_file="$2"
+  local label="$3"
+
+  jq -s -c --arg label "$label" '
+    map(
+      select(
+        any(
+          (.evidence.trusted_ingress_soften_histories // [])[];
+          (.label // "") == $label
+        )
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_trusted_soften_history_path_softened() {
+  local input_file="$1"
+  local output_file="$2"
+  local path_softened="$3"
+
+  jq -s -c --argjson path_softened "$path_softened" '
+    map(
+      select(
+        any(
+          (.evidence.trusted_ingress_soften_histories // [])[];
+          if $path_softened then
+            (.saw_request_path_softened // false)
+          else
+            (.saw_request_path_unsoftened // false)
+          end
+        )
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
 render_markdown_export() {
   local export_file="$1"
 
@@ -254,6 +343,21 @@ render_markdown_export() {
         + code(.trust_tier // "none")
         + (if (.label // null) != null then " (" + code(.label) + ")" else "" end)
       end;
+    def trusted_soften_history_summary($histories):
+      if ($histories | length) == 0 then
+        empty
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " [softened "
+             + code(.saw_request_path_softened)
+             + ", unsoftened "
+             + code(.saw_request_path_unsoftened)
+             + "]"
+           )
+         | join(", "))
+      end;
     def recon_component_lines($score):
       [
         optional_line("repeated_discovery_score"; ($score.repeated_discovery_score // 0 | if . > 0 then code(.) else empty end)),
@@ -270,9 +374,12 @@ render_markdown_export() {
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
     | ($export.deployment_context // {}) as $deployment
+    | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
+    | ($export.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
+    | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
     | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
     | (recon_component_lines($score)) as $recon_components
     | [
@@ -324,6 +431,39 @@ render_markdown_export() {
           end
         )),
         optional_line("Ingress edge action hint"; (($signals.edge_action // null) | if . != null then code(.) else empty end)),
+        optional_line("Trusted soften match"; (
+          if $trusted_soften_match != null then
+            code($trusted_soften_match.label // ($trusted_soften_match.source + "/" + $trusted_soften_match.trust_tier))
+            + " (" + code($trusted_soften_match.source) + " / " + code($trusted_soften_match.trust_tier) + ")"
+          else
+            empty
+          end
+        )),
+        optional_line("Trusted soften scope"; (
+          if $trusted_soften_match != null then
+            "soften "
+            + (
+                if (($trusted_soften_match.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  (($trusted_soften_match.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if (($trusted_soften_match.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; request path softened "
+            + code($trusted_soften_match.request_path_softened)
+          else
+            empty
+          end
+        )),
+        optional_line("Trusted soften history"; trusted_soften_history_summary($trusted_soften_histories)),
         "",
         "## Structured Recon Score",
         (if ($score.total // 0) > 0 then
@@ -410,6 +550,38 @@ render_markdown_export() {
             + ", bait "
             + code(.bait_id)
             + "]"
+        ),
+        "",
+        "## Active Trusted Ingress Softening",
+        (if ($active_trusted_soften_scopes | length) == 0 then
+          "- No active trusted-ingress soften scopes."
+        else
+          empty
+        end),
+        (
+          $active_trusted_soften_scopes[]
+          | "- Scope "
+            + code((.label // (.source + "/" + .trust_tier)))
+            + ": soften "
+            + (
+                if ((.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  ((.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if ((.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  ((.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; identity "
+            + code(.source)
+            + " / "
+            + code(.trust_tier)
         )
       ]
     | map(select(. != ""))
@@ -442,6 +614,26 @@ while [[ $# -gt 0 ]]; do
     --latest-mint-outcome)
       [[ $# -ge 2 ]] || fail "missing value for --latest-mint-outcome"
       LATEST_MINT_OUTCOME="$2"
+      shift 2
+      ;;
+    --trusted-soften-label)
+      [[ $# -ge 2 ]] || fail "missing value for --trusted-soften-label"
+      TRUSTED_SOFTEN_LABEL="$2"
+      shift 2
+      ;;
+    --trusted-soften-path-softened)
+      [[ $# -ge 2 ]] || fail "missing value for --trusted-soften-path-softened"
+      TRUSTED_SOFTEN_PATH_SOFTENED="$2"
+      shift 2
+      ;;
+    --trusted-soften-history-label)
+      [[ $# -ge 2 ]] || fail "missing value for --trusted-soften-history-label"
+      TRUSTED_SOFTEN_HISTORY_LABEL="$2"
+      shift 2
+      ;;
+    --trusted-soften-history-path-softened)
+      [[ $# -ge 2 ]] || fail "missing value for --trusted-soften-history-path-softened"
+      TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED="$2"
       shift 2
       ;;
     --webhook-url)
@@ -498,6 +690,26 @@ if [[ -n "$LATEST_MINT_OUTCOME" ]]; then
   esac
 fi
 
+if [[ -n "$TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
+  case "$TRUSTED_SOFTEN_PATH_SOFTENED" in
+    true|false)
+      ;;
+    *)
+      fail "--trusted-soften-path-softened must be true or false"
+      ;;
+  esac
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" ]]; then
+  case "$TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" in
+    true|false)
+      ;;
+    *)
+      fail "--trusted-soften-history-path-softened must be true or false"
+      ;;
+  esac
+fi
+
 if [[ -n "$TOP_LIMIT" && -n "$SESSION_ID" ]]; then
   fail "--top cannot be combined with --session"
 fi
@@ -547,7 +759,8 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
   deployment_context_json="$(
     jq -c '
       if (.bait_profile.profile_id // null) == null
-         and ((.bait_profile.polymorphic_baits // []) | length) == 0 then
+         and ((.bait_profile.polymorphic_baits // []) | length) == 0
+         and ((.ingress_trust.trusted_soften_scopes // []) | length) == 0 then
         null
       else
         {
@@ -561,6 +774,16 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
                 header_name,
                 kind,
                 prefix
+              }
+          ],
+          trusted_ingress_soften_scopes: [
+            (.ingress_trust.trusted_soften_scopes // [])[]
+            | {
+                label,
+                source,
+                trust_tier,
+                path_prefixes,
+                bait_soften_path_prefixes
               }
           ]
         }
@@ -618,6 +841,54 @@ if [[ -n "$LATEST_MINT_OUTCOME" ]]; then
   rendered_ndjson="$filtered_ndjson"
   if [[ ! -s "$rendered_ndjson" ]]; then
     fail "no edge decision exports matched --latest-mint-outcome ${LATEST_MINT_OUTCOME}"
+  fi
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_LABEL" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.trusted-soften-label-filtered.ndjson"
+  filter_by_trusted_soften_label \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$TRUSTED_SOFTEN_LABEL"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --trusted-soften-label ${TRUSTED_SOFTEN_LABEL}"
+  fi
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.trusted-soften-path-filtered.ndjson"
+  filter_by_trusted_soften_path_softened \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$TRUSTED_SOFTEN_PATH_SOFTENED"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --trusted-soften-path-softened ${TRUSTED_SOFTEN_PATH_SOFTENED}"
+  fi
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_HISTORY_LABEL" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.trusted-soften-history-label-filtered.ndjson"
+  filter_by_trusted_soften_history_label \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$TRUSTED_SOFTEN_HISTORY_LABEL"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --trusted-soften-history-label ${TRUSTED_SOFTEN_HISTORY_LABEL}"
+  fi
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.trusted-soften-history-path-filtered.ndjson"
+  filter_by_trusted_soften_history_path_softened \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --trusted-soften-history-path-softened ${TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED}"
   fi
 fi
 

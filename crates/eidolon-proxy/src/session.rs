@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use eidolon_core::{
     EdgeRecommendedAction, IngressActorKind, IngressAdvisorySignals, IngressIdentity,
     IngressIdentitySource, IngressTrustTier, IngressVerificationStrength, SessionId,
+    TrustedIngressSoftenMatch,
 };
 
 /// Request header carrying first-party cookies.
@@ -66,6 +67,8 @@ pub struct SessionContext {
     pub source: SessionSource,
     pub ingress_identity: IngressIdentity,
     pub ingress_signals: IngressAdvisorySignals,
+    pub trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
+    pub trusted_bait_soften_path_prefixes: Option<Vec<String>>,
 }
 
 impl SessionContext {
@@ -116,6 +119,8 @@ where
             source: SessionSource::Cookie,
             ingress_identity,
             ingress_signals,
+            trusted_ingress_soften_match: None,
+            trusted_bait_soften_path_prefixes: None,
         }
     } else {
         SessionContext {
@@ -123,6 +128,8 @@ where
             source: SessionSource::Generated,
             ingress_identity,
             ingress_signals,
+            trusted_ingress_soften_match: None,
+            trusted_bait_soften_path_prefixes: None,
         }
     }
 }

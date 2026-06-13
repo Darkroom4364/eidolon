@@ -28,11 +28,22 @@ spec:
             - $(EIDOLON_POLICY_STATE_PATH)
             - --ingress-transport-auth-secret-file
             - /var/run/secrets/eidolon-trusted-ingress/transport-auth.txt
+            - --ingress-trust-config
+            - /etc/eidolon-ingress-trust/ingress-trust.json
           volumeMounts:
             - name: eidolon-trusted-ingress
               mountPath: /var/run/secrets/eidolon-trusted-ingress
+              readOnly: true
+            - name: eidolon-ingress-trust
+              mountPath: /etc/eidolon-ingress-trust
               readOnly: true
       volumes:
         - name: eidolon-trusted-ingress
           secret:
             secretName: eidolon-trusted-ingress
+        - name: eidolon-ingress-trust
+          configMap:
+            name: eidolon-shield-ingress-trust-config
+            items:
+              - key: ingress-trust.json
+                path: ingress-trust.json

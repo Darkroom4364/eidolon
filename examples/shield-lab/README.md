@@ -60,6 +60,7 @@ Keep out of the private repo:
   export-orbstack-evidence.sh
   export-edge-decisions-orbstack.sh
   smoke-trusted-ingress-orbstack.sh
+  smoke-trusted-ingress-scoped-softening-orbstack.sh
   smoke-suspicious-promotion-orbstack.sh
   smoke-suspicious-aggregated-recon-orbstack.sh
   smoke-suspicious-detection-aggregation-orbstack.sh
@@ -540,15 +541,43 @@ Check the live lab status:
 examples/shield-lab/status-orbstack.sh
 ```
 
-The status output now includes the active `polymorphic-baits` matrix from the
-live bait-profile ConfigMap, so operators can see which default surfaces are
-session-minted without manually opening the profile file.
+The status output now includes both the active `polymorphic-baits` matrix from
+the live bait-profile ConfigMap and any active `trusted-soften-scopes` from the
+mounted ingress-trust ConfigMap, so operators can see which default surfaces
+are session-minted and which trusted identities are allowed to narrow bait
+softening without manually opening either config file.
 
 Smoke-check the trusted-ingress transport-auth path:
 
 ```sh
 examples/shield-lab/smoke-trusted-ingress-orbstack.sh
 ```
+
+Smoke-check the local allowlist soften-scope path:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-scoped-softening-orbstack.sh
+```
+
+Smoke-check that the same trusted allowlisted session still gets contained once
+runtime evidence becomes strong:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-contained-openapi-orbstack.sh
+```
+
+The default OrbStack deploy now also mounts a lab-local ingress-trust config at:
+
+```text
+examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-only.json
+```
+
+That default entry trusts `X-Eidolon-Trusted-Actor: docs-crawler` for
+`/docs` and `/openapi.json`, but narrows bait softening to `/docs` only. The
+scoped smoke proves that `/docs` is softened while `/openapi.json` stays baited
+for that same local allowlist actor. The containment smoke then proves that a
+session starting in that trusted softened path still enters controlled reality
+on a later same-session exact OpenAPI bait action.
 
 Summarize live shield metrics:
 
@@ -574,9 +603,10 @@ Export a redacted evidence bundle from the PVC-backed proxy state:
 examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 ```
 
-The exported bundle README now includes the active bait-profile id and the
-live polymorphic bait matrix from `cluster-status.json`, so offline review does
-not depend on access to the running cluster.
+The exported bundle README now includes the active bait-profile id, the live
+polymorphic bait matrix, and any active trusted-ingress soften scopes from
+`cluster-status.json`, so offline review does not depend on access to the
+running cluster.
 
 Each bundle now also includes `edge-session-index.md`, a compact redacted
 session index rendered from the enriched edge export path, including a minted
@@ -620,18 +650,32 @@ examples/shield-lab/export-edge-decisions-orbstack.sh \
   --format json \
   --latest-mint-outcome session_value_mismatch
 examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --trusted-soften-label docs-crawler
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --trusted-soften-path-softened false
+examples/shield-lab/export-edge-decisions-orbstack.sh \
   --format ndjson \
   --webhook-url https://collector.example.test/eidolon
 ```
 
 When the live bait-profile status is available, each exported decision now also
-includes `deployment_context`, which carries the active bait-profile id and the
-current polymorphic bait matrix alongside the session-level evidence. That same
-context now also includes a structured `polymorphic_bait_coverage` summary, so
-JSON consumers can see observed-vs-active minted bait coverage without
-comparing the two lists manually. When `evidence.latest_bait_header_value_mint`
-is present, the markdown summaries now also show whether the latest minted
-bait-shaped action was a `matched_session_value` or `session_value_mismatch`.
+includes `deployment_context`, which carries the active bait-profile id, the
+current polymorphic bait matrix, and any active trusted-ingress soften scopes
+alongside the session-level evidence. That same context now also includes a
+structured `polymorphic_bait_coverage` summary, so JSON consumers can see
+observed-vs-active minted bait coverage without comparing the two lists
+manually. When a request actually matched one of the local trusted soften
+entries, the export now also carries a session-level
+`trusted_ingress_soften_match` with the matched label/scope and whether the
+current request path was inside the narrower soften subset. The export evidence
+now also carries `trusted_ingress_soften_histories`, so later contained
+sessions still show which trusted soften scopes were seen earlier in the same
+session and whether they covered both softened and unsoftened paths. When
+`evidence.latest_bait_header_value_mint` is present, the markdown summaries now
+also show whether the latest minted bait-shaped action was a
+`matched_session_value` or `session_value_mismatch`.
 
 `--top <N>` ranks sessions by enforcement severity and recency first, so
 operators can pull a compact high-signal slice before exporting a full bundle.
@@ -639,7 +683,14 @@ operators can pull a compact high-signal slice before exporting a full bundle.
 observed at least `N` active session-minted bait surfaces. `--latest-mint-outcome
 <matched_session_value|session_value_mismatch>` narrows the export to sessions
 whose latest minted bait-shaped action either matched the same session or
-mismatched, which is useful for replay triage.
+mismatched, which is useful for replay triage. `--trusted-soften-label <label>`
+narrows the export to sessions that actually matched one local trusted soften
+scope, and `--trusted-soften-path-softened <true|false>` splits those sessions
+into requests that were or were not inside that narrower bait-soften subset.
+For post-containment review, `--trusted-soften-history-label <label>` and
+`--trusted-soften-history-path-softened <true|false>` do the same thing against
+the session-level trusted soften history, so contained sessions still show up
+even when the final request itself is no longer trusted.
 
 If you want the bundle-local `edge-session-index.md` to keep only sessions that
 cross the same polymorphic threshold, set:
@@ -657,9 +708,32 @@ EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME=session_value_mismatch \
   examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 ```
 
+If you want the bundle-local `edge-session-index.md` to keep only sessions that
+matched one trusted soften label, or only requests that were still outside the
+narrower soften subset, set:
+
+```sh
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL=docs-crawler \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED=false \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+```
+
+If you want the bundle-local `edge-session-index.md` to keep only sessions that
+matched one trusted soften history label or saw one unsoftened request earlier
+in the session, set:
+
+```sh
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL=docs-crawler \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED=false \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+```
+
 For a single-session operator summary that already combines session-level mint
-evidence with the active deployment polymorphic matrix and a coverage summary,
-render markdown from the same enriched export path:
+evidence with the active deployment polymorphic matrix, trusted soften scopes,
+matched trusted soften context, and a coverage summary, render markdown from
+the same enriched export path:
 
 ```sh
 examples/shield-lab/export-edge-decisions-orbstack.sh \

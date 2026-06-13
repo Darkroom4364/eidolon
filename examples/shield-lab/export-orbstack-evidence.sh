@@ -12,6 +12,10 @@ LOCAL_STATE_DIR="${EIDOLON_SHIELD_LOCAL_STATE_DIR:-}"
 SESSION_INDEX_LIMIT="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LIMIT:-25}"
 SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE:-}"
 SESSION_INDEX_LATEST_MINT_OUTCOME="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME:-}"
+SESSION_INDEX_TRUSTED_SOFTEN_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL:-}"
+SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED:-}"
+SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL:-}"
+SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED:-}"
 SELECTED_SESSION_ID=""
 BUNDLE_DIR=""
 
@@ -43,6 +47,20 @@ Environment:
                          Keep only sessions whose latest exported minted bait
                          outcome matches `matched_session_value` or
                          `session_value_mismatch`.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL
+                         Keep only sessions whose matched trusted-ingress
+                         soften scope label matches the given value.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED
+                         Keep only sessions whose matched trusted-ingress
+                         soften scope recorded `true` or `false` for request
+                         path softening.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL
+                         Keep only sessions whose trusted-ingress soften
+                         history includes the given label.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED
+                         Keep only sessions whose trusted-ingress soften
+                         history includes at least one request with `true` or
+                         `false` path softening.
 USAGE
 }
 
@@ -171,6 +189,44 @@ render_edge_session_index() {
             unobserved_bait_ids: ($active_ids | map(. as $bait_id | select($observed_active_ids | index($bait_id) == null)))
           }
       end;
+    def trusted_soften_summary($match):
+      if $match == null then
+        code("none")
+      else
+        code($match.label // ($match.source + "/" + $match.trust_tier))
+        + " (soften "
+        + (
+            if (($match.bait_soften_path_prefixes // []) | length) == 0 then
+              code("none")
+            else
+              (($match.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+            end
+          )
+        + "; path softened "
+        + code($match.request_path_softened)
+        + ")"
+      end;
+    def trusted_soften_history_summary($histories):
+      if ($histories | length) == 0 then
+        code("none")
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " [softened "
+             + code(.saw_request_path_softened)
+             + ", unsoftened "
+             + code(.saw_request_path_unsoftened)
+             + "]"
+           )
+         | join(", "))
+      end;
+    def trusted_soften_context_summary($match; $histories):
+      if $match != null then
+        trusted_soften_summary($match)
+      else
+        trusted_soften_history_summary($histories)
+      end;
     def severity_rank($state):
       if $state == "blocked" then 5
       elif $state == "controlled_reality" then 4
@@ -218,8 +274,8 @@ render_edge_session_index() {
           end
         ),
         "",
-        "| Session | Observed | Request | Policy | Action | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Session | Observed | Request | Policy | Action | Trusted Soften Context | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         (
           $shown
           | to_entries[]
@@ -227,6 +283,8 @@ render_edge_session_index() {
           | ($value.deployment_context // {}) as $deployment
           | ($value.evidence.bait_header_value_mints // []) as $mint_audits
           | ($value.evidence.latest_bait_header_value_mint // null) as $latest_mint
+          | ($value.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
+          | ($value.trusted_ingress_soften_match // null) as $trusted_soften_match
           | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
           | "| "
             + code("<redacted-" + ((.key + 1) | tostring) + ">")
@@ -238,6 +296,8 @@ render_edge_session_index() {
             + code($value.policy.state)
             + " | "
             + code($value.edge_recommendation.action)
+            + " | "
+            + trusted_soften_context_summary($trusted_soften_match; $trusted_soften_histories)
             + " | "
             + (
                 if ($mint_audits | length) == 0 then
@@ -300,6 +360,30 @@ write_edge_session_index() {
       "$SESSION_INDEX_LATEST_MINT_OUTCOME"
     )
   fi
+  if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_LABEL" ]]; then
+    edge_export_args+=(
+      --trusted-soften-label
+      "$SESSION_INDEX_TRUSTED_SOFTEN_LABEL"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
+    edge_export_args+=(
+      --trusted-soften-path-softened
+      "$SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL" ]]; then
+    edge_export_args+=(
+      --trusted-soften-history-label
+      "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" ]]; then
+    edge_export_args+=(
+      --trusted-soften-history-path-softened
+      "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED"
+    )
+  fi
 
   if ! run_bundle_edge_export "${edge_export_args[@]}" > /dev/null 2>"$export_error"; then
     if grep -q 'contains no request_seen sessions to export' "$export_error"; then
@@ -309,6 +393,18 @@ write_edge_session_index() {
       return 0
     fi
     if grep -q 'no edge decision exports matched --latest-mint-outcome' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --trusted-soften-label' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --trusted-soften-path-softened' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --trusted-soften-history-label' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --trusted-soften-history-path-softened' "$export_error"; then
       return 0
     fi
     cat "$export_error" >&2
@@ -376,6 +472,21 @@ render_selected_session_summary() {
         + code(.trust_tier // "none")
         + (if (.label // null) != null then " (" + code(.label) + ")" else "" end)
       end;
+    def trusted_soften_history_summary($histories):
+      if ($histories | length) == 0 then
+        empty
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " [softened "
+             + code(.saw_request_path_softened)
+             + ", unsoftened "
+             + code(.saw_request_path_unsoftened)
+             + "]"
+           )
+         | join(", "))
+      end;
     def recon_component_lines($score):
       [
         optional_line("repeated_discovery_score"; ($score.repeated_discovery_score // 0 | if . > 0 then code(.) else empty end)),
@@ -392,9 +503,12 @@ render_selected_session_summary() {
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
     | ($export.deployment_context // {}) as $deployment
+    | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
+    | ($export.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
+    | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
     | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
     | (recon_component_lines($score)) as $recon_components
     | [
@@ -448,6 +562,39 @@ render_selected_session_summary() {
           end
         )),
         optional_line("Ingress edge action hint"; (($signals.edge_action // null) | if . != null then code(.) else empty end)),
+        optional_line("Trusted soften match"; (
+          if $trusted_soften_match != null then
+            code($trusted_soften_match.label // ($trusted_soften_match.source + "/" + $trusted_soften_match.trust_tier))
+            + " (" + code($trusted_soften_match.source) + " / " + code($trusted_soften_match.trust_tier) + ")"
+          else
+            empty
+          end
+        )),
+        optional_line("Trusted soften scope"; (
+          if $trusted_soften_match != null then
+            "soften "
+            + (
+                if (($trusted_soften_match.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  (($trusted_soften_match.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if (($trusted_soften_match.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; request path softened "
+            + code($trusted_soften_match.request_path_softened)
+          else
+            empty
+          end
+        )),
+        optional_line("Trusted soften history"; trusted_soften_history_summary($trusted_soften_histories)),
         "",
         "## Structured Recon Score",
         (if ($score.total // 0) > 0 then
@@ -534,6 +681,38 @@ render_selected_session_summary() {
             + ", bait "
             + code(.bait_id)
             + "]"
+        ),
+        "",
+        "## Active Trusted Ingress Softening",
+        (if ($active_trusted_soften_scopes | length) == 0 then
+          "- No active trusted-ingress soften scopes."
+        else
+          empty
+        end),
+        (
+          $active_trusted_soften_scopes[]
+          | "- Scope "
+            + code((.label // (.source + "/" + .trust_tier)))
+            + ": soften "
+            + (
+                if ((.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  ((.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if ((.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  ((.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; identity "
+            + code(.source)
+            + " / "
+            + code(.trust_tier)
         )
       ]
     | map(select(. != ""))
@@ -567,6 +746,7 @@ write_readme() {
   local pvc_status
   local bait_profile_id
   local polymorphic_bait_count
+  local trusted_soften_scope_count
   edge_url="$(jq -r '.edge.url // "unavailable"' "$BUNDLE_DIR/cluster-status.json")"
   edge_status="$(jq -r 'if .edge.http_status == null then "unreachable" else (.edge.http_status | tostring) end' "$BUNDLE_DIR/cluster-status.json")"
   direct_url="$(jq -r '.direct_target_edge.url // "unavailable"' "$BUNDLE_DIR/cluster-status.json")"
@@ -576,6 +756,7 @@ write_readme() {
   pvc_status="$(jq -r '.proxy_state.status // "unknown"' "$BUNDLE_DIR/cluster-status.json")"
   bait_profile_id="$(jq -r '.bait_profile.profile_id // "unknown"' "$BUNDLE_DIR/cluster-status.json")"
   polymorphic_bait_count="$(jq -r '(.bait_profile.polymorphic_baits // []) | length' "$BUNDLE_DIR/cluster-status.json")"
+  trusted_soften_scope_count="$(jq -r '(.ingress_trust.trusted_soften_scopes // []) | length' "$BUNDLE_DIR/cluster-status.json")"
 
   {
     printf '# OrbStack Shield Evidence Bundle\n\n'
@@ -590,6 +771,7 @@ write_readme() {
     printf -- '- Proxy state PVC: `%s`\n' "$pvc_status"
     printf -- '- Bait profile: `%s`\n' "$bait_profile_id"
     printf -- '- Active polymorphic bait surfaces: `%s`\n' "$polymorphic_bait_count"
+    printf -- '- Trusted ingress soften scopes: `%s`\n' "$trusted_soften_scope_count"
     printf -- '- Redacted event log lines: `%s`\n' "$event_count"
     printf -- '- Redacted debug log lines: `%s`\n' "$debug_count"
     printf -- '- Redacted persisted policy sessions: `%s`\n\n' "$policy_session_count"
@@ -603,8 +785,34 @@ write_readme() {
       ' "$BUNDLE_DIR/cluster-status.json"
       printf '\n'
     fi
+    printf '## Active Trusted Ingress Softening\n\n'
+    if [[ "$trusted_soften_scope_count" -eq 0 ]]; then
+      printf 'No active trusted-ingress soften scopes were exported in `cluster-status.json`.\n\n'
+    else
+      jq -r '
+        (.ingress_trust.trusted_soften_scopes // [])[]
+        | "- `\(.label // (.source + "/" + .trust_tier))`: soften "
+          + (
+              if ((.bait_soften_path_prefixes // []) | length) == 0 then
+                "`none`"
+              else
+                ((.bait_soften_path_prefixes // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + "; match "
+          + (
+              if ((.path_prefixes // []) | length) == 0 then
+                "`all`"
+              else
+                ((.path_prefixes // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + "; identity `\(.source)` / `\(.trust_tier)`"
+      ' "$BUNDLE_DIR/cluster-status.json"
+      printf '\n'
+    fi
     printf '## Included files\n\n'
-    printf -- '- `cluster-status.json`: current cluster-facing operator status, including the active polymorphic bait matrix when available.\n'
+    printf -- '- `cluster-status.json`: current cluster-facing operator status, including the active polymorphic bait matrix and trusted-ingress soften scopes when available.\n'
     if [[ -f "$BUNDLE_DIR/edge-session-index.md" ]]; then
       printf -- '- `edge-session-index.md`: compact redacted summary of every exported session from the enriched edge export path.\n'
     fi
@@ -659,6 +867,26 @@ if [[ -n "$SESSION_INDEX_LATEST_MINT_OUTCOME" ]]; then
       ;;
     *)
       fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME must be matched_session_value or session_value_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
+  case "$SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED" in
+    true|false)
+      ;;
+    *)
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED must be true or false"
+      ;;
+  esac
+fi
+
+if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" ]]; then
+  case "$SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED" in
+    true|false)
+      ;;
+    *)
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED must be true or false"
       ;;
   esac
 fi
