@@ -15,6 +15,8 @@ SESSION_ID=""
 TOP_LIMIT=""
 MIN_POLYMORPHIC_COVERAGE=""
 LATEST_MINT_OUTCOME=""
+TRUSTED_SOFTEN_LABEL=""
+TRUSTED_SOFTEN_PATH_SOFTENED=""
 WEBHOOK_URL=""
 OUTPUT_PATH=""
 
@@ -37,6 +39,13 @@ Options:
   --latest-mint-outcome <matched_session_value|session_value_mismatch>
                          Keep only sessions whose latest exported minted bait
                          outcome matches the given status.
+  --trusted-soften-label <label>
+                         Keep only sessions whose matched trusted-ingress
+                         soften scope label matches the given value.
+  --trusted-soften-path-softened <true|false>
+                         Keep only sessions whose matched trusted-ingress
+                         soften scope recorded the given request-path softened
+                         status.
   --webhook-url <URL>    POST each export to this webhook as application/json.
   --output <PATH>        Write exports to a file instead of stdout.
   -h, --help             Show this help text.
@@ -206,6 +215,37 @@ filter_by_latest_mint_outcome() {
     map(
       select(
         (.evidence.latest_bait_header_value_mint.status // "") == $outcome
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_trusted_soften_label() {
+  local input_file="$1"
+  local output_file="$2"
+  local label="$3"
+
+  jq -s -c --arg label "$label" '
+    map(
+      select(
+        (.trusted_ingress_soften_match.label // "") == $label
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_trusted_soften_path_softened() {
+  local input_file="$1"
+  local output_file="$2"
+  local path_softened="$3"
+
+  jq -s -c --argjson path_softened "$path_softened" '
+    map(
+      select(
+        (.trusted_ingress_soften_match // null) != null
+        and ((.trusted_ingress_soften_match.request_path_softened // false) == $path_softened)
       )
     )
     | .[]
@@ -510,6 +550,16 @@ while [[ $# -gt 0 ]]; do
       LATEST_MINT_OUTCOME="$2"
       shift 2
       ;;
+    --trusted-soften-label)
+      [[ $# -ge 2 ]] || fail "missing value for --trusted-soften-label"
+      TRUSTED_SOFTEN_LABEL="$2"
+      shift 2
+      ;;
+    --trusted-soften-path-softened)
+      [[ $# -ge 2 ]] || fail "missing value for --trusted-soften-path-softened"
+      TRUSTED_SOFTEN_PATH_SOFTENED="$2"
+      shift 2
+      ;;
     --webhook-url)
       [[ $# -ge 2 ]] || fail "missing value for --webhook-url"
       WEBHOOK_URL="$2"
@@ -560,6 +610,16 @@ if [[ -n "$LATEST_MINT_OUTCOME" ]]; then
       ;;
     *)
       fail "--latest-mint-outcome must be matched_session_value or session_value_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
+  case "$TRUSTED_SOFTEN_PATH_SOFTENED" in
+    true|false)
+      ;;
+    *)
+      fail "--trusted-soften-path-softened must be true or false"
       ;;
   esac
 fi
@@ -695,6 +755,30 @@ if [[ -n "$LATEST_MINT_OUTCOME" ]]; then
   rendered_ndjson="$filtered_ndjson"
   if [[ ! -s "$rendered_ndjson" ]]; then
     fail "no edge decision exports matched --latest-mint-outcome ${LATEST_MINT_OUTCOME}"
+  fi
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_LABEL" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.trusted-soften-label-filtered.ndjson"
+  filter_by_trusted_soften_label \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$TRUSTED_SOFTEN_LABEL"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --trusted-soften-label ${TRUSTED_SOFTEN_LABEL}"
+  fi
+fi
+
+if [[ -n "$TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.trusted-soften-path-filtered.ndjson"
+  filter_by_trusted_soften_path_softened \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$TRUSTED_SOFTEN_PATH_SOFTENED"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --trusted-soften-path-softened ${TRUSTED_SOFTEN_PATH_SOFTENED}"
   fi
 fi
 
