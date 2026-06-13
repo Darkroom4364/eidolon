@@ -641,6 +641,12 @@ examples/shield-lab/export-edge-decisions-orbstack.sh \
   --format json \
   --latest-mint-outcome session_value_mismatch
 examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --trusted-soften-label docs-crawler
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --trusted-soften-path-softened false
+examples/shield-lab/export-edge-decisions-orbstack.sh \
   --format ndjson \
   --webhook-url https://collector.example.test/eidolon
 ```
@@ -665,7 +671,10 @@ operators can pull a compact high-signal slice before exporting a full bundle.
 observed at least `N` active session-minted bait surfaces. `--latest-mint-outcome
 <matched_session_value|session_value_mismatch>` narrows the export to sessions
 whose latest minted bait-shaped action either matched the same session or
-mismatched, which is useful for replay triage.
+mismatched, which is useful for replay triage. `--trusted-soften-label <label>`
+narrows the export to sessions that actually matched one local trusted soften
+scope, and `--trusted-soften-path-softened <true|false>` splits those sessions
+into requests that were or were not inside that narrower bait-soften subset.
 
 If you want the bundle-local `edge-session-index.md` to keep only sessions that
 cross the same polymorphic threshold, set:
@@ -680,6 +689,17 @@ share one latest minted outcome, set:
 
 ```sh
 EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME=session_value_mismatch \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+```
+
+If you want the bundle-local `edge-session-index.md` to keep only sessions that
+matched one trusted soften label, or only requests that were still outside the
+narrower soften subset, set:
+
+```sh
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL=docs-crawler \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED=false \
   examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 ```
 

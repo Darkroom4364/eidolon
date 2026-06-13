@@ -12,6 +12,8 @@ LOCAL_STATE_DIR="${EIDOLON_SHIELD_LOCAL_STATE_DIR:-}"
 SESSION_INDEX_LIMIT="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LIMIT:-25}"
 SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE:-}"
 SESSION_INDEX_LATEST_MINT_OUTCOME="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME:-}"
+SESSION_INDEX_TRUSTED_SOFTEN_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL:-}"
+SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED:-}"
 SELECTED_SESSION_ID=""
 BUNDLE_DIR=""
 
@@ -43,6 +45,13 @@ Environment:
                          Keep only sessions whose latest exported minted bait
                          outcome matches `matched_session_value` or
                          `session_value_mismatch`.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL
+                         Keep only sessions whose matched trusted-ingress
+                         soften scope label matches the given value.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED
+                         Keep only sessions whose matched trusted-ingress
+                         soften scope recorded `true` or `false` for request
+                         path softening.
 USAGE
 }
 
@@ -320,6 +329,18 @@ write_edge_session_index() {
       "$SESSION_INDEX_LATEST_MINT_OUTCOME"
     )
   fi
+  if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_LABEL" ]]; then
+    edge_export_args+=(
+      --trusted-soften-label
+      "$SESSION_INDEX_TRUSTED_SOFTEN_LABEL"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
+    edge_export_args+=(
+      --trusted-soften-path-softened
+      "$SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED"
+    )
+  fi
 
   if ! run_bundle_edge_export "${edge_export_args[@]}" > /dev/null 2>"$export_error"; then
     if grep -q 'contains no request_seen sessions to export' "$export_error"; then
@@ -329,6 +350,12 @@ write_edge_session_index() {
       return 0
     fi
     if grep -q 'no edge decision exports matched --latest-mint-outcome' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --trusted-soften-label' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --trusted-soften-path-softened' "$export_error"; then
       return 0
     fi
     cat "$export_error" >&2
@@ -774,6 +801,16 @@ if [[ -n "$SESSION_INDEX_LATEST_MINT_OUTCOME" ]]; then
       ;;
     *)
       fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME must be matched_session_value or session_value_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED" ]]; then
+  case "$SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED" in
+    true|false)
+      ;;
+    *)
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED must be true or false"
       ;;
   esac
 fi

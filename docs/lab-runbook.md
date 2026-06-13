@@ -330,6 +330,12 @@ environment override. The same live export path also supports
 `--latest-mint-outcome <matched_session_value|session_value_mismatch>`, and the
 bundle index supports the matching
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME` environment override.
+Trusted soften triage uses the same pattern: `--trusted-soften-label <label>`
+and `--trusted-soften-path-softened <true|false>` filter live exports to
+requests that actually matched one local trusted soften scope, and the bundle
+index supports the matching
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL` and
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED` overrides.
 
 ## M3 Scripted Bakeoff Runner
 

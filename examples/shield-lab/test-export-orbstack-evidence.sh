@@ -90,6 +90,8 @@ output=""
 session=""
 min_coverage=""
 latest_mint_outcome=""
+trusted_soften_label=""
+trusted_soften_path_softened=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output)
@@ -106,6 +108,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --latest-mint-outcome)
       latest_mint_outcome="$2"
+      shift 2
+      ;;
+    --trusted-soften-label)
+      trusted_soften_label="$2"
+      shift 2
+      ;;
+    --trusted-soften-path-softened)
+      trusted_soften_path_softened="$2"
       shift 2
       ;;
     *)
@@ -142,6 +152,28 @@ fi
 if [[ -n "$latest_mint_outcome" ]]; then
   case "$latest_mint_outcome" in
     matched_session_value)
+      rendered="$selected_array"
+      ;;
+    *)
+      rendered='[]'
+      ;;
+  esac
+fi
+
+if [[ -n "$trusted_soften_label" ]]; then
+  case "$trusted_soften_label" in
+    docs-crawler)
+      rendered="$selected_array"
+      ;;
+    *)
+      rendered='[]'
+      ;;
+  esac
+fi
+
+if [[ -n "$trusted_soften_path_softened" ]]; then
+  case "$trusted_soften_path_softened" in
+    false)
       rendered="$selected_array"
       ;;
     *)
@@ -361,9 +393,61 @@ test_export_bundle_filters_edge_index_by_latest_mint_outcome() {
   rg -q '`matched_session_value` via `X-Api-Key`' "$bundle_dir/edge-session-index.md"
 }
 
+test_export_bundle_filters_edge_index_by_trusted_soften_label() {
+  local temp_dir
+  local state_dir
+  local bundle_dir
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  bundle_dir="$temp_dir/bundle"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    EIDOLON_SHIELD_EDGE_EXPORT_SCRIPT="$temp_dir/export-edge-decisions.sh" \
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+    EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL=docs-crawler \
+    "$EXPORT_SCRIPT" \
+    "$bundle_dir" >/dev/null
+
+  rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
+  rg -q 'Exported sessions: `1`' "$bundle_dir/edge-session-index.md"
+  rg -q '`docs-crawler` \(soften `/docs`; path softened `false`\)' "$bundle_dir/edge-session-index.md"
+  ! rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
+}
+
+test_export_bundle_filters_edge_index_by_trusted_soften_path_softened() {
+  local temp_dir
+  local state_dir
+  local bundle_dir
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  bundle_dir="$temp_dir/bundle"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    EIDOLON_SHIELD_EDGE_EXPORT_SCRIPT="$temp_dir/export-edge-decisions.sh" \
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+    EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED=false \
+    "$EXPORT_SCRIPT" \
+    "$bundle_dir" >/dev/null
+
+  rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
+  rg -q 'Exported sessions: `1`' "$bundle_dir/edge-session-index.md"
+  rg -q '`docs-crawler` \(soften `/docs`; path softened `false`\)' "$bundle_dir/edge-session-index.md"
+  ! rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
+}
+
 test_export_bundle_redacts_sensitive_values
 test_export_refuses_non_empty_bundle_dir
 test_export_bundle_filters_edge_index_by_min_polymorphic_coverage
 test_export_bundle_filters_edge_index_by_latest_mint_outcome
+test_export_bundle_filters_edge_index_by_trusted_soften_label
+test_export_bundle_filters_edge_index_by_trusted_soften_path_softened
 
 printf 'shield-lab export checks passed\n'
