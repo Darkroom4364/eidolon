@@ -269,6 +269,9 @@ Current runtime policy:
 - local allowlist entries may also carry optional `user_agent_substrings` so
   verified crawler or partner automation matches can be narrowed to expected
   agent families without treating `User-Agent` itself as a trust source
+- local allowlist entries may also carry optional `not_before` and `expires_at`
+  windows so deployment-safe trust can be staged and retired without changing
+  any other match scopes
 - local allowlist scopes do not widen the global soften list; they only
   intersect with it
 - strong trusted identities do not suppress unrelated bait surfaces outside that

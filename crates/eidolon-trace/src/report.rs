@@ -459,6 +459,7 @@ fn edge_local_ingress_trust_scope_rejection_histories(
             history.label == rejection.label
                 && history.source == rejection.source
                 && history.trust_tier == rejection.trust_tier
+                && history.not_before == rejection.not_before
                 && history.expires_at == rejection.expires_at
                 && history.path_prefixes == rejection.path_prefixes
                 && history.bait_soften_path_prefixes == rejection.bait_soften_path_prefixes
@@ -476,6 +477,7 @@ fn edge_local_ingress_trust_scope_rejection_histories(
             label: rejection.label.clone(),
             source: rejection.source,
             trust_tier: rejection.trust_tier,
+            not_before: rejection.not_before,
             expires_at: rejection.expires_at,
             path_prefixes: rejection.path_prefixes.clone(),
             bait_soften_path_prefixes: rejection.bait_soften_path_prefixes.clone(),
@@ -1496,6 +1498,7 @@ mod tests {
                         source: IngressIdentitySource::LocalAllowlist,
                         trust_tier: IngressTrustTier::Allowlisted,
                         label: Some("internal-crawler".to_string()),
+                        not_before: None,
                         expires_at: None,
                     },
                     local_ingress_trust_scope_rejection: None,
@@ -1661,6 +1664,7 @@ mod tests {
                         source: IngressIdentitySource::LocalAllowlist,
                         trust_tier: IngressTrustTier::Allowlisted,
                         label: Some("docs-crawler".to_string()),
+                        not_before: None,
                         expires_at: None,
                     },
                     local_ingress_trust_scope_rejection: None,
@@ -1697,6 +1701,7 @@ mod tests {
                         source: IngressIdentitySource::LocalAllowlist,
                         trust_tier: IngressTrustTier::Allowlisted,
                         label: Some("docs-crawler".to_string()),
+                        not_before: None,
                         expires_at: None,
                     },
                     local_ingress_trust_scope_rejection: None,
@@ -1813,6 +1818,7 @@ mod tests {
                             label: Some("docs-crawler".to_string()),
                             source: IngressIdentitySource::LocalAllowlist,
                             trust_tier: IngressTrustTier::Allowlisted,
+                            not_before: None,
                             expires_at: None,
                             path_prefixes: vec!["/docs".to_string()],
                             bait_soften_path_prefixes: vec!["/docs".to_string()],
@@ -1875,6 +1881,7 @@ mod tests {
                             label: Some("docs-crawler".to_string()),
                             source: IngressIdentitySource::LocalAllowlist,
                             trust_tier: IngressTrustTier::Allowlisted,
+                            not_before: None,
                             expires_at: None,
                             path_prefixes: vec!["/docs".to_string()],
                             bait_soften_path_prefixes: vec!["/docs".to_string()],

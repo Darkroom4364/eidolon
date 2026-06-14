@@ -56,7 +56,7 @@ Environment:
                          rejection label matches the given value.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON
                          Keep only sessions whose latest local trust scope
-                         rejection reason matches `expired`,
+                         rejection reason matches `not_yet_active`, `expired`,
                          `request_user_agent_missing`,
                          `user_agent_mismatch`, `request_host_missing`,
                          `host_mismatch`, `client_peer_missing`, or
@@ -66,7 +66,7 @@ Environment:
                          history includes the given label.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON
                          Keep only sessions whose local trust scope rejection
-                         history includes `expired`,
+                         history includes `not_yet_active`, `expired`,
                          `request_user_agent_missing`,
                          `user_agent_mismatch`, `request_host_missing`,
                          `host_mismatch`, `client_peer_missing`, or
@@ -298,6 +298,20 @@ render_edge_session_index() {
                    code("none")
                  else
                    ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + (
+                 if (.not_before // null) == null then
+                   ""
+                 else
+                   "; not-before " + code(.not_before)
+                 end
+               )
+             + (
+                 if (.expires_at // null) == null then
+                   ""
+                 else
+                   "; expires " + code(.expires_at)
                  end
                )
              + "; ua "
@@ -692,6 +706,20 @@ render_selected_session_summary() {
                    ((.reasons // []) | map(code(.)) | join(", "))
                  end
                )
+             + (
+                 if (.not_before // null) == null then
+                   ""
+                 else
+                   "; not-before " + code(.not_before)
+                 end
+               )
+             + (
+                 if (.expires_at // null) == null then
+                   ""
+                 else
+                   "; expires " + code(.expires_at)
+                 end
+               )
              + "; ua "
              + (
                  if ((.user_agent_substrings // []) | length) == 0 then
@@ -846,6 +874,13 @@ render_selected_session_summary() {
                   code("any")
                 else
                   (($local_trust_rejection.source_cidrs // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ($local_trust_rejection.not_before // null) == null then
+                  ""
+                else
+                  "; not-before " + code($local_trust_rejection.not_before)
                 end
               )
             + (
@@ -1185,6 +1220,13 @@ write_readme() {
               end
             )
           + (
+              if (.not_before // null) == null then
+                ""
+              else
+                "; not-before `" + .not_before + "`"
+              end
+            )
+          + (
               if (.expires_at // null) == null then
                 ""
               else
@@ -1257,20 +1299,20 @@ fi
 
 if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON" ]]; then
   case "$SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON" in
-    expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+    not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
       ;;
     *)
-      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON must be one of: not_yet_active, expired, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi
 
 if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
   case "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON" in
-    expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+    not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
       ;;
     *)
-      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON must be one of: not_yet_active, expired, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi

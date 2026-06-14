@@ -48,13 +48,13 @@ Options:
   --local-trust-rejection-label <label>
                          Keep only sessions whose latest local trust scope
                          rejection label matches the given value.
-  --local-trust-rejection-reason <expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+  --local-trust-rejection-reason <not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
                          Keep only sessions whose latest local trust scope
                          rejection reason matches the given value.
   --local-trust-rejection-history-label <label>
                          Keep only sessions whose local trust scope rejection
                          history includes the given label.
-  --local-trust-rejection-history-reason <expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+  --local-trust-rejection-history-reason <not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
                          Keep only sessions whose local trust scope rejection
                          history includes the given reason.
   --trusted-soften-label <label>
@@ -479,6 +479,20 @@ render_markdown_export() {
                    ((.reasons // []) | map(code(.)) | join(", "))
                  end
                )
+             + (
+                 if (.not_before // null) == null then
+                   ""
+                 else
+                   "; not-before " + code(.not_before)
+                 end
+               )
+             + (
+                 if (.expires_at // null) == null then
+                   ""
+                 else
+                   "; expires " + code(.expires_at)
+                 end
+               )
              + "; ua "
              + (
                  if ((.user_agent_substrings // []) | length) == 0 then
@@ -631,6 +645,13 @@ render_markdown_export() {
                   code("any")
                 else
                   (($local_trust_rejection.source_cidrs // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ($local_trust_rejection.not_before // null) == null then
+                  ""
+                else
+                  "; not-before " + code($local_trust_rejection.not_before)
                 end
               )
             + (
@@ -841,6 +862,13 @@ render_markdown_export() {
                 end
               )
             + (
+                if (.not_before // null) == null then
+                  ""
+                else
+                  "; not-before " + code(.not_before)
+                end
+              )
+            + (
                 if (.expires_at // null) == null then
                   ""
                 else
@@ -981,20 +1009,20 @@ fi
 
 if [[ -n "$LOCAL_TRUST_REJECTION_REASON" ]]; then
   case "$LOCAL_TRUST_REJECTION_REASON" in
-    expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+    not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
       ;;
     *)
-      fail "--local-trust-rejection-reason must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      fail "--local-trust-rejection-reason must be one of: not_yet_active, expired, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi
 
 if [[ -n "$LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
   case "$LOCAL_TRUST_REJECTION_HISTORY_REASON" in
-    expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+    not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
       ;;
     *)
-      fail "--local-trust-rejection-history-reason must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      fail "--local-trust-rejection-history-reason must be one of: not_yet_active, expired, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi
@@ -1090,14 +1118,15 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
             | {
                 label,
                 source,
-              trust_tier,
-              expires_at,
-              path_prefixes,
-              bait_soften_path_prefixes,
-              user_agent_substrings,
-              hosts,
-              source_cidrs
-            }
+                trust_tier,
+                not_before,
+                expires_at,
+                path_prefixes,
+                bait_soften_path_prefixes,
+                user_agent_substrings,
+                hosts,
+                source_cidrs
+              }
           ]
         }
       end

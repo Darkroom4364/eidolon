@@ -165,6 +165,7 @@ pub enum IngressTrustTier {
 #[serde(rename_all = "snake_case")]
 pub enum LocalIngressTrustScopeRejectionReason {
     Expired,
+    NotYetActive,
     RequestUserAgentMissing,
     UserAgentMismatch,
     RequestHostMissing,
@@ -180,6 +181,8 @@ pub struct IngressIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
 }
 
@@ -189,6 +192,8 @@ pub struct LocalIngressTrustScopeRejection {
     pub label: Option<String>,
     pub source: IngressIdentitySource,
     pub trust_tier: IngressTrustTier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -698,6 +703,8 @@ pub struct EdgeTrustedIngressSoftenScope {
     pub source: IngressIdentitySource,
     pub trust_tier: IngressTrustTier,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_prefixes: Vec<String>,
@@ -756,6 +763,8 @@ pub struct EdgeLocalIngressTrustScopeRejectionHistory {
     pub label: Option<String>,
     pub source: IngressIdentitySource,
     pub trust_tier: IngressTrustTier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -910,12 +919,14 @@ mod tests {
                     source: IngressIdentitySource::VerifiedBot,
                     trust_tier: IngressTrustTier::EdgeVerified,
                     label: Some("googlebot".to_string()),
+                    not_before: None,
                     expires_at: None,
                 },
                 local_ingress_trust_scope_rejection: Some(LocalIngressTrustScopeRejection {
                     label: Some("docs-crawler".to_string()),
                     source: IngressIdentitySource::LocalAllowlist,
                     trust_tier: IngressTrustTier::Allowlisted,
+                    not_before: None,
                     expires_at: None,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
@@ -1312,12 +1323,14 @@ mod tests {
                 source: IngressIdentitySource::VerifiedBot,
                 trust_tier: IngressTrustTier::EdgeVerified,
                 label: Some("googlebot".to_string()),
+                not_before: None,
                 expires_at: None,
             },
             local_ingress_trust_scope_rejection: Some(LocalIngressTrustScopeRejection {
                 label: Some("docs-crawler".to_string()),
                 source: IngressIdentitySource::LocalAllowlist,
                 trust_tier: IngressTrustTier::Allowlisted,
+                not_before: None,
                 expires_at: None,
                 path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                 bait_soften_path_prefixes: vec!["/docs".to_string()],
@@ -1378,6 +1391,7 @@ mod tests {
                         label: Some("docs-crawler".to_string()),
                         source: IngressIdentitySource::LocalAllowlist,
                         trust_tier: IngressTrustTier::Allowlisted,
+                        not_before: None,
                         expires_at: None,
                         path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                         bait_soften_path_prefixes: vec!["/docs".to_string()],
@@ -1444,6 +1458,7 @@ mod tests {
                     label: Some("docs-crawler".to_string()),
                     source: IngressIdentitySource::LocalAllowlist,
                     trust_tier: IngressTrustTier::Allowlisted,
+                    not_before: None,
                     expires_at: None,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],

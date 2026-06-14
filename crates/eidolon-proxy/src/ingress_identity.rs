@@ -216,6 +216,16 @@ impl TrustedIngressEntry {
 
         if self
             .identity
+            .not_before
+            .is_some_and(|not_before| not_before > Utc::now())
+        {
+            return TrustedIngressEntryEvaluation::ScopeRejected(
+                self.scope_rejection(LocalIngressTrustScopeRejectionReason::NotYetActive),
+            );
+        }
+
+        if self
+            .identity
             .expires_at
             .is_some_and(|expires_at| expires_at <= Utc::now())
         {
@@ -296,6 +306,7 @@ impl TrustedIngressEntry {
             label: self.identity.label.clone(),
             source: self.identity.source,
             trust_tier: self.identity.trust_tier,
+            not_before: self.identity.not_before,
             expires_at: self.identity.expires_at,
             path_prefixes: self.path_prefixes.clone(),
             bait_soften_path_prefixes: self.bait_soften_path_prefixes.clone().unwrap_or_default(),
@@ -352,6 +363,8 @@ struct RawTrustedIngressEntry {
     label: String,
     source: IngressIdentitySource,
     trust_tier: IngressTrustTier,
+    #[serde(default)]
+    not_before: Option<DateTime<Utc>>,
     #[serde(default)]
     expires_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -490,6 +503,7 @@ impl RawTrustedIngressEntry {
                 source: self.source,
                 trust_tier: self.trust_tier,
                 label: Some(label.to_string()),
+                not_before: self.not_before,
                 expires_at: self.expires_at,
             },
             methods,
@@ -865,6 +879,84 @@ mod tests {
                 .resolve("GET", "/docs", None, None, [("X-Actor", "window")])
                 .is_none(),
             "expired trust entries should not match",
+        );
+    }
+
+    #[test]
+    fn not_yet_active_entries_do_not_match() {
+        let resolver = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "operator-window",
+                  "source": "operator_override",
+                  "trust_tier": "allowlisted",
+                  "not_before": "2999-01-01T00:00:00Z",
+                  "required_headers": [
+                    { "name": "X-Actor", "value": "window" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+        let resolver = must_ok(resolver, "config should parse");
+
+        assert!(
+            resolver
+                .resolve("GET", "/docs", None, None, [("X-Actor", "window")])
+                .is_none(),
+            "not-yet-active trust entries should not match",
+        );
+    }
+
+    #[test]
+    fn not_yet_active_scope_rejections_are_exposed() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "entries": [
+                    {
+                      "label": "docs-crawler",
+                      "source": "local_allowlist",
+                      "trust_tier": "allowlisted",
+                      "not_before": "2999-01-01T00:00:00Z",
+                      "path_prefixes": ["/docs"],
+                      "required_headers": [
+                        { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                      ]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let evaluation = resolver.evaluate(
+            "GET",
+            "/docs",
+            None,
+            None,
+            [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+        );
+
+        assert!(evaluation.resolved.is_none());
+        let rejection = evaluation
+            .scope_rejection
+            .expect("scope rejection should be recorded");
+        assert_eq!(rejection.label.as_deref(), Some("docs-crawler"));
+        assert_eq!(
+            rejection.reason,
+            LocalIngressTrustScopeRejectionReason::NotYetActive
+        );
+        assert_eq!(
+            rejection.not_before,
+            Some(
+                Utc.with_ymd_and_hms(2999, 1, 1, 0, 0, 0)
+                    .single()
+                    .unwrap_or_else(|| panic!("timestamp should be valid"))
+            )
         );
     }
 
@@ -1377,12 +1469,14 @@ mod tests {
             source: IngressIdentitySource::VerifiedBot,
             trust_tier: IngressTrustTier::WeaklyAsserted,
             label: Some("edge-bot".to_string()),
+            not_before: None,
             expires_at: None,
         };
         let local = IngressIdentity {
             source: IngressIdentitySource::LocalAllowlist,
             trust_tier: IngressTrustTier::Allowlisted,
             label: Some("internal-crawler".to_string()),
+            not_before: None,
             expires_at: None,
         };
 
@@ -1397,12 +1491,14 @@ mod tests {
             source: IngressIdentitySource::SignedAgent,
             trust_tier: IngressTrustTier::SignedAttested,
             label: Some("signed-agent".to_string()),
+            not_before: None,
             expires_at: None,
         };
         let local = IngressIdentity {
             source: IngressIdentitySource::LocalAllowlist,
             trust_tier: IngressTrustTier::Allowlisted,
             label: Some("internal-crawler".to_string()),
+            not_before: None,
             expires_at: None,
         };
 
@@ -1417,12 +1513,14 @@ mod tests {
             source: IngressIdentitySource::LocalAllowlist,
             trust_tier: IngressTrustTier::Allowlisted,
             label: Some("edge".to_string()),
+            not_before: None,
             expires_at: None,
         };
         let local = IngressIdentity {
             source: IngressIdentitySource::LocalAllowlist,
             trust_tier: IngressTrustTier::Allowlisted,
             label: Some("local".to_string()),
+            not_before: None,
             expires_at: None,
         };
 
@@ -1437,12 +1535,14 @@ mod tests {
             source: IngressIdentitySource::VerifiedBot,
             trust_tier: IngressTrustTier::WeaklyAsserted,
             label: None,
+            not_before: None,
             expires_at: None,
         };
         let allowlisted = IngressIdentity {
             source: IngressIdentitySource::LocalAllowlist,
             trust_tier: IngressTrustTier::Allowlisted,
             label: None,
+            not_before: None,
             expires_at: None,
         };
 

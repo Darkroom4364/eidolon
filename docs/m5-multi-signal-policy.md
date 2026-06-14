@@ -136,9 +136,12 @@ The current M5 slice is intentionally narrow:
 - local allowlist entries may also optionally carry `user_agent_substrings`,
   but only as a narrowing scope on already operator-controlled local trust
   entries; `User-Agent` alone still does not create trust
+- local allowlist entries may also optionally carry a `not_before` lower bound,
+  so deployment-safe trust windows can be staged without activating early
 - stale explicit trusted-ingress claims now degrade to `weakly_asserted`, and
-  stale local ingress-trust config entries stop matching entirely, so
-  deployment-safe trust windows do not silently stay strong after expiry
+  stale or not-yet-active local ingress-trust config entries stop matching
+  entirely, so deployment-safe trust windows do not silently stay strong after
+  expiry or before rollout
 - one conservative `observe -> suspicious` promotion now exists for authenticated
   discovery-surface requests that combine a low inverse vendor score with an
   explicitly agentic actor kind, while stronger trusted identities still keep
