@@ -227,8 +227,10 @@ Tie-break rules:
 - Local config wins over an equal-strength explicit edge claim.
 - A malformed or incomplete explicit claim degrades to `none`.
 - An explicit claim without a valid transport-auth header degrades to `none`.
-- A stale claim should be treated as at most `weakly_asserted` until explicit
-  freshness handling lands in runtime code.
+- A stale explicit claim is now degraded to at most `weakly_asserted` in
+  runtime code, so it remains auditable but no longer softens bait exposure as
+  a strong trusted identity.
+- A stale local ingress-trust config entry no longer matches at all.
 
 ### Important Runtime Rule
 

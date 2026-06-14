@@ -555,6 +555,13 @@ Smoke-check the trusted-ingress transport-auth path:
 examples/shield-lab/smoke-trusted-ingress-orbstack.sh
 ```
 
+Smoke-check that an authenticated but expired explicit ingress identity no
+longer softens bait:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-expired-claim-orbstack.sh
+```
+
 Smoke-check the local allowlist soften-scope path:
 
 ```sh
@@ -595,6 +602,18 @@ examples/shield-lab/smoke-trusted-ingress-source-cidr-gate-orbstack.sh
 That path proves the same trusted actor still receives the baited `/docs`
 surface when the local allowlist source CIDR does not match the direct OrbStack
 peer.
+
+For the adjacent freshness negative path, redeploy with the expired local-entry
+example and run the paired smoke:
+
+```sh
+EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH=examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-expired.json \
+  examples/shield-lab/deploy-orbstack.sh
+examples/shield-lab/smoke-trusted-ingress-expired-local-entry-orbstack.sh
+```
+
+That path proves the same trusted actor still receives the baited `/docs`
+surface when the checked-in local allowlist entry has expired.
 
 Summarize live shield metrics:
 
