@@ -166,6 +166,7 @@ status_json="$(jq -n \
             label: (.label // null),
             source: .source,
             trust_tier: .trust_tier,
+            not_before: (.not_before // null),
             expires_at: (.expires_at // null),
             path_prefixes: (.path_prefixes // []),
             bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
@@ -321,6 +322,13 @@ jq -r '
                   "; source any"
                 else
                   "; source " + (.source_cidrs | join(", "))
+                end
+              )
+            + (
+                if (.not_before // null) == null then
+                  ""
+                else
+                  "; not-before " + .not_before
                 end
               )
             + (
