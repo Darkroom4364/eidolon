@@ -640,6 +640,9 @@ pub struct EdgeEvidenceRef {
     pub event_ids: Vec<Uuid>,
     pub bundle_ref: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_ingress_trust_scope_rejection_histories:
+        Vec<EdgeLocalIngressTrustScopeRejectionHistory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_ingress_soften_histories: Vec<EdgeTrustedIngressSoftenHistory>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_header_value_mints: Vec<EdgeBaitHeaderValueMintAudit>,
@@ -735,6 +738,26 @@ pub struct EdgeTrustedIngressSoftenHistory {
     pub source_cidrs: Vec<String>,
     pub saw_request_path_softened: bool,
     pub saw_request_path_unsoftened: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeLocalIngressTrustScopeRejectionHistory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub source: IngressIdentitySource,
+    pub trust_tier: IngressTrustTier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bait_soften_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_cidrs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<LocalIngressTrustScopeRejectionReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1334,6 +1357,22 @@ mod tests {
                 event_schema_version: EVENT_SCHEMA_VERSION,
                 event_ids: vec![Uuid::new_v4()],
                 bundle_ref: "session:ref".to_string(),
+                local_ingress_trust_scope_rejection_histories: vec![
+                    EdgeLocalIngressTrustScopeRejectionHistory {
+                        label: Some("docs-crawler".to_string()),
+                        source: IngressIdentitySource::LocalAllowlist,
+                        trust_tier: IngressTrustTier::Allowlisted,
+                        expires_at: None,
+                        path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                        bait_soften_path_prefixes: vec!["/docs".to_string()],
+                        hosts: vec!["localhost".to_string()],
+                        source_cidrs: vec!["127.0.0.1/32".to_string()],
+                        reasons: vec![
+                            LocalIngressTrustScopeRejectionReason::HostMismatch,
+                            LocalIngressTrustScopeRejectionReason::SourceCidrMismatch,
+                        ],
+                    },
+                ],
                 trusted_ingress_soften_histories: vec![EdgeTrustedIngressSoftenHistory {
                     label: Some("docs-crawler".to_string()),
                     source: IngressIdentitySource::LocalAllowlist,
@@ -1436,6 +1475,20 @@ mod tests {
         assert_eq!(serialized["discovery_recon_score"]["query_score"], json!(1));
         assert_eq!(serialized["discovery_recon_score"]["total"], json!(3));
         assert_eq!(serialized["discovery_recon_score"]["threshold"], json!(3));
+        assert_eq!(
+            serialized["evidence"]["local_ingress_trust_scope_rejection_histories"][0]["label"],
+            json!("docs-crawler")
+        );
+        assert_eq!(
+            serialized["evidence"]["local_ingress_trust_scope_rejection_histories"][0]["reasons"]
+                [0],
+            json!("host_mismatch")
+        );
+        assert_eq!(
+            serialized["evidence"]["local_ingress_trust_scope_rejection_histories"][0]["reasons"]
+                [1],
+            json!("source_cidr_mismatch")
+        );
         assert_eq!(
             serialized["evidence"]["trusted_ingress_soften_histories"][0]["label"],
             json!("docs-crawler")
