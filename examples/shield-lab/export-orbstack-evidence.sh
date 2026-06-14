@@ -202,6 +202,14 @@ render_edge_session_index() {
               (($match.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
             end
           )
+        + "; host "
+        + (
+            if (($match.hosts // []) | length) == 0 then
+              code("any")
+            else
+              (($match.hosts // []) | map(code(.)) | join(", "))
+            end
+          )
         + "; path softened "
         + code($match.request_path_softened)
         + ")"
@@ -217,6 +225,14 @@ render_edge_session_index() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
              + ", source "
              + (
                  if ((.source_cidrs // []) | length) == 0 then
@@ -491,6 +507,14 @@ render_selected_session_summary() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
              + ", source "
              + (
                  if ((.source_cidrs // []) | length) == 0 then
@@ -602,6 +626,14 @@ render_selected_session_summary() {
                   code("all")
                 else
                   (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; host "
+            + (
+                if (($trusted_soften_match.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  (($trusted_soften_match.hosts // []) | map(code(.)) | join(", "))
                 end
               )
             + "; source "
@@ -733,6 +765,14 @@ render_selected_session_summary() {
                   ((.path_prefixes // []) | map(code(.)) | join(", "))
                 end
               )
+            + "; host "
+            + (
+                if ((.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  ((.hosts // []) | map(code(.)) | join(", "))
+                end
+              )
             + "; source "
             + (
                 if ((.source_cidrs // []) | length) == 0 then
@@ -844,6 +884,14 @@ write_readme() {
                 "`all`"
               else
                 ((.path_prefixes // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + "; host "
+          + (
+              if ((.hosts // []) | length) == 0 then
+                "`any`"
+              else
+                ((.hosts // []) | map("`" + . + "`") | join(", "))
               end
             )
           + "; source "

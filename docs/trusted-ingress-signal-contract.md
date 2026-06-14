@@ -204,6 +204,7 @@ The current local config supports:
 - trust tier
 - optional expiry
 - method scope
+- exact host scope, matched against the normalized request host without the port
 - path-prefix scope
 - optional source CIDR scope, matched against the proxy's direct TCP peer
 - required header matchers
@@ -262,6 +263,9 @@ Current runtime policy:
 - local allowlist entries may also carry optional `source_cidrs` so verified
   crawler or partner automation matches can be bound to expected source
   networks instead of header/path shape alone
+- local allowlist entries may also carry optional `hosts` so verified crawler
+  or partner automation matches can be bound to expected first-party hostnames
+  instead of header/path shape alone
 - local allowlist scopes do not widen the global soften list; they only
   intersect with it
 - strong trusted identities do not suppress unrelated bait surfaces outside that

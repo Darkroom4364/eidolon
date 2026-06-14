@@ -354,6 +354,14 @@ render_markdown_export() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
              + ", source "
              + (
                  if ((.source_cidrs // []) | length) == 0 then
@@ -463,6 +471,14 @@ render_markdown_export() {
                   code("all")
                 else
                   (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; host "
+            + (
+                if (($trusted_soften_match.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  (($trusted_soften_match.hosts // []) | map(code(.)) | join(", "))
                 end
               )
             + "; source "
@@ -592,6 +608,14 @@ render_markdown_export() {
                   code("all")
                 else
                   ((.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; host "
+            + (
+                if ((.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  ((.hosts // []) | map(code(.)) | join(", "))
                 end
               )
             + "; source "
@@ -812,12 +836,13 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
             | {
                 label,
                 source,
-                trust_tier,
-                expires_at,
-                path_prefixes,
-                bait_soften_path_prefixes,
-                source_cidrs
-              }
+              trust_tier,
+              expires_at,
+              path_prefixes,
+              bait_soften_path_prefixes,
+              hosts,
+              source_cidrs
+            }
           ]
         }
       end

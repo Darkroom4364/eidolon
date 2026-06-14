@@ -15,6 +15,7 @@ pub struct ResolvedIngressTrust {
     pub identity: IngressIdentity,
     pub path_prefixes: Vec<String>,
     pub bait_soften_path_prefixes: Option<Vec<String>>,
+    pub hosts: Option<Vec<String>>,
     pub source_cidrs: Option<Vec<String>>,
 }
 
@@ -31,6 +32,7 @@ impl IngressIdentityResolver {
         &self,
         method: &str,
         path: &str,
+        request_host: Option<&str>,
         client_ip: Option<IpAddr>,
         headers: I,
     ) -> Option<ResolvedIngressTrust>
@@ -47,11 +49,12 @@ impl IngressIdentityResolver {
 
         self.entries
             .iter()
-            .find(|entry| entry.matches(&method, path, client_ip, &headers))
+            .find(|entry| entry.matches(&method, path, request_host, client_ip, &headers))
             .map(|entry| ResolvedIngressTrust {
                 identity: entry.identity.clone(),
                 path_prefixes: entry.path_prefixes.clone(),
                 bait_soften_path_prefixes: entry.bait_soften_path_prefixes.clone(),
+                hosts: entry.hosts.clone(),
                 source_cidrs: entry
                     .source_cidrs
                     .as_ref()
@@ -137,6 +140,7 @@ struct TrustedIngressEntry {
     methods: Vec<String>,
     path_prefixes: Vec<String>,
     bait_soften_path_prefixes: Option<Vec<String>>,
+    hosts: Option<Vec<String>>,
     source_cidrs: Option<Vec<IpNet>>,
     required_headers: Vec<RequiredHeaderMatch>,
 }
@@ -146,6 +150,7 @@ impl TrustedIngressEntry {
         &self,
         method: &str,
         path: &str,
+        request_host: Option<&str>,
         client_ip: Option<IpAddr>,
         headers: &[(String, String)],
     ) -> bool {
@@ -168,6 +173,15 @@ impl TrustedIngressEntry {
                 .any(|prefix| path.starts_with(prefix))
         {
             return false;
+        }
+
+        if let Some(hosts) = &self.hosts {
+            let Some(request_host) = request_host else {
+                return false;
+            };
+            if !hosts.iter().any(|host| host == request_host) {
+                return false;
+            }
         }
 
         if let Some(source_cidrs) = &self.source_cidrs {
@@ -236,6 +250,8 @@ struct RawTrustedIngressEntry {
     path_prefixes: Vec<String>,
     #[serde(default)]
     bait_soften_path_prefixes: Option<Vec<String>>,
+    #[serde(default)]
+    hosts: Vec<String>,
     #[serde(default)]
     source_cidrs: Vec<String>,
     required_headers: Vec<RawRequiredHeaderMatch>,
@@ -346,6 +362,7 @@ impl RawTrustedIngressEntry {
             )?),
             None => None,
         };
+        let hosts = normalize_hosts(self.hosts, index)?;
         let source_cidrs = normalize_source_cidrs(self.source_cidrs, index)?;
 
         let required_headers = self
@@ -364,6 +381,7 @@ impl RawTrustedIngressEntry {
             methods,
             path_prefixes,
             bait_soften_path_prefixes,
+            hosts,
             source_cidrs,
             required_headers,
         })
@@ -428,6 +446,52 @@ fn normalize_source_cidrs(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Some(source_cidrs))
+}
+
+fn normalize_hosts(
+    hosts: Vec<String>,
+    index: usize,
+) -> Result<Option<Vec<String>>, IngressTrustConfigError> {
+    if hosts.is_empty() {
+        return Ok(None);
+    }
+
+    let hosts = hosts
+        .into_iter()
+        .map(|host| normalize_host_scope_value(&host, index))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Some(hosts))
+}
+
+fn normalize_host_scope_value(host: &str, index: usize) -> Result<String, IngressTrustConfigError> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(IngressTrustConfigError::new(format!(
+            "ingress trust config entry {index} hosts must not contain empty values"
+        )));
+    }
+    if host.contains('/') || host.chars().any(char::is_whitespace) {
+        return Err(IngressTrustConfigError::new(format!(
+            "ingress trust config entry {index} hosts value `{host}` is invalid: host scopes must be plain hosts without paths"
+        )));
+    }
+
+    let bracketless = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if bracketless.parse::<IpAddr>().is_ok() {
+        return Ok(bracketless.to_ascii_lowercase());
+    }
+
+    if host.contains(':') {
+        return Err(IngressTrustConfigError::new(format!(
+            "ingress trust config entry {index} hosts value `{host}` is invalid: host scopes must not include ports"
+        )));
+    }
+
+    Ok(host.to_ascii_lowercase())
 }
 
 impl RawRequiredHeaderMatch {
@@ -505,6 +569,7 @@ mod tests {
                 "GET",
                 "/docs/legacy-import",
                 None,
+                None,
                 [("X-Eidolon-Trusted-Actor", "internal-crawler")],
             ),
             "entry should match",
@@ -546,6 +611,7 @@ mod tests {
                 "POST",
                 "/docs/legacy-import",
                 None,
+                None,
                 [("X-Eidolon-Trusted-Actor", "internal-crawler")],
             )
             .is_none());
@@ -553,6 +619,7 @@ mod tests {
             .resolve(
                 "GET",
                 "/health",
+                None,
                 None,
                 [("X-Eidolon-Trusted-Actor", "internal-crawler")],
             )
@@ -587,7 +654,7 @@ mod tests {
         let resolver = must_ok(resolver, "config should parse");
 
         let trust = must_some(
-            resolver.resolve("GET", "/docs", None, [("X-Actor", "seed")]),
+            resolver.resolve("GET", "/docs", None, None, [("X-Actor", "seed")]),
             "entry should match",
         );
 
@@ -619,7 +686,7 @@ mod tests {
         let resolver = must_ok(resolver, "config should parse");
 
         let trust = must_some(
-            resolver.resolve("GET", "/docs", None, [("X-Actor", "window")]),
+            resolver.resolve("GET", "/docs", None, None, [("X-Actor", "window")]),
             "entry should match",
         );
 
@@ -655,7 +722,7 @@ mod tests {
 
         assert!(
             resolver
-                .resolve("GET", "/docs", None, [("X-Actor", "window")])
+                .resolve("GET", "/docs", None, None, [("X-Actor", "window")])
                 .is_none(),
             "expired trust entries should not match",
         );
@@ -684,7 +751,13 @@ mod tests {
         let resolver = must_ok(resolver, "config should parse");
 
         let trust = must_some(
-            resolver.resolve("GET", "/openapi.json", None, [("X-Actor", "docs-crawler")]),
+            resolver.resolve(
+                "GET",
+                "/openapi.json",
+                None,
+                None,
+                [("X-Actor", "docs-crawler")],
+            ),
             "entry should match",
         );
 
@@ -814,6 +887,7 @@ mod tests {
             .resolve(
                 "GET",
                 "/docs",
+                None,
                 Some("127.0.0.1".parse().expect("loopback ip should parse")),
                 [("X-Eidolon-Trusted-Actor", "docs-crawler")],
             )
@@ -822,6 +896,7 @@ mod tests {
             .resolve(
                 "GET",
                 "/docs",
+                None,
                 Some("192.168.1.20".parse().expect("private ip should parse")),
                 [("X-Eidolon-Trusted-Actor", "docs-crawler")],
             )
@@ -831,9 +906,87 @@ mod tests {
                 "GET",
                 "/docs",
                 None,
+                None,
                 [("X-Eidolon-Trusted-Actor", "docs-crawler")],
             )
             .is_none());
+    }
+
+    #[test]
+    fn hosts_can_gate_local_trust_matches() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "entries": [
+                    {
+                      "label": "docs-crawler",
+                      "source": "local_allowlist",
+                      "trust_tier": "allowlisted",
+                      "path_prefixes": ["/docs"],
+                      "hosts": ["docs.example.test", "127.0.0.1"],
+                      "required_headers": [
+                        { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                      ]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/docs",
+                Some("docs.example.test"),
+                None,
+                [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            )
+            .is_some());
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/docs",
+                Some("api.example.test"),
+                None,
+                [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            )
+            .is_none());
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/docs",
+                None,
+                None,
+                [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_hosts() {
+        let error = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "bad-host",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "hosts": ["docs.example.test:8443"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect_err("host scopes with ports should fail");
+
+        assert!(error
+            .to_string()
+            .contains("host scopes must not include ports"));
     }
 
     #[test]
