@@ -17,6 +17,8 @@ MIN_POLYMORPHIC_COVERAGE=""
 LATEST_MINT_OUTCOME=""
 LOCAL_TRUST_REJECTION_LABEL=""
 LOCAL_TRUST_REJECTION_REASON=""
+LOCAL_TRUST_REJECTION_HISTORY_LABEL=""
+LOCAL_TRUST_REJECTION_HISTORY_REASON=""
 TRUSTED_SOFTEN_LABEL=""
 TRUSTED_SOFTEN_PATH_SOFTENED=""
 TRUSTED_SOFTEN_HISTORY_LABEL=""
@@ -49,6 +51,12 @@ Options:
   --local-trust-rejection-reason <expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
                          Keep only sessions whose latest local trust scope
                          rejection reason matches the given value.
+  --local-trust-rejection-history-label <label>
+                         Keep only sessions whose local trust scope rejection
+                         history includes the given label.
+  --local-trust-rejection-history-reason <expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+                         Keep only sessions whose local trust scope rejection
+                         history includes the given reason.
   --trusted-soften-label <label>
                          Keep only sessions whose matched trusted-ingress
                          soften scope label matches the given value.
@@ -262,6 +270,42 @@ filter_by_local_trust_rejection_reason() {
     map(
       select(
         (.local_ingress_trust_scope_rejection.reason // "") == $reason
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_local_trust_rejection_history_label() {
+  local input_file="$1"
+  local output_file="$2"
+  local label="$3"
+
+  jq -s -c --arg label "$label" '
+    map(
+      select(
+        any(
+          (.evidence.local_ingress_trust_scope_rejection_histories // [])[];
+          (.label // "") == $label
+        )
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_local_trust_rejection_history_reason() {
+  local input_file="$1"
+  local output_file="$2"
+  local reason="$3"
+
+  jq -s -c --arg reason "$reason" '
+    map(
+      select(
+        any(
+          (.evidence.local_ingress_trust_scope_rejection_histories // [])[];
+          any((.reasons // [])[]; . == $reason)
+        )
       )
     )
     | .[]
@@ -811,6 +855,16 @@ while [[ $# -gt 0 ]]; do
       LOCAL_TRUST_REJECTION_REASON="$2"
       shift 2
       ;;
+    --local-trust-rejection-history-label)
+      [[ $# -ge 2 ]] || fail "missing value for --local-trust-rejection-history-label"
+      LOCAL_TRUST_REJECTION_HISTORY_LABEL="$2"
+      shift 2
+      ;;
+    --local-trust-rejection-history-reason)
+      [[ $# -ge 2 ]] || fail "missing value for --local-trust-rejection-history-reason"
+      LOCAL_TRUST_REJECTION_HISTORY_REASON="$2"
+      shift 2
+      ;;
     --trusted-soften-label)
       [[ $# -ge 2 ]] || fail "missing value for --trusted-soften-label"
       TRUSTED_SOFTEN_LABEL="$2"
@@ -891,6 +945,16 @@ if [[ -n "$LOCAL_TRUST_REJECTION_REASON" ]]; then
       ;;
     *)
       fail "--local-trust-rejection-reason must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
+  case "$LOCAL_TRUST_REJECTION_HISTORY_REASON" in
+    expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+      ;;
+    *)
+      fail "--local-trust-rejection-history-reason must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi
@@ -1073,6 +1137,30 @@ if [[ -n "$LOCAL_TRUST_REJECTION_REASON" ]]; then
   rendered_ndjson="$filtered_ndjson"
   if [[ ! -s "$rendered_ndjson" ]]; then
     fail "no edge decision exports matched --local-trust-rejection-reason ${LOCAL_TRUST_REJECTION_REASON}"
+  fi
+fi
+
+if [[ -n "$LOCAL_TRUST_REJECTION_HISTORY_LABEL" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.local-trust-history-label-filtered.ndjson"
+  filter_by_local_trust_rejection_history_label \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$LOCAL_TRUST_REJECTION_HISTORY_LABEL"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --local-trust-rejection-history-label ${LOCAL_TRUST_REJECTION_HISTORY_LABEL}"
+  fi
+fi
+
+if [[ -n "$LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.local-trust-history-reason-filtered.ndjson"
+  filter_by_local_trust_rejection_history_reason \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$LOCAL_TRUST_REJECTION_HISTORY_REASON"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --local-trust-rejection-history-reason ${LOCAL_TRUST_REJECTION_HISTORY_REASON}"
   fi
 fi
 

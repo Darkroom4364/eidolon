@@ -60,7 +60,7 @@ fi
 if [[ "$session" == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" ]]; then
   printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:00Z","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","request":{"method":"GET","path":"/docs/service-token"},"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"request_path_softened":true},"policy":{"state":"observe","routing_decision":"protected_upstream","reason":"trusted ingress identity suppressed bait surface intervention before runtime suspicion was established"},"evidence":{"event_schema_version":2,"event_ids":["11111111-1111-1111-1111-111111111111"],"bundle_ref":"session:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","trusted_ingress_soften_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"saw_request_path_softened":true,"saw_request_path_unsoftened":false}],"bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"matched_session_value"}},"edge_recommendation":{"action":"allow","ttl_seconds":300,"reason_codes":["trusted_identity","bait_softened"]}}'
 elif [[ "$session" == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" ]]; then
-  printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:01:00Z","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","request":{"method":"POST","path":"/api/v2/import/reconcile"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"controlled_reality","routing_decision":"controlled_reality","reason":"confirmed bait-derived action moved session into controlled reality","post_containment_persistence_kind":"controlled_reality_branch_escape"},"evidence":{"event_schema_version":2,"event_ids":["33333333-3333-3333-3333-333333333333"],"bundle_ref":"session:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","trusted_ingress_soften_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"saw_request_path_softened":true,"saw_request_path_unsoftened":true}]},"edge_recommendation":{"action":"preserve_eidolon_routing","ttl_seconds":300,"reason_codes":["eidolon_runtime_enforcement","controlled_reality"]}}'
+  printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:01:00Z","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","request":{"method":"POST","path":"/api/v2/import/reconcile"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"controlled_reality","routing_decision":"controlled_reality","reason":"confirmed bait-derived action moved session into controlled reality","post_containment_persistence_kind":"controlled_reality_branch_escape"},"evidence":{"event_schema_version":2,"event_ids":["33333333-3333-3333-3333-333333333333"],"bundle_ref":"session:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","local_ingress_trust_scope_rejection_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["docs.invalid.eidolon"],"source_cidrs":["192.168.194.1/32"],"reasons":["host_mismatch"]}],"trusted_ingress_soften_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"saw_request_path_softened":true,"saw_request_path_unsoftened":true}]},"edge_recommendation":{"action":"preserve_eidolon_routing","ttl_seconds":300,"reason_codes":["eidolon_runtime_enforcement","controlled_reality"]}}'
 elif [[ "$session" == "cccccccc-cccc-cccc-cccc-cccccccccccc" ]]; then
   printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:30Z","session_id":"cccccccc-cccc-cccc-cccc-cccccccccccc","request":{"method":"GET","path":"/openapi.json"},"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"request_path_softened":false},"policy":{"state":"observe","routing_decision":"rewritten_upstream","reason":"surface controller rewrote upstream response"},"evidence":{"event_schema_version":2,"event_ids":["55555555-5555-5555-5555-555555555555"],"bundle_ref":"session:cccccccc-cccc-cccc-cccc-cccccccccccc"},"edge_recommendation":{"action":"observe","reason_codes":["rewritten_upstream"]}}'
 elif [[ "$session" == "dddddddd-dddd-dddd-dddd-dddddddddddd" ]]; then
@@ -120,7 +120,8 @@ test_exports_all_sessions_as_json_array() {
       and .deployment_context.polymorphic_bait_coverage.observed_bait_count == 0
       and .deployment_context.trusted_ingress_soften_scopes[0].source == "local_allowlist"
       and .deployment_context.trusted_ingress_soften_scopes[0].hosts == ["127.0.0.1", "localhost"]
-      and .evidence.trusted_ingress_soften_histories[0].source_cidrs == ["192.168.194.1/32"])
+      and .evidence.trusted_ingress_soften_histories[0].source_cidrs == ["192.168.194.1/32"]
+      and .evidence.local_ingress_trust_scope_rejection_histories[0].reasons == ["host_mismatch"])
     and any(.[]; .session_id == "cccccccc-cccc-cccc-cccc-cccccccccccc"
       and .edge_recommendation.action == "observe"
       and .trusted_ingress_soften_match.label == "docs-crawler"
@@ -160,6 +161,7 @@ test_exports_one_session_as_ndjson() {
     and .deployment_context.polymorphic_bait_coverage.observed_bait_count == 0
     and .deployment_context.trusted_ingress_soften_scopes[0].path_prefixes == ["/docs", "/openapi.json"]
     and .deployment_context.trusted_ingress_soften_scopes[0].hosts == ["127.0.0.1", "localhost"]
+    and .evidence.local_ingress_trust_scope_rejection_histories[0].label == "docs-crawler"
   ' <<<"$output" >/dev/null
 }
 
@@ -375,6 +377,50 @@ test_filters_sessions_by_local_trust_rejection_reason() {
   ' <<<"$output" >/dev/null
 }
 
+test_filters_sessions_by_local_trust_rejection_history_label() {
+  local temp_dir state_dir output
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
+      --local-trust-rejection-history-label docs-crawler
+  )"
+
+  jq -e '
+    length == 1
+    and .[0].session_id == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    and .[0].evidence.local_ingress_trust_scope_rejection_histories[0].label == "docs-crawler"
+  ' <<<"$output" >/dev/null
+}
+
+test_filters_sessions_by_local_trust_rejection_history_reason() {
+  local temp_dir state_dir output
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
+      --local-trust-rejection-history-reason host_mismatch
+  )"
+
+  jq -e '
+    length == 1
+    and .[0].session_id == "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    and .[0].evidence.local_ingress_trust_scope_rejection_histories[0].reasons == ["host_mismatch"]
+  ' <<<"$output" >/dev/null
+}
+
 test_renders_single_session_markdown_summary() {
   local temp_dir state_dir output
   temp_dir="$(new_temp_dir)"
@@ -448,6 +494,8 @@ test_renders_trusted_soften_history_when_current_match_is_absent() {
   )"
 
   ! rg -q 'Trusted soften match:' <<<"$output"
+  ! rg -q 'Local trust scope rejection:' <<<"$output"
+  rg -q 'Local trust rejection history: `docs-crawler` \[`host_mismatch`; host `docs.invalid.eidolon`, source `192.168.194.1/32`\]' <<<"$output"
   rg -q 'Trusted soften history: `docs-crawler` \[softened `true`, unsoftened `true`, host `127.0.0.1`, `localhost`, source `192.168.194.1/32`\]' <<<"$output"
   rg -q 'Policy state: `controlled_reality`' <<<"$output"
 }
@@ -651,6 +699,8 @@ test_filters_sessions_by_trusted_soften_path_softened
 test_filters_sessions_by_trusted_soften_history_label
 test_filters_sessions_by_trusted_soften_history_path_softened
 test_filters_sessions_by_local_trust_rejection_reason
+test_filters_sessions_by_local_trust_rejection_history_label
+test_filters_sessions_by_local_trust_rejection_history_reason
 test_renders_single_session_markdown_summary
 test_renders_local_trust_scope_rejection_in_markdown_summary
 test_renders_trusted_soften_history_when_current_match_is_absent
