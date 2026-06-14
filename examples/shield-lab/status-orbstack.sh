@@ -169,6 +169,7 @@ status_json="$(jq -n \
             expires_at: (.expires_at // null),
             path_prefixes: (.path_prefixes // []),
             bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
+            user_agent_substrings: (.user_agent_substrings // []),
             hosts: (.hosts // []),
             source_cidrs: (.source_cidrs // [])
           }
@@ -299,6 +300,13 @@ jq -r '
                   "all"
                 else
                   (.path_prefixes | join(", "))
+                end
+              )
+            + (
+                if (.user_agent_substrings | length) == 0 then
+                  "; ua any"
+                else
+                  "; ua " + (.user_agent_substrings | join(", "))
                 end
               )
             + (

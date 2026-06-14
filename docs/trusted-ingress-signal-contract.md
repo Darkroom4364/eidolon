@@ -266,6 +266,9 @@ Current runtime policy:
 - local allowlist entries may also carry optional `hosts` so verified crawler
   or partner automation matches can be bound to expected first-party hostnames
   instead of header/path shape alone
+- local allowlist entries may also carry optional `user_agent_substrings` so
+  verified crawler or partner automation matches can be narrowed to expected
+  agent families without treating `User-Agent` itself as a trust source
 - local allowlist scopes do not widen the global soften list; they only
   intersect with it
 - strong trusted identities do not suppress unrelated bait surfaces outside that

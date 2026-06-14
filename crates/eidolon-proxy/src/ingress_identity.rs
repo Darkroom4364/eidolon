@@ -18,6 +18,7 @@ pub struct ResolvedIngressTrust {
     pub identity: IngressIdentity,
     pub path_prefixes: Vec<String>,
     pub bait_soften_path_prefixes: Option<Vec<String>>,
+    pub user_agent_substrings: Option<Vec<String>>,
     pub hosts: Option<Vec<String>>,
     pub source_cidrs: Option<Vec<String>>,
 }
@@ -171,6 +172,7 @@ struct TrustedIngressEntry {
     methods: Vec<String>,
     path_prefixes: Vec<String>,
     bait_soften_path_prefixes: Option<Vec<String>>,
+    user_agent_substrings: Option<Vec<String>>,
     hosts: Option<Vec<String>>,
     source_cidrs: Option<Vec<IpNet>>,
     required_headers: Vec<RequiredHeaderMatch>,
@@ -222,6 +224,27 @@ impl TrustedIngressEntry {
             );
         }
 
+        if let Some(user_agent_substrings) = &self.user_agent_substrings {
+            let request_user_agent = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                .map(|(_, value)| value);
+            let Some(request_user_agent) = request_user_agent else {
+                return TrustedIngressEntryEvaluation::ScopeRejected(self.scope_rejection(
+                    LocalIngressTrustScopeRejectionReason::RequestUserAgentMissing,
+                ));
+            };
+            let request_user_agent = request_user_agent.to_ascii_lowercase();
+            if !user_agent_substrings
+                .iter()
+                .any(|candidate| request_user_agent.contains(candidate))
+            {
+                return TrustedIngressEntryEvaluation::ScopeRejected(
+                    self.scope_rejection(LocalIngressTrustScopeRejectionReason::UserAgentMismatch),
+                );
+            }
+        }
+
         if let Some(hosts) = &self.hosts {
             let Some(request_host) = request_host else {
                 return TrustedIngressEntryEvaluation::ScopeRejected(
@@ -256,6 +279,7 @@ impl TrustedIngressEntry {
             identity: self.identity.clone(),
             path_prefixes: self.path_prefixes.clone(),
             bait_soften_path_prefixes: self.bait_soften_path_prefixes.clone(),
+            user_agent_substrings: self.user_agent_substrings.clone(),
             hosts: self.hosts.clone(),
             source_cidrs: self
                 .source_cidrs
@@ -275,6 +299,7 @@ impl TrustedIngressEntry {
             expires_at: self.identity.expires_at,
             path_prefixes: self.path_prefixes.clone(),
             bait_soften_path_prefixes: self.bait_soften_path_prefixes.clone().unwrap_or_default(),
+            user_agent_substrings: self.user_agent_substrings.clone().unwrap_or_default(),
             hosts: self.hosts.clone().unwrap_or_default(),
             source_cidrs: self
                 .source_cidrs
@@ -335,6 +360,8 @@ struct RawTrustedIngressEntry {
     path_prefixes: Vec<String>,
     #[serde(default)]
     bait_soften_path_prefixes: Option<Vec<String>>,
+    #[serde(default)]
+    user_agent_substrings: Vec<String>,
     #[serde(default)]
     hosts: Vec<String>,
     #[serde(default)]
@@ -447,6 +474,8 @@ impl RawTrustedIngressEntry {
             )?),
             None => None,
         };
+        let user_agent_substrings =
+            normalize_user_agent_substrings(self.user_agent_substrings, index)?;
         let hosts = normalize_hosts(self.hosts, index)?;
         let source_cidrs = normalize_source_cidrs(self.source_cidrs, index)?;
 
@@ -466,6 +495,7 @@ impl RawTrustedIngressEntry {
             methods,
             path_prefixes,
             bait_soften_path_prefixes,
+            user_agent_substrings,
             hosts,
             source_cidrs,
             required_headers,
@@ -531,6 +561,31 @@ fn normalize_source_cidrs(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Some(source_cidrs))
+}
+
+fn normalize_user_agent_substrings(
+    user_agent_substrings: Vec<String>,
+    index: usize,
+) -> Result<Option<Vec<String>>, IngressTrustConfigError> {
+    if user_agent_substrings.is_empty() {
+        return Ok(None);
+    }
+
+    let user_agent_substrings = user_agent_substrings
+        .into_iter()
+        .map(|substring| {
+            let substring = substring.trim();
+            if substring.is_empty() {
+                return Err(IngressTrustConfigError::new(format!(
+                    "ingress trust config entry {index} user_agent_substrings must not contain empty values"
+                )));
+            }
+
+            Ok(substring.to_ascii_lowercase())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Some(user_agent_substrings))
 }
 
 fn normalize_hosts(
@@ -853,6 +908,118 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_substrings_can_gate_local_trust_matches() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "entries": [
+                    {
+                      "label": "docs-crawler",
+                      "source": "local_allowlist",
+                      "trust_tier": "allowlisted",
+                      "path_prefixes": ["/docs"],
+                      "user_agent_substrings": ["eidolon-docs-crawler"],
+                      "required_headers": [
+                        { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                      ]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let trust = must_some(
+            resolver.resolve(
+                "GET",
+                "/docs",
+                None,
+                None,
+                [
+                    ("X-Eidolon-Trusted-Actor", "docs-crawler"),
+                    ("User-Agent", "Eidolon-Docs-Crawler/1.0"),
+                ],
+            ),
+            "entry should match",
+        );
+
+        assert_eq!(
+            trust.user_agent_substrings,
+            Some(vec!["eidolon-docs-crawler".to_string()])
+        );
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/docs",
+                None,
+                None,
+                [
+                    ("X-Eidolon-Trusted-Actor", "docs-crawler"),
+                    ("User-Agent", "Mozilla/5.0"),
+                ],
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn user_agent_scope_rejections_are_exposed() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "entries": [
+                    {
+                      "label": "docs-crawler",
+                      "source": "local_allowlist",
+                      "trust_tier": "allowlisted",
+                      "path_prefixes": ["/docs"],
+                      "user_agent_substrings": ["eidolon-docs-crawler"],
+                      "required_headers": [
+                        { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                      ]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let mismatch = resolver.evaluate(
+            "GET",
+            "/docs",
+            None,
+            None,
+            [
+                ("X-Eidolon-Trusted-Actor", "docs-crawler"),
+                ("User-Agent", "Mozilla/5.0"),
+            ],
+        );
+        let mismatch_rejection = must_some(mismatch.scope_rejection, "mismatch should be recorded");
+        assert_eq!(
+            mismatch_rejection.reason,
+            LocalIngressTrustScopeRejectionReason::UserAgentMismatch
+        );
+        assert_eq!(
+            mismatch_rejection.user_agent_substrings,
+            vec!["eidolon-docs-crawler".to_string()]
+        );
+
+        let missing = resolver.evaluate(
+            "GET",
+            "/docs",
+            None,
+            None,
+            [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+        );
+        let missing_rejection = must_some(missing.scope_rejection, "missing ua should be recorded");
+        assert_eq!(
+            missing_rejection.reason,
+            LocalIngressTrustScopeRejectionReason::RequestUserAgentMissing
+        );
+    }
+
+    #[test]
     fn rejects_empty_entries_and_user_agent_matchers() {
         let empty = parse_ingress_identity_resolver(r#"{"schema_version":1,"entries":[]}"#)
             .expect_err("empty config should fail");
@@ -872,11 +1039,31 @@ mod tests {
             }"#,
         )
         .expect_err("user-agent matcher should fail");
+        let empty_substring = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "bad",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "user_agent_substrings": [" "],
+                  "required_headers": [
+                    { "name": "X-Actor", "value": "bad" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect_err("empty user-agent substring should fail");
 
         assert!(empty.to_string().contains("must not be empty"));
         assert!(user_agent
             .to_string()
             .contains("must not trust `user-agent`"));
+        assert!(empty_substring
+            .to_string()
+            .contains("user_agent_substrings must not contain empty values"));
     }
 
     #[test]
