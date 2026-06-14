@@ -161,6 +161,16 @@ pub enum IngressTrustTier {
     SignedAttested,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalIngressTrustScopeRejectionReason {
+    Expired,
+    RequestHostMissing,
+    HostMismatch,
+    ClientPeerMissing,
+    SourceCidrMismatch,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngressIdentity {
     pub source: IngressIdentitySource,
@@ -169,6 +179,25 @@ pub struct IngressIdentity {
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalIngressTrustScopeRejection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub source: IngressIdentitySource,
+    pub trust_tier: IngressTrustTier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bait_soften_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_cidrs: Vec<String>,
+    pub reason: LocalIngressTrustScopeRejectionReason,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,6 +494,8 @@ pub enum EventKind {
         #[serde(default)]
         ingress_identity: IngressIdentity,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_ingress_trust_scope_rejection: Option<LocalIngressTrustScopeRejection>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
         #[serde(default, skip_serializing_if = "IngressAdvisorySignals::is_empty")]
         ingress_signals: IngressAdvisorySignals,
@@ -609,6 +640,9 @@ pub struct EdgeEvidenceRef {
     pub event_ids: Vec<Uuid>,
     pub bundle_ref: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_ingress_trust_scope_rejection_histories:
+        Vec<EdgeLocalIngressTrustScopeRejectionHistory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_ingress_soften_histories: Vec<EdgeTrustedIngressSoftenHistory>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_header_value_mints: Vec<EdgeBaitHeaderValueMintAudit>,
@@ -666,6 +700,8 @@ pub struct EdgeTrustedIngressSoftenScope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_cidrs: Vec<String>,
 }
 
@@ -679,6 +715,8 @@ pub struct TrustedIngressSoftenMatch {
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_cidrs: Vec<String>,
     pub request_path_softened: bool,
@@ -695,9 +733,31 @@ pub struct EdgeTrustedIngressSoftenHistory {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_cidrs: Vec<String>,
     pub saw_request_path_softened: bool,
     pub saw_request_path_unsoftened: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeLocalIngressTrustScopeRejectionHistory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub source: IngressIdentitySource,
+    pub trust_tier: IngressTrustTier,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bait_soften_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_cidrs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<LocalIngressTrustScopeRejectionReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,6 +787,8 @@ pub struct EidolonEdgeDecisionExport {
     pub session_id: SessionId,
     pub request: EdgeRequestRef,
     pub ingress_identity: IngressIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_ingress_trust_scope_rejection: Option<LocalIngressTrustScopeRejection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
     #[serde(default, skip_serializing_if = "IngressAdvisorySignals::is_empty")]
@@ -780,6 +842,7 @@ mod tests {
                     present: true,
                 }],
                 ingress_identity: IngressIdentity::default(),
+                local_ingress_trust_scope_rejection: None,
                 trusted_ingress_soften_match: None,
                 ingress_signals: IngressAdvisorySignals::default(),
                 discovery_recon_score: DiscoveryReconScore::default(),
@@ -837,12 +900,24 @@ mod tests {
                     label: Some("googlebot".to_string()),
                     expires_at: None,
                 },
+                local_ingress_trust_scope_rejection: Some(LocalIngressTrustScopeRejection {
+                    label: Some("docs-crawler".to_string()),
+                    source: IngressIdentitySource::LocalAllowlist,
+                    trust_tier: IngressTrustTier::Allowlisted,
+                    expires_at: None,
+                    path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                    bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    hosts: vec!["localhost".to_string()],
+                    source_cidrs: vec!["127.0.0.1/32".to_string()],
+                    reason: LocalIngressTrustScopeRejectionReason::HostMismatch,
+                }),
                 trusted_ingress_soften_match: Some(TrustedIngressSoftenMatch {
                     label: Some("docs-crawler".to_string()),
                     source: IngressIdentitySource::LocalAllowlist,
                     trust_tier: IngressTrustTier::Allowlisted,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                     request_path_softened: false,
                 }),
@@ -879,6 +954,14 @@ mod tests {
             "edge_verified"
         );
         assert_eq!(serialized["kind"]["ingress_identity"]["label"], "googlebot");
+        assert_eq!(
+            serialized["kind"]["local_ingress_trust_scope_rejection"]["reason"],
+            "host_mismatch"
+        );
+        assert_eq!(
+            serialized["kind"]["local_ingress_trust_scope_rejection"]["hosts"][0],
+            "localhost"
+        );
         assert_eq!(
             serialized["kind"]["trusted_ingress_soften_match"]["label"],
             "docs-crawler"
@@ -1217,12 +1300,24 @@ mod tests {
                 label: Some("googlebot".to_string()),
                 expires_at: None,
             },
+            local_ingress_trust_scope_rejection: Some(LocalIngressTrustScopeRejection {
+                label: Some("docs-crawler".to_string()),
+                source: IngressIdentitySource::LocalAllowlist,
+                trust_tier: IngressTrustTier::Allowlisted,
+                expires_at: None,
+                path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                bait_soften_path_prefixes: vec!["/docs".to_string()],
+                hosts: vec!["localhost".to_string()],
+                source_cidrs: vec!["127.0.0.1/32".to_string()],
+                reason: LocalIngressTrustScopeRejectionReason::HostMismatch,
+            }),
             trusted_ingress_soften_match: Some(TrustedIngressSoftenMatch {
                 label: Some("docs-crawler".to_string()),
                 source: IngressIdentitySource::LocalAllowlist,
                 trust_tier: IngressTrustTier::Allowlisted,
                 path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                 bait_soften_path_prefixes: vec!["/docs".to_string()],
+                hosts: vec!["127.0.0.1".to_string()],
                 source_cidrs: vec!["127.0.0.1/32".to_string()],
                 request_path_softened: false,
             }),
@@ -1262,12 +1357,29 @@ mod tests {
                 event_schema_version: EVENT_SCHEMA_VERSION,
                 event_ids: vec![Uuid::new_v4()],
                 bundle_ref: "session:ref".to_string(),
+                local_ingress_trust_scope_rejection_histories: vec![
+                    EdgeLocalIngressTrustScopeRejectionHistory {
+                        label: Some("docs-crawler".to_string()),
+                        source: IngressIdentitySource::LocalAllowlist,
+                        trust_tier: IngressTrustTier::Allowlisted,
+                        expires_at: None,
+                        path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
+                        bait_soften_path_prefixes: vec!["/docs".to_string()],
+                        hosts: vec!["localhost".to_string()],
+                        source_cidrs: vec!["127.0.0.1/32".to_string()],
+                        reasons: vec![
+                            LocalIngressTrustScopeRejectionReason::HostMismatch,
+                            LocalIngressTrustScopeRejectionReason::SourceCidrMismatch,
+                        ],
+                    },
+                ],
                 trusted_ingress_soften_histories: vec![EdgeTrustedIngressSoftenHistory {
                     label: Some("docs-crawler".to_string()),
                     source: IngressIdentitySource::LocalAllowlist,
                     trust_tier: IngressTrustTier::Allowlisted,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                     saw_request_path_softened: true,
                     saw_request_path_unsoftened: true,
@@ -1317,6 +1429,7 @@ mod tests {
                     expires_at: None,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                 }],
             }),
@@ -1334,12 +1447,24 @@ mod tests {
             json!("edge_verified")
         );
         assert_eq!(
+            serialized["local_ingress_trust_scope_rejection"]["reason"],
+            json!("host_mismatch")
+        );
+        assert_eq!(
+            serialized["local_ingress_trust_scope_rejection"]["hosts"][0],
+            json!("localhost")
+        );
+        assert_eq!(
             serialized["trusted_ingress_soften_match"]["label"],
             json!("docs-crawler")
         );
         assert_eq!(
             serialized["trusted_ingress_soften_match"]["request_path_softened"],
             json!(false)
+        );
+        assert_eq!(
+            serialized["trusted_ingress_soften_match"]["hosts"][0],
+            json!("127.0.0.1")
         );
         assert_eq!(serialized["ingress_signals"]["vendor_score"], json!(12));
         assert_eq!(serialized["ingress_signals"]["edge_action"], json!("allow"));
@@ -1350,6 +1475,20 @@ mod tests {
         assert_eq!(serialized["discovery_recon_score"]["query_score"], json!(1));
         assert_eq!(serialized["discovery_recon_score"]["total"], json!(3));
         assert_eq!(serialized["discovery_recon_score"]["threshold"], json!(3));
+        assert_eq!(
+            serialized["evidence"]["local_ingress_trust_scope_rejection_histories"][0]["label"],
+            json!("docs-crawler")
+        );
+        assert_eq!(
+            serialized["evidence"]["local_ingress_trust_scope_rejection_histories"][0]["reasons"]
+                [0],
+            json!("host_mismatch")
+        );
+        assert_eq!(
+            serialized["evidence"]["local_ingress_trust_scope_rejection_histories"][0]["reasons"]
+                [1],
+            json!("source_cidr_mismatch")
+        );
         assert_eq!(
             serialized["evidence"]["trusted_ingress_soften_histories"][0]["label"],
             json!("docs-crawler")
@@ -1408,6 +1547,10 @@ mod tests {
             serialized["deployment_context"]["trusted_ingress_soften_scopes"][0]
                 ["bait_soften_path_prefixes"][0],
             json!("/docs")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["trusted_ingress_soften_scopes"][0]["hosts"][0],
+            json!("127.0.0.1")
         );
         assert_eq!(
             serialized["policy"]["pre_containment_persistence_class"],

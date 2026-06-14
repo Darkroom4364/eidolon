@@ -546,8 +546,9 @@ the live bait-profile ConfigMap and any active `trusted-soften-scopes` from the
 mounted ingress-trust ConfigMap, so operators can see which default surfaces
 are session-minted and which trusted identities are allowed to narrow bait
 softening without manually opening either config file. When configured, those
-trusted soften scopes now also surface their `source_cidrs`, so network-bound
-allowlist narrowing is visible alongside path-bound narrowing.
+trusted soften scopes now also surface their `hosts` and `source_cidrs`, so
+host-bound and network-bound allowlist narrowing is visible alongside
+path-bound narrowing.
 
 Smoke-check the trusted-ingress transport-auth path:
 
@@ -583,10 +584,11 @@ examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-only.json
 
 That default entry trusts `X-Eidolon-Trusted-Actor: docs-crawler` for
 `/docs` and `/openapi.json`, narrows bait softening to `/docs` only, and also
-requires the direct peer to be inside OrbStack's NodePort gateway
-`192.168.194.1/32`. The scoped smoke proves
-that `/docs` is softened while `/openapi.json` stays baited for that same local
-allowlist actor and loopback-bound source. The containment smoke then proves
+requires both a first-party host match (`127.0.0.1` or `localhost`) and the
+direct peer to be inside OrbStack's NodePort gateway `192.168.194.1/32`. The
+scoped smoke proves that `/docs` is softened while `/openapi.json` stays baited
+for that same local allowlist actor, host, and loopback-bound source. The
+containment smoke then proves
 that a session starting in that trusted softened path still enters controlled
 reality on a later same-session exact OpenAPI bait action.
 
@@ -602,6 +604,19 @@ examples/shield-lab/smoke-trusted-ingress-source-cidr-gate-orbstack.sh
 That path proves the same trusted actor still receives the baited `/docs`
 surface when the local allowlist source CIDR does not match the direct OrbStack
 peer.
+
+For the adjacent host-scope negative path, redeploy with the checked-in
+mismatched-host example and run the paired smoke:
+
+```sh
+EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH=examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-mismatched-host.json \
+  examples/shield-lab/deploy-orbstack.sh
+examples/shield-lab/smoke-trusted-ingress-host-gate-orbstack.sh
+```
+
+That path proves the same trusted actor still receives the baited `/docs`
+surface when the local allowlist host scope does not match the first-party edge
+host.
 
 For the adjacent freshness negative path, redeploy with the expired local-entry
 example and run the paired smoke:
@@ -646,9 +661,11 @@ running cluster.
 
 Each bundle now also includes `edge-session-index.md`, a compact redacted
 session index rendered from the enriched edge export path, including a minted
-coverage column and latest mint-outcome column so operators can see how many
-active session-minted baits each session actually touched and whether the most
-recent minted bait-shaped action matched the same session or mismatched.
+coverage column, latest mint-outcome column, and local trust rejection column
+so operators can see how many active session-minted baits each session
+actually touched, whether the most recent minted bait-shaped action matched the
+same session or mismatched, and whether a scoped local trust rule nearly
+matched but failed host/source/freshness gating.
 
 If you already know the session you want to review, the same bundle export can
 also embed one redacted per-session edge summary rendered from the enriched edge
@@ -710,8 +727,9 @@ now also carries `trusted_ingress_soften_histories`, so later contained
 sessions still show which trusted soften scopes were seen earlier in the same
 session and whether they covered both softened and unsoftened paths. When
 configured, the same deployment and session-level trusted soften context now
-also includes `source_cidrs`, so operators can distinguish path-only
-allowlisting from network-bound allowlisting in both live and offline review.
+also includes `hosts` and `source_cidrs`, so operators can distinguish
+path-only allowlisting from host-bound or network-bound allowlisting in both
+live and offline review.
 When
 `evidence.latest_bait_header_value_mint` is present, the markdown summaries now
 also show whether the latest minted bait-shaped action was a
@@ -730,7 +748,19 @@ into requests that were or were not inside that narrower bait-soften subset.
 For post-containment review, `--trusted-soften-history-label <label>` and
 `--trusted-soften-history-path-softened <true|false>` do the same thing against
 the session-level trusted soften history, so contained sessions still show up
-even when the final request itself is no longer trusted.
+even when the final request itself is no longer trusted. For rejected local
+allowlist scopes, `--local-trust-rejection-label <label>` and
+`--local-trust-rejection-reason
+<expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`
+narrow live export to sessions whose latest request nearly matched one scoped
+local trust entry but failed freshness, host, or source-CIDR gating. When a
+later request moves the session onward into containment or another state, the
+exported markdown and bundle index now keep that earlier context under
+`Local trust rejection history`. If you want to filter on that preserved
+history instead of only the latest request, use
+`--local-trust-rejection-history-label <label>` or
+`--local-trust-rejection-history-reason
+<expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`.
 
 If you want the bundle-local `edge-session-index.md` to keep only sessions that
 cross the same polymorphic threshold, set:
@@ -767,6 +797,32 @@ in the session, set:
 EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL=docs-crawler \
   examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED=false \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+```
+
+If you want the bundle-local `edge-session-index.md` to keep only sessions that
+hit one rejected local trust scope label or reason, set:
+
+```sh
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL=docs-crawler \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON=host_mismatch \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+```
+
+If you want the live or bundle export to keep only sessions whose preserved
+local trust rejection history includes one label or reason, set:
+
+```sh
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --local-trust-rejection-history-label docs-crawler
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --local-trust-rejection-history-reason host_mismatch
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL=docs-crawler \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON=host_mismatch \
   examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 ```
 

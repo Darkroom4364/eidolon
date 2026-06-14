@@ -307,10 +307,11 @@ profile, including bait id, surface, header name, mint kind, and prefix. It
 also exposes any active trusted-ingress soften scopes from the mounted
 ingress-trust config, including the narrower `bait_soften_path_prefixes` that
 actually apply for that trusted identity. The default lab config now uses that
-field for the docs crawler entry with OrbStack's NodePort gateway
-`192.168.194.1/32`, and when configured
-those scope records carry `source_cidrs`, so deployment-safe network narrowing
-is visible in the same operator view.
+field for the docs crawler entry with OrbStack's first-party hosts
+`127.0.0.1` and `localhost` plus the NodePort gateway `192.168.194.1/32`, and
+when configured those scope records carry `hosts` and `source_cidrs`, so
+deployment-safe host and network narrowing are visible in the same operator
+view.
 
 The paired bundle exporter, `examples/shield-lab/export-orbstack-evidence.sh`,
 now emits a compact `edge-session-index.md` by default and can optionally
@@ -332,14 +333,33 @@ across the full session, so a later contained request can still show which
 trusted soften scope was seen earlier and whether it covered both softened and
 unsoftened paths. When configured, both the deployment-level trusted soften
 scope records and the session-level trusted soften match/history now also carry
-`source_cidrs`, so offline review can distinguish path-only matches from
-network-bound allowlist matches. For live export triage, `export-edge-decisions-orbstack.sh`
+`hosts` and `source_cidrs`, so offline review can distinguish path-only
+matches from host-bound or network-bound allowlist matches. For live export
+triage, `export-edge-decisions-orbstack.sh`
 also supports `--min-polymorphic-coverage <N>`, and the bundle index supports
 the matching `EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE`
 environment override. The same live export path also supports
 `--latest-mint-outcome <matched_session_value|session_value_mismatch>`, and the
 bundle index supports the matching
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME` environment override.
+For rejected local allowlist scopes, the same live export path also supports
+`--local-trust-rejection-label <label>` and
+`--local-trust-rejection-reason
+<expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
+and the bundle index supports matching
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL` and
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON` overrides.
+Those rejected-scope details now also survive later state changes as `Local
+trust rejection history` in the live markdown summary and bundle index, so a
+contained session still preserves the earlier host/source/freshness mismatch
+context. The same live export path also supports
+`--local-trust-rejection-history-label <label>` and
+`--local-trust-rejection-history-reason
+<expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
+and the bundle index supports matching
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL` and
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON`
+overrides.
 Trusted soften triage uses the same pattern: `--trusted-soften-label <label>`
 and `--trusted-soften-path-softened <true|false>` filter live exports to
 requests that actually matched one local trusted soften scope, and the bundle

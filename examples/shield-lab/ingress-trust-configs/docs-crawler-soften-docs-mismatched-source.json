@@ -8,6 +8,7 @@
       "methods": ["GET"],
       "path_prefixes": ["/docs", "/openapi.json"],
       "bait_soften_path_prefixes": ["/docs"],
+      "hosts": ["127.0.0.1", "localhost"],
       "source_cidrs": ["10.0.0.0/8"],
       "required_headers": [
         {

@@ -169,6 +169,7 @@ status_json="$(jq -n \
             expires_at: (.expires_at // null),
             path_prefixes: (.path_prefixes // []),
             bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
+            hosts: (.hosts // []),
             source_cidrs: (.source_cidrs // [])
           }
       ];
@@ -300,12 +301,18 @@ jq -r '
                   (.path_prefixes | join(", "))
                 end
               )
-            + "; source "
+            + (
+                if (.hosts | length) == 0 then
+                  "; host any"
+                else
+                  "; host " + (.hosts | join(", "))
+                end
+              )
             + (
                 if (.source_cidrs | length) == 0 then
-                  "any"
+                  "; source any"
                 else
-                  (.source_cidrs | join(", "))
+                  "; source " + (.source_cidrs | join(", "))
                 end
               )
             + (

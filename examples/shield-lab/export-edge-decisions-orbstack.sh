@@ -15,6 +15,10 @@ SESSION_ID=""
 TOP_LIMIT=""
 MIN_POLYMORPHIC_COVERAGE=""
 LATEST_MINT_OUTCOME=""
+LOCAL_TRUST_REJECTION_LABEL=""
+LOCAL_TRUST_REJECTION_REASON=""
+LOCAL_TRUST_REJECTION_HISTORY_LABEL=""
+LOCAL_TRUST_REJECTION_HISTORY_REASON=""
 TRUSTED_SOFTEN_LABEL=""
 TRUSTED_SOFTEN_PATH_SOFTENED=""
 TRUSTED_SOFTEN_HISTORY_LABEL=""
@@ -41,6 +45,18 @@ Options:
   --latest-mint-outcome <matched_session_value|session_value_mismatch>
                          Keep only sessions whose latest exported minted bait
                          outcome matches the given status.
+  --local-trust-rejection-label <label>
+                         Keep only sessions whose latest local trust scope
+                         rejection label matches the given value.
+  --local-trust-rejection-reason <expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+                         Keep only sessions whose latest local trust scope
+                         rejection reason matches the given value.
+  --local-trust-rejection-history-label <label>
+                         Keep only sessions whose local trust scope rejection
+                         history includes the given label.
+  --local-trust-rejection-history-reason <expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+                         Keep only sessions whose local trust scope rejection
+                         history includes the given reason.
   --trusted-soften-label <label>
                          Keep only sessions whose matched trusted-ingress
                          soften scope label matches the given value.
@@ -230,6 +246,72 @@ filter_by_latest_mint_outcome() {
   ' "$input_file" > "$output_file"
 }
 
+filter_by_local_trust_rejection_label() {
+  local input_file="$1"
+  local output_file="$2"
+  local label="$3"
+
+  jq -s -c --arg label "$label" '
+    map(
+      select(
+        (.local_ingress_trust_scope_rejection.label // "") == $label
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_local_trust_rejection_reason() {
+  local input_file="$1"
+  local output_file="$2"
+  local reason="$3"
+
+  jq -s -c --arg reason "$reason" '
+    map(
+      select(
+        (.local_ingress_trust_scope_rejection.reason // "") == $reason
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_local_trust_rejection_history_label() {
+  local input_file="$1"
+  local output_file="$2"
+  local label="$3"
+
+  jq -s -c --arg label "$label" '
+    map(
+      select(
+        any(
+          (.evidence.local_ingress_trust_scope_rejection_histories // [])[];
+          (.label // "") == $label
+        )
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_local_trust_rejection_history_reason() {
+  local input_file="$1"
+  local output_file="$2"
+  local reason="$3"
+
+  jq -s -c --arg reason "$reason" '
+    map(
+      select(
+        any(
+          (.evidence.local_ingress_trust_scope_rejection_histories // [])[];
+          any((.reasons // [])[]; . == $reason)
+        )
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
 filter_by_trusted_soften_label() {
   local input_file="$1"
   local output_file="$2"
@@ -354,6 +436,49 @@ render_markdown_export() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + ", source "
+             + (
+                 if ((.source_cidrs // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "]"
+           )
+         | join(", "))
+      end;
+    def local_trust_rejection_history_summary($histories):
+      if ($histories | length) == 0 then
+        empty
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " ["
+             + (
+                 if ((.reasons // []) | length) == 0 then
+                   code("none")
+                 else
+                   ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
              + ", source "
              + (
                  if ((.source_cidrs // []) | length) == 0 then
@@ -382,9 +507,12 @@ render_markdown_export() {
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
     | ($export.deployment_context // {}) as $deployment
+    | ($export.local_ingress_trust_scope_rejection // null) as $local_trust_rejection
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
+    | ($export.evidence.local_ingress_trust_scope_rejection_histories // [])
+      as $local_trust_rejection_histories
     | ($export.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
     | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
@@ -439,6 +567,60 @@ render_markdown_export() {
           end
         )),
         optional_line("Ingress edge action hint"; (($signals.edge_action // null) | if . != null then code(.) else empty end)),
+        optional_line("Local trust scope rejection"; (
+          if $local_trust_rejection != null then
+            code($local_trust_rejection.label // ($local_trust_rejection.source + "/" + $local_trust_rejection.trust_tier))
+            + " (" + code($local_trust_rejection.reason) + ")"
+          else
+            empty
+          end
+        )),
+        optional_line("Rejected local trust scope"; (
+          if $local_trust_rejection != null then
+            "soften "
+            + (
+                if (($local_trust_rejection.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  (($local_trust_rejection.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if (($local_trust_rejection.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  (($local_trust_rejection.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; host "
+            + (
+                if (($local_trust_rejection.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  (($local_trust_rejection.hosts // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; source "
+            + (
+                if (($local_trust_rejection.source_cidrs // []) | length) == 0 then
+                  code("any")
+                else
+                  (($local_trust_rejection.source_cidrs // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ($local_trust_rejection.expires_at // null) == null then
+                  ""
+                else
+                  "; expires " + code($local_trust_rejection.expires_at)
+                end
+              )
+          else
+            empty
+          end
+        )),
+        optional_line("Local trust rejection history"; local_trust_rejection_history_summary($local_trust_rejection_histories)),
         optional_line("Trusted soften match"; (
           if $trusted_soften_match != null then
             code($trusted_soften_match.label // ($trusted_soften_match.source + "/" + $trusted_soften_match.trust_tier))
@@ -463,6 +645,14 @@ render_markdown_export() {
                   code("all")
                 else
                   (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; host "
+            + (
+                if (($trusted_soften_match.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  (($trusted_soften_match.hosts // []) | map(code(.)) | join(", "))
                 end
               )
             + "; source "
@@ -594,6 +784,14 @@ render_markdown_export() {
                   ((.path_prefixes // []) | map(code(.)) | join(", "))
                 end
               )
+            + "; host "
+            + (
+                if ((.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  ((.hosts // []) | map(code(.)) | join(", "))
+                end
+              )
             + "; source "
             + (
                 if ((.source_cidrs // []) | length) == 0 then
@@ -645,6 +843,26 @@ while [[ $# -gt 0 ]]; do
     --latest-mint-outcome)
       [[ $# -ge 2 ]] || fail "missing value for --latest-mint-outcome"
       LATEST_MINT_OUTCOME="$2"
+      shift 2
+      ;;
+    --local-trust-rejection-label)
+      [[ $# -ge 2 ]] || fail "missing value for --local-trust-rejection-label"
+      LOCAL_TRUST_REJECTION_LABEL="$2"
+      shift 2
+      ;;
+    --local-trust-rejection-reason)
+      [[ $# -ge 2 ]] || fail "missing value for --local-trust-rejection-reason"
+      LOCAL_TRUST_REJECTION_REASON="$2"
+      shift 2
+      ;;
+    --local-trust-rejection-history-label)
+      [[ $# -ge 2 ]] || fail "missing value for --local-trust-rejection-history-label"
+      LOCAL_TRUST_REJECTION_HISTORY_LABEL="$2"
+      shift 2
+      ;;
+    --local-trust-rejection-history-reason)
+      [[ $# -ge 2 ]] || fail "missing value for --local-trust-rejection-history-reason"
+      LOCAL_TRUST_REJECTION_HISTORY_REASON="$2"
       shift 2
       ;;
     --trusted-soften-label)
@@ -717,6 +935,26 @@ if [[ -n "$LATEST_MINT_OUTCOME" ]]; then
       ;;
     *)
       fail "--latest-mint-outcome must be matched_session_value or session_value_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$LOCAL_TRUST_REJECTION_REASON" ]]; then
+  case "$LOCAL_TRUST_REJECTION_REASON" in
+    expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+      ;;
+    *)
+      fail "--local-trust-rejection-reason must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
+  case "$LOCAL_TRUST_REJECTION_HISTORY_REASON" in
+    expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+      ;;
+    *)
+      fail "--local-trust-rejection-history-reason must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi
@@ -812,12 +1050,13 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
             | {
                 label,
                 source,
-                trust_tier,
-                expires_at,
-                path_prefixes,
-                bait_soften_path_prefixes,
-                source_cidrs
-              }
+              trust_tier,
+              expires_at,
+              path_prefixes,
+              bait_soften_path_prefixes,
+              hosts,
+              source_cidrs
+            }
           ]
         }
       end
@@ -874,6 +1113,54 @@ if [[ -n "$LATEST_MINT_OUTCOME" ]]; then
   rendered_ndjson="$filtered_ndjson"
   if [[ ! -s "$rendered_ndjson" ]]; then
     fail "no edge decision exports matched --latest-mint-outcome ${LATEST_MINT_OUTCOME}"
+  fi
+fi
+
+if [[ -n "$LOCAL_TRUST_REJECTION_LABEL" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.local-trust-label-filtered.ndjson"
+  filter_by_local_trust_rejection_label \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$LOCAL_TRUST_REJECTION_LABEL"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --local-trust-rejection-label ${LOCAL_TRUST_REJECTION_LABEL}"
+  fi
+fi
+
+if [[ -n "$LOCAL_TRUST_REJECTION_REASON" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.local-trust-reason-filtered.ndjson"
+  filter_by_local_trust_rejection_reason \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$LOCAL_TRUST_REJECTION_REASON"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --local-trust-rejection-reason ${LOCAL_TRUST_REJECTION_REASON}"
+  fi
+fi
+
+if [[ -n "$LOCAL_TRUST_REJECTION_HISTORY_LABEL" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.local-trust-history-label-filtered.ndjson"
+  filter_by_local_trust_rejection_history_label \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$LOCAL_TRUST_REJECTION_HISTORY_LABEL"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --local-trust-rejection-history-label ${LOCAL_TRUST_REJECTION_HISTORY_LABEL}"
+  fi
+fi
+
+if [[ -n "$LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.local-trust-history-reason-filtered.ndjson"
+  filter_by_local_trust_rejection_history_reason \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$LOCAL_TRUST_REJECTION_HISTORY_REASON"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --local-trust-rejection-history-reason ${LOCAL_TRUST_REJECTION_HISTORY_REASON}"
   fi
 fi
 
