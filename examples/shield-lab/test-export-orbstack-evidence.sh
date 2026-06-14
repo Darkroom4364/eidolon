@@ -90,6 +90,8 @@ output=""
 session=""
 min_coverage=""
 latest_mint_outcome=""
+local_trust_rejection_label=""
+local_trust_rejection_reason=""
 trusted_soften_label=""
 trusted_soften_path_softened=""
 trusted_soften_history_label=""
@@ -110,6 +112,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --latest-mint-outcome)
       latest_mint_outcome="$2"
+      shift 2
+      ;;
+    --local-trust-rejection-label)
+      local_trust_rejection_label="$2"
+      shift 2
+      ;;
+    --local-trust-rejection-reason)
+      local_trust_rejection_reason="$2"
       shift 2
       ;;
     --trusted-soften-label)
@@ -136,14 +146,23 @@ done
 
 selected='{"contract_version":"2026-06-12.v1","observed_at":"2026-06-04T00:00:00Z","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","request":{"method":"GET","path":"/openapi.json?token=secret"},"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"request_path_softened":false},"ingress_signals":{"actor_kind":"assistant","vendor_score":42,"vendor_score_kind":"automation_likelihood_inverse","detection_ids":["det-123"]},"discovery_recon_score":{"query_score":1,"detection_score":2,"total":3,"threshold":3},"policy":{"state":"suspicious","routing_decision":"protected_upstream","reason":"aggregated recon signals moved session to suspicious"},"evidence":{"event_schema_version":2,"event_ids":["11111111-1111-1111-1111-111111111111"],"bundle_ref":"session:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","trusted_ingress_soften_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"saw_request_path_softened":true,"saw_request_path_unsoftened":true}],"bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"matched_session_value"}},"edge_recommendation":{"action":"observe","reason_codes":["suspicious_session"]},"deployment_context":{"bait_profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"trusted_ingress_soften_scopes":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","expires_at":"2999-06-05T12:00:00Z","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"]}]}}'
 selected_array="[$selected]"
-all_sessions='[{"contract_version":"2026-06-12.v1","observed_at":"2026-06-04T00:00:02Z","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","request":{"method":"POST","path":"/api/v2/import/reconcile?token=secret"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"controlled_reality","routing_decision":"controlled_reality","reason":"confirmed bait-derived action moved session into controlled reality"},"evidence":{"event_schema_version":2,"event_ids":["33333333-3333-3333-3333-333333333333"],"bundle_ref":"session:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","trusted_ingress_soften_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"saw_request_path_softened":true,"saw_request_path_unsoftened":true}]},"edge_recommendation":{"action":"preserve_eidolon_routing","reason_codes":["eidolon_runtime_enforcement","controlled_reality"]},"deployment_context":{"bait_profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"trusted_ingress_soften_scopes":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","expires_at":"2999-06-05T12:00:00Z","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"]}]}},{"contract_version":"2026-06-12.v1","observed_at":"2026-06-04T00:00:00Z","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","request":{"method":"GET","path":"/openapi.json?token=secret"},"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"request_path_softened":false},"ingress_signals":{"actor_kind":"assistant","vendor_score":42,"vendor_score_kind":"automation_likelihood_inverse","detection_ids":["det-123"]},"discovery_recon_score":{"query_score":1,"detection_score":2,"total":3,"threshold":3},"policy":{"state":"suspicious","routing_decision":"protected_upstream","reason":"aggregated recon signals moved session to suspicious"},"evidence":{"event_schema_version":2,"event_ids":["11111111-1111-1111-1111-111111111111"],"bundle_ref":"session:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","trusted_ingress_soften_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"saw_request_path_softened":true,"saw_request_path_unsoftened":true}],"bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"matched_session_value"}},"edge_recommendation":{"action":"observe","reason_codes":["suspicious_session"]},"deployment_context":{"bait_profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"trusted_ingress_soften_scopes":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","expires_at":"2999-06-05T12:00:00Z","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"]}]}}]'
+rejected='{"contract_version":"2026-06-12.v1","observed_at":"2026-06-04T00:00:01Z","session_id":"dddddddd-dddd-dddd-dddd-dddddddddddd","request":{"method":"GET","path":"/docs?token=secret"},"ingress_identity":{"source":"none","trust_tier":"none"},"local_ingress_trust_scope_rejection":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","reason":"host_mismatch","expires_at":"2999-06-05T12:00:00Z","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["api.internal.example"],"source_cidrs":["192.168.194.1/32"]},"policy":{"state":"observe","routing_decision":"protected_upstream","reason":"request remained observable after trusted ingress scope rejection"},"evidence":{"event_schema_version":2,"event_ids":["44444444-4444-4444-4444-444444444444"],"bundle_ref":"session:dddddddd-dddd-dddd-dddd-dddddddddddd","trusted_ingress_soften_histories":[]},"edge_recommendation":{"action":"observe","reason_codes":["trusted_ingress_scope_rejection"]},"deployment_context":{"bait_profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"trusted_ingress_soften_scopes":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","expires_at":"2999-06-05T12:00:00Z","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"]}]}}'
+rejected_array="[$rejected]"
+all_sessions='[{"contract_version":"2026-06-12.v1","observed_at":"2026-06-04T00:00:02Z","session_id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","request":{"method":"POST","path":"/api/v2/import/reconcile?token=secret"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"controlled_reality","routing_decision":"controlled_reality","reason":"confirmed bait-derived action moved session into controlled reality"},"evidence":{"event_schema_version":2,"event_ids":["33333333-3333-3333-3333-333333333333"],"bundle_ref":"session:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","trusted_ingress_soften_histories":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"saw_request_path_softened":true,"saw_request_path_unsoftened":true}]},"edge_recommendation":{"action":"preserve_eidolon_routing","reason_codes":["eidolon_runtime_enforcement","controlled_reality"]},"deployment_context":{"bait_profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"trusted_ingress_soften_scopes":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","expires_at":"2999-06-05T12:00:00Z","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"]}]}},'"$rejected"','"$selected"']'
 
 if [[ -n "$session" ]]; then
-  [[ "$session" == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" ]] || {
-    echo "unexpected session: $session" >&2
-    exit 1
-  }
-  rendered="$selected"
+  case "$session" in
+    aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa)
+      rendered="$selected"
+      ;;
+    dddddddd-dddd-dddd-dddd-dddddddddddd)
+      rendered="$rejected"
+      ;;
+    *)
+      echo "unexpected session: $session" >&2
+      exit 1
+      ;;
+  esac
 else
   rendered="$all_sessions"
 fi
@@ -163,6 +182,28 @@ if [[ -n "$latest_mint_outcome" ]]; then
   case "$latest_mint_outcome" in
     matched_session_value)
       rendered="$selected_array"
+      ;;
+    *)
+      rendered='[]'
+      ;;
+  esac
+fi
+
+if [[ -n "$local_trust_rejection_label" ]]; then
+  case "$local_trust_rejection_label" in
+    docs-crawler)
+      rendered="$rejected_array"
+      ;;
+    *)
+      rendered='[]'
+      ;;
+  esac
+fi
+
+if [[ -n "$local_trust_rejection_reason" ]]; then
+  case "$local_trust_rejection_reason" in
+    host_mismatch)
+      rendered="$rejected_array"
       ;;
     *)
       rendered='[]'
@@ -319,16 +360,20 @@ test_export_bundle_redacts_sensitive_values() {
   rg -q '## Active Trusted Ingress Softening' "$bundle_dir/README.md"
   rg -q '`docs-crawler`: soften `/docs`; match `/docs`, `/openapi.json`; host `127.0.0.1`, `localhost`; source `192.168.194.1/32`; expires `2999-06-05T12:00:00Z`; identity `local_allowlist` / `allowlisted`' "$bundle_dir/README.md"
   rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
-  rg -q 'Exported sessions: `2`' "$bundle_dir/edge-session-index.md"
+  rg -q 'Exported sessions: `3`' "$bundle_dir/edge-session-index.md"
+  rg -q 'Local Trust Rejection' "$bundle_dir/edge-session-index.md"
   rg -q 'Trusted Soften Context' "$bundle_dir/edge-session-index.md"
   rg -q 'Minted Coverage' "$bundle_dir/edge-session-index.md"
   rg -q 'Latest Mint Outcome' "$bundle_dir/edge-session-index.md"
   rg -q '<redacted-1>' "$bundle_dir/edge-session-index.md"
   rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
+  rg -q '<redacted-3>' "$bundle_dir/edge-session-index.md"
   rg -q '`controlled_reality`' "$bundle_dir/edge-session-index.md"
   rg -q '`suspicious`' "$bundle_dir/edge-session-index.md"
+  rg -q '`observe`' "$bundle_dir/edge-session-index.md"
   rg -q 'X-Api-Key' "$bundle_dir/edge-session-index.md"
   rg -q '`matched_session_value` via `X-Api-Key`' "$bundle_dir/edge-session-index.md"
+  rg -q '`docs-crawler` \(`host_mismatch`\)' "$bundle_dir/edge-session-index.md"
   rg -q '`docs-crawler` \(soften `/docs`; host `127.0.0.1`, `localhost`; path softened `false`\)' "$bundle_dir/edge-session-index.md"
   rg -q '`docs-crawler` \[softened `true`, unsoftened `true`, host `127.0.0.1`, `localhost`, source `192.168.194.1/32`\]' "$bundle_dir/edge-session-index.md"
   rg -q '`1/3`' "$bundle_dir/edge-session-index.md"
@@ -349,6 +394,30 @@ test_export_bundle_redacts_sensitive_values() {
   rg -q '/docs/service-token' "$bundle_dir/selected-session-edge-summary.md"
   rg -q '## Active Trusted Ingress Softening' "$bundle_dir/selected-session-edge-summary.md"
   rg -q 'Scope `docs-crawler`: soften `/docs`; match `/docs`, `/openapi.json`; host `127.0.0.1`, `localhost`; source `192.168.194.1/32`; expires `2999-06-05T12:00:00Z`; identity `local_allowlist` / `allowlisted`' "$bundle_dir/selected-session-edge-summary.md"
+}
+
+test_export_bundle_renders_selected_session_local_trust_rejection() {
+  local temp_dir
+  local state_dir
+  local bundle_dir
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  bundle_dir="$temp_dir/bundle"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    EIDOLON_SHIELD_EDGE_EXPORT_SCRIPT="$temp_dir/export-edge-decisions.sh" \
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+    "$EXPORT_SCRIPT" \
+    --session dddddddd-dddd-dddd-dddd-dddddddddddd \
+    "$bundle_dir" >/dev/null
+
+  rg -q '^# Eidolon Edge Session Summary$' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q 'Local trust scope rejection: `docs-crawler` \(`host_mismatch`\)' "$bundle_dir/selected-session-edge-summary.md"
+  rg -q 'Rejected local trust scope: soften `/docs`; match `/docs`, `/openapi.json`; host `api.internal.example`; source `192.168.194.1/32`; expires `2999-06-05T12:00:00Z`' "$bundle_dir/selected-session-edge-summary.md"
 }
 
 test_export_refuses_non_empty_bundle_dir() {
@@ -428,6 +497,56 @@ test_export_bundle_filters_edge_index_by_latest_mint_outcome() {
   ! rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
   rg -q 'Latest Mint Outcome' "$bundle_dir/edge-session-index.md"
   rg -q '`matched_session_value` via `X-Api-Key`' "$bundle_dir/edge-session-index.md"
+}
+
+test_export_bundle_filters_edge_index_by_local_trust_rejection_label() {
+  local temp_dir
+  local state_dir
+  local bundle_dir
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  bundle_dir="$temp_dir/bundle"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    EIDOLON_SHIELD_EDGE_EXPORT_SCRIPT="$temp_dir/export-edge-decisions.sh" \
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+    EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL=docs-crawler \
+    "$EXPORT_SCRIPT" \
+    "$bundle_dir" >/dev/null
+
+  rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
+  rg -q 'Exported sessions: `1`' "$bundle_dir/edge-session-index.md"
+  rg -q '`docs-crawler` \(`host_mismatch`\)' "$bundle_dir/edge-session-index.md"
+  ! rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
+}
+
+test_export_bundle_filters_edge_index_by_local_trust_rejection_reason() {
+  local temp_dir
+  local state_dir
+  local bundle_dir
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  bundle_dir="$temp_dir/bundle"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    EIDOLON_SHIELD_EDGE_EXPORT_SCRIPT="$temp_dir/export-edge-decisions.sh" \
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+    EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON=host_mismatch \
+    "$EXPORT_SCRIPT" \
+    "$bundle_dir" >/dev/null
+
+  rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
+  rg -q 'Exported sessions: `1`' "$bundle_dir/edge-session-index.md"
+  rg -q '`docs-crawler` \(`host_mismatch`\)' "$bundle_dir/edge-session-index.md"
+  ! rg -q '<redacted-2>' "$bundle_dir/edge-session-index.md"
 }
 
 test_export_bundle_filters_edge_index_by_trusted_soften_label() {
@@ -531,9 +650,12 @@ test_export_bundle_filters_edge_index_by_trusted_soften_history_path_softened() 
 }
 
 test_export_bundle_redacts_sensitive_values
+test_export_bundle_renders_selected_session_local_trust_rejection
 test_export_refuses_non_empty_bundle_dir
 test_export_bundle_filters_edge_index_by_min_polymorphic_coverage
 test_export_bundle_filters_edge_index_by_latest_mint_outcome
+test_export_bundle_filters_edge_index_by_local_trust_rejection_label
+test_export_bundle_filters_edge_index_by_local_trust_rejection_reason
 test_export_bundle_filters_edge_index_by_trusted_soften_label
 test_export_bundle_filters_edge_index_by_trusted_soften_path_softened
 test_export_bundle_filters_edge_index_by_trusted_soften_history_label

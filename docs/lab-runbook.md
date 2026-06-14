@@ -342,6 +342,13 @@ environment override. The same live export path also supports
 `--latest-mint-outcome <matched_session_value|session_value_mismatch>`, and the
 bundle index supports the matching
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME` environment override.
+For rejected local allowlist scopes, the same live export path also supports
+`--local-trust-rejection-label <label>` and
+`--local-trust-rejection-reason
+<expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
+and the bundle index supports matching
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL` and
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON` overrides.
 Trusted soften triage uses the same pattern: `--trusted-soften-label <label>`
 and `--trusted-soften-path-softened <true|false>` filter live exports to
 requests that actually matched one local trusted soften scope, and the bundle
