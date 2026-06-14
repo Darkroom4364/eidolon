@@ -48,13 +48,13 @@ Options:
   --local-trust-rejection-label <label>
                          Keep only sessions whose latest local trust scope
                          rejection label matches the given value.
-  --local-trust-rejection-reason <expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+  --local-trust-rejection-reason <expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
                          Keep only sessions whose latest local trust scope
                          rejection reason matches the given value.
   --local-trust-rejection-history-label <label>
                          Keep only sessions whose local trust scope rejection
                          history includes the given label.
-  --local-trust-rejection-history-reason <expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+  --local-trust-rejection-history-reason <expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
                          Keep only sessions whose local trust scope rejection
                          history includes the given reason.
   --trusted-soften-label <label>
@@ -436,6 +436,14 @@ render_markdown_export() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", ua "
+             + (
+                 if ((.user_agent_substrings // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.user_agent_substrings // []) | map(code(.)) | join(", "))
+                 end
+               )
              + ", host "
              + (
                  if ((.hosts // []) | length) == 0 then
@@ -469,6 +477,14 @@ render_markdown_export() {
                    code("none")
                  else
                    ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; ua "
+             + (
+                 if ((.user_agent_substrings // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.user_agent_substrings // []) | map(code(.)) | join(", "))
                  end
                )
              + "; host "
@@ -593,6 +609,14 @@ render_markdown_export() {
                   (($local_trust_rejection.path_prefixes // []) | map(code(.)) | join(", "))
                 end
               )
+            + "; ua "
+            + (
+                if (($local_trust_rejection.user_agent_substrings // []) | length) == 0 then
+                  code("any")
+                else
+                  (($local_trust_rejection.user_agent_substrings // []) | map(code(.)) | join(", "))
+                end
+              )
             + "; host "
             + (
                 if (($local_trust_rejection.hosts // []) | length) == 0 then
@@ -645,6 +669,14 @@ render_markdown_export() {
                   code("all")
                 else
                   (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; ua "
+            + (
+                if (($trusted_soften_match.user_agent_substrings // []) | length) == 0 then
+                  code("any")
+                else
+                  (($trusted_soften_match.user_agent_substrings // []) | map(code(.)) | join(", "))
                 end
               )
             + "; host "
@@ -782,6 +814,14 @@ render_markdown_export() {
                   code("all")
                 else
                   ((.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; ua "
+            + (
+                if ((.user_agent_substrings // []) | length) == 0 then
+                  code("any")
+                else
+                  ((.user_agent_substrings // []) | map(code(.)) | join(", "))
                 end
               )
             + "; host "
@@ -1054,6 +1094,7 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
               expires_at,
               path_prefixes,
               bait_soften_path_prefixes,
+              user_agent_substrings,
               hosts,
               source_cidrs
             }

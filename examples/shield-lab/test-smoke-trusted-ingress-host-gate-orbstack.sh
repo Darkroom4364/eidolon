@@ -50,6 +50,7 @@ set -euo pipefail
 headers_file=""
 body_file=""
 trusted_actor=""
+user_agent=""
 request_url=""
 
 while [[ $# -gt 0 ]]; do
@@ -67,6 +68,9 @@ while [[ $# -gt 0 ]]; do
         X-Eidolon-Trusted-Actor:*)
           trusted_actor="${2#X-Eidolon-Trusted-Actor: }"
           ;;
+        User-Agent:*)
+          user_agent="${2#User-Agent: }"
+          ;;
       esac
       shift 2
       ;;
@@ -81,6 +85,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$trusted_actor" == "docs-crawler" ]]
+[[ "$user_agent" == "eidolon-docs-crawler/1.0" ]]
 [[ "$request_url" == "http://127.0.0.1:31080/docs?topic=imports" ]]
 printf 'HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\r\n' > "$headers_file"
 cat > "$body_file" <<'HTML'
