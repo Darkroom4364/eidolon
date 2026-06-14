@@ -2137,6 +2137,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "client_peer": client_peer,
             "method": request.method.as_str(),
             "target_form": debug_target_form(&request.target),
+            "request_host": effective_request_host(&request),
             "path": debug_path(&path),
             "query_present": debug_query_present(&path),
             "http_version": request.version.as_str(),
@@ -2145,6 +2146,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "safe_headers": safe_header_observations(&request.headers),
             "session_source": debug_session_source(session.source),
             "ingress_identity": &session.ingress_identity,
+            "local_ingress_trust_scope_rejection":
+                &session.local_ingress_trust_scope_rejection,
             "ingress_signals": &session.ingress_signals,
             "trusted_ingress_local_soften_path_prefixes":
                 &session.trusted_bait_soften_path_prefixes,
@@ -3674,6 +3677,9 @@ fn request_seen_event(
             path: redacted_event_target(path),
             safe_headers: safe_header_observations(&request.headers),
             ingress_identity: session.ingress_identity.clone(),
+            local_ingress_trust_scope_rejection: session
+                .local_ingress_trust_scope_rejection
+                .clone(),
             trusted_ingress_soften_match: session.trusted_ingress_soften_match.clone(),
             ingress_signals: session.ingress_signals.clone(),
             discovery_recon_score: event_discovery_recon_score(
@@ -3779,13 +3785,15 @@ fn effective_session_context(
         headers.iter().copied(),
         runtime.ingress_transport_auth_secret.as_deref(),
     );
-    let local_trust = runtime.ingress_identity_resolver.resolve(
+    let local_trust_evaluation = runtime.ingress_identity_resolver.evaluate(
         &request.method,
         &surface_request.path,
         request_host.as_deref(),
         client_peer_ip,
         headers.iter().copied(),
     );
+    session.local_ingress_trust_scope_rejection = local_trust_evaluation.scope_rejection;
+    let local_trust = local_trust_evaluation.resolved;
     let merged_identity = ingress_identity::merge_ingress_identity(
         session.ingress_identity.clone(),
         local_trust.as_ref().map(|trust| trust.identity.clone()),
@@ -6826,6 +6834,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: Default::default(),
+                    local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
@@ -11361,6 +11370,14 @@ mod tests {
             disallowed_request_event["kind"]["ingress_identity"]["source"],
             "none"
         );
+        assert_eq!(
+            disallowed_request_event["kind"]["local_ingress_trust_scope_rejection"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            disallowed_request_event["kind"]["local_ingress_trust_scope_rejection"]["reason"],
+            "source_cidr_mismatch"
+        );
         assert!(disallowed_request_event["kind"]["trusted_ingress_soften_match"].is_null());
         assert_event_routing(
             &disallowed_event_log_path,
@@ -11372,6 +11389,162 @@ mod tests {
         assert_eq!(
             disallowed_surface_debug["fields"]["trusted_ingress_softened_surface"],
             false
+        );
+        let disallowed_request_debug =
+            first_debug_event(&disallowed_debug_log_path, "request_received");
+        assert_eq!(
+            disallowed_request_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
+            "source_cidr_mismatch"
+        );
+    }
+
+    #[test]
+    fn local_allowlist_hosts_must_match_request_host() {
+        let allowed_config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "hosts": ["proxy.local"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let allowed_event_log_path = unique_temp_path("trusted-host-allowed-events.jsonl");
+        let allowed_debug_log_path = unique_temp_path("trusted-host-allowed-debug.jsonl");
+        let allowed_original =
+            r#"<!doctype html><html><body><main>docs host scope</main></body></html>"#;
+        let (allowed_upstream, allowed_upstream_handle) =
+            spawn_upstream(html_response(allowed_original));
+        let mut allowed_runtime = test_runtime_with_m1_controller_and_debug_log(
+            allowed_upstream,
+            &allowed_event_log_path,
+            &allowed_debug_log_path,
+            unique_temp_path("trusted-host-allowed-control.txt"),
+        );
+        allowed_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&allowed_config_path),
+            "ingress trust config should load",
+        ));
+
+        let allowed_response = parse_downstream_response(&run_runtime_request(
+            allowed_runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        allowed_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let allowed_body = String::from_utf8(allowed_response.body).expect("body should be utf8");
+
+        assert_eq!(allowed_response.status, 200);
+        assert_eq!(allowed_body, allowed_original);
+        let allowed_request_event = first_event_of_type(&allowed_event_log_path, "request_seen");
+        assert_eq!(
+            allowed_request_event["kind"]["ingress_identity"]["source"],
+            "local_allowlist"
+        );
+        assert_eq!(
+            allowed_request_event["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-crawler"
+        );
+
+        let disallowed_config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "hosts": ["docs.example.test"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let disallowed_event_log_path = unique_temp_path("trusted-host-disallowed-events.jsonl");
+        let disallowed_debug_log_path = unique_temp_path("trusted-host-disallowed-debug.jsonl");
+        let disallowed_original =
+            r#"<!doctype html><html><body><main>docs host scope disallowed</main></body></html>"#;
+        let (disallowed_upstream, disallowed_upstream_handle) =
+            spawn_upstream(html_response(disallowed_original));
+        let mut disallowed_runtime = test_runtime_with_m1_controller_and_debug_log(
+            disallowed_upstream,
+            &disallowed_event_log_path,
+            &disallowed_debug_log_path,
+            unique_temp_path("trusted-host-disallowed-control.txt"),
+        );
+        disallowed_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&disallowed_config_path),
+            "ingress trust config should load",
+        ));
+
+        let disallowed_response = parse_downstream_response(&run_runtime_request(
+            disallowed_runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        disallowed_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let disallowed_body =
+            String::from_utf8(disallowed_response.body).expect("body should be utf8");
+
+        assert_eq!(disallowed_response.status, 200);
+        assert_ne!(disallowed_body, disallowed_original);
+        let disallowed_request_event =
+            first_event_of_type(&disallowed_event_log_path, "request_seen");
+        assert_eq!(
+            disallowed_request_event["kind"]["ingress_identity"]["source"],
+            "none"
+        );
+        assert_eq!(
+            disallowed_request_event["kind"]["local_ingress_trust_scope_rejection"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            disallowed_request_event["kind"]["local_ingress_trust_scope_rejection"]["reason"],
+            "host_mismatch"
+        );
+        assert_eq!(
+            disallowed_request_event["kind"]["local_ingress_trust_scope_rejection"]["hosts"][0],
+            "docs.example.test"
+        );
+        assert!(disallowed_request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        let disallowed_surface_debug =
+            first_debug_event(&disallowed_debug_log_path, "request_received");
+        assert_eq!(
+            disallowed_surface_debug["fields"]["request_host"],
+            "proxy.local"
+        );
+        assert_eq!(
+            disallowed_surface_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
+            "host_mismatch"
         );
     }
 
