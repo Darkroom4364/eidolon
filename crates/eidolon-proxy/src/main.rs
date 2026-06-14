@@ -3813,6 +3813,7 @@ fn effective_session_context(
                 .iter()
                 .any(|prefix| surface_request.path.starts_with(prefix)),
             bait_soften_path_prefixes,
+            user_agent_substrings: trust.user_agent_substrings.clone().unwrap_or_default(),
             hosts: trust.hosts.clone().unwrap_or_default(),
             source_cidrs: trust.source_cidrs.clone().unwrap_or_default(),
         })
@@ -11545,6 +11546,164 @@ mod tests {
         assert_eq!(
             disallowed_surface_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
             "host_mismatch"
+        );
+    }
+
+    #[test]
+    fn local_allowlist_user_agents_must_match_request_user_agent() {
+        let allowed_config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "user_agent_substrings": ["eidolon-docs-crawler"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let allowed_event_log_path = unique_temp_path("trusted-ua-allowed-events.jsonl");
+        let allowed_debug_log_path = unique_temp_path("trusted-ua-allowed-debug.jsonl");
+        let allowed_original =
+            r#"<!doctype html><html><body><main>docs ua scope</main></body></html>"#;
+        let (allowed_upstream, allowed_upstream_handle) =
+            spawn_upstream(html_response(allowed_original));
+        let mut allowed_runtime = test_runtime_with_m1_controller_and_debug_log(
+            allowed_upstream,
+            &allowed_event_log_path,
+            &allowed_debug_log_path,
+            unique_temp_path("trusted-ua-allowed-control.txt"),
+        );
+        allowed_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&allowed_config_path),
+            "ingress trust config should load",
+        ));
+
+        let allowed_response = parse_downstream_response(&run_runtime_request(
+            allowed_runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[
+                    ("X-Eidolon-Trusted-Actor", "docs-crawler"),
+                    ("User-Agent", "Eidolon-Docs-Crawler/1.0"),
+                ],
+            ),
+        ));
+        allowed_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let allowed_body = String::from_utf8(allowed_response.body).expect("body should be utf8");
+
+        assert_eq!(allowed_response.status, 200);
+        assert_eq!(allowed_body, allowed_original);
+        let allowed_request_event = first_event_of_type(&allowed_event_log_path, "request_seen");
+        assert_eq!(
+            allowed_request_event["kind"]["ingress_identity"]["source"],
+            "local_allowlist"
+        );
+        assert_eq!(
+            allowed_request_event["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            allowed_request_event["kind"]["trusted_ingress_soften_match"]["user_agent_substrings"]
+                [0],
+            "eidolon-docs-crawler"
+        );
+
+        let disallowed_config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "user_agent_substrings": ["eidolon-docs-crawler"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let disallowed_event_log_path = unique_temp_path("trusted-ua-disallowed-events.jsonl");
+        let disallowed_debug_log_path = unique_temp_path("trusted-ua-disallowed-debug.jsonl");
+        let disallowed_original =
+            r#"<!doctype html><html><body><main>docs ua scope disallowed</main></body></html>"#;
+        let (disallowed_upstream, disallowed_upstream_handle) =
+            spawn_upstream(html_response(disallowed_original));
+        let mut disallowed_runtime = test_runtime_with_m1_controller_and_debug_log(
+            disallowed_upstream,
+            &disallowed_event_log_path,
+            &disallowed_debug_log_path,
+            unique_temp_path("trusted-ua-disallowed-control.txt"),
+        );
+        disallowed_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&disallowed_config_path),
+            "ingress trust config should load",
+        ));
+
+        let disallowed_response = parse_downstream_response(&run_runtime_request(
+            disallowed_runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[
+                    ("X-Eidolon-Trusted-Actor", "docs-crawler"),
+                    ("User-Agent", "Mozilla/5.0"),
+                ],
+            ),
+        ));
+        disallowed_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let disallowed_body =
+            String::from_utf8(disallowed_response.body).expect("body should be utf8");
+
+        assert_eq!(disallowed_response.status, 200);
+        assert_ne!(disallowed_body, disallowed_original);
+        let disallowed_request_event =
+            first_event_of_type(&disallowed_event_log_path, "request_seen");
+        assert_eq!(
+            disallowed_request_event["kind"]["ingress_identity"]["source"],
+            "none"
+        );
+        assert_eq!(
+            disallowed_request_event["kind"]["local_ingress_trust_scope_rejection"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            disallowed_request_event["kind"]["local_ingress_trust_scope_rejection"]["reason"],
+            "user_agent_mismatch"
+        );
+        assert_eq!(
+            disallowed_request_event["kind"]["local_ingress_trust_scope_rejection"]
+                ["user_agent_substrings"][0],
+            "eidolon-docs-crawler"
+        );
+        assert!(disallowed_request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        let disallowed_request_debug =
+            first_debug_event(&disallowed_debug_log_path, "request_received");
+        assert_eq!(
+            disallowed_request_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
+            "user_agent_mismatch"
         );
     }
 

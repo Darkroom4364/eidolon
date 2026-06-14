@@ -12,6 +12,7 @@ LOCAL_STATE_DIR="${EIDOLON_SHIELD_LOCAL_STATE_DIR:-}"
 EDGE_EXPORT_BIN="${EIDOLON_EDGE_EXPORT_BIN:-}"
 TRUSTED_ACTOR_HEADER_NAME="${EIDOLON_SHIELD_TRUSTED_ACTOR_HEADER_NAME:-X-Eidolon-Trusted-Actor}"
 TRUSTED_ACTOR_HEADER_VALUE="${EIDOLON_SHIELD_TRUSTED_ACTOR_HEADER_VALUE:-docs-crawler}"
+TRUSTED_USER_AGENT="${EIDOLON_SHIELD_TRUSTED_USER_AGENT:-eidolon-docs-crawler/1.0}"
 SESSION_ID="${EIDOLON_SHIELD_TRUSTED_CONTAINMENT_SESSION_ID:-}"
 DOCS_PATH="${EIDOLON_SHIELD_TRUSTED_CONTAINMENT_DOCS_PATH:-/docs?topic=imports}"
 DOCS_PATH_PREFIX="${EIDOLON_SHIELD_TRUSTED_CONTAINMENT_DOCS_PATH_PREFIX:-/docs}"
@@ -140,6 +141,7 @@ curl_cmd -fsS \
   -o "$docs_body" \
   -H "Cookie: eidolon_session=${SESSION_ID}" \
   -H "${TRUSTED_ACTOR_HEADER_NAME}: ${TRUSTED_ACTOR_HEADER_VALUE}" \
+  -H "User-Agent: ${TRUSTED_USER_AGENT}" \
   "${edge_url}${DOCS_PATH}"
 
 docs_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$docs_headers")"
@@ -153,6 +155,7 @@ curl_cmd -fsS \
   -o "$openapi_body" \
   -H "Cookie: eidolon_session=${SESSION_ID}" \
   -H "${TRUSTED_ACTOR_HEADER_NAME}: ${TRUSTED_ACTOR_HEADER_VALUE}" \
+  -H "User-Agent: ${TRUSTED_USER_AGENT}" \
   "${edge_url}${OPENAPI_PATH}"
 
 openapi_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$openapi_headers")"
@@ -168,6 +171,7 @@ curl_cmd -sS \
   -o "$action_body" \
   -H "Cookie: eidolon_session=${SESSION_ID}" \
   -H "${TRUSTED_ACTOR_HEADER_NAME}: ${TRUSTED_ACTOR_HEADER_VALUE}" \
+  -H "User-Agent: ${TRUSTED_USER_AGENT}" \
   -H "${OPENAPI_HEADER_NAME}: ${minted_openapi_trace}" \
   "${edge_url}${ACTION_PATH}"
 

@@ -57,16 +57,20 @@ Environment:
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON
                          Keep only sessions whose latest local trust scope
                          rejection reason matches `expired`,
-                         `request_host_missing`, `host_mismatch`,
-                         `client_peer_missing`, or `source_cidr_mismatch`.
+                         `request_user_agent_missing`,
+                         `user_agent_mismatch`, `request_host_missing`,
+                         `host_mismatch`, `client_peer_missing`, or
+                         `source_cidr_mismatch`.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL
                          Keep only sessions whose local trust scope rejection
                          history includes the given label.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON
                          Keep only sessions whose local trust scope rejection
                          history includes `expired`,
-                         `request_host_missing`, `host_mismatch`,
-                         `client_peer_missing`, or `source_cidr_mismatch`.
+                         `request_user_agent_missing`,
+                         `user_agent_mismatch`, `request_host_missing`,
+                         `host_mismatch`, `client_peer_missing`, or
+                         `source_cidr_mismatch`.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL
                          Keep only sessions whose matched trusted-ingress
                          soften scope label matches the given value.
@@ -222,6 +226,14 @@ render_edge_session_index() {
               (($match.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
             end
           )
+        + "; ua "
+        + (
+            if (($match.user_agent_substrings // []) | length) == 0 then
+              code("any")
+            else
+              (($match.user_agent_substrings // []) | map(code(.)) | join(", "))
+            end
+          )
         + "; host "
         + (
             if (($match.hosts // []) | length) == 0 then
@@ -245,6 +257,14 @@ render_edge_session_index() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", ua "
+             + (
+                 if ((.user_agent_substrings // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.user_agent_substrings // []) | map(code(.)) | join(", "))
+                 end
+               )
              + ", host "
              + (
                  if ((.hosts // []) | length) == 0 then
@@ -278,6 +298,14 @@ render_edge_session_index() {
                    code("none")
                  else
                    ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; ua "
+             + (
+                 if ((.user_agent_substrings // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.user_agent_substrings // []) | map(code(.)) | join(", "))
                  end
                )
              + "; host "
@@ -621,6 +649,14 @@ render_selected_session_summary() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", ua "
+             + (
+                 if ((.user_agent_substrings // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.user_agent_substrings // []) | map(code(.)) | join(", "))
+                 end
+               )
              + ", host "
              + (
                  if ((.hosts // []) | length) == 0 then
@@ -654,6 +690,14 @@ render_selected_session_summary() {
                    code("none")
                  else
                    ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; ua "
+             + (
+                 if ((.user_agent_substrings // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.user_agent_substrings // []) | map(code(.)) | join(", "))
                  end
                )
              + "; host "
@@ -780,6 +824,14 @@ render_selected_session_summary() {
                   (($local_trust_rejection.path_prefixes // []) | map(code(.)) | join(", "))
                 end
               )
+            + "; ua "
+            + (
+                if (($local_trust_rejection.user_agent_substrings // []) | length) == 0 then
+                  code("any")
+                else
+                  (($local_trust_rejection.user_agent_substrings // []) | map(code(.)) | join(", "))
+                end
+              )
             + "; host "
             + (
                 if (($local_trust_rejection.hosts // []) | length) == 0 then
@@ -832,6 +884,14 @@ render_selected_session_summary() {
                   code("all")
                 else
                   (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; ua "
+            + (
+                if (($trusted_soften_match.user_agent_substrings // []) | length) == 0 then
+                  code("any")
+                else
+                  (($trusted_soften_match.user_agent_substrings // []) | map(code(.)) | join(", "))
                 end
               )
             + "; host "
@@ -971,6 +1031,14 @@ render_selected_session_summary() {
                   ((.path_prefixes // []) | map(code(.)) | join(", "))
                 end
               )
+            + "; ua "
+            + (
+                if ((.user_agent_substrings // []) | length) == 0 then
+                  code("any")
+                else
+                  ((.user_agent_substrings // []) | map(code(.)) | join(", "))
+                end
+              )
             + "; host "
             + (
                 if ((.hosts // []) | length) == 0 then
@@ -1090,6 +1158,14 @@ write_readme() {
                 "`all`"
               else
                 ((.path_prefixes // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + "; ua "
+          + (
+              if ((.user_agent_substrings // []) | length) == 0 then
+                "`any`"
+              else
+                ((.user_agent_substrings // []) | map("`" + . + "`") | join(", "))
               end
             )
           + "; host "

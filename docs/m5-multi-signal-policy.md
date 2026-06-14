@@ -133,6 +133,9 @@ The current M5 slice is intentionally narrow:
 - local allowlist entries may also optionally carry `source_cidrs`, matched
   against the proxy's direct TCP peer, so deployment-safe verified crawler
   handling does not rely only on path and header shape
+- local allowlist entries may also optionally carry `user_agent_substrings`,
+  but only as a narrowing scope on already operator-controlled local trust
+  entries; `User-Agent` alone still does not create trust
 - stale explicit trusted-ingress claims now degrade to `weakly_asserted`, and
   stale local ingress-trust config entries stop matching entirely, so
   deployment-safe trust windows do not silently stay strong after expiry
