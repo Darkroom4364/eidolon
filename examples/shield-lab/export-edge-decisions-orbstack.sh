@@ -390,6 +390,7 @@ render_markdown_export() {
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
     | ($export.deployment_context // {}) as $deployment
+    | ($export.local_ingress_trust_scope_rejection // null) as $local_trust_rejection
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
@@ -447,6 +448,59 @@ render_markdown_export() {
           end
         )),
         optional_line("Ingress edge action hint"; (($signals.edge_action // null) | if . != null then code(.) else empty end)),
+        optional_line("Local trust scope rejection"; (
+          if $local_trust_rejection != null then
+            code($local_trust_rejection.label // ($local_trust_rejection.source + "/" + $local_trust_rejection.trust_tier))
+            + " (" + code($local_trust_rejection.reason) + ")"
+          else
+            empty
+          end
+        )),
+        optional_line("Rejected local trust scope"; (
+          if $local_trust_rejection != null then
+            "soften "
+            + (
+                if (($local_trust_rejection.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  (($local_trust_rejection.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if (($local_trust_rejection.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  (($local_trust_rejection.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; host "
+            + (
+                if (($local_trust_rejection.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  (($local_trust_rejection.hosts // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; source "
+            + (
+                if (($local_trust_rejection.source_cidrs // []) | length) == 0 then
+                  code("any")
+                else
+                  (($local_trust_rejection.source_cidrs // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ($local_trust_rejection.expires_at // null) == null then
+                  ""
+                else
+                  "; expires " + code($local_trust_rejection.expires_at)
+                end
+              )
+          else
+            empty
+          end
+        )),
         optional_line("Trusted soften match"; (
           if $trusted_soften_match != null then
             code($trusted_soften_match.label // ($trusted_soften_match.source + "/" + $trusted_soften_match.trust_tier))

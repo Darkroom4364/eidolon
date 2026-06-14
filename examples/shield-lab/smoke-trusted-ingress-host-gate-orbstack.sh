@@ -113,6 +113,8 @@ docs_session_id="$(jq -r '.session_id // empty' <<<"$docs_request_json")"
 jq -e '
   (.kind.ingress_identity.source // "") == "none"
   and (.kind.ingress_identity.trust_tier // "") == "none"
+  and (.kind.local_ingress_trust_scope_rejection.label // "") == "docs-crawler"
+  and (.kind.local_ingress_trust_scope_rejection.reason // "") == "host_mismatch"
   and (.kind.trusted_ingress_soften_match // null) == null
 ' <<<"$docs_request_json" >/dev/null \
   || fail "trusted docs request unexpectedly matched the local allowlist despite the mismatched host scope"

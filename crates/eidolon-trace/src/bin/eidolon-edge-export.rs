@@ -337,6 +337,7 @@ mod tests {
                     label: Some("internal-crawler".to_string()),
                     expires_at: None,
                 },
+                local_ingress_trust_scope_rejection: None,
                 trusted_ingress_soften_match: None,
                 ingress_signals: Default::default(),
                 discovery_recon_score: Default::default(),
