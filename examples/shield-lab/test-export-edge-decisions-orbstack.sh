@@ -352,6 +352,29 @@ test_filters_sessions_by_trusted_soften_history_path_softened() {
   ' <<<"$output" >/dev/null
 }
 
+test_filters_sessions_by_local_trust_rejection_reason() {
+  local temp_dir state_dir output
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
+      --local-trust-rejection-reason host_mismatch
+  )"
+
+  jq -e '
+    length == 1
+    and .[0].session_id == "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    and .[0].local_ingress_trust_scope_rejection.label == "docs-crawler"
+    and .[0].local_ingress_trust_scope_rejection.reason == "host_mismatch"
+  ' <<<"$output" >/dev/null
+}
+
 test_renders_single_session_markdown_summary() {
   local temp_dir state_dir output
   temp_dir="$(new_temp_dir)"
@@ -627,6 +650,7 @@ test_filters_sessions_by_trusted_soften_label
 test_filters_sessions_by_trusted_soften_path_softened
 test_filters_sessions_by_trusted_soften_history_label
 test_filters_sessions_by_trusted_soften_history_path_softened
+test_filters_sessions_by_local_trust_rejection_reason
 test_renders_single_session_markdown_summary
 test_renders_local_trust_scope_rejection_in_markdown_summary
 test_renders_trusted_soften_history_when_current_match_is_absent
