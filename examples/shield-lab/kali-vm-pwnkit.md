@@ -172,8 +172,8 @@ visible after the cluster run is over.
 
 Every host bundle now also includes `edge-session-index.md`, which gives a
 compact redacted map of the exported sessions before you open a deeper
-per-session summary, including a quick minted-coverage column for each
-exported session.
+per-session summary, including quick minted-coverage, latest mint-outcome, and
+local trust rejection columns for each exported session.
 
 If you want the host bundle itself to carry one ready-made redacted session
 summary, add the session at export time:

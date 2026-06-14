@@ -661,9 +661,11 @@ running cluster.
 
 Each bundle now also includes `edge-session-index.md`, a compact redacted
 session index rendered from the enriched edge export path, including a minted
-coverage column and latest mint-outcome column so operators can see how many
-active session-minted baits each session actually touched and whether the most
-recent minted bait-shaped action matched the same session or mismatched.
+coverage column, latest mint-outcome column, and local trust rejection column
+so operators can see how many active session-minted baits each session
+actually touched, whether the most recent minted bait-shaped action matched the
+same session or mismatched, and whether a scoped local trust rule nearly
+matched but failed host/source/freshness gating.
 
 If you already know the session you want to review, the same bundle export can
 also embed one redacted per-session edge summary rendered from the enriched edge
@@ -746,7 +748,12 @@ into requests that were or were not inside that narrower bait-soften subset.
 For post-containment review, `--trusted-soften-history-label <label>` and
 `--trusted-soften-history-path-softened <true|false>` do the same thing against
 the session-level trusted soften history, so contained sessions still show up
-even when the final request itself is no longer trusted.
+even when the final request itself is no longer trusted. For rejected local
+allowlist scopes, `--local-trust-rejection-label <label>` and
+`--local-trust-rejection-reason
+<expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`
+narrow live export to sessions whose latest request nearly matched one scoped
+local trust entry but failed freshness, host, or source-CIDR gating.
 
 If you want the bundle-local `edge-session-index.md` to keep only sessions that
 cross the same polymorphic threshold, set:
@@ -783,6 +790,16 @@ in the session, set:
 EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL=docs-crawler \
   examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_PATH_SOFTENED=false \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+```
+
+If you want the bundle-local `edge-session-index.md` to keep only sessions that
+hit one rejected local trust scope label or reason, set:
+
+```sh
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL=docs-crawler \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON=host_mismatch \
   examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 ```
 
