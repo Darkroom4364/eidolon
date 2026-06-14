@@ -756,7 +756,11 @@ narrow live export to sessions whose latest request nearly matched one scoped
 local trust entry but failed freshness, host, or source-CIDR gating. When a
 later request moves the session onward into containment or another state, the
 exported markdown and bundle index now keep that earlier context under
-`Local trust rejection history`.
+`Local trust rejection history`. If you want to filter on that preserved
+history instead of only the latest request, use
+`--local-trust-rejection-history-label <label>` or
+`--local-trust-rejection-history-reason
+<expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`.
 
 If you want the bundle-local `edge-session-index.md` to keep only sessions that
 cross the same polymorphic threshold, set:
@@ -803,6 +807,22 @@ hit one rejected local trust scope label or reason, set:
 EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL=docs-crawler \
   examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON=host_mismatch \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+```
+
+If you want the live or bundle export to keep only sessions whose preserved
+local trust rejection history includes one label or reason, set:
+
+```sh
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --local-trust-rejection-history-label docs-crawler
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
+  --local-trust-rejection-history-reason host_mismatch
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL=docs-crawler \
+  examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
+EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON=host_mismatch \
   examples/shield-lab/export-orbstack-evidence.sh /private/tmp/eidolon-shield-bundle
 ```
 

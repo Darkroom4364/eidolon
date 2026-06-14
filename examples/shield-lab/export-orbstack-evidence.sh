@@ -14,6 +14,8 @@ SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_
 SESSION_INDEX_LATEST_MINT_OUTCOME="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME:-}"
 SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL:-}"
 SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON:-}"
+SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL:-}"
+SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON:-}"
 SESSION_INDEX_TRUSTED_SOFTEN_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL:-}"
 SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED:-}"
 SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL:-}"
@@ -55,6 +57,14 @@ Environment:
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON
                          Keep only sessions whose latest local trust scope
                          rejection reason matches `expired`,
+                         `request_host_missing`, `host_mismatch`,
+                         `client_peer_missing`, or `source_cidr_mismatch`.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL
+                         Keep only sessions whose local trust scope rejection
+                         history includes the given label.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON
+                         Keep only sessions whose local trust scope rejection
+                         history includes `expired`,
                          `request_host_missing`, `host_mismatch`,
                          `client_peer_missing`, or `source_cidr_mismatch`.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL
@@ -464,6 +474,18 @@ write_edge_session_index() {
       "$SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON"
     )
   fi
+  if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL" ]]; then
+    edge_export_args+=(
+      --local-trust-rejection-history-label
+      "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
+    edge_export_args+=(
+      --local-trust-rejection-history-reason
+      "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON"
+    )
+  fi
   if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_LABEL" ]]; then
     edge_export_args+=(
       --trusted-soften-label
@@ -503,6 +525,12 @@ write_edge_session_index() {
       return 0
     fi
     if grep -q 'no edge decision exports matched --local-trust-rejection-reason' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --local-trust-rejection-history-label' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --local-trust-rejection-history-reason' "$export_error"; then
       return 0
     fi
     if grep -q 'no edge decision exports matched --trusted-soften-label' "$export_error"; then
@@ -1157,6 +1185,16 @@ if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON" ]]; then
       ;;
     *)
       fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
+  case "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON" in
+    expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+      ;;
+    *)
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi
