@@ -3769,6 +3769,7 @@ fn effective_session_context(
     client_peer_ip: Option<IpAddr>,
 ) -> SessionContext {
     let headers: Vec<(&str, &str)> = header_pairs(&request.headers).collect();
+    let request_host = effective_request_host(request);
     let mut session = session::derive_session_from_headers(headers.iter().copied());
     session.ingress_identity = session::authenticated_ingress_identity_from_headers(
         headers.iter().copied(),
@@ -3781,6 +3782,7 @@ fn effective_session_context(
     let local_trust = runtime.ingress_identity_resolver.resolve(
         &request.method,
         &surface_request.path,
+        request_host.as_deref(),
         client_peer_ip,
         headers.iter().copied(),
     );
@@ -3803,6 +3805,7 @@ fn effective_session_context(
                 .iter()
                 .any(|prefix| surface_request.path.starts_with(prefix)),
             bait_soften_path_prefixes,
+            hosts: trust.hosts.clone().unwrap_or_default(),
             source_cidrs: trust.source_cidrs.clone().unwrap_or_default(),
         })
     });
@@ -4612,6 +4615,45 @@ fn normalize_request_target(target: &str) -> io::Result<&str> {
     Err(invalid_data(
         "HTTP request target must be origin-form or http absolute-form",
     ))
+}
+
+fn effective_request_host(request: &HttpRequest) -> Option<String> {
+    request_host_from_target(&request.target)
+        .or_else(|| {
+            request
+                .headers
+                .iter()
+                .find(|header| header.name.eq_ignore_ascii_case("host"))
+                .map(|header| header.value.as_str())
+        })
+        .and_then(normalize_request_host)
+}
+
+fn request_host_from_target(target: &str) -> Option<&str> {
+    let rest = target.strip_prefix("http://")?;
+    Some(match rest.split_once('/') {
+        Some((authority, _)) => authority,
+        None => rest,
+    })
+}
+
+fn normalize_request_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let bracketless = value
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(value);
+    if bracketless.parse::<IpAddr>().is_ok() {
+        return Some(bracketless.to_ascii_lowercase());
+    }
+
+    parse_authority(value)
+        .ok()
+        .map(|(host, _)| host.to_ascii_lowercase())
 }
 
 fn connection_nominated_headers(headers: &[HttpHeader]) -> Vec<String> {

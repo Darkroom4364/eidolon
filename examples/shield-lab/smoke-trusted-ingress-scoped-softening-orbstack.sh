@@ -14,6 +14,7 @@ OPENAPI_PATH="${EIDOLON_SHIELD_TRUSTED_SCOPE_OPENAPI_PATH:-/openapi.json}"
 DOCS_BAIT_MARKER="${EIDOLON_SHIELD_TRUSTED_SCOPE_DOCS_BAIT_MARKER:-X-Migration-Trace: }"
 OPENAPI_BAIT_PATH="${EIDOLON_SHIELD_TRUSTED_SCOPE_OPENAPI_BAIT_PATH:-/api/v2/import/reconcile}"
 EXPECTED_LOCAL_SOFTEN_PREFIX="${EIDOLON_SHIELD_TRUSTED_SCOPE_LOCAL_PREFIX:-/docs}"
+EXPECTED_HOST="${EIDOLON_SHIELD_TRUSTED_SCOPE_HOST:-127.0.0.1}"
 EXPECTED_SOURCE_CIDR="${EIDOLON_SHIELD_TRUSTED_SCOPE_SOURCE_CIDR:-192.168.194.1/32}"
 
 usage() {
@@ -144,8 +145,11 @@ docs_surface_debug="$(
 )" || fail "trusted docs session ${docs_session_id} had no surface_action_selected debug record"
 
 jq -e \
+  --arg expected_host "$EXPECTED_HOST" \
   --arg expected_source_cidr "$EXPECTED_SOURCE_CIDR" \
   --arg local_prefix "$EXPECTED_LOCAL_SOFTEN_PREFIX" '
+    ((.kind.trusted_ingress_soften_match.hosts // []) | index($expected_host)) != null
+    and
     (.kind.trusted_ingress_soften_match.source_cidrs // []) == [$expected_source_cidr]
     and
     .fields.surface_action.type == "protected_upstream"
@@ -186,8 +190,11 @@ openapi_surface_debug="$(
 )" || fail "trusted openapi session ${openapi_session_id} had no surface_action_selected debug record"
 
 jq -e \
+  --arg expected_host "$EXPECTED_HOST" \
   --arg expected_source_cidr "$EXPECTED_SOURCE_CIDR" \
   --arg local_prefix "$EXPECTED_LOCAL_SOFTEN_PREFIX" '
+    ((.kind.trusted_ingress_soften_match.hosts // []) | index($expected_host)) != null
+    and
     (.kind.trusted_ingress_soften_match.source_cidrs // []) == [$expected_source_cidr]
     and
     .fields.candidate_surface_action.type == "rewritten_upstream"

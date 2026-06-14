@@ -666,6 +666,8 @@ pub struct EdgeTrustedIngressSoftenScope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_cidrs: Vec<String>,
 }
 
@@ -679,6 +681,8 @@ pub struct TrustedIngressSoftenMatch {
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_cidrs: Vec<String>,
     pub request_path_softened: bool,
@@ -694,6 +698,8 @@ pub struct EdgeTrustedIngressSoftenHistory {
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_cidrs: Vec<String>,
     pub saw_request_path_softened: bool,
@@ -843,6 +849,7 @@ mod tests {
                     trust_tier: IngressTrustTier::Allowlisted,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                     request_path_softened: false,
                 }),
@@ -1223,6 +1230,7 @@ mod tests {
                 trust_tier: IngressTrustTier::Allowlisted,
                 path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                 bait_soften_path_prefixes: vec!["/docs".to_string()],
+                hosts: vec!["127.0.0.1".to_string()],
                 source_cidrs: vec!["127.0.0.1/32".to_string()],
                 request_path_softened: false,
             }),
@@ -1268,6 +1276,7 @@ mod tests {
                     trust_tier: IngressTrustTier::Allowlisted,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                     saw_request_path_softened: true,
                     saw_request_path_unsoftened: true,
@@ -1317,6 +1326,7 @@ mod tests {
                     expires_at: None,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                 }],
             }),
@@ -1340,6 +1350,10 @@ mod tests {
         assert_eq!(
             serialized["trusted_ingress_soften_match"]["request_path_softened"],
             json!(false)
+        );
+        assert_eq!(
+            serialized["trusted_ingress_soften_match"]["hosts"][0],
+            json!("127.0.0.1")
         );
         assert_eq!(serialized["ingress_signals"]["vendor_score"], json!(12));
         assert_eq!(serialized["ingress_signals"]["edge_action"], json!("allow"));
@@ -1408,6 +1422,10 @@ mod tests {
             serialized["deployment_context"]["trusted_ingress_soften_scopes"][0]
                 ["bait_soften_path_prefixes"][0],
             json!("/docs")
+        );
+        assert_eq!(
+            serialized["deployment_context"]["trusted_ingress_soften_scopes"][0]["hosts"][0],
+            json!("127.0.0.1")
         );
         assert_eq!(
             serialized["policy"]["pre_containment_persistence_class"],
