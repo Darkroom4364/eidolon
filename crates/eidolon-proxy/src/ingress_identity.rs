@@ -1,7 +1,10 @@
 use std::{fmt, fs, net::IpAddr, path::Path};
 
 use chrono::{DateTime, Utc};
-use eidolon_core::{IngressIdentity, IngressIdentitySource, IngressTrustTier};
+use eidolon_core::{
+    IngressIdentity, IngressIdentitySource, IngressTrustTier, LocalIngressTrustScopeRejection,
+    LocalIngressTrustScopeRejectionReason,
+};
 use ipnet::IpNet;
 use serde::Deserialize;
 
@@ -15,7 +18,14 @@ pub struct ResolvedIngressTrust {
     pub identity: IngressIdentity,
     pub path_prefixes: Vec<String>,
     pub bait_soften_path_prefixes: Option<Vec<String>>,
+    pub hosts: Option<Vec<String>>,
     pub source_cidrs: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IngressTrustEvaluation {
+    pub resolved: Option<ResolvedIngressTrust>,
+    pub scope_rejection: Option<LocalIngressTrustScopeRejection>,
 }
 
 impl IngressIdentityResolver {
@@ -31,9 +41,27 @@ impl IngressIdentityResolver {
         &self,
         method: &str,
         path: &str,
+        request_host: Option<&str>,
         client_ip: Option<IpAddr>,
         headers: I,
     ) -> Option<ResolvedIngressTrust>
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: AsRef<str>,
+        V: AsRef<str>,
+    {
+        self.evaluate(method, path, request_host, client_ip, headers)
+            .resolved
+    }
+
+    pub fn evaluate<I, N, V>(
+        &self,
+        method: &str,
+        path: &str,
+        request_host: Option<&str>,
+        client_ip: Option<IpAddr>,
+        headers: I,
+    ) -> IngressTrustEvaluation
     where
         I: IntoIterator<Item = (N, V)>,
         N: AsRef<str>,
@@ -45,18 +73,24 @@ impl IngressIdentityResolver {
             .collect();
         let method = method.trim().to_ascii_uppercase();
 
-        self.entries
-            .iter()
-            .find(|entry| entry.matches(&method, path, client_ip, &headers))
-            .map(|entry| ResolvedIngressTrust {
-                identity: entry.identity.clone(),
-                path_prefixes: entry.path_prefixes.clone(),
-                bait_soften_path_prefixes: entry.bait_soften_path_prefixes.clone(),
-                source_cidrs: entry
-                    .source_cidrs
-                    .as_ref()
-                    .map(|cidrs| cidrs.iter().map(ToString::to_string).collect()),
-            })
+        let mut evaluation = IngressTrustEvaluation::default();
+        for entry in &self.entries {
+            match entry.evaluate(&method, path, request_host, client_ip, &headers) {
+                TrustedIngressEntryEvaluation::Matched => {
+                    evaluation.resolved = Some(entry.resolved_trust());
+                    evaluation.scope_rejection = None;
+                    return evaluation;
+                }
+                TrustedIngressEntryEvaluation::ScopeRejected(rejection) => {
+                    if evaluation.scope_rejection.is_none() {
+                        evaluation.scope_rejection = Some(rejection);
+                    }
+                }
+                TrustedIngressEntryEvaluation::NoMatch => {}
+            }
+        }
+
+        evaluation
     }
 }
 
@@ -137,28 +171,28 @@ struct TrustedIngressEntry {
     methods: Vec<String>,
     path_prefixes: Vec<String>,
     bait_soften_path_prefixes: Option<Vec<String>>,
+    hosts: Option<Vec<String>>,
     source_cidrs: Option<Vec<IpNet>>,
     required_headers: Vec<RequiredHeaderMatch>,
 }
 
+enum TrustedIngressEntryEvaluation {
+    Matched,
+    ScopeRejected(LocalIngressTrustScopeRejection),
+    NoMatch,
+}
+
 impl TrustedIngressEntry {
-    fn matches(
+    fn evaluate(
         &self,
         method: &str,
         path: &str,
+        request_host: Option<&str>,
         client_ip: Option<IpAddr>,
         headers: &[(String, String)],
-    ) -> bool {
-        if self
-            .identity
-            .expires_at
-            .is_some_and(|expires_at| expires_at <= Utc::now())
-        {
-            return false;
-        }
-
+    ) -> TrustedIngressEntryEvaluation {
         if !self.methods.is_empty() && !self.methods.iter().any(|candidate| candidate == method) {
-            return false;
+            return TrustedIngressEntryEvaluation::NoMatch;
         }
 
         if !self.path_prefixes.is_empty()
@@ -167,23 +201,88 @@ impl TrustedIngressEntry {
                 .iter()
                 .any(|prefix| path.starts_with(prefix))
         {
-            return false;
+            return TrustedIngressEntryEvaluation::NoMatch;
+        }
+
+        if !self.required_headers.iter().all(|required| {
+            headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(&required.name) && value == &required.value
+            })
+        }) {
+            return TrustedIngressEntryEvaluation::NoMatch;
+        }
+
+        if self
+            .identity
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= Utc::now())
+        {
+            return TrustedIngressEntryEvaluation::ScopeRejected(
+                self.scope_rejection(LocalIngressTrustScopeRejectionReason::Expired),
+            );
+        }
+
+        if let Some(hosts) = &self.hosts {
+            let Some(request_host) = request_host else {
+                return TrustedIngressEntryEvaluation::ScopeRejected(
+                    self.scope_rejection(LocalIngressTrustScopeRejectionReason::RequestHostMissing),
+                );
+            };
+            if !hosts.iter().any(|host| host == request_host) {
+                return TrustedIngressEntryEvaluation::ScopeRejected(
+                    self.scope_rejection(LocalIngressTrustScopeRejectionReason::HostMismatch),
+                );
+            }
         }
 
         if let Some(source_cidrs) = &self.source_cidrs {
             let Some(client_ip) = client_ip else {
-                return false;
+                return TrustedIngressEntryEvaluation::ScopeRejected(
+                    self.scope_rejection(LocalIngressTrustScopeRejectionReason::ClientPeerMissing),
+                );
             };
             if !source_cidrs.iter().any(|cidr| cidr.contains(&client_ip)) {
-                return false;
+                return TrustedIngressEntryEvaluation::ScopeRejected(
+                    self.scope_rejection(LocalIngressTrustScopeRejectionReason::SourceCidrMismatch),
+                );
             }
         }
 
-        self.required_headers.iter().all(|required| {
-            headers.iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case(&required.name) && value == &required.value
-            })
-        })
+        TrustedIngressEntryEvaluation::Matched
+    }
+
+    fn resolved_trust(&self) -> ResolvedIngressTrust {
+        ResolvedIngressTrust {
+            identity: self.identity.clone(),
+            path_prefixes: self.path_prefixes.clone(),
+            bait_soften_path_prefixes: self.bait_soften_path_prefixes.clone(),
+            hosts: self.hosts.clone(),
+            source_cidrs: self
+                .source_cidrs
+                .as_ref()
+                .map(|cidrs| cidrs.iter().map(ToString::to_string).collect()),
+        }
+    }
+
+    fn scope_rejection(
+        &self,
+        reason: LocalIngressTrustScopeRejectionReason,
+    ) -> LocalIngressTrustScopeRejection {
+        LocalIngressTrustScopeRejection {
+            label: self.identity.label.clone(),
+            source: self.identity.source,
+            trust_tier: self.identity.trust_tier,
+            expires_at: self.identity.expires_at,
+            path_prefixes: self.path_prefixes.clone(),
+            bait_soften_path_prefixes: self.bait_soften_path_prefixes.clone().unwrap_or_default(),
+            hosts: self.hosts.clone().unwrap_or_default(),
+            source_cidrs: self
+                .source_cidrs
+                .as_ref()
+                .map(|cidrs| cidrs.iter().map(ToString::to_string).collect())
+                .unwrap_or_default(),
+            reason,
+        }
     }
 }
 
@@ -236,6 +335,8 @@ struct RawTrustedIngressEntry {
     path_prefixes: Vec<String>,
     #[serde(default)]
     bait_soften_path_prefixes: Option<Vec<String>>,
+    #[serde(default)]
+    hosts: Vec<String>,
     #[serde(default)]
     source_cidrs: Vec<String>,
     required_headers: Vec<RawRequiredHeaderMatch>,
@@ -346,6 +447,7 @@ impl RawTrustedIngressEntry {
             )?),
             None => None,
         };
+        let hosts = normalize_hosts(self.hosts, index)?;
         let source_cidrs = normalize_source_cidrs(self.source_cidrs, index)?;
 
         let required_headers = self
@@ -364,6 +466,7 @@ impl RawTrustedIngressEntry {
             methods,
             path_prefixes,
             bait_soften_path_prefixes,
+            hosts,
             source_cidrs,
             required_headers,
         })
@@ -428,6 +531,52 @@ fn normalize_source_cidrs(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Some(source_cidrs))
+}
+
+fn normalize_hosts(
+    hosts: Vec<String>,
+    index: usize,
+) -> Result<Option<Vec<String>>, IngressTrustConfigError> {
+    if hosts.is_empty() {
+        return Ok(None);
+    }
+
+    let hosts = hosts
+        .into_iter()
+        .map(|host| normalize_host_scope_value(&host, index))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Some(hosts))
+}
+
+fn normalize_host_scope_value(host: &str, index: usize) -> Result<String, IngressTrustConfigError> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(IngressTrustConfigError::new(format!(
+            "ingress trust config entry {index} hosts must not contain empty values"
+        )));
+    }
+    if host.contains('/') || host.chars().any(char::is_whitespace) {
+        return Err(IngressTrustConfigError::new(format!(
+            "ingress trust config entry {index} hosts value `{host}` is invalid: host scopes must be plain hosts without paths"
+        )));
+    }
+
+    let bracketless = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if bracketless.parse::<IpAddr>().is_ok() {
+        return Ok(bracketless.to_ascii_lowercase());
+    }
+
+    if host.contains(':') {
+        return Err(IngressTrustConfigError::new(format!(
+            "ingress trust config entry {index} hosts value `{host}` is invalid: host scopes must not include ports"
+        )));
+    }
+
+    Ok(host.to_ascii_lowercase())
 }
 
 impl RawRequiredHeaderMatch {
@@ -505,6 +654,7 @@ mod tests {
                 "GET",
                 "/docs/legacy-import",
                 None,
+                None,
                 [("X-Eidolon-Trusted-Actor", "internal-crawler")],
             ),
             "entry should match",
@@ -546,6 +696,7 @@ mod tests {
                 "POST",
                 "/docs/legacy-import",
                 None,
+                None,
                 [("X-Eidolon-Trusted-Actor", "internal-crawler")],
             )
             .is_none());
@@ -553,6 +704,7 @@ mod tests {
             .resolve(
                 "GET",
                 "/health",
+                None,
                 None,
                 [("X-Eidolon-Trusted-Actor", "internal-crawler")],
             )
@@ -587,7 +739,7 @@ mod tests {
         let resolver = must_ok(resolver, "config should parse");
 
         let trust = must_some(
-            resolver.resolve("GET", "/docs", None, [("X-Actor", "seed")]),
+            resolver.resolve("GET", "/docs", None, None, [("X-Actor", "seed")]),
             "entry should match",
         );
 
@@ -619,7 +771,7 @@ mod tests {
         let resolver = must_ok(resolver, "config should parse");
 
         let trust = must_some(
-            resolver.resolve("GET", "/docs", None, [("X-Actor", "window")]),
+            resolver.resolve("GET", "/docs", None, None, [("X-Actor", "window")]),
             "entry should match",
         );
 
@@ -655,7 +807,7 @@ mod tests {
 
         assert!(
             resolver
-                .resolve("GET", "/docs", None, [("X-Actor", "window")])
+                .resolve("GET", "/docs", None, None, [("X-Actor", "window")])
                 .is_none(),
             "expired trust entries should not match",
         );
@@ -684,7 +836,13 @@ mod tests {
         let resolver = must_ok(resolver, "config should parse");
 
         let trust = must_some(
-            resolver.resolve("GET", "/openapi.json", None, [("X-Actor", "docs-crawler")]),
+            resolver.resolve(
+                "GET",
+                "/openapi.json",
+                None,
+                None,
+                [("X-Actor", "docs-crawler")],
+            ),
             "entry should match",
         );
 
@@ -814,6 +972,7 @@ mod tests {
             .resolve(
                 "GET",
                 "/docs",
+                None,
                 Some("127.0.0.1".parse().expect("loopback ip should parse")),
                 [("X-Eidolon-Trusted-Actor", "docs-crawler")],
             )
@@ -822,6 +981,7 @@ mod tests {
             .resolve(
                 "GET",
                 "/docs",
+                None,
                 Some("192.168.1.20".parse().expect("private ip should parse")),
                 [("X-Eidolon-Trusted-Actor", "docs-crawler")],
             )
@@ -831,9 +991,172 @@ mod tests {
                 "GET",
                 "/docs",
                 None,
+                None,
                 [("X-Eidolon-Trusted-Actor", "docs-crawler")],
             )
             .is_none());
+    }
+
+    #[test]
+    fn source_cidr_scope_rejections_are_exposed() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "entries": [
+                    {
+                      "label": "docs-crawler",
+                      "source": "local_allowlist",
+                      "trust_tier": "allowlisted",
+                      "path_prefixes": ["/docs"],
+                      "source_cidrs": ["10.0.0.0/8"],
+                      "required_headers": [
+                        { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                      ]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let evaluation = resolver.evaluate(
+            "GET",
+            "/docs",
+            None,
+            Some("192.168.1.20".parse().expect("private ip should parse")),
+            [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+        );
+
+        assert!(evaluation.resolved.is_none());
+        let rejection = evaluation
+            .scope_rejection
+            .expect("scope rejection should be recorded");
+        assert_eq!(rejection.label.as_deref(), Some("docs-crawler"));
+        assert_eq!(
+            rejection.reason,
+            LocalIngressTrustScopeRejectionReason::SourceCidrMismatch
+        );
+    }
+
+    #[test]
+    fn hosts_can_gate_local_trust_matches() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "entries": [
+                    {
+                      "label": "docs-crawler",
+                      "source": "local_allowlist",
+                      "trust_tier": "allowlisted",
+                      "path_prefixes": ["/docs"],
+                      "hosts": ["docs.example.test", "127.0.0.1"],
+                      "required_headers": [
+                        { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                      ]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/docs",
+                Some("docs.example.test"),
+                None,
+                [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            )
+            .is_some());
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/docs",
+                Some("api.example.test"),
+                None,
+                [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            )
+            .is_none());
+        assert!(resolver
+            .resolve(
+                "GET",
+                "/docs",
+                None,
+                None,
+                [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn host_scope_rejections_are_exposed() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "entries": [
+                    {
+                      "label": "docs-crawler",
+                      "source": "local_allowlist",
+                      "trust_tier": "allowlisted",
+                      "path_prefixes": ["/docs"],
+                      "hosts": ["docs.example.test"],
+                      "required_headers": [
+                        { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                      ]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let evaluation = resolver.evaluate(
+            "GET",
+            "/docs",
+            Some("api.example.test"),
+            None,
+            [("X-Eidolon-Trusted-Actor", "docs-crawler")],
+        );
+
+        assert!(evaluation.resolved.is_none());
+        let rejection = evaluation
+            .scope_rejection
+            .expect("scope rejection should be recorded");
+        assert_eq!(rejection.label.as_deref(), Some("docs-crawler"));
+        assert_eq!(
+            rejection.reason,
+            LocalIngressTrustScopeRejectionReason::HostMismatch
+        );
+        assert_eq!(rejection.hosts, vec!["docs.example.test".to_string()]);
+    }
+
+    #[test]
+    fn rejects_invalid_hosts() {
+        let error = parse_ingress_identity_resolver(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "bad-host",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "hosts": ["docs.example.test:8443"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        )
+        .expect_err("host scopes with ports should fail");
+
+        assert!(error
+            .to_string()
+            .contains("host scopes must not include ports"));
     }
 
     #[test]

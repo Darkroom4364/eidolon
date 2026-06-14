@@ -12,6 +12,10 @@ LOCAL_STATE_DIR="${EIDOLON_SHIELD_LOCAL_STATE_DIR:-}"
 SESSION_INDEX_LIMIT="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LIMIT:-25}"
 SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE:-}"
 SESSION_INDEX_LATEST_MINT_OUTCOME="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME:-}"
+SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL:-}"
+SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON:-}"
+SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL:-}"
+SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON:-}"
 SESSION_INDEX_TRUSTED_SOFTEN_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL:-}"
 SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_PATH_SOFTENED:-}"
 SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_HISTORY_LABEL:-}"
@@ -47,6 +51,22 @@ Environment:
                          Keep only sessions whose latest exported minted bait
                          outcome matches `matched_session_value` or
                          `session_value_mismatch`.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL
+                         Keep only sessions whose latest local trust scope
+                         rejection label matches the given value.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON
+                         Keep only sessions whose latest local trust scope
+                         rejection reason matches `expired`,
+                         `request_host_missing`, `host_mismatch`,
+                         `client_peer_missing`, or `source_cidr_mismatch`.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL
+                         Keep only sessions whose local trust scope rejection
+                         history includes the given label.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON
+                         Keep only sessions whose local trust scope rejection
+                         history includes `expired`,
+                         `request_host_missing`, `host_mismatch`,
+                         `client_peer_missing`, or `source_cidr_mismatch`.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_TRUSTED_SOFTEN_LABEL
                          Keep only sessions whose matched trusted-ingress
                          soften scope label matches the given value.
@@ -202,6 +222,14 @@ render_edge_session_index() {
               (($match.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
             end
           )
+        + "; host "
+        + (
+            if (($match.hosts // []) | length) == 0 then
+              code("any")
+            else
+              (($match.hosts // []) | map(code(.)) | join(", "))
+            end
+          )
         + "; path softened "
         + code($match.request_path_softened)
         + ")"
@@ -217,6 +245,49 @@ render_edge_session_index() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + ", source "
+             + (
+                 if ((.source_cidrs // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "]"
+           )
+         | join(", "))
+      end;
+    def local_trust_rejection_history_summary($histories):
+      if ($histories | length) == 0 then
+        code("none")
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " ["
+             + (
+                 if ((.reasons // []) | length) == 0 then
+                   code("none")
+                 else
+                   ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
              + ", source "
              + (
                  if ((.source_cidrs // []) | length) == 0 then
@@ -234,6 +305,21 @@ render_edge_session_index() {
         trusted_soften_summary($match)
       else
         trusted_soften_history_summary($histories)
+      end;
+    def local_trust_rejection_summary($rejection):
+      if $rejection == null then
+        code("none")
+      else
+        code($rejection.label // ($rejection.source + "/" + $rejection.trust_tier))
+        + " ("
+        + code($rejection.reason)
+        + ")"
+      end;
+    def local_trust_rejection_context_summary($rejection; $histories):
+      if $rejection != null then
+        local_trust_rejection_summary($rejection)
+      else
+        local_trust_rejection_history_summary($histories)
       end;
     def severity_rank($state):
       if $state == "blocked" then 5
@@ -282,8 +368,8 @@ render_edge_session_index() {
           end
         ),
         "",
-        "| Session | Observed | Request | Policy | Action | Trusted Soften Context | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Session | Observed | Request | Policy | Action | Local Trust Rejection | Trusted Soften Context | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         (
           $shown
           | to_entries[]
@@ -291,7 +377,10 @@ render_edge_session_index() {
           | ($value.deployment_context // {}) as $deployment
           | ($value.evidence.bait_header_value_mints // []) as $mint_audits
           | ($value.evidence.latest_bait_header_value_mint // null) as $latest_mint
+          | ($value.evidence.local_ingress_trust_scope_rejection_histories // [])
+            as $local_trust_rejection_histories
           | ($value.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
+          | ($value.local_ingress_trust_scope_rejection // null) as $local_trust_rejection
           | ($value.trusted_ingress_soften_match // null) as $trusted_soften_match
           | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
           | "| "
@@ -304,6 +393,11 @@ render_edge_session_index() {
             + code($value.policy.state)
             + " | "
             + code($value.edge_recommendation.action)
+            + " | "
+            + local_trust_rejection_context_summary(
+                $local_trust_rejection;
+                $local_trust_rejection_histories
+              )
             + " | "
             + trusted_soften_context_summary($trusted_soften_match; $trusted_soften_histories)
             + " | "
@@ -368,6 +462,30 @@ write_edge_session_index() {
       "$SESSION_INDEX_LATEST_MINT_OUTCOME"
     )
   fi
+  if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL" ]]; then
+    edge_export_args+=(
+      --local-trust-rejection-label
+      "$SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON" ]]; then
+    edge_export_args+=(
+      --local-trust-rejection-reason
+      "$SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL" ]]; then
+    edge_export_args+=(
+      --local-trust-rejection-history-label
+      "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
+    edge_export_args+=(
+      --local-trust-rejection-history-reason
+      "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON"
+    )
+  fi
   if [[ -n "$SESSION_INDEX_TRUSTED_SOFTEN_LABEL" ]]; then
     edge_export_args+=(
       --trusted-soften-label
@@ -401,6 +519,18 @@ write_edge_session_index() {
       return 0
     fi
     if grep -q 'no edge decision exports matched --latest-mint-outcome' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --local-trust-rejection-label' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --local-trust-rejection-reason' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --local-trust-rejection-history-label' "$export_error"; then
+      return 0
+    fi
+    if grep -q 'no edge decision exports matched --local-trust-rejection-history-reason' "$export_error"; then
       return 0
     fi
     if grep -q 'no edge decision exports matched --trusted-soften-label' "$export_error"; then
@@ -491,6 +621,49 @@ render_selected_session_summary() {
              + code(.saw_request_path_softened)
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
+             + ", host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + ", source "
+             + (
+                 if ((.source_cidrs // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "]"
+           )
+         | join(", "))
+      end;
+    def local_trust_rejection_history_summary($histories):
+      if ($histories | length) == 0 then
+        empty
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " ["
+             + (
+                 if ((.reasons // []) | length) == 0 then
+                   code("none")
+                 else
+                   ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
              + ", source "
              + (
                  if ((.source_cidrs // []) | length) == 0 then
@@ -519,9 +692,12 @@ render_selected_session_summary() {
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
     | ($export.deployment_context // {}) as $deployment
+    | ($export.local_ingress_trust_scope_rejection // null) as $local_trust_rejection
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
+    | ($export.evidence.local_ingress_trust_scope_rejection_histories // [])
+      as $local_trust_rejection_histories
     | ($export.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
     | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
@@ -578,6 +754,60 @@ render_selected_session_summary() {
           end
         )),
         optional_line("Ingress edge action hint"; (($signals.edge_action // null) | if . != null then code(.) else empty end)),
+        optional_line("Local trust scope rejection"; (
+          if $local_trust_rejection != null then
+            code($local_trust_rejection.label // ($local_trust_rejection.source + "/" + $local_trust_rejection.trust_tier))
+            + " (" + code($local_trust_rejection.reason) + ")"
+          else
+            empty
+          end
+        )),
+        optional_line("Rejected local trust scope"; (
+          if $local_trust_rejection != null then
+            "soften "
+            + (
+                if (($local_trust_rejection.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  (($local_trust_rejection.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if (($local_trust_rejection.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  (($local_trust_rejection.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; host "
+            + (
+                if (($local_trust_rejection.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  (($local_trust_rejection.hosts // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; source "
+            + (
+                if (($local_trust_rejection.source_cidrs // []) | length) == 0 then
+                  code("any")
+                else
+                  (($local_trust_rejection.source_cidrs // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ($local_trust_rejection.expires_at // null) == null then
+                  ""
+                else
+                  "; expires " + code($local_trust_rejection.expires_at)
+                end
+              )
+          else
+            empty
+          end
+        )),
+        optional_line("Local trust rejection history"; local_trust_rejection_history_summary($local_trust_rejection_histories)),
         optional_line("Trusted soften match"; (
           if $trusted_soften_match != null then
             code($trusted_soften_match.label // ($trusted_soften_match.source + "/" + $trusted_soften_match.trust_tier))
@@ -602,6 +832,14 @@ render_selected_session_summary() {
                   code("all")
                 else
                   (($trusted_soften_match.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; host "
+            + (
+                if (($trusted_soften_match.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  (($trusted_soften_match.hosts // []) | map(code(.)) | join(", "))
                 end
               )
             + "; source "
@@ -733,6 +971,14 @@ render_selected_session_summary() {
                   ((.path_prefixes // []) | map(code(.)) | join(", "))
                 end
               )
+            + "; host "
+            + (
+                if ((.hosts // []) | length) == 0 then
+                  code("any")
+                else
+                  ((.hosts // []) | map(code(.)) | join(", "))
+                end
+              )
             + "; source "
             + (
                 if ((.source_cidrs // []) | length) == 0 then
@@ -846,6 +1092,14 @@ write_readme() {
                 ((.path_prefixes // []) | map("`" + . + "`") | join(", "))
               end
             )
+          + "; host "
+          + (
+              if ((.hosts // []) | length) == 0 then
+                "`any`"
+              else
+                ((.hosts // []) | map("`" + . + "`") | join(", "))
+              end
+            )
           + "; source "
           + (
               if ((.source_cidrs // []) | length) == 0 then
@@ -921,6 +1175,26 @@ if [[ -n "$SESSION_INDEX_LATEST_MINT_OUTCOME" ]]; then
       ;;
     *)
       fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME must be matched_session_value or session_value_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON" ]]; then
+  case "$SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON" in
+    expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+      ;;
+    *)
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
+  case "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON" in
+    expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+      ;;
+    *)
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON must be one of: expired, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi
