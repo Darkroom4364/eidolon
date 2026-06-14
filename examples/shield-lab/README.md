@@ -753,7 +753,10 @@ allowlist scopes, `--local-trust-rejection-label <label>` and
 `--local-trust-rejection-reason
 <expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`
 narrow live export to sessions whose latest request nearly matched one scoped
-local trust entry but failed freshness, host, or source-CIDR gating.
+local trust entry but failed freshness, host, or source-CIDR gating. When a
+later request moves the session onward into containment or another state, the
+exported markdown and bundle index now keep that earlier context under
+`Local trust rejection history`.
 
 If you want the bundle-local `edge-session-index.md` to keep only sessions that
 cross the same polymorphic threshold, set:

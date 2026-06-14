@@ -412,6 +412,41 @@ render_markdown_export() {
            )
          | join(", "))
       end;
+    def local_trust_rejection_history_summary($histories):
+      if ($histories | length) == 0 then
+        empty
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " ["
+             + (
+                 if ((.reasons // []) | length) == 0 then
+                   code("none")
+                 else
+                   ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + ", source "
+             + (
+                 if ((.source_cidrs // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "]"
+           )
+         | join(", "))
+      end;
     def recon_component_lines($score):
       [
         optional_line("repeated_discovery_score"; ($score.repeated_discovery_score // 0 | if . > 0 then code(.) else empty end)),
@@ -432,6 +467,8 @@ render_markdown_export() {
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
+    | ($export.evidence.local_ingress_trust_scope_rejection_histories // [])
+      as $local_trust_rejection_histories
     | ($export.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
     | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
@@ -539,6 +576,7 @@ render_markdown_export() {
             empty
           end
         )),
+        optional_line("Local trust rejection history"; local_trust_rejection_history_summary($local_trust_rejection_histories)),
         optional_line("Trusted soften match"; (
           if $trusted_soften_match != null then
             code($trusted_soften_match.label // ($trusted_soften_match.source + "/" + $trusted_soften_match.trust_tier))

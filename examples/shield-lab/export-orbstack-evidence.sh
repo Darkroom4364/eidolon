@@ -255,6 +255,41 @@ render_edge_session_index() {
            )
          | join(", "))
       end;
+    def local_trust_rejection_history_summary($histories):
+      if ($histories | length) == 0 then
+        code("none")
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " ["
+             + (
+                 if ((.reasons // []) | length) == 0 then
+                   code("none")
+                 else
+                   ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + ", source "
+             + (
+                 if ((.source_cidrs // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "]"
+           )
+         | join(", "))
+      end;
     def trusted_soften_context_summary($match; $histories):
       if $match != null then
         trusted_soften_summary($match)
@@ -269,6 +304,12 @@ render_edge_session_index() {
         + " ("
         + code($rejection.reason)
         + ")"
+      end;
+    def local_trust_rejection_context_summary($rejection; $histories):
+      if $rejection != null then
+        local_trust_rejection_summary($rejection)
+      else
+        local_trust_rejection_history_summary($histories)
       end;
     def severity_rank($state):
       if $state == "blocked" then 5
@@ -326,6 +367,8 @@ render_edge_session_index() {
           | ($value.deployment_context // {}) as $deployment
           | ($value.evidence.bait_header_value_mints // []) as $mint_audits
           | ($value.evidence.latest_bait_header_value_mint // null) as $latest_mint
+          | ($value.evidence.local_ingress_trust_scope_rejection_histories // [])
+            as $local_trust_rejection_histories
           | ($value.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
           | ($value.local_ingress_trust_scope_rejection // null) as $local_trust_rejection
           | ($value.trusted_ingress_soften_match // null) as $trusted_soften_match
@@ -341,7 +384,10 @@ render_edge_session_index() {
             + " | "
             + code($value.edge_recommendation.action)
             + " | "
-            + local_trust_rejection_summary($local_trust_rejection)
+            + local_trust_rejection_context_summary(
+                $local_trust_rejection;
+                $local_trust_rejection_histories
+              )
             + " | "
             + trusted_soften_context_summary($trusted_soften_match; $trusted_soften_histories)
             + " | "
@@ -567,6 +613,41 @@ render_selected_session_summary() {
            )
          | join(", "))
       end;
+    def local_trust_rejection_history_summary($histories):
+      if ($histories | length) == 0 then
+        empty
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " ["
+             + (
+                 if ((.reasons // []) | length) == 0 then
+                   code("none")
+                 else
+                   ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; host "
+             + (
+                 if ((.hosts // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.hosts // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + ", source "
+             + (
+                 if ((.source_cidrs // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "]"
+           )
+         | join(", "))
+      end;
     def recon_component_lines($score):
       [
         optional_line("repeated_discovery_score"; ($score.repeated_discovery_score // 0 | if . > 0 then code(.) else empty end)),
@@ -587,6 +668,8 @@ render_selected_session_summary() {
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
+    | ($export.evidence.local_ingress_trust_scope_rejection_histories // [])
+      as $local_trust_rejection_histories
     | ($export.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
     | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
@@ -696,6 +779,7 @@ render_selected_session_summary() {
             empty
           end
         )),
+        optional_line("Local trust rejection history"; local_trust_rejection_history_summary($local_trust_rejection_histories)),
         optional_line("Trusted soften match"; (
           if $trusted_soften_match != null then
             code($trusted_soften_match.label // ($trusted_soften_match.source + "/" + $trusted_soften_match.trust_tier))

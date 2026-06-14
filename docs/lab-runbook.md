@@ -349,6 +349,10 @@ For rejected local allowlist scopes, the same live export path also supports
 and the bundle index supports matching
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL` and
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON` overrides.
+Those rejected-scope details now also survive later state changes as `Local
+trust rejection history` in the live markdown summary and bundle index, so a
+contained session still preserves the earlier host/source/freshness mismatch
+context.
 Trusted soften triage uses the same pattern: `--trusted-soften-label <label>`
 and `--trusted-soften-path-softened <true|false>` filter live exports to
 requests that actually matched one local trusted soften scope, and the bundle
