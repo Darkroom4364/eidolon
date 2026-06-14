@@ -165,6 +165,8 @@ pub enum IngressTrustTier {
 #[serde(rename_all = "snake_case")]
 pub enum LocalIngressTrustScopeRejectionReason {
     Expired,
+    RequestUserAgentMissing,
+    UserAgentMismatch,
     RequestHostMissing,
     HostMismatch,
     ClientPeerMissing,
@@ -193,6 +195,8 @@ pub struct LocalIngressTrustScopeRejection {
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_agent_substrings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -700,6 +704,8 @@ pub struct EdgeTrustedIngressSoftenScope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_agent_substrings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_cidrs: Vec<String>,
@@ -715,6 +721,8 @@ pub struct TrustedIngressSoftenMatch {
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_agent_substrings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -732,6 +740,8 @@ pub struct EdgeTrustedIngressSoftenHistory {
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_agent_substrings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -752,6 +762,8 @@ pub struct EdgeLocalIngressTrustScopeRejectionHistory {
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_agent_substrings: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -907,6 +919,7 @@ mod tests {
                     expires_at: None,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                     hosts: vec!["localhost".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                     reason: LocalIngressTrustScopeRejectionReason::HostMismatch,
@@ -917,6 +930,7 @@ mod tests {
                     trust_tier: IngressTrustTier::Allowlisted,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                     hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                     request_path_softened: false,
@@ -1307,6 +1321,7 @@ mod tests {
                 expires_at: None,
                 path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                 bait_soften_path_prefixes: vec!["/docs".to_string()],
+                user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                 hosts: vec!["localhost".to_string()],
                 source_cidrs: vec!["127.0.0.1/32".to_string()],
                 reason: LocalIngressTrustScopeRejectionReason::HostMismatch,
@@ -1317,6 +1332,7 @@ mod tests {
                 trust_tier: IngressTrustTier::Allowlisted,
                 path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                 bait_soften_path_prefixes: vec!["/docs".to_string()],
+                user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                 hosts: vec!["127.0.0.1".to_string()],
                 source_cidrs: vec!["127.0.0.1/32".to_string()],
                 request_path_softened: false,
@@ -1365,6 +1381,7 @@ mod tests {
                         expires_at: None,
                         path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                         bait_soften_path_prefixes: vec!["/docs".to_string()],
+                        user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                         hosts: vec!["localhost".to_string()],
                         source_cidrs: vec!["127.0.0.1/32".to_string()],
                         reasons: vec![
@@ -1379,6 +1396,7 @@ mod tests {
                     trust_tier: IngressTrustTier::Allowlisted,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                     hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                     saw_request_path_softened: true,
@@ -1429,6 +1447,7 @@ mod tests {
                     expires_at: None,
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
+                    user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                     hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                 }],

@@ -12,8 +12,8 @@ write_fixture_state() {
   local dir="$1"
 
   cat > "$dir/events.jsonl" <<'JSONL'
-{"schema_version":2,"id":"11111111-1111-1111-1111-111111111111","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-13T08:00:00Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"GET","path":"/docs?topic=<redacted>","safe_headers":[],"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"request_path_softened":true},"routing_decision":"protected_upstream"}}
-{"schema_version":2,"id":"22222222-2222-2222-2222-222222222222","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-13T08:00:01Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"GET","path":"/openapi.json","safe_headers":[],"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"request_path_softened":false},"routing_decision":"rewritten_upstream"}}
+{"schema_version":2,"id":"11111111-1111-1111-1111-111111111111","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-13T08:00:00Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"GET","path":"/docs?topic=<redacted>","safe_headers":[],"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"user_agent_substrings":["eidolon-docs-crawler"],"request_path_softened":true},"routing_decision":"protected_upstream"}}
+{"schema_version":2,"id":"22222222-2222-2222-2222-222222222222","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-13T08:00:01Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"GET","path":"/openapi.json","safe_headers":[],"ingress_identity":{"source":"local_allowlist","trust_tier":"allowlisted","label":"docs-crawler"},"trusted_ingress_soften_match":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"user_agent_substrings":["eidolon-docs-crawler"],"request_path_softened":false},"routing_decision":"rewritten_upstream"}}
 {"schema_version":2,"id":"33333333-3333-3333-3333-333333333333","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-13T08:00:01Z","source":"surface_controller","policy_state":"observe","kind":{"type":"bait_exposed","bait_id":"openapi_reconcile_trace","exposure_id":"exp-openapi","surface":"/openapi.json","header_value_mint":{"header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"}}}
 {"schema_version":2,"id":"44444444-4444-4444-4444-444444444444","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-13T08:00:02Z","source":"proxy","policy_state":"suspicious","kind":{"type":"request_seen","method":"POST","path":"/api/v2/import/reconcile","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"routing_decision":"eidolon_owned"}}
 {"schema_version":2,"id":"55555555-5555-5555-5555-555555555555","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-13T08:00:02Z","source":"bait_engine","policy_state":"observe","kind":{"type":"bait_action_observed","bait_id":"openapi_reconcile_trace","exposure_id":"exp-openapi","method":"POST","path":"/api/v2/import/reconcile","header_value_mint":{"header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},"header_value_mint_status":"matched_session_value"}}
@@ -54,6 +54,7 @@ headers_file=""
 body_file=""
 cookie=""
 trusted_actor=""
+user_agent=""
 trace_header=""
 request_url=""
 
@@ -79,6 +80,9 @@ while [[ $# -gt 0 ]]; do
         X-Eidolon-Trusted-Actor:*)
           trusted_actor="${2#X-Eidolon-Trusted-Actor: }"
           ;;
+        User-Agent:*)
+          user_agent="${2#User-Agent: }"
+          ;;
         X-OpenAPI-Trace:*)
           trace_header="${2#X-OpenAPI-Trace: }"
           ;;
@@ -97,6 +101,7 @@ done
 
 [[ "$cookie" == "eidolon_session=11111111-1111-4111-8111-111111111111" ]]
 [[ "$trusted_actor" == "docs-crawler" ]]
+[[ "$user_agent" == "eidolon-docs-crawler/1.0" ]]
 
 case "${method}|${request_url}" in
   "GET|http://127.0.0.1:31080/docs?topic=imports")

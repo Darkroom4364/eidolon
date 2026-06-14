@@ -8,6 +8,7 @@
       "methods": ["GET"],
       "path_prefixes": ["/docs", "/openapi.json"],
       "bait_soften_path_prefixes": ["/docs"],
+      "user_agent_substrings": ["eidolon-docs-crawler"],
       "hosts": ["docs.invalid.eidolon"],
       "source_cidrs": ["192.168.194.1/32"],
       "required_headers": [
