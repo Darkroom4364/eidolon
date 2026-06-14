@@ -10552,6 +10552,83 @@ mod tests {
     }
 
     #[test]
+    fn expired_authenticated_ingress_identity_does_not_soften_bait_surface() {
+        let event_log_path = unique_temp_path("expired-ingress-identity-events.jsonl");
+        let debug_log_path = unique_temp_path("expired-ingress-identity-debug.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, upstream_handle) = spawn_upstream(json_response(original));
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("expired-ingress-identity-control.txt"),
+        );
+        let mut runtime = runtime;
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/openapi.json",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+                    (
+                        session::INGRESS_IDENTITY_LABEL_HEADER_NAME,
+                        "expired-edge-agent",
+                    ),
+                    (
+                        session::INGRESS_IDENTITY_EXPIRES_AT_HEADER_NAME,
+                        "2000-01-01T00:00:00Z",
+                    ),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        must_join(upstream_handle.join(), "upstream thread should join");
+        let body: Value = must_ok(
+            serde_json::from_slice(&response.body),
+            "body should be rewritten openapi json",
+        );
+
+        assert_eq!(response.status, 200);
+        assert!(body["paths"]["/api/v2/import/reconcile"].is_object());
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["source"],
+            "signed_agent"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["trust_tier"],
+            "weakly_asserted"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["label"],
+            "expired-edge-agent"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["expires_at"],
+            "2000-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            request_event["kind"]["routing_decision"].as_str(),
+            Some("protected_upstream")
+        );
+
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "rewritten_upstream"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+    }
+
+    #[test]
     fn proxy_never_forwards_reserved_eidolon_headers_upstream() {
         let event_log_path = unique_temp_path("strip-eidolon-headers-events.jsonl");
         let (upstream, upstream_handle) =

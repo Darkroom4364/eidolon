@@ -166,6 +166,7 @@ status_json="$(jq -n \
             label: (.label // null),
             source: .source,
             trust_tier: .trust_tier,
+            expires_at: (.expires_at // null),
             path_prefixes: (.path_prefixes // []),
             bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
             source_cidrs: (.source_cidrs // [])
@@ -305,6 +306,13 @@ jq -r '
                   "any"
                 else
                   (.source_cidrs | join(", "))
+                end
+              )
+            + (
+                if (.expires_at // null) == null then
+                  ""
+                else
+                  "; expires " + .expires_at
                 end
               )
             + ")"
