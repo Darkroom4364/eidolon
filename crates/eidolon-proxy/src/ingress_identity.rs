@@ -16,6 +16,7 @@ pub struct IngressIdentityResolver {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedIngressTrust {
     pub identity: IngressIdentity,
+    pub methods: Vec<String>,
     pub path_prefixes: Vec<String>,
     pub bait_soften_path_prefixes: Option<Vec<String>>,
     pub user_agent_substrings: Option<Vec<String>>,
@@ -85,7 +86,7 @@ impl IngressIdentityResolver {
                 }
                 TrustedIngressEntryEvaluation::ScopeRejected(rejection) => {
                     if evaluation.scope_rejection.is_none() {
-                        evaluation.scope_rejection = Some(rejection);
+                        evaluation.scope_rejection = Some(*rejection);
                     }
                 }
                 TrustedIngressEntryEvaluation::NoMatch => {}
@@ -181,7 +182,7 @@ struct TrustedIngressEntry {
 
 enum TrustedIngressEntryEvaluation {
     Matched,
-    ScopeRejected(LocalIngressTrustScopeRejection),
+    ScopeRejected(Box<LocalIngressTrustScopeRejection>),
     NoMatch,
 }
 
@@ -194,26 +195,15 @@ impl TrustedIngressEntry {
         client_ip: Option<IpAddr>,
         headers: &[(String, String)],
     ) -> TrustedIngressEntryEvaluation {
-        if !self.methods.is_empty() && !self.methods.iter().any(|candidate| candidate == method) {
-            return TrustedIngressEntryEvaluation::NoMatch;
-        }
-
-        if !self.path_prefixes.is_empty()
-            && !self
-                .path_prefixes
-                .iter()
-                .any(|prefix| path.starts_with(prefix))
-        {
-            return TrustedIngressEntryEvaluation::NoMatch;
-        }
-
         if !self.required_headers.iter().all(|required| {
             headers.iter().any(|(name, value)| {
                 name.eq_ignore_ascii_case(&required.name) && value == &required.value
             })
         }) {
             if let Some(reason) = self.required_header_rejection_reason(headers) {
-                return TrustedIngressEntryEvaluation::ScopeRejected(self.scope_rejection(reason));
+                return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
+                    self.scope_rejection(reason),
+                ));
             }
             return TrustedIngressEntryEvaluation::NoMatch;
         }
@@ -223,9 +213,9 @@ impl TrustedIngressEntry {
             .not_before
             .is_some_and(|not_before| not_before > Utc::now())
         {
-            return TrustedIngressEntryEvaluation::ScopeRejected(
+            return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
                 self.scope_rejection(LocalIngressTrustScopeRejectionReason::NotYetActive),
-            );
+            ));
         }
 
         if self
@@ -233,9 +223,9 @@ impl TrustedIngressEntry {
             .expires_at
             .is_some_and(|expires_at| expires_at <= Utc::now())
         {
-            return TrustedIngressEntryEvaluation::ScopeRejected(
+            return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
                 self.scope_rejection(LocalIngressTrustScopeRejectionReason::Expired),
-            );
+            ));
         }
 
         if let Some(user_agent_substrings) = &self.user_agent_substrings {
@@ -244,8 +234,10 @@ impl TrustedIngressEntry {
                 .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
                 .map(|(_, value)| value);
             let Some(request_user_agent) = request_user_agent else {
-                return TrustedIngressEntryEvaluation::ScopeRejected(self.scope_rejection(
-                    LocalIngressTrustScopeRejectionReason::RequestUserAgentMissing,
+                return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
+                    self.scope_rejection(
+                        LocalIngressTrustScopeRejectionReason::RequestUserAgentMissing,
+                    ),
                 ));
             };
             let request_user_agent = request_user_agent.to_ascii_lowercase();
@@ -253,36 +245,53 @@ impl TrustedIngressEntry {
                 .iter()
                 .any(|candidate| request_user_agent.contains(candidate))
             {
-                return TrustedIngressEntryEvaluation::ScopeRejected(
+                return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
                     self.scope_rejection(LocalIngressTrustScopeRejectionReason::UserAgentMismatch),
-                );
+                ));
             }
         }
 
         if let Some(hosts) = &self.hosts {
             let Some(request_host) = request_host else {
-                return TrustedIngressEntryEvaluation::ScopeRejected(
+                return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
                     self.scope_rejection(LocalIngressTrustScopeRejectionReason::RequestHostMissing),
-                );
+                ));
             };
             if !hosts.iter().any(|host| host == request_host) {
-                return TrustedIngressEntryEvaluation::ScopeRejected(
+                return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
                     self.scope_rejection(LocalIngressTrustScopeRejectionReason::HostMismatch),
-                );
+                ));
             }
         }
 
         if let Some(source_cidrs) = &self.source_cidrs {
             let Some(client_ip) = client_ip else {
-                return TrustedIngressEntryEvaluation::ScopeRejected(
+                return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
                     self.scope_rejection(LocalIngressTrustScopeRejectionReason::ClientPeerMissing),
-                );
+                ));
             };
             if !source_cidrs.iter().any(|cidr| cidr.contains(&client_ip)) {
-                return TrustedIngressEntryEvaluation::ScopeRejected(
+                return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
                     self.scope_rejection(LocalIngressTrustScopeRejectionReason::SourceCidrMismatch),
-                );
+                ));
             }
+        }
+
+        if !self.methods.is_empty() && !self.methods.iter().any(|candidate| candidate == method) {
+            return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
+                self.scope_rejection(LocalIngressTrustScopeRejectionReason::MethodMismatch),
+            ));
+        }
+
+        if !self.path_prefixes.is_empty()
+            && !self
+                .path_prefixes
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+        {
+            return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
+                self.scope_rejection(LocalIngressTrustScopeRejectionReason::PathMismatch),
+            ));
         }
 
         TrustedIngressEntryEvaluation::Matched
@@ -291,6 +300,7 @@ impl TrustedIngressEntry {
     fn resolved_trust(&self) -> ResolvedIngressTrust {
         ResolvedIngressTrust {
             identity: self.identity.clone(),
+            methods: self.methods.clone(),
             path_prefixes: self.path_prefixes.clone(),
             bait_soften_path_prefixes: self.bait_soften_path_prefixes.clone(),
             user_agent_substrings: self.user_agent_substrings.clone(),
@@ -317,6 +327,7 @@ impl TrustedIngressEntry {
             trust_tier: self.identity.trust_tier,
             not_before: self.identity.not_before,
             expires_at: self.identity.expires_at,
+            methods: self.methods.clone(),
             path_prefixes: self.path_prefixes.clone(),
             bait_soften_path_prefixes: self.bait_soften_path_prefixes.clone().unwrap_or_default(),
             user_agent_substrings: self.user_agent_substrings.clone().unwrap_or_default(),
@@ -775,6 +786,7 @@ mod tests {
             trust.required_header_names,
             vec!["X-Eidolon-Trusted-Actor".to_string()]
         );
+        assert_eq!(trust.methods, vec!["GET".to_string()]);
         assert!(trust.bait_soften_path_prefixes.is_none());
     }
 
@@ -799,24 +811,41 @@ mod tests {
         );
         let resolver = must_ok(resolver, "config should parse");
 
-        assert!(resolver
-            .resolve(
-                "POST",
-                "/docs/legacy-import",
-                None,
-                None,
-                [("X-Eidolon-Trusted-Actor", "internal-crawler")],
+        let method_mismatch = resolver.evaluate(
+            "POST",
+            "/docs/legacy-import",
+            None,
+            None,
+            [("X-Eidolon-Trusted-Actor", "internal-crawler")],
+        );
+        assert!(method_mismatch.resolved.is_none());
+        assert_eq!(
+            must_some(
+                method_mismatch.scope_rejection,
+                "method mismatch should be exposed"
             )
-            .is_none());
-        assert!(resolver
-            .resolve(
-                "GET",
-                "/health",
-                None,
-                None,
-                [("X-Eidolon-Trusted-Actor", "internal-crawler")],
-            )
-            .is_none());
+            .reason,
+            LocalIngressTrustScopeRejectionReason::MethodMismatch
+        );
+
+        let path_mismatch = resolver.evaluate(
+            "GET",
+            "/health",
+            None,
+            None,
+            [("X-Eidolon-Trusted-Actor", "internal-crawler")],
+        );
+        assert!(path_mismatch.resolved.is_none());
+        let path_rejection = must_some(
+            path_mismatch.scope_rejection,
+            "path mismatch should be exposed",
+        );
+        assert_eq!(
+            path_rejection.reason,
+            LocalIngressTrustScopeRejectionReason::PathMismatch
+        );
+        assert_eq!(path_rejection.methods, vec!["GET".to_string()]);
+        assert_eq!(path_rejection.path_prefixes, vec!["/docs".to_string()]);
     }
 
     #[test]

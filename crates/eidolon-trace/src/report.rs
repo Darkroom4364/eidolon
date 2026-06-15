@@ -410,6 +410,7 @@ fn edge_trusted_ingress_soften_histories(
             history.label == trusted_match.label
                 && history.source == trusted_match.source
                 && history.trust_tier == trusted_match.trust_tier
+                && history.methods == trusted_match.methods
                 && history.path_prefixes == trusted_match.path_prefixes
                 && history.bait_soften_path_prefixes == trusted_match.bait_soften_path_prefixes
                 && history.user_agent_substrings == trusted_match.user_agent_substrings
@@ -429,6 +430,7 @@ fn edge_trusted_ingress_soften_histories(
             label: trusted_match.label.clone(),
             source: trusted_match.source,
             trust_tier: trusted_match.trust_tier,
+            methods: trusted_match.methods.clone(),
             path_prefixes: trusted_match.path_prefixes.clone(),
             bait_soften_path_prefixes: trusted_match.bait_soften_path_prefixes.clone(),
             user_agent_substrings: trusted_match.user_agent_substrings.clone(),
@@ -463,6 +465,7 @@ fn edge_local_ingress_trust_scope_rejection_histories(
                 && history.trust_tier == rejection.trust_tier
                 && history.not_before == rejection.not_before
                 && history.expires_at == rejection.expires_at
+                && history.methods == rejection.methods
                 && history.path_prefixes == rejection.path_prefixes
                 && history.bait_soften_path_prefixes == rejection.bait_soften_path_prefixes
                 && history.user_agent_substrings == rejection.user_agent_substrings
@@ -482,6 +485,7 @@ fn edge_local_ingress_trust_scope_rejection_histories(
             trust_tier: rejection.trust_tier,
             not_before: rejection.not_before,
             expires_at: rejection.expires_at,
+            methods: rejection.methods.clone(),
             path_prefixes: rejection.path_prefixes.clone(),
             bait_soften_path_prefixes: rejection.bait_soften_path_prefixes.clone(),
             user_agent_substrings: rejection.user_agent_substrings.clone(),
@@ -1510,6 +1514,7 @@ mod tests {
                         label: Some("internal-crawler".to_string()),
                         source: IngressIdentitySource::LocalAllowlist,
                         trust_tier: IngressTrustTier::Allowlisted,
+                        methods: vec!["GET".to_string()],
                         path_prefixes: vec!["/docs".to_string()],
                         bait_soften_path_prefixes: vec!["/docs".to_string()],
                         user_agent_substrings: vec!["internal-crawler".to_string()],
@@ -1677,6 +1682,7 @@ mod tests {
                         label: Some("docs-crawler".to_string()),
                         source: IngressIdentitySource::LocalAllowlist,
                         trust_tier: IngressTrustTier::Allowlisted,
+                        methods: vec!["GET".to_string()],
                         path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                         bait_soften_path_prefixes: vec!["/docs".to_string()],
                         user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
@@ -1715,6 +1721,7 @@ mod tests {
                         label: Some("docs-crawler".to_string()),
                         source: IngressIdentitySource::LocalAllowlist,
                         trust_tier: IngressTrustTier::Allowlisted,
+                        methods: vec!["GET".to_string()],
                         path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                         bait_soften_path_prefixes: vec!["/docs".to_string()],
                         user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
@@ -1827,6 +1834,7 @@ mod tests {
                             trust_tier: IngressTrustTier::Allowlisted,
                             not_before: None,
                             expires_at: None,
+                            methods: vec!["GET".to_string()],
                             path_prefixes: vec!["/docs".to_string()],
                             bait_soften_path_prefixes: vec!["/docs".to_string()],
                             user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
@@ -1891,6 +1899,7 @@ mod tests {
                             trust_tier: IngressTrustTier::Allowlisted,
                             not_before: None,
                             expires_at: None,
+                            methods: vec!["GET".to_string()],
                             path_prefixes: vec!["/docs".to_string()],
                             bait_soften_path_prefixes: vec!["/docs".to_string()],
                             user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],

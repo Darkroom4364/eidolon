@@ -3808,6 +3808,7 @@ fn effective_session_context(
             label: trust.identity.label.clone(),
             source: trust.identity.source,
             trust_tier: trust.identity.trust_tier,
+            methods: trust.methods.clone(),
             path_prefixes: trust.path_prefixes.clone(),
             request_path_softened: bait_soften_path_prefixes
                 .iter()
@@ -11778,6 +11779,10 @@ mod tests {
                 [0],
             "X-Eidolon-Trusted-Actor"
         );
+        assert_eq!(
+            allowed_request_event["kind"]["trusted_ingress_soften_match"]["methods"][0],
+            "GET"
+        );
 
         let missing_event_log_path =
             unique_temp_path("trusted-required-header-missing-events.jsonl");
@@ -11879,6 +11884,87 @@ mod tests {
         assert_eq!(
             wrong_request_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
             "required_header_value_mismatch"
+        );
+    }
+
+    #[test]
+    fn local_allowlist_path_scope_mismatches_are_exposed() {
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs", "/openapi.json"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let event_log_path = unique_temp_path("trusted-path-scope-events.jsonl");
+        let debug_log_path = unique_temp_path("trusted-path-scope-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>linked route path scope mismatch</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("trusted-path-scope-control.txt"),
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/customer/import-recovery-checklist?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert_ne!(body, original);
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["kind"]["ingress_identity"]["source"], "none");
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["reason"],
+            "path_mismatch"
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["methods"][0],
+            "GET"
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["path_prefixes"],
+            serde_json::json!(["/docs", "/openapi.json"])
+        );
+        assert!(request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(
+            request_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
+            "path_mismatch"
+        );
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
         );
     }
 

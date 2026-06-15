@@ -345,7 +345,7 @@ bundle index supports the matching
 For rejected local allowlist scopes, the same live export path also supports
 `--local-trust-rejection-label <label>` and
 `--local-trust-rejection-reason
-<not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
+<not_yet_active|expired|method_mismatch|path_mismatch|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
 and the bundle index supports matching
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL` and
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON` overrides.
@@ -355,7 +355,7 @@ contained session still preserves the earlier host/source/freshness mismatch
 context. The same live export path also supports
 `--local-trust-rejection-history-label <label>` and
 `--local-trust-rejection-history-reason
-<not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
+<not_yet_active|expired|method_mismatch|path_mismatch|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
 and the bundle index supports matching
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL` and
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON`
@@ -386,6 +386,12 @@ and run
 That smoke proves the docs crawler header alone is not enough: the same request
 stays baited when the configured local allowlist source CIDR does not match the
 direct OrbStack peer.
+
+For the adjacent request-scope proof, keep the default trust config and run
+`examples/shield-lab/smoke-trusted-ingress-path-gate-orbstack.sh`. That smoke
+proves the same trusted actor and crawler-family request still stays baited
+when the checked-in local allowlist `path_prefixes` do not cover the request,
+and that Eidolon records the near miss explicitly as `path_mismatch`.
 
 For the adjacent freshness proof, redeploy the lab with
 `examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-expired.json`

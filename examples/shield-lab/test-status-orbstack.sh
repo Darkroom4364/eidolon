@@ -124,6 +124,7 @@ test_json_status_reports_edge_and_pvc() {
       and .ingress_trust.trusted_soften_scopes[0].source == "local_allowlist"
       and .ingress_trust.trusted_soften_scopes[0].trust_tier == "allowlisted"
       and .ingress_trust.trusted_soften_scopes[0].expires_at == "2999-06-05T12:00:00Z"
+      and .ingress_trust.trusted_soften_scopes[0].methods == ["GET"]
       and .ingress_trust.trusted_soften_scopes[0].path_prefixes == ["/docs", "/openapi.json"]
       and .ingress_trust.trusted_soften_scopes[0].bait_soften_path_prefixes == ["/docs"]
       and .ingress_trust.trusted_soften_scopes[0].user_agent_substrings == ["eidolon-docs-crawler"]
@@ -150,7 +151,7 @@ test_human_status_mentions_running_components() {
   rg -q 'direct-target: http://127.0.0.1:31081 \(HTTP 200, type=NodePort\)' <<<"$output"
   rg -q 'proxy: 1/1 ready' <<<"$output"
   rg -q 'trusted-ingress: transport-auth enabled' <<<"$output"
-  rg -q 'trusted-soften-scopes: docs-crawler -> /docs \(match /docs, /openapi.json; ua eidolon-docs-crawler; host 127.0.0.1, localhost; source 192.168.194.1/32; headers X-Eidolon-Trusted-Actor; expires 2999-06-05T12:00:00Z\)' <<<"$output"
+  rg -q 'trusted-soften-scopes: docs-crawler -> /docs \(match /docs, /openapi.json; methods GET; ua eidolon-docs-crawler; host 127.0.0.1, localhost; source 192.168.194.1/32; headers X-Eidolon-Trusted-Actor; expires 2999-06-05T12:00:00Z\)' <<<"$output"
   rg -q 'bait-signing: enabled' <<<"$output"
   rg -q 'polymorphic-baits: /docs/legacy-import -> X-Migration-Trace \[mig\], /openapi.json -> X-OpenAPI-Trace \[oapi\], /docs/service-token -> X-Api-Key \[svc\]' <<<"$output"
   rg -q 'target: 2/2 ready' <<<"$output"

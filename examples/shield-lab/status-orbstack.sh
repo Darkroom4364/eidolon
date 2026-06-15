@@ -168,6 +168,7 @@ status_json="$(jq -n \
             trust_tier: .trust_tier,
             not_before: (.not_before // null),
             expires_at: (.expires_at // null),
+            methods: (.methods // []),
             path_prefixes: (.path_prefixes // []),
             bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
             user_agent_substrings: (.user_agent_substrings // []),
@@ -302,6 +303,13 @@ jq -r '
                   "all"
                 else
                   (.path_prefixes | join(", "))
+                end
+              )
+            + (
+                if (.methods | length) == 0 then
+                  "; methods any"
+                else
+                  "; methods " + (.methods | join(", "))
                 end
               )
             + (
