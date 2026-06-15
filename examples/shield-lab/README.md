@@ -642,6 +642,18 @@ That path proves the same crawler-family request still receives the baited
 wrong `X-Eidolon-Trusted-Actor` value, and that Eidolon records the near miss
 explicitly as `required_header_value_mismatch`.
 
+For the adjacent request-scope negative path, keep the default trust config and
+run the paired smoke:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-path-gate-orbstack.sh
+```
+
+That path proves the same trusted actor and crawler-family request still
+receives the baited linked surface when the local allowlist `path_prefixes`
+scope does not cover the request, and that Eidolon records the near miss
+explicitly as `path_mismatch`.
+
 For the adjacent freshness negative paths, redeploy with the expired or
 future-dated local-entry examples and run the paired smokes:
 
@@ -780,17 +792,17 @@ the session-level trusted soften history, so contained sessions still show up
 even when the final request itself is no longer trusted. For rejected local
 allowlist scopes, `--local-trust-rejection-label <label>` and
 `--local-trust-rejection-reason
-<not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`
+<not_yet_active|expired|method_mismatch|path_mismatch|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`
 narrow live export to sessions whose latest request nearly matched one scoped
-local trust entry but failed freshness, user-agent, host, or source-CIDR
-gating. When a later request moves the session onward into containment or
-another state, the
-exported markdown and bundle index now keep that earlier context under
+local trust entry but failed freshness, request-scope, user-agent, host, or
+source-CIDR gating. When a later request moves the session onward into
+containment or another state, the exported markdown and bundle index now keep
+that earlier context under
 `Local trust rejection history`. If you want to filter on that preserved
 history instead of only the latest request, use
 `--local-trust-rejection-history-label <label>` or
 `--local-trust-rejection-history-reason
-<not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`.
+<not_yet_active|expired|method_mismatch|path_mismatch|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`.
 
 If you want the bundle-local `edge-session-index.md` to keep only sessions that
 cross the same polymorphic threshold, set:

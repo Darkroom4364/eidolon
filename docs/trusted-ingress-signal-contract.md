@@ -275,6 +275,10 @@ Current runtime policy:
 - local allowlist entries may also carry optional `not_before` and `expires_at`
   windows so deployment-safe trust can be staged and retired without changing
   any other match scopes
+- when a request nearly matches a local allowlist entry but misses the allowed
+  HTTP method or request path scope, Eidolon records that explicitly as
+  `method_mismatch` or `path_mismatch` instead of silently collapsing back to
+  `none`
 - when a request nearly matches a local allowlist entry but misses one required
   header name or value, Eidolon records that explicitly as
   `required_header_missing` or `required_header_value_mismatch` instead of

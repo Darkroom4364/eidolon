@@ -166,6 +166,8 @@ pub enum IngressTrustTier {
 pub enum LocalIngressTrustScopeRejectionReason {
     Expired,
     NotYetActive,
+    MethodMismatch,
+    PathMismatch,
     RequiredHeaderMissing,
     RequiredHeaderValueMismatch,
     RequestUserAgentMissing,
@@ -198,6 +200,8 @@ pub struct LocalIngressTrustScopeRejection {
     pub not_before: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -711,6 +715,8 @@ pub struct EdgeTrustedIngressSoftenScope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_soften_path_prefixes: Vec<String>,
@@ -730,6 +736,8 @@ pub struct TrustedIngressSoftenMatch {
     pub label: Option<String>,
     pub source: IngressIdentitySource,
     pub trust_tier: IngressTrustTier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -751,6 +759,8 @@ pub struct EdgeTrustedIngressSoftenHistory {
     pub label: Option<String>,
     pub source: IngressIdentitySource,
     pub trust_tier: IngressTrustTier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -777,6 +787,8 @@ pub struct EdgeLocalIngressTrustScopeRejectionHistory {
     pub not_before: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_prefixes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -940,6 +952,7 @@ mod tests {
                     trust_tier: IngressTrustTier::Allowlisted,
                     not_before: None,
                     expires_at: None,
+                    methods: vec!["GET".to_string()],
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
                     user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
@@ -952,6 +965,7 @@ mod tests {
                     label: Some("docs-crawler".to_string()),
                     source: IngressIdentitySource::LocalAllowlist,
                     trust_tier: IngressTrustTier::Allowlisted,
+                    methods: vec!["GET".to_string()],
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
                     user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
@@ -1000,6 +1014,10 @@ mod tests {
         assert_eq!(
             serialized["kind"]["local_ingress_trust_scope_rejection"]["hosts"][0],
             "localhost"
+        );
+        assert_eq!(
+            serialized["kind"]["local_ingress_trust_scope_rejection"]["methods"][0],
+            "GET"
         );
         assert_eq!(
             serialized["kind"]["trusted_ingress_soften_match"]["label"],
@@ -1346,6 +1364,7 @@ mod tests {
                 trust_tier: IngressTrustTier::Allowlisted,
                 not_before: None,
                 expires_at: None,
+                methods: vec!["GET".to_string()],
                 path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                 bait_soften_path_prefixes: vec!["/docs".to_string()],
                 user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
@@ -1358,6 +1377,7 @@ mod tests {
                 label: Some("docs-crawler".to_string()),
                 source: IngressIdentitySource::LocalAllowlist,
                 trust_tier: IngressTrustTier::Allowlisted,
+                methods: vec!["GET".to_string()],
                 path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                 bait_soften_path_prefixes: vec!["/docs".to_string()],
                 user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
@@ -1409,6 +1429,7 @@ mod tests {
                         trust_tier: IngressTrustTier::Allowlisted,
                         not_before: None,
                         expires_at: None,
+                        methods: vec!["GET".to_string()],
                         path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                         bait_soften_path_prefixes: vec!["/docs".to_string()],
                         user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
@@ -1425,6 +1446,7 @@ mod tests {
                     label: Some("docs-crawler".to_string()),
                     source: IngressIdentitySource::LocalAllowlist,
                     trust_tier: IngressTrustTier::Allowlisted,
+                    methods: vec!["GET".to_string()],
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
                     user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
@@ -1478,6 +1500,7 @@ mod tests {
                     trust_tier: IngressTrustTier::Allowlisted,
                     not_before: None,
                     expires_at: None,
+                    methods: vec!["GET".to_string()],
                     path_prefixes: vec!["/docs".to_string(), "/openapi.json".to_string()],
                     bait_soften_path_prefixes: vec!["/docs".to_string()],
                     user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],

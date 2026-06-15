@@ -362,6 +362,7 @@ test_export_bundle_redacts_sensitive_values() {
     and (.ingress_trust.trusted_soften_scopes | length) == 1
     and .ingress_trust.trusted_soften_scopes[0].label == "docs-crawler"
     and .ingress_trust.trusted_soften_scopes[0].expires_at == "2999-06-05T12:00:00Z"
+    and .ingress_trust.trusted_soften_scopes[0].methods == ["GET"]
     and .ingress_trust.trusted_soften_scopes[0].user_agent_substrings == ["eidolon-docs-crawler"]
     and .ingress_trust.trusted_soften_scopes[0].hosts == ["127.0.0.1", "localhost"]
     and .ingress_trust.trusted_soften_scopes[0].source_cidrs == ["192.168.194.1/32"]
@@ -392,7 +393,7 @@ test_export_bundle_redacts_sensitive_values() {
   rg -q '`/openapi.json` -> `X-OpenAPI-Trace` \(`oapi`, `session_hmac_sha256_v1`, bait id `openapi_reconcile_trace`\)' "$bundle_dir/README.md"
   rg -q '`/docs/service-token` -> `X-Api-Key` \(`svc`, `session_hmac_sha256_v1`, bait id `fake_service_token`\)' "$bundle_dir/README.md"
   rg -q '## Active Trusted Ingress Softening' "$bundle_dir/README.md"
-  rg -q '`docs-crawler`: soften `/docs`; match `/docs`, `/openapi.json`; ua `eidolon-docs-crawler`; host `127.0.0.1`, `localhost`; source `192.168.194.1/32`; headers `X-Eidolon-Trusted-Actor`; expires `2999-06-05T12:00:00Z`; identity `local_allowlist` / `allowlisted`' "$bundle_dir/README.md"
+  rg -q '`docs-crawler`: soften `/docs`; match `/docs`, `/openapi.json`; methods `GET`; ua `eidolon-docs-crawler`; host `127.0.0.1`, `localhost`; source `192.168.194.1/32`; headers `X-Eidolon-Trusted-Actor`; expires `2999-06-05T12:00:00Z`; identity `local_allowlist` / `allowlisted`' "$bundle_dir/README.md"
   rg -q '^# Eidolon Edge Session Index$' "$bundle_dir/edge-session-index.md"
   rg -q 'Exported sessions: `3`' "$bundle_dir/edge-session-index.md"
   rg -q 'Local Trust Rejection' "$bundle_dir/edge-session-index.md"
