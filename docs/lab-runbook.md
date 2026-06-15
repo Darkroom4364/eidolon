@@ -387,6 +387,13 @@ That smoke proves the docs crawler header alone is not enough: the same request
 stays baited when the configured local allowlist source CIDR does not match the
 direct OrbStack peer.
 
+For the adjacent request-method proof, keep the default trust config and run
+`examples/shield-lab/smoke-trusted-ingress-method-gate-orbstack.sh`. That
+smoke proves the same trusted actor and crawler-family request does not receive
+trusted softening when the checked-in local allowlist `methods` scope does not
+cover the request, and that Eidolon records the near miss explicitly as
+`method_mismatch`.
+
 For the adjacent request-scope proof, keep the default trust config and run
 `examples/shield-lab/smoke-trusted-ingress-path-gate-orbstack.sh`. That smoke
 proves the same trusted actor and crawler-family request still stays baited
