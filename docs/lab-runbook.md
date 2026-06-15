@@ -345,7 +345,7 @@ bundle index supports the matching
 For rejected local allowlist scopes, the same live export path also supports
 `--local-trust-rejection-label <label>` and
 `--local-trust-rejection-reason
-<expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
+<not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
 and the bundle index supports matching
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL` and
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON` overrides.
@@ -355,7 +355,7 @@ contained session still preserves the earlier host/source/freshness mismatch
 context. The same live export path also supports
 `--local-trust-rejection-history-label <label>` and
 `--local-trust-rejection-history-reason
-<expired|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
+<not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`,
 and the bundle index supports matching
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL` and
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON`

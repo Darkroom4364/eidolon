@@ -57,6 +57,8 @@ Environment:
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON
                          Keep only sessions whose latest local trust scope
                          rejection reason matches `not_yet_active`, `expired`,
+                         `required_header_missing`,
+                         `required_header_value_mismatch`,
                          `request_user_agent_missing`,
                          `user_agent_mismatch`, `request_host_missing`,
                          `host_mismatch`, `client_peer_missing`, or
@@ -67,6 +69,8 @@ Environment:
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON
                          Keep only sessions whose local trust scope rejection
                          history includes `not_yet_active`, `expired`,
+                         `required_header_missing`,
+                         `required_header_value_mismatch`,
                          `request_user_agent_missing`,
                          `user_agent_mismatch`, `request_host_missing`,
                          `host_mismatch`, `client_peer_missing`, or
@@ -242,6 +246,14 @@ render_edge_session_index() {
               (($match.hosts // []) | map(code(.)) | join(", "))
             end
           )
+        + "; headers "
+        + (
+            if (($match.required_header_names // []) | length) == 0 then
+              code("any")
+            else
+              (($match.required_header_names // []) | map(code(.)) | join(", "))
+            end
+          )
         + "; path softened "
         + code($match.request_path_softened)
         + ")"
@@ -279,6 +291,14 @@ render_edge_session_index() {
                    code("any")
                  else
                    ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + ", headers "
+             + (
+                 if ((.required_header_names // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.required_header_names // []) | map(code(.)) | join(", "))
                  end
                )
              + "]"
@@ -336,6 +356,14 @@ render_edge_session_index() {
                    code("any")
                  else
                    ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; headers "
+             + (
+                 if ((.required_header_names // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.required_header_names // []) | map(code(.)) | join(", "))
                  end
                )
              + "]"
@@ -687,6 +715,14 @@ render_selected_session_summary() {
                    ((.source_cidrs // []) | map(code(.)) | join(", "))
                  end
                )
+             + ", headers "
+             + (
+                 if ((.required_header_names // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.required_header_names // []) | map(code(.)) | join(", "))
+                 end
+               )
              + "]"
            )
          | join(", "))
@@ -742,6 +778,14 @@ render_selected_session_summary() {
                    code("any")
                  else
                    ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; headers "
+             + (
+                 if ((.required_header_names // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.required_header_names // []) | map(code(.)) | join(", "))
                  end
                )
              + "]"
@@ -876,6 +920,14 @@ render_selected_session_summary() {
                   (($local_trust_rejection.source_cidrs // []) | map(code(.)) | join(", "))
                 end
               )
+            + "; headers "
+            + (
+                if (($local_trust_rejection.required_header_names // []) | length) == 0 then
+                  code("any")
+                else
+                  (($local_trust_rejection.required_header_names // []) | map(code(.)) | join(", "))
+                end
+              )
             + (
                 if ($local_trust_rejection.not_before // null) == null then
                   ""
@@ -943,6 +995,14 @@ render_selected_session_summary() {
                   code("any")
                 else
                   (($trusted_soften_match.source_cidrs // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; headers "
+            + (
+                if (($trusted_soften_match.required_header_names // []) | length) == 0 then
+                  code("any")
+                else
+                  (($trusted_soften_match.required_header_names // []) | map(code(.)) | join(", "))
                 end
               )
             + "; request path softened "
@@ -1090,6 +1150,14 @@ render_selected_session_summary() {
                   ((.source_cidrs // []) | map(code(.)) | join(", "))
                 end
               )
+            + "; headers "
+            + (
+                if ((.required_header_names // []) | length) == 0 then
+                  code("any")
+                else
+                  ((.required_header_names // []) | map(code(.)) | join(", "))
+                end
+              )
             + (
                 if (.expires_at // null) == null then
                   ""
@@ -1219,6 +1287,14 @@ write_readme() {
                 ((.source_cidrs // []) | map("`" + . + "`") | join(", "))
               end
             )
+          + "; headers "
+          + (
+              if ((.required_header_names // []) | length) == 0 then
+                "`any`"
+              else
+                ((.required_header_names // []) | map("`" + . + "`") | join(", "))
+              end
+            )
           + (
               if (.not_before // null) == null then
                 ""
@@ -1299,20 +1375,20 @@ fi
 
 if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON" ]]; then
   case "$SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON" in
-    not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+    not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
       ;;
     *)
-      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON must be one of: not_yet_active, expired, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON must be one of: not_yet_active, expired, required_header_missing, required_header_value_mismatch, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi
 
 if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
   case "$SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON" in
-    not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+    not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
       ;;
     *)
-      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON must be one of: not_yet_active, expired, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_REASON must be one of: not_yet_active, expired, required_header_missing, required_header_value_mismatch, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi

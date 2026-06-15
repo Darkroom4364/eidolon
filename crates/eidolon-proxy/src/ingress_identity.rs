@@ -21,6 +21,7 @@ pub struct ResolvedIngressTrust {
     pub user_agent_substrings: Option<Vec<String>>,
     pub hosts: Option<Vec<String>>,
     pub source_cidrs: Option<Vec<String>>,
+    pub required_header_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -211,6 +212,9 @@ impl TrustedIngressEntry {
                 name.eq_ignore_ascii_case(&required.name) && value == &required.value
             })
         }) {
+            if let Some(reason) = self.required_header_rejection_reason(headers) {
+                return TrustedIngressEntryEvaluation::ScopeRejected(self.scope_rejection(reason));
+            }
             return TrustedIngressEntryEvaluation::NoMatch;
         }
 
@@ -295,6 +299,11 @@ impl TrustedIngressEntry {
                 .source_cidrs
                 .as_ref()
                 .map(|cidrs| cidrs.iter().map(ToString::to_string).collect()),
+            required_header_names: self
+                .required_headers
+                .iter()
+                .map(|header| header.name.clone())
+                .collect(),
         }
     }
 
@@ -317,8 +326,34 @@ impl TrustedIngressEntry {
                 .as_ref()
                 .map(|cidrs| cidrs.iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),
+            required_header_names: self
+                .required_headers
+                .iter()
+                .map(|header| header.name.clone())
+                .collect(),
             reason,
         }
+    }
+
+    fn required_header_rejection_reason(
+        &self,
+        headers: &[(String, String)],
+    ) -> Option<LocalIngressTrustScopeRejectionReason> {
+        for required in &self.required_headers {
+            let matches: Vec<&str> = headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(&required.name))
+                .map(|(_, value)| value.as_str())
+                .collect();
+            if matches.is_empty() {
+                return Some(LocalIngressTrustScopeRejectionReason::RequiredHeaderMissing);
+            }
+            if !matches.iter().any(|value| *value == required.value) {
+                return Some(LocalIngressTrustScopeRejectionReason::RequiredHeaderValueMismatch);
+            }
+        }
+
+        None
     }
 }
 
@@ -736,6 +771,10 @@ mod tests {
         );
         assert_eq!(trust.identity.trust_tier, IngressTrustTier::Allowlisted);
         assert_eq!(trust.identity.label.as_deref(), Some("internal-crawler"));
+        assert_eq!(
+            trust.required_header_names,
+            vec!["X-Eidolon-Trusted-Actor".to_string()]
+        );
         assert!(trust.bait_soften_path_prefixes.is_none());
     }
 
@@ -957,6 +996,98 @@ mod tests {
                     .single()
                     .unwrap_or_else(|| panic!("timestamp should be valid"))
             )
+        );
+        assert_eq!(
+            rejection.required_header_names,
+            vec!["X-Eidolon-Trusted-Actor".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_required_headers_are_exposed_as_scope_rejections() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "entries": [
+                    {
+                      "label": "docs-crawler",
+                      "source": "local_allowlist",
+                      "trust_tier": "allowlisted",
+                      "path_prefixes": ["/docs"],
+                      "required_headers": [
+                        { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                      ]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let evaluation = resolver.evaluate(
+            "GET",
+            "/docs",
+            None,
+            None,
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert!(evaluation.resolved.is_none());
+        let rejection = evaluation
+            .scope_rejection
+            .expect("scope rejection should be recorded");
+        assert_eq!(
+            rejection.reason,
+            LocalIngressTrustScopeRejectionReason::RequiredHeaderMissing
+        );
+        assert_eq!(
+            rejection.required_header_names,
+            vec!["X-Eidolon-Trusted-Actor".to_string()]
+        );
+    }
+
+    #[test]
+    fn wrong_required_header_values_are_exposed_as_scope_rejections() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "entries": [
+                    {
+                      "label": "docs-crawler",
+                      "source": "local_allowlist",
+                      "trust_tier": "allowlisted",
+                      "path_prefixes": ["/docs"],
+                      "required_headers": [
+                        { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                      ]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let evaluation = resolver.evaluate(
+            "GET",
+            "/docs",
+            None,
+            None,
+            [("X-Eidolon-Trusted-Actor", "wrong-crawler")],
+        );
+
+        assert!(evaluation.resolved.is_none());
+        let rejection = evaluation
+            .scope_rejection
+            .expect("scope rejection should be recorded");
+        assert_eq!(
+            rejection.reason,
+            LocalIngressTrustScopeRejectionReason::RequiredHeaderValueMismatch
+        );
+        assert_eq!(
+            rejection.required_header_names,
+            vec!["X-Eidolon-Trusted-Actor".to_string()]
         );
     }
 

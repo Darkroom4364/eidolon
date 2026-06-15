@@ -48,13 +48,13 @@ Options:
   --local-trust-rejection-label <label>
                          Keep only sessions whose latest local trust scope
                          rejection label matches the given value.
-  --local-trust-rejection-reason <not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+  --local-trust-rejection-reason <not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
                          Keep only sessions whose latest local trust scope
                          rejection reason matches the given value.
   --local-trust-rejection-history-label <label>
                          Keep only sessions whose local trust scope rejection
                          history includes the given label.
-  --local-trust-rejection-history-reason <not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+  --local-trust-rejection-history-reason <not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
                          Keep only sessions whose local trust scope rejection
                          history includes the given reason.
   --trusted-soften-label <label>
@@ -460,6 +460,14 @@ render_markdown_export() {
                    ((.source_cidrs // []) | map(code(.)) | join(", "))
                  end
                )
+             + ", headers "
+             + (
+                 if ((.required_header_names // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.required_header_names // []) | map(code(.)) | join(", "))
+                 end
+               )
              + "]"
            )
          | join(", "))
@@ -515,6 +523,14 @@ render_markdown_export() {
                    code("any")
                  else
                    ((.source_cidrs // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "; headers "
+             + (
+                 if ((.required_header_names // []) | length) == 0 then
+                   code("any")
+                 else
+                   ((.required_header_names // []) | map(code(.)) | join(", "))
                  end
                )
              + "]"
@@ -647,6 +663,14 @@ render_markdown_export() {
                   (($local_trust_rejection.source_cidrs // []) | map(code(.)) | join(", "))
                 end
               )
+            + "; headers "
+            + (
+                if (($local_trust_rejection.required_header_names // []) | length) == 0 then
+                  code("any")
+                else
+                  (($local_trust_rejection.required_header_names // []) | map(code(.)) | join(", "))
+                end
+              )
             + (
                 if ($local_trust_rejection.not_before // null) == null then
                   ""
@@ -714,6 +738,14 @@ render_markdown_export() {
                   code("any")
                 else
                   (($trusted_soften_match.source_cidrs // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; headers "
+            + (
+                if (($trusted_soften_match.required_header_names // []) | length) == 0 then
+                  code("any")
+                else
+                  (($trusted_soften_match.required_header_names // []) | map(code(.)) | join(", "))
                 end
               )
             + "; request path softened "
@@ -859,6 +891,14 @@ render_markdown_export() {
                   code("any")
                 else
                   ((.source_cidrs // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; headers "
+            + (
+                if ((.required_header_names // []) | length) == 0 then
+                  code("any")
+                else
+                  ((.required_header_names // []) | map(code(.)) | join(", "))
                 end
               )
             + (
@@ -1009,20 +1049,20 @@ fi
 
 if [[ -n "$LOCAL_TRUST_REJECTION_REASON" ]]; then
   case "$LOCAL_TRUST_REJECTION_REASON" in
-    not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+    not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
       ;;
     *)
-      fail "--local-trust-rejection-reason must be one of: not_yet_active, expired, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      fail "--local-trust-rejection-reason must be one of: not_yet_active, expired, required_header_missing, required_header_value_mismatch, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi
 
 if [[ -n "$LOCAL_TRUST_REJECTION_HISTORY_REASON" ]]; then
   case "$LOCAL_TRUST_REJECTION_HISTORY_REASON" in
-    not_yet_active|expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
+    not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch)
       ;;
     *)
-      fail "--local-trust-rejection-history-reason must be one of: not_yet_active, expired, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
+      fail "--local-trust-rejection-history-reason must be one of: not_yet_active, expired, required_header_missing, required_header_value_mismatch, request_user_agent_missing, user_agent_mismatch, request_host_missing, host_mismatch, client_peer_missing, source_cidr_mismatch"
       ;;
   esac
 fi
@@ -1125,7 +1165,8 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
                 bait_soften_path_prefixes,
                 user_agent_substrings,
                 hosts,
-                source_cidrs
+                source_cidrs,
+                required_header_names
               }
           ]
         }
