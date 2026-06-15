@@ -415,6 +415,7 @@ fn edge_trusted_ingress_soften_histories(
                 && history.user_agent_substrings == trusted_match.user_agent_substrings
                 && history.hosts == trusted_match.hosts
                 && history.source_cidrs == trusted_match.source_cidrs
+                && history.required_header_names == trusted_match.required_header_names
         }) {
             if trusted_match.request_path_softened {
                 existing.saw_request_path_softened = true;
@@ -433,6 +434,7 @@ fn edge_trusted_ingress_soften_histories(
             user_agent_substrings: trusted_match.user_agent_substrings.clone(),
             hosts: trusted_match.hosts.clone(),
             source_cidrs: trusted_match.source_cidrs.clone(),
+            required_header_names: trusted_match.required_header_names.clone(),
             saw_request_path_softened: trusted_match.request_path_softened,
             saw_request_path_unsoftened: !trusted_match.request_path_softened,
         });
@@ -466,6 +468,7 @@ fn edge_local_ingress_trust_scope_rejection_histories(
                 && history.user_agent_substrings == rejection.user_agent_substrings
                 && history.hosts == rejection.hosts
                 && history.source_cidrs == rejection.source_cidrs
+                && history.required_header_names == rejection.required_header_names
         }) {
             if !existing.reasons.contains(&rejection.reason) {
                 existing.reasons.push(rejection.reason);
@@ -484,6 +487,7 @@ fn edge_local_ingress_trust_scope_rejection_histories(
             user_agent_substrings: rejection.user_agent_substrings.clone(),
             hosts: rejection.hosts.clone(),
             source_cidrs: rejection.source_cidrs.clone(),
+            required_header_names: rejection.required_header_names.clone(),
             reasons: vec![rejection.reason],
         });
     }
@@ -1511,6 +1515,7 @@ mod tests {
                         user_agent_substrings: vec!["internal-crawler".to_string()],
                         hosts: vec!["127.0.0.1".to_string()],
                         source_cidrs: vec!["127.0.0.1/32".to_string()],
+                        required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
                         request_path_softened: true,
                     }),
                     ingress_signals: IngressAdvisorySignals {
@@ -1677,6 +1682,7 @@ mod tests {
                         user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                         hosts: vec!["127.0.0.1".to_string()],
                         source_cidrs: vec!["127.0.0.1/32".to_string()],
+                        required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
                         request_path_softened: true,
                     }),
                     ingress_signals: Default::default(),
@@ -1714,6 +1720,7 @@ mod tests {
                         user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                         hosts: vec!["127.0.0.1".to_string()],
                         source_cidrs: vec!["127.0.0.1/32".to_string()],
+                        required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
                         request_path_softened: false,
                     }),
                     ingress_signals: Default::default(),
@@ -1825,6 +1832,7 @@ mod tests {
                             user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                             hosts: vec!["docs.example.test".to_string()],
                             source_cidrs: vec!["127.0.0.1/32".to_string()],
+                            required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
                             reason:
                                 eidolon_core::LocalIngressTrustScopeRejectionReason::HostMismatch,
                         },
@@ -1888,6 +1896,7 @@ mod tests {
                             user_agent_substrings: vec!["eidolon-docs-crawler".to_string()],
                             hosts: vec!["docs.example.test".to_string()],
                             source_cidrs: vec!["127.0.0.1/32".to_string()],
+                            required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
                             reason:
                                 eidolon_core::LocalIngressTrustScopeRejectionReason::HostMismatch,
                         },

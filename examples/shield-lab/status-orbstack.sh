@@ -172,7 +172,8 @@ status_json="$(jq -n \
             bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
             user_agent_substrings: (.user_agent_substrings // []),
             hosts: (.hosts // []),
-            source_cidrs: (.source_cidrs // [])
+            source_cidrs: (.source_cidrs // []),
+            required_header_names: ((.required_headers // []) | map(.name))
           }
       ];
     {
@@ -322,6 +323,13 @@ jq -r '
                   "; source any"
                 else
                   "; source " + (.source_cidrs | join(", "))
+                end
+              )
+            + (
+                if (.required_header_names | length) == 0 then
+                  "; headers any"
+                else
+                  "; headers " + (.required_header_names | join(", "))
                 end
               )
             + (
