@@ -11911,9 +11911,8 @@ mod tests {
         let event_log_path = unique_temp_path("trusted-path-scope-events.jsonl");
         let debug_log_path = unique_temp_path("trusted-path-scope-debug.jsonl");
         let original = r#"<!doctype html><html><body><main>linked route path scope mismatch</main></body></html>"#;
-        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
         let mut runtime = test_runtime_with_m1_controller_and_debug_log(
-            upstream,
+            closed_upstream(),
             &event_log_path,
             &debug_log_path,
             unique_temp_path("trusted-path-scope-control.txt"),
@@ -11932,7 +11931,6 @@ mod tests {
                 &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
             ),
         ));
-        upstream_handle.join().expect("upstream thread should join");
         let body = String::from_utf8(response.body).expect("body should be utf8");
 
         assert_eq!(response.status, 200);
