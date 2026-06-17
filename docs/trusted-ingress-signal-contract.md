@@ -269,6 +269,20 @@ Current runtime policy:
 - local allowlist entries may also carry optional `user_agent_substrings` so
   verified crawler or partner automation matches can be narrowed to expected
   agent families without treating `User-Agent` itself as a trust source
+- local allowlist entries may also carry optional `required_headers` so
+  deployment-safe trust can still demand exact edge-provided headers without
+  treating those header names or values as permanent runtime evidence
+- local allowlist entries may also carry optional `not_before` and `expires_at`
+  windows so deployment-safe trust can be staged and retired without changing
+  any other match scopes
+- when a request nearly matches a local allowlist entry but misses the allowed
+  HTTP method or request path scope, Eidolon records that explicitly as
+  `method_mismatch` or `path_mismatch` instead of silently collapsing back to
+  `none`
+- when a request nearly matches a local allowlist entry but misses one required
+  header name or value, Eidolon records that explicitly as
+  `required_header_missing` or `required_header_value_mismatch` instead of
+  silently collapsing back to `none`
 - local allowlist scopes do not widen the global soften list; they only
   intersect with it
 - strong trusted identities do not suppress unrelated bait surfaces outside that

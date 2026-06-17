@@ -3808,6 +3808,7 @@ fn effective_session_context(
             label: trust.identity.label.clone(),
             source: trust.identity.source,
             trust_tier: trust.identity.trust_tier,
+            methods: trust.methods.clone(),
             path_prefixes: trust.path_prefixes.clone(),
             request_path_softened: bait_soften_path_prefixes
                 .iter()
@@ -3816,6 +3817,7 @@ fn effective_session_context(
             user_agent_substrings: trust.user_agent_substrings.clone().unwrap_or_default(),
             hosts: trust.hosts.clone().unwrap_or_default(),
             source_cidrs: trust.source_cidrs.clone().unwrap_or_default(),
+            required_header_names: trust.required_header_names.clone(),
         })
     });
     session.trusted_bait_soften_path_prefixes = session
@@ -11704,6 +11706,420 @@ mod tests {
         assert_eq!(
             disallowed_request_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
             "user_agent_mismatch"
+        );
+    }
+
+    #[test]
+    fn local_allowlist_required_headers_must_match() {
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let allowed_event_log_path =
+            unique_temp_path("trusted-required-header-allowed-events.jsonl");
+        let allowed_debug_log_path =
+            unique_temp_path("trusted-required-header-allowed-debug.jsonl");
+        let allowed_original =
+            r#"<!doctype html><html><body><main>docs required header scope</main></body></html>"#;
+        let (allowed_upstream, allowed_upstream_handle) =
+            spawn_upstream(html_response(allowed_original));
+        let mut allowed_runtime = test_runtime_with_m1_controller_and_debug_log(
+            allowed_upstream,
+            &allowed_event_log_path,
+            &allowed_debug_log_path,
+            unique_temp_path("trusted-required-header-allowed-control.txt"),
+        );
+        allowed_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let allowed_response = parse_downstream_response(&run_runtime_request(
+            allowed_runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        allowed_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let allowed_body = String::from_utf8(allowed_response.body).expect("body should be utf8");
+
+        assert_eq!(allowed_response.status, 200);
+        assert_eq!(allowed_body, allowed_original);
+        let allowed_request_event = first_event_of_type(&allowed_event_log_path, "request_seen");
+        assert_eq!(
+            allowed_request_event["kind"]["ingress_identity"]["source"],
+            "local_allowlist"
+        );
+        assert_eq!(
+            allowed_request_event["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            allowed_request_event["kind"]["trusted_ingress_soften_match"]["required_header_names"]
+                [0],
+            "X-Eidolon-Trusted-Actor"
+        );
+        assert_eq!(
+            allowed_request_event["kind"]["trusted_ingress_soften_match"]["methods"][0],
+            "GET"
+        );
+
+        let missing_event_log_path =
+            unique_temp_path("trusted-required-header-missing-events.jsonl");
+        let missing_debug_log_path =
+            unique_temp_path("trusted-required-header-missing-debug.jsonl");
+        let missing_original = r#"<!doctype html><html><body><main>docs required header scope missing</main></body></html>"#;
+        let (missing_upstream, missing_upstream_handle) =
+            spawn_upstream(html_response(missing_original));
+        let mut missing_runtime = test_runtime_with_m1_controller_and_debug_log(
+            missing_upstream,
+            &missing_event_log_path,
+            &missing_debug_log_path,
+            unique_temp_path("trusted-required-header-missing-control.txt"),
+        );
+        missing_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let missing_response = parse_downstream_response(&run_runtime_request(
+            missing_runtime,
+            &request_with_cookie("GET", "/docs?topic=imports", &cookie_header(), &[]),
+        ));
+        missing_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let missing_body = String::from_utf8(missing_response.body).expect("body should be utf8");
+
+        assert_eq!(missing_response.status, 200);
+        assert_ne!(missing_body, missing_original);
+        let missing_request_event = first_event_of_type(&missing_event_log_path, "request_seen");
+        assert_eq!(
+            missing_request_event["kind"]["ingress_identity"]["source"],
+            "none"
+        );
+        assert_eq!(
+            missing_request_event["kind"]["local_ingress_trust_scope_rejection"]["reason"],
+            "required_header_missing"
+        );
+        assert_eq!(
+            missing_request_event["kind"]["local_ingress_trust_scope_rejection"]
+                ["required_header_names"][0],
+            "X-Eidolon-Trusted-Actor"
+        );
+        assert!(missing_request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        let missing_request_debug = first_debug_event(&missing_debug_log_path, "request_received");
+        assert_eq!(
+            missing_request_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
+            "required_header_missing"
+        );
+
+        let wrong_event_log_path = unique_temp_path("trusted-required-header-wrong-events.jsonl");
+        let wrong_debug_log_path = unique_temp_path("trusted-required-header-wrong-debug.jsonl");
+        let wrong_original = r#"<!doctype html><html><body><main>docs required header scope wrong</main></body></html>"#;
+        let (wrong_upstream, wrong_upstream_handle) = spawn_upstream(html_response(wrong_original));
+        let mut wrong_runtime = test_runtime_with_m1_controller_and_debug_log(
+            wrong_upstream,
+            &wrong_event_log_path,
+            &wrong_debug_log_path,
+            unique_temp_path("trusted-required-header-wrong-control.txt"),
+        );
+        wrong_runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let wrong_response = parse_downstream_response(&run_runtime_request(
+            wrong_runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "wrong-crawler")],
+            ),
+        ));
+        wrong_upstream_handle
+            .join()
+            .expect("upstream thread should join");
+        let wrong_body = String::from_utf8(wrong_response.body).expect("body should be utf8");
+
+        assert_eq!(wrong_response.status, 200);
+        assert_ne!(wrong_body, wrong_original);
+        let wrong_request_event = first_event_of_type(&wrong_event_log_path, "request_seen");
+        assert_eq!(
+            wrong_request_event["kind"]["ingress_identity"]["source"],
+            "none"
+        );
+        assert_eq!(
+            wrong_request_event["kind"]["local_ingress_trust_scope_rejection"]["reason"],
+            "required_header_value_mismatch"
+        );
+        assert_eq!(
+            wrong_request_event["kind"]["local_ingress_trust_scope_rejection"]
+                ["required_header_names"][0],
+            "X-Eidolon-Trusted-Actor"
+        );
+        assert!(wrong_request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        let wrong_request_debug = first_debug_event(&wrong_debug_log_path, "request_received");
+        assert_eq!(
+            wrong_request_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
+            "required_header_value_mismatch"
+        );
+    }
+
+    #[test]
+    fn local_allowlist_path_scope_mismatches_are_exposed() {
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs", "/openapi.json"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let event_log_path = unique_temp_path("trusted-path-scope-events.jsonl");
+        let debug_log_path = unique_temp_path("trusted-path-scope-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>linked route path scope mismatch</main></body></html>"#;
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("trusted-path-scope-control.txt"),
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/customer/import-recovery-checklist?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert_ne!(body, original);
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["kind"]["ingress_identity"]["source"], "none");
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["reason"],
+            "path_mismatch"
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["methods"][0],
+            "GET"
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["path_prefixes"],
+            serde_json::json!(["/docs", "/openapi.json"])
+        );
+        assert!(request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(
+            request_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
+            "path_mismatch"
+        );
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+    }
+
+    #[test]
+    fn local_allowlist_method_scope_mismatches_are_exposed() {
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs", "/openapi.json"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let event_log_path = unique_temp_path("trusted-method-scope-events.jsonl");
+        let debug_log_path = unique_temp_path("trusted-method-scope-debug.jsonl");
+        let original =
+            r#"<!doctype html><html><body><main>docs method scope mismatch</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("trusted-method-scope-control.txt"),
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "POST",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        assert_eq!(response.status, 200);
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["kind"]["ingress_identity"]["source"], "none");
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["reason"],
+            "method_mismatch"
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["methods"],
+            serde_json::json!(["GET"])
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["path_prefixes"],
+            serde_json::json!(["/docs", "/openapi.json"])
+        );
+        assert!(request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(
+            request_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
+            "method_mismatch"
+        );
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
+        );
+    }
+
+    #[test]
+    fn local_allowlist_not_yet_active_entries_remain_baited() {
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "docs-crawler",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "not_before": "2999-01-01T00:00:00Z",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "bait_soften_path_prefixes": ["/docs"],
+                  "required_headers": [
+                    { "name": "X-Eidolon-Trusted-Actor", "value": "docs-crawler" }
+                  ]
+                }
+              ]
+            }"#,
+        );
+
+        let event_log_path = unique_temp_path("trusted-not-before-events.jsonl");
+        let debug_log_path = unique_temp_path("trusted-not-before-debug.jsonl");
+        let original =
+            r#"<!doctype html><html><body><main>docs not-before scope</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("trusted-not-before-control.txt"),
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "docs-crawler")],
+            ),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert_ne!(body, original);
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["kind"]["ingress_identity"]["source"], "none");
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["label"],
+            "docs-crawler"
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["reason"],
+            "not_yet_active"
+        );
+        assert_eq!(
+            request_event["kind"]["local_ingress_trust_scope_rejection"]["not_before"],
+            "2999-01-01T00:00:00Z"
+        );
+        assert!(request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(
+            request_debug["fields"]["local_ingress_trust_scope_rejection"]["reason"],
+            "not_yet_active"
+        );
+        assert_eq!(
+            request_debug["fields"]["local_ingress_trust_scope_rejection"]["not_before"],
+            "2999-01-01T00:00:00Z"
         );
     }
 

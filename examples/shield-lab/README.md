@@ -630,17 +630,58 @@ That path proves the same trusted actor still receives the baited `/docs`
 surface when the local allowlist `user_agent_substrings` scope does not match
 the request's `User-Agent`.
 
-For the adjacent freshness negative path, redeploy with the expired local-entry
-example and run the paired smoke:
+For the adjacent required-header negative path, keep the default trust config
+and run the paired smoke:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-required-header-gate-orbstack.sh
+```
+
+That path proves the same crawler-family request still receives the baited
+`/docs` surface when the local allowlist `required_headers` scope sees the
+wrong `X-Eidolon-Trusted-Actor` value, and that Eidolon records the near miss
+explicitly as `required_header_value_mismatch`.
+
+For the adjacent request-method negative path, keep the default trust config
+and run the paired smoke:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-method-gate-orbstack.sh
+```
+
+That path proves the same trusted actor and crawler-family request still
+does not receive trusted softening when the local allowlist `methods` scope
+does not cover the request, and that Eidolon records the near miss explicitly
+as `method_mismatch`.
+
+For the adjacent request-scope negative path, keep the default trust config and
+run the paired smoke:
+
+```sh
+examples/shield-lab/smoke-trusted-ingress-path-gate-orbstack.sh
+```
+
+That path proves the same trusted actor and crawler-family request still
+receives the baited linked surface when the local allowlist `path_prefixes`
+scope does not cover the request, and that Eidolon records the near miss
+explicitly as `path_mismatch`.
+
+For the adjacent freshness negative paths, redeploy with the expired or
+future-dated local-entry examples and run the paired smokes:
 
 ```sh
 EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH=examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-expired.json \
   examples/shield-lab/deploy-orbstack.sh
 examples/shield-lab/smoke-trusted-ingress-expired-local-entry-orbstack.sh
+
+EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH=examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-not-yet-active.json \
+  examples/shield-lab/deploy-orbstack.sh
+examples/shield-lab/smoke-trusted-ingress-not-yet-active-local-entry-orbstack.sh
 ```
 
 That path proves the same trusted actor still receives the baited `/docs`
-surface when the checked-in local allowlist entry has expired.
+surface when the checked-in local allowlist entry has expired or is not active
+yet.
 
 Summarize live shield metrics:
 
@@ -763,17 +804,17 @@ the session-level trusted soften history, so contained sessions still show up
 even when the final request itself is no longer trusted. For rejected local
 allowlist scopes, `--local-trust-rejection-label <label>` and
 `--local-trust-rejection-reason
-<expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`
+<not_yet_active|expired|method_mismatch|path_mismatch|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`
 narrow live export to sessions whose latest request nearly matched one scoped
-local trust entry but failed freshness, user-agent, host, or source-CIDR
-gating. When a later request moves the session onward into containment or
-another state, the
-exported markdown and bundle index now keep that earlier context under
+local trust entry but failed freshness, request-method/path scope, user-agent,
+host, or source-CIDR gating. When a later request moves the session onward into
+containment or another state, the exported markdown and bundle index now keep
+that earlier context under
 `Local trust rejection history`. If you want to filter on that preserved
 history instead of only the latest request, use
 `--local-trust-rejection-history-label <label>` or
 `--local-trust-rejection-history-reason
-<expired|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`.
+<not_yet_active|expired|method_mismatch|path_mismatch|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>`.
 
 If you want the bundle-local `edge-session-index.md` to keep only sessions that
 cross the same polymorphic threshold, set:
