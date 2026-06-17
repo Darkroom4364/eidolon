@@ -335,6 +335,7 @@ mod tests {
                     source: IngressIdentitySource::LocalAllowlist,
                     trust_tier: IngressTrustTier::Allowlisted,
                     label: Some("internal-crawler".to_string()),
+                    not_before: None,
                     expires_at: None,
                 },
                 local_ingress_trust_scope_rejection: None,

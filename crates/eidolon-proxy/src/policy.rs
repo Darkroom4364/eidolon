@@ -993,6 +993,7 @@ mod tests {
                 source: eidolon_core::IngressIdentitySource::SignedAgent,
                 trust_tier: eidolon_core::IngressTrustTier::SignedAttested,
                 label: Some("signed-agent".to_string()),
+                not_before: None,
                 expires_at: None,
             },
             &IngressAdvisorySignals {
@@ -1067,6 +1068,7 @@ mod tests {
                 source: eidolon_core::IngressIdentitySource::SignedAgent,
                 trust_tier: eidolon_core::IngressTrustTier::SignedAttested,
                 label: Some("signed-agent".to_string()),
+                not_before: None,
                 expires_at: None,
             },
             DiscoverySurfaceFanout {

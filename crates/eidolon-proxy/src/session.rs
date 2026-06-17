@@ -173,6 +173,7 @@ where
                 source,
                 trust_tier,
                 label,
+                not_before: None,
                 expires_at,
             },
             Utc::now(),
@@ -558,6 +559,7 @@ mod tests {
                 source: IngressIdentitySource::OperatorOverride,
                 trust_tier: IngressTrustTier::Allowlisted,
                 label: Some("internal-crawler".to_string()),
+                not_before: None,
                 expires_at: Some(
                     DateTime::parse_from_rfc3339("2999-06-04T12:00:00Z")
                         .expect("timestamp should parse")

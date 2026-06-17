@@ -166,12 +166,15 @@ status_json="$(jq -n \
             label: (.label // null),
             source: .source,
             trust_tier: .trust_tier,
+            not_before: (.not_before // null),
             expires_at: (.expires_at // null),
+            methods: (.methods // []),
             path_prefixes: (.path_prefixes // []),
             bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
             user_agent_substrings: (.user_agent_substrings // []),
             hosts: (.hosts // []),
-            source_cidrs: (.source_cidrs // [])
+            source_cidrs: (.source_cidrs // []),
+            required_header_names: ((.required_headers // []) | map(.name))
           }
       ];
     {
@@ -303,6 +306,13 @@ jq -r '
                 end
               )
             + (
+                if (.methods | length) == 0 then
+                  "; methods any"
+                else
+                  "; methods " + (.methods | join(", "))
+                end
+              )
+            + (
                 if (.user_agent_substrings | length) == 0 then
                   "; ua any"
                 else
@@ -321,6 +331,20 @@ jq -r '
                   "; source any"
                 else
                   "; source " + (.source_cidrs | join(", "))
+                end
+              )
+            + (
+                if (.required_header_names | length) == 0 then
+                  "; headers any"
+                else
+                  "; headers " + (.required_header_names | join(", "))
+                end
+              )
+            + (
+                if (.not_before // null) == null then
+                  ""
+                else
+                  "; not-before " + .not_before
                 end
               )
             + (
