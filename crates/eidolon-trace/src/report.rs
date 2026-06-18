@@ -417,6 +417,7 @@ fn edge_trusted_ingress_soften_histories(
                 && history.hosts == trusted_match.hosts
                 && history.source_cidrs == trusted_match.source_cidrs
                 && history.required_header_names == trusted_match.required_header_names
+                && history.verified_categories == trusted_match.verified_categories
         }) {
             if trusted_match.request_path_softened {
                 existing.saw_request_path_softened = true;
@@ -437,6 +438,7 @@ fn edge_trusted_ingress_soften_histories(
             hosts: trusted_match.hosts.clone(),
             source_cidrs: trusted_match.source_cidrs.clone(),
             required_header_names: trusted_match.required_header_names.clone(),
+            verified_categories: trusted_match.verified_categories.clone(),
             saw_request_path_softened: trusted_match.request_path_softened,
             saw_request_path_unsoftened: !trusted_match.request_path_softened,
         });
@@ -1521,6 +1523,7 @@ mod tests {
                         hosts: vec!["127.0.0.1".to_string()],
                         source_cidrs: vec!["127.0.0.1/32".to_string()],
                         required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
+                        verified_categories: Vec::new(),
                         request_path_softened: true,
                     }),
                     ingress_signals: IngressAdvisorySignals {
@@ -1689,6 +1692,7 @@ mod tests {
                         hosts: vec!["127.0.0.1".to_string()],
                         source_cidrs: vec!["127.0.0.1/32".to_string()],
                         required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
+                        verified_categories: Vec::new(),
                         request_path_softened: true,
                     }),
                     ingress_signals: Default::default(),
@@ -1728,6 +1732,7 @@ mod tests {
                         hosts: vec!["127.0.0.1".to_string()],
                         source_cidrs: vec!["127.0.0.1/32".to_string()],
                         required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
+                        verified_categories: Vec::new(),
                         request_path_softened: false,
                     }),
                     ingress_signals: Default::default(),

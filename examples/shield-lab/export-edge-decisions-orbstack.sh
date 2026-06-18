@@ -437,6 +437,13 @@ render_markdown_export() {
              + ", unsoftened "
              + code(.saw_request_path_unsoftened)
              + (
+                 if ((.verified_categories // []) | length) == 0 then
+                   ""
+                 else
+                   ", categories " + ((.verified_categories // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + (
                  if ((.methods // []) | length) == 0 then
                    ""
                  else
@@ -739,6 +746,14 @@ render_markdown_export() {
                 end
               )
             + (
+                if (($trusted_soften_match.verified_categories // []) | length) == 0 then
+                  ""
+                else
+                  "; categories "
+                  + (($trusted_soften_match.verified_categories // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
                 if (($trusted_soften_match.methods // []) | length) == 0 then
                   ""
                 else
@@ -897,6 +912,13 @@ render_markdown_export() {
                   code("all")
                 else
                   ((.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ((.verified_categories // []) | length) == 0 then
+                  ""
+                else
+                  "; categories " + ((.verified_categories // []) | map(code(.)) | join(", "))
                 end
               )
             + (
@@ -1204,7 +1226,8 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
                 user_agent_substrings,
                 hosts,
                 source_cidrs,
-                required_header_names
+                required_header_names,
+                verified_categories
               }
           ]
         }

@@ -159,24 +159,47 @@ status_json="$(jq -n \
           }
       ];
     def trusted_soften_scopes:
-      [
-        (ingress_trust_document.entries // [])[]
-        | select(((.bait_soften_path_prefixes // []) | length) > 0)
-        | {
-            label: (.label // null),
-            source: .source,
-            trust_tier: .trust_tier,
-            not_before: (.not_before // null),
-            expires_at: (.expires_at // null),
-            methods: (.methods // []),
-            path_prefixes: (.path_prefixes // []),
-            bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
-            user_agent_substrings: (.user_agent_substrings // []),
-            hosts: (.hosts // []),
-            source_cidrs: (.source_cidrs // []),
-            required_header_names: ((.required_headers // []) | map(.name))
-          }
-      ];
+      (
+        [
+          (ingress_trust_document.entries // [])[]
+          | select(((.bait_soften_path_prefixes // []) | length) > 0)
+          | {
+              label: (.label // null),
+              source: .source,
+              trust_tier: .trust_tier,
+              not_before: (.not_before // null),
+              expires_at: (.expires_at // null),
+              methods: (.methods // []),
+              path_prefixes: (.path_prefixes // []),
+              bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
+              user_agent_substrings: (.user_agent_substrings // []),
+              hosts: (.hosts // []),
+              source_cidrs: (.source_cidrs // []),
+              required_header_names: ((.required_headers // []) | map(.name)),
+              verified_categories: []
+            }
+        ]
+        +
+        [
+          (ingress_trust_document.authenticated_entries // [])[]
+          | select(((.bait_soften_path_prefixes // []) | length) > 0)
+          | {
+              label: (.label // null),
+              source: .source,
+              trust_tier: .trust_tier,
+              not_before: (.not_before // null),
+              expires_at: (.expires_at // null),
+              methods: (.methods // []),
+              path_prefixes: (.path_prefixes // []),
+              bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
+              user_agent_substrings: [],
+              hosts: [],
+              source_cidrs: [],
+              required_header_names: [],
+              verified_categories: (.verified_categories // [])
+            }
+        ]
+      );
     {
       generated_at: $generated_at,
       context: $context,
@@ -310,6 +333,13 @@ jq -r '
                   "; methods any"
                 else
                   "; methods " + (.methods | join(", "))
+                end
+              )
+            + (
+                if (.verified_categories | length) == 0 then
+                  ""
+                else
+                  "; categories " + (.verified_categories | join(", "))
                 end
               )
             + (

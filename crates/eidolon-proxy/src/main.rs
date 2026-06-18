@@ -3794,32 +3794,35 @@ fn effective_session_context(
     );
     session.local_ingress_trust_scope_rejection = local_trust_evaluation.scope_rejection;
     let local_trust = local_trust_evaluation.resolved;
+    let authenticated_trust = runtime.ingress_identity_resolver.resolve_authenticated(
+        &session.ingress_identity,
+        &session.ingress_signals,
+        &request.method,
+        &surface_request.path,
+    );
+    if runtime
+        .ingress_identity_resolver
+        .has_authenticated_entries()
+        && authenticated_trust.is_none()
+        && ingress_identity::requires_authenticated_rule(&session.ingress_identity)
+    {
+        session.ingress_identity =
+            ingress_identity::downgrade_to_weakly_asserted(session.ingress_identity.clone());
+    }
     let merged_identity = ingress_identity::merge_ingress_identity(
         session.ingress_identity.clone(),
         local_trust.as_ref().map(|trust| trust.identity.clone()),
     );
-    session.trusted_ingress_soften_match = local_trust.as_ref().and_then(|trust| {
-        if merged_identity != trust.identity {
-            return None;
-        }
-
-        let bait_soften_path_prefixes = trust.bait_soften_path_prefixes.clone()?;
-        Some(eidolon_core::TrustedIngressSoftenMatch {
-            label: trust.identity.label.clone(),
-            source: trust.identity.source,
-            trust_tier: trust.identity.trust_tier,
-            methods: trust.methods.clone(),
-            path_prefixes: trust.path_prefixes.clone(),
-            request_path_softened: bait_soften_path_prefixes
-                .iter()
-                .any(|prefix| surface_request.path.starts_with(prefix)),
-            bait_soften_path_prefixes,
-            user_agent_substrings: trust.user_agent_substrings.clone().unwrap_or_default(),
-            hosts: trust.hosts.clone().unwrap_or_default(),
-            source_cidrs: trust.source_cidrs.clone().unwrap_or_default(),
-            required_header_names: trust.required_header_names.clone(),
+    session.trusted_ingress_soften_match = authenticated_trust
+        .as_ref()
+        .and_then(|trust| {
+            trusted_ingress_soften_match(trust, &merged_identity, &surface_request.path)
         })
-    });
+        .or_else(|| {
+            local_trust.as_ref().and_then(|trust| {
+                trusted_ingress_soften_match(trust, &merged_identity, &surface_request.path)
+            })
+        });
     session.trusted_bait_soften_path_prefixes = session
         .trusted_ingress_soften_match
         .as_ref()
@@ -3827,6 +3830,34 @@ fn effective_session_context(
     session.ingress_identity = merged_identity;
 
     session
+}
+
+fn trusted_ingress_soften_match(
+    trust: &ingress_identity::ResolvedIngressTrust,
+    merged_identity: &eidolon_core::IngressIdentity,
+    request_path: &str,
+) -> Option<eidolon_core::TrustedIngressSoftenMatch> {
+    if merged_identity != &trust.identity {
+        return None;
+    }
+
+    let bait_soften_path_prefixes = trust.bait_soften_path_prefixes.clone()?;
+    Some(eidolon_core::TrustedIngressSoftenMatch {
+        label: trust.identity.label.clone(),
+        source: trust.identity.source,
+        trust_tier: trust.identity.trust_tier,
+        methods: trust.methods.clone(),
+        path_prefixes: trust.path_prefixes.clone(),
+        request_path_softened: bait_soften_path_prefixes
+            .iter()
+            .any(|prefix| request_path.starts_with(prefix)),
+        bait_soften_path_prefixes,
+        user_agent_substrings: trust.user_agent_substrings.clone().unwrap_or_default(),
+        hosts: trust.hosts.clone().unwrap_or_default(),
+        source_cidrs: trust.source_cidrs.clone().unwrap_or_default(),
+        required_header_names: trust.required_header_names.clone(),
+        verified_categories: trust.verified_categories.clone(),
+    })
 }
 
 fn maybe_soften_surface_action_for_trusted_ingress(
@@ -10906,6 +10937,171 @@ mod tests {
         assert_eq!(
             request_event["kind"]["ingress_identity"]["label"],
             "signed-agent"
+        );
+    }
+
+    #[test]
+    fn configured_authenticated_explicit_rule_can_soften_docs_surface() {
+        let event_log_path = unique_temp_path("explicit-auth-rule-soften-events.jsonl");
+        let debug_log_path = unique_temp_path("explicit-auth-rule-soften-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs explicit softening</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("explicit-auth-rule-soften-control.txt"),
+        );
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "authenticated_entries": [
+                {
+                  "label": "docs-signed-agent",
+                  "source": "signed_agent",
+                  "trust_tier": "signed_attested",
+                  "verified_categories": ["AI Assistant"],
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs", "/openapi.json"],
+                  "bait_soften_path_prefixes": ["/docs"]
+                }
+              ]
+            }"#,
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+                    (
+                        session::INGRESS_IDENTITY_LABEL_HEADER_NAME,
+                        "docs-signed-agent",
+                    ),
+                    (session::INGRESS_VERIFIED_CATEGORY_HEADER_NAME, "AI Assistant"),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(body, original);
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["kind"]["ingress_identity"]["source"], "signed_agent");
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["trust_tier"],
+            "signed_attested"
+        );
+        assert_eq!(
+            request_event["kind"]["trusted_ingress_soften_match"]["label"],
+            "docs-signed-agent"
+        );
+        assert_eq!(
+            request_event["kind"]["trusted_ingress_soften_match"]["verified_categories"],
+            serde_json::json!(["AI Assistant"])
+        );
+        assert_eq!(
+            request_event["kind"]["trusted_ingress_soften_match"]["request_path_softened"],
+            true
+        );
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            true
+        );
+    }
+
+    #[test]
+    fn unmatched_authenticated_explicit_rule_degrades_to_weakly_asserted_and_stays_baited() {
+        let event_log_path = unique_temp_path("explicit-auth-rule-mismatch-events.jsonl");
+        let debug_log_path = unique_temp_path("explicit-auth-rule-mismatch-debug.jsonl");
+        let original = r#"<!doctype html><html><body><main>docs explicit mismatch</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("explicit-auth-rule-mismatch-control.txt"),
+        );
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "authenticated_entries": [
+                {
+                  "label": "docs-signed-agent",
+                  "source": "signed_agent",
+                  "trust_tier": "signed_attested",
+                  "verified_categories": ["AI Assistant"],
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs", "/openapi.json"],
+                  "bait_soften_path_prefixes": ["/docs"]
+                }
+              ]
+            }"#,
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+                    (
+                        session::INGRESS_IDENTITY_LABEL_HEADER_NAME,
+                        "wrong-signed-agent",
+                    ),
+                    (session::INGRESS_VERIFIED_CATEGORY_HEADER_NAME, "AI Assistant"),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert_ne!(body, original);
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_event["kind"]["ingress_identity"]["source"], "signed_agent");
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["trust_tier"],
+            "weakly_asserted"
+        );
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["label"],
+            "wrong-signed-agent"
+        );
+        assert!(request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "rewritten_upstream"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            false
         );
     }
 

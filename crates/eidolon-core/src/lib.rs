@@ -728,6 +728,8 @@ pub struct EdgeTrustedIngressSoftenScope {
     pub source_cidrs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_header_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_categories: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -750,6 +752,8 @@ pub struct TrustedIngressSoftenMatch {
     pub source_cidrs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_header_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_categories: Vec<String>,
     pub request_path_softened: bool,
 }
 
@@ -773,6 +777,8 @@ pub struct EdgeTrustedIngressSoftenHistory {
     pub source_cidrs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_header_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_categories: Vec<String>,
     pub saw_request_path_softened: bool,
     pub saw_request_path_unsoftened: bool,
 }
@@ -972,6 +978,7 @@ mod tests {
                     hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                     required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
+                    verified_categories: Vec::new(),
                     request_path_softened: false,
                 }),
                 ingress_signals: IngressAdvisorySignals {
@@ -1384,6 +1391,7 @@ mod tests {
                 hosts: vec!["127.0.0.1".to_string()],
                 source_cidrs: vec!["127.0.0.1/32".to_string()],
                 required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
+                verified_categories: Vec::new(),
                 request_path_softened: false,
             }),
             ingress_signals: IngressAdvisorySignals {
@@ -1453,6 +1461,7 @@ mod tests {
                     hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                     required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
+                    verified_categories: Vec::new(),
                     saw_request_path_softened: true,
                     saw_request_path_unsoftened: true,
                 }],
@@ -1507,6 +1516,7 @@ mod tests {
                     hosts: vec!["127.0.0.1".to_string()],
                     source_cidrs: vec!["127.0.0.1/32".to_string()],
                     required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
+                    verified_categories: Vec::new(),
                 }],
             }),
         };
