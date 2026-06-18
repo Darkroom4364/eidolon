@@ -48,13 +48,13 @@ Options:
   --local-trust-rejection-label <label>
                          Keep only sessions whose latest local trust scope
                          rejection label matches the given value.
-  --local-trust-rejection-reason <not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+  --local-trust-rejection-reason <not_yet_active|expired|method_mismatch|path_mismatch|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
                          Keep only sessions whose latest local trust scope
                          rejection reason matches the given value.
   --local-trust-rejection-history-label <label>
                          Keep only sessions whose local trust scope rejection
                          history includes the given label.
-  --local-trust-rejection-history-reason <not_yet_active|expired|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
+  --local-trust-rejection-history-reason <not_yet_active|expired|method_mismatch|path_mismatch|required_header_missing|required_header_value_mismatch|request_user_agent_missing|user_agent_mismatch|request_host_missing|host_mismatch|client_peer_missing|source_cidr_mismatch>
                          Keep only sessions whose local trust scope rejection
                          history includes the given reason.
   --trusted-soften-label <label>
@@ -574,14 +574,18 @@ render_markdown_export() {
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
     | ($export.deployment_context // {}) as $deployment
+    | ($export.authenticated_ingress_rule_rejection // null) as $authenticated_rule_rejection
     | ($export.local_ingress_trust_scope_rejection // null) as $local_trust_rejection
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
+    | ($export.evidence.authenticated_ingress_rule_rejection_histories // [])
+      as $authenticated_rule_rejection_histories
     | ($export.evidence.local_ingress_trust_scope_rejection_histories // [])
       as $local_trust_rejection_histories
     | ($export.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
+    | ($deployment.authenticated_trusted_ingress_rules // []) as $active_authenticated_rules
     | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
     | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
     | (recon_component_lines($score)) as $recon_components
@@ -634,6 +638,107 @@ render_markdown_export() {
           end
         )),
         optional_line("Ingress edge action hint"; (($signals.edge_action // null) | if . != null then code(.) else empty end)),
+        optional_line("Authenticated rule rejection"; (
+          if $authenticated_rule_rejection != null then
+            code($authenticated_rule_rejection.label // ($authenticated_rule_rejection.source + "/" + $authenticated_rule_rejection.trust_tier))
+            + " (" + code($authenticated_rule_rejection.reason) + ")"
+          else
+            empty
+          end
+        )),
+        optional_line("Rejected authenticated rule"; (
+          if $authenticated_rule_rejection != null then
+            "soften "
+            + (
+                if (($authenticated_rule_rejection.bait_soften_path_prefixes // []) | length) == 0 then
+                  code("none")
+                else
+                  (($authenticated_rule_rejection.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + "; match "
+            + (
+                if (($authenticated_rule_rejection.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  (($authenticated_rule_rejection.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if (($authenticated_rule_rejection.methods // []) | length) == 0 then
+                  ""
+                else
+                  "; methods "
+                  + (($authenticated_rule_rejection.methods // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if (($authenticated_rule_rejection.verified_categories // []) | length) == 0 then
+                  ""
+                else
+                  "; categories "
+                  + (($authenticated_rule_rejection.verified_categories // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ($authenticated_rule_rejection.not_before // null) == null then
+                  ""
+                else
+                  "; not-before " + code($authenticated_rule_rejection.not_before)
+                end
+              )
+            + (
+                if ($authenticated_rule_rejection.expires_at // null) == null then
+                  ""
+                else
+                  "; expires " + code($authenticated_rule_rejection.expires_at)
+                end
+              )
+          else
+            empty
+          end
+        )),
+        optional_line("Authenticated rule rejection history"; (
+          if ($authenticated_rule_rejection_histories | length) == 0 then
+            empty
+          else
+            ($authenticated_rule_rejection_histories
+             | map(
+                 code(.label // (.source + "/" + .trust_tier))
+                 + " ["
+                 + (
+                     if ((.reasons // []) | length) == 0 then
+                       code("none")
+                     else
+                       ((.reasons // []) | map(code(.)) | join(", "))
+                     end
+                   )
+                 + (
+                     if (.not_before // null) == null then
+                       ""
+                     else
+                       "; not-before " + code(.not_before)
+                     end
+                   )
+                 + (
+                     if (.expires_at // null) == null then
+                       ""
+                     else
+                       "; expires " + code(.expires_at)
+                     end
+                   )
+                 + (
+                     if ((.verified_categories // []) | length) == 0 then
+                       ""
+                     else
+                       "; categories " + ((.verified_categories // []) | map(code(.)) | join(", "))
+                     end
+                   )
+                 + "]"
+               )
+             | join(", "))
+          end
+        )),
         optional_line("Local trust scope rejection"; (
           if $local_trust_rejection != null then
             code($local_trust_rejection.label // ($local_trust_rejection.source + "/" + $local_trust_rejection.trust_tier))
@@ -886,6 +991,47 @@ render_markdown_export() {
             + ", bait "
             + code(.bait_id)
             + "]"
+        ),
+        "",
+        "## Active Authenticated Trusted Ingress Rules",
+        (if ($active_authenticated_rules | length) == 0 then
+          "- No active authenticated trusted-ingress rules."
+        else
+          empty
+        end),
+        (
+          $active_authenticated_rules[]
+          | "- Rule "
+            + code((.label // (.source + "/" + .trust_tier)))
+            + ": match "
+            + (
+                if ((.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  ((.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ((.bait_soften_path_prefixes // []) | length) == 0 then
+                  "; soften none"
+                else
+                  "; soften " + ((.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ((.verified_categories // []) | length) == 0 then
+                  ""
+                else
+                  "; categories " + ((.verified_categories // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ((.methods // []) | length) == 0 then
+                  ""
+                else
+                  "; methods " + ((.methods // []) | map(code(.)) | join(", "))
+                end
+              )
         ),
         "",
         "## Active Trusted Ingress Softening",
@@ -1196,6 +1342,7 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
     jq -c '
       if (.bait_profile.profile_id // null) == null
          and ((.bait_profile.polymorphic_baits // []) | length) == 0
+         and ((.ingress_trust.authenticated_trusted_ingress_rules // []) | length) == 0
          and ((.ingress_trust.trusted_soften_scopes // []) | length) == 0 then
         null
       else
@@ -1210,6 +1357,20 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
                 header_name,
                 kind,
                 prefix
+              }
+          ],
+          authenticated_trusted_ingress_rules: [
+            (.ingress_trust.authenticated_trusted_ingress_rules // [])[]
+            | {
+                label,
+                source,
+                trust_tier,
+                not_before,
+                expires_at,
+                methods,
+                path_prefixes,
+                bait_soften_path_prefixes,
+                verified_categories
               }
           ],
           trusted_ingress_soften_scopes: [

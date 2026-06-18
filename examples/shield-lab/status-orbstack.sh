@@ -200,6 +200,21 @@ status_json="$(jq -n \
             }
         ]
       );
+    def authenticated_trusted_ingress_rules:
+      [
+        (ingress_trust_document.authenticated_entries // [])[]
+        | {
+            label: (.label // null),
+            source: .source,
+            trust_tier: .trust_tier,
+            not_before: (.not_before // null),
+            expires_at: (.expires_at // null),
+            methods: (.methods // []),
+            path_prefixes: (.path_prefixes // []),
+            bait_soften_path_prefixes: (.bait_soften_path_prefixes // []),
+            verified_categories: (.verified_categories // [])
+          }
+      ];
     {
       generated_at: $generated_at,
       context: $context,
@@ -277,6 +292,7 @@ status_json="$(jq -n \
       },
       ingress_trust: {
         configmap_name: ($ingress_trust_configmap.metadata.name // null),
+        authenticated_trusted_ingress_rules: authenticated_trusted_ingress_rules,
         trusted_soften_scopes: trusted_soften_scopes
       }
     }
@@ -310,6 +326,63 @@ jq -r '
   ),
   "proxy: \(.proxy.ready_replicas)/\(.proxy.replicas) ready, pods=\(.proxy.pod_names | join(", "))",
   "trusted-ingress: transport-auth " + (if .proxy.trusted_ingress_transport_auth_enabled then "enabled" else "disabled" end),
+  (
+    if (.ingress_trust.authenticated_trusted_ingress_rules | length) == 0 then
+      "authenticated-trusted-rules: none"
+    else
+      "authenticated-trusted-rules: " + (
+        .ingress_trust.authenticated_trusted_ingress_rules
+        | map(
+            ((.label // (.source + "/" + .trust_tier)))
+            + " (match "
+            + (
+                if (.path_prefixes | length) == 0 then
+                  "all"
+                else
+                  (.path_prefixes | join(", "))
+                end
+              )
+            + (
+                if (.bait_soften_path_prefixes | length) == 0 then
+                  "; soften none"
+                else
+                  "; soften " + (.bait_soften_path_prefixes | join(", "))
+                end
+              )
+            + (
+                if (.methods | length) == 0 then
+                  "; methods any"
+                else
+                  "; methods " + (.methods | join(", "))
+                end
+              )
+            + (
+                if (.verified_categories | length) == 0 then
+                  ""
+                else
+                  "; categories " + (.verified_categories | join(", "))
+                end
+              )
+            + (
+                if (.not_before // null) == null then
+                  ""
+                else
+                  "; not-before " + .not_before
+                end
+              )
+            + (
+                if (.expires_at // null) == null then
+                  ""
+                else
+                  "; expires " + .expires_at
+                end
+              )
+            + ")"
+          )
+        | join(", ")
+      )
+    end
+  ),
   (
     if (.ingress_trust.trusted_soften_scopes | length) == 0 then
       "trusted-soften-scopes: none"

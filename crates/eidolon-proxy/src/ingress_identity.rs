@@ -2,6 +2,7 @@ use std::{fmt, fs, net::IpAddr, path::Path};
 
 use chrono::{DateTime, Utc};
 use eidolon_core::{
+    AuthenticatedIngressRuleRejection, AuthenticatedIngressRuleRejectionReason,
     IngressAdvisorySignals, IngressIdentity, IngressIdentitySource, IngressTrustTier,
     LocalIngressTrustScopeRejection, LocalIngressTrustScopeRejectionReason,
 };
@@ -31,6 +32,12 @@ pub struct ResolvedIngressTrust {
 pub struct IngressTrustEvaluation {
     pub resolved: Option<ResolvedIngressTrust>,
     pub scope_rejection: Option<LocalIngressTrustScopeRejection>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthenticatedIngressTrustEvaluation {
+    pub resolved: Option<ResolvedIngressTrust>,
+    pub rule_rejection: Option<AuthenticatedIngressRuleRejection>,
 }
 
 impl IngressIdentityResolver {
@@ -102,6 +109,59 @@ impl IngressIdentityResolver {
         evaluation
     }
 
+    pub fn evaluate_authenticated(
+        &self,
+        identity: &IngressIdentity,
+        signals: &IngressAdvisorySignals,
+        method: &str,
+        path: &str,
+    ) -> AuthenticatedIngressTrustEvaluation {
+        let method = method.trim().to_ascii_uppercase();
+        let mut evaluation = AuthenticatedIngressTrustEvaluation::default();
+        let mut saw_source_trust_candidate = false;
+
+        for entry in &self.authenticated_entries {
+            match entry.evaluate(identity, signals, &method, path) {
+                AuthenticatedTrustedIngressEntryEvaluation::Matched => {
+                    evaluation.resolved = Some(entry.resolved_trust());
+                    evaluation.rule_rejection = None;
+                    return evaluation;
+                }
+                AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(rejection) => {
+                    saw_source_trust_candidate = true;
+                    let should_replace = match evaluation.rule_rejection.as_ref() {
+                        None => true,
+                        Some(current) => {
+                            authenticated_rule_rejection_priority(rejection.reason)
+                                > authenticated_rule_rejection_priority(current.reason)
+                        }
+                    };
+                    if should_replace {
+                        evaluation.rule_rejection = Some(rejection);
+                    }
+                }
+                AuthenticatedTrustedIngressEntryEvaluation::NoMatch => {}
+            }
+        }
+
+        if !saw_source_trust_candidate && requires_authenticated_rule(identity) {
+            evaluation.rule_rejection = Some(AuthenticatedIngressRuleRejection {
+                label: identity.label.clone(),
+                source: identity.source,
+                trust_tier: identity.trust_tier,
+                not_before: None,
+                expires_at: None,
+                methods: Vec::new(),
+                path_prefixes: Vec::new(),
+                bait_soften_path_prefixes: Vec::new(),
+                verified_categories: Vec::new(),
+                reason: AuthenticatedIngressRuleRejectionReason::NoMatchingRule,
+            });
+        }
+
+        evaluation
+    }
+
     pub fn resolve_authenticated(
         &self,
         identity: &IngressIdentity,
@@ -109,12 +169,8 @@ impl IngressIdentityResolver {
         method: &str,
         path: &str,
     ) -> Option<ResolvedIngressTrust> {
-        let method = method.trim().to_ascii_uppercase();
-        self.authenticated_entries.iter().find_map(|entry| {
-            entry
-                .matches(identity, signals, &method, path)
-                .then(|| entry.resolved_trust())
-        })
+        self.evaluate_authenticated(identity, signals, method, path)
+            .resolved
     }
 }
 
@@ -214,6 +270,22 @@ fn ingress_identity_source_rank(identity: &IngressIdentity) -> u8 {
     }
 }
 
+fn authenticated_rule_rejection_priority(
+    reason: AuthenticatedIngressRuleRejectionReason,
+) -> u8 {
+    match reason {
+        AuthenticatedIngressRuleRejectionReason::Expired
+        | AuthenticatedIngressRuleRejectionReason::NotYetActive => 5,
+        AuthenticatedIngressRuleRejectionReason::VerifiedCategoryMissing
+        | AuthenticatedIngressRuleRejectionReason::VerifiedCategoryMismatch => 4,
+        AuthenticatedIngressRuleRejectionReason::MethodMismatch
+        | AuthenticatedIngressRuleRejectionReason::PathMismatch => 3,
+        AuthenticatedIngressRuleRejectionReason::LabelMissing
+        | AuthenticatedIngressRuleRejectionReason::LabelMismatch => 2,
+        AuthenticatedIngressRuleRejectionReason::NoMatchingRule => 1,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrustedIngressEntry {
     identity: IngressIdentity,
@@ -238,6 +310,12 @@ struct AuthenticatedTrustedIngressEntry {
 enum TrustedIngressEntryEvaluation {
     Matched,
     ScopeRejected(Box<LocalIngressTrustScopeRejection>),
+    NoMatch,
+}
+
+enum AuthenticatedTrustedIngressEntryEvaluation {
+    Matched,
+    RuleRejected(AuthenticatedIngressRuleRejection),
     NoMatch,
 }
 
@@ -425,18 +503,30 @@ impl TrustedIngressEntry {
 }
 
 impl AuthenticatedTrustedIngressEntry {
-    fn matches(
+    fn evaluate(
         &self,
         identity: &IngressIdentity,
         signals: &IngressAdvisorySignals,
         method: &str,
         path: &str,
-    ) -> bool {
-        if identity.source != self.identity.source
-            || identity.trust_tier != self.identity.trust_tier
-            || identity.label != self.identity.label
+    ) -> AuthenticatedTrustedIngressEntryEvaluation {
+        if identity.source != self.identity.source || identity.trust_tier != self.identity.trust_tier
         {
-            return false;
+            return AuthenticatedTrustedIngressEntryEvaluation::NoMatch;
+        }
+
+        match (&self.identity.label, &identity.label) {
+            (Some(_), None) => {
+                return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(
+                    self.rule_rejection(AuthenticatedIngressRuleRejectionReason::LabelMissing),
+                );
+            }
+            (Some(expected), Some(actual)) if actual != expected => {
+                return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(
+                    self.rule_rejection(AuthenticatedIngressRuleRejectionReason::LabelMismatch),
+                );
+            }
+            _ => {}
         }
 
         if self
@@ -444,7 +534,9 @@ impl AuthenticatedTrustedIngressEntry {
             .not_before
             .is_some_and(|not_before| not_before > Utc::now())
         {
-            return false;
+            return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(
+                self.rule_rejection(AuthenticatedIngressRuleRejectionReason::NotYetActive),
+            );
         }
 
         if self
@@ -452,11 +544,15 @@ impl AuthenticatedTrustedIngressEntry {
             .expires_at
             .is_some_and(|expires_at| expires_at <= Utc::now())
         {
-            return false;
+            return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(
+                self.rule_rejection(AuthenticatedIngressRuleRejectionReason::Expired),
+            );
         }
 
         if !self.methods.is_empty() && !self.methods.iter().any(|candidate| candidate == method) {
-            return false;
+            return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(
+                self.rule_rejection(AuthenticatedIngressRuleRejectionReason::MethodMismatch),
+            );
         }
 
         if !self.path_prefixes.is_empty()
@@ -465,19 +561,35 @@ impl AuthenticatedTrustedIngressEntry {
                 .iter()
                 .any(|prefix| path.starts_with(prefix))
         {
-            return false;
+            return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(
+                self.rule_rejection(AuthenticatedIngressRuleRejectionReason::PathMismatch),
+            );
         }
 
         if self.verified_categories.is_empty() {
-            return true;
+            return AuthenticatedTrustedIngressEntryEvaluation::Matched;
         }
 
         let Some(verified_category) = signals.verified_category.as_deref() else {
-            return false;
+            return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(
+                self.rule_rejection(
+                    AuthenticatedIngressRuleRejectionReason::VerifiedCategoryMissing,
+                ),
+            );
         };
-        self.verified_categories
+        if !self
+            .verified_categories
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(verified_category))
+        {
+            return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(
+                self.rule_rejection(
+                    AuthenticatedIngressRuleRejectionReason::VerifiedCategoryMismatch,
+                ),
+            );
+        };
+
+        AuthenticatedTrustedIngressEntryEvaluation::Matched
     }
 
     fn resolved_trust(&self) -> ResolvedIngressTrust {
@@ -491,6 +603,24 @@ impl AuthenticatedTrustedIngressEntry {
             source_cidrs: None,
             required_header_names: Vec::new(),
             verified_categories: self.verified_categories.clone(),
+        }
+    }
+
+    fn rule_rejection(
+        &self,
+        reason: AuthenticatedIngressRuleRejectionReason,
+    ) -> AuthenticatedIngressRuleRejection {
+        AuthenticatedIngressRuleRejection {
+            label: self.identity.label.clone(),
+            source: self.identity.source,
+            trust_tier: self.identity.trust_tier,
+            not_before: self.identity.not_before,
+            expires_at: self.identity.expires_at,
+            methods: self.methods.clone(),
+            path_prefixes: self.path_prefixes.clone(),
+            bait_soften_path_prefixes: self.bait_soften_path_prefixes.clone().unwrap_or_default(),
+            verified_categories: self.verified_categories.clone(),
+            reason,
         }
     }
 }
@@ -1605,25 +1735,139 @@ mod tests {
             expires_at: None,
         };
 
-        assert!(resolver
-            .resolve_authenticated(
-                &identity,
-                &IngressAdvisorySignals::default(),
-                "GET",
-                "/docs",
+        let missing_category = resolver.evaluate_authenticated(
+            &identity,
+            &IngressAdvisorySignals::default(),
+            "GET",
+            "/docs",
+        );
+        assert!(missing_category.resolved.is_none());
+        assert_eq!(
+            must_some(
+                missing_category.rule_rejection,
+                "missing category rejection should be recorded",
             )
-            .is_none());
-        assert!(resolver
-            .resolve_authenticated(
-                &identity,
-                &IngressAdvisorySignals {
-                    verified_category: Some("Search Engine".to_string()),
-                    ..IngressAdvisorySignals::default()
-                },
-                "GET",
-                "/customer/import-recovery-checklist",
+            .reason,
+            AuthenticatedIngressRuleRejectionReason::VerifiedCategoryMissing
+        );
+
+        let path_mismatch = resolver.evaluate_authenticated(
+            &identity,
+            &IngressAdvisorySignals {
+                verified_category: Some("Search Engine".to_string()),
+                ..IngressAdvisorySignals::default()
+            },
+            "GET",
+            "/customer/import-recovery-checklist",
+        );
+        assert!(path_mismatch.resolved.is_none());
+        assert_eq!(
+            must_some(
+                path_mismatch.rule_rejection,
+                "path mismatch should be recorded",
             )
-            .is_none());
+            .reason,
+            AuthenticatedIngressRuleRejectionReason::PathMismatch
+        );
+    }
+
+    #[test]
+    fn authenticated_entries_expose_label_and_freshness_rejections() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "authenticated_entries": [
+                    {
+                      "label": "future-signed-agent",
+                      "source": "signed_agent",
+                      "trust_tier": "signed_attested",
+                      "not_before": "2999-01-01T00:00:00Z",
+                      "methods": ["GET"],
+                      "path_prefixes": ["/docs"]
+                    },
+                    {
+                      "label": "expired-signed-agent",
+                      "source": "signed_agent",
+                      "trust_tier": "signed_attested",
+                      "expires_at": "2000-01-01T00:00:00Z",
+                      "methods": ["GET"],
+                      "path_prefixes": ["/docs"]
+                    },
+                    {
+                      "label": "current-signed-agent",
+                      "source": "signed_agent",
+                      "trust_tier": "signed_attested",
+                      "methods": ["GET"],
+                      "path_prefixes": ["/docs"]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let label_mismatch = resolver.evaluate_authenticated(
+            &IngressIdentity {
+                source: IngressIdentitySource::SignedAgent,
+                trust_tier: IngressTrustTier::SignedAttested,
+                label: Some("wrong-signed-agent".to_string()),
+                not_before: None,
+                expires_at: None,
+            },
+            &IngressAdvisorySignals::default(),
+            "GET",
+            "/docs",
+        );
+        assert!(label_mismatch.resolved.is_none());
+        assert_eq!(
+            must_some(
+                label_mismatch.rule_rejection,
+                "label mismatch should be recorded",
+            )
+            .reason,
+            AuthenticatedIngressRuleRejectionReason::LabelMismatch
+        );
+
+        let not_yet_active = resolver.evaluate_authenticated(
+            &IngressIdentity {
+                source: IngressIdentitySource::SignedAgent,
+                trust_tier: IngressTrustTier::SignedAttested,
+                label: Some("future-signed-agent".to_string()),
+                not_before: None,
+                expires_at: None,
+            },
+            &IngressAdvisorySignals::default(),
+            "GET",
+            "/docs",
+        );
+        assert!(not_yet_active.resolved.is_none());
+        assert_eq!(
+            must_some(
+                not_yet_active.rule_rejection,
+                "not-yet-active rejection should be recorded",
+            )
+            .reason,
+            AuthenticatedIngressRuleRejectionReason::NotYetActive
+        );
+
+        let expired = resolver.evaluate_authenticated(
+            &IngressIdentity {
+                source: IngressIdentitySource::SignedAgent,
+                trust_tier: IngressTrustTier::SignedAttested,
+                label: Some("expired-signed-agent".to_string()),
+                not_before: None,
+                expires_at: None,
+            },
+            &IngressAdvisorySignals::default(),
+            "GET",
+            "/docs",
+        );
+        assert!(expired.resolved.is_none());
+        assert_eq!(
+            must_some(expired.rule_rejection, "expired rejection should be recorded").reason,
+            AuthenticatedIngressRuleRejectionReason::Expired
+        );
     }
 
     #[test]
