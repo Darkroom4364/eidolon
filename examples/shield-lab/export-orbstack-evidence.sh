@@ -829,14 +829,18 @@ render_selected_session_summary() {
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
     | ($export.deployment_context // {}) as $deployment
+    | ($export.authenticated_ingress_rule_rejection // null) as $authenticated_rule_rejection
     | ($export.local_ingress_trust_scope_rejection // null) as $local_trust_rejection
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
+    | ($export.evidence.authenticated_ingress_rule_rejection_histories // [])
+      as $authenticated_rule_rejection_histories
     | ($export.evidence.local_ingress_trust_scope_rejection_histories // [])
       as $local_trust_rejection_histories
     | ($export.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
     | ($deployment.polymorphic_baits // []) as $active_polymorphic_baits
+    | ($deployment.authenticated_trusted_ingress_rules // []) as $active_authenticated_rules
     | ($deployment.trusted_ingress_soften_scopes // []) as $active_trusted_soften_scopes
     | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
     | (recon_component_lines($score)) as $recon_components
@@ -891,6 +895,41 @@ render_selected_session_summary() {
           end
         )),
         optional_line("Ingress edge action hint"; (($signals.edge_action // null) | if . != null then code(.) else empty end)),
+        optional_line("Authenticated rule rejection"; (
+          if $authenticated_rule_rejection != null then
+            code($authenticated_rule_rejection.label // ($authenticated_rule_rejection.source + "/" + $authenticated_rule_rejection.trust_tier))
+            + " (" + code($authenticated_rule_rejection.reason) + ")"
+          else
+            empty
+          end
+        )),
+        optional_line("Authenticated rule rejection history"; (
+          if ($authenticated_rule_rejection_histories | length) == 0 then
+            empty
+          else
+            ($authenticated_rule_rejection_histories
+             | map(
+                 code(.label // (.source + "/" + .trust_tier))
+                 + " ["
+                 + (
+                     if ((.reasons // []) | length) == 0 then
+                       code("none")
+                     else
+                       ((.reasons // []) | map(code(.)) | join(", "))
+                     end
+                   )
+                 + (
+                     if ((.verified_categories // []) | length) == 0 then
+                       ""
+                     else
+                       "; categories " + ((.verified_categories // []) | map(code(.)) | join(", "))
+                     end
+                   )
+                 + "]"
+               )
+             | join(", "))
+          end
+        )),
         optional_line("Local trust scope rejection"; (
           if $local_trust_rejection != null then
             code($local_trust_rejection.label // ($local_trust_rejection.source + "/" + $local_trust_rejection.trust_tier))
@@ -1137,6 +1176,47 @@ render_selected_session_summary() {
             + "]"
         ),
         "",
+        "## Active Authenticated Trusted Ingress Rules",
+        (if ($active_authenticated_rules | length) == 0 then
+          "- No active authenticated trusted-ingress rules."
+        else
+          empty
+        end),
+        (
+          $active_authenticated_rules[]
+          | "- Rule "
+            + code((.label // (.source + "/" + .trust_tier)))
+            + ": match "
+            + (
+                if ((.path_prefixes // []) | length) == 0 then
+                  code("all")
+                else
+                  ((.path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ((.bait_soften_path_prefixes // []) | length) == 0 then
+                  "; soften none"
+                else
+                  "; soften " + ((.bait_soften_path_prefixes // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ((.verified_categories // []) | length) == 0 then
+                  ""
+                else
+                  "; categories " + ((.verified_categories // []) | map(code(.)) | join(", "))
+                end
+              )
+            + (
+                if ((.methods // []) | length) == 0 then
+                  ""
+                else
+                  "; methods " + ((.methods // []) | map(code(.)) | join(", "))
+                end
+              )
+        ),
+        "",
         "## Active Trusted Ingress Softening",
         (if ($active_trusted_soften_scopes | length) == 0 then
           "- No active trusted-ingress soften scopes."
@@ -1239,6 +1319,7 @@ write_readme() {
   local pvc_status
   local bait_profile_id
   local polymorphic_bait_count
+  local authenticated_rule_count
   local trusted_soften_scope_count
   edge_url="$(jq -r '.edge.url // "unavailable"' "$BUNDLE_DIR/cluster-status.json")"
   edge_status="$(jq -r 'if .edge.http_status == null then "unreachable" else (.edge.http_status | tostring) end' "$BUNDLE_DIR/cluster-status.json")"
@@ -1249,6 +1330,7 @@ write_readme() {
   pvc_status="$(jq -r '.proxy_state.status // "unknown"' "$BUNDLE_DIR/cluster-status.json")"
   bait_profile_id="$(jq -r '.bait_profile.profile_id // "unknown"' "$BUNDLE_DIR/cluster-status.json")"
   polymorphic_bait_count="$(jq -r '(.bait_profile.polymorphic_baits // []) | length' "$BUNDLE_DIR/cluster-status.json")"
+  authenticated_rule_count="$(jq -r '(.ingress_trust.authenticated_trusted_ingress_rules // []) | length' "$BUNDLE_DIR/cluster-status.json")"
   trusted_soften_scope_count="$(jq -r '(.ingress_trust.trusted_soften_scopes // []) | length' "$BUNDLE_DIR/cluster-status.json")"
 
   {
@@ -1264,6 +1346,7 @@ write_readme() {
     printf -- '- Proxy state PVC: `%s`\n' "$pvc_status"
     printf -- '- Bait profile: `%s`\n' "$bait_profile_id"
     printf -- '- Active polymorphic bait surfaces: `%s`\n' "$polymorphic_bait_count"
+    printf -- '- Active authenticated trusted-ingress rules: `%s`\n' "$authenticated_rule_count"
     printf -- '- Trusted ingress soften scopes: `%s`\n' "$trusted_soften_scope_count"
     printf -- '- Redacted event log lines: `%s`\n' "$event_count"
     printf -- '- Redacted debug log lines: `%s`\n' "$debug_count"
@@ -1275,6 +1358,44 @@ write_readme() {
       jq -r '
         (.bait_profile.polymorphic_baits // [])[]
         | "- `\(.surface)` -> `\(.header_name)` (`\(.prefix)`, `\(.kind)`, bait id `\(.bait_id)`)"
+      ' "$BUNDLE_DIR/cluster-status.json"
+      printf '\n'
+    fi
+    printf '## Active Authenticated Trusted Ingress Rules\n\n'
+    if [[ "$authenticated_rule_count" -eq 0 ]]; then
+      printf 'No active authenticated trusted-ingress rules were exported in `cluster-status.json`.\n\n'
+    else
+      jq -r '
+        (.ingress_trust.authenticated_trusted_ingress_rules // [])[]
+        | "- `\(.label // (.source + "/" + .trust_tier))`: match "
+          + (
+              if ((.path_prefixes // []) | length) == 0 then
+                "`all`"
+              else
+                ((.path_prefixes // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + (
+              if ((.bait_soften_path_prefixes // []) | length) == 0 then
+                "; soften `none`"
+              else
+                "; soften " + ((.bait_soften_path_prefixes // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + (
+              if ((.verified_categories // []) | length) == 0 then
+                ""
+              else
+                "; categories " + ((.verified_categories // []) | map("`" + . + "`") | join(", "))
+              end
+            )
+          + (
+              if ((.methods // []) | length) == 0 then
+                ""
+              else
+                "; methods " + ((.methods // []) | map("`" + . + "`") | join(", "))
+              end
+            )
       ' "$BUNDLE_DIR/cluster-status.json"
       printf '\n'
     fi

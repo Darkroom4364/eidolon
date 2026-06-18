@@ -2146,6 +2146,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             "safe_headers": safe_header_observations(&request.headers),
             "session_source": debug_session_source(session.source),
             "ingress_identity": &session.ingress_identity,
+            "authenticated_ingress_rule_rejection":
+                &session.authenticated_ingress_rule_rejection,
             "local_ingress_trust_scope_rejection":
                 &session.local_ingress_trust_scope_rejection,
             "ingress_signals": &session.ingress_signals,
@@ -3677,6 +3679,9 @@ fn request_seen_event(
             path: redacted_event_target(path),
             safe_headers: safe_header_observations(&request.headers),
             ingress_identity: session.ingress_identity.clone(),
+            authenticated_ingress_rule_rejection: session
+                .authenticated_ingress_rule_rejection
+                .clone(),
             local_ingress_trust_scope_rejection: session
                 .local_ingress_trust_scope_rejection
                 .clone(),
@@ -3794,12 +3799,15 @@ fn effective_session_context(
     );
     session.local_ingress_trust_scope_rejection = local_trust_evaluation.scope_rejection;
     let local_trust = local_trust_evaluation.resolved;
-    let authenticated_trust = runtime.ingress_identity_resolver.resolve_authenticated(
+    let authenticated_trust_evaluation = runtime.ingress_identity_resolver.evaluate_authenticated(
         &session.ingress_identity,
         &session.ingress_signals,
         &request.method,
         &surface_request.path,
     );
+    session.authenticated_ingress_rule_rejection =
+        authenticated_trust_evaluation.rule_rejection.clone();
+    let authenticated_trust = authenticated_trust_evaluation.resolved;
     if runtime
         .ingress_identity_resolver
         .has_authenticated_entries()
@@ -6868,6 +6876,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: Default::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -11093,7 +11102,24 @@ mod tests {
             request_event["kind"]["ingress_identity"]["label"],
             "wrong-signed-agent"
         );
+        assert_eq!(
+            request_event["kind"]["authenticated_ingress_rule_rejection"]["label"],
+            "docs-signed-agent"
+        );
+        assert_eq!(
+            request_event["kind"]["authenticated_ingress_rule_rejection"]["reason"],
+            "label_mismatch"
+        );
+        assert_eq!(
+            request_event["kind"]["authenticated_ingress_rule_rejection"]["verified_categories"],
+            serde_json::json!(["AI Assistant"])
+        );
         assert!(request_event["kind"]["trusted_ingress_soften_match"].is_null());
+        let request_debug = first_debug_event(&debug_log_path, "request_received");
+        assert_eq!(
+            request_debug["fields"]["authenticated_ingress_rule_rejection"]["reason"],
+            "label_mismatch"
+        );
         let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
         assert_eq!(
             surface_debug["fields"]["surface_action"]["type"],
