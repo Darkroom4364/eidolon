@@ -413,6 +413,16 @@ smoke proves a transport-authenticated but expired explicit claim is still
 recorded, but only as `weakly_asserted`, and the baited OpenAPI surface stays
 active.
 
+For the adjacent authenticated explicit-rule proof, redeploy with
+`examples/shield-lab/ingress-trust-configs/signed-agent-soften-docs-only.json`
+and run
+`examples/shield-lab/smoke-trusted-ingress-explicit-rule-orbstack.sh`. That
+smoke proves a transport-authenticated signed-agent claim only softens `/docs`
+when it matches one configured `authenticated_entries` rule, including the
+expected label and verified category. A mismatched signed-agent claim remains
+auditable but is degraded to `weakly_asserted`, so the baited docs surface
+stays active.
+
 ## M3 Scripted Bakeoff Runner
 
 The scripted M3 runner creates the first comparable artifact shape across the four static controls and Eidolon MVP. It is runner plumbing for M3, not the final empirical uniqueness result. Final M3 still requires authorized agentic or scanner runs and proxy trace artifacts.
