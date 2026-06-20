@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "authenticated_entries": [
+    {
+      "label": "docs-signed-agent",
+      "source": "signed_agent",
+      "trust_tier": "signed_attested",
+      "methods": ["GET"],
+      "path_prefixes": ["/docs", "/openapi.json"]
+    },
+    {
+      "label": "docs-signed-agent",
+      "source": "signed_agent",
+      "trust_tier": "signed_attested",
+      "verified_categories": ["AI Assistant"],
+      "methods": ["GET"],
+      "path_prefixes": ["/docs"],
+      "bait_soften_path_prefixes": ["/docs"]
+    }
+  ]
+}

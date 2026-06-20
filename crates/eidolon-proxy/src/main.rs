@@ -11043,6 +11043,98 @@ mod tests {
     }
 
     #[test]
+    fn more_specific_authenticated_explicit_rule_wins_over_broader_match() {
+        let event_log_path = unique_temp_path("explicit-auth-rule-specificity-events.jsonl");
+        let debug_log_path = unique_temp_path("explicit-auth-rule-specificity-debug.jsonl");
+        let original =
+            r#"<!doctype html><html><body><main>docs explicit specificity</main></body></html>"#;
+        let (upstream, upstream_handle) = spawn_upstream(html_response(original));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("explicit-auth-rule-specificity-control.txt"),
+        );
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "authenticated_entries": [
+                {
+                  "label": "docs-signed-agent",
+                  "source": "signed_agent",
+                  "trust_tier": "signed_attested",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs", "/openapi.json"]
+                },
+                {
+                  "label": "docs-signed-agent",
+                  "source": "signed_agent",
+                  "trust_tier": "signed_attested",
+                  "verified_categories": ["AI Assistant"],
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "bait_soften_path_prefixes": ["/docs"]
+                }
+              ]
+            }"#,
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "ingress trust config should load",
+        ));
+        runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs?topic=imports",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+                    (
+                        session::INGRESS_IDENTITY_LABEL_HEADER_NAME,
+                        "docs-signed-agent",
+                    ),
+                    (
+                        session::INGRESS_VERIFIED_CATEGORY_HEADER_NAME,
+                        "AI Assistant",
+                    ),
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                ],
+            ),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        let body = String::from_utf8(response.body).expect("body should be utf8");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(body, original);
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_eq!(
+            request_event["kind"]["trusted_ingress_soften_match"]["path_prefixes"],
+            serde_json::json!(["/docs"])
+        );
+        assert_eq!(
+            request_event["kind"]["trusted_ingress_soften_match"]["verified_categories"],
+            serde_json::json!(["AI Assistant"])
+        );
+        assert_eq!(
+            request_event["kind"]["trusted_ingress_soften_match"]["request_path_softened"],
+            true
+        );
+        let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_debug["fields"]["surface_action"]["type"],
+            "protected_upstream"
+        );
+        assert_eq!(
+            surface_debug["fields"]["trusted_ingress_softened_surface"],
+            true
+        );
+    }
+
+    #[test]
     fn unmatched_authenticated_explicit_rule_degrades_to_weakly_asserted_and_stays_baited() {
         let event_log_path = unique_temp_path("explicit-auth-rule-mismatch-events.jsonl");
         let debug_log_path = unique_temp_path("explicit-auth-rule-mismatch-debug.jsonl");

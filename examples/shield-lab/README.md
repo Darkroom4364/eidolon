@@ -577,6 +577,20 @@ That path proves a transport-authenticated strong explicit claim can soften
 same signed-agent claim stays auditable but degrades to `weakly_asserted` and
 keeps the baited `/docs` surface when the configured label no longer matches.
 
+For the adjacent overlap-specificity path, redeploy with the checked-in
+overlapping signed-agent config and run the paired smoke:
+
+```sh
+EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH=examples/shield-lab/ingress-trust-configs/signed-agent-overlapping-docs-specific.json \
+  examples/shield-lab/deploy-orbstack.sh
+examples/shield-lab/smoke-trusted-ingress-explicit-rule-specificity-orbstack.sh
+```
+
+That path proves overlapping authenticated explicit rules no longer rely on
+config order alone: the narrower docs/category rule supplies the explicit-rule
+soften-match metadata on `/docs`, while `/openapi.json` falls back to the
+broader strong-identity softening path.
+
 Smoke-check the local allowlist soften-scope path:
 
 ```sh
