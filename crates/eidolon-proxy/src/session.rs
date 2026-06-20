@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use eidolon_core::{
-    EdgeRecommendedAction, IngressActorKind, IngressAdvisorySignals, IngressIdentity,
-    IngressIdentitySource, IngressTrustTier, IngressVerificationStrength,
-    LocalIngressTrustScopeRejection, SessionId, TrustedIngressSoftenMatch,
+    AuthenticatedIngressRuleRejection, EdgeRecommendedAction, IngressActorKind,
+    IngressAdvisorySignals, IngressIdentity, IngressIdentitySource, IngressTrustTier,
+    IngressVerificationStrength, LocalIngressTrustScopeRejection, SessionId,
+    TrustedIngressSoftenMatch,
 };
 
 /// Request header carrying first-party cookies.
@@ -66,6 +67,7 @@ pub struct SessionContext {
     pub session_id: SessionId,
     pub source: SessionSource,
     pub ingress_identity: IngressIdentity,
+    pub authenticated_ingress_rule_rejection: Option<AuthenticatedIngressRuleRejection>,
     pub local_ingress_trust_scope_rejection: Option<LocalIngressTrustScopeRejection>,
     pub ingress_signals: IngressAdvisorySignals,
     pub trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
@@ -119,6 +121,7 @@ where
             session_id,
             source: SessionSource::Cookie,
             ingress_identity,
+            authenticated_ingress_rule_rejection: None,
             local_ingress_trust_scope_rejection: None,
             ingress_signals,
             trusted_ingress_soften_match: None,
@@ -129,6 +132,7 @@ where
             session_id: SessionId::new(),
             source: SessionSource::Generated,
             ingress_identity,
+            authenticated_ingress_rule_rejection: None,
             local_ingress_trust_scope_rejection: None,
             ingress_signals,
             trusted_ingress_soften_match: None,

@@ -338,6 +338,7 @@ mod tests {
                     not_before: None,
                     expires_at: None,
                 },
+                authenticated_ingress_rule_rejection: None,
                 local_ingress_trust_scope_rejection: None,
                 trusted_ingress_soften_match: None,
                 ingress_signals: Default::default(),

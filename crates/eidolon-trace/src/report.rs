@@ -1,8 +1,9 @@
 use std::fmt::Write;
 
 use eidolon_core::{
-    BaitHeaderValueMintAudit, BaitHeaderValueMintStatus, EdgeBaitHeaderValueMintAudit,
-    EdgeEvidenceRef, EdgeLocalIngressTrustScopeRejectionHistory, EdgeObservedBaitHeaderValueMint,
+    BaitHeaderValueMintAudit, BaitHeaderValueMintStatus,
+    EdgeAuthenticatedIngressRuleRejectionHistory, EdgeBaitHeaderValueMintAudit, EdgeEvidenceRef,
+    EdgeLocalIngressTrustScopeRejectionHistory, EdgeObservedBaitHeaderValueMint,
     EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestRef,
     EdgeTrustedIngressSoftenHistory, EidolonEdgeDecisionExport, EventKind, IngressAdvisorySignals,
     PolicyState, PostContainmentPersistenceKind, PreContainmentPersistenceClass,
@@ -265,6 +266,7 @@ pub fn edge_decision_export_for_evidence(
             method,
             path,
             ingress_identity,
+            authenticated_ingress_rule_rejection,
             local_ingress_trust_scope_rejection,
             trusted_ingress_soften_match,
             ingress_signals,
@@ -281,6 +283,7 @@ pub fn edge_decision_export_for_evidence(
             method.clone(),
             path.clone(),
             ingress_identity.clone(),
+            authenticated_ingress_rule_rejection.clone(),
             local_ingress_trust_scope_rejection.clone(),
             trusted_ingress_soften_match.clone(),
             ingress_signals.clone(),
@@ -294,6 +297,7 @@ pub fn edge_decision_export_for_evidence(
         method,
         path,
         ingress_identity,
+        authenticated_ingress_rule_rejection,
         local_ingress_trust_scope_rejection,
         trusted_ingress_soften_match,
         ingress_signals,
@@ -334,6 +338,7 @@ pub fn edge_decision_export_for_evidence(
         session_id: bundle.session_id,
         request: EdgeRequestRef { method, path },
         ingress_identity,
+        authenticated_ingress_rule_rejection,
         local_ingress_trust_scope_rejection,
         trusted_ingress_soften_match,
         ingress_signals,
@@ -355,6 +360,8 @@ pub fn edge_decision_export_for_evidence(
                 [latest_policy_reason_event, latest_policy_routing_event],
             ),
             bundle_ref: format!("session:{}", bundle.session_id.0),
+            authenticated_ingress_rule_rejection_histories:
+                edge_authenticated_ingress_rule_rejection_histories(timeline),
             local_ingress_trust_scope_rejection_histories:
                 edge_local_ingress_trust_scope_rejection_histories(timeline),
             trusted_ingress_soften_histories: edge_trusted_ingress_soften_histories(timeline),
@@ -365,6 +372,54 @@ pub fn edge_decision_export_for_evidence(
         edge_recommendation,
         deployment_context: None,
     })
+}
+
+fn edge_authenticated_ingress_rule_rejection_histories(
+    timeline: &SessionTimeline,
+) -> Vec<EdgeAuthenticatedIngressRuleRejectionHistory> {
+    let mut histories: Vec<EdgeAuthenticatedIngressRuleRejectionHistory> = Vec::new();
+
+    for timeline_event in &timeline.events {
+        let EventKind::RequestSeen {
+            authenticated_ingress_rule_rejection: Some(rejection),
+            ..
+        } = &timeline_event.event.kind
+        else {
+            continue;
+        };
+
+        if let Some(existing) = histories.iter_mut().find(|history| {
+            history.label == rejection.label
+                && history.source == rejection.source
+                && history.trust_tier == rejection.trust_tier
+                && history.not_before == rejection.not_before
+                && history.expires_at == rejection.expires_at
+                && history.methods == rejection.methods
+                && history.path_prefixes == rejection.path_prefixes
+                && history.bait_soften_path_prefixes == rejection.bait_soften_path_prefixes
+                && history.verified_categories == rejection.verified_categories
+        }) {
+            if !existing.reasons.contains(&rejection.reason) {
+                existing.reasons.push(rejection.reason);
+            }
+            continue;
+        }
+
+        histories.push(EdgeAuthenticatedIngressRuleRejectionHistory {
+            label: rejection.label.clone(),
+            source: rejection.source,
+            trust_tier: rejection.trust_tier,
+            not_before: rejection.not_before,
+            expires_at: rejection.expires_at,
+            methods: rejection.methods.clone(),
+            path_prefixes: rejection.path_prefixes.clone(),
+            bait_soften_path_prefixes: rejection.bait_soften_path_prefixes.clone(),
+            verified_categories: rejection.verified_categories.clone(),
+            reasons: vec![rejection.reason],
+        });
+    }
+
+    histories
 }
 
 fn edge_bait_header_value_mints(bundle: &EvidenceBundle) -> Vec<EdgeBaitHeaderValueMintAudit> {
@@ -417,6 +472,7 @@ fn edge_trusted_ingress_soften_histories(
                 && history.hosts == trusted_match.hosts
                 && history.source_cidrs == trusted_match.source_cidrs
                 && history.required_header_names == trusted_match.required_header_names
+                && history.verified_categories == trusted_match.verified_categories
         }) {
             if trusted_match.request_path_softened {
                 existing.saw_request_path_softened = true;
@@ -437,6 +493,7 @@ fn edge_trusted_ingress_soften_histories(
             hosts: trusted_match.hosts.clone(),
             source_cidrs: trusted_match.source_cidrs.clone(),
             required_header_names: trusted_match.required_header_names.clone(),
+            verified_categories: trusted_match.verified_categories.clone(),
             saw_request_path_softened: trusted_match.request_path_softened,
             saw_request_path_unsoftened: !trusted_match.request_path_softened,
         });
@@ -1138,6 +1195,7 @@ mod tests {
                     },
                 ],
                 ingress_identity: IngressIdentity::default(),
+                authenticated_ingress_rule_rejection: None,
                 local_ingress_trust_scope_rejection: None,
                 trusted_ingress_soften_match: None,
                 ingress_signals: Default::default(),
@@ -1157,6 +1215,7 @@ mod tests {
                 path: "/openapi.json".to_string(),
                 safe_headers: Vec::new(),
                 ingress_identity: IngressIdentity::default(),
+                authenticated_ingress_rule_rejection: None,
                 local_ingress_trust_scope_rejection: None,
                 trusted_ingress_soften_match: None,
                 ingress_signals: IngressAdvisorySignals {
@@ -1249,6 +1308,7 @@ mod tests {
                 path: "/admin/decoy".to_string(),
                 safe_headers: Vec::new(),
                 ingress_identity: IngressIdentity::default(),
+                authenticated_ingress_rule_rejection: None,
                 local_ingress_trust_scope_rejection: None,
                 trusted_ingress_soften_match: None,
                 ingress_signals: Default::default(),
@@ -1417,6 +1477,7 @@ mod tests {
                             .to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -1444,6 +1505,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -1509,6 +1571,7 @@ mod tests {
                         not_before: None,
                         expires_at: None,
                     },
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: Some(eidolon_core::TrustedIngressSoftenMatch {
                         label: Some("internal-crawler".to_string()),
@@ -1521,6 +1584,7 @@ mod tests {
                         hosts: vec!["127.0.0.1".to_string()],
                         source_cidrs: vec!["127.0.0.1/32".to_string()],
                         required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
+                        verified_categories: Vec::new(),
                         request_path_softened: true,
                     }),
                     ingress_signals: IngressAdvisorySignals {
@@ -1621,6 +1685,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -1677,6 +1742,7 @@ mod tests {
                         not_before: None,
                         expires_at: None,
                     },
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: Some(eidolon_core::TrustedIngressSoftenMatch {
                         label: Some("docs-crawler".to_string()),
@@ -1689,6 +1755,7 @@ mod tests {
                         hosts: vec!["127.0.0.1".to_string()],
                         source_cidrs: vec!["127.0.0.1/32".to_string()],
                         required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
+                        verified_categories: Vec::new(),
                         request_path_softened: true,
                     }),
                     ingress_signals: Default::default(),
@@ -1716,6 +1783,7 @@ mod tests {
                         not_before: None,
                         expires_at: None,
                     },
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: Some(eidolon_core::TrustedIngressSoftenMatch {
                         label: Some("docs-crawler".to_string()),
@@ -1728,6 +1796,7 @@ mod tests {
                         hosts: vec!["127.0.0.1".to_string()],
                         source_cidrs: vec!["127.0.0.1/32".to_string()],
                         required_header_names: vec!["X-Eidolon-Trusted-Actor".to_string()],
+                        verified_categories: Vec::new(),
                         request_path_softened: false,
                     }),
                     ingress_signals: Default::default(),
@@ -1761,6 +1830,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -1827,6 +1897,7 @@ mod tests {
                     path: "/docs?topic=imports".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: Some(
                         eidolon_core::LocalIngressTrustScopeRejection {
                             label: Some("docs-crawler".to_string()),
@@ -1892,6 +1963,7 @@ mod tests {
                     path: "/docs?topic=imports".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: Some(
                         eidolon_core::LocalIngressTrustScopeRejection {
                             label: Some("docs-crawler".to_string()),
@@ -1925,6 +1997,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -1986,6 +2059,7 @@ mod tests {
                     path: "/docs/minted-trace".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -2013,6 +2087,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -2081,6 +2156,7 @@ mod tests {
                     path: "/docs/minted-trace".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -2121,6 +2197,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -2163,6 +2240,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -2235,6 +2313,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -2296,6 +2375,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: IngressAdvisorySignals {
@@ -2381,6 +2461,7 @@ mod tests {
                     path: "/api/v1/projects".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -2445,6 +2526,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -2514,6 +2596,7 @@ mod tests {
                     path: "/docs".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -2594,6 +2677,7 @@ mod tests {
                     path: "/api/v2/import/validate".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
@@ -2674,6 +2758,7 @@ mod tests {
                     path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
                     local_ingress_trust_scope_rejection: None,
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),

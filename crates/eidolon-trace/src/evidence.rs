@@ -577,6 +577,7 @@ mod tests {
                 path: path.to_string(),
                 safe_headers: Vec::new(),
                 ingress_identity: IngressIdentity::default(),
+                authenticated_ingress_rule_rejection: None,
                 local_ingress_trust_scope_rejection: None,
                 trusted_ingress_soften_match: None,
                 ingress_signals: Default::default(),

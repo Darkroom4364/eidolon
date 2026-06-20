@@ -396,6 +396,8 @@ Status checklist:
   `bait_soften_path_prefixes` now exist on `main` and optional per-entry
   `source_cidrs`, `hosts`, stale-claim freshness handling, optional
   `not_before` rollout windows, and
-  `user_agent_substrings` now exist on the current branch as narrower
-  deployment-safe trust primitives
+  `user_agent_substrings` now exist on `main` as narrower deployment-safe
+  trust primitives, while `feature/trusted-ingress-explicit-rules` adds
+  request-scoped `authenticated_entries` for transport-authenticated strong
+  explicit claims such as `signed_agent`
 - [ ] Prepare the external-readiness note and release checklist
