@@ -279,6 +279,9 @@ Current runtime policy:
   local allowlist entries, so transport-authenticated strong explicit claims
   such as `signed_agent` can be narrowed by their own method/path soften scope
   and optional `verified_category` requirements
+- when multiple authenticated explicit trust rules could match the same strong
+  explicit claim, Eidolon now chooses the most specific matching rule instead
+  of relying on config order alone
 - when authenticated explicit trust rules are configured, a strong explicit
   claim that does not match one of them is degraded to `weakly_asserted`
   before bait softening is considered
