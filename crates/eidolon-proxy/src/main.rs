@@ -10953,7 +10953,8 @@ mod tests {
     fn configured_authenticated_explicit_rule_can_soften_docs_surface() {
         let event_log_path = unique_temp_path("explicit-auth-rule-soften-events.jsonl");
         let debug_log_path = unique_temp_path("explicit-auth-rule-soften-debug.jsonl");
-        let original = r#"<!doctype html><html><body><main>docs explicit softening</main></body></html>"#;
+        let original =
+            r#"<!doctype html><html><body><main>docs explicit softening</main></body></html>"#;
         let (upstream, upstream_handle) = spawn_upstream(html_response(original));
         let mut runtime = test_runtime_with_m1_controller_and_debug_log(
             upstream,
@@ -10996,7 +10997,10 @@ mod tests {
                         session::INGRESS_IDENTITY_LABEL_HEADER_NAME,
                         "docs-signed-agent",
                     ),
-                    (session::INGRESS_VERIFIED_CATEGORY_HEADER_NAME, "AI Assistant"),
+                    (
+                        session::INGRESS_VERIFIED_CATEGORY_HEADER_NAME,
+                        "AI Assistant",
+                    ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
                 ],
             ),
@@ -11007,7 +11011,10 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(body, original);
         let request_event = first_event_of_type(&event_log_path, "request_seen");
-        assert_eq!(request_event["kind"]["ingress_identity"]["source"], "signed_agent");
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["source"],
+            "signed_agent"
+        );
         assert_eq!(
             request_event["kind"]["ingress_identity"]["trust_tier"],
             "signed_attested"
@@ -11039,7 +11046,8 @@ mod tests {
     fn unmatched_authenticated_explicit_rule_degrades_to_weakly_asserted_and_stays_baited() {
         let event_log_path = unique_temp_path("explicit-auth-rule-mismatch-events.jsonl");
         let debug_log_path = unique_temp_path("explicit-auth-rule-mismatch-debug.jsonl");
-        let original = r#"<!doctype html><html><body><main>docs explicit mismatch</main></body></html>"#;
+        let original =
+            r#"<!doctype html><html><body><main>docs explicit mismatch</main></body></html>"#;
         let (upstream, upstream_handle) = spawn_upstream(html_response(original));
         let mut runtime = test_runtime_with_m1_controller_and_debug_log(
             upstream,
@@ -11082,7 +11090,10 @@ mod tests {
                         session::INGRESS_IDENTITY_LABEL_HEADER_NAME,
                         "wrong-signed-agent",
                     ),
-                    (session::INGRESS_VERIFIED_CATEGORY_HEADER_NAME, "AI Assistant"),
+                    (
+                        session::INGRESS_VERIFIED_CATEGORY_HEADER_NAME,
+                        "AI Assistant",
+                    ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
                 ],
             ),
@@ -11093,7 +11104,10 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_ne!(body, original);
         let request_event = first_event_of_type(&event_log_path, "request_seen");
-        assert_eq!(request_event["kind"]["ingress_identity"]["source"], "signed_agent");
+        assert_eq!(
+            request_event["kind"]["ingress_identity"]["source"],
+            "signed_agent"
+        );
         assert_eq!(
             request_event["kind"]["ingress_identity"]["trust_tier"],
             "weakly_asserted"
