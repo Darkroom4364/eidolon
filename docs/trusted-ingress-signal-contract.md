@@ -275,6 +275,13 @@ Current runtime policy:
 - local allowlist entries may also carry optional `not_before` and `expires_at`
   windows so deployment-safe trust can be staged and retired without changing
   any other match scopes
+- authenticated explicit trust rules may now be configured separately from
+  local allowlist entries, so transport-authenticated strong explicit claims
+  such as `signed_agent` can be narrowed by their own method/path soften scope
+  and optional `verified_category` requirements
+- when authenticated explicit trust rules are configured, a strong explicit
+  claim that does not match one of them is degraded to `weakly_asserted`
+  before bait softening is considered
 - when a request nearly matches a local allowlist entry but misses the allowed
   HTTP method or request path scope, Eidolon records that explicitly as
   `method_mismatch` or `path_mismatch` instead of silently collapsing back to

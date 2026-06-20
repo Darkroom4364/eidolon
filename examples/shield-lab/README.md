@@ -563,6 +563,20 @@ longer softens bait:
 examples/shield-lab/smoke-trusted-ingress-expired-claim-orbstack.sh
 ```
 
+For the adjacent authenticated explicit-rule path, redeploy with the checked-in
+signed-agent config and run the paired smoke:
+
+```sh
+EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH=examples/shield-lab/ingress-trust-configs/signed-agent-soften-docs-only.json \
+  examples/shield-lab/deploy-orbstack.sh
+examples/shield-lab/smoke-trusted-ingress-explicit-rule-orbstack.sh
+```
+
+That path proves a transport-authenticated strong explicit claim can soften
+`/docs` only when it matches one configured `authenticated_entries` rule. The
+same signed-agent claim stays auditable but degrades to `weakly_asserted` and
+keeps the baited `/docs` surface when the configured label no longer matches.
+
 Smoke-check the local allowlist soften-scope path:
 
 ```sh
