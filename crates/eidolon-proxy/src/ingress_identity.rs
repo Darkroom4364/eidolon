@@ -270,9 +270,7 @@ fn ingress_identity_source_rank(identity: &IngressIdentity) -> u8 {
     }
 }
 
-fn authenticated_rule_rejection_priority(
-    reason: AuthenticatedIngressRuleRejectionReason,
-) -> u8 {
+fn authenticated_rule_rejection_priority(reason: AuthenticatedIngressRuleRejectionReason) -> u8 {
     match reason {
         AuthenticatedIngressRuleRejectionReason::Expired
         | AuthenticatedIngressRuleRejectionReason::NotYetActive => 5,
@@ -510,7 +508,8 @@ impl AuthenticatedTrustedIngressEntry {
         method: &str,
         path: &str,
     ) -> AuthenticatedTrustedIngressEntryEvaluation {
-        if identity.source != self.identity.source || identity.trust_tier != self.identity.trust_tier
+        if identity.source != self.identity.source
+            || identity.trust_tier != self.identity.trust_tier
         {
             return AuthenticatedTrustedIngressEntryEvaluation::NoMatch;
         }
@@ -582,11 +581,9 @@ impl AuthenticatedTrustedIngressEntry {
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(verified_category))
         {
-            return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(
-                self.rule_rejection(
-                    AuthenticatedIngressRuleRejectionReason::VerifiedCategoryMismatch,
-                ),
-            );
+            return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(self.rule_rejection(
+                AuthenticatedIngressRuleRejectionReason::VerifiedCategoryMismatch,
+            ));
         };
 
         AuthenticatedTrustedIngressEntryEvaluation::Matched
@@ -1691,12 +1688,12 @@ mod tests {
         assert_eq!(resolver.len(), 1);
         assert_eq!(trust.identity.source, IngressIdentitySource::SignedAgent);
         assert_eq!(trust.identity.trust_tier, IngressTrustTier::SignedAttested);
-        assert_eq!(
-            trust.identity.label.as_deref(),
-            Some("docs-signed-agent")
-        );
+        assert_eq!(trust.identity.label.as_deref(), Some("docs-signed-agent"));
         assert_eq!(trust.methods, vec!["GET".to_string()]);
-        assert_eq!(trust.path_prefixes, vec!["/docs".to_string(), "/openapi.json".to_string()]);
+        assert_eq!(
+            trust.path_prefixes,
+            vec!["/docs".to_string(), "/openapi.json".to_string()]
+        );
         assert_eq!(
             trust.bait_soften_path_prefixes,
             Some(vec!["/docs".to_string()])
@@ -1865,7 +1862,11 @@ mod tests {
         );
         assert!(expired.resolved.is_none());
         assert_eq!(
-            must_some(expired.rule_rejection, "expired rejection should be recorded").reason,
+            must_some(
+                expired.rule_rejection,
+                "expired rejection should be recorded"
+            )
+            .reason,
             AuthenticatedIngressRuleRejectionReason::Expired
         );
     }
