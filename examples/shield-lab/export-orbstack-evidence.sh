@@ -12,6 +12,10 @@ LOCAL_STATE_DIR="${EIDOLON_SHIELD_LOCAL_STATE_DIR:-}"
 SESSION_INDEX_LIMIT="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LIMIT:-25}"
 SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE:-}"
 SESSION_INDEX_LATEST_MINT_OUTCOME="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME:-}"
+SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_LABEL:-}"
+SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_REASON="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_REASON:-}"
+SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL:-}"
+SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_REASON="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_REASON:-}"
 SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL:-}"
 SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON:-}"
 SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL="${EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_HISTORY_LABEL:-}"
@@ -48,12 +52,34 @@ Environment:
                          Keep only sessions that observed at least N active
                          session-minted bait surfaces in `edge-session-index.md`.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME
-                         Keep only sessions whose latest exported minted bait
-                         outcome matches `matched_session_value` or
-                         `session_value_mismatch`.
+                          Keep only sessions whose latest exported minted bait
+                          outcome matches `matched_session_value` or
+                          `session_value_mismatch`.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_LABEL
+                         Keep only sessions whose latest authenticated
+                         trusted-ingress rule rejection label matches the given
+                         value.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_REASON
+                         Keep only sessions whose latest authenticated
+                         trusted-ingress rule rejection reason matches
+                         `no_matching_rule`, `label_missing`,
+                         `label_mismatch`, `not_yet_active`, `expired`,
+                         `method_mismatch`, `path_mismatch`,
+                         `verified_category_missing`, or
+                         `verified_category_mismatch`.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL
+                         Keep only sessions whose authenticated trusted-ingress
+                         rule rejection history includes the given label.
+  EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_REASON
+                         Keep only sessions whose authenticated trusted-ingress
+                         rule rejection history includes `no_matching_rule`,
+                         `label_missing`, `label_mismatch`, `not_yet_active`,
+                         `expired`, `method_mismatch`, `path_mismatch`,
+                         `verified_category_missing`, or
+                         `verified_category_mismatch`.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL
-                         Keep only sessions whose latest local trust scope
-                         rejection label matches the given value.
+                          Keep only sessions whose latest local trust scope
+                          rejection label matches the given value.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LOCAL_TRUST_REJECTION_REASON
                          Keep only sessions whose latest local trust scope
                          rejection reason matches `not_yet_active`, `expired`,
@@ -319,6 +345,53 @@ render_edge_session_index() {
            )
          | join(", "))
       end;
+    def authenticated_rule_rejection_history_summary($histories):
+      if ($histories | length) == 0 then
+        code("none")
+      else
+        ($histories
+         | map(
+             code(.label // (.source + "/" + .trust_tier))
+             + " ["
+             + (
+                 if ((.reasons // []) | length) == 0 then
+                   code("none")
+                 else
+                   ((.reasons // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + (
+                 if (.not_before // null) == null then
+                   ""
+                 else
+                   "; not-before " + code(.not_before)
+                 end
+               )
+             + (
+                 if (.expires_at // null) == null then
+                   ""
+                 else
+                   "; expires " + code(.expires_at)
+                 end
+               )
+             + (
+                 if ((.methods // []) | length) == 0 then
+                   ""
+                 else
+                   "; methods " + ((.methods // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + (
+                 if ((.verified_categories // []) | length) == 0 then
+                   ""
+                 else
+                   "; categories " + ((.verified_categories // []) | map(code(.)) | join(", "))
+                 end
+               )
+             + "]"
+           )
+         | join(", "))
+      end;
     def local_trust_rejection_history_summary($histories):
       if ($histories | length) == 0 then
         code("none")
@@ -397,6 +470,21 @@ render_edge_session_index() {
       else
         trusted_soften_history_summary($histories)
       end;
+    def authenticated_rule_rejection_summary($rejection):
+      if $rejection == null then
+        code("none")
+      else
+        code($rejection.label // ($rejection.source + "/" + $rejection.trust_tier))
+        + " ("
+        + code($rejection.reason)
+        + ")"
+      end;
+    def authenticated_rule_rejection_context_summary($rejection; $histories):
+      if $rejection != null then
+        authenticated_rule_rejection_summary($rejection)
+      else
+        authenticated_rule_rejection_history_summary($histories)
+      end;
     def local_trust_rejection_summary($rejection):
       if $rejection == null then
         code("none")
@@ -459,8 +547,8 @@ render_edge_session_index() {
           end
         ),
         "",
-        "| Session | Observed | Request | Policy | Action | Local Trust Rejection | Trusted Soften Context | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Session | Observed | Request | Policy | Action | Authenticated Rule Rejection | Local Trust Rejection | Trusted Soften Context | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         (
           $shown
           | to_entries[]
@@ -468,9 +556,12 @@ render_edge_session_index() {
           | ($value.deployment_context // {}) as $deployment
           | ($value.evidence.bait_header_value_mints // []) as $mint_audits
           | ($value.evidence.latest_bait_header_value_mint // null) as $latest_mint
+          | ($value.evidence.authenticated_ingress_rule_rejection_histories // [])
+            as $authenticated_rule_rejection_histories
           | ($value.evidence.local_ingress_trust_scope_rejection_histories // [])
             as $local_trust_rejection_histories
           | ($value.evidence.trusted_ingress_soften_histories // []) as $trusted_soften_histories
+          | ($value.authenticated_ingress_rule_rejection // null) as $authenticated_rule_rejection
           | ($value.local_ingress_trust_scope_rejection // null) as $local_trust_rejection
           | ($value.trusted_ingress_soften_match // null) as $trusted_soften_match
           | (coverage_or_fallback($deployment; $mint_audits)) as $coverage
@@ -484,6 +575,11 @@ render_edge_session_index() {
             + code($value.policy.state)
             + " | "
             + code($value.edge_recommendation.action)
+            + " | "
+            + authenticated_rule_rejection_context_summary(
+                $authenticated_rule_rejection;
+                $authenticated_rule_rejection_histories
+              )
             + " | "
             + local_trust_rejection_context_summary(
                 $local_trust_rejection;
@@ -551,6 +647,30 @@ write_edge_session_index() {
     edge_export_args+=(
       --latest-mint-outcome
       "$SESSION_INDEX_LATEST_MINT_OUTCOME"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_LABEL" ]]; then
+    edge_export_args+=(
+      --authenticated-rule-rejection-label
+      "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_LABEL"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_REASON" ]]; then
+    edge_export_args+=(
+      --authenticated-rule-rejection-reason
+      "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_REASON"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL" ]]; then
+    edge_export_args+=(
+      --authenticated-rule-rejection-history-label
+      "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL"
+    )
+  fi
+  if [[ -n "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_REASON" ]]; then
+    edge_export_args+=(
+      --authenticated-rule-rejection-history-reason
+      "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_REASON"
     )
   fi
   if [[ -n "$SESSION_INDEX_LOCAL_TRUST_REJECTION_LABEL" ]]; then
@@ -1534,6 +1654,26 @@ if [[ -n "$SESSION_INDEX_LATEST_MINT_OUTCOME" ]]; then
       ;;
     *)
       fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME must be matched_session_value or session_value_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_REASON" ]]; then
+  case "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_REASON" in
+    no_matching_rule|label_missing|label_mismatch|not_yet_active|expired|method_mismatch|path_mismatch|verified_category_missing|verified_category_mismatch)
+      ;;
+    *)
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_REASON must be one of: no_matching_rule, label_missing, label_mismatch, not_yet_active, expired, method_mismatch, path_mismatch, verified_category_missing, verified_category_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_REASON" ]]; then
+  case "$SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_REASON" in
+    no_matching_rule|label_missing|label_mismatch|not_yet_active|expired|method_mismatch|path_mismatch|verified_category_missing|verified_category_mismatch)
+      ;;
+    *)
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_REASON must be one of: no_matching_rule, label_missing, label_mismatch, not_yet_active, expired, method_mismatch, path_mismatch, verified_category_missing, verified_category_mismatch"
       ;;
   esac
 fi
