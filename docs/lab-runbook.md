@@ -342,6 +342,24 @@ environment override. The same live export path also supports
 `--latest-mint-outcome <matched_session_value|session_value_mismatch>`, and the
 bundle index supports the matching
 `EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME` environment override.
+For authenticated explicit trusted-ingress rules, the same live export path
+also supports `--authenticated-rule-rejection-label <label>` and
+`--authenticated-rule-rejection-reason
+<no_matching_rule|label_missing|label_mismatch|not_yet_active|expired|method_mismatch|path_mismatch|verified_category_missing|verified_category_mismatch>`,
+and the bundle index supports matching
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_LABEL` and
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_REASON`
+overrides. Those authenticated rejection details now also survive later state
+changes as `Authenticated rule rejection history` in the live markdown summary
+and bundle index, so a contained session still preserves the earlier explicit
+rule mismatch context. The same live export path also supports
+`--authenticated-rule-rejection-history-label <label>` and
+`--authenticated-rule-rejection-history-reason
+<no_matching_rule|label_missing|label_mismatch|not_yet_active|expired|method_mismatch|path_mismatch|verified_category_missing|verified_category_mismatch>`,
+and the bundle index supports matching
+`EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL`
+and `EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_HISTORY_REASON`
+overrides.
 For rejected local allowlist scopes, the same live export path also supports
 `--local-trust-rejection-label <label>` and
 `--local-trust-rejection-reason

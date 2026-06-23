@@ -40,6 +40,18 @@ pub struct AuthenticatedIngressTrustEvaluation {
     pub rule_rejection: Option<AuthenticatedIngressRuleRejection>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AuthenticatedRuleSpecificity {
+    matched_path_prefix_len: usize,
+    configured_path_prefix_len: usize,
+    verified_category_required: bool,
+    method_constrained: bool,
+    has_time_window: bool,
+    verified_category_count_inverse: usize,
+    method_count_inverse: usize,
+    path_prefix_count_inverse: usize,
+}
+
 impl IngressIdentityResolver {
     pub fn len(&self) -> usize {
         self.entries.len() + self.authenticated_entries.len()
@@ -119,29 +131,54 @@ impl IngressIdentityResolver {
         let method = method.trim().to_ascii_uppercase();
         let mut evaluation = AuthenticatedIngressTrustEvaluation::default();
         let mut saw_source_trust_candidate = false;
+        let mut resolved_match: Option<(AuthenticatedRuleSpecificity, ResolvedIngressTrust)> = None;
+        let mut rejected_match: Option<(
+            u8,
+            AuthenticatedRuleSpecificity,
+            AuthenticatedIngressRuleRejection,
+        )> = None;
 
         for entry in &self.authenticated_entries {
+            let specificity = authenticated_rule_specificity(entry, path);
             match entry.evaluate(identity, signals, &method, path) {
                 AuthenticatedTrustedIngressEntryEvaluation::Matched => {
-                    evaluation.resolved = Some(entry.resolved_trust());
-                    evaluation.rule_rejection = None;
-                    return evaluation;
+                    let should_replace = match resolved_match.as_ref() {
+                        None => true,
+                        Some((current_specificity, _)) => specificity > *current_specificity,
+                    };
+                    if should_replace {
+                        resolved_match = Some((specificity, entry.resolved_trust()));
+                    }
                 }
                 AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(rejection) => {
                     saw_source_trust_candidate = true;
-                    let should_replace = match evaluation.rule_rejection.as_ref() {
+                    let rejection_priority =
+                        authenticated_rule_rejection_priority(rejection.reason);
+                    let should_replace = match rejected_match.as_ref() {
                         None => true,
-                        Some(current) => {
-                            authenticated_rule_rejection_priority(rejection.reason)
-                                > authenticated_rule_rejection_priority(current.reason)
+                        Some((current_priority, current_specificity, _)) => {
+                            rejection_priority > *current_priority
+                                || (rejection_priority == *current_priority
+                                    && specificity > *current_specificity)
                         }
                     };
                     if should_replace {
-                        evaluation.rule_rejection = Some(rejection);
+                        rejected_match = Some((rejection_priority, specificity, rejection));
                     }
                 }
                 AuthenticatedTrustedIngressEntryEvaluation::NoMatch => {}
             }
+        }
+
+        if let Some((_, resolved)) = resolved_match {
+            evaluation.resolved = Some(resolved);
+            evaluation.rule_rejection = None;
+            return evaluation;
+        }
+
+        if let Some((_, _, rejection)) = rejected_match {
+            evaluation.rule_rejection = Some(rejection);
+            return evaluation;
         }
 
         if !saw_source_trust_candidate && requires_authenticated_rule(identity) {
@@ -281,6 +318,41 @@ fn authenticated_rule_rejection_priority(reason: AuthenticatedIngressRuleRejecti
         AuthenticatedIngressRuleRejectionReason::LabelMissing
         | AuthenticatedIngressRuleRejectionReason::LabelMismatch => 2,
         AuthenticatedIngressRuleRejectionReason::NoMatchingRule => 1,
+    }
+}
+
+fn authenticated_rule_specificity(
+    entry: &AuthenticatedTrustedIngressEntry,
+    path: &str,
+) -> AuthenticatedRuleSpecificity {
+    let matched_path_prefix_len = entry
+        .path_prefixes
+        .iter()
+        .filter(|prefix| path.starts_with(prefix.as_str()))
+        .map(|prefix| prefix.len())
+        .max()
+        .unwrap_or_default();
+    let configured_path_prefix_len = entry
+        .path_prefixes
+        .iter()
+        .map(|prefix| prefix.len())
+        .max()
+        .unwrap_or_default();
+    let configured_path_prefix_len = if matched_path_prefix_len == 0 {
+        configured_path_prefix_len
+    } else {
+        matched_path_prefix_len
+    };
+
+    AuthenticatedRuleSpecificity {
+        matched_path_prefix_len,
+        configured_path_prefix_len,
+        verified_category_required: !entry.verified_categories.is_empty(),
+        method_constrained: !entry.methods.is_empty(),
+        has_time_window: entry.identity.not_before.is_some() || entry.identity.expires_at.is_some(),
+        verified_category_count_inverse: usize::MAX - entry.verified_categories.len(),
+        method_count_inverse: usize::MAX - entry.methods.len(),
+        path_prefix_count_inverse: usize::MAX - entry.path_prefixes.len(),
     }
 }
 
@@ -1765,6 +1837,117 @@ mod tests {
             )
             .reason,
             AuthenticatedIngressRuleRejectionReason::PathMismatch
+        );
+    }
+
+    #[test]
+    fn authenticated_entries_choose_most_specific_match() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "authenticated_entries": [
+                    {
+                      "label": "docs-signed-agent",
+                      "source": "signed_agent",
+                      "trust_tier": "signed_attested",
+                      "methods": ["GET"],
+                      "path_prefixes": ["/docs", "/openapi.json"]
+                    },
+                    {
+                      "label": "docs-signed-agent",
+                      "source": "signed_agent",
+                      "trust_tier": "signed_attested",
+                      "verified_categories": ["AI Assistant"],
+                      "methods": ["GET"],
+                      "path_prefixes": ["/docs"],
+                      "bait_soften_path_prefixes": ["/docs"]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let trust = must_some(
+            resolver.resolve_authenticated(
+                &IngressIdentity {
+                    source: IngressIdentitySource::SignedAgent,
+                    trust_tier: IngressTrustTier::SignedAttested,
+                    label: Some("docs-signed-agent".to_string()),
+                    not_before: None,
+                    expires_at: None,
+                },
+                &IngressAdvisorySignals {
+                    verified_category: Some("AI Assistant".to_string()),
+                    ..IngressAdvisorySignals::default()
+                },
+                "GET",
+                "/docs?topic=imports",
+            ),
+            "most specific authenticated entry should match",
+        );
+
+        assert_eq!(trust.path_prefixes, vec!["/docs".to_string()]);
+        assert_eq!(
+            trust.bait_soften_path_prefixes,
+            Some(vec!["/docs".to_string()])
+        );
+        assert_eq!(trust.verified_categories, vec!["AI Assistant".to_string()]);
+    }
+
+    #[test]
+    fn authenticated_entries_choose_most_specific_rejection_when_rules_overlap() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "authenticated_entries": [
+                    {
+                      "label": "docs-signed-agent",
+                      "source": "signed_agent",
+                      "trust_tier": "signed_attested",
+                      "methods": ["GET"],
+                      "path_prefixes": ["/docs"]
+                    },
+                    {
+                      "label": "docs-signed-agent",
+                      "source": "signed_agent",
+                      "trust_tier": "signed_attested",
+                      "methods": ["GET"],
+                      "path_prefixes": ["/docs/legacy-import"]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let rejection = must_some(
+            resolver
+                .evaluate_authenticated(
+                    &IngressIdentity {
+                        source: IngressIdentitySource::SignedAgent,
+                        trust_tier: IngressTrustTier::SignedAttested,
+                        label: Some("docs-signed-agent".to_string()),
+                        not_before: None,
+                        expires_at: None,
+                    },
+                    &IngressAdvisorySignals::default(),
+                    "GET",
+                    "/health",
+                )
+                .rule_rejection,
+            "most specific rejection should be recorded",
+        );
+
+        assert_eq!(
+            rejection.reason,
+            AuthenticatedIngressRuleRejectionReason::PathMismatch
+        );
+        assert_eq!(
+            rejection.path_prefixes,
+            vec!["/docs/legacy-import".to_string()]
         );
     }
 

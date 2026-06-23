@@ -15,6 +15,10 @@ SESSION_ID=""
 TOP_LIMIT=""
 MIN_POLYMORPHIC_COVERAGE=""
 LATEST_MINT_OUTCOME=""
+AUTHENTICATED_RULE_REJECTION_LABEL=""
+AUTHENTICATED_RULE_REJECTION_REASON=""
+AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL=""
+AUTHENTICATED_RULE_REJECTION_HISTORY_REASON=""
 LOCAL_TRUST_REJECTION_LABEL=""
 LOCAL_TRUST_REJECTION_REASON=""
 LOCAL_TRUST_REJECTION_HISTORY_LABEL=""
@@ -45,6 +49,20 @@ Options:
   --latest-mint-outcome <matched_session_value|session_value_mismatch>
                          Keep only sessions whose latest exported minted bait
                          outcome matches the given status.
+  --authenticated-rule-rejection-label <label>
+                         Keep only sessions whose latest authenticated
+                         trusted-ingress rule rejection label matches the
+                         given value.
+  --authenticated-rule-rejection-reason <no_matching_rule|label_missing|label_mismatch|not_yet_active|expired|method_mismatch|path_mismatch|verified_category_missing|verified_category_mismatch>
+                         Keep only sessions whose latest authenticated
+                         trusted-ingress rule rejection reason matches the
+                         given value.
+  --authenticated-rule-rejection-history-label <label>
+                         Keep only sessions whose authenticated trusted-ingress
+                         rule rejection history includes the given label.
+  --authenticated-rule-rejection-history-reason <no_matching_rule|label_missing|label_mismatch|not_yet_active|expired|method_mismatch|path_mismatch|verified_category_missing|verified_category_mismatch>
+                         Keep only sessions whose authenticated trusted-ingress
+                         rule rejection history includes the given reason.
   --local-trust-rejection-label <label>
                          Keep only sessions whose latest local trust scope
                          rejection label matches the given value.
@@ -240,6 +258,72 @@ filter_by_latest_mint_outcome() {
     map(
       select(
         (.evidence.latest_bait_header_value_mint.status // "") == $outcome
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_authenticated_rule_rejection_label() {
+  local input_file="$1"
+  local output_file="$2"
+  local label="$3"
+
+  jq -s -c --arg label "$label" '
+    map(
+      select(
+        (.authenticated_ingress_rule_rejection.label // "") == $label
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_authenticated_rule_rejection_reason() {
+  local input_file="$1"
+  local output_file="$2"
+  local reason="$3"
+
+  jq -s -c --arg reason "$reason" '
+    map(
+      select(
+        (.authenticated_ingress_rule_rejection.reason // "") == $reason
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_authenticated_rule_rejection_history_label() {
+  local input_file="$1"
+  local output_file="$2"
+  local label="$3"
+
+  jq -s -c --arg label "$label" '
+    map(
+      select(
+        any(
+          (.evidence.authenticated_ingress_rule_rejection_histories // [])[];
+          (.label // "") == $label
+        )
+      )
+    )
+    | .[]
+  ' "$input_file" > "$output_file"
+}
+
+filter_by_authenticated_rule_rejection_history_reason() {
+  local input_file="$1"
+  local output_file="$2"
+  local reason="$3"
+
+  jq -s -c --arg reason "$reason" '
+    map(
+      select(
+        any(
+          (.evidence.authenticated_ingress_rule_rejection_histories // [])[];
+          any((.reasons // [])[]; . == $reason)
+        )
       )
     )
     | .[]
@@ -1158,6 +1242,26 @@ while [[ $# -gt 0 ]]; do
       LATEST_MINT_OUTCOME="$2"
       shift 2
       ;;
+    --authenticated-rule-rejection-label)
+      [[ $# -ge 2 ]] || fail "missing value for --authenticated-rule-rejection-label"
+      AUTHENTICATED_RULE_REJECTION_LABEL="$2"
+      shift 2
+      ;;
+    --authenticated-rule-rejection-reason)
+      [[ $# -ge 2 ]] || fail "missing value for --authenticated-rule-rejection-reason"
+      AUTHENTICATED_RULE_REJECTION_REASON="$2"
+      shift 2
+      ;;
+    --authenticated-rule-rejection-history-label)
+      [[ $# -ge 2 ]] || fail "missing value for --authenticated-rule-rejection-history-label"
+      AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL="$2"
+      shift 2
+      ;;
+    --authenticated-rule-rejection-history-reason)
+      [[ $# -ge 2 ]] || fail "missing value for --authenticated-rule-rejection-history-reason"
+      AUTHENTICATED_RULE_REJECTION_HISTORY_REASON="$2"
+      shift 2
+      ;;
     --local-trust-rejection-label)
       [[ $# -ge 2 ]] || fail "missing value for --local-trust-rejection-label"
       LOCAL_TRUST_REJECTION_LABEL="$2"
@@ -1248,6 +1352,26 @@ if [[ -n "$LATEST_MINT_OUTCOME" ]]; then
       ;;
     *)
       fail "--latest-mint-outcome must be matched_session_value or session_value_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$AUTHENTICATED_RULE_REJECTION_REASON" ]]; then
+  case "$AUTHENTICATED_RULE_REJECTION_REASON" in
+    no_matching_rule|label_missing|label_mismatch|not_yet_active|expired|method_mismatch|path_mismatch|verified_category_missing|verified_category_mismatch)
+      ;;
+    *)
+      fail "--authenticated-rule-rejection-reason must be one of: no_matching_rule, label_missing, label_mismatch, not_yet_active, expired, method_mismatch, path_mismatch, verified_category_missing, verified_category_mismatch"
+      ;;
+  esac
+fi
+
+if [[ -n "$AUTHENTICATED_RULE_REJECTION_HISTORY_REASON" ]]; then
+  case "$AUTHENTICATED_RULE_REJECTION_HISTORY_REASON" in
+    no_matching_rule|label_missing|label_mismatch|not_yet_active|expired|method_mismatch|path_mismatch|verified_category_missing|verified_category_mismatch)
+      ;;
+    *)
+      fail "--authenticated-rule-rejection-history-reason must be one of: no_matching_rule, label_missing, label_mismatch, not_yet_active, expired, method_mismatch, path_mismatch, verified_category_missing, verified_category_mismatch"
       ;;
   esac
 fi
@@ -1446,6 +1570,54 @@ if [[ -n "$LATEST_MINT_OUTCOME" ]]; then
   rendered_ndjson="$filtered_ndjson"
   if [[ ! -s "$rendered_ndjson" ]]; then
     fail "no edge decision exports matched --latest-mint-outcome ${LATEST_MINT_OUTCOME}"
+  fi
+fi
+
+if [[ -n "$AUTHENTICATED_RULE_REJECTION_LABEL" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.authenticated-rule-label-filtered.ndjson"
+  filter_by_authenticated_rule_rejection_label \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$AUTHENTICATED_RULE_REJECTION_LABEL"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --authenticated-rule-rejection-label ${AUTHENTICATED_RULE_REJECTION_LABEL}"
+  fi
+fi
+
+if [[ -n "$AUTHENTICATED_RULE_REJECTION_REASON" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.authenticated-rule-reason-filtered.ndjson"
+  filter_by_authenticated_rule_rejection_reason \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$AUTHENTICATED_RULE_REJECTION_REASON"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --authenticated-rule-rejection-reason ${AUTHENTICATED_RULE_REJECTION_REASON}"
+  fi
+fi
+
+if [[ -n "$AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.authenticated-rule-history-label-filtered.ndjson"
+  filter_by_authenticated_rule_rejection_history_label \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --authenticated-rule-rejection-history-label ${AUTHENTICATED_RULE_REJECTION_HISTORY_LABEL}"
+  fi
+fi
+
+if [[ -n "$AUTHENTICATED_RULE_REJECTION_HISTORY_REASON" ]]; then
+  filtered_ndjson="$tmp_dir/edge-exports.authenticated-rule-history-reason-filtered.ndjson"
+  filter_by_authenticated_rule_rejection_history_reason \
+    "$rendered_ndjson" \
+    "$filtered_ndjson" \
+    "$AUTHENTICATED_RULE_REJECTION_HISTORY_REASON"
+  rendered_ndjson="$filtered_ndjson"
+  if [[ ! -s "$rendered_ndjson" ]]; then
+    fail "no edge decision exports matched --authenticated-rule-rejection-history-reason ${AUTHENTICATED_RULE_REJECTION_HISTORY_REASON}"
   fi
 fi
 

@@ -577,6 +577,20 @@ That path proves a transport-authenticated strong explicit claim can soften
 same signed-agent claim stays auditable but degrades to `weakly_asserted` and
 keeps the baited `/docs` surface when the configured label no longer matches.
 
+For the adjacent overlap-specificity path, redeploy with the checked-in
+overlapping signed-agent config and run the paired smoke:
+
+```sh
+EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH=examples/shield-lab/ingress-trust-configs/signed-agent-overlapping-docs-specific.json \
+  examples/shield-lab/deploy-orbstack.sh
+examples/shield-lab/smoke-trusted-ingress-explicit-rule-specificity-orbstack.sh
+```
+
+That path proves overlapping authenticated explicit rules no longer rely on
+config order alone: the narrower docs/category rule supplies the explicit-rule
+soften-match metadata on `/docs`, while `/openapi.json` falls back to the
+broader strong-identity softening path.
+
 Smoke-check the local allowlist soften-scope path:
 
 ```sh
@@ -771,6 +785,9 @@ examples/shield-lab/export-edge-decisions-orbstack.sh \
   --latest-mint-outcome session_value_mismatch
 examples/shield-lab/export-edge-decisions-orbstack.sh \
   --format json \
+  --authenticated-rule-rejection-reason verified_category_mismatch
+examples/shield-lab/export-edge-decisions-orbstack.sh \
+  --format json \
   --trusted-soften-label docs-crawler
 examples/shield-lab/export-edge-decisions-orbstack.sh \
   --format json \
@@ -812,6 +829,18 @@ mismatched, which is useful for replay triage. `--trusted-soften-label <label>`
 narrows the export to sessions that actually matched one local trusted soften
 scope, and `--trusted-soften-path-softened <true|false>` splits those sessions
 into requests that were or were not inside that narrower bait-soften subset.
+For authenticated explicit trusted-ingress rules, use
+`--authenticated-rule-rejection-label <label>` or
+`--authenticated-rule-rejection-reason
+<no_matching_rule|label_missing|label_mismatch|not_yet_active|expired|method_mismatch|path_mismatch|verified_category_missing|verified_category_mismatch>`
+to narrow live export to requests that carried a strong explicit claim but were
+degraded to `weakly_asserted` because the configured authenticated rule did not
+match. If a later request moves the session onward into containment or another
+state, use `--authenticated-rule-rejection-history-label <label>` or
+`--authenticated-rule-rejection-history-reason
+<no_matching_rule|label_missing|label_mismatch|not_yet_active|expired|method_mismatch|path_mismatch|verified_category_missing|verified_category_mismatch>`
+to filter against the preserved session-level authenticated rule rejection
+history instead of only the latest request.
 For post-containment review, `--trusted-soften-history-label <label>` and
 `--trusted-soften-history-path-softened <true|false>` do the same thing against
 the session-level trusted soften history, so contained sessions still show up
