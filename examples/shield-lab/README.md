@@ -54,6 +54,7 @@ Keep out of the private repo:
 ```text
   shield-lab/
   kind-config.yaml
+  deploy-kind.sh
   status-orbstack.sh
   metrics-orbstack.sh
   logs-orbstack.sh
@@ -503,6 +504,12 @@ Create a `kind` cluster:
 
 ```sh
 kind create cluster --name eidolon-shield --config kind-config.yaml
+```
+
+Or let the lab runner create or reuse it and apply the `kind` overlay:
+
+```sh
+examples/shield-lab/deploy-kind.sh
 ```
 
 Validate the shared base and both overlays without touching a live cluster:
