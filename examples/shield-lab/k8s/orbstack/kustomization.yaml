@@ -4,5 +4,8 @@ resources:
   - ../base
   - shield-edge-service.yaml
   - target-edge-service.yaml
-patches:
-  - path: eidolon-proxy-trusted-ingress-patch.yaml
+images:
+  - name: eidolon-shield-proxy
+    newTag: local
+  - name: eidolon-owned-demo-target
+    newTag: local

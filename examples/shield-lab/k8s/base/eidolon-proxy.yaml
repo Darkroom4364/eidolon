@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: shield-proxy
-          image: eidolon-shield-proxy:local
+          image: eidolon-shield-proxy
           imagePullPolicy: IfNotPresent
           args:
             - --owned-cluster-lab
@@ -37,6 +37,10 @@ spec:
             - $(EIDOLON_INTERVENTION_CONTROL_PATH)
             - --policy-state
             - $(EIDOLON_POLICY_STATE_PATH)
+            - --ingress-transport-auth-secret-file
+            - /var/run/secrets/eidolon-trusted-ingress/transport-auth.txt
+            - --ingress-trust-config
+            - /etc/eidolon-ingress-trust/ingress-trust.json
           ports:
             - containerPort: 9102
               name: http
@@ -80,6 +84,12 @@ spec:
             - name: eidolon-bait-signing
               mountPath: /var/run/secrets/eidolon-bait-signing
               readOnly: true
+            - name: eidolon-trusted-ingress
+              mountPath: /var/run/secrets/eidolon-trusted-ingress
+              readOnly: true
+            - name: eidolon-ingress-trust
+              mountPath: /etc/eidolon-ingress-trust
+              readOnly: true
           readinessProbe:
             tcpSocket:
               port: http
@@ -103,6 +113,15 @@ spec:
         - name: eidolon-bait-signing
           secret:
             secretName: eidolon-bait-signing
+        - name: eidolon-trusted-ingress
+          secret:
+            secretName: eidolon-trusted-ingress
+        - name: eidolon-ingress-trust
+          configMap:
+            name: eidolon-shield-ingress-trust-config
+            items:
+              - key: ingress-trust.json
+                path: ingress-trust.json
 ---
 apiVersion: v1
 kind: Service
