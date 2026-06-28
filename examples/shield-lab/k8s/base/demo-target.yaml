@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: owned-demo-target
-          image: eidolon-owned-demo-target:local
+          image: eidolon-owned-demo-target
           imagePullPolicy: IfNotPresent
           env:
             - name: EIDOLON_LAB_TARGET_ADDR

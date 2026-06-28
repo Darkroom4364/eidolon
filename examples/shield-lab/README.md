@@ -54,6 +54,7 @@ Keep out of the private repo:
 ```text
   shield-lab/
   kind-config.yaml
+  deploy-kind.sh
   status-orbstack.sh
   metrics-orbstack.sh
   logs-orbstack.sh
@@ -505,10 +506,22 @@ Create a `kind` cluster:
 kind create cluster --name eidolon-shield --config kind-config.yaml
 ```
 
-Apply the base to a non-OrbStack cluster:
+Or let the lab runner create or reuse it and apply the `kind` overlay:
 
 ```sh
-kubectl apply -k k8s/base
+examples/shield-lab/deploy-kind.sh
+```
+
+Validate the shared base and both overlays without touching a live cluster:
+
+```sh
+examples/shield-lab/validate-k8s-manifests.sh
+```
+
+Apply the `kind` overlay to a non-OrbStack cluster:
+
+```sh
+kubectl apply -k k8s/kind
 ```
 
 Apply the OrbStack overlay manually:
@@ -522,6 +535,10 @@ Port forward the proxy:
 ```sh
 kubectl -n shield-system port-forward svc/eidolon-shield-proxy 9102:9102
 ```
+
+`k8s/base` is now the shared runtime layer. `k8s/orbstack` and `k8s/kind`
+only diverge on exposure and image selection, so portability checks can stay
+separate from the OrbStack-specific NodePort path.
 
 Check the OrbStack edge service:
 
