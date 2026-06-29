@@ -309,7 +309,11 @@ run_variant() {
   esac
 
   echo "pwnkit qualification variant $((index + 1))/$VARIANT_COUNT: $variant_id -> $variant_dir" >&2
-  env "${env_args[@]}" "$runner_path" "$run_count" "$variant_dir"
+  if [[ "${#env_args[@]}" -gt 0 ]]; then
+    env "${env_args[@]}" "$runner_path" "$run_count" "$variant_dir"
+  else
+    "$runner_path" "$run_count" "$variant_dir"
+  fi
 }
 
 main() {
