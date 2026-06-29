@@ -143,13 +143,17 @@ examples/qualification/run-pwnkit-qualification-matrix.sh
 
 The seed manifest lives at
 [`qualification/pwnkit-qualification-variants.json`](qualification/pwnkit-qualification-variants.json).
-It records positive-control, transfer-control, and direct-only negative-control
-slots separately from M3. The negative-control path uses the dedicated simple
-owned target profile through
-`examples/qualification/run-pwnkit-direct-qualification-sample.sh`, while the
-VM-backed Kali variants still flow through the existing wrappers. In dry-run
-mode the matrix also writes `vm-spool-plan.json` so those VM requirements stay
-explicit without pretending the repo already owns a real VM provisioner:
+It records positive-control, transfer-control, direct-only negative-control,
+and stock-vs-patched comparison slots separately from M3. The negative-control
+path uses the dedicated simple owned target profile through
+`examples/qualification/run-pwnkit-direct-qualification-sample.sh`, the
+stock-vs-patched path compares one `upstream_current` local sample against the
+canonical `local_patched_pwnkit` sample through
+`examples/qualification/run-pwnkit-stock-vs-patched-qualification-sample.sh`,
+and the VM-backed Kali variants still flow through the existing wrappers. In
+dry-run mode the matrix also writes `vm-spool-plan.json` so those VM
+requirements stay explicit without pretending the repo already owns a real VM
+provisioner:
 
 ```sh
 EIDOLON_PWNKIT_QUAL_DRY_RUN=1 \
@@ -174,6 +178,17 @@ examples/qualification/run-pwnkit-direct-qualification-sample.sh \
 examples/qualification/package-pwnkit-direct-qualification-sample.sh \
   /tmp/eidolon-pwnkit-direct-qualification \
   /tmp/eidolon-pwnkit-direct-qualification-bundle
+```
+
+To exercise the stock-vs-patched comparison sample by itself:
+
+```sh
+examples/qualification/run-pwnkit-stock-vs-patched-qualification-sample.sh \
+  3 \
+  /tmp/eidolon-pwnkit-stock-compare
+examples/qualification/package-pwnkit-stock-vs-patched-qualification-sample.sh \
+  /tmp/eidolon-pwnkit-stock-compare \
+  /tmp/eidolon-pwnkit-stock-compare-bundle
 ```
 
 The initial matrix reuses existing runners:

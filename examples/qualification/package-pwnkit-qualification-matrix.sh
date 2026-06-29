@@ -118,6 +118,9 @@ package_variants() {
           pwnkit_direct_qualification_sample)
             "$SCRIPT_DIR/package-pwnkit-direct-qualification-sample.sh" "$source_dir" "$dest_dir"
             ;;
+          pwnkit_stock_vs_patched_qualification_sample)
+            "$SCRIPT_DIR/package-pwnkit-stock-vs-patched-qualification-sample.sh" "$source_dir" "$dest_dir"
+            ;;
           *)
             fail "unsupported completed sample run_kind for $variant_id: $run_kind"
             ;;

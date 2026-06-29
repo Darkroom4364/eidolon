@@ -14,6 +14,7 @@ RUNNER_M3_LOCAL_SAMPLE="${EIDOLON_PWNKIT_QUAL_RUNNER_M3_LOCAL_SAMPLE:-$REPO_ROOT
 RUNNER_M3_KALI_SAME_VM="${EIDOLON_PWNKIT_QUAL_RUNNER_M3_KALI_SAME_VM:-$REPO_ROOT/examples/m3/run-pwnkit-kali-vm.sh}"
 RUNNER_SHIELD_LAB_KALI_ORBSTACK="${EIDOLON_PWNKIT_QUAL_RUNNER_SHIELD_LAB_KALI_ORBSTACK:-$REPO_ROOT/examples/shield-lab/run-pwnkit-kali-vm.sh}"
 RUNNER_QUAL_DIRECT_SAMPLE="${EIDOLON_PWNKIT_QUAL_RUNNER_DIRECT_SAMPLE:-$REPO_ROOT/examples/qualification/run-pwnkit-direct-qualification-sample.sh}"
+RUNNER_QUAL_STOCK_VS_PATCHED_SAMPLE="${EIDOLON_PWNKIT_QUAL_RUNNER_STOCK_VS_PATCHED_SAMPLE:-$REPO_ROOT/examples/qualification/run-pwnkit-stock-vs-patched-qualification-sample.sh}"
 
 usage() {
   cat <<'USAGE'
@@ -41,6 +42,8 @@ Environment:
                                  Override the Kali -> OrbStack NodePort runner.
   EIDOLON_PWNKIT_QUAL_RUNNER_DIRECT_SAMPLE
                                  Override the direct-only qualification runner.
+  EIDOLON_PWNKIT_QUAL_RUNNER_STOCK_VS_PATCHED_SAMPLE
+                                 Override the local stock-vs-patched runner.
 
 Outputs:
   <matrix-dir>/matrix-plan.json
@@ -134,6 +137,7 @@ validate_manifest() {
         or .runner_kind == "m3_kali_same_vm"
         or .runner_kind == "shield_lab_kali_orbstack"
         or .runner_kind == "qualification_direct_sample"
+        or .runner_kind == "qualification_stock_vs_patched_sample"
       )
       and (.run_count == null or (.run_count | type == "number" and floor == . and . > 0))
       and (.vm_profile == null or (.vm_profile | type == "string"))
@@ -172,6 +176,9 @@ resolve_runner_path() {
       ;;
     qualification_direct_sample)
       printf '%s' "$RUNNER_QUAL_DIRECT_SAMPLE"
+      ;;
+    qualification_stock_vs_patched_sample)
+      printf '%s' "$RUNNER_QUAL_STOCK_VS_PATCHED_SAMPLE"
       ;;
     *)
       fail "unsupported runner_kind: $runner_kind"
@@ -316,6 +323,11 @@ run_variant() {
     qualification_direct_sample)
       if truthy "$EIDOLON_PWNKIT_QUAL_DRY_RUN"; then
         env_args+=("EIDOLON_PWNKIT_QUAL_DIRECT_DRY_RUN=1")
+      fi
+      ;;
+    qualification_stock_vs_patched_sample)
+      if truthy "$EIDOLON_PWNKIT_QUAL_DRY_RUN"; then
+        env_args+=("EIDOLON_PWNKIT_QUAL_STOCK_COMPARE_DRY_RUN=1")
       fi
       ;;
   esac

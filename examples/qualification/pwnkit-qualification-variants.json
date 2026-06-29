@@ -68,16 +68,14 @@
     },
     {
       "variant_id": "upstream_current_stock_comparison",
-      "enabled": false,
+      "enabled": true,
       "control_kind": "stock_vs_patched",
       "hypothesis_id": "upstream_current_stock_parity",
       "hypothesis": "An upstream-current scanner build should be compared separately from the local patched fixture before making scanner-quality claims.",
       "expected_observation": "separate_stock_vs_patched_evidence_track",
-      "runner_kind": "m3_local_sample",
-      "blocked_reason": "enable only after the upstream-current runner path and evidence handling are ready for comparison",
-      "env": {
-        "EIDOLON_M3_PWNKIT_EVIDENCE_TRACK": "upstream_current"
-      }
+      "runner_kind": "qualification_stock_vs_patched_sample",
+      "run_count": 1,
+      "notes": "Runs both upstream_current and canonical local_patched_pwnkit local samples, then records their parity separately from M3 closeout."
     }
   ]
 }

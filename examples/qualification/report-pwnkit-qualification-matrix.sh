@@ -64,6 +64,7 @@ jq -r '
     (if .vm_profile != null then " vm=`\(.vm_profile)`" else "" end) +
     (if .runner_kind != null then " runner=`\(.runner_kind)`" else "" end) +
     (if .strongest_claim_level != null then " strongest_claim=`\(.strongest_claim_level)`" else "" end) +
+    (if .stock_vs_patched_parity_status != null then " parity_status=`\(.stock_vs_patched_parity_status)`" else "" end) +
     (if .blocked_reason != null then " blocked_reason=`\(.blocked_reason)`" else "" end);
 
   [
