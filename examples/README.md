@@ -143,10 +143,13 @@ examples/qualification/run-pwnkit-qualification-matrix.sh
 
 The seed manifest lives at
 [`qualification/pwnkit-qualification-variants.json`](qualification/pwnkit-qualification-variants.json).
-It records positive-control, transfer-control, and blocked hypothesis slots
-separately from M3. In dry-run mode it also writes `vm-spool-plan.json`, which
-queues the VM-backed Kali variants through the existing wrappers without
-pretending the repo already owns a real VM provisioner:
+It records positive-control, transfer-control, and direct-only negative-control
+slots separately from M3. The negative-control path uses the dedicated simple
+owned target profile through
+`examples/qualification/run-pwnkit-direct-qualification-sample.sh`, while the
+VM-backed Kali variants still flow through the existing wrappers. In dry-run
+mode the matrix also writes `vm-spool-plan.json` so those VM requirements stay
+explicit without pretending the repo already owns a real VM provisioner:
 
 ```sh
 EIDOLON_PWNKIT_QUAL_DRY_RUN=1 \
@@ -160,6 +163,17 @@ examples/qualification/report-pwnkit-qualification-matrix.sh /tmp/eidolon-pwnkit
 examples/qualification/package-pwnkit-qualification-matrix.sh \
   /tmp/eidolon-pwnkit-qualification \
   /tmp/eidolon-pwnkit-qualification-bundle
+```
+
+To exercise the direct-only negative-control sample by itself:
+
+```sh
+examples/qualification/run-pwnkit-direct-qualification-sample.sh \
+  3 \
+  /tmp/eidolon-pwnkit-direct-qualification
+examples/qualification/package-pwnkit-direct-qualification-sample.sh \
+  /tmp/eidolon-pwnkit-direct-qualification \
+  /tmp/eidolon-pwnkit-direct-qualification-bundle
 ```
 
 The initial matrix reuses existing runners:

@@ -95,6 +95,7 @@ package_variants() {
   local index
   local variant_id
   local execution_state
+  local run_kind
   local source_dir
   local dest_dir
 
@@ -109,7 +110,18 @@ package_variants() {
 
     case "$execution_state" in
       completed)
-        "$SCRIPT_DIR/../m3/package-pwnkit-sample.sh" "$source_dir" "$dest_dir"
+        run_kind="$(jq -r '.run_kind' "$source_dir/pwnkit-stability-sample.json")"
+        case "$run_kind" in
+          m3_pwnkit_codex_sample)
+            "$SCRIPT_DIR/../m3/package-pwnkit-sample.sh" "$source_dir" "$dest_dir"
+            ;;
+          pwnkit_direct_qualification_sample)
+            "$SCRIPT_DIR/package-pwnkit-direct-qualification-sample.sh" "$source_dir" "$dest_dir"
+            ;;
+          *)
+            fail "unsupported completed sample run_kind for $variant_id: $run_kind"
+            ;;
+        esac
         ;;
       planned)
         mkdir -p "$dest_dir"
@@ -171,7 +183,7 @@ write_readme() {
     printf -- '- `vm-spool-plan.json`: VM-backed topology spool requirements.\n'
     printf -- '- `variants/<variant-id>/...`: packaged completed samples or preserved plan/status files.\n'
     printf -- '- `SHA256SUMS`: checksums for committed bundle files.\n\n'
-    printf 'Completed variants are packaged through the M3 sample packager so raw pwnkit DBs, auth files, stdout/stderr logs, proxy JSONL, and private debug logs do not enter the qualification bundle.\n'
+    printf 'Completed variants are packaged through the appropriate sample packager so raw pwnkit DBs, auth files, stdout/stderr logs, proxy JSONL, and private debug logs do not enter the qualification bundle.\n'
   } > "$BUNDLE_DIR/README.md"
 }
 
