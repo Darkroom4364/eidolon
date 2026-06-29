@@ -51,14 +51,20 @@
       }
     },
     {
-      "variant_id": "negative_control_placeholder",
-      "enabled": false,
+      "variant_id": "direct_negative_control",
+      "enabled": true,
       "control_kind": "negative_control",
       "hypothesis_id": "hardened_target_negative_control",
       "hypothesis": "A hardened or intentionally simple owned target should stay mostly quiet under the same scanner setup.",
       "expected_observation": "minimal_or_no_findings",
-      "runner_kind": "m3_local_sample",
-      "blocked_reason": "define a dedicated hardened owned target and qualification URLs before enabling this control"
+      "runner_kind": "qualification_direct_sample",
+      "run_count": 1,
+      "notes": "Runs against the direct-only qualification_negative_control target profile outside the Eidolon proxy path.",
+      "env": {
+        "EIDOLON_LAB_TARGET_PROFILE": "qualification_negative_control",
+        "EIDOLON_M3_PWNKIT_EVIDENCE_TRACK": "local_patched_pwnkit",
+        "EIDOLON_M3_PWNKIT_FIXTURE_ID": "pwnkit-local-patched"
+      }
     },
     {
       "variant_id": "upstream_current_stock_comparison",
