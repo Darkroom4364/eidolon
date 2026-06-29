@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "run_kind": "pwnkit_qualification_matrix_manifest",
+  "boundary": "scanner_qualification",
+  "variants": [
+    {
+      "variant_id": "local_sample_positive_control",
+      "enabled": true,
+      "control_kind": "positive_control",
+      "hypothesis_id": "host_loopback_positive_control",
+      "hypothesis": "A current local pwnkit checkout should still produce material direct-target findings on the owned loopback lab before topology hardening claims are made.",
+      "expected_observation": "direct_target_yields_material_findings",
+      "runner_kind": "m3_local_sample",
+      "run_count": 1,
+      "notes": "Use this first as the local positive control before interpreting transfer behavior.",
+      "env": {
+        "EIDOLON_M3_PWNKIT_EVIDENCE_TRACK": "local_patched_pwnkit",
+        "EIDOLON_M3_PWNKIT_FIXTURE_ID": "pwnkit-local-patched"
+      }
+    },
+    {
+      "variant_id": "kali_same_vm_transfer_control",
+      "enabled": true,
+      "control_kind": "transfer_control",
+      "hypothesis_id": "kali_same_vm_loopback_transfer",
+      "hypothesis": "The same scanner should preserve broadly similar findings when the same owned loopback lab is exercised from inside a Kali VM.",
+      "expected_observation": "same_vm_loopback_preserves_finding_signal",
+      "runner_kind": "m3_kali_same_vm",
+      "vm_profile": "kali_vm_same_vm_loopback",
+      "run_count": 1,
+      "notes": "VM-backed transfer control for the same-VM loopback topology.",
+      "env": {
+        "EIDOLON_M3_PWNKIT_EVIDENCE_TRACK": "local_patched_pwnkit",
+        "EIDOLON_M3_PWNKIT_FIXTURE_ID": "pwnkit-local-patched"
+      }
+    },
+    {
+      "variant_id": "kali_orbstack_transfer_control",
+      "enabled": true,
+      "control_kind": "transfer_control",
+      "hypothesis_id": "kali_orbstack_nodeport_transfer",
+      "hypothesis": "The scanner should still produce material findings when moved to the Kali-to-OrbStack NodePort topology, instead of collapsing outside the favored path.",
+      "expected_observation": "orbstack_nodeport_retains_signal",
+      "runner_kind": "shield_lab_kali_orbstack",
+      "vm_profile": "kali_vm_to_orbstack_nodeport",
+      "run_count": 1,
+      "notes": "Requires the host-side Shield lab to be deployed before the VM run starts.",
+      "env": {
+        "EIDOLON_M3_PWNKIT_EVIDENCE_TRACK": "local_patched_pwnkit",
+        "EIDOLON_M3_PWNKIT_FIXTURE_ID": "pwnkit-local-patched"
+      }
+    },
+    {
+      "variant_id": "negative_control_placeholder",
+      "enabled": false,
+      "control_kind": "negative_control",
+      "hypothesis_id": "hardened_target_negative_control",
+      "hypothesis": "A hardened or intentionally simple owned target should stay mostly quiet under the same scanner setup.",
+      "expected_observation": "minimal_or_no_findings",
+      "runner_kind": "m3_local_sample",
+      "blocked_reason": "define a dedicated hardened owned target and qualification URLs before enabling this control"
+    },
+    {
+      "variant_id": "upstream_current_stock_comparison",
+      "enabled": false,
+      "control_kind": "stock_vs_patched",
+      "hypothesis_id": "upstream_current_stock_parity",
+      "hypothesis": "An upstream-current scanner build should be compared separately from the local patched fixture before making scanner-quality claims.",
+      "expected_observation": "separate_stock_vs_patched_evidence_track",
+      "runner_kind": "m3_local_sample",
+      "blocked_reason": "enable only after the upstream-current runner path and evidence handling are ready for comparison",
+      "env": {
+        "EIDOLON_M3_PWNKIT_EVIDENCE_TRACK": "upstream_current"
+      }
+    }
+  ]
+}

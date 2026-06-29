@@ -132,6 +132,33 @@ The action-trace collector reads `proxy-events.jsonl` and can prove scripted
 same-session bait action and controlled-reality entry. It does not claim
 autonomous agent behavior.
 
+## Scanner Qualification
+
+To separate scanner-quality claims from Eidolon's M3 uniqueness closeout, use
+the dedicated pwnkit qualification matrix:
+
+```sh
+examples/qualification/run-pwnkit-qualification-matrix.sh
+```
+
+The seed manifest lives at
+[`qualification/pwnkit-qualification-variants.json`](qualification/pwnkit-qualification-variants.json).
+It records positive-control, transfer-control, and blocked hypothesis slots
+separately from M3. In dry-run mode it also writes `vm-spool-plan.json`, which
+queues the VM-backed Kali variants through the existing wrappers without
+pretending the repo already owns a real VM provisioner:
+
+```sh
+EIDOLON_PWNKIT_QUAL_DRY_RUN=1 \
+  examples/qualification/run-pwnkit-qualification-matrix.sh
+```
+
+The initial matrix reuses existing runners:
+
+- `examples/m3/run-pwnkit-sample.sh`
+- `examples/m3/run-pwnkit-kali-vm.sh`
+- `examples/shield-lab/run-pwnkit-kali-vm.sh`
+
 ## M3 pwnkit Codex Bakeoff
 
 With the demo target and Eidolon proxy running, collect a pwnkit Codex run
