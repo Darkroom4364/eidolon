@@ -153,6 +153,15 @@ EIDOLON_PWNKIT_QUAL_DRY_RUN=1 \
   examples/qualification/run-pwnkit-qualification-matrix.sh
 ```
 
+To turn a completed matrix into a review bundle plus Markdown summary:
+
+```sh
+examples/qualification/report-pwnkit-qualification-matrix.sh /tmp/eidolon-pwnkit-qualification
+examples/qualification/package-pwnkit-qualification-matrix.sh \
+  /tmp/eidolon-pwnkit-qualification \
+  /tmp/eidolon-pwnkit-qualification-bundle
+```
+
 The initial matrix reuses existing runners:
 
 - `examples/m3/run-pwnkit-sample.sh`
