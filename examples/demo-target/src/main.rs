@@ -10,6 +10,9 @@ use serde_json::Value;
 const DEFAULT_ADDR: &str = "127.0.0.1:9001";
 const ADDR_ENV: &str = "EIDOLON_LAB_TARGET_ADDR";
 const OWNED_CLUSTER_LAB_ENV: &str = "EIDOLON_OWNED_CLUSTER_LAB";
+const PROFILE_ENV: &str = "EIDOLON_LAB_TARGET_PROFILE";
+const DEFAULT_PROFILE: &str = "default";
+const NEGATIVE_CONTROL_PROFILE: &str = "qualification_negative_control";
 const SECURITY_HEADERS: &[(&str, &str)] = &[
     (
         "Content-Security-Policy",
@@ -23,10 +26,12 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
 fn main() -> io::Result<()> {
     let addr = env::var(ADDR_ENV).unwrap_or_else(|_| DEFAULT_ADDR.to_string());
     let owned_cluster_lab = env_flag_enabled(OWNED_CLUSTER_LAB_ENV);
+    let profile = TargetProfile::from_env()?;
     ensure_allowed_lab_addr(&addr, owned_cluster_lab)?;
 
     let listener = TcpListener::bind(&addr)?;
     println!("eidolon-demo-target listening on http://{addr}");
+    println!("target profile: {}", profile.as_str());
     if owned_cluster_lab {
         println!("owned cluster lab enabled via {OWNED_CLUSTER_LAB_ENV}=1");
     } else {
@@ -36,8 +41,8 @@ fn main() -> io::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                thread::spawn(|| {
-                    if let Err(error) = handle_connection(stream) {
+                thread::spawn(move || {
+                    if let Err(error) = handle_connection(stream, profile) {
                         eprintln!("connection error: {error}");
                     }
                 });
@@ -47,6 +52,41 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetProfile {
+    Default,
+    QualificationNegativeControl,
+}
+
+impl TargetProfile {
+    fn from_env() -> io::Result<Self> {
+        match env::var(PROFILE_ENV) {
+            Ok(value) => match value.as_str() {
+                DEFAULT_PROFILE => Ok(Self::Default),
+                NEGATIVE_CONTROL_PROFILE => Ok(Self::QualificationNegativeControl),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{PROFILE_ENV} must be one of: {DEFAULT_PROFILE}, {NEGATIVE_CONTROL_PROFILE}"
+                    ),
+                )),
+            },
+            Err(env::VarError::NotPresent) => Ok(Self::Default),
+            Err(env::VarError::NotUnicode(_)) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{PROFILE_ENV} must be valid utf-8"),
+            )),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => DEFAULT_PROFILE,
+            Self::QualificationNegativeControl => NEGATIVE_CONTROL_PROFILE,
+        }
+    }
 }
 
 fn ensure_allowed_lab_addr(addr: &str, owned_cluster_lab: bool) -> io::Result<()> {
@@ -74,7 +114,7 @@ fn env_flag_enabled(name: &str) -> bool {
     )
 }
 
-fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
+fn handle_connection(mut stream: TcpStream, profile: TargetProfile) -> io::Result<()> {
     let mut buffer = [0; 8192];
     let bytes_read = stream.read(&mut buffer)?;
     if bytes_read == 0 {
@@ -82,7 +122,7 @@ fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
     }
 
     let request = Request::parse(&buffer[..bytes_read]);
-    let response = route_request(&request);
+    let response = route_request(profile, &request);
     stream.write_all(&response.to_http_bytes())?;
     stream.flush()
 }
@@ -267,23 +307,39 @@ impl Response {
     }
 }
 
-fn route_request(request: &Request) -> Response {
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") => Response::ok_html(home_page()),
-        ("GET", "/health") => {
+fn route_request(profile: TargetProfile, request: &Request) -> Response {
+    match (profile, request.method.as_str(), request.path.as_str()) {
+        (TargetProfile::Default, "GET", "/") => Response::ok_html(home_page()),
+        (_, "GET", "/health") => {
             Response::ok_json(r#"{"status":"ok","target":"eidolon-demo-target"}"#)
         }
-        ("GET", "/docs") => Response::ok_html(docs_page()),
-        ("GET", "/openapi.json") => Response::ok_json(openapi_document()),
-        ("GET", "/api/v1/projects") => Response::ok_json(projects_json()),
-        ("GET", path) if path.starts_with("/api/v1/projects/") => project_detail(path),
-        ("POST", "/api/v1/imports") => create_import(request),
-        ("GET", path) if path.starts_with("/api/v1/imports/") => import_detail(path),
-        ("POST", path) if path.starts_with("/api/") => Response::not_found(path),
-        (method, path @ ("/" | "/health" | "/docs" | "/openapi.json" | "/api/v1/projects")) => {
+        (TargetProfile::Default, "GET", "/docs") => Response::ok_html(docs_page()),
+        (TargetProfile::Default, "GET", "/openapi.json") => Response::ok_json(openapi_document()),
+        (TargetProfile::Default, "GET", "/api/v1/projects") => Response::ok_json(projects_json()),
+        (TargetProfile::Default, "GET", path) if path.starts_with("/api/v1/projects/") => {
+            project_detail(path)
+        }
+        (TargetProfile::Default, "POST", "/api/v1/imports") => create_import(request),
+        (TargetProfile::Default, "GET", path) if path.starts_with("/api/v1/imports/") => {
+            import_detail(path)
+        }
+        (TargetProfile::QualificationNegativeControl, "GET", "/") => {
+            Response::ok_html(qualification_negative_control_home_page())
+        }
+        (TargetProfile::QualificationNegativeControl, "GET", "/docs") => {
+            Response::ok_html(qualification_negative_control_docs_page())
+        }
+        (TargetProfile::QualificationNegativeControl, "GET", "/openapi.json") => {
+            Response::ok_json(qualification_negative_control_openapi_document())
+        }
+        (TargetProfile::Default, method, path @ ("/" | "/docs" | "/openapi.json")) => {
             Response::method_not_allowed(method, path)
         }
-        (_, path) => Response::not_found(path),
+        (TargetProfile::Default, method, path @ "/api/v1/projects") => {
+            Response::method_not_allowed(method, path)
+        }
+        (_, "POST", path) if path.starts_with("/api/") => Response::not_found(path),
+        (_, _, path) => Response::not_found(path),
     }
 }
 
@@ -353,6 +409,24 @@ fn home_page() -> &'static str {
 </html>"#
 }
 
+fn qualification_negative_control_home_page() -> &'static str {
+    r#"<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Eidolon Qualification Target</title></head>
+<body>
+  <main>
+    <h1>Eidolon Qualification Target</h1>
+    <p>Intentionally simple owned target for scanner negative-control qualification.</p>
+    <nav>
+      <a href="/docs">Docs</a>
+      <a href="/openapi.json">OpenAPI</a>
+      <a href="/health">Health</a>
+    </nav>
+  </main>
+</body>
+</html>"#
+}
+
 fn docs_page() -> &'static str {
     r#"<!doctype html>
 <html lang="en">
@@ -366,6 +440,22 @@ fn docs_page() -> &'static str {
     <h2>Imports</h2>
     <p>Use <code>POST /api/v1/imports</code> to create a synthetic import job.</p>
     <p>No endpoint in this target is intentionally vulnerable.</p>
+  </main>
+</body>
+</html>"#
+}
+
+fn qualification_negative_control_docs_page() -> &'static str {
+    r#"<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Qualification Target Docs</title></head>
+<body>
+  <main>
+    <h1>Qualification Target Docs</h1>
+    <p>This owned target is intentionally simple and is used as a negative control for scanner qualification.</p>
+    <h2>Supported endpoint</h2>
+    <p>Use <code>GET /health</code> to verify the service is reachable.</p>
+    <p>No project, import, authentication, or write surfaces are exposed in this profile.</p>
   </main>
 </body>
 </html>"#
@@ -441,6 +531,27 @@ fn openapi_document() -> &'static str {
         ],
         "responses": {
           "200": { "description": "Import status" }
+        }
+      }
+    }
+  }
+}"#
+}
+
+fn qualification_negative_control_openapi_document() -> &'static str {
+    r#"{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Eidolon Qualification Negative Control Target",
+    "version": "0.1.0",
+    "description": "Intentionally simple owned target for scanner negative-control qualification."
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "responses": {
+          "200": { "description": "Target is healthy" }
         }
       }
     }
@@ -538,10 +649,13 @@ mod tests {
     #[test]
     fn exposes_normal_docs_and_openapi() {
         assert_eq!(
-            route_request(&Request::for_test("GET", "/docs")).status,
+            route_request(TargetProfile::Default, &Request::for_test("GET", "/docs")).status,
             200
         );
-        let openapi = route_request(&Request::for_test("GET", "/openapi.json"));
+        let openapi = route_request(
+            TargetProfile::Default,
+            &Request::for_test("GET", "/openapi.json"),
+        );
         assert_eq!(openapi.status, 200);
         assert!(openapi.body.contains(r#""openapi": "3.0.3""#));
         assert!(openapi.body.contains("/api/v1/imports"));
@@ -550,11 +664,17 @@ mod tests {
 
     #[test]
     fn project_routes_return_synthetic_data() {
-        let list = route_request(&Request::for_test("GET", "/api/v1/projects"));
+        let list = route_request(
+            TargetProfile::Default,
+            &Request::for_test("GET", "/api/v1/projects"),
+        );
         assert_eq!(list.status, 200);
         assert!(list.body.contains("Alpha Migration"));
 
-        let detail = route_request(&Request::for_test("GET", "/api/v1/projects/alpha"));
+        let detail = route_request(
+            TargetProfile::Default,
+            &Request::for_test("GET", "/api/v1/projects/alpha"),
+        );
         assert_eq!(detail.status, 200);
         assert!(detail.body.contains(r#""id":"alpha""#));
     }
@@ -562,6 +682,7 @@ mod tests {
     #[test]
     fn import_post_requires_valid_json_request() {
         let response = route_request(
+            TargetProfile::Default,
             &Request::for_test("POST", "/api/v1/imports")
                 .with_header("Content-Type", "application/json")
                 .with_body(br#"{"source":"lab","mode":"synthetic"}"#.to_vec()),
@@ -573,6 +694,7 @@ mod tests {
     #[test]
     fn import_post_rejects_malformed_or_non_json_bodies() {
         let malformed = route_request(
+            TargetProfile::Default,
             &Request::for_test("POST", "/api/v1/imports")
                 .with_header("Content-Type", "application/json")
                 .with_body(br#"{"source":"lab""#.to_vec()),
@@ -580,6 +702,7 @@ mod tests {
         assert_eq!(malformed.status, 400);
 
         let missing_source = route_request(
+            TargetProfile::Default,
             &Request::for_test("POST", "/api/v1/imports")
                 .with_header("Content-Type", "application/json")
                 .with_body(br#"{"mode":"synthetic"}"#.to_vec()),
@@ -587,6 +710,7 @@ mod tests {
         assert_eq!(missing_source.status, 400);
 
         let plain_text = route_request(
+            TargetProfile::Default,
             &Request::for_test("POST", "/api/v1/imports")
                 .with_header("Content-Type", "text/plain")
                 .with_body(b"hello".to_vec()),
@@ -596,7 +720,7 @@ mod tests {
 
     #[test]
     fn responses_include_browser_hardening_headers() {
-        let response = route_request(&Request::for_test("GET", "/docs"));
+        let response = route_request(TargetProfile::Default, &Request::for_test("GET", "/docs"));
         let bytes = response.to_http_bytes();
         let raw = String::from_utf8(bytes).expect("response should be utf8");
 
@@ -610,20 +734,56 @@ mod tests {
 
     #[test]
     fn import_status_only_returns_known_synthetic_job() {
-        let known = route_request(&Request::for_test("GET", "/api/v1/imports/demo-import-1"));
+        let known = route_request(
+            TargetProfile::Default,
+            &Request::for_test("GET", "/api/v1/imports/demo-import-1"),
+        );
         assert_eq!(known.status, 200);
         assert!(known.body.contains(r#""id":"demo-import-1""#));
 
-        let unknown = route_request(&Request::for_test(
-            "GET",
-            "/api/v1/imports/not-a-real-import-xyz",
-        ));
+        let unknown = route_request(
+            TargetProfile::Default,
+            &Request::for_test("GET", "/api/v1/imports/not-a-real-import-xyz"),
+        );
         assert_eq!(unknown.status, 404);
     }
 
     #[test]
     fn legacy_bait_route_is_not_real_target_behavior() {
-        let response = route_request(&Request::for_test("POST", "/api/v2/import/reconcile"));
+        let response = route_request(
+            TargetProfile::Default,
+            &Request::for_test("POST", "/api/v2/import/reconcile"),
+        );
         assert_eq!(response.status, 404);
+    }
+
+    #[test]
+    fn qualification_negative_control_profile_exposes_only_minimal_surface() {
+        let docs = route_request(
+            TargetProfile::QualificationNegativeControl,
+            &Request::for_test("GET", "/docs"),
+        );
+        assert_eq!(docs.status, 200);
+        assert!(docs.body.contains("negative control"));
+
+        let openapi = route_request(
+            TargetProfile::QualificationNegativeControl,
+            &Request::for_test("GET", "/openapi.json"),
+        );
+        assert_eq!(openapi.status, 200);
+        assert!(openapi.body.contains(r#""/health""#));
+        assert!(!openapi.body.contains("/api/v1/imports"));
+
+        let projects = route_request(
+            TargetProfile::QualificationNegativeControl,
+            &Request::for_test("GET", "/api/v1/projects"),
+        );
+        assert_eq!(projects.status, 404);
+
+        let imports = route_request(
+            TargetProfile::QualificationNegativeControl,
+            &Request::for_test("POST", "/api/v1/imports"),
+        );
+        assert_eq!(imports.status, 404);
     }
 }

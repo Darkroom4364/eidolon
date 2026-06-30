@@ -132,6 +132,71 @@ The action-trace collector reads `proxy-events.jsonl` and can prove scripted
 same-session bait action and controlled-reality entry. It does not claim
 autonomous agent behavior.
 
+## Scanner Qualification
+
+To separate scanner-quality claims from Eidolon's M3 uniqueness closeout, use
+the dedicated pwnkit qualification matrix:
+
+```sh
+examples/qualification/run-pwnkit-qualification-matrix.sh
+```
+
+The seed manifest lives at
+[`qualification/pwnkit-qualification-variants.json`](qualification/pwnkit-qualification-variants.json).
+It records positive-control, transfer-control, direct-only negative-control,
+and stock-vs-patched comparison slots separately from M3. The negative-control
+path uses the dedicated simple owned target profile through
+`examples/qualification/run-pwnkit-direct-qualification-sample.sh`, the
+stock-vs-patched path compares one `upstream_current` local sample against the
+canonical `local_patched_pwnkit` sample through
+`examples/qualification/run-pwnkit-stock-vs-patched-qualification-sample.sh`,
+and the VM-backed Kali variants still flow through the existing wrappers. In
+dry-run mode the matrix also writes `vm-spool-plan.json` so those VM
+requirements stay explicit without pretending the repo already owns a real VM
+provisioner:
+
+```sh
+EIDOLON_PWNKIT_QUAL_DRY_RUN=1 \
+  examples/qualification/run-pwnkit-qualification-matrix.sh
+```
+
+To turn a completed matrix into a review bundle plus Markdown summary:
+
+```sh
+examples/qualification/report-pwnkit-qualification-matrix.sh /tmp/eidolon-pwnkit-qualification
+examples/qualification/package-pwnkit-qualification-matrix.sh \
+  /tmp/eidolon-pwnkit-qualification \
+  /tmp/eidolon-pwnkit-qualification-bundle
+```
+
+To exercise the direct-only negative-control sample by itself:
+
+```sh
+examples/qualification/run-pwnkit-direct-qualification-sample.sh \
+  3 \
+  /tmp/eidolon-pwnkit-direct-qualification
+examples/qualification/package-pwnkit-direct-qualification-sample.sh \
+  /tmp/eidolon-pwnkit-direct-qualification \
+  /tmp/eidolon-pwnkit-direct-qualification-bundle
+```
+
+To exercise the stock-vs-patched comparison sample by itself:
+
+```sh
+examples/qualification/run-pwnkit-stock-vs-patched-qualification-sample.sh \
+  3 \
+  /tmp/eidolon-pwnkit-stock-compare
+examples/qualification/package-pwnkit-stock-vs-patched-qualification-sample.sh \
+  /tmp/eidolon-pwnkit-stock-compare \
+  /tmp/eidolon-pwnkit-stock-compare-bundle
+```
+
+The initial matrix reuses existing runners:
+
+- `examples/m3/run-pwnkit-sample.sh`
+- `examples/m3/run-pwnkit-kali-vm.sh`
+- `examples/shield-lab/run-pwnkit-kali-vm.sh`
+
 ## M3 pwnkit Codex Bakeoff
 
 With the demo target and Eidolon proxy running, collect a pwnkit Codex run
