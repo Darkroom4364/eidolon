@@ -206,6 +206,16 @@ examples/qualification/spool-pwnkit-qualification-orbstack-vms.sh \
   /tmp/eidolon-pwnkit-vm-spool
 ```
 
+To execute one VM-backed qualification variant from the macOS host and refresh
+the matrix summary after copying the VM sample back:
+
+```sh
+examples/qualification/run-pwnkit-qualification-orbstack-vm-variant.sh \
+  /tmp/eidolon-pwnkit-qualification \
+  kali_orbstack_transfer_control \
+  /tmp/eidolon-pwnkit-vm-spool
+```
+
 ## M3 pwnkit Codex Bakeoff
 
 With the demo target and Eidolon proxy running, collect a pwnkit Codex run

@@ -263,6 +263,10 @@ machine_exists() {
   local machine_name="$1"
   local name
 
+  if [[ "${EXISTING_MACHINES+set}" != "set" ]]; then
+    return 1
+  fi
+  [[ "${#EXISTING_MACHINES[@]}" -gt 0 ]] || return 1
   for name in "${EXISTING_MACHINES[@]}"; do
     if [[ "$name" == "$machine_name" ]]; then
       return 0
