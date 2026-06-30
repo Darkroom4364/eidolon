@@ -257,6 +257,257 @@ json_bool() {
   fi
 }
 
+observability_timestamp() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+relative_artifact_path() {
+  local path="$1"
+
+  if [[ -z "$path" ]]; then
+    printf ''
+    return
+  fi
+
+  case "$path" in
+    "$ARTIFACT_DIR"/*)
+      printf '%s' "${path#$ARTIFACT_DIR/}"
+      ;;
+    *)
+      printf '%s' "$path"
+      ;;
+  esac
+}
+
+jsonl_line_count() {
+  local path="$1"
+
+  if [[ -f "$path" ]]; then
+    awk 'END { print NR + 0 }' "$path"
+  else
+    printf '0'
+  fi
+}
+
+tool_result_json_count() {
+  if [[ -d "$OBS_TOOL_RESULTS_DIR" ]]; then
+    find "$OBS_TOOL_RESULTS_DIR" -type f -name '*.json' | wc -l | tr -d ' '
+  else
+    printf '0'
+  fi
+}
+
+initialize_observability() {
+  OBS_HYPOTHESES_FILE="$ARTIFACT_DIR/hypotheses.jsonl"
+  OBS_ACTIONS_FILE="$ARTIFACT_DIR/actions.jsonl"
+  OBS_TOOL_RESULTS_DIR="$ARTIFACT_DIR/tool-results"
+  OBS_SUMMARY_FILE="$ARTIFACT_DIR/agent-summary.json"
+
+  mkdir -p "$OBS_TOOL_RESULTS_DIR"
+  touch "$OBS_HYPOTHESES_FILE" "$OBS_ACTIONS_FILE"
+}
+
+record_hypothesis() {
+  local stage="$1"
+  local hypothesis="$2"
+  local confidence="$3"
+  local planned_check="$4"
+  local status="${5:-planned}"
+  local leg="${6:-}"
+
+  jq -cn \
+    --arg timestamp "$(observability_timestamp)" \
+    --arg stage "$stage" \
+    --arg hypothesis "$hypothesis" \
+    --arg confidence "$confidence" \
+    --arg planned_check "$planned_check" \
+    --arg status "$status" \
+    --arg leg "$leg" \
+    '{
+      timestamp: $timestamp,
+      stage: $stage,
+      hypothesis: $hypothesis,
+      confidence: $confidence,
+      planned_check: $planned_check,
+      status: $status,
+      leg: (if $leg == "" then null else $leg end)
+    }' >> "$OBS_HYPOTHESES_FILE"
+}
+
+record_action() {
+  local stage="$1"
+  local action="$2"
+  local target="$3"
+  local reason="$4"
+  local outcome="$5"
+  local leg="${6:-}"
+  local note="${7:-}"
+
+  jq -cn \
+    --arg timestamp "$(observability_timestamp)" \
+    --arg stage "$stage" \
+    --arg action "$action" \
+    --arg target "$target" \
+    --arg reason "$reason" \
+    --arg outcome "$outcome" \
+    --arg leg "$leg" \
+    --arg note "$note" \
+    '{
+      timestamp: $timestamp,
+      stage: $stage,
+      action: $action,
+      target: $target,
+      reason: $reason,
+      outcome: $outcome,
+      leg: (if $leg == "" then null else $leg end),
+      note: (if $note == "" then null else $note end)
+    }' >> "$OBS_ACTIONS_FILE"
+}
+
+update_agent_summary() {
+  local status="$1"
+  local stage="$2"
+  local current_leg="$3"
+  local current_attempt="$4"
+  local latest_note="${5:-}"
+  local eidolon_report_present=false
+  local direct_report_present=false
+  local runner_metadata_present=false
+  local hypothesis_count
+  local action_count
+  local tool_result_count
+  local runner_environment
+  local runner_environment_source
+
+  hypothesis_count="$(jsonl_line_count "$OBS_HYPOTHESES_FILE")"
+  action_count="$(jsonl_line_count "$OBS_ACTIONS_FILE")"
+  tool_result_count="$(tool_result_json_count)"
+  runner_environment="$(runner_environment_value)"
+  runner_environment_source="$(runner_environment_source_value)"
+
+  [[ -f "$ARTIFACT_DIR/pwnkit-eidolon.json" ]] && eidolon_report_present=true
+  [[ -f "$ARTIFACT_DIR/pwnkit-direct.json" ]] && direct_report_present=true
+  [[ -f "$ARTIFACT_DIR/pwnkit-runner-metadata.json" ]] && runner_metadata_present=true
+
+  jq -n \
+    --arg generated_at "$(observability_timestamp)" \
+    --arg artifact_dir "$ARTIFACT_DIR" \
+    --arg mode "$MODE" \
+    --arg status "$status" \
+    --arg stage "$stage" \
+    --arg current_leg "$current_leg" \
+    --arg current_attempt "$current_attempt" \
+    --arg latest_note "$latest_note" \
+    --arg target_url "$TARGET_URL" \
+    --arg proxy_url "$PROXY_URL" \
+    --arg runner_environment "$runner_environment" \
+    --arg runner_environment_source "$runner_environment_source" \
+    --arg network_topology "$EIDOLON_M3_NETWORK_TOPOLOGY" \
+    --arg observations_hypotheses_file "$(relative_artifact_path "$OBS_HYPOTHESES_FILE")" \
+    --arg observations_actions_file "$(relative_artifact_path "$OBS_ACTIONS_FILE")" \
+    --arg observations_tool_results_dir "$(relative_artifact_path "$OBS_TOOL_RESULTS_DIR")" \
+    --argjson current_attempt_num "$(if [[ -n "$current_attempt" ]]; then printf '%s' "$current_attempt"; else printf 'null'; fi)" \
+    --argjson hypothesis_count "$hypothesis_count" \
+    --argjson action_count "$action_count" \
+    --argjson tool_result_count "$tool_result_count" \
+    --argjson eidolon_report_present "$(json_bool "$eidolon_report_present")" \
+    --argjson direct_report_present "$(json_bool "$direct_report_present")" \
+    --argjson runner_metadata_present "$(json_bool "$runner_metadata_present")" \
+    '{
+      schema_version: 1,
+      run_kind: "pwnkit_agent_summary",
+      boundary: "scanner_qualification",
+      generated_at: $generated_at,
+      artifact_dir: $artifact_dir,
+      mode: $mode,
+      status: $status,
+      stage: $stage,
+      current_leg: (if $current_leg == "" then null else $current_leg end),
+      current_attempt: $current_attempt_num,
+      latest_note: (if $latest_note == "" then null else $latest_note end),
+      target_url: $target_url,
+      proxy_url: $proxy_url,
+      environment: {
+        runner_environment: $runner_environment,
+        runner_environment_source: $runner_environment_source,
+        network_topology: $network_topology
+      },
+      observability: {
+        hypotheses_file: $observations_hypotheses_file,
+        actions_file: $observations_actions_file,
+        tool_results_dir: $observations_tool_results_dir
+      },
+      artifact_presence: {
+        runner_metadata: $runner_metadata_present,
+        eidolon_report: $eidolon_report_present,
+        direct_report: $direct_report_present
+      },
+      artifact_counts: {
+        hypotheses: $hypothesis_count,
+        actions: $action_count,
+        tool_results: $tool_result_count
+      }
+    }' > "$OBS_SUMMARY_FILE"
+}
+
+write_scan_tool_result() {
+  local label="$1"
+  local attempt="$2"
+  local url="$3"
+  local scope_file="$4"
+  local output_json="$5"
+  local output_stdout="$6"
+  local output_db="$7"
+  local output_stderr="$8"
+  local exit_code="$9"
+  local report_valid="${10}"
+  local finding_count_value="${11}"
+  local agent_error_count="${12}"
+  local transient_error_count="${13}"
+  local result_status="${14}"
+  local result_path="$OBS_TOOL_RESULTS_DIR/pwnkit-$label-attempt-$attempt.json"
+
+  jq -n \
+    --arg generated_at "$(observability_timestamp)" \
+    --arg label "$label" \
+    --arg target_url "$url" \
+    --arg scope_file "$(relative_artifact_path "$scope_file")" \
+    --arg output_json "$(relative_artifact_path "$output_json")" \
+    --arg output_stdout "$(relative_artifact_path "$output_stdout")" \
+    --arg output_db "$(relative_artifact_path "$output_db")" \
+    --arg output_stderr "$(relative_artifact_path "$output_stderr")" \
+    --arg result_status "$result_status" \
+    --argjson attempt "$attempt" \
+    --argjson exit_code "$exit_code" \
+    --argjson report_valid "$(json_bool "$report_valid")" \
+    --argjson finding_count "$finding_count_value" \
+    --argjson agent_error_count "$agent_error_count" \
+    --argjson transient_error_count "$transient_error_count" \
+    --argjson timeout_seconds "$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
+    '{
+      schema_version: 1,
+      run_kind: "pwnkit_tool_result",
+      boundary: "scanner_qualification",
+      generated_at: $generated_at,
+      tool: "pwnkit",
+      label: $label,
+      attempt: $attempt,
+      status: $result_status,
+      target_url: $target_url,
+      timeout_seconds: $timeout_seconds,
+      scope_file: $scope_file,
+      output_json: $output_json,
+      output_stdout: $output_stdout,
+      output_db: $output_db,
+      output_stderr: $output_stderr,
+      exit_code: $exit_code,
+      report_valid: $report_valid,
+      finding_count: $finding_count,
+      agent_error_count: $agent_error_count,
+      transient_error_count: $transient_error_count
+    }' > "$result_path"
+}
+
 validate_fixture_id() {
   if [[ -z "$EIDOLON_M3_PWNKIT_FIXTURE_ID" ]]; then
     return
@@ -1110,8 +1361,29 @@ run_scan() {
   scan_args+=(--verbose)
 
   echo "m3 pwnkit $label -> $url" >&2
+  record_hypothesis \
+    "scan" \
+    "pwnkit ${label} leg should produce a valid report against the configured ${label} target" \
+    "medium" \
+    "run pwnkit ${label} and inspect the normalized report plus stderr/stdout artifacts" \
+    "planned" \
+    "$label"
 
   while :; do
+    update_agent_summary \
+      "running" \
+      "scan" \
+      "$label" \
+      "$attempt" \
+      "starting pwnkit ${label} attempt ${attempt}"
+    record_action \
+      "scan" \
+      "run_pwnkit_scan" \
+      "$label" \
+      "collect the ${label} leg artifacts and determine whether a valid report is produced" \
+      "started" \
+      "$label" \
+      "attempt ${attempt}"
     set +e
     (
       export PWNKIT_NO_UPDATE_CHECK=1
@@ -1166,9 +1438,61 @@ run_scan() {
       transient_error_count=1
     fi
 
+    local report_valid=false
+    local finding_count_value=0
+    local action_outcome="failed"
+    if valid_pwnkit_report "$output_json"; then
+      report_valid=true
+      finding_count_value="$(finding_count "$output_json")"
+      if [[ "$exit_code" -eq 0 || "$finding_count_value" -gt 0 ]]; then
+        action_outcome="completed"
+      else
+        action_outcome="report_without_findings"
+      fi
+    elif [[ "$transient_error_count" -gt 0 ]]; then
+      action_outcome="transient_backend_error"
+    fi
+
+    write_scan_tool_result \
+      "$label" \
+      "$attempt" \
+      "$url" \
+      "$scope_file" \
+      "$output_json" \
+      "$output_stdout" \
+      "$output_db" \
+      "$output_stderr" \
+      "$exit_code" \
+      "$report_valid" \
+      "$finding_count_value" \
+      "$agent_error_count" \
+      "$transient_error_count" \
+      "$action_outcome"
+
     if scan_can_retry_in_place "$label" \
       && [[ "$transient_error_count" -gt 0 ]] \
       && (( attempt < EIDOLON_M3_PWNKIT_MAX_ATTEMPTS )); then
+      record_hypothesis \
+        "retry" \
+        "a retry of the ${label} leg may succeed because only transient Codex backend errors were recorded" \
+        "medium" \
+        "archive the failed attempt and rerun the same ${label} scan in place" \
+        "planned" \
+        "$label"
+      record_action \
+        "retry" \
+        "archive_and_retry_pwnkit_scan" \
+        "$label" \
+        "only transient Codex backend errors were recorded" \
+        "retrying" \
+        "$label" \
+        "attempt ${attempt}"
+      update_agent_summary \
+        "retrying" \
+        "retry" \
+        "$label" \
+        "$attempt" \
+        "retrying ${label} after transient backend error"
       echo "warning: pwnkit $label attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS recorded transient Codex backend error; retrying with failed artifacts archived under private/" >&2
       archive_scan_attempt \
         "$label" \
@@ -1184,6 +1508,20 @@ run_scan() {
     if [[ "$agent_error_count" -gt 0 ]]; then
       echo "warning: pwnkit $label completed with sanitized agent_error count=$agent_error_count" >&2
     fi
+    record_action \
+      "scan" \
+      "run_pwnkit_scan" \
+      "$label" \
+      "collect the ${label} leg artifacts and determine whether a valid report is produced" \
+      "$action_outcome" \
+      "$label" \
+      "attempt ${attempt}"
+    update_agent_summary \
+      "$action_outcome" \
+      "scan" \
+      "$label" \
+      "$attempt" \
+      "finished pwnkit ${label} attempt ${attempt} with outcome ${action_outcome}"
     break
   done
 
@@ -1234,6 +1572,7 @@ main() {
   validate_evidence_track
   mkdir -p "$ARTIFACT_DIR"
   printf '%s\n' "$ARTIFACT_DIR" > "$ARTIFACT_DIR/artifact-dir.txt"
+  initialize_observability
 
   PIN_EIDOLON_SESSION=false
   PINNED_EIDOLON_SESSION_ID=""
@@ -1255,9 +1594,57 @@ main() {
   PWNKIT_DIRECT_SCOPE_FILE="$(write_pwnkit_scope_file "direct" "$TARGET_URL")"
   resolve_pwnkit_codex_auth
   write_runner_metadata
+  record_hypothesis \
+    "setup" \
+    "the runner metadata and scope files should be sufficient to explain the scan environment before pwnkit executes" \
+    "high" \
+    "write runner metadata plus per-leg scope files into the artifact directory" \
+    "planned"
+  record_action \
+    "setup" \
+    "write_runner_metadata" \
+    "artifact_dir" \
+    "capture runtime, auth source, scope, and environment details before scanning" \
+    "completed"
+  update_agent_summary \
+    "initialized" \
+    "setup" \
+    "" \
+    "" \
+    "runner metadata and scope files written"
 
   case "$MODE" in
     preflight)
+      record_action \
+        "preflight" \
+        "complete_preflight" \
+        "artifact_dir" \
+        "validate local runner plumbing without executing live scans" \
+        "completed"
+      jq -n \
+        --arg generated_at "$(observability_timestamp)" \
+        --arg metadata_file "$(relative_artifact_path "$ARTIFACT_DIR/pwnkit-runner-metadata.json")" \
+        --arg eidolon_scope "$(relative_artifact_path "$PWNKIT_EIDOLON_SCOPE_FILE")" \
+        --arg direct_scope "$(relative_artifact_path "$PWNKIT_DIRECT_SCOPE_FILE")" \
+        '{
+          schema_version: 1,
+          run_kind: "pwnkit_tool_result",
+          boundary: "scanner_qualification",
+          generated_at: $generated_at,
+          tool: "pwnkit_runner_preflight",
+          status: "completed",
+          metadata_file: $metadata_file,
+          scopes: {
+            eidolon: $eidolon_scope,
+            direct: $direct_scope
+          }
+        }' > "$OBS_TOOL_RESULTS_DIR/preflight.json"
+      update_agent_summary \
+        "preflight_complete" \
+        "preflight" \
+        "" \
+        "" \
+        "preflight completed without executing live scans"
       echo "m3 pwnkit preflight: $ARTIFACT_DIR" >&2
       ;;
     all)
@@ -1275,6 +1662,18 @@ main() {
       exit 2
       ;;
   esac
+
+  local final_status="completed"
+  if [[ "$MODE" == "preflight" ]]; then
+    final_status="preflight_complete"
+  fi
+
+  update_agent_summary \
+    "$final_status" \
+    "finalize" \
+    "" \
+    "" \
+    "runner finished"
 
   echo "artifacts: $ARTIFACT_DIR" >&2
 }

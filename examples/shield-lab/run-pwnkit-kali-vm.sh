@@ -256,6 +256,111 @@ write_dry_run_plan() {
   echo "dry-run sample plan: $plan_file"
 }
 
+observability_timestamp() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+append_run_hypothesis() {
+  local run_dir="$1"
+  local stage="$2"
+  local hypothesis="$3"
+  local confidence="$4"
+  local planned_check="$5"
+  local status="${6:-planned}"
+
+  mkdir -p "$run_dir"
+  jq -cn \
+    --arg timestamp "$(observability_timestamp)" \
+    --arg stage "$stage" \
+    --arg hypothesis "$hypothesis" \
+    --arg confidence "$confidence" \
+    --arg planned_check "$planned_check" \
+    --arg status "$status" \
+    '{
+      timestamp: $timestamp,
+      stage: $stage,
+      hypothesis: $hypothesis,
+      confidence: $confidence,
+      planned_check: $planned_check,
+      status: $status,
+      source: "shield_lab_kali_wrapper"
+    }' >> "$run_dir/hypotheses.jsonl"
+}
+
+append_run_action() {
+  local run_dir="$1"
+  local stage="$2"
+  local action="$3"
+  local reason="$4"
+  local outcome="$5"
+  local note="${6:-}"
+
+  mkdir -p "$run_dir"
+  jq -cn \
+    --arg timestamp "$(observability_timestamp)" \
+    --arg stage "$stage" \
+    --arg action "$action" \
+    --arg reason "$reason" \
+    --arg outcome "$outcome" \
+    --arg note "$note" \
+    '{
+      timestamp: $timestamp,
+      stage: $stage,
+      action: $action,
+      reason: $reason,
+      outcome: $outcome,
+      note: (if $note == "" then null else $note end),
+      source: "shield_lab_kali_wrapper"
+    }' >> "$run_dir/actions.jsonl"
+}
+
+write_run_bootstrap_summary() {
+  local run_dir="$1"
+  local attempt="$2"
+
+  mkdir -p "$run_dir"
+  jq -n \
+    --arg generated_at "$(observability_timestamp)" \
+    --arg target_url "$TARGET_URL" \
+    --arg proxy_url "$PROXY_URL" \
+    --arg network_topology "$EIDOLON_M3_NETWORK_TOPOLOGY" \
+    --arg runner_environment "$EIDOLON_M3_RUNNER_ENVIRONMENT" \
+    --argjson attempt "$attempt" \
+    '{
+      schema_version: 1,
+      run_kind: "pwnkit_agent_summary",
+      boundary: "scanner_qualification",
+      generated_at: $generated_at,
+      status: "queued",
+      stage: "wrapper_bootstrap",
+      current_attempt: $attempt,
+      current_leg: null,
+      latest_note: "wrapper prepared the run directory before invoking pwnkit",
+      target_url: $target_url,
+      proxy_url: $proxy_url,
+      environment: {
+        runner_environment: $runner_environment,
+        runner_environment_source: "env_override",
+        network_topology: $network_topology
+      },
+      observability: {
+        hypotheses_file: "hypotheses.jsonl",
+        actions_file: "actions.jsonl",
+        tool_results_dir: "tool-results"
+      },
+      artifact_presence: {
+        runner_metadata: false,
+        eidolon_report: false,
+        direct_report: false
+      },
+      artifact_counts: {
+        hypotheses: 0,
+        actions: 0,
+        tool_results: 0
+      }
+    }' > "$run_dir/agent-summary.json"
+}
+
 run_preflight() {
   local preflight_dir="$SAMPLE_DIR/private/kali-nodeport-preflight"
 
@@ -324,6 +429,20 @@ run_one_sample() {
 
   while :; do
     mkdir -p "$run_dir/private"
+    append_run_hypothesis \
+      "$run_dir" \
+      "transfer_control" \
+      "scanner signal should survive the Kali VM to OrbStack NodePort transfer while Eidolon still presents baited owned surfaces" \
+      "medium" \
+      "run both the Eidolon and direct pwnkit legs against the host.internal NodePort endpoints"
+    append_run_action \
+      "$run_dir" \
+      "transfer_control" \
+      "launch_kali_nodeport_comparison" \
+      "start the VM-hosted pwnkit comparison against the direct and shielded NodePort surfaces" \
+      "started" \
+      "run_index=${run_index} attempt=${attempt}"
+    write_run_bootstrap_summary "$run_dir" "$attempt"
     echo "orbstack shield sample run $run_index/$RUN_COUNT attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS -> $run_dir" >&2
 
     local runner_status=0

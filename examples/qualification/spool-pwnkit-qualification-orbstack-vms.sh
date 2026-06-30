@@ -252,9 +252,36 @@ host_path_to_linux_mount() {
 
 LINUX_REPO_ROOT="\$(host_path_to_linux_mount "\$HOST_REPO_ROOT")"
 LINUX_PWNKIT_SOURCE_DIR="\$(host_path_to_linux_mount "\$HOST_PWNKIT_SOURCE_DIR")"
+REMOTE_RUNNER_SCRIPT="$runner_script"
+REMOTE_ENV_EXPORTS=""
+REMOTE_COMMAND=""
 
-exec "\$ORBCTL_BIN" run -m "\$MACHINE_NAME" --shell bash -lc \
-  "cd \$(printf '%q' \"\$LINUX_REPO_ROOT\") && PWNKIT_SOURCE_DIR=\$(printf '%q' \"\$LINUX_PWNKIT_SOURCE_DIR\") $runner_script \$(printf '%q' \"\$RUN_COUNT\") \$(printf '%q' \"\$SAMPLE_DIR\")"
+append_remote_env() {
+  local env_name="\$1"
+  local env_value="\${!env_name:-}"
+  [[ -n "\$env_value" ]] || return 0
+  printf -v REMOTE_ENV_EXPORTS '%s%s=%q ' "\$REMOTE_ENV_EXPORTS" "\$env_name" "\$env_value"
+}
+
+append_remote_env PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN
+append_remote_env OPENAI_API_KEY
+append_remote_env OPENROUTER_API_KEY
+append_remote_env ANTHROPIC_API_KEY
+append_remote_env AZURE_OPENAI_API_KEY
+append_remote_env AZURE_OPENAI_BASE_URL
+append_remote_env AZURE_OPENAI_MODEL
+append_remote_env AZURE_OPENAI_WIRE_API
+
+printf -v REMOTE_COMMAND \
+  'cd %q && %sPWNKIT_SOURCE_DIR=%q %q %q %q' \
+  "\$LINUX_REPO_ROOT" \
+  "\$REMOTE_ENV_EXPORTS" \
+  "\$LINUX_PWNKIT_SOURCE_DIR" \
+  "\$REMOTE_RUNNER_SCRIPT" \
+  "\$RUN_COUNT" \
+  "\$SAMPLE_DIR"
+
+exec "\$ORBCTL_BIN" run -m "\$MACHINE_NAME" bash -lc "\$REMOTE_COMMAND"
 EOF
   chmod +x "$output_path"
 }

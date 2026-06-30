@@ -107,6 +107,7 @@ test_dry_run_writes_manifest_and_helper_scripts() {
   rg -q 'examples/shield-lab/run-pwnkit-kali-vm.sh' "$output_dir/run-kali_vm_to_orbstack_nodeport.sh"
   rg -q 'HOST_PWNKIT_SOURCE_DIR="\$\{PWNKIT_SOURCE_DIR:-/Users/tester/Projects/pwnkit\}"' "$output_dir/run-kali_vm_same_vm_loopback.sh"
   rg -q 'LINUX_PWNKIT_SOURCE_DIR="\$\(host_path_to_linux_mount "\$HOST_PWNKIT_SOURCE_DIR"\)"' "$output_dir/run-kali_vm_same_vm_loopback.sh"
+  rg -q 'append_remote_env PWNKIT_CHATGPT_OAUTH_REFRESH_TOKEN' "$output_dir/run-kali_vm_to_orbstack_nodeport.sh"
   rg -q 'deploy the Shield lab on the macOS host' "$output_dir/vm-spool-manifest.json"
 }
 

@@ -11,6 +11,7 @@ HOST_OUTPUT_DIR="$TMP_ROOT/host-output"
 HOST_BUNDLE_DIR="$TMP_ROOT/host-bundle"
 EDGE_DECISIONS_PATH="$TMP_ROOT/edge-decisions.json"
 mkdir -p "$VM_SAMPLE_DIR/run-1"
+mkdir -p "$VM_SAMPLE_DIR/run-1/tool-results"
 mkdir -p "$HOST_BUNDLE_DIR"
 
 cat > "$VM_SAMPLE_DIR/pwnkit-stability-sample.json" <<'JSON'
@@ -20,6 +21,26 @@ JSON
 cat > "$VM_SAMPLE_DIR/run-1/pwnkit-summary.json" <<'JSON'
 {"run_id":"run-1","eidolon_findings":1}
 JSON
+
+cat > "$VM_SAMPLE_DIR/run-1/hypotheses.jsonl" <<'JSONL'
+{"hypothesis":"signal survives transfer"}
+JSONL
+
+cat > "$VM_SAMPLE_DIR/run-1/actions.jsonl" <<'JSONL'
+{"action":"launch_pwnkit_scan"}
+JSONL
+
+cat > "$VM_SAMPLE_DIR/run-1/agent-summary.json" <<'JSON'
+{"status":"running","artifact_counts":{"tool_results":1}}
+JSON
+
+cat > "$VM_SAMPLE_DIR/run-1/tool-results/pwnkit-eidolon-attempt-1.json" <<'JSON'
+{"tool":"pwnkit","label":"eidolon","status":"running"}
+JSON
+
+cat > "$VM_SAMPLE_DIR/run-1/pwnkit-eidolon.stderr.log" <<'LOG'
+stderr line
+LOG
 
 cat > "$HOST_BUNDLE_DIR/README.md" <<'MD'
 # Host bundle
@@ -63,6 +84,11 @@ ORB_BIN="$ORB_STUB" \
 
 test -f "$HOST_OUTPUT_DIR/pwnkit-stability-sample.json"
 test -f "$HOST_OUTPUT_DIR/run-1/pwnkit-summary.json"
+test -f "$HOST_OUTPUT_DIR/run-1/hypotheses.jsonl"
+test -f "$HOST_OUTPUT_DIR/run-1/actions.jsonl"
+test -f "$HOST_OUTPUT_DIR/run-1/agent-summary.json"
+test -f "$HOST_OUTPUT_DIR/run-1/tool-results/pwnkit-eidolon-attempt-1.json"
+test -f "$HOST_OUTPUT_DIR/run-1/pwnkit-eidolon.stderr.log"
 test -f "$HOST_OUTPUT_DIR/README.md"
 grep -q 'pwnkit-stability-sample.json' "$HOST_OUTPUT_DIR/README.md"
 grep -q 'run-1/pwnkit-summary.json' "$HOST_OUTPUT_DIR/README.md"
@@ -79,4 +105,6 @@ LOCAL_OUTPUT_DIR="$TMP_ROOT/host-output-local"
 
 test -f "$LOCAL_OUTPUT_DIR/pwnkit-stability-sample.json"
 test -f "$LOCAL_OUTPUT_DIR/run-1/pwnkit-summary.json"
+test -f "$LOCAL_OUTPUT_DIR/run-1/hypotheses.jsonl"
+test -f "$LOCAL_OUTPUT_DIR/run-1/tool-results/pwnkit-eidolon-attempt-1.json"
 grep -q 'host_bundle_dir' "$LOCAL_OUTPUT_DIR/README.md"

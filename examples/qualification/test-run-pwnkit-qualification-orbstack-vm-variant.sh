@@ -215,6 +215,8 @@ test_runner_spools_executes_collects_and_refreshes() {
     and .variant_id == "kali_transfer"
     and .machine_name == "eidolon-qual-kali-orbstack"
     and .run_count == 2
+    and (.observability.watcher_script | endswith("/examples/qualification/watch-pwnkit-qualification-vm-run.sh"))
+    and .observability.vm_sample_dir == "/tmp/eidolon-pwnkit-qualification-kali-orbstack"
   ' "$matrix_dir/kali_transfer/vm-run-manifest.json" >/dev/null
 }
 

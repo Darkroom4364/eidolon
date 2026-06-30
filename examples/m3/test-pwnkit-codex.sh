@@ -434,6 +434,21 @@ test_preflight_writes_metadata_and_scopes_without_scan() {
     and .pwnkit.scopes.eidolon.in_scope == ["127.0.0.1"]
     and .pwnkit.scopes.direct.in_scope == ["127.0.0.1"]
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+  [[ -f "$artifact/hypotheses.jsonl" ]]
+  [[ -f "$artifact/actions.jsonl" ]]
+  [[ -f "$artifact/agent-summary.json" ]]
+  [[ -f "$artifact/tool-results/preflight.json" ]]
+  jq -e '
+    .status == "preflight_complete"
+    and .artifact_presence.runner_metadata == true
+    and .artifact_counts.hypotheses >= 1
+    and .artifact_counts.actions >= 2
+    and .artifact_counts.tool_results >= 1
+  ' "$artifact/agent-summary.json" >/dev/null
+  jq -e '
+    .tool == "pwnkit_runner_preflight"
+    and .status == "completed"
+  ' "$artifact/tool-results/preflight.json" >/dev/null
 }
 
 test_preflight_accepts_orbstack_nodeport_topology_and_non_loopback_scope() {
@@ -456,6 +471,39 @@ test_preflight_accepts_orbstack_nodeport_topology_and_non_loopback_scope() {
     and .pwnkit.scopes.eidolon.in_scope == ["host.internal"]
     and .pwnkit.scopes.direct.in_scope == ["host.internal"]
   ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
+}
+
+test_direct_run_writes_observability_trace_files() {
+  local repo
+  local artifact
+  repo="$(new_temp_dir)"
+  artifact="$(new_temp_dir)"
+  init_fake_pwnkit_checkout "$repo"
+
+  EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    PWNKIT_NODE_ENTRY="$repo/dist/pwnkit.js" \
+    "$RUNNER" direct "$artifact" >/dev/null
+
+  [[ -f "$artifact/hypotheses.jsonl" ]]
+  [[ -f "$artifact/actions.jsonl" ]]
+  [[ -f "$artifact/agent-summary.json" ]]
+  [[ -f "$artifact/tool-results/pwnkit-direct-attempt-1.json" ]]
+  jq -e '
+    .status == "completed"
+    and .artifact_presence.direct_report == true
+    and .artifact_presence.eidolon_report == false
+    and .artifact_counts.hypotheses >= 2
+    and .artifact_counts.actions >= 2
+    and .artifact_counts.tool_results >= 1
+  ' "$artifact/agent-summary.json" >/dev/null
+  jq -e '
+    .tool == "pwnkit"
+    and .label == "direct"
+    and .attempt == 1
+    and .status == "completed"
+    and .report_valid == true
+  ' "$artifact/tool-results/pwnkit-direct-attempt-1.json" >/dev/null
 }
 
 test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret() {
@@ -1117,6 +1165,7 @@ test_rejects_invalid_pwnkit_heartbeat_seconds
 test_source_checkout_metadata_records_dirty_worktree
 test_preflight_writes_metadata_and_scopes_without_scan
 test_preflight_accepts_orbstack_nodeport_topology_and_non_loopback_scope
+test_direct_run_writes_observability_trace_files
 test_auto_loads_fresh_codex_access_token_from_auth_file_without_recording_secret
 test_auto_loaded_codex_access_token_stays_out_of_process_args
 test_emits_sanitized_heartbeat_while_scan_is_running

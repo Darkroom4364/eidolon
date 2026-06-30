@@ -209,6 +209,7 @@ write_vm_run_manifest() {
     --arg vm_sample_dir "$VM_SAMPLE_DIR" \
     --arg host_bundle_dir "$HOST_BUNDLE_DIR" \
     --arg edge_decisions_path "$EDGE_DECISIONS_PATH" \
+    --arg watcher_script "$REPO_ROOT/examples/qualification/watch-pwnkit-qualification-vm-run.sh" \
     '{
       schema_version: 1,
       run_kind: "pwnkit_qualification_orbstack_vm_variant_run",
@@ -223,6 +224,10 @@ write_vm_run_manifest() {
       runner_kind: $runner_kind,
       run_count: ($run_count | tonumber),
       vm_sample_dir: $vm_sample_dir,
+      observability: {
+        watcher_script: $watcher_script,
+        vm_sample_dir: $vm_sample_dir
+      },
       host_bundle_dir: (if $host_bundle_dir == "" then null else $host_bundle_dir end),
       edge_decisions_path: (if $edge_decisions_path == "" then null else $edge_decisions_path end)
     }' > "$VARIANT_DIR/vm-run-manifest.json"

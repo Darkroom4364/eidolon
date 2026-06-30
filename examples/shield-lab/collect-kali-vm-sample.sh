@@ -66,8 +66,16 @@ copy_sample_tree() {
       find . -maxdepth 2 -type f \
         \( -path './run-*/pwnkit-summary.json' \
         -o -path './run-*/pwnkit-direct.json' \
-        -o -path './run-*/pwnkit-eidolon.json' \) \
+        -o -path './run-*/pwnkit-eidolon.json' \
+        -o -path './run-*/pwnkit-direct.stdout.log' \
+        -o -path './run-*/pwnkit-direct.stderr.log' \
+        -o -path './run-*/pwnkit-eidolon.stdout.log' \
+        -o -path './run-*/pwnkit-eidolon.stderr.log' \
+        -o -path './run-*/hypotheses.jsonl' \
+        -o -path './run-*/actions.jsonl' \
+        -o -path './run-*/agent-summary.json' \) \
         -print0 >> "$manifest"
+      find . -maxdepth 3 -type f -path './run-*/tool-results/*.json' -print0 >> "$manifest"
       tar --null -T "$manifest" -cf -
     ) | tar -xf - -C "$host_output_dir"
     rm -f "$manifest"
@@ -88,8 +96,16 @@ printf '%s\0' './pwnkit-stability-sample.json' > \"\$manifest\"
 find . -maxdepth 2 -type f \\
   \\( -path './run-*/pwnkit-summary.json' \\
   -o -path './run-*/pwnkit-direct.json' \\
-  -o -path './run-*/pwnkit-eidolon.json' \\) \\
+  -o -path './run-*/pwnkit-eidolon.json' \\
+  -o -path './run-*/pwnkit-direct.stdout.log' \\
+  -o -path './run-*/pwnkit-direct.stderr.log' \\
+  -o -path './run-*/pwnkit-eidolon.stdout.log' \\
+  -o -path './run-*/pwnkit-eidolon.stderr.log' \\
+  -o -path './run-*/hypotheses.jsonl' \\
+  -o -path './run-*/actions.jsonl' \\
+  -o -path './run-*/agent-summary.json' \\) \\
   -print0 >> \"\$manifest\"
+find . -maxdepth 3 -type f -path './run-*/tool-results/*.json' -print0 >> \"\$manifest\"
 tar --null -T \"\$manifest\" -cf -
 " | tar -xf - -C "$host_output_dir"
 }
