@@ -652,7 +652,10 @@ mod tests {
             route_request(TargetProfile::Default, &Request::for_test("GET", "/docs")).status,
             200
         );
-        let openapi = route_request(TargetProfile::Default, &Request::for_test("GET", "/openapi.json"));
+        let openapi = route_request(
+            TargetProfile::Default,
+            &Request::for_test("GET", "/openapi.json"),
+        );
         assert_eq!(openapi.status, 200);
         assert!(openapi.body.contains(r#""openapi": "3.0.3""#));
         assert!(openapi.body.contains("/api/v1/imports"));
@@ -661,12 +664,17 @@ mod tests {
 
     #[test]
     fn project_routes_return_synthetic_data() {
-        let list = route_request(TargetProfile::Default, &Request::for_test("GET", "/api/v1/projects"));
+        let list = route_request(
+            TargetProfile::Default,
+            &Request::for_test("GET", "/api/v1/projects"),
+        );
         assert_eq!(list.status, 200);
         assert!(list.body.contains("Alpha Migration"));
 
-        let detail =
-            route_request(TargetProfile::Default, &Request::for_test("GET", "/api/v1/projects/alpha"));
+        let detail = route_request(
+            TargetProfile::Default,
+            &Request::for_test("GET", "/api/v1/projects/alpha"),
+        );
         assert_eq!(detail.status, 200);
         assert!(detail.body.contains(r#""id":"alpha""#));
     }
