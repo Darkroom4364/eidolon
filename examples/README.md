@@ -197,6 +197,15 @@ The initial matrix reuses existing runners:
 - `examples/m3/run-pwnkit-kali-vm.sh`
 - `examples/shield-lab/run-pwnkit-kali-vm.sh`
 
+To turn the matrix `vm-spool-plan.json` into real OrbStack Kali machines plus
+host-side helper scripts for the mapped VM wrappers:
+
+```sh
+examples/qualification/spool-pwnkit-qualification-orbstack-vms.sh \
+  /tmp/eidolon-pwnkit-qualification/vm-spool-plan.json \
+  /tmp/eidolon-pwnkit-vm-spool
+```
+
 ## M3 pwnkit Codex Bakeoff
 
 With the demo target and Eidolon proxy running, collect a pwnkit Codex run
