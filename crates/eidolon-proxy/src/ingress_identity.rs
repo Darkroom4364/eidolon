@@ -1838,6 +1838,25 @@ mod tests {
             .reason,
             AuthenticatedIngressRuleRejectionReason::PathMismatch
         );
+
+        let method_mismatch = resolver.evaluate_authenticated(
+            &identity,
+            &IngressAdvisorySignals {
+                verified_category: Some("Search Engine".to_string()),
+                ..IngressAdvisorySignals::default()
+            },
+            "POST",
+            "/docs",
+        );
+        assert!(method_mismatch.resolved.is_none());
+        assert_eq!(
+            must_some(
+                method_mismatch.rule_rejection,
+                "method mismatch should be recorded",
+            )
+            .reason,
+            AuthenticatedIngressRuleRejectionReason::MethodMismatch
+        );
     }
 
     #[test]
@@ -2052,6 +2071,52 @@ mod tests {
             .reason,
             AuthenticatedIngressRuleRejectionReason::Expired
         );
+    }
+
+    #[test]
+    fn authenticated_entries_record_no_matching_rule_for_strong_identity_without_candidate() {
+        let resolver = must_ok(
+            parse_ingress_identity_resolver(
+                r#"{
+                  "schema_version": 1,
+                  "authenticated_entries": [
+                    {
+                      "label": "docs-signed-agent",
+                      "source": "verified_bot",
+                      "trust_tier": "edge_verified",
+                      "methods": ["GET"],
+                      "path_prefixes": ["/docs"]
+                    }
+                  ]
+                }"#,
+            ),
+            "config should parse",
+        );
+
+        let no_matching_rule = resolver.evaluate_authenticated(
+            &IngressIdentity {
+                source: IngressIdentitySource::SignedAgent,
+                trust_tier: IngressTrustTier::SignedAttested,
+                label: Some("different-signed-agent".to_string()),
+                not_before: None,
+                expires_at: None,
+            },
+            &IngressAdvisorySignals::default(),
+            "GET",
+            "/health",
+        );
+        assert!(no_matching_rule.resolved.is_none());
+        let rejection = must_some(
+            no_matching_rule.rule_rejection,
+            "no-matching-rule rejection should be recorded",
+        );
+        assert_eq!(
+            rejection.reason,
+            AuthenticatedIngressRuleRejectionReason::NoMatchingRule
+        );
+        assert_eq!(rejection.label.as_deref(), Some("different-signed-agent"));
+        assert!(rejection.path_prefixes.is_empty());
+        assert!(rejection.methods.is_empty());
     }
 
     #[test]
