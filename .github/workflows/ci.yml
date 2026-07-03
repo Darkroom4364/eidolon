@@ -102,3 +102,27 @@ jobs:
               sha256sum -c SHA256SUMS
             )
           done
+
+  shield-lab-k8s:
+    name: Shield lab k8s
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.31.0
+
+      - name: Install fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ripgrep
+
+      - name: Validate shield-lab manifests
+        run: examples/shield-lab/validate-k8s-manifests.sh
+
+      - name: Run kind deploy fixture test
+        run: examples/shield-lab/test-deploy-kind.sh
