@@ -126,3 +126,10 @@ jobs:
 
       - name: Run kind deploy fixture test
         run: examples/shield-lab/test-deploy-kind.sh
+
+      - name: Run authenticated trusted-ingress fixture tests
+        run: |
+          bash examples/shield-lab/test-smoke-trusted-ingress-explicit-rule-orbstack.sh
+          bash examples/shield-lab/test-smoke-trusted-ingress-expired-claim-orbstack.sh
+          bash examples/shield-lab/test-smoke-trusted-ingress-explicit-method-gate-orbstack.sh
+          bash examples/shield-lab/test-smoke-trusted-ingress-explicit-path-gate-orbstack.sh

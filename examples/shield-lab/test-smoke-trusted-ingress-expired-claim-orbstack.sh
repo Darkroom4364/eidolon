@@ -12,10 +12,11 @@ write_fixture_state() {
   local dir="$1"
 
   cat > "$dir/events.jsonl" <<'JSONL'
-{"schema_version":2,"id":"11111111-1111-1111-1111-111111111111","session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","observed_at":"2026-06-13T19:00:01Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"GET","path":"/openapi.json","safe_headers":[],"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"expired-orbstack-smoke","expires_at":"2000-01-01T00:00:00Z"},"routing_decision":"protected_upstream"}}
+{"schema_version":2,"id":"11111111-1111-1111-1111-111111111111","session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","observed_at":"2026-06-13T19:00:01Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"GET","path":"/openapi.json","safe_headers":[],"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"expired-orbstack-smoke","expires_at":"2000-01-01T00:00:00Z"},"authenticated_ingress_rule_rejection":{"label":"expired-orbstack-smoke","source":"signed_agent","trust_tier":"signed_attested","expires_at":"2000-01-01T00:00:00Z","methods":["GET"],"path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"reason":"expired"},"routing_decision":"protected_upstream"}}
 JSONL
 
   cat > "$dir/debug.jsonl" <<'JSONL'
+{"event":"request_received","fields":{"authenticated_ingress_rule_rejection":{"label":"expired-orbstack-smoke","reason":"expired"}},"observed_at_unix_ms":1781290801000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
 {"event":"surface_action_selected","fields":{"candidate_surface_action":{"type":"rewritten_upstream"},"surface_action":{"type":"rewritten_upstream"},"trusted_ingress_softened_surface":false,"trusted_ingress_softening_reason":null},"observed_at_unix_ms":1781290801001,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
 JSONL
 }

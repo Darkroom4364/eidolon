@@ -200,6 +200,9 @@ mismatched_surface_debug="$(
 jq -e '
   (.kind.ingress_identity.source // "") == "signed_agent"
   and (.kind.ingress_identity.trust_tier // "") == "weakly_asserted"
+  and (.kind.authenticated_ingress_rule_rejection.label // "") == "docs-signed-agent"
+  and (.kind.authenticated_ingress_rule_rejection.reason // "") == "label_mismatch"
+  and (.kind.authenticated_ingress_rule_rejection.verified_categories // []) == ["AI Assistant"]
   and (.kind.trusted_ingress_soften_match // null) == null
   and .fields.candidate_surface_action.type == "rewritten_upstream"
   and .fields.surface_action.type == "rewritten_upstream"
@@ -209,5 +212,18 @@ jq -e '
   --argjson debug "$mismatched_surface_debug" \
   '{kind: $event.kind, fields: $debug.fields}')" >/dev/null \
   || fail "mismatched explicit docs session ${mismatched_session_id} did not downgrade and stay baited"
+
+mismatched_request_debug="$(
+  jq -c -e -s \
+    --arg session_id "$mismatched_session_id" '
+      map(select(.session_id == $session_id and .event == "request_received"))
+      | last
+    ' "$debug_file"
+)" || fail "mismatched explicit docs session ${mismatched_session_id} had no request_received debug record"
+
+jq -e '
+  (.fields.authenticated_ingress_rule_rejection.reason // "") == "label_mismatch"
+' <<<"$mismatched_request_debug" >/dev/null \
+  || fail "mismatched explicit docs session ${mismatched_session_id} did not record label_mismatch in request debug output"
 
 echo "trusted-ingress explicit-rule smoke ok: configured session ${matched_session_id} softened /docs, mismatched session ${mismatched_session_id} downgraded to weakly_asserted and stayed baited"

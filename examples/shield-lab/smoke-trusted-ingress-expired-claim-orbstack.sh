@@ -131,6 +131,8 @@ jq -e \
     (.kind.ingress_identity.source // "") == "signed_agent"
     and (.kind.ingress_identity.trust_tier // "") == "weakly_asserted"
     and (.kind.ingress_identity.expires_at // "") == $expires_at
+    and (.kind.authenticated_ingress_rule_rejection.label // "") == "expired-orbstack-smoke"
+    and (.kind.authenticated_ingress_rule_rejection.reason // "") == "expired"
     and (.kind.trusted_ingress_soften_match // null) == null
   ' <<<"$request_event_json" >/dev/null \
   || fail "expired trusted openapi request did not degrade to weakly_asserted without softening"
@@ -148,5 +150,18 @@ jq -e '
   and .fields.trusted_ingress_softened_surface == false
 ' <<<"$surface_debug" >/dev/null \
   || fail "expired trusted openapi session ${session_id} unexpectedly softened the baited surface"
+
+request_debug="$(
+  jq -c -e -s \
+    --arg session_id "$session_id" '
+      map(select(.session_id == $session_id and .event == "request_received"))
+      | last
+    ' "$debug_file"
+)" || fail "expired trusted openapi session ${session_id} had no request_received debug record"
+
+jq -e '
+  (.fields.authenticated_ingress_rule_rejection.reason // "") == "expired"
+' <<<"$request_debug" >/dev/null \
+  || fail "expired trusted openapi session ${session_id} did not record expired in request debug output"
 
 echo "trusted-ingress expired-claim smoke ok: session ${session_id} degraded to weakly_asserted and stayed baited"
