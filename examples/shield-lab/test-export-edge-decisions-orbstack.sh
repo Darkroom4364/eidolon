@@ -22,6 +22,12 @@ write_fixture_state() {
 {"schema_version":2,"id":"88888888-8888-8888-8888-888888888888","session_id":"dddddddd-dddd-dddd-dddd-dddddddddddd","observed_at":"2026-06-05T00:00:46Z","source":"policy_router","policy_state":"observe","kind":{"type":"policy_decision","routing_decision":"rewritten_upstream","reason":"request stayed baited after local allowlist host scope mismatch"}}
 {"schema_version":2,"id":"99999999-9999-9999-9999-999999999999","session_id":"eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee","observed_at":"2026-06-05T00:00:50Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"GET","path":"/docs","safe_headers":[],"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"operator.openai.com"},"authenticated_ingress_rule_rejection":{"label":"signed-agent-docs","source":"signed_agent","trust_tier":"signed_attested","path_prefixes":["/docs"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"methods":["GET"],"reason":"verified_category_mismatch"},"routing_decision":"rewritten_upstream"}}
 {"schema_version":2,"id":"aaaaaaaa-9999-9999-9999-999999999999","session_id":"eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee","observed_at":"2026-06-05T00:00:51Z","source":"policy_router","policy_state":"observe","kind":{"type":"policy_decision","routing_decision":"rewritten_upstream","reason":"signed agent claim stayed baited after authenticated explicit rule category mismatch"}}
+{"schema_version":2,"id":"ffffffff-1111-1111-1111-111111111111","session_id":"ffffffff-ffff-ffff-ffff-ffffffffffff","observed_at":"2026-06-05T00:00:52Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"POST","path":"/docs","safe_headers":[],"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"docs-signed-agent"},"authenticated_ingress_rule_rejection":{"label":"signed-agent-docs","source":"signed_agent","trust_tier":"signed_attested","path_prefixes":["/docs"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"methods":["GET"],"reason":"method_mismatch"},"routing_decision":"rewritten_upstream"}}
+{"schema_version":2,"id":"ffffffff-2222-2222-2222-222222222222","session_id":"ffffffff-ffff-ffff-ffff-ffffffffffff","observed_at":"2026-06-05T00:00:53Z","source":"policy_router","policy_state":"observe","kind":{"type":"policy_decision","routing_decision":"rewritten_upstream","reason":"signed agent claim stayed baited after authenticated explicit rule method mismatch"}}
+{"schema_version":2,"id":"abababab-1111-1111-1111-111111111111","session_id":"abababab-abab-abab-abab-abababababab","observed_at":"2026-06-05T00:00:54Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"GET","path":"/customer/import-recovery-checklist","safe_headers":[],"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"docs-signed-agent"},"authenticated_ingress_rule_rejection":{"label":"signed-agent-docs","source":"signed_agent","trust_tier":"signed_attested","path_prefixes":["/docs"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"methods":["GET"],"reason":"path_mismatch"},"routing_decision":"eidolon_owned"}}
+{"schema_version":2,"id":"abababab-2222-2222-2222-222222222222","session_id":"abababab-abab-abab-abab-abababababab","observed_at":"2026-06-05T00:00:55Z","source":"policy_router","policy_state":"observe","kind":{"type":"policy_decision","routing_decision":"eidolon_owned","reason":"signed agent claim stayed baited after authenticated explicit rule path mismatch"}}
+{"schema_version":2,"id":"12121212-1111-1111-1111-111111111111","session_id":"12121212-1212-1212-1212-121212121212","observed_at":"2026-06-05T00:00:56Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"GET","path":"/openapi.json","safe_headers":[],"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"expired-orbstack-smoke","expires_at":"2000-01-01T00:00:00Z"},"authenticated_ingress_rule_rejection":{"label":"expired-orbstack-smoke","source":"signed_agent","trust_tier":"signed_attested","expires_at":"2000-01-01T00:00:00Z","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"methods":["GET"],"reason":"expired"},"routing_decision":"rewritten_upstream"}}
+{"schema_version":2,"id":"12121212-2222-2222-2222-222222222222","session_id":"12121212-1212-1212-1212-121212121212","observed_at":"2026-06-05T00:00:57Z","source":"policy_router","policy_state":"observe","kind":{"type":"policy_decision","routing_decision":"rewritten_upstream","reason":"signed agent claim stayed baited after authenticated explicit rule expiry"}}
 JSONL
 
   cat > "$dir/cluster-status.json" <<'JSON'
@@ -69,6 +75,12 @@ elif [[ "$session" == "cccccccc-cccc-cccc-cccc-cccccccccccc" ]]; then
     printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:45Z","session_id":"dddddddd-dddd-dddd-dddd-dddddddddddd","request":{"method":"GET","path":"/docs?topic=<redacted>"},"ingress_identity":{"source":"none","trust_tier":"none"},"local_ingress_trust_scope_rejection":{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"user_agent_substrings":["eidolon-docs-crawler"],"hosts":["docs.invalid.eidolon"],"source_cidrs":["192.168.194.1/32"],"required_header_names":["X-Eidolon-Trusted-Actor"],"reason":"host_mismatch"},"policy":{"state":"observe","routing_decision":"rewritten_upstream","reason":"request stayed baited after local allowlist host scope mismatch"},"evidence":{"event_schema_version":2,"event_ids":["77777777-7777-7777-7777-777777777777"],"bundle_ref":"session:dddddddd-dddd-dddd-dddd-dddddddddddd"},"edge_recommendation":{"action":"observe","reason_codes":["rewritten_upstream"]}}'
   elif [[ "$session" == "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee" ]]; then
     printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:50Z","session_id":"eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee","request":{"method":"GET","path":"/docs"},"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"operator.openai.com"},"authenticated_ingress_rule_rejection":{"label":"signed-agent-docs","source":"signed_agent","trust_tier":"signed_attested","path_prefixes":["/docs"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"methods":["GET"],"reason":"verified_category_mismatch"},"policy":{"state":"observe","routing_decision":"rewritten_upstream","reason":"signed agent claim stayed baited after authenticated explicit rule category mismatch"},"evidence":{"event_schema_version":2,"event_ids":["99999999-9999-9999-9999-999999999999"],"bundle_ref":"session:eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"},"edge_recommendation":{"action":"observe","reason_codes":["rewritten_upstream"]}}'
+  elif [[ "$session" == "ffffffff-ffff-ffff-ffff-ffffffffffff" ]]; then
+    printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:52Z","session_id":"ffffffff-ffff-ffff-ffff-ffffffffffff","request":{"method":"POST","path":"/docs"},"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"docs-signed-agent"},"authenticated_ingress_rule_rejection":{"label":"signed-agent-docs","source":"signed_agent","trust_tier":"signed_attested","path_prefixes":["/docs"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"methods":["GET"],"reason":"method_mismatch"},"policy":{"state":"observe","routing_decision":"rewritten_upstream","reason":"signed agent claim stayed baited after authenticated explicit rule method mismatch"},"evidence":{"event_schema_version":2,"event_ids":["ffffffff-1111-1111-1111-111111111111"],"bundle_ref":"session:ffffffff-ffff-ffff-ffff-ffffffffffff"},"edge_recommendation":{"action":"observe","reason_codes":["rewritten_upstream"]}}'
+  elif [[ "$session" == "abababab-abab-abab-abab-abababababab" ]]; then
+    printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:54Z","session_id":"abababab-abab-abab-abab-abababababab","request":{"method":"GET","path":"/customer/import-recovery-checklist"},"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"docs-signed-agent"},"authenticated_ingress_rule_rejection":{"label":"signed-agent-docs","source":"signed_agent","trust_tier":"signed_attested","path_prefixes":["/docs"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"methods":["GET"],"reason":"path_mismatch"},"policy":{"state":"observe","routing_decision":"eidolon_owned","reason":"signed agent claim stayed baited after authenticated explicit rule path mismatch"},"evidence":{"event_schema_version":2,"event_ids":["abababab-1111-1111-1111-111111111111"],"bundle_ref":"session:abababab-abab-abab-abab-abababababab"},"edge_recommendation":{"action":"observe","reason_codes":["eidolon_owned"]}}'
+  elif [[ "$session" == "12121212-1212-1212-1212-121212121212" ]]; then
+    printf '%s\n' '{"contract_version":"2026-06-05.v1","observed_at":"2026-06-05T00:00:56Z","session_id":"12121212-1212-1212-1212-121212121212","request":{"method":"GET","path":"/openapi.json"},"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"expired-orbstack-smoke","expires_at":"2000-01-01T00:00:00Z"},"authenticated_ingress_rule_rejection":{"label":"expired-orbstack-smoke","source":"signed_agent","trust_tier":"signed_attested","expires_at":"2000-01-01T00:00:00Z","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"methods":["GET"],"reason":"expired"},"policy":{"state":"observe","routing_decision":"rewritten_upstream","reason":"signed agent claim stayed baited after authenticated explicit rule expiry"},"evidence":{"event_schema_version":2,"event_ids":["12121212-1111-1111-1111-111111111111"],"bundle_ref":"session:12121212-1212-1212-1212-121212121212"},"edge_recommendation":{"action":"observe","reason_codes":["rewritten_upstream"]}}'
   else
   echo "unexpected session $session" >&2
   exit 1
@@ -100,7 +112,7 @@ test_exports_all_sessions_as_json_array() {
   )"
 
   jq -e '
-    length == 5
+    length == 8
     and any(.[]; .session_id == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
       and .edge_recommendation.action == "allow"
       and .deployment_context.bait_profile_id == "orbstack_default_m3_catalog"
@@ -158,6 +170,12 @@ test_exports_all_sessions_as_json_array() {
       and .authenticated_ingress_rule_rejection.methods == ["GET"]
       and .deployment_context.authenticated_trusted_ingress_rules[0].label == "signed-agent-docs"
       and .deployment_context.authenticated_trusted_ingress_rules[0].verified_categories == ["AI Assistant"])
+    and any(.[]; .session_id == "ffffffff-ffff-ffff-ffff-ffffffffffff"
+      and .authenticated_ingress_rule_rejection.reason == "method_mismatch")
+    and any(.[]; .session_id == "abababab-abab-abab-abab-abababababab"
+      and .authenticated_ingress_rule_rejection.reason == "path_mismatch")
+    and any(.[]; .session_id == "12121212-1212-1212-1212-121212121212"
+      and .authenticated_ingress_rule_rejection.reason == "expired")
   ' <<<"$output" >/dev/null
 }
 
@@ -211,12 +229,12 @@ test_posts_each_export_to_webhook_and_writes_output_file() {
 
   [[ -f "$output_file" ]]
   jq -e '
-    length == 5
+    length == 8
     and .[0].deployment_context.bait_profile_id == "orbstack_default_m3_catalog"
     and .[0].deployment_context.polymorphic_bait_coverage.active_bait_count == 3
     and .[0].deployment_context.trusted_ingress_soften_scopes[0].trust_tier == "allowlisted"
   ' "$output_file" >/dev/null
-  [[ "$(wc -l < "$webhook_log" | tr -d ' ')" -eq 5 ]]
+  [[ "$(wc -l < "$webhook_log" | tr -d ' ')" -eq 8 ]]
   rg -q 'https://collector.example.test/eidolon' "$webhook_log"
   rg -q 'deployment_context' "$webhook_log"
 }
@@ -303,9 +321,14 @@ test_filters_sessions_by_authenticated_rule_rejection_label() {
   )"
 
   jq -e '
-    length == 1
-    and .[0].session_id == "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
-    and .[0].authenticated_ingress_rule_rejection.label == "signed-agent-docs"
+    length == 3
+    and all(.[]; .authenticated_ingress_rule_rejection.label == "signed-agent-docs")
+    and any(.[]; .session_id == "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+      and .authenticated_ingress_rule_rejection.reason == "verified_category_mismatch")
+    and any(.[]; .session_id == "ffffffff-ffff-ffff-ffff-ffffffffffff"
+      and .authenticated_ingress_rule_rejection.reason == "method_mismatch")
+    and any(.[]; .session_id == "abababab-abab-abab-abab-abababababab"
+      and .authenticated_ingress_rule_rejection.reason == "path_mismatch")
   ' <<<"$output" >/dev/null
 }
 
@@ -328,6 +351,72 @@ test_filters_sessions_by_authenticated_rule_rejection_reason() {
     length == 1
     and .[0].session_id == "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
     and .[0].authenticated_ingress_rule_rejection.reason == "verified_category_mismatch"
+  ' <<<"$output" >/dev/null
+}
+
+test_filters_sessions_by_authenticated_rule_rejection_reason_method_mismatch() {
+  local temp_dir state_dir output
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
+      --authenticated-rule-rejection-reason method_mismatch
+  )"
+
+  jq -e '
+    length == 1
+    and .[0].session_id == "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    and .[0].authenticated_ingress_rule_rejection.reason == "method_mismatch"
+  ' <<<"$output" >/dev/null
+}
+
+test_filters_sessions_by_authenticated_rule_rejection_reason_path_mismatch() {
+  local temp_dir state_dir output
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
+      --authenticated-rule-rejection-reason path_mismatch
+  )"
+
+  jq -e '
+    length == 1
+    and .[0].session_id == "abababab-abab-abab-abab-abababababab"
+    and .[0].authenticated_ingress_rule_rejection.reason == "path_mismatch"
+  ' <<<"$output" >/dev/null
+}
+
+test_filters_sessions_by_authenticated_rule_rejection_reason_expired() {
+  local temp_dir state_dir output
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  output="$(
+    EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$EXPORT_SCRIPT" \
+      --authenticated-rule-rejection-reason expired
+  )"
+
+  jq -e '
+    length == 1
+    and .[0].session_id == "12121212-1212-1212-1212-121212121212"
+    and .[0].authenticated_ingress_rule_rejection.reason == "expired"
   ' <<<"$output" >/dev/null
 }
 
@@ -831,6 +920,9 @@ test_filters_sessions_by_min_polymorphic_coverage
 test_filters_sessions_by_latest_mint_outcome
 test_filters_sessions_by_authenticated_rule_rejection_label
 test_filters_sessions_by_authenticated_rule_rejection_reason
+test_filters_sessions_by_authenticated_rule_rejection_reason_method_mismatch
+test_filters_sessions_by_authenticated_rule_rejection_reason_path_mismatch
+test_filters_sessions_by_authenticated_rule_rejection_reason_expired
 test_filters_sessions_by_authenticated_rule_rejection_history_label
 test_filters_sessions_by_authenticated_rule_rejection_history_reason
 test_filters_sessions_by_trusted_soften_label

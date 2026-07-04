@@ -150,7 +150,7 @@ surface_debug="$(
 )" || fail "explicit trusted method-gate session ${session_id} had no surface_action_selected debug record"
 
 jq -e '
-  .fields.surface_action.type == "rewritten_upstream"
+  .fields.surface_action.type == "protected_upstream"
   and .fields.trusted_ingress_softened_surface == false
 ' <<<"$surface_debug" >/dev/null \
   || fail "explicit trusted method-gate session ${session_id} unexpectedly softened the surface"

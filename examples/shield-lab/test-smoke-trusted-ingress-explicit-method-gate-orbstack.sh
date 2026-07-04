@@ -12,12 +12,12 @@ write_fixture_state() {
   local dir="$1"
 
   cat > "$dir/events.jsonl" <<'JSONL'
-{"schema_version":2,"id":"11111111-1111-1111-1111-111111111111","session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","observed_at":"2026-06-20T10:00:01Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"POST","path":"/docs?topic=<redacted>","safe_headers":[],"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"docs-signed-agent"},"authenticated_ingress_rule_rejection":{"label":"docs-signed-agent","source":"signed_agent","trust_tier":"signed_attested","methods":["GET"],"path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"reason":"method_mismatch"},"routing_decision":"rewritten_upstream"}}
+{"schema_version":2,"id":"11111111-1111-1111-1111-111111111111","session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","observed_at":"2026-06-20T10:00:01Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"POST","path":"/docs?topic=<redacted>","safe_headers":[],"ingress_identity":{"source":"signed_agent","trust_tier":"weakly_asserted","label":"docs-signed-agent"},"authenticated_ingress_rule_rejection":{"label":"docs-signed-agent","source":"signed_agent","trust_tier":"signed_attested","methods":["GET"],"path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"reason":"method_mismatch"},"routing_decision":"protected_upstream"}}
 JSONL
 
   cat > "$dir/debug.jsonl" <<'JSONL'
 {"event":"request_received","fields":{"authenticated_ingress_rule_rejection":{"label":"docs-signed-agent","reason":"method_mismatch"}},"observed_at_unix_ms":1781949601000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
-{"event":"surface_action_selected","fields":{"candidate_surface_action":{"type":"rewritten_upstream"},"surface_action":{"type":"rewritten_upstream"},"trusted_ingress_softened_surface":false,"trusted_ingress_softening_reason":null},"observed_at_unix_ms":1781949601001,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+{"event":"surface_action_selected","fields":{"candidate_surface_action":{"type":"protected_upstream"},"surface_action":{"type":"protected_upstream"},"trusted_ingress_softened_surface":false,"trusted_ingress_softening_reason":null},"observed_at_unix_ms":1781949601001,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
 JSONL
 }
 

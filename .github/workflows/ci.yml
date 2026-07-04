@@ -133,3 +133,5 @@ jobs:
           bash examples/shield-lab/test-smoke-trusted-ingress-expired-claim-orbstack.sh
           bash examples/shield-lab/test-smoke-trusted-ingress-explicit-method-gate-orbstack.sh
           bash examples/shield-lab/test-smoke-trusted-ingress-explicit-path-gate-orbstack.sh
+          bash examples/shield-lab/test-smoke-trusted-ingress-explicit-method-export-orbstack.sh
+          bash examples/shield-lab/test-smoke-trusted-ingress-explicit-path-export-orbstack.sh
