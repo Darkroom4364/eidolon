@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "guest_profile": "microvm_min",
+  "description": "Smallest disposable guest profile for scripted pwnkit validation.",
+  "boot_contract": {
+    "snapshot_required": false,
+    "repo_mount_writable": false,
+    "credentials_passthrough": false
+  },
+  "observability": {
+    "serial_console_required": true,
+    "guest_trace_required": true,
+    "heartbeat_required": true
+  },
+  "artifact_contract": {
+    "sample_manifest": "pwnkit-stability-sample.json",
+    "serial_console_log": "serial-console.log"
+  }
+}

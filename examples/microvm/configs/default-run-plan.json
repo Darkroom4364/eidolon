@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "run_kind": "pwnkit_microvm_plan",
+  "boundary": "scanner_validation",
+  "description": "Default dry-run microVM pwnkit contract for disposable guest execution.",
+  "runner_environment": "microvm",
+  "supported_network_topologies": [
+    "microvm_to_orbstack_nodeport",
+    "microvm_isolated_local"
+  ],
+  "supported_hypervisors": [
+    "firecracker",
+    "cloud_hypervisor",
+    "qemu"
+  ],
+  "supported_guest_profiles": [
+    "microvm_min",
+    "microvm_kali_compat"
+  ],
+  "required_run_outputs": [
+    "agent-summary.json",
+    "hypotheses.jsonl",
+    "actions.jsonl",
+    "guest-trace.jsonl",
+    "heartbeat.jsonl",
+    "exit-status.json",
+    "stdout.log",
+    "stderr.log",
+    "serial-console.log",
+    "vm-metadata.json"
+  ],
+  "required_tool_results_dir": "tool-results",
+  "host_side_exports": [
+    "cluster evidence bundle",
+    "edge decisions export"
+  ]
+}

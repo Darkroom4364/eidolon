@@ -216,6 +216,22 @@ examples/qualification/run-pwnkit-qualification-orbstack-vm-variant.sh \
   /tmp/eidolon-pwnkit-vm-spool
 ```
 
+## MicroVM Scaffold
+
+The repo also carries a dry-run-only microVM scaffold for a future disposable
+guest pwnkit path:
+
+```sh
+examples/microvm/run-pwnkit-microvm.sh 1 /tmp/eidolon-microvm-sample
+examples/microvm/fake-guest-runner.sh /tmp/eidolon-microvm-sample/sample-plan.json
+examples/microvm/test-run-pwnkit-microvm.sh
+examples/microvm/test-fake-guest-runner.sh
+examples/microvm/test-collect-microvm-sample.sh
+```
+
+See [microvm/README.md](microvm/README.md) and
+[microvm/microvm-pwnkit.md](microvm/microvm-pwnkit.md).
+
 ## M3 pwnkit Codex Bakeoff
 
 With the demo target and Eidolon proxy running, collect a pwnkit Codex run
