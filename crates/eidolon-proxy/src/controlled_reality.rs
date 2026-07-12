@@ -37,18 +37,19 @@ impl ControlledRealityResponder {
         }
     }
 
-    pub fn fail_closed_response(&self, request: &SurfaceRequestMeta) -> Option<SurfaceResponse> {
-        (is_decoy_write(request)).then(|| {
-            json_response(
-                403,
-                json!({
-                    "status": "blocked",
-                    "synthetic": true,
-                    "reason": "known controlled-reality write path failed closed",
-                    "path": request.path,
-                }),
-            )
-        })
+    pub fn fail_closed_bait_action_response(
+        &self,
+        request: &SurfaceRequestMeta,
+    ) -> SurfaceResponse {
+        json_response(
+            403,
+            json!({
+                "status": "blocked",
+                "synthetic": true,
+                "reason": "configured unsafe bait action failed closed",
+                "path": request.path,
+            }),
+        )
     }
 
     pub fn is_controlled_branch(&self, request: &SurfaceRequestMeta) -> bool {
@@ -87,10 +88,6 @@ pub fn rate_limited_response(retry_after_seconds: u64) -> SurfaceResponse {
         }))
         .expect("static rate-limit JSON should serialize"),
     )
-}
-
-pub fn is_decoy_write(request: &SurfaceRequestMeta) -> bool {
-    request.path == DECOY_RECONCILE_PATH && is_unsafe_method(&request.method)
 }
 
 pub fn is_controlled_branch_path(path: &str) -> bool {
@@ -158,8 +155,10 @@ fn json_response(status: u16, body: serde_json::Value) -> SurfaceResponse {
     )
 }
 
-fn is_unsafe_method(method: &str) -> bool {
-    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+pub fn is_unsafe_method(method: &str) -> bool {
+    !["GET", "HEAD", "OPTIONS", "TRACE"]
+        .iter()
+        .any(|safe_method| method.eq_ignore_ascii_case(safe_method))
 }
 
 #[cfg(test)]
@@ -207,18 +206,25 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_only_handles_known_decoy_write_paths() {
+    fn fail_closed_bait_action_response_is_generic_and_synthetic() {
         let responder = ControlledRealityResponder;
+        let response =
+            responder.fail_closed_bait_action_response(&request("POST", "/custom/unsafe-action"));
 
-        assert!(responder
-            .fail_closed_response(&request("POST", DECOY_RECONCILE_PATH))
-            .is_some());
-        assert!(responder
-            .fail_closed_response(&request("GET", DECOY_RECONCILE_PATH))
-            .is_none());
-        assert!(responder
-            .fail_closed_response(&request("POST", "/api/v1/imports"))
-            .is_none());
+        assert_eq!(response.status, 403);
+        assert!(String::from_utf8(response.body)
+            .expect("body should be utf8")
+            .contains("configured unsafe bait action failed closed"));
+    }
+
+    #[test]
+    fn unsafe_methods_are_case_insensitive() {
+        for method in ["POST", "put", "Patch", "DELETE", "CONNECT", "PROPFIND"] {
+            assert!(is_unsafe_method(method), "{method} should be unsafe");
+        }
+        for method in ["GET", "HEAD", "OPTIONS", "TRACE"] {
+            assert!(!is_unsafe_method(method), "{method} should be safe");
+        }
     }
 
     #[test]
