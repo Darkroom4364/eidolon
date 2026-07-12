@@ -129,6 +129,7 @@ docs/
   architecture.md
   learning-hardness.md
   threat-model.md
+  engineering-operating-policy.md
   mvp-plan.md
   safety.md
   lab.md
@@ -148,8 +149,9 @@ examples/
 
 ## Current Status
 
-M3 and M4 are complete on `main`. Current work is in M5: adaptive bait policy
-and shield hardening.
+M3 is complete on `main`. The core M4 edge-operations slice is merged, but the
+M4 milestone remains open for `#46` and `#47`. Broader M5 feature expansion is
+paused behind the engineering safety gate tracked by `#213`.
 
 The repository already includes:
 
@@ -163,9 +165,13 @@ The repository already includes:
 - an OrbStack shield-lab deployment with live status, evidence export,
   edge-decision export, trusted-ingress smoke checks, and Kali VM validation
 
-The current gap is no longer basic proxy plumbing. The main product work is
-graduated multi-signal policy that keeps ingress identity, advisory risk
-signals, runtime evidence, policy state, and enforcement separate.
+The current priority is closing the documented safety gate by implementing and
+proving fail-closed bait-action routing, correct evidence classification,
+protected session identity, request-linked causality, bounded state, canonical
+request targets, and enforced merge checks.
+
+For the required work order and merge gate, see
+[docs/engineering-operating-policy.md](docs/engineering-operating-policy.md).
 
 For the end-state definition, see [docs/completed-project.md](docs/completed-project.md).
 

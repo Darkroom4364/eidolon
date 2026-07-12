@@ -382,22 +382,42 @@ Status checklist:
   the issue acceptance criteria (`main`)
 - [ ] Broaden the narrow hand-tuned transitions into a more general
   multi-signal aggregation plane
-- [x] Per-session signed polymorphic bait generation now exists on
-  `feature/polymorphic-bait-session-hmac`: HMAC-minted bait values verify
+- [x] Per-session signed polymorphic bait generation exists on `main`:
+  HMAC-minted bait values verify
   deterministically, default OrbStack enables session-minted docs, OpenAPI,
   and service-token surfaces, replay mismatches are audited and exported as
   structured `matched_session_value` versus `session_value_mismatch`
   outcomes, operator exports can filter by minted coverage and latest outcome,
   and the remaining hidden-route and JS-helper bait classes stay static as
   explicit negative controls
-  (`current branch only`)
+  (`main`)
 - [ ] Expand deployment-safe allowlists and verified crawler handling beyond
   the current trusted-ingress slice; per-entry local allowlist
   `bait_soften_path_prefixes` now exist on `main` and optional per-entry
   `source_cidrs`, `hosts`, stale-claim freshness handling, optional
   `not_before` rollout windows, and
-  `user_agent_substrings` now exist on `main` as narrower deployment-safe
-  trust primitives, while `feature/trusted-ingress-explicit-rules` adds
-  request-scoped `authenticated_entries` for transport-authenticated strong
-  explicit claims such as `signed_agent`
+  `user_agent_substrings` and request-scoped `authenticated_entries` now exist
+  on `main` as narrower deployment-safe trust primitives for
+  transport-authenticated strong explicit claims such as `signed_agent`
 - [ ] Prepare the external-readiness note and release checklist
+
+## Active Engineering Safety Gate
+
+GitHub issue `#213` is the governing priority. Until it closes with merged
+adversarial regression coverage, the project does not prioritize additional
+policy states, bait or controlled-reality breadth, trust variants, benchmark
+expansion, microVM execution, telemetry expansion, or export sealing.
+Automated repository enforcement remains incomplete and is tracked by `#214`.
+
+The execution order is:
+
+1. Complete `#208` as a small PR series, beginning with Eidolon ownership of
+   every configured unsafe bait-action shape before proof validation.
+2. Complete `#209` so rejected observations remain visible facts without
+   confirmed-chain scoring.
+3. Design `#207` together with the lifetime, rotation, and bounded-storage
+   requirements in `#211`.
+4. Define `#212` canonical request-target semantics before freezing the `#210`
+   request-level event contract.
+5. Finish `#211`, `#212`, and repository-wide enforcement in `#214` before
+   resuming feature expansion.
