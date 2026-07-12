@@ -144,6 +144,18 @@ impl BaitRegistry {
         self.baits.iter().find(|bait| bait.bait_class == bait_class)
     }
 
+    /// Returns whether the configured catalog contains this method and path.
+    ///
+    /// Ownership deliberately ignores proof headers and values. Callers use
+    /// this before proof validation so a rejected decoy action cannot fall
+    /// through to a protected upstream.
+    pub fn matches_action_route(&self, method: &str, path: &str) -> bool {
+        self.baits.iter().any(|bait| {
+            bait.expected_action.method.eq_ignore_ascii_case(method)
+                && bait.expected_action.path == path
+        })
+    }
+
     /// Returns the first registered bait whose expected action matches the request.
     ///
     /// `path` must be the normalized request path without a query string. Query
@@ -441,6 +453,23 @@ mod tests {
         );
 
         assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn action_route_matching_ignores_proof_headers_and_values() {
+        let registry = demo_registry();
+
+        assert!(registry.matches_action_route("POST", DECOY_RECONCILE_PATH));
+        assert!(registry.matches_action_route("post", DECOY_RECONCILE_PATH));
+        assert!(!registry.matches_action_route("GET", DECOY_RECONCILE_PATH));
+        assert!(!registry.matches_action_route("POST", "/api/v2/import/reconcile/"));
+    }
+
+    #[test]
+    fn shared_action_route_is_owned_without_selecting_a_bait() {
+        let registry = BaitRegistry::m3_catalog();
+
+        assert!(registry.matches_action_route("POST", DECOY_RECONCILE_PATH));
     }
 
     #[test]

@@ -21,9 +21,9 @@ use eidolon_core::{
 };
 use eidolon_proxy::{
     controlled_reality::{
-        rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
-        DECOY_RECONCILE_PATH, DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY,
-        MAX_CONTROLLED_REALITY_ACTION_DEPTH, MAX_TARPIT_DELAY,
+        is_unsafe_method, rate_limited_response, ControlledRealityConfig,
+        ControlledRealityResponder, DECOY_RECONCILE_PATH, DEFAULT_RETRY_AFTER_SECONDS,
+        DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH, MAX_TARPIT_DELAY,
     },
     debug_log::FileDebugLogWriter,
     event_log::FileEventLogWriter,
@@ -1976,6 +1976,10 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
     let path = normalized_event_path(&request)?;
     let surface_request = surface_request_meta(&request, &path);
+    let owns_configured_unsafe_bait_action = is_unsafe_method(&request.method)
+        && runtime
+            .bait_registry
+            .matches_action_route(&request.method, &surface_request.path);
     let session = effective_session_context(runtime, &request, &surface_request, client_peer_ip);
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
     let starting_policy_state = policy_state;
@@ -2191,43 +2195,41 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         }),
     )?;
 
-    if !intervention_mode.interventions_enabled() {
-        if let Some(response) = runtime
+    if !intervention_mode.interventions_enabled() && owns_configured_unsafe_bait_action {
+        let response = runtime
             .controlled_reality
-            .fail_closed_response(&surface_request)
-        {
-            write_debug(
-                runtime,
-                "interventions_disabled_fail_closed",
-                Some(session.session_id),
-                json!({
-                    "method": request.method.as_str(),
-                    "path": debug_path(&surface_request.path),
-                    "query_present": surface_request.query.is_some(),
-                    "response_status": response.status,
-                    "response_body_len": response.body.len(),
-                }),
-            )?;
-            let decision = policy::PolicyDecision::new(
-                policy_state,
-                RoutingDecision::EidolonOwned,
-                "interventions disabled; known controlled-reality write path failed closed",
-            );
+            .fail_closed_bait_action_response(&surface_request);
+        write_debug(
+            runtime,
+            "interventions_disabled_fail_closed",
+            Some(session.session_id),
+            json!({
+                "method": request.method.as_str(),
+                "path": debug_path(&surface_request.path),
+                "query_present": surface_request.query.is_some(),
+                "response_status": response.status,
+                "response_body_len": response.body.len(),
+            }),
+        )?;
+        let decision = policy::PolicyDecision::new(
+            policy_state,
+            RoutingDecision::EidolonOwned,
+            "interventions disabled; configured unsafe bait action failed closed",
+        );
 
-            return write_direct_response(DirectResponseContext {
-                client_stream,
-                runtime,
-                session: &session,
-                request: &request,
-                path: &path,
-                decision: &decision,
-                discovery_recon_score,
-                discovery_recon_threshold,
-                response,
-                intervention_mode,
-                surface_requested_intervention: true,
-            });
-        }
+        return write_direct_response(DirectResponseContext {
+            client_stream,
+            runtime,
+            session: &session,
+            request: &request,
+            path: &path,
+            decision: &decision,
+            discovery_recon_score,
+            discovery_recon_threshold,
+            response,
+            intervention_mode,
+            surface_requested_intervention: true,
+        });
     }
 
     let mut decision = policy::decide_for_state(policy_state, intervention_mode);
@@ -2433,7 +2435,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     }
 
     if intervention_mode.interventions_enabled()
-        && (matches!(&surface_action, SurfaceAction::ProtectedUpstream)
+        && (surface_action_can_reach_upstream(&surface_action)
             || (decision.policy_state == PolicyState::RateLimited
                 && matches!(&surface_action, SurfaceAction::RateLimited { .. })))
     {
@@ -2582,7 +2584,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     }
 
     if intervention_mode.interventions_enabled()
-        && matches!(&surface_action, SurfaceAction::ProtectedUpstream)
+        && surface_action_can_reach_upstream(&surface_action)
     {
         if let Some(action_shape_match) = runtime.bait_registry.match_action_shape(
             &request.method,
@@ -2740,6 +2742,40 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 });
             }
         }
+    }
+
+    if owns_configured_unsafe_bait_action && surface_action_can_reach_upstream(&surface_action) {
+        let rejected_decision = policy::PolicyDecision::new(
+            decision.policy_state,
+            RoutingDecision::EidolonOwned,
+            "configured unsafe bait action failed closed after proof rejection",
+        );
+        write_debug(
+            runtime,
+            "bait_action_rejected_fail_closed",
+            Some(session.session_id),
+            json!({
+                "method": request.method.as_str(),
+                "path": debug_path(&surface_request.path),
+                "query_present": surface_request.query.is_some(),
+                "response_status": 403,
+            }),
+        )?;
+        return write_direct_response(DirectResponseContext {
+            client_stream,
+            runtime,
+            session: &session,
+            request: &request,
+            path: &path,
+            decision: &rejected_decision,
+            discovery_recon_score,
+            discovery_recon_threshold,
+            response: runtime
+                .controlled_reality
+                .fail_closed_bait_action_response(&surface_request),
+            intervention_mode,
+            surface_requested_intervention: true,
+        });
     }
 
     if let Some(mut response) = direct_surface_response(surface_action.clone()) {
@@ -3549,6 +3585,13 @@ fn surface_headers(headers: &[HttpHeader]) -> Vec<SurfaceHeader> {
         .iter()
         .map(|header| SurfaceHeader::new(header.name.clone(), header.value.clone()))
         .collect()
+}
+
+fn surface_action_can_reach_upstream(action: &SurfaceAction) -> bool {
+    matches!(
+        action,
+        SurfaceAction::ProtectedUpstream | SurfaceAction::RewrittenUpstream { .. }
+    )
 }
 
 fn direct_surface_response(action: SurfaceAction) -> Option<HttpResponse> {
@@ -4799,6 +4842,7 @@ mod tests {
     use std::{
         io::{Cursor, Read, Write},
         net::{Shutdown, TcpListener},
+        sync::mpsc,
         thread::JoinHandle,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -5194,6 +5238,28 @@ mod tests {
         }"##
     }
 
+    fn custom_unsafe_action_profile_json(method: &str) -> String {
+        r##"{
+          "schema_version": 1,
+          "profile_id": "custom_unsafe_action",
+          "baits": [
+            {
+              "id": "custom_commit_trace",
+              "bait_class": "docs",
+              "surface": "/docs/custom-commit",
+              "surface_kind": "docs",
+              "expected_action": {
+                "method": "__METHOD__",
+                "path": "/eidolon-lab/custom-commit",
+                "header_name": "X-Eidolon-Custom-Proof",
+                "header_value": "custom-proof-value"
+              }
+            }
+          ]
+        }"##
+        .replace("__METHOD__", method)
+    }
+
     fn set_runtime_policy_state(runtime: &ProxyRuntime, cookie: &str, policy_state: PolicyState) {
         let session_id =
             session::session_id_from_cookie_header(cookie).expect("cookie should contain session");
@@ -5236,47 +5302,113 @@ mod tests {
         (upstream, handle)
     }
 
-    fn spawn_upstream_sequence(
+    struct RecordingUpstream {
+        stop: mpsc::Sender<()>,
+        handle: JoinHandle<Vec<Vec<u8>>>,
+    }
+
+    impl RecordingUpstream {
+        fn finish(self) -> Vec<Vec<u8>> {
+            self.stop
+                .send(())
+                .expect("recording upstream should accept stop signal");
+            must_join(self.handle.join(), "recording upstream should join")
+        }
+    }
+
+    fn spawn_recording_upstream(
         responses: impl IntoIterator<Item = Vec<u8>>,
-    ) -> (UpstreamTarget, JoinHandle<Vec<Vec<u8>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("upstream should bind");
-        let addr = listener.local_addr().expect("upstream should have address");
+    ) -> (UpstreamTarget, RecordingUpstream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("recording upstream should bind");
+        let addr = listener
+            .local_addr()
+            .expect("recording upstream should have address");
+        listener
+            .set_nonblocking(true)
+            .expect("recording upstream should be nonblocking");
         let responses: Vec<Vec<u8>> = responses.into_iter().collect();
+        assert!(
+            !responses.is_empty(),
+            "recording upstream needs a fallback response"
+        );
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
-            let mut requests = Vec::with_capacity(responses.len());
-
-            for response in responses {
-                let (mut stream, _) = listener.accept().expect("upstream should accept");
-                let mut request = Vec::new();
-                let mut chunk = [0_u8; 1024];
-
-                loop {
-                    let bytes_read = stream.read(&mut chunk).expect("upstream request read");
-                    if bytes_read == 0 {
-                        break;
+            ready_tx
+                .send(())
+                .expect("recording upstream should signal readiness");
+            let mut requests = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .expect("recording upstream read timeout should set");
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 1024];
+                        loop {
+                            let bytes_read = stream
+                                .read(&mut chunk)
+                                .expect("recording upstream request should read");
+                            if bytes_read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&chunk[..bytes_read]);
+                            if find_header_end(&request).is_some() {
+                                break;
+                            }
+                        }
+                        let response = responses
+                            .get(requests.len())
+                            .unwrap_or_else(|| responses.last().expect("responses are nonempty"));
+                        stream
+                            .write_all(response)
+                            .expect("recording upstream response should write");
+                        stream.flush().expect("recording upstream should flush");
+                        requests.push(request);
                     }
-
-                    request.extend_from_slice(&chunk[..bytes_read]);
-                    if find_header_end(&request).is_some() {
-                        break;
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        match stop_rx.try_recv() {
+                            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return requests,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                        }
                     }
+                    Err(error) => panic!("recording upstream accept failed: {error}"),
                 }
-
-                stream
-                    .write_all(&response)
-                    .expect("upstream response should write");
-                stream.flush().expect("upstream response should flush");
-                requests.push(request);
             }
-
-            requests
         });
+        ready_rx
+            .recv()
+            .expect("recording upstream should become ready");
         let upstream = must_ok(
             parse_upstream(&format!("http://{addr}"), false),
-            "upstream target should parse",
+            "recording upstream target should parse",
         );
 
-        (upstream, handle)
+        (
+            upstream,
+            RecordingUpstream {
+                stop: stop_tx,
+                handle,
+            },
+        )
+    }
+
+    fn upstream_request_lines(requests: &[Vec<u8>]) -> Vec<String> {
+        requests
+            .iter()
+            .map(|request| {
+                let request =
+                    std::str::from_utf8(request).expect("upstream request should be utf8");
+                request
+                    .lines()
+                    .next()
+                    .expect("upstream request should have a request line")
+                    .to_string()
+            })
+            .collect()
     }
 
     fn closed_upstream() -> UpstreamTarget {
@@ -6307,8 +6439,10 @@ mod tests {
             .clone();
         let signing_secret: Arc<str> = Arc::from("mint-secret");
         let event_log_path = unique_temp_path("session-minted-bait-events.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
         let runtime = test_runtime_with_bait_profile(
-            closed_upstream(),
+            upstream,
             &event_log_path,
             unique_temp_path("session-minted-bait-control.txt"),
             loaded,
@@ -6380,8 +6514,13 @@ mod tests {
                 &[(&header_name, &header_value_a)],
             ),
         ));
+        let upstream_requests = upstream_recorder.finish();
 
         assert_eq!(action_response.status, 202);
+        assert!(
+            upstream_requests.is_empty(),
+            "valid minted action reached protected upstream"
+        );
         let action = first_event_of_type(&event_log_path, "bait_action_observed");
         assert_eq!(action["kind"]["bait_id"], "minted_trace");
         assert_eq!(
@@ -6415,7 +6554,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_session_minted_bait_replay_from_other_session_is_not_correlated() {
+    fn runtime_session_minted_bait_from_other_session_fails_closed_without_correlation() {
         let path = write_bait_profile(session_minted_profile_json());
         let loaded = load_bait_profile(&path).expect("minted profile should load");
         let bait = loaded
@@ -6425,7 +6564,8 @@ mod tests {
             .clone();
         let signing_secret: Arc<str> = Arc::from("mint-secret");
         let event_log_path = unique_temp_path("session-minted-bait-replay-events.jsonl");
-        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
         let runtime = test_runtime_with_bait_profile(
             upstream,
             &event_log_path,
@@ -6468,16 +6608,15 @@ mod tests {
                 &[(&header_name, &header_value_a)],
             ),
         ));
-        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
+        let upstream_requests = upstream_recorder.finish();
 
         assert_eq!(exposure_a.status, 200);
         assert_eq!(exposure_b.status, 200);
-        assert_eq!(replay_response.body, br#"{"mode":"upstream"}"#);
-        assert!(must_ok(
-            String::from_utf8(upstream_request),
-            "request should be utf8"
-        )
-        .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+        assert_eq!(replay_response.status, 403);
+        assert!(
+            upstream_requests.is_empty(),
+            "request reached protected upstream"
+        );
 
         let replay_action = events_of_type(&event_log_path, "bait_action_observed")
             .into_iter()
@@ -6508,10 +6647,7 @@ mod tests {
             })
             .expect("replayed minted request_seen should exist");
         assert_eq!(replay_request["policy_state"], "observe");
-        assert_eq!(
-            replay_request["kind"]["routing_decision"],
-            "protected_upstream"
-        );
+        assert_eq!(replay_request["kind"]["routing_decision"], "eidolon_owned");
 
         assert!(!events_of_type(&event_log_path, "policy_changed")
             .into_iter()
@@ -6519,6 +6655,53 @@ mod tests {
                 event["session_id"] == session_b.0.to_string()
                     && event["kind"]["to"] == "controlled_reality"
             }));
+    }
+
+    #[test]
+    fn runtime_invalid_session_minted_bait_value_fails_closed() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("minted profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait should exist")
+            .clone();
+        let header_name = bait
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("minted bait should keep header name")
+            .to_string();
+        let event_log_path = unique_temp_path("invalid-minted-bait-events.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("invalid-minted-bait-control.txt"),
+            loaded,
+            Some(Arc::from("mint-secret")),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                &bait.expected_action.path,
+                &cookie_header(),
+                &[(&header_name, "minted.not-a-valid-proof")],
+            ),
+        ));
+        let upstream_requests = upstream_recorder.finish();
+
+        assert_eq!(response.status, 403);
+        assert!(
+            upstream_requests.is_empty(),
+            "request reached protected upstream"
+        );
+        let rejected_action = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(rejected_action["kind"]["bait_id"], "minted_trace");
+        assert!(rejected_action["kind"]["exposure_id"].is_null());
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
     }
 
     #[test]
@@ -8217,8 +8400,7 @@ mod tests {
         let event_log_path = unique_temp_path("aggregated-decoy-write-suspicious-events.jsonl");
         let debug_log_path = unique_temp_path("aggregated-decoy-write-suspicious-debug.jsonl");
         let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
-        let (upstream, _upstream_handle) =
-            spawn_upstream_sequence([html_response(original), html_response(original)]);
+        let (upstream, upstream_recorder) = spawn_recording_upstream([html_response(original)]);
         let mut runtime = test_runtime_with_m1_controller_and_debug_log(
             upstream,
             &event_log_path,
@@ -8245,9 +8427,14 @@ mod tests {
             runtime,
             &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &headers),
         ));
+        let upstream_requests = upstream_recorder.finish();
 
         assert_eq!(first_response.status, 200);
-        assert_eq!(second_response.status, 200);
+        assert_eq!(second_response.status, 403);
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec!["GET /docs?topic=imports HTTP/1.1".to_string()]
+        );
 
         let request_events = events_of_type(&event_log_path, "request_seen");
         assert_eq!(request_events.len(), 2);
@@ -8259,7 +8446,7 @@ mod tests {
         assert_eq!(request_events[1]["policy_state"], "suspicious");
         assert_eq!(
             request_events[1]["kind"]["routing_decision"],
-            "protected_upstream"
+            "eidolon_owned"
         );
         assert_eq!(
             request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
@@ -8336,10 +8523,7 @@ mod tests {
         let loaded = load_bait_profile(&path).expect("alternate write profile should load");
         let event_log_path = unique_temp_path("aggregated-alt-write-suspicious-events.jsonl");
         let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
-        let (upstream, _upstream_handle) = spawn_upstream_sequence([
-            html_response(original),
-            json_response(r#"{"mode":"validate"}"#),
-        ]);
+        let (upstream, upstream_recorder) = spawn_recording_upstream([html_response(original)]);
         let mut runtime = test_runtime_with_bait_profile(
             upstream,
             &event_log_path,
@@ -8367,6 +8551,7 @@ mod tests {
             runtime,
             &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
         ));
+        let upstream_requests = upstream_recorder.finish();
 
         let first_body = must_ok(
             String::from_utf8(first_response.body),
@@ -8375,7 +8560,11 @@ mod tests {
 
         assert_eq!(first_response.status, 200);
         assert!(first_body.contains("/docs/import-validate"));
-        assert_eq!(second_response.status, 200);
+        assert_eq!(second_response.status, 403);
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec!["GET /docs?topic=imports HTTP/1.1".to_string()]
+        );
 
         let request_events = events_of_type(&event_log_path, "request_seen");
         assert_eq!(request_events.len(), 2);
@@ -8388,7 +8577,7 @@ mod tests {
         assert_eq!(request_events[1]["kind"]["path"], "/api/v2/import/validate");
         assert_eq!(
             request_events[1]["kind"]["routing_decision"],
-            "protected_upstream"
+            "eidolon_owned"
         );
         assert_eq!(
             request_events[1]["kind"]["discovery_recon_score"]["query_score"],
@@ -8434,11 +8623,7 @@ mod tests {
         let event_log_path = unique_temp_path("aggregated-decoy-write-repeat-bonus-events.jsonl");
         let debug_log_path = unique_temp_path("aggregated-decoy-write-repeat-bonus-debug.jsonl");
         let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
-        let (upstream, _upstream_handle) = spawn_upstream_sequence([
-            html_response(original),
-            json_response(r#"{"mode":"upstream"}"#),
-            json_response(r#"{"mode":"upstream"}"#),
-        ]);
+        let (upstream, upstream_recorder) = spawn_recording_upstream([html_response(original)]);
         let mut runtime = test_runtime_with_m1_controller_and_debug_log(
             upstream,
             &event_log_path,
@@ -8473,12 +8658,17 @@ mod tests {
             runtime,
             &request_with_cookie("GET", "/docs", &cookie, &headers),
         ));
+        let upstream_requests = upstream_recorder.finish();
 
         assert_eq!(first_response.status, 200);
-        assert_eq!(second_response.status, 200);
-        assert_eq!(third_response.status, 200);
+        assert_eq!(second_response.status, 403);
+        assert_eq!(third_response.status, 403);
         assert_eq!(fourth_response.status, 429);
         assert_eq!(header_values(&fourth_response, "retry-after"), vec!["30"]);
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec!["GET /docs?topic=imports HTTP/1.1".to_string()]
+        );
 
         let request_events = events_of_type(&event_log_path, "request_seen");
         assert_eq!(request_events.len(), 4);
@@ -8490,7 +8680,7 @@ mod tests {
         assert_eq!(request_events[1]["policy_state"], "suspicious");
         assert_eq!(
             request_events[1]["kind"]["routing_decision"],
-            "protected_upstream"
+            "eidolon_owned"
         );
         assert_eq!(
             request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
@@ -8503,7 +8693,7 @@ mod tests {
         assert_eq!(request_events[2]["policy_state"], "suspicious");
         assert_eq!(
             request_events[2]["kind"]["routing_decision"],
-            "protected_upstream"
+            "eidolon_owned"
         );
         assert_eq!(
             request_events[2]["kind"]["discovery_recon_score"]["query_score"],
@@ -8776,10 +8966,7 @@ mod tests {
         let event_log_path = unique_temp_path("aggregated-decoy-write-rate-limit-events.jsonl");
         let debug_log_path = unique_temp_path("aggregated-decoy-write-rate-limit-debug.jsonl");
         let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
-        let (upstream, _upstream_handle) = spawn_upstream_sequence([
-            html_response(original),
-            json_response(r#"{"mode":"upstream"}"#),
-        ]);
+        let (upstream, upstream_recorder) = spawn_recording_upstream([html_response(original)]);
         let mut runtime = test_runtime_with_m1_controller_and_debug_log(
             upstream,
             &event_log_path,
@@ -8810,11 +8997,16 @@ mod tests {
             runtime,
             &request_with_cookie("GET", "/docs", &cookie, &headers),
         ));
+        let upstream_requests = upstream_recorder.finish();
 
         assert_eq!(first_response.status, 200);
-        assert_eq!(second_response.status, 200);
+        assert_eq!(second_response.status, 403);
         assert_eq!(third_response.status, 429);
         assert_eq!(header_values(&third_response, "retry-after"), vec!["30"]);
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec!["GET /docs?topic=imports HTTP/1.1".to_string()]
+        );
 
         let request_events = events_of_type(&event_log_path, "request_seen");
         assert_eq!(request_events.len(), 3);
@@ -8826,7 +9018,7 @@ mod tests {
         assert_eq!(request_events[1]["policy_state"], "suspicious");
         assert_eq!(
             request_events[1]["kind"]["routing_decision"],
-            "protected_upstream"
+            "eidolon_owned"
         );
         assert_eq!(
             request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
@@ -8962,10 +9154,7 @@ mod tests {
         let debug_log_path =
             unique_temp_path("aggregated-decoy-write-fanout-rate-limit-debug.jsonl");
         let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
-        let (upstream, _upstream_handle) = spawn_upstream_sequence([
-            html_response(original),
-            json_response(r#"{"mode":"reconcile"}"#),
-        ]);
+        let (upstream, upstream_recorder) = spawn_recording_upstream([html_response(original)]);
         let mut runtime = test_runtime_with_bait_profile(
             upstream,
             &event_log_path,
@@ -9000,18 +9189,23 @@ mod tests {
             runtime,
             &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
         ));
+        let upstream_requests = upstream_recorder.finish();
 
         assert_eq!(first_response.status, 200);
-        assert_eq!(second_response.status, 200);
+        assert_eq!(second_response.status, 403);
         assert_eq!(third_response.status, 429);
         assert_eq!(header_values(&third_response, "retry-after"), vec!["30"]);
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec!["GET /docs?topic=imports HTTP/1.1".to_string()]
+        );
 
         let request_events = events_of_type(&event_log_path, "request_seen");
         assert_eq!(request_events.len(), 3);
         assert_eq!(request_events[1]["policy_state"], "suspicious");
         assert_eq!(
             request_events[1]["kind"]["routing_decision"],
-            "protected_upstream"
+            "eidolon_owned"
         );
         assert_eq!(request_events[2]["policy_state"], "rate_limited");
         assert_eq!(request_events[2]["kind"]["path"], "/api/v2/import/validate");
@@ -9141,10 +9335,7 @@ mod tests {
         let event_log_path = unique_temp_path("aggregated-decoy-write-recon-blocked-events.jsonl");
         let debug_log_path = unique_temp_path("aggregated-decoy-write-recon-blocked-debug.jsonl");
         let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
-        let (upstream, _upstream_handle) = spawn_upstream_sequence([
-            html_response(original),
-            json_response(r#"{"mode":"upstream"}"#),
-        ]);
+        let (upstream, upstream_recorder) = spawn_recording_upstream([html_response(original)]);
         let mut runtime = test_runtime_with_m1_controller_and_debug_log(
             upstream,
             &event_log_path,
@@ -9179,12 +9370,17 @@ mod tests {
             runtime,
             &request_with_cookie("GET", "/docs", &cookie, &headers),
         ));
+        let upstream_requests = upstream_recorder.finish();
 
         assert_eq!(first_response.status, 200);
-        assert_eq!(second_response.status, 200);
+        assert_eq!(second_response.status, 403);
         assert_eq!(third_response.status, 429);
         assert_eq!(fourth_response.status, 403);
         assert_eq!(header_values(&third_response, "retry-after"), vec!["30"]);
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec!["GET /docs?topic=imports HTTP/1.1".to_string()]
+        );
 
         let request_events = events_of_type(&event_log_path, "request_seen");
         assert_eq!(request_events.len(), 4);
@@ -9196,7 +9392,7 @@ mod tests {
         assert_eq!(request_events[1]["policy_state"], "suspicious");
         assert_eq!(
             request_events[1]["kind"]["routing_decision"],
-            "protected_upstream"
+            "eidolon_owned"
         );
         assert_eq!(
             request_events[1]["kind"]["discovery_recon_score"]["decoy_write_probe_score"],
@@ -9234,16 +9430,29 @@ mod tests {
         );
 
         let policy_decisions = events_of_type(&event_log_path, "policy_decision");
-        assert_eq!(policy_decisions.len(), 2);
-        assert!(policy_decisions[1]["kind"]["reason"]
+        assert_eq!(policy_decisions.len(), 3);
+        assert!(policy_decisions.iter().any(|decision| {
+            decision["kind"]["reason"].as_str().is_some_and(|reason| {
+                reason.contains("configured unsafe bait action failed closed")
+            })
+        }));
+        let blocked_decision = policy_decisions
+            .iter()
+            .find(|decision| {
+                decision["kind"]["reason"].as_str().is_some_and(|reason| {
+                    reason.contains("rate-limited discovery recon retry moved session to blocked")
+                })
+            })
+            .expect("blocked policy decision should exist");
+        assert!(blocked_decision["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| {
                 reason.contains("rate-limited discovery recon retry moved session to blocked")
             }));
-        assert!(policy_decisions[1]["kind"]["reason"]
+        assert!(blocked_decision["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("decoy_write_probe_seen=true")));
-        assert!(policy_decisions[1]["kind"]["reason"]
+        assert!(blocked_decision["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("decoy_write_probe_score=2")));
 
@@ -9361,10 +9570,7 @@ mod tests {
         let event_log_path = unique_temp_path("aggregated-decoy-write-fanout-blocked-events.jsonl");
         let debug_log_path = unique_temp_path("aggregated-decoy-write-fanout-blocked-debug.jsonl");
         let original = r#"<!doctype html><html><body><main>docs</main></body></html>"#;
-        let (upstream, _upstream_handle) = spawn_upstream_sequence([
-            html_response(original),
-            json_response(r#"{"mode":"reconcile"}"#),
-        ]);
+        let (upstream, upstream_recorder) = spawn_recording_upstream([html_response(original)]);
         let mut runtime = test_runtime_with_bait_profile(
             upstream,
             &event_log_path,
@@ -9403,12 +9609,17 @@ mod tests {
             runtime,
             &post_request_with_cookie("/api/v2/import/validate", &cookie, &headers),
         ));
+        let upstream_requests = upstream_recorder.finish();
 
         assert_eq!(first_response.status, 200);
-        assert_eq!(second_response.status, 200);
+        assert_eq!(second_response.status, 403);
         assert_eq!(third_response.status, 429);
         assert_eq!(fourth_response.status, 403);
         assert_eq!(header_values(&third_response, "retry-after"), vec!["30"]);
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec!["GET /docs?topic=imports HTTP/1.1".to_string()]
+        );
 
         let request_events = events_of_type(&event_log_path, "request_seen");
         assert_eq!(request_events.len(), 4);
@@ -9450,19 +9661,32 @@ mod tests {
         );
 
         let policy_decisions = events_of_type(&event_log_path, "policy_decision");
-        assert_eq!(policy_decisions.len(), 2);
-        assert!(policy_decisions[1]["kind"]["reason"]
+        assert_eq!(policy_decisions.len(), 3);
+        assert!(policy_decisions.iter().any(|decision| {
+            decision["kind"]["reason"].as_str().is_some_and(|reason| {
+                reason.contains("configured unsafe bait action failed closed")
+            })
+        }));
+        let blocked_decision = policy_decisions
+            .iter()
+            .find(|decision| {
+                decision["kind"]["reason"].as_str().is_some_and(|reason| {
+                    reason.contains("rate-limited discovery recon retry moved session to blocked")
+                })
+            })
+            .expect("blocked policy decision should exist");
+        assert!(blocked_decision["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| {
                 reason.contains("rate-limited discovery recon retry moved session to blocked")
             }));
-        assert!(policy_decisions[1]["kind"]["reason"]
+        assert!(blocked_decision["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("decoy_write_probe_count=2")));
-        assert!(policy_decisions[1]["kind"]["reason"]
+        assert!(blocked_decision["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("decoy_write_probe_path_classes=2")));
-        assert!(policy_decisions[1]["kind"]["reason"]
+        assert!(blocked_decision["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("decoy_write_probe_path_fanout_bonus=1")));
 
@@ -12808,8 +13032,10 @@ mod tests {
     #[test]
     fn runtime_correlates_same_session_bait_action_and_does_not_forward() {
         let event_log_path = unique_temp_path("bait-action-events.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
         let runtime = test_runtime_with_m1_controller(
-            closed_upstream(),
+            upstream,
             &event_log_path,
             unique_temp_path("bait-action-control.txt"),
         );
@@ -12827,9 +13053,14 @@ mod tests {
                 &[("X-Migration-Trace", "rel_2025_04_b7f2")],
             ),
         ));
+        let upstream_requests = upstream_recorder.finish();
 
         assert_eq!(exposure_response.status, 200);
         assert_eq!(action_response.status, 202);
+        assert!(
+            upstream_requests.is_empty(),
+            "valid static action reached protected upstream"
+        );
         assert!(String::from_utf8(action_response.body)
             .expect("body should be utf8")
             .contains(r#""write_committed":false"#));
@@ -13043,9 +13274,10 @@ mod tests {
     }
 
     #[test]
-    fn runtime_wrong_bait_header_value_logs_unmatched_bait_action_and_forwards_upstream() {
+    fn runtime_wrong_bait_header_value_logs_near_miss_and_fails_closed() {
         let event_log_path = unique_temp_path("near-miss-events.jsonl");
-        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
         let runtime = test_runtime_with_m1_controller(
             upstream,
             &event_log_path,
@@ -13065,14 +13297,13 @@ mod tests {
                 &[("X-Migration-Trace", "wrong")],
             ),
         ));
-        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
+        let upstream_requests = upstream_recorder.finish();
 
-        assert_eq!(response.body, br#"{"mode":"upstream"}"#);
-        assert!(must_ok(
-            String::from_utf8(upstream_request),
-            "request should be utf8"
-        )
-        .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+        assert_eq!(response.status, 403);
+        assert!(
+            upstream_requests.is_empty(),
+            "request reached protected upstream"
+        );
         assert_eq!(events_of_type(&event_log_path, "bait_exposed").len(), 1);
         let near_miss = first_event_of_type(&event_log_path, "bait_action_observed");
         assert_eq!(near_miss["policy_state"], "observe");
@@ -13082,12 +13313,14 @@ mod tests {
             events_of_type(&event_log_path, "rate_limit_applied").len(),
             0
         );
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
     }
 
     #[test]
-    fn runtime_missing_bait_header_on_shared_path_does_not_log_bait_action() {
+    fn runtime_missing_bait_header_on_shared_path_fails_closed_without_bait_action() {
         let event_log_path = unique_temp_path("missing-bait-header-events.jsonl");
-        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
         let runtime = test_runtime_with_m1_controller(
             upstream,
             &event_log_path,
@@ -13103,20 +13336,47 @@ mod tests {
             runtime,
             &post_request_with_cookie("/api/v2/import/reconcile", &cookie, &[]),
         ));
-        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
+        let upstream_requests = upstream_recorder.finish();
 
-        assert_eq!(response.body, br#"{"mode":"upstream"}"#);
-        assert!(must_ok(
-            String::from_utf8(upstream_request),
-            "request should be utf8"
-        )
-        .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+        assert_eq!(response.status, 403);
+        assert!(
+            upstream_requests.is_empty(),
+            "request reached protected upstream"
+        );
         assert_eq!(events_of_type(&event_log_path, "bait_exposed").len(), 1);
         assert_event_type_absent(&event_log_path, "bait_action_observed");
         assert_eq!(
             events_of_type(&event_log_path, "rate_limit_applied").len(),
             0
         );
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+    }
+
+    #[test]
+    fn runtime_unconfigured_unsafe_route_still_forwards() {
+        let event_log_path = unique_temp_path("unconfigured-unsafe-route-events.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"upstream"}"#)]);
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("unconfigured-unsafe-route-control.txt"),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie("PUT", "/api/v1/imports", &cookie_header(), &[]),
+        ));
+        let upstream_requests = upstream_recorder.finish();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, br#"{"mode":"upstream"}"#);
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec!["PUT /api/v1/imports HTTP/1.1".to_string()]
+        );
+        assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
     }
 
     #[test]
@@ -13495,15 +13755,16 @@ mod tests {
     }
 
     #[test]
-    fn disabled_interventions_fail_closed_for_known_decoy_write_path() {
+    fn disabled_interventions_fail_closed_for_configured_unsafe_bait_action() {
         let event_log_path = unique_temp_path("disabled-bait-events.jsonl");
         let control_path = unique_temp_path("disabled-bait-control.txt");
         must_ok(
             fs::write(&control_path, "disabled"),
             "control file should write",
         );
-        let runtime =
-            test_runtime_with_m1_controller(closed_upstream(), &event_log_path, control_path);
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let runtime = test_runtime_with_m1_controller(upstream, &event_log_path, control_path);
 
         let response = parse_downstream_response(&run_runtime_request(
             runtime,
@@ -13513,14 +13774,188 @@ mod tests {
                 &[("X-Migration-Trace", "rel_2025_04_b7f2")],
             ),
         ));
+        let upstream_requests = upstream_recorder.finish();
 
         assert_eq!(response.status, 403);
+        assert!(
+            upstream_requests.is_empty(),
+            "request reached protected upstream"
+        );
         assert!(
             must_ok(String::from_utf8(response.body), "body should be utf8")
                 .contains("failed closed")
         );
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_type_absent(&event_log_path, "bait_exposed");
+        assert_event_type_absent(&event_log_path, "bait_action_observed");
+    }
+
+    #[test]
+    fn custom_profile_unsafe_methods_missing_and_wrong_proofs_fail_closed() {
+        for method in ["POST", "PUT", "PATCH", "DELETE", "CONNECT", "PROPFIND"] {
+            let path = write_bait_profile(&custom_unsafe_action_profile_json(method));
+            let loaded = load_bait_profile(&path).expect("custom bait profile should load");
+            let event_log_path =
+                unique_temp_path(&format!("custom-{method}-bait-action-events.jsonl"));
+            let (upstream, upstream_recorder) =
+                spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+            let runtime = test_runtime_with_bait_profile(
+                upstream,
+                &event_log_path,
+                unique_temp_path(&format!("custom-{method}-bait-action-control.txt")),
+                loaded,
+                None,
+            );
+
+            let cookie = cookie_header();
+            let missing_target = if method == "PATCH" {
+                "/eidolon-lab/custom-commit?attempt=1"
+            } else {
+                "/eidolon-lab/custom-commit"
+            };
+            let missing_response = parse_downstream_response(&run_runtime_request(
+                runtime.clone(),
+                &request_with_cookie(method, missing_target, &cookie, &[]),
+            ));
+            let wrong_response = parse_downstream_response(&run_runtime_request(
+                runtime,
+                &request_with_cookie(
+                    method,
+                    "/eidolon-lab/custom-commit",
+                    &cookie,
+                    &[("X-Eidolon-Custom-Proof", "wrong")],
+                ),
+            ));
+            let upstream_requests = upstream_recorder.finish();
+
+            assert_eq!(missing_response.status, 403, "missing {method} proof");
+            assert_eq!(wrong_response.status, 403, "wrong {method} proof");
+            assert!(
+                upstream_requests.is_empty(),
+                "{method} request reached protected upstream"
+            );
+            let rejected_actions = events_of_type(&event_log_path, "bait_action_observed");
+            assert_eq!(rejected_actions.len(), 1);
+            let rejected_action = &rejected_actions[0];
+            assert_eq!(rejected_action["kind"]["bait_id"], "custom_commit_trace");
+            assert!(rejected_action["kind"]["exposure_id"].is_null());
+            assert!(events_of_type(&event_log_path, "request_seen")
+                .iter()
+                .all(|event| event["kind"]["routing_decision"] == "eidolon_owned"));
+        }
+    }
+
+    #[test]
+    fn custom_profile_valid_put_action_preserves_interception_behavior() {
+        let path = write_bait_profile(&custom_unsafe_action_profile_json("PUT"));
+        let loaded = load_bait_profile(&path).expect("custom bait profile should load");
+        let event_log_path = unique_temp_path("valid-custom-put-action-events.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("valid-custom-put-action-control.txt"),
+            loaded,
+            None,
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "PUT",
+                "/eidolon-lab/custom-commit",
+                &cookie_header(),
+                &[("X-Eidolon-Custom-Proof", "custom-proof-value")],
+            ),
+        ));
+        let upstream_requests = upstream_recorder.finish();
+
+        assert_eq!(response.status, 202);
+        assert!(upstream_requests.is_empty());
+        let action = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(action["kind"]["bait_id"], "custom_commit_trace");
+        assert!(action["kind"]["exposure_id"].is_null());
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+    }
+
+    #[test]
+    fn custom_profile_rejected_action_fails_closed_before_rewritten_upstream() {
+        let path = write_bait_profile(&custom_unsafe_action_profile_json("PUT"));
+        let loaded = load_bait_profile(&path).expect("custom bait profile should load");
+        let event_log_path = unique_temp_path("rewritten-custom-put-action-events.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([html_response("<html><body>upstream</body></html>")]);
+        let mut runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("rewritten-custom-put-action-control.txt"),
+            loaded,
+            None,
+        );
+        runtime.surface_controller = Arc::new(StaticSurfaceController {
+            action: html_rewrite_action("<p>should not rewrite</p>"),
+        });
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "PUT",
+                "/eidolon-lab/custom-commit",
+                &cookie_header(),
+                &[("X-Eidolon-Custom-Proof", "wrong")],
+            ),
+        ));
+        let upstream_requests = upstream_recorder.finish();
+
+        assert_eq!(response.status, 403);
+        assert!(upstream_requests.is_empty());
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+    }
+
+    #[test]
+    fn disabled_interventions_fail_closed_for_custom_profile_unsafe_bait_action() {
+        let path = write_bait_profile(&custom_unsafe_action_profile_json("PUT"));
+        let loaded = load_bait_profile(&path).expect("custom bait profile should load");
+        let event_log_path = unique_temp_path("disabled-custom-bait-action-events.jsonl");
+        let control_path = unique_temp_path("disabled-custom-bait-action-control.txt");
+        must_ok(
+            fs::write(&control_path, "disabled"),
+            "control file should write",
+        );
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let runtime =
+            test_runtime_with_bait_profile(upstream, &event_log_path, control_path, loaded, None);
+
+        let cookie = cookie_header();
+        let responses = [
+            request_with_cookie(
+                "PUT",
+                "/eidolon-lab/custom-commit",
+                &cookie,
+                &[("X-Eidolon-Custom-Proof", "custom-proof-value")],
+            ),
+            request_with_cookie("PUT", "/eidolon-lab/custom-commit", &cookie, &[]),
+            request_with_cookie(
+                "PUT",
+                "/eidolon-lab/custom-commit",
+                &cookie,
+                &[("X-Eidolon-Custom-Proof", "wrong")],
+            ),
+        ]
+        .map(|request| parse_downstream_response(&run_runtime_request(runtime.clone(), &request)));
+        let upstream_requests = upstream_recorder.finish();
+
+        assert!(responses.iter().all(|response| response.status == 403));
+        assert!(
+            upstream_requests.is_empty(),
+            "request reached protected upstream"
+        );
+        assert_eq!(events_of_type(&event_log_path, "request_seen").len(), 3);
+        assert!(events_of_type(&event_log_path, "request_seen")
+            .iter()
+            .all(|event| event["kind"]["routing_decision"] == "eidolon_owned"));
         assert_event_type_absent(&event_log_path, "bait_action_observed");
     }
 
