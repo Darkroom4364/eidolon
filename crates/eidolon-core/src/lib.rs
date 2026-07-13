@@ -63,6 +63,8 @@ pub enum HeaderValueMintKind {
 pub struct HeaderValueMint {
     pub kind: HeaderValueMintKind,
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_window_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +78,11 @@ pub struct BaitHeaderValueMintAudit {
 #[serde(rename_all = "snake_case")]
 pub enum BaitHeaderValueMintStatus {
     MatchedSessionValue,
+    ExpiredSessionValue,
+    ReplaySeen,
+    ReplayStateCapacityExceeded,
+    MissingSessionValue,
+    MalformedSessionValue,
     SessionValueMismatch,
 }
 
