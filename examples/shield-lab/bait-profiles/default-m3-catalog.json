@@ -14,7 +14,8 @@
         "header_name": "X-Migration-Trace",
         "header_value_mint": {
           "kind": "session_hmac_sha256_v1",
-          "prefix": "mig"
+          "prefix": "mig",
+          "proof_window_seconds": 300
         }
       }
     },
@@ -29,7 +30,8 @@
         "header_name": "X-OpenAPI-Trace",
         "header_value_mint": {
           "kind": "session_hmac_sha256_v1",
-          "prefix": "oapi"
+          "prefix": "oapi",
+          "proof_window_seconds": 300
         }
       }
     },
@@ -56,7 +58,8 @@
         "header_name": "X-Api-Key",
         "header_value_mint": {
           "kind": "session_hmac_sha256_v1",
-          "prefix": "svc"
+          "prefix": "svc",
+          "proof_window_seconds": 300
         }
       }
     },

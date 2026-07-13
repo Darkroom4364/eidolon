@@ -1,7 +1,13 @@
-use std::{borrow::Cow, error::Error, fmt};
+use std::{
+    borrow::Cow,
+    error::Error,
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use eidolon_core::{
-    Bait, BaitClass, BaitId, ExpectedAction, HeaderValueMintKind, SessionId, SurfaceKind,
+    Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, ExpectedAction, HeaderValueMintKind,
+    SessionId, SurfaceKind,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -176,7 +182,10 @@ impl BaitRegistry {
             .iter()
             .find(|bait| exact_action_matches(&bait.expected_action, method, path, &headers))
             .cloned()
-            .map(|bait| BaitActionMatch { bait })
+            .map(|bait| BaitActionMatch {
+                bait,
+                header_value_mint_status: None,
+            })
     }
 
     pub fn match_action_for_session<'a, I>(
@@ -190,18 +199,63 @@ impl BaitRegistry {
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
+        self.match_action_for_session_at(
+            method,
+            path,
+            headers,
+            session_id,
+            signing_secret,
+            current_epoch_seconds(),
+        )
+    }
+
+    pub fn match_action_for_session_at<'a, I>(
+        &self,
+        method: &str,
+        path: &str,
+        headers: I,
+        session_id: SessionId,
+        signing_secret: Option<&str>,
+        now_epoch_seconds: u64,
+    ) -> Result<Option<BaitActionMatch>, BaitValueError>
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
         let headers: Vec<(&str, &str)> = headers.into_iter().collect();
+        let mut rejected_match = None;
 
         for bait in &self.baits {
-            let rendered = render_bait_for_session(bait, session_id, signing_secret)?;
-            if exact_action_matches(&rendered.expected_action, method, path, &headers) {
-                return Ok(Some(BaitActionMatch {
-                    bait: rendered.into_owned(),
-                }));
+            if let Some(status) = verify_action_for_session(
+                bait,
+                method,
+                path,
+                &headers,
+                session_id,
+                signing_secret,
+                now_epoch_seconds,
+            )? {
+                if matches!(
+                    status,
+                    None | Some(BaitHeaderValueMintStatus::MatchedSessionValue)
+                ) {
+                    return Ok(Some(BaitActionMatch {
+                        bait: bait.clone(),
+                        header_value_mint_status: status,
+                    }));
+                }
+                let candidate = BaitActionMatch {
+                    bait: bait.clone(),
+                    header_value_mint_status: status,
+                };
+                if status != Some(BaitHeaderValueMintStatus::MissingSessionValue)
+                    || rejected_match.is_none()
+                {
+                    rejected_match = Some(candidate);
+                }
             }
         }
 
-        Ok(None)
+        Ok(rejected_match)
     }
 
     /// Returns the first registered bait whose method and path match the request
@@ -223,7 +277,10 @@ impl BaitRegistry {
             .iter()
             .find(|bait| action_shape_matches(&bait.expected_action, method, path, &headers))
             .cloned()
-            .map(|bait| BaitActionMatch { bait })
+            .map(|bait| BaitActionMatch {
+                bait,
+                header_value_mint_status: None,
+            })
     }
 }
 
@@ -243,6 +300,7 @@ pub fn m3_baits() -> Vec<Bait> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaitActionMatch {
     pub bait: Bait,
+    pub header_value_mint_status: Option<BaitHeaderValueMintStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +379,15 @@ pub fn render_bait_for_session<'a>(
     session_id: SessionId,
     signing_secret: Option<&str>,
 ) -> Result<Cow<'a, Bait>, BaitValueError> {
+    render_bait_for_session_at(bait, session_id, signing_secret, current_epoch_seconds())
+}
+
+pub fn render_bait_for_session_at<'a>(
+    bait: &'a Bait,
+    session_id: SessionId,
+    signing_secret: Option<&str>,
+    now_epoch_seconds: u64,
+) -> Result<Cow<'a, Bait>, BaitValueError> {
     let Some(mint) = bait.expected_action.header_value_mint.as_ref() else {
         return Ok(Cow::Borrowed(bait));
     };
@@ -343,6 +410,7 @@ pub fn render_bait_for_session<'a>(
         session_id,
         signing_secret,
         header_name,
+        now_epoch_seconds,
     ));
     Ok(Cow::Owned(rendered))
 }
@@ -355,9 +423,14 @@ fn mint_header_value(
     session_id: SessionId,
     signing_secret: &str,
     header_name: &str,
+    now_epoch_seconds: u64,
 ) -> String {
     match mint.kind {
         HeaderValueMintKind::SessionHmacSha256V1 => {
+            let window_bucket = mint
+                .proof_window_seconds
+                .filter(|window| *window > 0)
+                .map(|window| now_epoch_seconds / window);
             let mut mac = match HmacSha256::new_from_slice(signing_secret.as_bytes()) {
                 Ok(mac) => mac,
                 Err(_error) => unreachable!("hmac accepts any key length"),
@@ -373,11 +446,117 @@ fn mint_header_value(
             mac.update(bait.expected_action.path.as_bytes());
             mac.update(b"\0");
             mac.update(header_name.to_ascii_lowercase().as_bytes());
+            if let Some(bucket) = window_bucket {
+                mac.update(b"\0");
+                mac.update(bucket.to_string().as_bytes());
+            }
             let tag = mac.finalize().into_bytes();
 
-            format!("{}_{}", mint.prefix, hex_prefix(&tag, 12))
+            match window_bucket {
+                Some(bucket) => format!("{}_w{bucket:x}_{}", mint.prefix, hex_prefix(&tag, 12)),
+                None => format!("{}_{}", mint.prefix, hex_prefix(&tag, 12)),
+            }
         }
     }
+}
+
+fn current_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn verify_action_for_session(
+    bait: &Bait,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    session_id: SessionId,
+    signing_secret: Option<&str>,
+    now_epoch_seconds: u64,
+) -> Result<Option<Option<BaitHeaderValueMintStatus>>, BaitValueError> {
+    if !bait.expected_action.method.eq_ignore_ascii_case(method)
+        || bait.expected_action.path != path
+    {
+        return Ok(None);
+    }
+
+    let Some(mint) = bait.expected_action.header_value_mint.as_ref() else {
+        return Ok(
+            exact_action_matches(&bait.expected_action, method, path, headers).then_some(None),
+        );
+    };
+    let Some(header_name) = bait.expected_action.header_name.as_deref() else {
+        return Ok(None);
+    };
+    let Some((_, presented_value)) = headers
+        .iter()
+        .find(|(name, _)| header_name.eq_ignore_ascii_case(name))
+    else {
+        return Ok(Some(Some(BaitHeaderValueMintStatus::MissingSessionValue)));
+    };
+    let Some(signing_secret) = signing_secret
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(BaitValueError::MissingSigningSecret {
+            bait_id: bait.id.clone(),
+        });
+    };
+
+    let Some(window) = mint.proof_window_seconds.filter(|window| *window > 0) else {
+        let rendered =
+            render_bait_for_session_at(bait, session_id, Some(signing_secret), now_epoch_seconds)?;
+        return Ok(Some(Some(
+            if exact_action_matches(&rendered.expected_action, method, path, headers) {
+                BaitHeaderValueMintStatus::MatchedSessionValue
+            } else {
+                BaitHeaderValueMintStatus::SessionValueMismatch
+            },
+        )));
+    };
+
+    let Some((presented_bucket, presented_tag)) = parse_windowed_mint_value(mint, presented_value)
+    else {
+        return Ok(Some(Some(BaitHeaderValueMintStatus::MalformedSessionValue)));
+    };
+    let expected = mint_header_value(
+        bait,
+        mint,
+        session_id,
+        signing_secret,
+        header_name,
+        presented_bucket.saturating_mul(window),
+    );
+    let Some((_, expected_tag)) = parse_windowed_mint_value(mint, &expected) else {
+        unreachable!("windowed mint output must parse");
+    };
+    if expected_tag != presented_tag {
+        return Ok(Some(Some(BaitHeaderValueMintStatus::SessionValueMismatch)));
+    }
+
+    let current_bucket = now_epoch_seconds / window;
+    let status = if presented_bucket == current_bucket {
+        BaitHeaderValueMintStatus::MatchedSessionValue
+    } else if presented_bucket < current_bucket {
+        BaitHeaderValueMintStatus::ExpiredSessionValue
+    } else {
+        BaitHeaderValueMintStatus::SessionValueMismatch
+    };
+    Ok(Some(Some(status)))
+}
+
+fn parse_windowed_mint_value<'a>(
+    mint: &eidolon_core::HeaderValueMint,
+    value: &'a str,
+) -> Option<(u64, &'a str)> {
+    let remainder = value.strip_prefix(&format!("{}_w", mint.prefix))?;
+    let (bucket_hex, tag) = remainder.split_once('_')?;
+    if tag.len() != 24 || !tag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((u64::from_str_radix(bucket_hex, 16).ok()?, tag))
 }
 
 fn hex_prefix(bytes: &[u8], limit: usize) -> String {
@@ -417,6 +596,7 @@ mod tests {
                 header_value_mint: Some(eidolon_core::HeaderValueMint {
                     kind: HeaderValueMintKind::SessionHmacSha256V1,
                     prefix: "minted".to_string(),
+                    proof_window_seconds: None,
                 }),
             },
         }
@@ -934,12 +1114,122 @@ mod tests {
             )
             .expect("cross-session replay should not error");
 
-        assert_eq!(matched, None);
+        assert_eq!(
+            matched.map(|matched| matched.header_value_mint_status),
+            Some(Some(BaitHeaderValueMintStatus::SessionValueMismatch))
+        );
         assert_eq!(
             registry
                 .match_action_shape("POST", DECOY_RECONCILE_PATH, [(header_name, header_value)])
                 .map(|matched| matched.bait.id),
             Some(BaitId("minted_trace".to_string()))
+        );
+    }
+
+    #[test]
+    fn windowed_mint_reports_expired_proof() {
+        let mut bait = session_minted_bait();
+        bait.expected_action
+            .header_value_mint
+            .as_mut()
+            .expect("mint config")
+            .proof_window_seconds = Some(60);
+        let mut registry = BaitRegistry::new();
+        registry.add(bait.clone());
+        let session = SessionId::new();
+        let rendered = render_bait_for_session_at(&bait, session, Some("secret"), 1_200)
+            .expect("render")
+            .into_owned();
+        let name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("name");
+        let value = rendered
+            .expected_action
+            .header_value
+            .as_deref()
+            .expect("value");
+
+        let accepted = registry
+            .match_action_for_session_at(
+                "POST",
+                DECOY_RECONCILE_PATH,
+                [(name, value)],
+                session,
+                Some("secret"),
+                1_259,
+            )
+            .expect("verify")
+            .expect("owned action");
+        let expired = registry
+            .match_action_for_session_at(
+                "POST",
+                DECOY_RECONCILE_PATH,
+                [(name, value)],
+                session,
+                Some("secret"),
+                1_260,
+            )
+            .expect("verify")
+            .expect("owned action");
+
+        assert_eq!(
+            accepted.header_value_mint_status,
+            Some(BaitHeaderValueMintStatus::MatchedSessionValue)
+        );
+        assert_eq!(
+            expired.header_value_mint_status,
+            Some(BaitHeaderValueMintStatus::ExpiredSessionValue)
+        );
+    }
+
+    #[test]
+    fn shared_route_checks_later_valid_minted_bait_before_rejecting() {
+        let first = session_minted_bait();
+        let mut second = first.clone();
+        second.id = BaitId("second".to_string());
+        second.expected_action.header_name = Some("X-Second-Proof".to_string());
+        second
+            .expected_action
+            .header_value_mint
+            .as_mut()
+            .expect("mint")
+            .prefix = "second".to_string();
+        let session = SessionId::new();
+        let rendered = render_bait_for_session_at(&second, session, Some("secret"), 1_200)
+            .expect("render")
+            .into_owned();
+        let name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("name");
+        let value = rendered
+            .expected_action
+            .header_value
+            .as_deref()
+            .expect("value");
+        let mut registry = BaitRegistry::new();
+        registry.add(first);
+        registry.add(second);
+
+        let matched = registry
+            .match_action_for_session_at(
+                "POST",
+                DECOY_RECONCILE_PATH,
+                [(name, value)],
+                session,
+                Some("secret"),
+                1_200,
+            )
+            .expect("verify")
+            .expect("valid second bait");
+
+        assert_eq!(matched.bait.id, BaitId("second".to_string()));
+        assert_eq!(
+            matched.header_value_mint_status,
+            Some(BaitHeaderValueMintStatus::MatchedSessionValue)
         );
     }
 }

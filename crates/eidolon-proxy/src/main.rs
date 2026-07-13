@@ -52,6 +52,7 @@ const DEFAULT_HTTP_PORT: u16 = 80;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BAIT_EXPOSURES: usize = 4096;
+const MAX_CONSUMED_BAIT_PROOFS: usize = 4096;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -924,6 +925,17 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     };
     let bait_exposures = BaitExposureStore::from_event_log(&config.event_log_path)?;
     let restored_bait_exposure_count = bait_exposures.len();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let consumed_bait_proofs = ConsumedBaitProofStore::from_event_log(
+        &config.event_log_path,
+        &bait_registry,
+        bait_signing_secret.as_deref(),
+        now,
+    )?;
+    let restored_consumed_bait_proof_count = consumed_bait_proofs.consumed.len();
     let runtime = ProxyRuntime {
         upstream: config.upstream,
         event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
@@ -948,6 +960,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         bait_registry,
         bait_content,
         bait_exposures: Arc::new(Mutex::new(bait_exposures)),
+        consumed_bait_proofs: Arc::new(Mutex::new(consumed_bait_proofs)),
     };
     write_debug(
         &runtime,
@@ -963,6 +976,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
             },
             "bait_profile": bait_profile_debug,
             "bait_signing_enabled": bait_signing_secret.is_some(),
+            "restored_consumed_bait_proof_count": restored_consumed_bait_proof_count,
             "ingress_identity_rule_count": runtime.ingress_identity_resolver.len(),
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
             "trusted_bait_soften_path_prefixes": runtime.trusted_bait_soften_path_prefixes,
@@ -1011,12 +1025,146 @@ struct ProxyRuntime {
     bait_registry: Arc<BaitRegistry>,
     bait_content: BaitContentOverrides,
     bait_exposures: Arc<Mutex<BaitExposureStore>>,
+    consumed_bait_proofs: Arc<Mutex<ConsumedBaitProofStore>>,
 }
 
 #[derive(Debug, Default)]
 struct BaitExposureStore {
     exposures: HashMap<(SessionId, BaitId), ExposureId>,
     exposure_order: VecDeque<(SessionId, BaitId)>,
+}
+
+#[derive(Debug, Default)]
+struct ConsumedBaitProofStore {
+    consumed: HashMap<(SessionId, BaitId, String), u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumeProofOutcome {
+    Fresh,
+    Replay,
+    CapacityExceeded,
+}
+
+impl ConsumedBaitProofStore {
+    fn from_event_log(
+        path: &Path,
+        registry: &BaitRegistry,
+        signing_secret: Option<&str>,
+        now: u64,
+    ) -> io::Result<Self> {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+        let mut store = Self::default();
+        for (line_index, line) in BufReader::new(file).lines().enumerate() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: Event = serde_json::from_str(&line).map_err(|error| {
+                invalid_data(format!(
+                    "could not rebuild consumed bait proof store from event log line {}: {error}",
+                    line_index + 1
+                ))
+            })?;
+            if event.schema_version != EVENT_SCHEMA_VERSION {
+                return Err(invalid_data(format!(
+                    "could not rebuild consumed bait proof store from event log line {}: unsupported schema version {}",
+                    line_index + 1,
+                    event.schema_version
+                )));
+            }
+            let EventKind::BaitActionObserved {
+                bait_id,
+                header_value_mint_status,
+                ..
+            } = event.kind
+            else {
+                continue;
+            };
+            if !matches!(
+                header_value_mint_status,
+                Some(BaitHeaderValueMintStatus::MatchedSessionValue)
+                    | Some(BaitHeaderValueMintStatus::ReplaySeen)
+            ) {
+                continue;
+            }
+            let Some(bait) = registry.baits().iter().find(|bait| bait.id == bait_id) else {
+                continue;
+            };
+            let issued_at = u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
+            let rendered = eidolon_bait::render_bait_for_session_at(
+                bait,
+                event.session_id,
+                signing_secret,
+                issued_at,
+            )
+            .map_err(|error| invalid_data(error.to_string()))?;
+            let Some(proof_value) = rendered.expected_action.header_value.clone() else {
+                continue;
+            };
+            let expires_at = proof_expiry_epoch_seconds(bait, &proof_value)?;
+            if expires_at <= now {
+                continue;
+            }
+            let key = (event.session_id, bait_id, proof_value);
+            if let Some(existing_expiry) = store.consumed.get_mut(&key) {
+                *existing_expiry = expires_at;
+                continue;
+            }
+            if store.consumed.len() >= MAX_CONSUMED_BAIT_PROOFS {
+                return Err(invalid_data(
+                    "active consumed bait proof state exceeds configured capacity",
+                ));
+            }
+            store.consumed.insert(key, expires_at);
+        }
+        Ok(store)
+    }
+
+    fn check_and_mark(
+        &mut self,
+        session_id: SessionId,
+        bait_id: BaitId,
+        proof_value: String,
+        expires_at: u64,
+        now: u64,
+    ) -> ConsumeProofOutcome {
+        let key = (session_id, bait_id, proof_value);
+        self.consumed.retain(|_, expiry| *expiry > now);
+        if self.consumed.contains_key(&key) {
+            return ConsumeProofOutcome::Replay;
+        }
+        if self.consumed.len() >= MAX_CONSUMED_BAIT_PROOFS {
+            return ConsumeProofOutcome::CapacityExceeded;
+        }
+        self.consumed.insert(key, expires_at);
+        ConsumeProofOutcome::Fresh
+    }
+}
+
+fn proof_expiry_epoch_seconds(bait: &Bait, proof_value: &str) -> io::Result<u64> {
+    let Some(mint) = bait.expected_action.header_value_mint.as_ref() else {
+        return Err(invalid_data("proof expiry requested for static bait"));
+    };
+    let Some(window) = mint.proof_window_seconds else {
+        return Err(invalid_data("minted proof has no configured lifetime"));
+    };
+    let prefix = format!("{}_w", mint.prefix);
+    let bucket_hex = proof_value
+        .strip_prefix(&prefix)
+        .and_then(|value| value.split_once('_'))
+        .map(|(bucket, _)| bucket)
+        .ok_or_else(|| invalid_data("matched proof has malformed window"))?;
+    let bucket = u64::from_str_radix(bucket_hex, 16)
+        .map_err(|_| invalid_data("matched proof has invalid window"))?;
+    bucket
+        .checked_add(1)
+        .and_then(|next| next.checked_mul(window))
+        .ok_or_else(|| invalid_data("matched proof expiry overflowed"))
 }
 
 impl BaitExposureStore {
@@ -1363,11 +1511,6 @@ fn validate_bait(bait: &Bait) -> Result<(), ConfigError> {
         "bait.expected_action.header_value",
         bait.expected_action.header_value.as_deref(),
     )?;
-    validate_optional_header_value_mint(
-        "bait.expected_action.header_value_mint",
-        bait.expected_action.header_value_mint.as_ref(),
-    )?;
-
     if bait.expected_action.header_value.is_some() && bait.expected_action.header_name.is_none() {
         return Err(ConfigError::new(
             "bait expected action cannot require a header value without naming the header",
@@ -1387,6 +1530,10 @@ fn validate_bait(bait: &Bait) -> Result<(), ConfigError> {
             "bait expected action cannot set both a static header value and a minted header value",
         ));
     }
+    validate_optional_header_value_mint(
+        "bait.expected_action.header_value_mint",
+        bait.expected_action.header_value_mint.as_ref(),
+    )?;
 
     Ok(())
 }
@@ -1407,7 +1554,18 @@ fn validate_optional_header_value_mint(
     let Some(mint) = mint else {
         return Ok(());
     };
-    validate_non_empty(&format!("{label}.prefix"), &mint.prefix)
+    validate_non_empty(&format!("{label}.prefix"), &mint.prefix)?;
+    if mint.proof_window_seconds.is_none() {
+        return Err(ConfigError::new(format!(
+            "{label}.proof_window_seconds is required"
+        )));
+    }
+    if mint.proof_window_seconds == Some(0) {
+        return Err(ConfigError::new(format!(
+            "{label}.proof_window_seconds must be greater than zero"
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_surface_overrides_reference_baits(
@@ -2450,10 +2608,57 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             )
             .map_err(|error| invalid_data(error.to_string()))?
         {
+            let mut mint_status = action_match.header_value_mint_status;
+            if mint_status == Some(BaitHeaderValueMintStatus::MatchedSessionValue) {
+                let proof_value = action_match
+                    .bait
+                    .expected_action
+                    .header_name
+                    .as_deref()
+                    .and_then(|name| {
+                        request
+                            .headers
+                            .iter()
+                            .find(|header| header.name.eq_ignore_ascii_case(name))
+                    })
+                    .map(|header| header.value.clone())
+                    .ok_or_else(|| invalid_data("matched minted proof had no header value"))?;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let expires_at = proof_expiry_epoch_seconds(&action_match.bait, &proof_value)?;
+                let outcome = runtime
+                    .consumed_bait_proofs
+                    .lock()
+                    .map_err(|_| io::Error::other("consumed bait proof store lock poisoned"))?
+                    .check_and_mark(
+                        session.session_id,
+                        action_match.bait.id.clone(),
+                        proof_value,
+                        expires_at,
+                        now,
+                    );
+                mint_status = Some(match outcome {
+                    ConsumeProofOutcome::Fresh => BaitHeaderValueMintStatus::MatchedSessionValue,
+                    ConsumeProofOutcome::Replay => BaitHeaderValueMintStatus::ReplaySeen,
+                    ConsumeProofOutcome::CapacityExceeded => {
+                        BaitHeaderValueMintStatus::ReplayStateCapacityExceeded
+                    }
+                });
+            }
+            let proof_accepted = matches!(
+                mint_status,
+                None | Some(BaitHeaderValueMintStatus::MatchedSessionValue)
+            );
             effective_decision = policy::PolicyDecision::new(
                 decision.policy_state,
                 RoutingDecision::EidolonOwned,
-                "bait-derived decoy action intercepted before protected upstream",
+                if proof_accepted {
+                    "bait-derived decoy action intercepted before protected upstream"
+                } else {
+                    "rejected bait proof failed closed before protected upstream"
+                },
             );
             write_event(
                 &runtime.event_log,
@@ -2473,6 +2678,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 &action_match.bait,
                 &request.method,
                 &surface_request.path,
+                mint_status,
             )?;
             write_debug(
                 runtime,
@@ -2485,10 +2691,21 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     "query_present": surface_request.query.is_some(),
                     "matched_prior_exposure": action_exposure_id.is_some(),
                     "exposure_id": &action_exposure_id,
+                    "header_value_mint_status": mint_status.map(|status| format!("{status:?}")),
                 }),
             )?;
 
-            let mut response = if let Some(transition) =
+            let mut response = if !proof_accepted {
+                write_event(
+                    &runtime.event_log,
+                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                )?;
+                surface_response_to_http(
+                    runtime
+                        .controlled_reality
+                        .fail_closed_bait_action_response(&surface_request),
+                )
+            } else if let Some(transition) =
                 policy::transition_after_correlated_bait_action(decision.policy_state)
                     .filter(|_| action_exposure_id.is_some())
             {
@@ -3497,8 +3714,17 @@ fn write_bait_action_observed_event(
     bait: &Bait,
     method: &str,
     path: &str,
+    header_value_mint_status: Option<BaitHeaderValueMintStatus>,
 ) -> io::Result<Option<ExposureId>> {
-    let exposure_id = bait_action_exposure_id(runtime, session, &bait.id)?;
+    let accepted = matches!(
+        header_value_mint_status,
+        None | Some(BaitHeaderValueMintStatus::MatchedSessionValue)
+    );
+    let exposure_id = if accepted {
+        bait_action_exposure_id(runtime, session, &bait.id)?
+    } else {
+        None
+    };
     write_bait_action_observed_event_with_exposure(
         runtime,
         session,
@@ -3509,9 +3735,7 @@ fn write_bait_action_observed_event(
             path,
             exposure_id: exposure_id.clone(),
             prior_same_bait_exposure: exposure_id.is_some(),
-            header_value_mint_status: bait
-                .header_value_mint_audit()
-                .map(|_| BaitHeaderValueMintStatus::MatchedSessionValue),
+            header_value_mint_status,
         },
     )?;
 
@@ -4995,6 +5219,7 @@ mod tests {
             bait_registry,
             bait_content: BaitContentOverrides::default(),
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+            consumed_bait_proofs: Arc::new(Mutex::new(ConsumedBaitProofStore::default())),
         }
     }
 
@@ -5044,6 +5269,7 @@ mod tests {
             bait_registry,
             bait_content: BaitContentOverrides::default(),
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+            consumed_bait_proofs: Arc::new(Mutex::new(ConsumedBaitProofStore::default())),
         }
     }
 
@@ -5076,6 +5302,7 @@ mod tests {
             bait_registry,
             bait_content: BaitContentOverrides::default(),
             bait_exposures: Arc::new(Mutex::new(bait_exposures)),
+            consumed_bait_proofs: Arc::new(Mutex::new(ConsumedBaitProofStore::default())),
         }
     }
 
@@ -5110,6 +5337,7 @@ mod tests {
             bait_registry,
             bait_content,
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+            consumed_bait_proofs: Arc::new(Mutex::new(ConsumedBaitProofStore::default())),
         }
     }
 
@@ -5176,7 +5404,8 @@ mod tests {
                 "header_name": "X-Migration-Trace",
                 "header_value_mint": {
                   "kind": "session_hmac_sha256_v1",
-                  "prefix": "minted"
+                  "prefix": "minted",
+                  "proof_window_seconds": 60
                 }
               }
             }
@@ -6554,6 +6783,275 @@ mod tests {
     }
 
     #[test]
+    fn runtime_replayed_session_proof_fails_closed_without_upstream_request() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("profile");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("bait")
+            .clone();
+        let secret: Arc<str> = Arc::from("mint-secret");
+        let session = SessionId::new();
+        let cookie = format!("eidolon_session={}", session.0);
+        let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
+            .expect("render")
+            .into_owned();
+        let name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("name")
+            .to_string();
+        let value = rendered.expected_action.header_value.expect("value");
+        let event_log = unique_temp_path("replayed-proof-events.jsonl");
+        let (upstream, recorder) = spawn_recording_upstream([
+            json_response(r#"{"unexpected":1}"#),
+            json_response(r#"{"unexpected":2}"#),
+        ]);
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log,
+            unique_temp_path("replayed-proof-control.txt"),
+            loaded,
+            Some(secret),
+        );
+
+        let first = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie(&bait.expected_action.path, &cookie, &[(&name, &value)]),
+        ));
+        let replay = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(&bait.expected_action.path, &cookie, &[(&name, &value)]),
+        ));
+
+        assert_eq!(first.status, 202);
+        assert_eq!(replay.status, 403);
+        assert!(
+            recorder.finish().is_empty(),
+            "proof request reached upstream"
+        );
+        let actions = events_of_type(&event_log, "bait_action_observed");
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            actions[0]["kind"]["header_value_mint_status"],
+            "matched_session_value"
+        );
+        assert_eq!(
+            actions[1]["kind"]["header_value_mint_status"],
+            "replay_seen"
+        );
+        assert!(actions[1]["kind"]["exposure_id"].is_null());
+    }
+
+    #[test]
+    fn runtime_replay_capacity_failure_fails_closed_without_upstream_request() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("profile");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("bait")
+            .clone();
+        let secret: Arc<str> = Arc::from("mint-secret");
+        let session = SessionId::new();
+        let cookie = format!("eidolon_session={}", session.0);
+        let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
+            .expect("render")
+            .into_owned();
+        let name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("name")
+            .to_string();
+        let value = rendered.expected_action.header_value.expect("value");
+        let event_log = unique_temp_path("proof-capacity-events.jsonl");
+        let (upstream, recorder) = spawn_recording_upstream([json_response(r#"{"unexpected":1}"#)]);
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log,
+            unique_temp_path("proof-capacity-control.txt"),
+            loaded,
+            Some(secret),
+        );
+        {
+            let mut store = runtime.consumed_bait_proofs.lock().expect("store");
+            for index in 0..MAX_CONSUMED_BAIT_PROOFS {
+                store.consumed.insert(
+                    (
+                        SessionId::new(),
+                        BaitId(format!("bait-{index}")),
+                        format!("proof-{index}"),
+                    ),
+                    u64::MAX,
+                );
+            }
+        }
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(&bait.expected_action.path, &cookie, &[(&name, &value)]),
+        ));
+
+        assert_eq!(response.status, 403);
+        assert!(
+            recorder.finish().is_empty(),
+            "capacity failure reached upstream"
+        );
+        let action = first_event_of_type(&event_log, "bait_action_observed");
+        assert_eq!(
+            action["kind"]["header_value_mint_status"],
+            "replay_state_capacity_exceeded"
+        );
+        assert!(action["kind"]["exposure_id"].is_null());
+    }
+
+    #[test]
+    fn runtime_replay_after_store_rebuild_fails_closed_without_upstream_request() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("profile");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("bait")
+            .clone();
+        let secret: Arc<str> = Arc::from("mint-secret");
+        let session = SessionId::new();
+        let cookie = format!("eidolon_session={}", session.0);
+        let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
+            .expect("render")
+            .into_owned();
+        let name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("name")
+            .to_string();
+        let value = rendered.expected_action.header_value.expect("value");
+        let event_log = unique_temp_path("restart-replay-events.jsonl");
+        let (first_upstream, first_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":1}"#)]);
+        let first_runtime = test_runtime_with_bait_profile(
+            first_upstream,
+            &event_log,
+            unique_temp_path("restart-replay-first-control.txt"),
+            loaded.clone(),
+            Some(Arc::clone(&secret)),
+        );
+
+        let first = parse_downstream_response(&run_runtime_request(
+            first_runtime,
+            &post_request_with_cookie(&bait.expected_action.path, &cookie, &[(&name, &value)]),
+        ));
+        assert_eq!(first.status, 202);
+        assert!(
+            first_recorder.finish().is_empty(),
+            "first proof reached upstream"
+        );
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let restored = ConsumedBaitProofStore::from_event_log(
+            &event_log,
+            &loaded.registry,
+            Some(secret.as_ref()),
+            now,
+        )
+        .expect("restore consumed proofs");
+        let (second_upstream, second_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":2}"#)]);
+        let mut second_runtime = test_runtime_with_bait_profile(
+            second_upstream,
+            &event_log,
+            unique_temp_path("restart-replay-second-control.txt"),
+            loaded,
+            Some(secret),
+        );
+        second_runtime.consumed_bait_proofs = Arc::new(Mutex::new(restored));
+
+        let replay = parse_downstream_response(&run_runtime_request(
+            second_runtime,
+            &post_request_with_cookie(&bait.expected_action.path, &cookie, &[(&name, &value)]),
+        ));
+
+        assert_eq!(replay.status, 403);
+        assert!(
+            second_recorder.finish().is_empty(),
+            "restart replay reached upstream"
+        );
+        let actions = events_of_type(&event_log, "bait_action_observed");
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            actions[1]["kind"]["header_value_mint_status"],
+            "replay_seen"
+        );
+        assert!(actions[1]["kind"]["exposure_id"].is_null());
+    }
+
+    #[test]
+    fn runtime_expired_session_proof_fails_closed_without_upstream_request() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("profile");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("bait")
+            .clone();
+        let secret: Arc<str> = Arc::from("mint-secret");
+        let session = SessionId::new();
+        let cookie = format!("eidolon_session={}", session.0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let rendered = eidolon_bait::render_bait_for_session_at(
+            &bait,
+            session,
+            Some(secret.as_ref()),
+            now.saturating_sub(180),
+        )
+        .expect("render")
+        .into_owned();
+        let name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("name")
+            .to_string();
+        let value = rendered.expected_action.header_value.expect("value");
+        let event_log = unique_temp_path("expired-proof-events.jsonl");
+        let (upstream, recorder) = spawn_recording_upstream([json_response(r#"{"unexpected":1}"#)]);
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log,
+            unique_temp_path("expired-proof-control.txt"),
+            loaded,
+            Some(secret),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(&bait.expected_action.path, &cookie, &[(&name, &value)]),
+        ));
+
+        assert_eq!(response.status, 403);
+        assert!(
+            recorder.finish().is_empty(),
+            "expired proof reached upstream"
+        );
+        let action = first_event_of_type(&event_log, "bait_action_observed");
+        assert_eq!(
+            action["kind"]["header_value_mint_status"],
+            "expired_session_value"
+        );
+        assert!(action["kind"]["exposure_id"].is_null());
+    }
+
+    #[test]
     fn runtime_session_minted_bait_from_other_session_fails_closed_without_correlation() {
         let path = write_bait_profile(session_minted_profile_json());
         let loaded = load_bait_profile(&path).expect("minted profile should load");
@@ -6637,6 +7135,10 @@ mod tests {
             replay_action["kind"]["header_value_mint"]["prefix"],
             "minted"
         );
+        assert_eq!(
+            replay_action["kind"]["header_value_mint_status"],
+            "session_value_mismatch"
+        );
         assert!(!replay_action.to_string().contains(&header_value_a));
 
         let replay_request = events_of_type(&event_log_path, "request_seen")
@@ -6655,6 +7157,43 @@ mod tests {
                 event["session_id"] == session_b.0.to_string()
                     && event["kind"]["to"] == "controlled_reality"
             }));
+    }
+
+    #[test]
+    fn runtime_missing_session_proof_fails_closed_with_explicit_outcome() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("profile");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("bait")
+            .clone();
+        let event_log = unique_temp_path("missing-proof-events.jsonl");
+        let (upstream, recorder) = spawn_recording_upstream([json_response(r#"{"unexpected":1}"#)]);
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log,
+            unique_temp_path("missing-proof-control.txt"),
+            loaded,
+            Some(Arc::from("mint-secret")),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(&bait.expected_action.path, &cookie_header(), &[]),
+        ));
+
+        assert_eq!(response.status, 403);
+        assert!(
+            recorder.finish().is_empty(),
+            "missing proof reached upstream"
+        );
+        let action = first_event_of_type(&event_log, "bait_action_observed");
+        assert_eq!(
+            action["kind"]["header_value_mint_status"],
+            "missing_session_value"
+        );
+        assert!(action["kind"]["exposure_id"].is_null());
     }
 
     #[test]
@@ -6701,6 +7240,10 @@ mod tests {
         let rejected_action = first_event_of_type(&event_log_path, "bait_action_observed");
         assert_eq!(rejected_action["kind"]["bait_id"], "minted_trace");
         assert!(rejected_action["kind"]["exposure_id"].is_null());
+        assert_eq!(
+            rejected_action["kind"]["header_value_mint_status"],
+            "malformed_session_value"
+        );
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
     }
 
@@ -7039,6 +7582,116 @@ mod tests {
         let store = BaitExposureStore::from_event_log(&path).expect("missing log should rebuild");
 
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn consumed_proof_store_is_per_proof_and_fails_closed_at_capacity() {
+        let mut store = ConsumedBaitProofStore::default();
+        let session = SessionId::new();
+        let bait = BaitId("minted".to_string());
+
+        assert_eq!(
+            store.check_and_mark(session, bait.clone(), "proof-a".to_string(), 100, 0),
+            ConsumeProofOutcome::Fresh
+        );
+        assert_eq!(
+            store.check_and_mark(session, bait.clone(), "proof-a".to_string(), 100, 0),
+            ConsumeProofOutcome::Replay
+        );
+        assert_eq!(
+            store.check_and_mark(session, bait, "proof-b".to_string(), 100, 0),
+            ConsumeProofOutcome::Fresh
+        );
+
+        while store.consumed.len() < MAX_CONSUMED_BAIT_PROOFS {
+            let index = store.consumed.len();
+            assert_eq!(
+                store.check_and_mark(
+                    SessionId::new(),
+                    BaitId(format!("bait-{index}")),
+                    format!("proof-{index}"),
+                    100,
+                    0,
+                ),
+                ConsumeProofOutcome::Fresh
+            );
+        }
+        assert_eq!(
+            store.check_and_mark(
+                SessionId::new(),
+                BaitId("overflow".to_string()),
+                "overflow".to_string(),
+                100,
+                0,
+            ),
+            ConsumeProofOutcome::CapacityExceeded
+        );
+        assert_eq!(store.consumed.len(), MAX_CONSUMED_BAIT_PROOFS);
+        assert_eq!(
+            store.check_and_mark(
+                SessionId::new(),
+                BaitId("after-expiry".to_string()),
+                "fresh".to_string(),
+                200,
+                100,
+            ),
+            ConsumeProofOutcome::Fresh
+        );
+        assert_eq!(store.consumed.len(), 1);
+    }
+
+    #[test]
+    fn consumed_proof_store_restores_active_proofs_from_event_log() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("profile");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("bait")
+            .clone();
+        let session = SessionId::new();
+        let mut event = Event::new(
+            session,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: bait.id.clone(),
+                exposure_id: None,
+                method: "POST".to_string(),
+                path: bait.expected_action.path.clone(),
+                header_value_mint: bait.header_value_mint_audit(),
+                header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            },
+        );
+        event.observed_at = chrono::DateTime::from_timestamp(1_200, 0).expect("timestamp");
+        let event_log = unique_temp_path("consumed-proof-rebuild.jsonl");
+        fs::write(
+            &event_log,
+            format!(
+                "{line}\n{line}\n",
+                line = serde_json::to_string(&event).expect("serialize")
+            ),
+        )
+        .expect("write event log");
+        let rendered =
+            eidolon_bait::render_bait_for_session_at(&bait, session, Some("mint-secret"), 1_200)
+                .expect("render")
+                .into_owned();
+        let proof = rendered.expected_action.header_value.expect("proof");
+
+        let mut store = ConsumedBaitProofStore::from_event_log(
+            &event_log,
+            &loaded.registry,
+            Some("mint-secret"),
+            1_259,
+        )
+        .expect("restore");
+
+        assert_eq!(store.consumed.len(), 1);
+        assert_eq!(
+            store.check_and_mark(session, bait.id, proof, 1_260, 1_259),
+            ConsumeProofOutcome::Replay
+        );
     }
 
     #[test]
