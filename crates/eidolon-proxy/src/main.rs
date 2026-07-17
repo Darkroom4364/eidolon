@@ -14876,14 +14876,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_secs();
-        let current = eidolon_bait::render_bait_for_session_at(
-            &bait,
-            session_a,
-            Some(secret.as_ref()),
-            now,
-        )
-        .expect("current proof should render")
-        .into_owned();
+        let current =
+            eidolon_bait::render_bait_for_session_at(&bait, session_a, Some(secret.as_ref()), now)
+                .expect("current proof should render")
+                .into_owned();
         let expired = eidolon_bait::render_bait_for_session_at(
             &bait,
             session_a,
