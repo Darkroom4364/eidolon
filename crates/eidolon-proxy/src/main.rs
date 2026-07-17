@@ -1502,7 +1502,7 @@ fn validate_bait(bait: &Bait) -> Result<(), ConfigError> {
     validate_non_empty("bait.id", &bait.id.0)?;
     validate_path("bait.surface", &bait.surface)?;
     validate_non_empty("bait.expected_action.method", &bait.expected_action.method)?;
-    validate_path("bait.expected_action.path", &bait.expected_action.path)?;
+    validate_action_path("bait.expected_action.path", &bait.expected_action.path)?;
     validate_optional_non_empty(
         "bait.expected_action.header_name",
         bait.expected_action.header_name.as_deref(),
@@ -1606,6 +1606,70 @@ fn validate_path(label: &str, value: &str) -> Result<(), ConfigError> {
     }
 
     Ok(())
+}
+
+fn validate_action_path(label: &str, value: &str) -> Result<(), ConfigError> {
+    validate_path(label, value)?;
+    if value.contains('?') || value.contains('#') {
+        return Err(ConfigError::new(format!(
+            "{label} must be a canonical path-only value without a query string or fragment"
+        )));
+    }
+    let canonical = canonical_action_route_path(value).map_err(|reason| {
+        ConfigError::new(format!(
+            "{label} must be a canonical path-only value: {reason}"
+        ))
+    })?;
+    if canonical != value {
+        return Err(ConfigError::new(format!(
+            "{label} must be a canonical path-only value without percent-encoded bytes"
+        )));
+    }
+
+    Ok(())
+}
+
+fn canonical_action_route_path(target: &str) -> Result<String, &'static str> {
+    let raw_path_end = target
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index))
+        .unwrap_or(target.len());
+    let raw_path = &target[..raw_path_end];
+    let bytes = raw_path.as_bytes();
+    let mut canonical = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            canonical.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err("percent escape is incomplete");
+        }
+        let high = hex_value(bytes[index + 1]).ok_or("percent escape is not hexadecimal")?;
+        let low = hex_value(bytes[index + 2]).ok_or("percent escape is not hexadecimal")?;
+        canonical.push((high << 4) | low);
+        index += 3;
+    }
+
+    let decoded =
+        String::from_utf8(canonical).map_err(|_| "percent escape decodes to invalid UTF-8")?;
+    let decoded_path_end = decoded
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index))
+        .unwrap_or(decoded.len());
+    Ok(decoded[..decoded_path_end].to_string())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn bait_profile_debug_value(metadata: &Option<BaitProfileMetadata>) -> Value {
@@ -2134,10 +2198,8 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
     let path = normalized_event_path(&request)?;
     let surface_request = surface_request_meta(&request, &path);
-    let owns_configured_unsafe_bait_action = is_unsafe_method(&request.method)
-        && runtime
-            .bait_registry
-            .matches_action_route(&request.method, &surface_request.path);
+    let owns_configured_unsafe_bait_action =
+        owns_configured_unsafe_bait_action(runtime, &surface_request);
     let session = effective_session_context(runtime, &request, &surface_request, client_peer_ip);
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
     let starting_policy_state = policy_state;
@@ -3200,6 +3262,37 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
 
     client_stream.write_all(&response.to_http_bytes())?;
     client_stream.flush()
+}
+
+fn owns_configured_unsafe_bait_action(
+    runtime: &ProxyRuntime,
+    request: &SurfaceRequestMeta,
+) -> bool {
+    if !is_unsafe_method(&request.method) {
+        return false;
+    }
+
+    let incoming_path = canonical_action_route_path(&request.target);
+    runtime.bait_registry.baits().iter().any(|bait| {
+        if !bait
+            .expected_action
+            .method
+            .eq_ignore_ascii_case(&request.method)
+        {
+            return false;
+        }
+
+        match (
+            canonical_action_route_path(&bait.expected_action.path),
+            incoming_path.as_ref(),
+        ) {
+            (Ok(expected), Ok(incoming)) => expected == incoming.as_str(),
+            _ => {
+                bait.expected_action.path == request.path
+                    || bait.expected_action.path == request.target
+            }
+        }
+    })
 }
 
 fn maybe_transition_to_blocked_from_reality_escape_attempt(
@@ -5468,6 +5561,10 @@ mod tests {
     }
 
     fn custom_unsafe_action_profile_json(method: &str) -> String {
+        custom_unsafe_action_profile_json_with_path(method, "/eidolon-lab/custom-commit")
+    }
+
+    fn custom_unsafe_action_profile_json_with_path(method: &str, action_path: &str) -> String {
         r##"{
           "schema_version": 1,
           "profile_id": "custom_unsafe_action",
@@ -5479,7 +5576,7 @@ mod tests {
               "surface_kind": "docs",
               "expected_action": {
                 "method": "__METHOD__",
-                "path": "/eidolon-lab/custom-commit",
+                "path": "__ACTION_PATH__",
                 "header_name": "X-Eidolon-Custom-Proof",
                 "header_value": "custom-proof-value"
               }
@@ -5487,6 +5584,34 @@ mod tests {
           ]
         }"##
         .replace("__METHOD__", method)
+        .replace("__ACTION_PATH__", action_path)
+    }
+
+    // Simulate malformed registry state so the runtime guard remains testable after loader rejection.
+    fn unchecked_custom_unsafe_action_profile(action_path: &str) -> LoadedBaitProfile {
+        let mut registry = BaitRegistry::new();
+        registry.add(Bait {
+            id: BaitId("custom_commit_trace".to_string()),
+            bait_class: BaitClass::Docs,
+            surface: "/docs/custom-commit".to_string(),
+            surface_kind: SurfaceKind::Docs,
+            expected_action: ExpectedAction {
+                method: "PUT".to_string(),
+                path: action_path.to_string(),
+                header_name: Some("X-Eidolon-Custom-Proof".to_string()),
+                header_value: Some("custom-proof-value".to_string()),
+                header_value_mint: None,
+            },
+        });
+
+        LoadedBaitProfile {
+            registry,
+            content: BaitContentOverrides::default(),
+            metadata: Some(BaitProfileMetadata {
+                profile_id: "unchecked_custom_unsafe_action".to_string(),
+                hypothesis: None,
+            }),
+        }
     }
 
     fn set_runtime_policy_state(runtime: &ProxyRuntime, cookie: &str, policy_state: PolicyState) {
@@ -6539,6 +6664,81 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot set both a static header value and a minted header value"));
+    }
+
+    #[test]
+    fn bait_profile_rejects_query_and_fragment_in_expected_action_path() {
+        for action_path in [
+            "/eidolon-lab/custom-commit?attempt=1",
+            "/eidolon-lab/custom-commit#proof",
+        ] {
+            let path = write_bait_profile(&custom_unsafe_action_profile_json_with_path(
+                "PUT",
+                action_path,
+            ));
+
+            let error = load_bait_profile(&path)
+                .expect_err("non-path expected action target should be rejected");
+
+            assert_eq!(
+                error.to_string(),
+                "bait.expected_action.path must be a canonical path-only value without a query string or fragment"
+            );
+        }
+    }
+
+    #[test]
+    fn bait_profile_rejects_percent_encoded_reserved_path_bytes() {
+        for action_path in [
+            "/eidolon-lab/custom-commit%3Fattempt=1",
+            "/eidolon-lab/custom-commit%23proof",
+            "/eidolon-lab/custom%2Fcommit",
+        ] {
+            let path = write_bait_profile(&custom_unsafe_action_profile_json_with_path(
+                "PUT",
+                action_path,
+            ));
+
+            let error = load_bait_profile(&path)
+                .expect_err("percent-encoded expected action path should be rejected");
+
+            assert_eq!(
+                error.to_string(),
+                "bait.expected_action.path must be a canonical path-only value without percent-encoded bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn bait_profile_rejects_noncanonical_or_malformed_percent_encoding() {
+        for (action_path, expected_error) in [
+            (
+                "/eidolon-lab/route-%63",
+                "bait.expected_action.path must be a canonical path-only value without percent-encoded bytes",
+            ),
+            (
+                "/eidolon-lab/custom-commit%3fproof",
+                "bait.expected_action.path must be a canonical path-only value without percent-encoded bytes",
+            ),
+            (
+                "/eidolon-lab/custom-commit%",
+                "bait.expected_action.path must be a canonical path-only value: percent escape is incomplete",
+            ),
+            (
+                "/eidolon-lab/custom-commit%GG",
+                "bait.expected_action.path must be a canonical path-only value: percent escape is not hexadecimal",
+            ),
+        ] {
+            let path = write_bait_profile(&custom_unsafe_action_profile_json_with_path(
+                "PUT",
+                action_path,
+            ));
+
+            let error = load_bait_profile(&path)
+                .expect_err("noncanonical expected action path should be rejected");
+
+            assert_eq!(error.to_string(), expected_error);
+        }
     }
 
     #[test]
@@ -14495,6 +14695,331 @@ mod tests {
             assert!(events_of_type(&event_log_path, "request_seen")
                 .iter()
                 .all(|event| event["kind"]["routing_decision"] == "eidolon_owned"));
+        }
+    }
+
+    #[test]
+    fn query_bearing_custom_action_fails_closed_if_validation_is_bypassed() {
+        let action_target = "/eidolon-lab/custom-commit?attempt=1";
+
+        for interventions_disabled in [false, true] {
+            let loaded = unchecked_custom_unsafe_action_profile(action_target);
+            let mode = if interventions_disabled {
+                "emergency-disabled"
+            } else {
+                "enabled"
+            };
+            let event_log_path = unique_temp_path(&format!("query-action-{mode}-events.jsonl"));
+            let control_path = unique_temp_path(&format!("query-action-{mode}-control.txt"));
+            if interventions_disabled {
+                must_ok(
+                    fs::write(&control_path, "disabled"),
+                    "control file should write",
+                );
+            }
+            let (upstream, upstream_recorder) =
+                spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+            let runtime = test_runtime_with_bait_profile(
+                upstream,
+                &event_log_path,
+                control_path,
+                loaded,
+                None,
+            );
+            let cookie = cookie_header();
+
+            let missing_response = parse_downstream_response(&run_runtime_request(
+                runtime.clone(),
+                &request_with_cookie("PUT", action_target, &cookie, &[]),
+            ));
+            let wrong_response = parse_downstream_response(&run_runtime_request(
+                runtime,
+                &request_with_cookie(
+                    "PUT",
+                    action_target,
+                    &cookie,
+                    &[("X-Eidolon-Custom-Proof", "wrong")],
+                ),
+            ));
+            let upstream_requests = upstream_recorder.finish();
+
+            assert_eq!(missing_response.status, 403, "missing proof in {mode} mode");
+            assert_eq!(wrong_response.status, 403, "wrong proof in {mode} mode");
+            assert!(
+                upstream_requests.is_empty(),
+                "query-bearing configured action reached protected upstream in {mode} mode"
+            );
+            assert_eq!(events_of_type(&event_log_path, "request_seen").len(), 2);
+            assert!(events_of_type(&event_log_path, "request_seen")
+                .iter()
+                .all(|event| event["kind"]["routing_decision"] == "eidolon_owned"));
+        }
+    }
+
+    #[test]
+    fn ambiguous_custom_action_targets_never_connect_to_upstream_in_any_mode() {
+        let cases = [
+            (
+                "raw-fragment",
+                "/eidolon-lab/route-c",
+                "/eidolon-lab/route-c#fragment",
+                false,
+            ),
+            (
+                "encoded-incoming-alias",
+                "/eidolon-lab/route-c",
+                "/eidolon-lab/route-%63",
+                false,
+            ),
+            (
+                "encoded-config-alias",
+                "/eidolon-lab/route-%63",
+                "/eidolon-lab/route-c",
+                true,
+            ),
+            (
+                "encoded-reserved-alias",
+                "/eidolon-lab/route/c",
+                "/eidolon-lab/route%2Fc",
+                false,
+            ),
+            (
+                "absolute-form",
+                "/eidolon-lab/route-c",
+                "http://proxy.local/eidolon-lab/route-c",
+                false,
+            ),
+        ];
+
+        for interventions_disabled in [false, true] {
+            let mode = if interventions_disabled {
+                "emergency-disabled"
+            } else {
+                "enabled"
+            };
+            for (case, configured_path, incoming_target, bypass_validation) in cases {
+                let loaded = if bypass_validation {
+                    // Loader rejection is primary; this exercises runtime defense in depth.
+                    unchecked_custom_unsafe_action_profile(configured_path)
+                } else {
+                    let path = write_bait_profile(&custom_unsafe_action_profile_json_with_path(
+                        "PUT",
+                        configured_path,
+                    ));
+                    load_bait_profile(&path).expect("canonical custom profile should load")
+                };
+                let event_log_path =
+                    unique_temp_path(&format!("ambiguous-{case}-{mode}-events.jsonl"));
+                let control_path =
+                    unique_temp_path(&format!("ambiguous-{case}-{mode}-control.txt"));
+                if interventions_disabled {
+                    must_ok(
+                        fs::write(&control_path, "disabled"),
+                        "control file should write",
+                    );
+                }
+                let (upstream, upstream_recorder) =
+                    spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+                let runtime = test_runtime_with_bait_profile(
+                    upstream,
+                    &event_log_path,
+                    control_path,
+                    loaded,
+                    None,
+                );
+                let cookie = cookie_header();
+
+                let missing_response = parse_downstream_response(&run_runtime_request(
+                    runtime.clone(),
+                    &request_with_cookie("PUT", incoming_target, &cookie, &[]),
+                ));
+                let wrong_response = parse_downstream_response(&run_runtime_request(
+                    runtime,
+                    &request_with_cookie(
+                        "PUT",
+                        incoming_target,
+                        &cookie,
+                        &[("X-Eidolon-Custom-Proof", "wrong")],
+                    ),
+                ));
+                let upstream_connections = upstream_recorder.finish();
+
+                assert_eq!(missing_response.status, 403, "missing proof: {case} {mode}");
+                assert_eq!(wrong_response.status, 403, "wrong proof: {case} {mode}");
+                assert!(
+                    upstream_connections.is_empty(),
+                    "{case} target connected to protected upstream in {mode} mode"
+                );
+                assert_eq!(events_of_type(&event_log_path, "request_seen").len(), 2);
+                assert!(events_of_type(&event_log_path, "request_seen")
+                    .iter()
+                    .all(|event| event["kind"]["routing_decision"] == "eidolon_owned"));
+            }
+        }
+    }
+
+    #[test]
+    fn absolute_form_minted_proof_rejections_never_connect_to_upstream() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("minted profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait should exist")
+            .clone();
+        let secret: Arc<str> = Arc::from("mint-secret");
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        let cookie_a = format!("eidolon_session={}", session_a.0);
+        let cookie_b = format!("eidolon_session={}", session_b.0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let current =
+            eidolon_bait::render_bait_for_session_at(&bait, session_a, Some(secret.as_ref()), now)
+                .expect("current proof should render")
+                .into_owned();
+        let expired = eidolon_bait::render_bait_for_session_at(
+            &bait,
+            session_a,
+            Some(secret.as_ref()),
+            now.saturating_sub(180),
+        )
+        .expect("expired proof should render")
+        .into_owned();
+        let header_name = current
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("minted bait should keep header name")
+            .to_string();
+        let current_value = current
+            .expected_action
+            .header_value
+            .expect("current proof should have a value");
+        let expired_value = expired
+            .expected_action
+            .header_value
+            .expect("expired proof should have a value");
+        let absolute_target = format!("http://proxy.local{}", bait.expected_action.path);
+        let event_log_path = unique_temp_path("absolute-minted-proof-events.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("absolute-minted-proof-control.txt"),
+            loaded,
+            Some(secret),
+        );
+
+        let requests = [
+            request_with_cookie("POST", &absolute_target, &cookie_a, &[]),
+            request_with_cookie(
+                "POST",
+                &absolute_target,
+                &cookie_a,
+                &[(&header_name, "minted.not-a-valid-proof")],
+            ),
+            request_with_cookie(
+                "POST",
+                &absolute_target,
+                &cookie_a,
+                &[(&header_name, &expired_value)],
+            ),
+            request_with_cookie(
+                "POST",
+                &absolute_target,
+                &cookie_b,
+                &[(&header_name, &current_value)],
+            ),
+            request_with_cookie(
+                "POST",
+                &absolute_target,
+                &cookie_a,
+                &[(&header_name, &current_value)],
+            ),
+            request_with_cookie(
+                "POST",
+                &absolute_target,
+                &cookie_a,
+                &[(&header_name, &current_value)],
+            ),
+        ];
+        let responses = requests.map(|request| {
+            parse_downstream_response(&run_runtime_request(runtime.clone(), &request))
+        });
+        let upstream_connections = upstream_recorder.finish();
+
+        assert_eq!(
+            responses.map(|response| response.status),
+            [403, 403, 403, 403, 202, 403]
+        );
+        assert!(
+            upstream_connections.is_empty(),
+            "absolute-form proof requests connected to protected upstream"
+        );
+        let statuses = events_of_type(&event_log_path, "bait_action_observed")
+            .into_iter()
+            .map(|event| event["kind"]["header_value_mint_status"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [
+                "missing_session_value",
+                "malformed_session_value",
+                "expired_session_value",
+                "session_value_mismatch",
+                "matched_session_value",
+                "replay_seen",
+            ]
+        );
+        assert!(events_of_type(&event_log_path, "request_seen")
+            .iter()
+            .all(|event| event["kind"]["routing_decision"] == "eidolon_owned"));
+    }
+
+    #[test]
+    fn encoded_delimiter_custom_actions_fail_closed_without_upstream_requests() {
+        for action_path in [
+            "/eidolon-lab/custom-commit%3Fattempt=1",
+            "/eidolon-lab/custom-commit%23proof",
+        ] {
+            let loaded = unchecked_custom_unsafe_action_profile(action_path);
+            let event_log_path = unique_temp_path("encoded-custom-action-events.jsonl");
+            let (upstream, upstream_recorder) =
+                spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+            let runtime = test_runtime_with_bait_profile(
+                upstream,
+                &event_log_path,
+                unique_temp_path("encoded-custom-action-control.txt"),
+                loaded,
+                None,
+            );
+            let cookie = cookie_header();
+
+            let missing_response = parse_downstream_response(&run_runtime_request(
+                runtime.clone(),
+                &request_with_cookie("PUT", action_path, &cookie, &[]),
+            ));
+            let wrong_response = parse_downstream_response(&run_runtime_request(
+                runtime,
+                &request_with_cookie(
+                    "PUT",
+                    action_path,
+                    &cookie,
+                    &[("X-Eidolon-Custom-Proof", "wrong")],
+                ),
+            ));
+            let upstream_requests = upstream_recorder.finish();
+
+            assert_eq!(missing_response.status, 403);
+            assert_eq!(wrong_response.status, 403);
+            assert!(
+                upstream_requests.is_empty(),
+                "encoded configured action reached protected upstream"
+            );
         }
     }
 
