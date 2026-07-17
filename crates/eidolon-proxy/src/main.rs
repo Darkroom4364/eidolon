@@ -1622,7 +1622,7 @@ fn validate_action_path(label: &str, value: &str) -> Result<(), ConfigError> {
     })?;
     if canonical != value {
         return Err(ConfigError::new(format!(
-            "{label} must be a canonical path-only value with unreserved bytes decoded and percent escapes uppercase"
+            "{label} must be a canonical path-only value without percent-encoded bytes"
         )));
     }
 
@@ -1630,12 +1630,12 @@ fn validate_action_path(label: &str, value: &str) -> Result<(), ConfigError> {
 }
 
 fn canonical_action_route_path(target: &str) -> Result<String, &'static str> {
-    let path_end = target
+    let raw_path_end = target
         .char_indices()
         .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index))
         .unwrap_or(target.len());
-    let path = &target[..path_end];
-    let bytes = path.as_bytes();
+    let raw_path = &target[..raw_path_end];
+    let bytes = raw_path.as_bytes();
     let mut canonical = Vec::with_capacity(bytes.len());
     let mut index = 0;
 
@@ -1650,20 +1650,17 @@ fn canonical_action_route_path(target: &str) -> Result<String, &'static str> {
         }
         let high = hex_value(bytes[index + 1]).ok_or("percent escape is not hexadecimal")?;
         let low = hex_value(bytes[index + 2]).ok_or("percent escape is not hexadecimal")?;
-        let decoded = (high << 4) | low;
-        if decoded.is_ascii_alphanumeric() || matches!(decoded, b'-' | b'.' | b'_' | b'~') {
-            canonical.push(decoded);
-        } else {
-            canonical.extend_from_slice(&[
-                b'%',
-                uppercase_hex_digit(high),
-                uppercase_hex_digit(low),
-            ]);
-        }
+        canonical.push((high << 4) | low);
         index += 3;
     }
 
-    String::from_utf8(canonical).map_err(|_| "percent escape decodes to invalid UTF-8")
+    let decoded =
+        String::from_utf8(canonical).map_err(|_| "percent escape decodes to invalid UTF-8")?;
+    let decoded_path_end = decoded
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index))
+        .unwrap_or(decoded.len());
+    Ok(decoded[..decoded_path_end].to_string())
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -1672,14 +1669,6 @@ fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
-    }
-}
-
-fn uppercase_hex_digit(value: u8) -> u8 {
-    match value {
-        0..=9 => b'0' + value,
-        10..=15 => b'A' + value - 10,
-        _ => unreachable!("hex nibble must fit in four bits"),
     }
 }
 
@@ -6699,19 +6688,24 @@ mod tests {
     }
 
     #[test]
-    fn bait_profile_accepts_canonical_encoded_reserved_path_bytes() {
+    fn bait_profile_rejects_percent_encoded_reserved_path_bytes() {
         for action_path in [
             "/eidolon-lab/custom-commit%3Fattempt=1",
             "/eidolon-lab/custom-commit%23proof",
+            "/eidolon-lab/custom%2Fcommit",
         ] {
             let path = write_bait_profile(&custom_unsafe_action_profile_json_with_path(
                 "PUT",
                 action_path,
             ));
 
-            let loaded = load_bait_profile(&path).expect("encoded path should load");
+            let error = load_bait_profile(&path)
+                .expect_err("percent-encoded expected action path should be rejected");
 
-            assert_eq!(loaded.registry.baits()[0].expected_action.path, action_path);
+            assert_eq!(
+                error.to_string(),
+                "bait.expected_action.path must be a canonical path-only value without percent-encoded bytes"
+            );
         }
     }
 
@@ -6720,11 +6714,11 @@ mod tests {
         for (action_path, expected_error) in [
             (
                 "/eidolon-lab/route-%63",
-                "bait.expected_action.path must be a canonical path-only value with unreserved bytes decoded and percent escapes uppercase",
+                "bait.expected_action.path must be a canonical path-only value without percent-encoded bytes",
             ),
             (
                 "/eidolon-lab/custom-commit%3fproof",
-                "bait.expected_action.path must be a canonical path-only value with unreserved bytes decoded and percent escapes uppercase",
+                "bait.expected_action.path must be a canonical path-only value without percent-encoded bytes",
             ),
             (
                 "/eidolon-lab/custom-commit%",
@@ -14784,6 +14778,12 @@ mod tests {
                 true,
             ),
             (
+                "encoded-reserved-alias",
+                "/eidolon-lab/route/c",
+                "/eidolon-lab/route%2Fc",
+                false,
+            ),
+            (
                 "absolute-form",
                 "/eidolon-lab/route-c",
                 "http://proxy.local/eidolon-lab/route-c",
@@ -14986,11 +14986,7 @@ mod tests {
             "/eidolon-lab/custom-commit%3Fattempt=1",
             "/eidolon-lab/custom-commit%23proof",
         ] {
-            let path = write_bait_profile(&custom_unsafe_action_profile_json_with_path(
-                "PUT",
-                action_path,
-            ));
-            let loaded = load_bait_profile(&path).expect("encoded path should load");
+            let loaded = unchecked_custom_unsafe_action_profile(action_path);
             let event_log_path = unique_temp_path("encoded-custom-action-events.jsonl");
             let (upstream, upstream_recorder) =
                 spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);

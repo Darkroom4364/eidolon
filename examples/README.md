@@ -317,9 +317,8 @@ The seed promotion manifest is
 change only owned bait surfaces and OpenAPI insertions; ordinary traffic still
 uses the protected upstream path. Each `expected_action.path` must be a
 canonical path-only value beginning with `/`; query strings and fragments are
-rejected rather than stripped or normalized. Percent escapes must be complete
-and uppercase, and unreserved path bytes must be written literally rather than
-percent encoded.
+rejected rather than stripped or normalized. Percent-encoded paths are also
+rejected; action paths must use their direct canonical path spelling.
 
 To prepare a sample for committing under `docs/evidence/m3/`, package only the
 redacted evidence:
