@@ -315,7 +315,10 @@ EIDOLON_M3_BAIT_PROFILE=examples/m3/bait-profiles/openapi-promotion-probe.json \
 The seed promotion manifest is
 [`m3/bait-promotion-variants.json`](m3/bait-promotion-variants.json). Profiles
 change only owned bait surfaces and OpenAPI insertions; ordinary traffic still
-uses the protected upstream path.
+uses the protected upstream path. Each `expected_action.path` must be a
+canonical path-only value beginning with `/`; query strings and fragments are
+rejected rather than stripped or normalized. Percent-encoded paths are also
+rejected; action paths must use their direct canonical path spelling.
 
 To prepare a sample for committing under `docs/evidence/m3/`, package only the
 redacted evidence:
