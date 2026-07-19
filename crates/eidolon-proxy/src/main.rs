@@ -13,7 +13,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use eidolon_bait::{docs_for_bait, render_bait_for_session, BaitRegistry};
+use eidolon_bait::{
+    docs_for_bait, render_bait_for_session, render_bait_for_session_at, BaitRegistry,
+};
 use eidolon_core::{
     Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, DiscoveryReconScore, Event, EventKind,
     EventSource, ExposureId, HeaderValueMint, PolicyState, RoutingDecision, SafeHeaderObservation,
@@ -924,6 +926,8 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     };
     let bait_exposures = BaitExposureStore::from_event_log(&config.event_log_path)?;
     let restored_bait_exposure_count = bait_exposures.len();
+    let bait_action_replays = BaitActionReplayStore::from_event_log(&config.event_log_path)?;
+    let restored_bait_action_replay_count = bait_action_replays.consumed.len();
     let runtime = ProxyRuntime {
         upstream: config.upstream,
         event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
@@ -948,6 +952,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         bait_registry,
         bait_content,
         bait_exposures: Arc::new(Mutex::new(bait_exposures)),
+        bait_action_replays: Arc::new(Mutex::new(bait_action_replays)),
     };
     write_debug(
         &runtime,
@@ -967,6 +972,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
             "trusted_bait_soften_path_prefixes": runtime.trusted_bait_soften_path_prefixes,
             "restored_bait_exposure_count": restored_bait_exposure_count,
+            "restored_bait_action_replay_count": restored_bait_action_replay_count,
             "debug_log_visibility": "server_side_only",
         }),
     )?;
@@ -1011,12 +1017,19 @@ struct ProxyRuntime {
     bait_registry: Arc<BaitRegistry>,
     bait_content: BaitContentOverrides,
     bait_exposures: Arc<Mutex<BaitExposureStore>>,
+    bait_action_replays: Arc<Mutex<BaitActionReplayStore>>,
 }
 
 #[derive(Debug, Default)]
 struct BaitExposureStore {
     exposures: HashMap<(SessionId, BaitId), ExposureId>,
     exposure_order: VecDeque<(SessionId, BaitId)>,
+}
+
+#[derive(Debug, Default)]
+struct BaitActionReplayStore {
+    consumed: HashSet<(SessionId, BaitId)>,
+    consumed_order: VecDeque<(SessionId, BaitId)>,
 }
 
 impl BaitExposureStore {
@@ -1098,6 +1111,94 @@ impl BaitExposureStore {
 
     fn exposure_for_action(&self, session_id: SessionId, bait_id: &BaitId) -> Option<ExposureId> {
         self.exposures.get(&(session_id, bait_id.clone())).cloned()
+    }
+}
+
+impl BaitActionReplayStore {
+    fn from_event_log(path: &Path) -> io::Result<Self> {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+
+        Self::from_event_log_reader(BufReader::new(file))
+    }
+
+    fn from_event_log_reader(reader: impl BufRead) -> io::Result<Self> {
+        let mut store = Self::default();
+
+        for (line_index, line) in reader.lines().enumerate() {
+            let line_number = line_index + 1;
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let value: Value = serde_json::from_str(&line).map_err(|error| {
+                invalid_data(format!(
+                    "could not rebuild bait replay store from event log line {line_number}: {error}"
+                ))
+            })?;
+            let schema_version = value
+                .get("schema_version")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    invalid_data(format!(
+                        "could not rebuild bait replay store from event log line {line_number}: missing schema_version"
+                    ))
+                })?;
+            if schema_version != u64::from(EVENT_SCHEMA_VERSION) {
+                return Err(invalid_data(format!(
+                    "could not rebuild bait replay store from event log line {line_number}: unsupported schema_version {schema_version}; expected {EVENT_SCHEMA_VERSION}"
+                )));
+            }
+
+            let event: Event = serde_json::from_value(value).map_err(|error| {
+                invalid_data(format!(
+                    "could not rebuild bait replay store from event log line {line_number}: {error}"
+                ))
+            })?;
+
+            if let EventKind::BaitActionObserved {
+                bait_id,
+                header_value_mint,
+                header_value_mint_status,
+                ..
+            } = event.kind
+            {
+                if header_value_mint.is_some()
+                    && matches!(
+                        header_value_mint_status,
+                        Some(BaitHeaderValueMintStatus::MatchedSessionValue)
+                            | Some(BaitHeaderValueMintStatus::ReplaySeen)
+                    )
+                {
+                    store.record_consumed(event.session_id, bait_id);
+                }
+            }
+        }
+
+        Ok(store)
+    }
+
+    fn record_consumed(&mut self, session_id: SessionId, bait_id: BaitId) {
+        let key = (session_id, bait_id);
+        if self.consumed.insert(key.clone()) {
+            self.consumed_order.push_back(key);
+        }
+
+        while self.consumed.len() > MAX_BAIT_EXPOSURES {
+            if let Some(oldest) = self.consumed_order.pop_front() {
+                self.consumed.remove(&oldest);
+            }
+        }
+    }
+
+    fn mark_and_check_replay(&mut self, session_id: SessionId, bait_id: BaitId) -> bool {
+        let already_consumed = self.consumed.contains(&(session_id, bait_id.clone()));
+        self.record_consumed(session_id, bait_id);
+        already_consumed
     }
 }
 
@@ -1407,7 +1508,13 @@ fn validate_optional_header_value_mint(
     let Some(mint) = mint else {
         return Ok(());
     };
-    validate_non_empty(&format!("{label}.prefix"), &mint.prefix)
+    validate_non_empty(&format!("{label}.prefix"), &mint.prefix)?;
+    if mint.proof_window_seconds == Some(0) {
+        return Err(ConfigError::new(format!(
+            "{label}.proof_window_seconds must be greater than zero"
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_surface_overrides_reference_baits(
@@ -1713,7 +1820,7 @@ fn html_escape(value: &str) -> String {
 
 fn bait_surface_response(bait: &Bait, content: &BaitContentOverrides) -> SurfaceResponse {
     if let Some(override_content) = content.surface_for(bait) {
-        return SurfaceResponse::new(
+        let mut response = SurfaceResponse::new(
             override_content.status.unwrap_or(200),
             vec![SurfaceHeader::new(
                 "Content-Type",
@@ -1724,9 +1831,11 @@ fn bait_surface_response(bait: &Bait, content: &BaitContentOverrides) -> Surface
             )],
             override_content.body.clone(),
         );
+        maybe_mark_bait_surface_private_no_store(&mut response, bait);
+        return response;
     }
 
-    match bait.bait_class {
+    let mut response = match bait.bait_class {
         BaitClass::Docs => SurfaceResponse::new(
             200,
             vec![SurfaceHeader::new(
@@ -1768,7 +1877,9 @@ fn bait_surface_response(bait: &Bait, content: &BaitContentOverrides) -> Surface
             javascript_for_bait(bait),
         ),
         BaitClass::OpenApi => surface_text_response(404, "openapi bait is exposed by rewrite\n"),
-    }
+    };
+    maybe_mark_bait_surface_private_no_store(&mut response, bait);
+    response
 }
 
 fn default_surface_content_type(bait_class: BaitClass) -> &'static str {
@@ -1901,16 +2012,38 @@ fn owned_openapi_discovery_response(
     });
 
     match serde_json::to_vec(&document) {
-        Ok(body) => SurfaceResponse::new(
-            200,
-            vec![SurfaceHeader::new(
-                "Content-Type",
-                "application/json; charset=utf-8",
-            )],
-            body,
-        ),
+        Ok(body) => {
+            let mut response = SurfaceResponse::new(
+                200,
+                vec![SurfaceHeader::new(
+                    "Content-Type",
+                    "application/json; charset=utf-8",
+                )],
+                body,
+            );
+            maybe_mark_bait_surface_private_no_store(&mut response, bait);
+            response
+        }
         Err(_) => surface_text_response(500, "failed to render owned openapi discovery response\n"),
     }
+}
+
+fn maybe_mark_bait_surface_private_no_store(response: &mut SurfaceResponse, bait: &Bait) {
+    if bait.expected_action.header_value_mint.is_none() {
+        return;
+    }
+
+    if response
+        .headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case("Cache-Control"))
+    {
+        return;
+    }
+
+    response
+        .headers
+        .push(SurfaceHeader::new("Cache-Control", "private, no-store"));
 }
 
 fn default_openapi_reconcile_request_body() -> Value {
@@ -2448,29 +2581,66 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             )
             .map_err(|error| invalid_data(error.to_string()))?
         {
-            effective_decision = policy::PolicyDecision::new(
-                decision.policy_state,
-                RoutingDecision::EidolonOwned,
-                "bait-derived decoy action intercepted before protected upstream",
+            let action_exposure_id =
+                bait_action_exposure_id(runtime, &session, &action_match.bait.id)?;
+            let header_value_mint_status = if action_match.header_value_mint_status
+                == Some(BaitHeaderValueMintStatus::ExpiredSessionValue)
+            {
+                Some(BaitHeaderValueMintStatus::ExpiredSessionValue)
+            } else {
+                mark_bait_action_replay_if_needed(runtime, session.session_id, &action_match.bait)?
+            };
+            let mint_not_fresh = matches!(
+                header_value_mint_status,
+                Some(BaitHeaderValueMintStatus::ReplaySeen)
+                    | Some(BaitHeaderValueMintStatus::ExpiredSessionValue)
             );
-            write_event(
-                &runtime.event_log,
-                &request_seen_event(
-                    &request,
-                    &path,
-                    &session,
-                    &effective_decision,
-                    discovery_recon_score,
-                    discovery_recon_threshold,
-                ),
-            )?;
-            let action_exposure_id = write_bait_action_observed_event(
+            effective_decision = if header_value_mint_status
+                == Some(BaitHeaderValueMintStatus::ReplaySeen)
+            {
+                policy::PolicyDecision::protected_upstream(
+                    decision.policy_state,
+                    "session-minted bait proof replay detected; request left on normal routing path",
+                )
+            } else if header_value_mint_status
+                == Some(BaitHeaderValueMintStatus::ExpiredSessionValue)
+            {
+                policy::PolicyDecision::protected_upstream(
+                    decision.policy_state,
+                    "session-minted bait proof expired before use; request left on normal routing path",
+                )
+            } else {
+                policy::PolicyDecision::new(
+                    decision.policy_state,
+                    RoutingDecision::EidolonOwned,
+                    "bait-derived decoy action intercepted before protected upstream",
+                )
+            };
+            if !mint_not_fresh {
+                write_event(
+                    &runtime.event_log,
+                    &request_seen_event(
+                        &request,
+                        &path,
+                        &session,
+                        &effective_decision,
+                        discovery_recon_score,
+                        discovery_recon_threshold,
+                    ),
+                )?;
+            }
+            write_bait_action_observed_event_with_exposure(
                 runtime,
                 &session,
                 decision.policy_state,
-                &action_match.bait,
-                &request.method,
-                &surface_request.path,
+                BaitActionObservation {
+                    bait: &action_match.bait,
+                    method: &request.method,
+                    path: &surface_request.path,
+                    exposure_id: action_exposure_id.clone(),
+                    prior_same_bait_exposure: action_exposure_id.is_some(),
+                    header_value_mint_status,
+                },
             )?;
             write_debug(
                 runtime,
@@ -2483,101 +2653,123 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     "query_present": surface_request.query.is_some(),
                     "matched_prior_exposure": action_exposure_id.is_some(),
                     "exposure_id": &action_exposure_id,
+                    "header_value_mint_status":
+                        header_value_mint_status.map(|status| format!("{status:?}")),
                 }),
             )?;
 
-            let mut response = if let Some(transition) =
-                policy::transition_after_correlated_bait_action(decision.policy_state)
-                    .filter(|_| action_exposure_id.is_some())
-            {
+            if mint_not_fresh {
                 write_debug(
                     runtime,
-                    "policy_transition_selected",
+                    "bait_action_non_fresh_rejected",
                     Some(session.session_id),
                     json!({
-                        "from": transition.from,
-                        "to": transition.to,
-                        "reason": transition.reason.as_str(),
+                        "bait_id": &action_match.bait.id,
+                        "method": request.method.as_str(),
+                        "path": debug_path(&surface_request.path),
+                        "query_present": surface_request.query.is_some(),
+                        "header_value_mint_status":
+                            header_value_mint_status.map(|status| format!("{status:?}")),
                     }),
                 )?;
-                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-                write_event(
-                    &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
-                )?;
-                let (action, controlled_transition) = controlled_reality_action(
-                    runtime,
-                    session.session_id,
-                    &surface_request,
-                    transition.reason.clone(),
-                )?;
-                effective_decision = if let Some(controlled_transition) = controlled_transition {
+            } else {
+                let mut response = if let Some(transition) =
+                    policy::transition_after_correlated_bait_action(decision.policy_state)
+                        .filter(|_| action_exposure_id.is_some())
+                {
                     write_debug(
                         runtime,
                         "policy_transition_selected",
                         Some(session.session_id),
                         json!({
-                            "from": controlled_transition.from,
-                            "to": controlled_transition.to,
-                            "reason": controlled_transition.reason.as_str(),
+                            "from": transition.from,
+                            "to": transition.to,
+                            "reason": transition.reason.as_str(),
                         }),
                     )?;
-                    set_policy_state_for_session(
-                        runtime,
-                        session.session_id,
-                        controlled_transition.to,
-                    )?;
+                    set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                     write_event(
                         &runtime.event_log,
-                        &policy::policy_changed_event(session.session_id, &controlled_transition),
+                        &policy::policy_changed_event(session.session_id, &transition),
                     )?;
-                    policy::PolicyDecision::new(
-                        controlled_transition.to,
-                        action.routing_decision(),
-                        controlled_transition.reason.clone(),
-                    )
+                    let (action, controlled_transition) = controlled_reality_action(
+                        runtime,
+                        session.session_id,
+                        &surface_request,
+                        transition.reason.clone(),
+                    )?;
+                    effective_decision = if let Some(controlled_transition) = controlled_transition
+                    {
+                        write_debug(
+                            runtime,
+                            "policy_transition_selected",
+                            Some(session.session_id),
+                            json!({
+                                "from": controlled_transition.from,
+                                "to": controlled_transition.to,
+                                "reason": controlled_transition.reason.as_str(),
+                            }),
+                        )?;
+                        set_policy_state_for_session(
+                            runtime,
+                            session.session_id,
+                            controlled_transition.to,
+                        )?;
+                        write_event(
+                            &runtime.event_log,
+                            &policy::policy_changed_event(
+                                session.session_id,
+                                &controlled_transition,
+                            ),
+                        )?;
+                        policy::PolicyDecision::new(
+                            controlled_transition.to,
+                            action.routing_decision(),
+                            controlled_transition.reason.clone(),
+                        )
+                    } else {
+                        direct_surface_decision(transition.to, &action, transition.reason)
+                    };
+                    write_event(
+                        &runtime.event_log,
+                        &policy::policy_intervention_event(session.session_id, &effective_decision),
+                    )?;
+                    direct_surface_response(action)
+                        .expect("controlled reality action should produce direct response")
                 } else {
-                    direct_surface_decision(transition.to, &action, transition.reason)
+                    write_event(
+                        &runtime.event_log,
+                        &policy::policy_intervention_event(session.session_id, &effective_decision),
+                    )?;
+                    bait_action_synthetic_response()
                 };
+                apply_response_headers(&mut response, &session);
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                    &policy::response_audit_event(
+                        session.session_id,
+                        &effective_decision,
+                        response.status,
+                    ),
                 )?;
-                direct_surface_response(action)
-                    .expect("controlled reality action should produce direct response")
-            } else {
-                write_event(
-                    &runtime.event_log,
-                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                write_debug(
+                    runtime,
+                    "response_served",
+                    Some(session.session_id),
+                    json!({
+                        "route": "bait_action_direct",
+                        "decision": {
+                            "policy_state": effective_decision.policy_state,
+                            "routing_decision": effective_decision.routing_decision,
+                            "reason": effective_decision.reason.as_str(),
+                        },
+                        "response": debug_response_fields(&response),
+                    }),
                 )?;
-                bait_action_synthetic_response()
-            };
-            apply_response_headers(&mut response, &session);
-            write_event(
-                &runtime.event_log,
-                &policy::response_audit_event(
-                    session.session_id,
-                    &effective_decision,
-                    response.status,
-                ),
-            )?;
-            write_debug(
-                runtime,
-                "response_served",
-                Some(session.session_id),
-                json!({
-                    "route": "bait_action_direct",
-                    "decision": {
-                        "policy_state": effective_decision.policy_state,
-                        "routing_decision": effective_decision.routing_decision,
-                        "reason": effective_decision.reason.as_str(),
-                    },
-                    "response": debug_response_fields(&response),
-                }),
-            )?;
 
-            client_stream.write_all(&response.to_http_bytes())?;
-            return client_stream.flush();
+                client_stream.write_all(&response.to_http_bytes())?;
+                return client_stream.flush();
+            }
         }
     }
 
@@ -3406,6 +3598,28 @@ struct BaitActionObservation<'a> {
     header_value_mint_status: Option<BaitHeaderValueMintStatus>,
 }
 
+fn mark_bait_action_replay_if_needed(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    bait: &Bait,
+) -> io::Result<Option<BaitHeaderValueMintStatus>> {
+    if bait.header_value_mint_audit().is_none() {
+        return Ok(None);
+    }
+
+    let mut replays = runtime
+        .bait_action_replays
+        .lock()
+        .map_err(|_| io::Error::other("bait replay store lock poisoned"))?;
+    let replay_seen = replays.mark_and_check_replay(session_id, bait.id.clone());
+
+    Ok(Some(if replay_seen {
+        BaitHeaderValueMintStatus::ReplaySeen
+    } else {
+        BaitHeaderValueMintStatus::MatchedSessionValue
+    }))
+}
+
 fn write_bait_action_observed_event_with_exposure(
     runtime: &ProxyRuntime,
     session: &SessionContext,
@@ -3452,34 +3666,6 @@ fn write_bait_action_observed_event_with_exposure(
             "exposure_id": &exposure_id,
         }),
     )
-}
-
-fn write_bait_action_observed_event(
-    runtime: &ProxyRuntime,
-    session: &SessionContext,
-    policy_state: PolicyState,
-    bait: &Bait,
-    method: &str,
-    path: &str,
-) -> io::Result<Option<ExposureId>> {
-    let exposure_id = bait_action_exposure_id(runtime, session, &bait.id)?;
-    write_bait_action_observed_event_with_exposure(
-        runtime,
-        session,
-        policy_state,
-        BaitActionObservation {
-            bait,
-            method,
-            path,
-            exposure_id: exposure_id.clone(),
-            prior_same_bait_exposure: exposure_id.is_some(),
-            header_value_mint_status: bait
-                .header_value_mint_audit()
-                .map(|_| BaitHeaderValueMintStatus::MatchedSessionValue),
-        },
-    )?;
-
-    Ok(exposure_id)
 }
 
 fn write_bait_action_near_miss_event(
@@ -4951,6 +5137,7 @@ mod tests {
             bait_registry,
             bait_content: BaitContentOverrides::default(),
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+            bait_action_replays: Arc::new(Mutex::new(BaitActionReplayStore::default())),
         }
     }
 
@@ -5000,6 +5187,7 @@ mod tests {
             bait_registry,
             bait_content: BaitContentOverrides::default(),
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+            bait_action_replays: Arc::new(Mutex::new(BaitActionReplayStore::default())),
         }
     }
 
@@ -5032,6 +5220,7 @@ mod tests {
             bait_registry,
             bait_content: BaitContentOverrides::default(),
             bait_exposures: Arc::new(Mutex::new(bait_exposures)),
+            bait_action_replays: Arc::new(Mutex::new(BaitActionReplayStore::default())),
         }
     }
 
@@ -5066,6 +5255,7 @@ mod tests {
             bait_registry,
             bait_content,
             bait_exposures: Arc::new(Mutex::new(BaitExposureStore::default())),
+            bait_action_replays: Arc::new(Mutex::new(BaitActionReplayStore::default())),
         }
     }
 
@@ -5133,6 +5323,31 @@ mod tests {
                 "header_value_mint": {
                   "kind": "session_hmac_sha256_v1",
                   "prefix": "minted"
+                }
+              }
+            }
+          ]
+        }"##
+    }
+
+    fn session_windowed_minted_profile_json() -> &'static str {
+        r##"{
+          "schema_version": 1,
+          "profile_id": "session_windowed_minted_trace",
+          "baits": [
+            {
+              "id": "minted_trace",
+              "bait_class": "docs",
+              "surface": "/docs/minted-trace",
+              "surface_kind": "docs",
+              "expected_action": {
+                "method": "POST",
+                "path": "/api/v2/import/reconcile",
+                "header_name": "X-Migration-Trace",
+                "header_value_mint": {
+                  "kind": "session_hmac_sha256_v1",
+                  "prefix": "minted",
+                  "proof_window_seconds": 60
                 }
               }
             }
@@ -6359,6 +6574,15 @@ mod tests {
         assert_eq!(response_a.status, 200);
         assert_eq!(response_a_repeat.status, 200);
         assert_eq!(response_b.status, 200);
+        assert!(response_a.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("Cache-Control") && header.value == "private, no-store"
+        }));
+        assert!(response_a_repeat.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("Cache-Control") && header.value == "private, no-store"
+        }));
+        assert!(response_b.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("Cache-Control") && header.value == "private, no-store"
+        }));
 
         let body_a = must_ok(String::from_utf8(response_a.body), "body should be utf8");
         let body_a_repeat = must_ok(
@@ -6412,6 +6636,176 @@ mod tests {
         );
         assert_eq!(exposure["kind"]["header_value_mint"]["prefix"], "minted");
         assert!(!exposure.to_string().contains(&header_value_a));
+    }
+
+    #[test]
+    fn runtime_session_minted_bait_replay_in_same_session_is_logged_and_not_correlated() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("minted profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait should exist")
+            .clone();
+        let signing_secret: Arc<str> = Arc::from("mint-secret");
+        let event_log_path =
+            unique_temp_path("session-minted-bait-same-session-replay-events.jsonl");
+        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("session-minted-bait-same-session-replay-control.txt"),
+            loaded,
+            Some(Arc::clone(&signing_secret)),
+        );
+        let session_id = SessionId::new();
+        let cookie = format!("eidolon_session={}", session_id.0);
+        let rendered = render_bait_for_session(&bait, session_id, Some(signing_secret.as_ref()))
+            .expect("session bait should render")
+            .into_owned();
+        let header_name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("minted bait should keep header name")
+            .to_string();
+        let header_value = rendered
+            .expected_action
+            .header_value
+            .clone()
+            .expect("session bait should mint header value");
+
+        let exposure_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/minted-trace", &cookie),
+        ));
+        assert_eq!(exposure_response.status, 200);
+
+        runtime
+            .bait_action_replays
+            .lock()
+            .expect("replay store lock should succeed")
+            .record_consumed(session_id, bait.id.clone());
+
+        let replay_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                &bait.expected_action.path,
+                &cookie,
+                &[(&header_name, &header_value)],
+            ),
+        ));
+        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
+
+        assert_eq!(replay_response.body, br#"{"mode":"upstream"}"#);
+        assert!(must_ok(
+            String::from_utf8(upstream_request),
+            "request should be utf8"
+        )
+        .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+
+        let replay_action = events_of_type(&event_log_path, "bait_action_observed")
+            .into_iter()
+            .find(|event| event["session_id"] == session_id.0.to_string())
+            .expect("same-session replay should be logged");
+        assert_eq!(replay_action["kind"]["bait_id"], "minted_trace");
+        assert_eq!(
+            replay_action["kind"]["header_value_mint_status"],
+            "replay_seen"
+        );
+
+        assert!(!events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .any(|event| {
+                event["session_id"] == session_id.0.to_string()
+                    && event["kind"]["to"] == "controlled_reality"
+            }));
+    }
+
+    #[test]
+    fn runtime_session_minted_bait_expired_in_same_session_is_logged_and_left_upstream() {
+        let path = write_bait_profile(session_windowed_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("windowed minted profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("windowed minted bait should exist")
+            .clone();
+        let signing_secret: Arc<str> = Arc::from("mint-secret");
+        let event_log_path = unique_temp_path("session-minted-bait-expired-events.jsonl");
+        let (upstream, upstream_handle) = spawn_upstream(json_response(r#"{"mode":"upstream"}"#));
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("session-minted-bait-expired-control.txt"),
+            loaded,
+            Some(Arc::clone(&signing_secret)),
+        );
+        let session_id = SessionId::new();
+        let cookie = format!("eidolon_session={}", session_id.0);
+        let now_epoch_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_secs();
+        let rendered = render_bait_for_session_at(
+            &bait,
+            session_id,
+            Some(signing_secret.as_ref()),
+            now_epoch_seconds.saturating_sub(121),
+        )
+        .expect("expired session bait should render")
+        .into_owned();
+        let header_name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("minted bait should keep header name")
+            .to_string();
+        let header_value = rendered
+            .expected_action
+            .header_value
+            .clone()
+            .expect("expired session bait should mint header value");
+
+        let exposure_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/minted-trace", &cookie),
+        ));
+        assert_eq!(exposure_response.status, 200);
+
+        let expired_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                &bait.expected_action.path,
+                &cookie,
+                &[(&header_name, &header_value)],
+            ),
+        ));
+        let upstream_request = must_join(upstream_handle.join(), "upstream thread should join");
+
+        assert_eq!(expired_response.body, br#"{"mode":"upstream"}"#);
+        assert!(must_ok(
+            String::from_utf8(upstream_request),
+            "request should be utf8"
+        )
+        .starts_with("POST /api/v2/import/reconcile HTTP/1.1\r\n"));
+
+        let expired_action = events_of_type(&event_log_path, "bait_action_observed")
+            .into_iter()
+            .find(|event| event["session_id"] == session_id.0.to_string())
+            .expect("expired same-session proof should be logged");
+        assert_eq!(expired_action["kind"]["bait_id"], "minted_trace");
+        assert_eq!(
+            expired_action["kind"]["header_value_mint_status"],
+            "expired_session_value"
+        );
+
+        assert!(!events_of_type(&event_log_path, "policy_changed")
+            .into_iter()
+            .any(|event| {
+                event["session_id"] == session_id.0.to_string()
+                    && event["kind"]["to"] == "controlled_reality"
+            }));
     }
 
     #[test]
@@ -6519,6 +6913,176 @@ mod tests {
                 event["session_id"] == session_b.0.to_string()
                     && event["kind"]["to"] == "controlled_reality"
             }));
+    }
+
+    #[test]
+    fn runtime_committed_service_token_bait_produces_same_session_controlled_reality() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/shield-lab/bait-profiles/default-m3-catalog.json");
+        let loaded = load_bait_profile(&path).expect("committed shield-lab profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_class(BaitClass::FakeCredentialToken)
+            .expect("fake service token bait should exist")
+            .clone();
+        let signing_secret: Arc<str> = Arc::from("mint-secret");
+        let event_log_path = unique_temp_path("service-token-controlled-reality-events.jsonl");
+        let runtime = test_runtime_with_bait_profile(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("service-token-controlled-reality-control.txt"),
+            loaded,
+            Some(Arc::clone(&signing_secret)),
+        );
+        let session_id = SessionId::new();
+        let cookie = format!("eidolon_session={}", session_id.0);
+        let rendered = render_bait_for_session(&bait, session_id, Some(signing_secret.as_ref()))
+            .expect("service token bait should render")
+            .into_owned();
+        let header_name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("service token bait should keep header name")
+            .to_string();
+        let header_value = rendered
+            .expected_action
+            .header_value
+            .clone()
+            .expect("service token bait should mint header value");
+
+        let exposure_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/service-token", &cookie),
+        ));
+        let action_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[(&header_name, &header_value)],
+            ),
+        ));
+
+        assert_eq!(exposure_response.status, 200);
+        assert!(exposure_response.headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("Cache-Control") && header.value == "private, no-store"
+        }));
+        assert_eq!(action_response.status, 202);
+        assert!(must_ok(
+            String::from_utf8(action_response.body),
+            "body should be utf8"
+        )
+        .contains(r#""write_committed":false"#));
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        let action = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(exposure["kind"]["bait_id"], "fake_service_token");
+        assert_eq!(action["kind"]["bait_id"], "fake_service_token");
+        assert_eq!(
+            action["kind"]["header_value_mint_status"],
+            "matched_session_value"
+        );
+        assert_eq!(
+            action["kind"]["exposure_id"],
+            exposure["kind"]["exposure_id"]
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "controlled_reality");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("confirmed bait-derived action moved session into controlled reality")));
+        assert_eq!(
+            first_event_of_type(&event_log_path, "controlled_reality_entered")["policy_state"],
+            "controlled_reality"
+        );
+    }
+
+    #[test]
+    fn runtime_committed_js_helper_bait_produces_same_session_controlled_reality() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/shield-lab/bait-profiles/default-m3-catalog.json");
+        let loaded = load_bait_profile(&path).expect("committed shield-lab profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_class(BaitClass::JsDiscoveredRoute)
+            .expect("js helper bait should exist")
+            .clone();
+        let signing_secret: Arc<str> = Arc::from("mint-secret");
+        let event_log_path = unique_temp_path("js-helper-controlled-reality-events.jsonl");
+        let runtime = test_runtime_with_bait_profile(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("js-helper-controlled-reality-control.txt"),
+            loaded,
+            Some(signing_secret),
+        );
+        let cookie = cookie_header();
+        let header_name = bait
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("js helper bait should keep header name")
+            .to_string();
+        let header_value = bait
+            .expected_action
+            .header_value
+            .clone()
+            .expect("js helper bait should keep static header value");
+
+        let exposure_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/assets/import-helper.js", &cookie),
+        ));
+        let exposure_body = must_ok(
+            String::from_utf8(exposure_response.body),
+            "body should be utf8",
+        );
+        let action_response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(
+                "/api/v2/import/reconcile",
+                &cookie,
+                &[(&header_name, &header_value)],
+            ),
+        ));
+
+        assert_eq!(exposure_response.status, 200);
+        assert!(exposure_body.contains("window.__eidolonImportWorker"));
+        assert!(exposure_body.contains("X-Import-Worker"));
+        assert!(exposure_body.contains("worker_2026_05_c19b"));
+        assert_eq!(action_response.status, 202);
+        assert!(must_ok(
+            String::from_utf8(action_response.body),
+            "body should be utf8"
+        )
+        .contains(r#""write_committed":false"#));
+
+        let exposure = first_event_of_type(&event_log_path, "bait_exposed");
+        let action = first_event_of_type(&event_log_path, "bait_action_observed");
+        assert_eq!(exposure["kind"]["bait_id"], "js_worker_resume_trace");
+        assert_eq!(action["kind"]["bait_id"], "js_worker_resume_trace");
+        assert!(action["kind"]["header_value_mint"].is_null());
+        assert!(action["kind"]["header_value_mint_status"].is_null());
+        assert_eq!(
+            action["kind"]["exposure_id"],
+            exposure["kind"]["exposure_id"]
+        );
+
+        let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "controlled_reality");
+        assert!(policy_changed["kind"]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason
+                .contains("confirmed bait-derived action moved session into controlled reality")));
+        assert_eq!(
+            first_event_of_type(&event_log_path, "controlled_reality_entered")["policy_state"],
+            "controlled_reality"
+        );
     }
 
     #[test]
@@ -7864,9 +8428,10 @@ mod tests {
         assert!(policy_changes[1]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_rate_limit_threshold=5")));
-        assert!(policy_changes[1]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+        assert_eq!(
+            policy_changes[1]["kind"]["persistence"]["pre_containment_persistence_class"],
+            "discovery_recon"
+        );
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -8033,12 +8598,14 @@ mod tests {
         assert!(policy_changes[2]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_block_threshold=5")));
-        assert!(policy_changes[2]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
-        assert!(policy_changes[2]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_kind=discovery_recon_retry")));
+        assert_eq!(
+            policy_changes[2]["kind"]["persistence"]["pre_containment_persistence_class"],
+            "discovery_recon"
+        );
+        assert_eq!(
+            policy_changes[2]["kind"]["persistence"]["pre_containment_persistence_kind"],
+            "discovery_recon_retry"
+        );
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -8095,12 +8662,6 @@ mod tests {
         assert!(surface_debugs[2]["fields"]["policy_reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("detection_score=2")));
-        assert!(surface_debugs[2]["fields"]["policy_reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
-        assert!(surface_debugs[2]["fields"]["policy_reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_kind=discovery_recon_retry")));
         assert_eq!(
             surface_debugs[2]["fields"]["surface_action"]["type"],
             "eidolon_owned"
@@ -8717,9 +9278,10 @@ mod tests {
         assert!(policy_changes[1]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_rate_limit_threshold=5")));
-        assert!(policy_changes[1]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+        assert_eq!(
+            policy_changes[1]["kind"]["persistence"]["pre_containment_persistence_class"],
+            "discovery_recon"
+        );
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -8901,9 +9463,10 @@ mod tests {
         assert!(policy_changes[1]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_rate_limit_threshold=5")));
-        assert!(policy_changes[1]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+        assert_eq!(
+            policy_changes[1]["kind"]["persistence"]["pre_containment_persistence_class"],
+            "discovery_recon"
+        );
 
         assert_event_type_absent(&event_log_path, "bait_action_observed");
 
@@ -9498,12 +10061,14 @@ mod tests {
         assert!(policy_changes[2]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_score=5")));
-        assert!(policy_changes[2]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_kind=write_recon_retry")));
-        assert!(policy_changes[2]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=write_recon")));
+        assert_eq!(
+            policy_changes[2]["kind"]["persistence"]["pre_containment_persistence_kind"],
+            "write_recon_retry"
+        );
+        assert_eq!(
+            policy_changes[2]["kind"]["persistence"]["pre_containment_persistence_class"],
+            "write_recon"
+        );
 
         assert_event_type_absent(&event_log_path, "bait_action_observed");
 
@@ -9725,7 +10290,7 @@ mod tests {
         assert_eq!(surface_debugs[2]["fields"]["policy_state"], "blocked");
         assert_eq!(
             surface_debugs[2]["fields"]["policy_reason"],
-            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_class=discovery_recon persistence_kind=discovery_recon_retry"
+            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5"
         );
         assert_eq!(
             surface_debugs[2]["fields"]["surface_action"]["type"],
@@ -13164,9 +13729,10 @@ mod tests {
             .is_some_and(|reason| reason.contains(
                 "suspicious same-bait near miss after exposure moved session to rate limited"
             )));
-        assert!(policy_changed["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=same_bait_near_miss")));
+        assert_eq!(
+            policy_changed["kind"]["persistence"]["pre_containment_persistence_class"],
+            "same_bait_near_miss"
+        );
         let request_seen = events_of_type(&event_log_path, "request_seen")
             .into_iter()
             .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
@@ -13685,10 +14251,10 @@ mod tests {
         assert!(blocked_change["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("depth=3")));
-        assert!(blocked_change["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason
-                .contains("post_containment_persistence_kind=controlled_reality_depth_limit")));
+        assert_eq!(
+            blocked_change["kind"]["persistence"]["post_containment_persistence_kind"],
+            "controlled_reality_depth_limit"
+        );
 
         let blocked_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()
@@ -13815,10 +14381,10 @@ mod tests {
             .is_some_and(|reason| reason.contains(
                 "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked"
             )));
-        assert!(blocked_change["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason
-                .contains("post_containment_persistence_kind=controlled_reality_branch_escape")));
+        assert_eq!(
+            blocked_change["kind"]["persistence"]["post_containment_persistence_kind"],
+            "controlled_reality_branch_escape"
+        );
 
         let blocked_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()

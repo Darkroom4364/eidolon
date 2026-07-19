@@ -435,6 +435,7 @@ mod tests {
                 EventKind::PolicyDecision {
                     routing_decision: RoutingDecision::ProtectedUpstream,
                     reason: "trusted ingress identity suppressed bait surface intervention before runtime suspicion was established".to_string(),
+                    persistence: eidolon_core::PolicyPersistenceMetadata::default(),
                 },
             ),
         ]);

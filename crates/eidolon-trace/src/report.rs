@@ -1,7 +1,9 @@
 use std::fmt::Write;
 
+#[cfg(test)]
+use eidolon_core::PolicyPersistenceMetadata;
 use eidolon_core::{
-    BaitHeaderValueMintAudit, BaitHeaderValueMintStatus,
+    BaitHeaderValueMintAudit, BaitHeaderValueMintStatus, EdgeBaitHeaderValueMintOutcomeSummary,
     EdgeAuthenticatedIngressRuleRejectionHistory, EdgeBaitHeaderValueMintAudit, EdgeEvidenceRef,
     EdgeLocalIngressTrustScopeRejectionHistory, EdgeObservedBaitHeaderValueMint,
     EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestRef,
@@ -120,6 +122,23 @@ pub fn render_evidence_markdown(timeline: &SessionTimeline, bundle: &EvidenceBun
                     unconfirmed_action_reason(action)
                 ),
             );
+        }
+    }
+
+    let mint_outcomes = bait_header_value_mint_outcome_summary(bundle);
+    if !mint_outcomes.is_empty() {
+        push_line(&mut report, format_args!("\n## Session-Minted Proof Outcomes"));
+        push_line(&mut report, format_args!("| Outcome | Count |"));
+        push_line(&mut report, format_args!("| --- | --- |"));
+        for (label, count) in [
+            ("matched_session_value", mint_outcomes.matched_session_value),
+            ("expired_session_value", mint_outcomes.expired_session_value),
+            ("replay_seen", mint_outcomes.replay_seen),
+            ("session_value_mismatch", mint_outcomes.session_value_mismatch),
+        ] {
+            if count > 0 {
+                push_line(&mut report, format_args!("| `{label}` | `{count}` |"));
+            }
         }
     }
 
@@ -323,14 +342,23 @@ pub fn edge_decision_export_for_evidence(
         .and_then(|event| event.reason.clone())
         .unwrap_or_else(|| "latest request routing decision".to_string());
     let latest_request_bait_action = latest_request_bait_action_event(timeline, request_event);
-    let edge_recommendation =
-        edge_recommendation_for(policy_state, routing_decision, reason.as_str());
-    let pre_containment_persistence_class =
-        pre_containment_persistence_class_for(policy_state, reason.as_str());
-    let pre_containment_persistence_kind =
-        pre_containment_persistence_kind_for(policy_state, reason.as_str());
-    let post_containment_persistence_kind =
-        post_containment_persistence_kind_for(policy_state, reason.as_str());
+    let pre_containment_persistence_class = latest_policy_reason_event
+        .and_then(|event| event.persistence.pre_containment_persistence_class)
+        .or_else(|| pre_containment_persistence_class_for(policy_state, reason.as_str()));
+    let pre_containment_persistence_kind = latest_policy_reason_event
+        .and_then(|event| event.persistence.pre_containment_persistence_kind)
+        .or_else(|| pre_containment_persistence_kind_for(policy_state, reason.as_str()));
+    let post_containment_persistence_kind = latest_policy_reason_event
+        .and_then(|event| event.persistence.post_containment_persistence_kind)
+        .or_else(|| post_containment_persistence_kind_for(policy_state, reason.as_str()));
+    let edge_recommendation = edge_recommendation_for(
+        policy_state,
+        routing_decision,
+        reason.as_str(),
+        pre_containment_persistence_class,
+        pre_containment_persistence_kind,
+        post_containment_persistence_kind,
+    );
 
     Some(EidolonEdgeDecisionExport {
         contract_version: TRUSTED_INGRESS_CONTRACT_VERSION.to_string(),
@@ -366,6 +394,9 @@ pub fn edge_decision_export_for_evidence(
                 edge_local_ingress_trust_scope_rejection_histories(timeline),
             trusted_ingress_soften_histories: edge_trusted_ingress_soften_histories(timeline),
             bait_header_value_mints: edge_bait_header_value_mints(bundle),
+            bait_header_value_mint_outcome_summary: bait_header_value_mint_outcome_summary(
+                bundle,
+            ),
             latest_bait_header_value_mint: latest_request_bait_action
                 .and_then(edge_observed_bait_header_value_mint),
         },
@@ -445,6 +476,36 @@ fn edge_bait_header_value_mints(bundle: &EvidenceBundle) -> Vec<EdgeBaitHeaderVa
     }
 
     audits
+}
+
+fn bait_header_value_mint_outcome_summary(
+    bundle: &EvidenceBundle,
+) -> EdgeBaitHeaderValueMintOutcomeSummary {
+    let mut summary = EdgeBaitHeaderValueMintOutcomeSummary::default();
+
+    for action in bundle
+        .matched_actions
+        .iter()
+        .chain(bundle.unmatched_actions.iter())
+    {
+        match action.header_value_mint_status {
+            Some(BaitHeaderValueMintStatus::MatchedSessionValue) => {
+                summary.matched_session_value += 1;
+            }
+            Some(BaitHeaderValueMintStatus::ExpiredSessionValue) => {
+                summary.expired_session_value += 1;
+            }
+            Some(BaitHeaderValueMintStatus::ReplaySeen) => {
+                summary.replay_seen += 1;
+            }
+            Some(BaitHeaderValueMintStatus::SessionValueMismatch) => {
+                summary.session_value_mismatch += 1;
+            }
+            None => {}
+        }
+    }
+
+    summary
 }
 
 fn edge_trusted_ingress_soften_histories(
@@ -685,6 +746,9 @@ fn edge_recommendation_for(
     policy_state: PolicyState,
     routing_decision: RoutingDecision,
     reason: &str,
+    pre_containment_persistence_class: Option<PreContainmentPersistenceClass>,
+    pre_containment_persistence_kind: Option<PreContainmentPersistenceKind>,
+    post_containment_persistence_kind: Option<PostContainmentPersistenceKind>,
 ) -> EdgeRecommendation {
     if reason.contains("trusted ingress identity suppressed bait surface intervention") {
         return EdgeRecommendation {
@@ -707,7 +771,13 @@ fn edge_recommendation_for(
             "eidolon_runtime_enforcement".to_string(),
             snake_case_debug(&routing_decision),
         ];
-        reason_codes.extend(grouped_enforcement_reason_codes(policy_state, reason));
+        reason_codes.extend(grouped_enforcement_reason_codes(
+            policy_state,
+            reason,
+            pre_containment_persistence_class,
+            pre_containment_persistence_kind,
+            post_containment_persistence_kind,
+        ));
         return EdgeRecommendation {
             action: EdgeRecommendedAction::PreserveEidolonRouting,
             ttl_seconds: Some(300),
@@ -730,29 +800,39 @@ fn edge_recommendation_for(
     }
 }
 
-fn grouped_enforcement_reason_codes(policy_state: PolicyState, reason: &str) -> Vec<String> {
+fn grouped_enforcement_reason_codes(
+    policy_state: PolicyState,
+    reason: &str,
+    pre_containment_persistence_class: Option<PreContainmentPersistenceClass>,
+    pre_containment_persistence_kind: Option<PreContainmentPersistenceKind>,
+    post_containment_persistence_kind: Option<PostContainmentPersistenceKind>,
+) -> Vec<String> {
     if matches!(
         policy_state,
         PolicyState::RateLimited | PolicyState::Blocked
     ) {
         if policy_state == PolicyState::RateLimited {
-            if let Some(class) = PreContainmentPersistenceClass::from_reason(reason) {
+            if let Some(class) = pre_containment_persistence_class
+                .or_else(|| PreContainmentPersistenceClass::from_explicit_reason_marker(reason))
+            {
                 return vec![
                     PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
                     class.code().to_string(),
                 ];
             }
-        } else if let Some(kind) = PreContainmentPersistenceKind::from_reason(reason) {
+        } else if let Some(kind) = pre_containment_persistence_kind
+            .or_else(|| PreContainmentPersistenceKind::from_explicit_reason_marker(reason))
+        {
             return vec![
                 PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
                 kind.detail_code().to_string(),
             ];
         }
-    } else {
-        return Vec::new();
     }
 
-    if let Some(kind) = PostContainmentPersistenceKind::from_reason(reason) {
+    if let Some(kind) = post_containment_persistence_kind
+        .or_else(|| PostContainmentPersistenceKind::from_explicit_reason_marker(reason))
+    {
         return vec![
             POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY.to_string(),
             kind.detail_code().to_string(),
@@ -760,6 +840,62 @@ fn grouped_enforcement_reason_codes(policy_state: PolicyState, reason: &str) -> 
     }
 
     Vec::new()
+}
+
+#[cfg(test)]
+mod grouped_enforcement_reason_code_tests {
+    use super::*;
+
+    #[test]
+    fn grouped_reason_codes_prefer_structured_rate_limited_fields() {
+        assert_eq!(
+            grouped_enforcement_reason_codes(
+                PolicyState::RateLimited,
+                "generic rate limit reason",
+                Some(PreContainmentPersistenceClass::DiscoveryRecon),
+                None,
+                None,
+            ),
+            vec![
+                "pre_containment_persistence".to_string(),
+                "discovery_recon".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn grouped_reason_codes_prefer_structured_blocked_fields() {
+        assert_eq!(
+            grouped_enforcement_reason_codes(
+                PolicyState::Blocked,
+                "generic blocked reason",
+                None,
+                Some(PreContainmentPersistenceKind::WriteReconRetry),
+                None,
+            ),
+            vec![
+                "pre_containment_persistence".to_string(),
+                "write_recon_retry".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn grouped_reason_codes_prefer_structured_post_containment_fields() {
+        assert_eq!(
+            grouped_enforcement_reason_codes(
+                PolicyState::ControlledReality,
+                "generic containment reason",
+                None,
+                None,
+                Some(PostContainmentPersistenceKind::ControlledRealityDepthLimit),
+            ),
+            vec![
+                "post_containment_persistence".to_string(),
+                "controlled_reality_depth_limit".to_string(),
+            ]
+        );
+    }
 }
 
 fn pre_containment_persistence_class_for(
@@ -770,7 +906,7 @@ fn pre_containment_persistence_class_for(
         policy_state,
         PolicyState::RateLimited | PolicyState::Blocked
     )
-    .then(|| PreContainmentPersistenceClass::from_reason(reason))
+    .then(|| PreContainmentPersistenceClass::from_explicit_reason_marker(reason))
     .flatten()
 }
 
@@ -779,7 +915,7 @@ fn pre_containment_persistence_kind_for(
     reason: &str,
 ) -> Option<PreContainmentPersistenceKind> {
     (policy_state == PolicyState::Blocked)
-        .then(|| PreContainmentPersistenceKind::from_reason(reason))
+        .then(|| PreContainmentPersistenceKind::from_explicit_reason_marker(reason))
         .flatten()
 }
 
@@ -788,7 +924,7 @@ fn post_containment_persistence_kind_for(
     reason: &str,
 ) -> Option<PostContainmentPersistenceKind> {
     (policy_state == PolicyState::Blocked)
-        .then(|| PostContainmentPersistenceKind::from_reason(reason))
+        .then(|| PostContainmentPersistenceKind::from_explicit_reason_marker(reason))
         .flatten()
 }
 
@@ -807,11 +943,23 @@ fn preferred_policy_reason_event(
 
             match policy_state {
                 PolicyState::RateLimited => {
-                    PreContainmentPersistenceClass::from_reason(reason).is_some()
+                    event
+                        .persistence
+                        .pre_containment_persistence_class
+                        .is_some()
+                        || PreContainmentPersistenceClass::from_explicit_reason_marker(reason)
+                            .is_some()
                 }
                 PolicyState::Blocked => {
-                    PreContainmentPersistenceKind::from_reason(reason).is_some()
-                        || PostContainmentPersistenceKind::from_reason(reason).is_some()
+                    event.persistence.pre_containment_persistence_kind.is_some()
+                        || event
+                            .persistence
+                            .post_containment_persistence_kind
+                            .is_some()
+                        || PreContainmentPersistenceKind::from_explicit_reason_marker(reason)
+                            .is_some()
+                        || PostContainmentPersistenceKind::from_explicit_reason_marker(reason)
+                            .is_some()
                 }
                 _ => false,
             }
@@ -956,7 +1104,9 @@ fn replay_summary(event: &TimelineEvent, bundle: &EvidenceBundle) -> String {
                 )
             )
         }
-        EventKind::PolicyChanged { from, to, reason } => format!(
+        EventKind::PolicyChanged {
+            from, to, reason, ..
+        } => format!(
             "policy changed from `{}` to `{}`: {}",
             snake_case_debug(from),
             snake_case_debug(to),
@@ -965,15 +1115,16 @@ fn replay_summary(event: &TimelineEvent, bundle: &EvidenceBundle) -> String {
         EventKind::PolicyDecision {
             routing_decision,
             reason,
+            ..
         } => format!(
             "policy decision `{}`: {}",
             snake_case_debug(routing_decision),
             markdown_text(reason)
         ),
-        EventKind::ControlledRealityEntered { reason } => {
+        EventKind::ControlledRealityEntered { reason, .. } => {
             format!("controlled reality entered: {}", markdown_text(reason))
         }
-        EventKind::RateLimitApplied { reason } => {
+        EventKind::RateLimitApplied { reason, .. } => {
             format!("rate limit applied: {}", markdown_text(reason))
         }
         EventKind::RealityEscapeAttempt {
@@ -981,6 +1132,7 @@ fn replay_summary(event: &TimelineEvent, bundle: &EvidenceBundle) -> String {
             path,
             routing_decision,
             reason,
+            ..
         } => format!(
             "reality escape attempt `{}` `{}` routed `{}`: {}",
             inline_code(method),
@@ -1279,6 +1431,7 @@ mod tests {
             EventKind::PolicyDecision {
                 routing_decision: RoutingDecision::EidolonOwned,
                 reason: "bait-derived action intercepted".to_string(),
+                persistence: PolicyPersistenceMetadata::default(),
             },
         )
     }
@@ -1290,6 +1443,7 @@ mod tests {
             PolicyState::ControlledReality,
             EventKind::ControlledRealityEntered {
                 reason: "confirmed bait-derived action".to_string(),
+                persistence: PolicyPersistenceMetadata::default(),
             },
         )
     }
@@ -1615,6 +1769,7 @@ mod tests {
                 EventKind::PolicyDecision {
                     routing_decision: RoutingDecision::ProtectedUpstream,
                     reason: "trusted ingress identity suppressed bait surface intervention before runtime suspicion was established".to_string(),
+                    persistence: PolicyPersistenceMetadata::default(),
                 },
             ),
         ]);
@@ -1699,6 +1854,7 @@ mod tests {
                 PolicyState::ControlledReality,
                 EventKind::ControlledRealityEntered {
                     reason: "confirmed bait-derived action".to_string(),
+                    persistence: PolicyPersistenceMetadata::default(),
                 },
             ),
         ]);
@@ -1819,6 +1975,7 @@ mod tests {
                     to: PolicyState::Suspicious,
                     reason: "session recon discovery-surface fanout promoted request to suspicious"
                         .to_string(),
+                    persistence: PolicyPersistenceMetadata::default(),
                 },
             ),
             Event::new(
@@ -1853,6 +2010,7 @@ mod tests {
                     to: PolicyState::ControlledReality,
                     reason: "confirmed bait-derived action moved session into controlled reality"
                         .to_string(),
+                    persistence: PolicyPersistenceMetadata::default(),
                 },
             ),
             Event::new(
@@ -1930,6 +2088,7 @@ mod tests {
                     routing_decision: RoutingDecision::RewrittenUpstream,
                     reason: "request stayed baited after local allowlist host scope mismatch"
                         .to_string(),
+                    persistence: PolicyPersistenceMetadata::default(),
                 },
             ),
         ]);
@@ -2013,6 +2172,7 @@ mod tests {
                     routing_decision: RoutingDecision::ControlledReality,
                     reason: "confirmed bait-derived action moved session into controlled reality"
                         .to_string(),
+                    persistence: PolicyPersistenceMetadata::default(),
                 },
             ),
         ]);
@@ -2127,6 +2287,13 @@ mod tests {
         );
         assert_eq!(export.evidence.bait_header_value_mints[0].prefix, "minted");
         assert_eq!(
+            export.evidence.bait_header_value_mint_outcome_summary,
+            EdgeBaitHeaderValueMintOutcomeSummary {
+                matched_session_value: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
             export.evidence.latest_bait_header_value_mint,
             Some(EdgeObservedBaitHeaderValueMint {
                 bait_id: BaitId("minted_trace".to_string()),
@@ -2224,7 +2391,69 @@ mod tests {
                 status: BaitHeaderValueMintStatus::SessionValueMismatch,
             })
         );
+        assert_eq!(
+            export.evidence.bait_header_value_mint_outcome_summary,
+            EdgeBaitHeaderValueMintOutcomeSummary {
+                session_value_mismatch: 1,
+                ..Default::default()
+            }
+        );
         assert_eq!(export.evidence.event_ids.len(), 2);
+    }
+
+    #[test]
+    fn markdown_report_renders_session_minted_proof_outcome_summary() {
+        let session_id = SessionId::new();
+        let mint = BaitHeaderValueMintAudit {
+            header_name: "X-Minted-Trace".to_string(),
+            kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+            prefix: "minted".to_string(),
+        };
+        let report = render_markdown_report(&timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    exposure_id: ExposureId("exp-a".to_string()),
+                    surface: "/docs/minted-trace".to_string(),
+                    header_value_mint: Some(mint.clone()),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::BaitEngine,
+                PolicyState::Observe,
+                EventKind::BaitActionObserved {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    exposure_id: Some(ExposureId("exp-a".to_string())),
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    header_value_mint: Some(mint.clone()),
+                    header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::BaitEngine,
+                PolicyState::Observe,
+                EventKind::BaitActionObserved {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    exposure_id: None,
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    header_value_mint: Some(mint),
+                    header_value_mint_status: Some(
+                        BaitHeaderValueMintStatus::ExpiredSessionValue,
+                    ),
+                },
+            ),
+        ]));
+
+        assert!(report.contains("## Session-Minted Proof Outcomes"));
+        assert!(report.contains("| `matched_session_value` | `1` |"));
+        assert!(report.contains("| `expired_session_value` | `1` |"));
     }
 
     #[test]
@@ -2267,6 +2496,12 @@ mod tests {
                     from: PolicyState::Suspicious,
                     to: PolicyState::RateLimited,
                     reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
+                    persistence: PolicyPersistenceMetadata {
+                        pre_containment_persistence_class: Some(
+                            PreContainmentPersistenceClass::DiscoveryRecon,
+                        ),
+                        ..PolicyPersistenceMetadata::default()
+                    },
                 },
             ),
             Event::new(
@@ -2275,6 +2510,12 @@ mod tests {
                 PolicyState::RateLimited,
                 EventKind::RateLimitApplied {
                     reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
+                    persistence: PolicyPersistenceMetadata {
+                        pre_containment_persistence_class: Some(
+                            PreContainmentPersistenceClass::DiscoveryRecon,
+                        ),
+                        ..PolicyPersistenceMetadata::default()
+                    },
                 },
             ),
         ]);
@@ -2329,6 +2570,12 @@ mod tests {
                     from: PolicyState::Suspicious,
                     to: PolicyState::RateLimited,
                     reason: "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss".to_string(),
+                    persistence: PolicyPersistenceMetadata {
+                        pre_containment_persistence_class: Some(
+                            PreContainmentPersistenceClass::SameBaitNearMiss,
+                        ),
+                        ..PolicyPersistenceMetadata::default()
+                    },
                 },
             ),
             Event::new(
@@ -2337,6 +2584,12 @@ mod tests {
                 PolicyState::RateLimited,
                 EventKind::RateLimitApplied {
                     reason: "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss".to_string(),
+                    persistence: PolicyPersistenceMetadata {
+                        pre_containment_persistence_class: Some(
+                            PreContainmentPersistenceClass::SameBaitNearMiss,
+                        ),
+                        ..PolicyPersistenceMetadata::default()
+                    },
                 },
             ),
         ]);
@@ -2402,6 +2655,12 @@ mod tests {
                 PolicyState::RateLimited,
                 EventKind::RateLimitApplied {
                     reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=1 query_seen=true legacy_openapi_query_seen=false linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=2 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=0 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=2 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
+                    persistence: PolicyPersistenceMetadata {
+                        pre_containment_persistence_class: Some(
+                            PreContainmentPersistenceClass::DiscoveryRecon,
+                        ),
+                        ..PolicyPersistenceMetadata::default()
+                    },
                 },
             ),
             Event::new(
@@ -2411,6 +2670,7 @@ mod tests {
                 EventKind::PolicyDecision {
                     routing_decision: RoutingDecision::RateLimited,
                     reason: "rate limited policy throttles the request".to_string(),
+                    persistence: PolicyPersistenceMetadata::default(),
                 },
             ),
             Event::new(
@@ -2477,6 +2737,12 @@ mod tests {
                     from: PolicyState::ControlledReality,
                     to: PolicyState::Blocked,
                     reason: "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2 post_containment_persistence_kind=controlled_reality_branch_escape".to_string(),
+                    persistence: PolicyPersistenceMetadata {
+                        post_containment_persistence_kind: Some(
+                            PostContainmentPersistenceKind::ControlledRealityBranchEscape,
+                        ),
+                        ..PolicyPersistenceMetadata::default()
+                    },
                 },
             ),
             Event::new(
@@ -2542,6 +2808,15 @@ mod tests {
                     from: PolicyState::RateLimited,
                     to: PolicyState::Blocked,
                     reason: "rate-limited same-bait near miss retry moved session to blocked: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss persistence_kind=same_bait_near_miss_retry".to_string(),
+                    persistence: PolicyPersistenceMetadata {
+                        pre_containment_persistence_class: Some(
+                            PreContainmentPersistenceClass::SameBaitNearMiss,
+                        ),
+                        pre_containment_persistence_kind: Some(
+                            PreContainmentPersistenceKind::SameBaitNearMissRetry,
+                        ),
+                        ..PolicyPersistenceMetadata::default()
+                    },
                 },
             ),
             Event::new(
@@ -2623,6 +2898,15 @@ mod tests {
                     from: PolicyState::RateLimited,
                     to: PolicyState::Blocked,
                     reason: "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_class=discovery_recon persistence_kind=discovery_recon_retry".to_string(),
+                    persistence: PolicyPersistenceMetadata {
+                        pre_containment_persistence_class: Some(
+                            PreContainmentPersistenceClass::DiscoveryRecon,
+                        ),
+                        pre_containment_persistence_kind: Some(
+                            PreContainmentPersistenceKind::DiscoveryReconRetry,
+                        ),
+                        ..PolicyPersistenceMetadata::default()
+                    },
                 },
             ),
             Event::new(
@@ -2704,6 +2988,15 @@ mod tests {
                     from: PolicyState::RateLimited,
                     to: PolicyState::Blocked,
                     reason: "rate-limited discovery recon retry moved session to blocked: path=/api/v2/import/validate actor_kind=agentic_browser vendor_score=35 discovery_requests=1 distinct_surfaces=1 query_seen=true legacy_openapi_query_seen=false linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=true decoy_write_probe_count=2 decoy_write_probe_path_classes=2 detection_count=0 repeated_discovery_score=0 query_score=1 legacy_openapi_query_score=0 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=3 decoy_write_probe_path_fanout_bonus=1 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_class=write_recon persistence_kind=write_recon_retry".to_string(),
+                    persistence: PolicyPersistenceMetadata {
+                        pre_containment_persistence_class: Some(
+                            PreContainmentPersistenceClass::WriteRecon,
+                        ),
+                        pre_containment_persistence_kind: Some(
+                            PreContainmentPersistenceKind::WriteReconRetry,
+                        ),
+                        ..PolicyPersistenceMetadata::default()
+                    },
                 },
             ),
             Event::new(
@@ -2774,6 +3067,12 @@ mod tests {
                     from: PolicyState::ControlledReality,
                     to: PolicyState::Blocked,
                     reason: "controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4 post_containment_persistence_kind=controlled_reality_depth_limit".to_string(),
+                    persistence: PolicyPersistenceMetadata {
+                        post_containment_persistence_kind: Some(
+                            PostContainmentPersistenceKind::ControlledRealityDepthLimit,
+                        ),
+                        ..PolicyPersistenceMetadata::default()
+                    },
                 },
             ),
             Event::new(

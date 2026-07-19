@@ -63,6 +63,8 @@ pub enum HeaderValueMintKind {
 pub struct HeaderValueMint {
     pub kind: HeaderValueMintKind,
     pub prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_window_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +78,8 @@ pub struct BaitHeaderValueMintAudit {
 #[serde(rename_all = "snake_case")]
 pub enum BaitHeaderValueMintStatus {
     MatchedSessionValue,
+    ExpiredSessionValue,
+    ReplaySeen,
     SessionValueMismatch,
 }
 
@@ -375,12 +379,16 @@ impl PreContainmentPersistenceClass {
         }
     }
 
-    pub fn from_reason(reason: &str) -> Option<Self> {
-        if let Some(class_code) = reason
+    pub fn from_explicit_reason_marker(reason: &str) -> Option<Self> {
+        reason
             .split_ascii_whitespace()
             .find_map(|field| field.strip_prefix("persistence_class="))
-        {
-            return Self::from_code(class_code);
+            .and_then(Self::from_code)
+    }
+
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        if let Some(class) = Self::from_explicit_reason_marker(reason) {
+            return Some(class);
         }
 
         if reason
@@ -436,19 +444,20 @@ impl PreContainmentPersistenceKind {
         }
     }
 
-    pub fn from_reason(reason: &str) -> Option<Self> {
+    pub fn from_explicit_reason_marker(reason: &str) -> Option<Self> {
         if let Some(detail_code) = reason
             .split_ascii_whitespace()
             .find_map(|field| field.strip_prefix("persistence_kind="))
         {
             return Self::from_detail_code(detail_code);
         }
-        if let Some(class_code) = reason
-            .split_ascii_whitespace()
-            .find_map(|field| field.strip_prefix("persistence_class="))
-        {
-            return PreContainmentPersistenceClass::from_code(class_code)
-                .map(PreContainmentPersistenceClass::blocked_kind);
+        PreContainmentPersistenceClass::from_explicit_reason_marker(reason)
+            .map(PreContainmentPersistenceClass::blocked_kind)
+    }
+
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        if let Some(kind) = Self::from_explicit_reason_marker(reason) {
+            return Some(kind);
         }
 
         if reason.contains("rate-limited same-bait near miss retry moved session to blocked") {
@@ -503,12 +512,16 @@ impl PostContainmentPersistenceKind {
         }
     }
 
-    pub fn from_reason(reason: &str) -> Option<Self> {
-        if let Some(detail_code) = reason
+    pub fn from_explicit_reason_marker(reason: &str) -> Option<Self> {
+        reason
             .split_ascii_whitespace()
             .find_map(|field| field.strip_prefix("post_containment_persistence_kind="))
-        {
-            return Self::from_detail_code(detail_code);
+            .and_then(Self::from_detail_code)
+    }
+
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        if let Some(kind) = Self::from_explicit_reason_marker(reason) {
+            return Some(kind);
         }
 
         if reason.contains(
@@ -532,6 +545,24 @@ impl PostContainmentPersistenceKind {
             "controlled_reality_depth_limit" => Some(Self::ControlledRealityDepthLimit),
             _ => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyPersistenceMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_containment_persistence_class: Option<PreContainmentPersistenceClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_containment_persistence_kind: Option<PreContainmentPersistenceKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_containment_persistence_kind: Option<PostContainmentPersistenceKind>,
+}
+
+impl PolicyPersistenceMetadata {
+    pub fn is_empty(&self) -> bool {
+        self.pre_containment_persistence_class.is_none()
+            && self.pre_containment_persistence_kind.is_none()
+            && self.post_containment_persistence_kind.is_none()
     }
 }
 
@@ -582,22 +613,32 @@ pub enum EventKind {
         from: PolicyState,
         to: PolicyState,
         reason: String,
+        #[serde(default, skip_serializing_if = "PolicyPersistenceMetadata::is_empty")]
+        persistence: PolicyPersistenceMetadata,
     },
     PolicyDecision {
         routing_decision: RoutingDecision,
         reason: String,
+        #[serde(default, skip_serializing_if = "PolicyPersistenceMetadata::is_empty")]
+        persistence: PolicyPersistenceMetadata,
     },
     ControlledRealityEntered {
         reason: String,
+        #[serde(default, skip_serializing_if = "PolicyPersistenceMetadata::is_empty")]
+        persistence: PolicyPersistenceMetadata,
     },
     RateLimitApplied {
         reason: String,
+        #[serde(default, skip_serializing_if = "PolicyPersistenceMetadata::is_empty")]
+        persistence: PolicyPersistenceMetadata,
     },
     RealityEscapeAttempt {
         method: String,
         path: String,
         routing_decision: RoutingDecision,
         reason: String,
+        #[serde(default, skip_serializing_if = "PolicyPersistenceMetadata::is_empty")]
+        persistence: PolicyPersistenceMetadata,
     },
 }
 
@@ -703,6 +744,8 @@ pub struct EdgeEvidenceRef {
     pub trusted_ingress_soften_histories: Vec<EdgeTrustedIngressSoftenHistory>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bait_header_value_mints: Vec<EdgeBaitHeaderValueMintAudit>,
+    #[serde(default, skip_serializing_if = "EdgeBaitHeaderValueMintOutcomeSummary::is_empty")]
+    pub bait_header_value_mint_outcome_summary: EdgeBaitHeaderValueMintOutcomeSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_bait_header_value_mint: Option<EdgeObservedBaitHeaderValueMint>,
 }
@@ -722,6 +765,31 @@ pub struct EdgeObservedBaitHeaderValueMint {
     pub kind: HeaderValueMintKind,
     pub prefix: String,
     pub status: BaitHeaderValueMintStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeBaitHeaderValueMintOutcomeSummary {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub matched_session_value: u16,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub expired_session_value: u16,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replay_seen: u16,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub session_value_mismatch: u16,
+}
+
+impl EdgeBaitHeaderValueMintOutcomeSummary {
+    pub fn is_empty(&self) -> bool {
+        self.matched_session_value == 0
+            && self.expired_session_value == 0
+            && self.replay_seen == 0
+            && self.session_value_mismatch == 0
+    }
+}
+
+fn is_zero(value: &u16) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1005,6 +1073,7 @@ mod tests {
                 from: PolicyState::Observe,
                 to: PolicyState::Suspicious,
                 reason: "bait action matched expected header and path".to_string(),
+                persistence: PolicyPersistenceMetadata::default(),
             },
         );
 
@@ -1248,6 +1317,10 @@ mod tests {
         let reason = "rate-limited discovery recon retry moved session to blocked: path=/docs persistence_kind=discovery_recon_retry";
 
         assert_eq!(
+            PreContainmentPersistenceKind::from_explicit_reason_marker(reason),
+            Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
+        );
+        assert_eq!(
             PreContainmentPersistenceKind::from_reason(reason),
             Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
         );
@@ -1269,6 +1342,10 @@ mod tests {
             "suspicious discovery recon persistence moved session to rate limited: path=/docs persistence_class=discovery_recon";
 
         assert_eq!(
+            PreContainmentPersistenceKind::from_explicit_reason_marker(reason),
+            Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
+        );
+        assert_eq!(
             PreContainmentPersistenceKind::from_reason(reason),
             Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
         );
@@ -1280,6 +1357,24 @@ mod tests {
             "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile persistence_class=same_bait_near_miss";
 
         assert_eq!(
+            PreContainmentPersistenceClass::from_explicit_reason_marker(reason),
+            Some(PreContainmentPersistenceClass::SameBaitNearMiss)
+        );
+        assert_eq!(
+            PreContainmentPersistenceClass::from_reason(reason),
+            Some(PreContainmentPersistenceClass::SameBaitNearMiss)
+        );
+    }
+
+    #[test]
+    fn pre_containment_persistence_class_explicit_marker_does_not_use_legacy_phrase_fallback() {
+        let reason = "suspicious same-bait near miss after exposure moved session to rate limited";
+
+        assert_eq!(
+            PreContainmentPersistenceClass::from_explicit_reason_marker(reason),
+            None
+        );
+        assert_eq!(
             PreContainmentPersistenceClass::from_reason(reason),
             Some(PreContainmentPersistenceClass::SameBaitNearMiss)
         );
@@ -1289,6 +1384,25 @@ mod tests {
     fn post_containment_persistence_kind_parses_explicit_marker() {
         let reason = "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects post_containment_persistence_kind=controlled_reality_branch_escape";
 
+        assert_eq!(
+            PostContainmentPersistenceKind::from_explicit_reason_marker(reason),
+            Some(PostContainmentPersistenceKind::ControlledRealityBranchEscape)
+        );
+        assert_eq!(
+            PostContainmentPersistenceKind::from_reason(reason),
+            Some(PostContainmentPersistenceKind::ControlledRealityBranchEscape)
+        );
+    }
+
+    #[test]
+    fn post_containment_persistence_kind_explicit_marker_does_not_use_legacy_phrase_fallback() {
+        let reason =
+            "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked";
+
+        assert_eq!(
+            PostContainmentPersistenceKind::from_explicit_reason_marker(reason),
+            None
+        );
         assert_eq!(
             PostContainmentPersistenceKind::from_reason(reason),
             Some(PostContainmentPersistenceKind::ControlledRealityBranchEscape)
@@ -1305,6 +1419,7 @@ mod tests {
             EventKind::PolicyDecision {
                 routing_decision: RoutingDecision::ProtectedUpstream,
                 reason: "interventions disabled; forwarding to protected upstream".to_string(),
+                persistence: PolicyPersistenceMetadata::default(),
             },
         );
 
@@ -1561,6 +1676,10 @@ mod tests {
                     kind: HeaderValueMintKind::SessionHmacSha256V1,
                     prefix: "minted".to_string(),
                 }],
+                bait_header_value_mint_outcome_summary: EdgeBaitHeaderValueMintOutcomeSummary {
+                    session_value_mismatch: 1,
+                    ..Default::default()
+                },
                 latest_bait_header_value_mint: Some(EdgeObservedBaitHeaderValueMint {
                     bait_id: BaitId("minted_trace".to_string()),
                     header_name: "X-Minted-Trace".to_string(),
@@ -1687,6 +1806,11 @@ mod tests {
         assert_eq!(
             serialized["evidence"]["bait_header_value_mints"][0]["kind"],
             json!("session_hmac_sha256_v1")
+        );
+        assert_eq!(
+            serialized["evidence"]["bait_header_value_mint_outcome_summary"]
+                ["session_value_mismatch"],
+            json!(1)
         );
         assert_eq!(
             serialized["evidence"]["latest_bait_header_value_mint"]["status"],

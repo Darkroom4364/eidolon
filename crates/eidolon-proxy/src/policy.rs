@@ -1,7 +1,9 @@
+#[cfg(test)]
+use eidolon_core::PreContainmentPersistenceKind;
 use eidolon_core::{
     BaitId, Event, EventKind, EventSource, IngressActorKind, IngressAdvisorySignals,
-    IngressIdentity, PolicyState, PostContainmentPersistenceKind, PreContainmentPersistenceClass,
-    RoutingDecision, SessionId,
+    IngressIdentity, PolicyPersistenceMetadata, PolicyState, PostContainmentPersistenceKind,
+    PreContainmentPersistenceClass, RoutingDecision, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -196,6 +198,7 @@ pub struct PolicyDecision {
     pub policy_state: PolicyState,
     pub routing_decision: RoutingDecision,
     pub reason: String,
+    pub persistence: PolicyPersistenceMetadata,
 }
 
 impl PolicyDecision {
@@ -208,6 +211,7 @@ impl PolicyDecision {
             policy_state,
             routing_decision,
             reason: reason.into(),
+            persistence: PolicyPersistenceMetadata::default(),
         }
     }
 
@@ -227,6 +231,7 @@ pub struct PolicyTransition {
     pub from: PolicyState,
     pub to: PolicyState,
     pub reason: String,
+    pub persistence: PolicyPersistenceMetadata,
 }
 
 impl PolicyTransition {
@@ -235,6 +240,7 @@ impl PolicyTransition {
             from,
             to,
             reason: reason.into(),
+            persistence: PolicyPersistenceMetadata::default(),
         }
     }
 }
@@ -495,22 +501,21 @@ pub fn transition_to_rate_limited_from_suspicious_discovery_recon(
         return None;
     }
 
-    Some(PolicyTransition::new(
+    let mut transition = PolicyTransition::new(
         current_state,
         PolicyState::RateLimited,
-        append_pre_containment_persistence_class(
-            format_discovery_recon_reason(
-                DISCOVERY_RECON_PERSISTENCE_RATE_LIMIT_REASON_PREFIX,
-                "recon_rate_limit_threshold",
-                DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD,
-                path,
-                ingress_signals.actor_kind,
-                profile.signal,
-                recon_state,
-            ),
-            profile.persistence_class,
+        format_discovery_recon_reason(
+            DISCOVERY_RECON_PERSISTENCE_RATE_LIMIT_REASON_PREFIX,
+            "recon_rate_limit_threshold",
+            DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD,
+            path,
+            ingress_signals.actor_kind,
+            profile.signal,
+            recon_state,
         ),
-    ))
+    );
+    transition.persistence = pre_containment_persistence_metadata(profile.persistence_class);
+    Some(transition)
 }
 
 pub fn transition_to_blocked_from_repeated_discovery_recon(
@@ -537,22 +542,22 @@ pub fn transition_to_blocked_from_repeated_discovery_recon(
         return None;
     }
 
-    Some(PolicyTransition::new(
+    let mut transition = PolicyTransition::new(
         current_state,
         PolicyState::Blocked,
-        append_pre_containment_blocked_persistence_markers(
-            format_discovery_recon_reason(
-                DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX,
-                "recon_block_threshold",
-                DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD,
-                path,
-                ingress_signals.actor_kind,
-                profile.signal,
-                recon_state,
-            ),
-            profile.persistence_class,
+        format_discovery_recon_reason(
+            DISCOVERY_RECON_PERSISTENCE_BLOCKED_REASON_PREFIX,
+            "recon_block_threshold",
+            DISCOVERY_RECON_RATE_LIMIT_SCORE_THRESHOLD,
+            path,
+            ingress_signals.actor_kind,
+            profile.signal,
+            recon_state,
         ),
-    ))
+    );
+    transition.persistence =
+        pre_containment_blocked_persistence_metadata(profile.persistence_class);
+    Some(transition)
 }
 
 pub fn transition_to_rate_limited_from_same_bait_near_miss(
@@ -565,17 +570,17 @@ pub fn transition_to_rate_limited_from_same_bait_near_miss(
         return None;
     }
 
-    Some(PolicyTransition::new(
+    let mut transition = PolicyTransition::new(
         current_state,
         PolicyState::RateLimited,
-        append_pre_containment_persistence_class(
-            format!(
-                "{SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX}: path={path} bait_id={}",
-                bait_id.0
-            ),
-            PreContainmentPersistenceClass::SameBaitNearMiss,
+        format!(
+            "{SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX}: path={path} bait_id={}",
+            bait_id.0
         ),
-    ))
+    );
+    transition.persistence =
+        pre_containment_persistence_metadata(PreContainmentPersistenceClass::SameBaitNearMiss);
+    Some(transition)
 }
 
 pub fn transition_to_blocked_from_repeated_same_bait_near_miss(
@@ -588,17 +593,18 @@ pub fn transition_to_blocked_from_repeated_same_bait_near_miss(
         return None;
     }
 
-    Some(PolicyTransition::new(
+    let mut transition = PolicyTransition::new(
         current_state,
         PolicyState::Blocked,
-        append_pre_containment_blocked_persistence_markers(
-            format!(
-                "{REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX}: path={path} bait_id={}",
-                bait_id.0
-            ),
-            PreContainmentPersistenceClass::SameBaitNearMiss,
+        format!(
+            "{REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX}: path={path} bait_id={}",
+            bait_id.0
         ),
-    ))
+    );
+    transition.persistence = pre_containment_blocked_persistence_metadata(
+        PreContainmentPersistenceClass::SameBaitNearMiss,
+    );
+    Some(transition)
 }
 
 fn discovery_recon_signal_profile(
@@ -701,30 +707,34 @@ fn pre_containment_persistence_class_for_recon(
     None
 }
 
-fn append_pre_containment_persistence_class(
-    reason: String,
+fn pre_containment_persistence_metadata(
     persistence_class: PreContainmentPersistenceClass,
-) -> String {
-    format!("{reason} {}", persistence_class.marker())
+) -> PolicyPersistenceMetadata {
+    PolicyPersistenceMetadata {
+        pre_containment_persistence_class: Some(persistence_class),
+        pre_containment_persistence_kind: None,
+        post_containment_persistence_kind: None,
+    }
 }
 
-fn append_pre_containment_blocked_persistence_markers(
-    reason: String,
+fn pre_containment_blocked_persistence_metadata(
     persistence_class: PreContainmentPersistenceClass,
-) -> String {
-    let persistence_kind = persistence_class.blocked_kind();
-    format!(
-        "{reason} {} {}",
-        persistence_class.marker(),
-        persistence_kind.marker()
-    )
+) -> PolicyPersistenceMetadata {
+    PolicyPersistenceMetadata {
+        pre_containment_persistence_class: Some(persistence_class),
+        pre_containment_persistence_kind: Some(persistence_class.blocked_kind()),
+        post_containment_persistence_kind: None,
+    }
 }
 
-fn append_post_containment_persistence_kind(
-    reason: String,
+fn post_containment_persistence_metadata(
     persistence_kind: PostContainmentPersistenceKind,
-) -> String {
-    format!("{reason} {}", persistence_kind.marker())
+) -> PolicyPersistenceMetadata {
+    PolicyPersistenceMetadata {
+        pre_containment_persistence_class: None,
+        pre_containment_persistence_kind: None,
+        post_containment_persistence_kind: Some(persistence_kind),
+    }
 }
 
 pub fn transition_to_blocked_from_repeated_controlled_reality_depth_limit(
@@ -737,16 +747,17 @@ pub fn transition_to_blocked_from_repeated_controlled_reality_depth_limit(
         return None;
     }
 
-    Some(PolicyTransition::new(
+    let mut transition = PolicyTransition::new(
         current_state,
         PolicyState::Blocked,
-        append_post_containment_persistence_kind(
-            format!(
+        format!(
             "{REPEATED_CONTROLLED_REALITY_DEPTH_LIMIT_BLOCKED_REASON_PREFIX}: path={path} depth={depth} depth_limit={depth_limit}",
-            ),
-            PostContainmentPersistenceKind::ControlledRealityDepthLimit,
         ),
-    ))
+    );
+    transition.persistence = post_containment_persistence_metadata(
+        PostContainmentPersistenceKind::ControlledRealityDepthLimit,
+    );
+    Some(transition)
 }
 
 pub fn transition_to_blocked_from_repeated_reality_escape_attempt(
@@ -758,16 +769,17 @@ pub fn transition_to_blocked_from_repeated_reality_escape_attempt(
         return None;
     }
 
-    Some(PolicyTransition::new(
+    let mut transition = PolicyTransition::new(
         current_state,
         PolicyState::Blocked,
-        append_post_containment_persistence_kind(
-            format!(
+        format!(
             "{REPEATED_REALITY_ESCAPE_BLOCKED_REASON_PREFIX}: path={path} attempt_count={attempt_count}",
-            ),
-            PostContainmentPersistenceKind::ControlledRealityBranchEscape,
         ),
-    ))
+    );
+    transition.persistence = post_containment_persistence_metadata(
+        PostContainmentPersistenceKind::ControlledRealityBranchEscape,
+    );
+    Some(transition)
 }
 
 pub fn decide_for_state(
@@ -812,13 +824,16 @@ pub fn policy_intervention_event(session_id: SessionId, decision: &PolicyDecisio
     let kind = match decision.routing_decision {
         RoutingDecision::ControlledReality => EventKind::ControlledRealityEntered {
             reason: decision.reason.clone(),
+            persistence: decision.persistence.clone(),
         },
         RoutingDecision::RateLimited => EventKind::RateLimitApplied {
             reason: decision.reason.clone(),
+            persistence: decision.persistence.clone(),
         },
         _ => EventKind::PolicyDecision {
             routing_decision: decision.routing_decision,
             reason: decision.reason.clone(),
+            persistence: decision.persistence.clone(),
         },
     };
 
@@ -839,6 +854,7 @@ pub fn policy_changed_event(session_id: SessionId, transition: &PolicyTransition
             from: transition.from,
             to: transition.to,
             reason: transition.reason.clone(),
+            persistence: transition.persistence.clone(),
         },
     )
 }
@@ -876,6 +892,7 @@ pub fn reality_escape_attempt_event(
             path: path.into(),
             routing_decision,
             reason: reason.into(),
+            persistence: PolicyPersistenceMetadata::default(),
         },
     )
 }
@@ -1123,9 +1140,14 @@ mod tests {
             .contains(SAME_BAIT_NEAR_MISS_RATE_LIMIT_REASON_PREFIX));
         assert!(transition.reason.contains("path=/api/v2/import/reconcile"));
         assert!(transition.reason.contains("bait_id=rel_2025_04_b7f2"));
-        assert!(transition
-            .reason
-            .contains("persistence_class=same_bait_near_miss"));
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::SameBaitNearMiss)
+        );
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_kind,
+            None
+        );
     }
 
     #[test]
@@ -1196,9 +1218,14 @@ mod tests {
         assert!(transition.reason.contains("legacy_openapi_query_score=2"));
         assert!(transition.reason.contains("recon_score=5"));
         assert!(transition.reason.contains("recon_rate_limit_threshold=5"));
-        assert!(transition
-            .reason
-            .contains("persistence_class=discovery_recon"));
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::DiscoveryRecon)
+        );
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_kind,
+            None
+        );
     }
 
     #[test]
@@ -1339,7 +1366,14 @@ mod tests {
             .contains("decoy_write_probe_path_fanout_bonus=1"));
         assert!(transition.reason.contains("recon_score=5"));
         assert!(transition.reason.contains("recon_rate_limit_threshold=5"));
-        assert!(transition.reason.contains("persistence_class=write_recon"));
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::WriteRecon)
+        );
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_kind,
+            None
+        );
     }
 
     #[test]
@@ -1391,12 +1425,14 @@ mod tests {
         assert!(transition.reason.contains("legacy_openapi_query_score=2"));
         assert!(transition.reason.contains("recon_score=5"));
         assert!(transition.reason.contains("recon_block_threshold=5"));
-        assert!(transition
-            .reason
-            .contains("persistence_class=discovery_recon"));
-        assert!(transition
-            .reason
-            .contains("persistence_kind=discovery_recon_retry"));
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::DiscoveryRecon)
+        );
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_kind,
+            Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
+        );
     }
 
     #[test]
@@ -1448,12 +1484,14 @@ mod tests {
         assert!(transition.reason.contains("decoy_write_probe_score=2"));
         assert!(transition.reason.contains("recon_score=5"));
         assert!(transition.reason.contains("recon_block_threshold=5"));
-        assert!(transition
-            .reason
-            .contains("persistence_class=discovery_recon"));
-        assert!(transition
-            .reason
-            .contains("persistence_kind=discovery_recon_retry"));
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::DiscoveryRecon)
+        );
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_kind,
+            Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
+        );
     }
 
     #[test]
@@ -1594,10 +1632,14 @@ mod tests {
             .contains("decoy_write_probe_path_fanout_bonus=1"));
         assert!(transition.reason.contains("recon_score=5"));
         assert!(transition.reason.contains("recon_block_threshold=5"));
-        assert!(transition.reason.contains("persistence_class=write_recon"));
-        assert!(transition
-            .reason
-            .contains("persistence_kind=write_recon_retry"));
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::WriteRecon)
+        );
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_kind,
+            Some(PreContainmentPersistenceKind::WriteReconRetry)
+        );
     }
 
     #[test]
@@ -1618,12 +1660,14 @@ mod tests {
             .contains(REPEATED_SAME_BAIT_NEAR_MISS_BLOCKED_REASON_PREFIX));
         assert!(transition.reason.contains("path=/api/v2/import/reconcile"));
         assert!(transition.reason.contains("bait_id=rel_2025_04_b7f2"));
-        assert!(transition
-            .reason
-            .contains("persistence_class=same_bait_near_miss"));
-        assert!(transition
-            .reason
-            .contains("persistence_kind=same_bait_near_miss_retry"));
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_class,
+            Some(PreContainmentPersistenceClass::SameBaitNearMiss)
+        );
+        assert_eq!(
+            transition.persistence.pre_containment_persistence_kind,
+            Some(PreContainmentPersistenceKind::SameBaitNearMissRetry)
+        );
     }
 
     #[test]
@@ -2283,9 +2327,10 @@ mod tests {
         assert!(transition.reason.contains("path=/api/v2/import/reconcile"));
         assert!(transition.reason.contains("depth=6"));
         assert!(transition.reason.contains("depth_limit=4"));
-        assert!(transition
-            .reason
-            .contains("post_containment_persistence_kind=controlled_reality_depth_limit"));
+        assert_eq!(
+            transition.persistence.post_containment_persistence_kind,
+            Some(PostContainmentPersistenceKind::ControlledRealityDepthLimit)
+        );
     }
 
     #[test]
@@ -2324,9 +2369,10 @@ mod tests {
             .contains(REPEATED_REALITY_ESCAPE_BLOCKED_REASON_PREFIX));
         assert!(transition.reason.contains("path=/api/v1/projects"));
         assert!(transition.reason.contains("attempt_count=2"));
-        assert!(transition
-            .reason
-            .contains("post_containment_persistence_kind=controlled_reality_branch_escape"));
+        assert_eq!(
+            transition.persistence.post_containment_persistence_kind,
+            Some(PostContainmentPersistenceKind::ControlledRealityBranchEscape)
+        );
     }
 
     #[test]
@@ -2374,6 +2420,7 @@ mod tests {
                 from: PolicyState::Observe,
                 to: PolicyState::ControlledReality,
                 ref reason,
+                ..
             } if reason == &transition.reason
         ));
     }
@@ -2390,7 +2437,7 @@ mod tests {
         assert_eq!(event.policy_state, PolicyState::RateLimited);
         assert!(matches!(
             event.kind,
-            EventKind::RateLimitApplied { ref reason }
+            EventKind::RateLimitApplied { ref reason, .. }
                 if reason == &decision.reason
         ));
     }
@@ -2410,6 +2457,7 @@ mod tests {
             EventKind::PolicyDecision {
                 routing_decision: RoutingDecision::ProtectedUpstream,
                 ref reason,
+                ..
             } if reason == &decision.reason
         ));
     }

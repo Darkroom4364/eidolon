@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use eidolon_core::{
     BaitHeaderValueMintAudit, BaitHeaderValueMintStatus, BaitId, EventKind, ExposureId,
-    PolicyState, RoutingDecision, Score, SessionId,
+    PolicyPersistenceMetadata, PolicyState, RoutingDecision, Score, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +62,8 @@ pub struct PolicyEventEvidence {
     pub to_policy_state: Option<PolicyState>,
     pub status: Option<u16>,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "PolicyPersistenceMetadata::is_empty")]
+    pub persistence: PolicyPersistenceMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,10 +235,12 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                 to_policy_state: None,
                 status: Some(*status),
                 reason: None,
+                persistence: PolicyPersistenceMetadata::default(),
             }),
             EventKind::PolicyDecision {
                 routing_decision,
                 reason,
+                persistence,
             } => bundle.policy_events.push(PolicyEventEvidence {
                 event_ref,
                 policy_state: timeline_event.event.policy_state,
@@ -246,8 +250,14 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                 to_policy_state: None,
                 status: None,
                 reason: Some(reason.clone()),
+                persistence: persistence.clone(),
             }),
-            EventKind::PolicyChanged { from, to, reason } => {
+            EventKind::PolicyChanged {
+                from,
+                to,
+                reason,
+                persistence,
+            } => {
                 bundle.policy_events.push(PolicyEventEvidence {
                     event_ref,
                     policy_state: timeline_event.event.policy_state,
@@ -257,9 +267,13 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     to_policy_state: Some(*to),
                     status: None,
                     reason: Some(reason.clone()),
+                    persistence: persistence.clone(),
                 });
             }
-            EventKind::ControlledRealityEntered { reason } => {
+            EventKind::ControlledRealityEntered {
+                reason,
+                persistence,
+            } => {
                 bundle.policy_events.push(PolicyEventEvidence {
                     event_ref,
                     policy_state: timeline_event.event.policy_state,
@@ -269,9 +283,13 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     to_policy_state: None,
                     status: None,
                     reason: Some(reason.clone()),
+                    persistence: persistence.clone(),
                 });
             }
-            EventKind::RateLimitApplied { reason } => {
+            EventKind::RateLimitApplied {
+                reason,
+                persistence,
+            } => {
                 bundle.policy_events.push(PolicyEventEvidence {
                     event_ref,
                     policy_state: timeline_event.event.policy_state,
@@ -281,11 +299,13 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     to_policy_state: None,
                     status: None,
                     reason: Some(reason.clone()),
+                    persistence: persistence.clone(),
                 });
             }
             EventKind::RealityEscapeAttempt {
                 routing_decision,
                 reason,
+                persistence,
                 ..
             } => {
                 bundle.policy_events.push(PolicyEventEvidence {
@@ -297,6 +317,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     to_policy_state: None,
                     status: None,
                     reason: Some(reason.clone()),
+                    persistence: persistence.clone(),
                 });
             }
             EventKind::RequestSeen { .. } => {}
@@ -610,6 +631,7 @@ mod tests {
             PolicyState::ControlledReality,
             EventKind::ControlledRealityEntered {
                 reason: "confirmed bait-derived action".to_string(),
+                persistence: PolicyPersistenceMetadata::default(),
             },
         )
     }
@@ -633,6 +655,7 @@ mod tests {
             EventKind::PolicyDecision {
                 routing_decision: RoutingDecision::EidolonOwned,
                 reason: "bait-derived action intercepted".to_string(),
+                persistence: PolicyPersistenceMetadata::default(),
             },
         );
 
@@ -816,6 +839,7 @@ mod tests {
                 from: PolicyState::Observe,
                 to: PolicyState::ControlledReality,
                 reason: "confirmed bait-derived action".to_string(),
+                persistence: PolicyPersistenceMetadata::default(),
             },
         );
         let timeline = timeline(vec![
