@@ -1,0 +1,16 @@
+[test]
+  command = ["cargo", "test", "--workspace", "--locked"]
+  build_command = ["cargo", "check", "--workspace", "--locked"]
+  timeout = 120
+  jobs = 3
+
+  [mutations]
+  schemata = true
+  max_per_run = 0
+  max_per_file = 0
+  skip_noisy_files = true
+  respect_workspace_ignores = true
+  exclude_paths = [
+    "target/**",
+    ".git/**",
+  ]

@@ -1,4 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+.tmp-*/
+.pnpm-store/
+.togi.lock
 
