@@ -72,12 +72,19 @@ test_collects_quiet_and_noisy_runs() {
   summary="$("$COLLECTOR" "$quiet_dir" "$noisy_dir")"
   jq -e '
     .run_kind == "pwnkit_direct_qualification_sample"
+    and .claim_posture == "scanner_qualification_only"
+    and .lane == "eidolon_owned_target"
+    and .defense_mode == "none"
+    and .substrate == "host_local"
+    and .substrate_counts == [{"substrate":"host_local","count":2}]
     and .counts.quiet_runs == 1
     and .counts.noisy_runs == 1
     and .counts.target_interaction_observed == 2
     and .qualification_result.ready_for_negative_control_claim == false
     and .strongest_claim_level == "direct_findings_present"
     and .weakest_claim_level == "no_direct_findings"
+    and (.artifacts[] | select(.present == true) | .lane == "eidolon_owned_target")
+    and (.artifacts[] | select(.present == true) | .substrate == "host_local")
   ' <<<"$summary" >/dev/null
 }
 

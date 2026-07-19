@@ -15,6 +15,7 @@ RUNNER_M3_KALI_SAME_VM="${EIDOLON_PWNKIT_QUAL_RUNNER_M3_KALI_SAME_VM:-$REPO_ROOT
 RUNNER_SHIELD_LAB_KALI_ORBSTACK="${EIDOLON_PWNKIT_QUAL_RUNNER_SHIELD_LAB_KALI_ORBSTACK:-$REPO_ROOT/examples/shield-lab/run-pwnkit-kali-vm.sh}"
 RUNNER_QUAL_DIRECT_SAMPLE="${EIDOLON_PWNKIT_QUAL_RUNNER_DIRECT_SAMPLE:-$REPO_ROOT/examples/qualification/run-pwnkit-direct-qualification-sample.sh}"
 RUNNER_QUAL_STOCK_VS_PATCHED_SAMPLE="${EIDOLON_PWNKIT_QUAL_RUNNER_STOCK_VS_PATCHED_SAMPLE:-$REPO_ROOT/examples/qualification/run-pwnkit-stock-vs-patched-qualification-sample.sh}"
+RUNNER_QUAL_BENCHMARK_SAMPLE="${EIDOLON_PWNKIT_QUAL_RUNNER_BENCHMARK_SAMPLE:-$REPO_ROOT/examples/qualification/run-pwnkit-benchmark-sample.sh}"
 
 usage() {
   cat <<'USAGE'
@@ -44,6 +45,8 @@ Environment:
                                  Override the direct-only qualification runner.
   EIDOLON_PWNKIT_QUAL_RUNNER_STOCK_VS_PATCHED_SAMPLE
                                  Override the local stock-vs-patched runner.
+  EIDOLON_PWNKIT_QUAL_RUNNER_BENCHMARK_SAMPLE
+                                 Override the benchmark-lane runner.
 
 Outputs:
   <matrix-dir>/matrix-plan.json
@@ -121,6 +124,18 @@ validate_manifest() {
     and all(.variants[]; (
       (.variant_id | type == "string")
       and (.enabled == null or (.enabled | type == "boolean"))
+      and (.lane == null or (.lane | type == "string"))
+      and (.benchmark_family == null or (.benchmark_family | type == "string"))
+      and (.benchmark_task_id == null or (.benchmark_task_id | type == "string"))
+      and (.benchmark_snapshot_id == null or (.benchmark_snapshot_id | type == "string"))
+      and (.benchmark_model_id == null or (.benchmark_model_id | type == "string"))
+      and (.benchmark_prompt_bundle_hash == null or (.benchmark_prompt_bundle_hash | type == "string"))
+      and (.benchmark_validation_rule == null or (.benchmark_validation_rule | type == "string"))
+      and (.benchmark_action_budget == null or (.benchmark_action_budget | type == "number" and floor == . and . > 0))
+      and (.benchmark_token_budget == null or (.benchmark_token_budget | type == "number" and floor == . and . > 0))
+      and (.benchmark_wall_clock_budget_seconds == null or (.benchmark_wall_clock_budget_seconds | type == "number" and floor == . and . > 0))
+      and (.substrate == null or (.substrate | type == "string"))
+      and (.defense_mode == null or (.defense_mode | type == "string"))
       and (.control_kind | type == "string")
       and (
         .control_kind == "positive_control"
@@ -138,6 +153,7 @@ validate_manifest() {
         or .runner_kind == "shield_lab_kali_orbstack"
         or .runner_kind == "qualification_direct_sample"
         or .runner_kind == "qualification_stock_vs_patched_sample"
+        or .runner_kind == "qualification_benchmark_sample"
       )
       and (.run_count == null or (.run_count | type == "number" and floor == . and . > 0))
       and (.vm_profile == null or (.vm_profile | type == "string"))
@@ -179,6 +195,9 @@ resolve_runner_path() {
       ;;
     qualification_stock_vs_patched_sample)
       printf '%s' "$RUNNER_QUAL_STOCK_VS_PATCHED_SAMPLE"
+      ;;
+    qualification_benchmark_sample)
+      printf '%s' "$RUNNER_QUAL_BENCHMARK_SAMPLE"
       ;;
     *)
       fail "unsupported runner_kind: $runner_kind"
@@ -231,6 +250,22 @@ write_vm_spool_plan() {
         | group_by(.vm_profile)
         | map({
             vm_profile: .[0].vm_profile,
+            lane: (
+              ([.[].lane] | map(select(. != null and . != "")) | unique) as $values
+              | if ($values | length) == 1 then $values[0] else null end
+            ),
+            benchmark_family: (
+              ([.[].benchmark_family] | map(select(. != null and . != "")) | unique) as $values
+              | if ($values | length) == 1 then $values[0] else null end
+            ),
+            substrate: (
+              ([.[].substrate] | map(select(. != null and . != "")) | unique) as $values
+              | if ($values | length) == 1 then $values[0] else null end
+            ),
+            defense_mode: (
+              ([.[].defense_mode] | map(select(. != null and . != "")) | unique) as $values
+              | if ($values | length) == 1 then $values[0] else null end
+            ),
             runner_kinds: ([.[].runner_kind] | unique),
             control_kinds: ([.[].control_kind] | unique),
             variant_ids: [.[].variant_id],

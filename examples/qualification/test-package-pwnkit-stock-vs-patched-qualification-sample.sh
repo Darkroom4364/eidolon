@@ -315,8 +315,17 @@ test_packager_creates_bundle() {
   [[ -f "$bundle_dir/tracks/local-patched/pwnkit-stability-sample.json" ]]
   [[ -f "$bundle_dir/SHA256SUMS" ]]
   rg -q 'stock-vs-patched comparison bundle' "$bundle_dir/README.md"
+  rg -q 'lane: `eidolon_owned_target`; defense: `comparison`.' "$bundle_dir/README.md"
   rg -q '<sample-path-omitted>' "$bundle_dir/pwnkit-stability-sample.json"
   rg -q '<sample-path-omitted>' "$bundle_dir/pwnkit-parity.json"
+  jq -e '
+    .lane == "eidolon_owned_target"
+    and .defense_mode == "comparison"
+    and .substrate == "host_local"
+    and .artifact_identity.upstream_sample_source == "<sample-path-omitted>"
+    and .artifact_identity.parity_source == "<parity-source-omitted>"
+    and (.artifacts[] | .artifact_identity.sample_path == "<sample-path-omitted>")
+  ' "$bundle_dir/pwnkit-stability-sample.json" >/dev/null
 }
 
 test_packager_creates_bundle

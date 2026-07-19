@@ -100,6 +100,23 @@ done | jq -s '
   def rate($numerator; $denominator):
     if $denominator == 0 then null else ($numerator / $denominator) end;
 
+  def normalize_substrate($runner_environment; $network_topology):
+    if $runner_environment == "host_mac" and $network_topology == "same_host_loopback" then
+      "host_local"
+    elif $runner_environment == "kali_vm" and $network_topology == "same_vm_loopback" then
+      "kali_vm_same_vm_loopback"
+    elif $runner_environment == "kali_vm" and $network_topology == "kali_vm_to_orbstack_nodeport" then
+      "kali_vm_orbstack_nodeport"
+    elif $runner_environment == "microvm_guest" then
+      "microvm_guest"
+    elif ($network_topology // "") != "" then
+      $network_topology
+    elif ($runner_environment // "") != "" then
+      $runner_environment
+    else
+      "unknown"
+    end;
+
   def count_values($values; $label):
     $values
     | map(select(. != null and . != ""))
@@ -138,6 +155,13 @@ done | jq -s '
       {
         artifact_dir,
         present: true,
+        lane: "eidolon_owned_target",
+        benchmark_family: null,
+        defense_mode: "none",
+        artifact_identity: {
+          artifact_kind: "pwnkit_direct_qualification_run",
+          artifact_dir
+        },
         evidence_track,
         runner_git_head: (.runner.pwnkit.git_head // null),
         runner_package_version: (.runner.pwnkit.package_version // null),
@@ -177,6 +201,7 @@ done | jq -s '
         runner_environment: (.runner.environment.runner_environment // null),
         runner_environment_source: (.runner.environment.runner_environment_source // null),
         runner_network_topology: (.runner.environment.network_topology // null),
+        substrate: normalize_substrate(.runner.environment.runner_environment; .runner.environment.network_topology),
         runner_os: (.runner.environment.os // null),
         runner_tool_fingerprint: (.runner.environment.tool_fingerprint // []),
         claim_level,
@@ -201,6 +226,7 @@ done | jq -s '
   | ($valid | map(select((.direct_finding_count // 0) == 0)) | length) as $quiet_count
   | ($valid | map(select((.direct_finding_count // 0) > 0)) | length) as $noisy_count
   | ($valid | map(select((.agent_error_diagnostics.count // 0) > 0)) | length) as $agent_error_count
+  | ($valid | map(.substrate) | map(select(. != null and . != "")) | unique) as $substrates
   | ($valid | map(.direct_finding_count // 0) | add // 0) as $direct_finding_total
   | ($valid | map(.direct_db_saved_finding_count // 0) | add // 0) as $direct_db_saved_total
   | ($valid | map(.direct_db_active_finding_count // 0) | add // 0) as $direct_db_active_total
@@ -209,6 +235,28 @@ done | jq -s '
       schema_version: 1,
       run_kind: "pwnkit_direct_qualification_sample",
       boundary: "scanner_qualification",
+      claim_posture: "scanner_qualification_only",
+      evaluation_lane_version: 1,
+      lane: "eidolon_owned_target",
+      benchmark_family: null,
+      defense_mode: "none",
+      substrate: (
+        if ($substrates | length) == 1 then
+          $substrates[0]
+        elif ($substrates | length) == 0 then
+          "unknown"
+        else
+          "mixed"
+        end
+      ),
+      artifact_identity: {
+        artifact_kind: "pwnkit_direct_qualification_sample",
+        source_artifact_count: ($raw | length)
+      },
+      budget: {
+        observed_artifact_count: ($raw | length),
+        observed_valid_summary_count: $valid_count
+      },
       generated_at: (now | todateiso8601),
       artifact_count: ($raw | length),
       valid_summary_count: $valid_count,
@@ -256,6 +304,7 @@ done | jq -s '
       mixed_evidence_tracks: (($valid | map(.evidence_track) | map(select(. != null and . != "")) | unique | length) > 1),
       unknown_evidence_track_count: ($valid | map(select(.evidence_track == "unknown")) | length),
       runner_environments: ($valid | map(.runner_environment) | map(select(. != null and . != "")) | unique),
+      substrate_counts: count_values(($artifacts | map(.substrate)); "substrate"),
       runner_network_topologies: ($valid | map(.runner_network_topology) | map(select(. != null and . != "")) | unique),
       tool_fingerprint_summary: tool_fingerprint_summary,
       source_checkout: {

@@ -18,6 +18,9 @@ write_spool_plan() {
     vm_profiles: [
       {
         vm_profile: "kali_vm_same_vm_loopback",
+        lane: "kali_vm_transfer",
+        substrate: "kali_vm_same_vm_loopback",
+        defense_mode: "comparison",
         runner_kinds: ["m3_kali_same_vm"],
         control_kinds: ["transfer_control"],
         variant_ids: ["kali_same_vm_transfer_control"],
@@ -25,6 +28,9 @@ write_spool_plan() {
       },
       {
         vm_profile: "kali_vm_to_orbstack_nodeport",
+        lane: "kali_vm_transfer",
+        substrate: "kali_vm_orbstack_nodeport",
+        defense_mode: "comparison",
         runner_kinds: ["shield_lab_kali_orbstack"],
         control_kinds: ["transfer_control"],
         variant_ids: ["kali_orbstack_transfer_control"],
@@ -97,10 +103,14 @@ test_dry_run_writes_manifest_and_helper_scripts() {
 
   jq -e '
     .run_kind == "pwnkit_qualification_orbstack_vm_spool_manifest"
+    and .claim_posture == "scanner_qualification_only"
+    and .evaluation_lane_version == 1
     and .provider == "orbstack"
     and .dry_run == true
     and (.profiles | length == 2)
     and (.profiles[0].machine_name | startswith("eidolon-qual-"))
+    and all(.profiles[]; .lane == "kali_vm_transfer")
+    and all(.profiles[]; .defense_mode == "comparison")
   ' "$output_dir/vm-spool-manifest.json" >/dev/null
 
   rg -q 'examples/m3/run-pwnkit-kali-vm.sh' "$output_dir/run-kali_vm_same_vm_loopback.sh"
@@ -142,6 +152,9 @@ test_execution_creates_missing_and_reuses_existing_machines() {
     .dry_run == false
     and (.profiles[] | select(.vm_profile == "kali_vm_same_vm_loopback") | .existed == true and .created == false)
     and (.profiles[] | select(.vm_profile == "kali_vm_to_orbstack_nodeport") | .existed == false and .created == true)
+    and (.profiles[] | select(.vm_profile == "kali_vm_same_vm_loopback") | .substrate == "kali_vm_same_vm_loopback")
+    and (.profiles[] | select(.vm_profile == "kali_vm_to_orbstack_nodeport") | .substrate == "kali_vm_orbstack_nodeport")
+    and (.profiles[] | .artifact_identity.artifact_kind == "pwnkit_qualification_orbstack_vm_spool_profile")
   ' "$output_dir/vm-spool-manifest.json" >/dev/null
 }
 

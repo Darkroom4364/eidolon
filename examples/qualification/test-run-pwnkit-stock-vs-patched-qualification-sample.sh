@@ -263,9 +263,16 @@ test_execution_collects_parity_summary() {
   jq -e '.comparison.parity_status == "parity_reproduced"' "$sample_dir/pwnkit-parity.json" >/dev/null
   jq -e '
     .run_kind == "pwnkit_stock_vs_patched_qualification_sample"
+    and .claim_posture == "scanner_qualification_only"
+    and .lane == "eidolon_owned_target"
+    and .defense_mode == "comparison"
+    and .substrate == "host_local"
+    and .substrate_counts == [{"substrate":"host_local","count":1}]
     and (.evidence_tracks | sort == ["local_patched_pwnkit", "upstream_current"])
     and .comparison.parity_status == "parity_reproduced"
     and (.artifacts | length == 2)
+    and (.artifacts[] | .lane == "eidolon_owned_target")
+    and (.artifacts[] | .substrate == "host_local")
     and .strict_stability.ready_for_stability_claim == true
   ' "$sample_dir/pwnkit-stability-sample.json" >/dev/null
 }

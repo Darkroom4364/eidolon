@@ -48,7 +48,10 @@ jq -e '.canonical_track == "local_patched_pwnkit"' "$PARITY_FILE" >/dev/null \
 jq -n \
   --slurpfile upstream "$UPSTREAM_SAMPLE" \
   --slurpfile local "$LOCAL_PATCHED_SAMPLE" \
-  --slurpfile parity "$PARITY_FILE" '
+  --slurpfile parity "$PARITY_FILE" \
+  --arg upstream_path "$UPSTREAM_SAMPLE" \
+  --arg local_path "$LOCAL_PATCHED_SAMPLE" \
+  --arg parity_path "$PARITY_FILE" '
   def count_values($values; $label):
     $values
     | map(select(. != null and . != ""))
@@ -56,15 +59,66 @@ jq -n \
     | group_by(.)
     | map({($label): .[0], count: length});
 
+  def normalize_substrate($runner_environment; $network_topology):
+    if $runner_environment == "host_mac" and $network_topology == "same_host_loopback" then
+      "host_local"
+    elif $runner_environment == "kali_vm" and $network_topology == "same_vm_loopback" then
+      "kali_vm_same_vm_loopback"
+    elif $runner_environment == "kali_vm" and $network_topology == "kali_vm_to_orbstack_nodeport" then
+      "kali_vm_orbstack_nodeport"
+    elif $runner_environment == "microvm_guest" then
+      "microvm_guest"
+    elif ($network_topology // "") != "" then
+      $network_topology
+    elif ($runner_environment // "") != "" then
+      $runner_environment
+    else
+      "unknown"
+    end;
+
   ($upstream[0]) as $upstream_sample
   | ($local[0]) as $local_sample
   | ($parity[0]) as $parity_sample
   | (($upstream_sample.evidence_tracks // []) + ($local_sample.evidence_tracks // [])) as $combined_tracks
   | ($combined_tracks | unique) as $unique_tracks
+  | ((($upstream_sample.runner_environments // []) + ($local_sample.runner_environments // [])) | unique) as $runner_environments
+  | ((($upstream_sample.runner_network_topologies // []) + ($local_sample.runner_network_topologies // [])) | unique) as $runner_network_topologies
+  | ([
+      ($upstream_sample.runner_environments // [])[] as $env
+      | ($upstream_sample.runner_network_topologies // [])[] as $topo
+      | normalize_substrate($env; $topo),
+      ($local_sample.runner_environments // [])[] as $env
+      | ($local_sample.runner_network_topologies // [])[] as $topo
+      | normalize_substrate($env; $topo)
+    ] | map(select(. != null and . != "")) | unique) as $substrates
   | {
       schema_version: 1,
       run_kind: "pwnkit_stock_vs_patched_qualification_sample",
       boundary: "scanner_qualification",
+      claim_posture: "scanner_qualification_only",
+      evaluation_lane_version: 1,
+      lane: "eidolon_owned_target",
+      benchmark_family: null,
+      defense_mode: "comparison",
+      substrate: (
+        if ($substrates | length) == 1 then
+          $substrates[0]
+        elif ($substrates | length) == 0 then
+          "unknown"
+        else
+          "mixed"
+        end
+      ),
+      artifact_identity: {
+        artifact_kind: "pwnkit_stock_vs_patched_qualification_sample",
+        upstream_sample_source: $upstream_path,
+        local_patched_sample_source: $local_path,
+        parity_source: $parity_path
+      },
+      budget: {
+        observed_sample_count: 2,
+        observed_valid_summary_count: 2
+      },
       generated_at: (now | todateiso8601),
       artifact_count: 2,
       valid_summary_count: 2,
@@ -110,14 +164,9 @@ jq -n \
       single_evidence_track: (($unique_tracks | length) == 1),
       mixed_evidence_tracks: (($unique_tracks | length) > 1),
       unknown_evidence_track_count: ($combined_tracks | map(select(. == "unknown")) | length),
-      runner_environments: (
-        (($upstream_sample.runner_environments // []) + ($local_sample.runner_environments // []))
-        | unique
-      ),
-      runner_network_topologies: (
-        (($upstream_sample.runner_network_topologies // []) + ($local_sample.runner_network_topologies // []))
-        | unique
-      ),
+      runner_environments: $runner_environments,
+      substrate_counts: count_values($substrates; "substrate"),
+      runner_network_topologies: $runner_network_topologies,
       tool_fingerprint_summary: (
         (($upstream_sample.tool_fingerprint_summary // []) + ($local_sample.tool_fingerprint_summary // []))
         | unique
@@ -167,8 +216,21 @@ jq -n \
       artifacts: [
         {
           artifact_id: "upstream-current",
+          lane: "eidolon_owned_target",
+          benchmark_family: null,
+          defense_mode: "comparison",
+          substrate: (
+            normalize_substrate(
+              (($upstream_sample.runner_environments // [null])[0]);
+              (($upstream_sample.runner_network_topologies // [null])[0])
+            )
+          ),
           parity_role: "candidate",
           evidence_track: "upstream_current",
+          artifact_identity: {
+            artifact_kind: "pwnkit_stock_vs_patched_track_summary",
+            sample_path: ($parity_sample.tracks.upstream_current.sample_path // null)
+          },
           sample_path: ($parity_sample.tracks.upstream_current.sample_path // null),
           runner_git_head: ($parity_sample.tracks.upstream_current.runner_git_head // null),
           runner_package_version: ($parity_sample.tracks.upstream_current.runner_package_version // null),
@@ -186,8 +248,21 @@ jq -n \
         },
         {
           artifact_id: "local-patched",
+          lane: "eidolon_owned_target",
+          benchmark_family: null,
+          defense_mode: "comparison",
+          substrate: (
+            normalize_substrate(
+              (($local_sample.runner_environments // [null])[0]);
+              (($local_sample.runner_network_topologies // [null])[0])
+            )
+          ),
           parity_role: "canonical",
           evidence_track: "local_patched_pwnkit",
+          artifact_identity: {
+            artifact_kind: "pwnkit_stock_vs_patched_track_summary",
+            sample_path: ($parity_sample.tracks.local_patched_pwnkit.sample_path // null)
+          },
           sample_path: ($parity_sample.tracks.local_patched_pwnkit.sample_path // null),
           runner_git_head: ($parity_sample.tracks.local_patched_pwnkit.runner_git_head // null),
           runner_package_version: ($parity_sample.tracks.local_patched_pwnkit.runner_package_version // null),

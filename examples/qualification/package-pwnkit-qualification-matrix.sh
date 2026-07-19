@@ -77,8 +77,15 @@ validate_summary() {
     .schema_version == 1
     and .run_kind == "pwnkit_qualification_matrix_summary"
     and .boundary == "scanner_qualification"
+    and (
+      (.claim_posture // "scanner_qualification_only") == "scanner_qualification_only"
+      or (.claim_posture // "scanner_qualification_only") == "benchmark_capability_only"
+      or (.claim_posture // "scanner_qualification_only") == "mixed_lane_contract"
+    )
     and (.variants | type == "array")
   ' "$SUMMARY_FILE" >/dev/null || fail "invalid qualification matrix summary: $SUMMARY_FILE"
+  jq -e '(.benchmark_contract.mixed_benchmark_and_nonbenchmark // false) == false' "$SUMMARY_FILE" >/dev/null \
+    || fail "mixed benchmark and non-benchmark lanes must not be packaged together"
 }
 
 copy_top_level_files() {
@@ -121,6 +128,9 @@ package_variants() {
           pwnkit_stock_vs_patched_qualification_sample)
             "$SCRIPT_DIR/package-pwnkit-stock-vs-patched-qualification-sample.sh" "$source_dir" "$dest_dir"
             ;;
+          pwnkit_benchmark_sample)
+            "$SCRIPT_DIR/package-pwnkit-benchmark-sample.sh" "$source_dir" "$dest_dir"
+            ;;
           *)
             fail "unsupported completed sample run_kind for $variant_id: $run_kind"
             ;;
@@ -156,7 +166,11 @@ package_variants() {
 
 write_readme() {
   local completed planned blocked missing positive_done negative_done transfer_done stock_done
+  local positive_result negative_result transfer_result stock_result lane_summary result_summary
+  local claim_posture benchmark_families benchmark_tasks qualification_status qualification_ready qualification_reasons
+  local manifest_sha256 comparison_scope rerun_lanes rerun_substrates rerun_defenses rerun_runners rerun_controls rerun_tracks rerun_fixtures
 
+  claim_posture="$(jq -r '.claim_posture // "scanner_qualification_only"' "$SUMMARY_FILE")"
   completed="$(jq -r '.completed_variant_count' "$SUMMARY_FILE")"
   planned="$(jq -r '.planned_variant_count' "$SUMMARY_FILE")"
   blocked="$(jq -r '.blocked_variant_count' "$SUMMARY_FILE")"
@@ -165,20 +179,70 @@ write_readme() {
   negative_done="$(jq -r '.acceptance_coverage.negative_control_completed' "$SUMMARY_FILE")"
   transfer_done="$(jq -r '.acceptance_coverage.transfer_control_completed' "$SUMMARY_FILE")"
   stock_done="$(jq -r '.acceptance_coverage.stock_vs_patched_completed' "$SUMMARY_FILE")"
+  positive_result="$(jq -r '.acceptance_results.positive_control' "$SUMMARY_FILE")"
+  negative_result="$(jq -r '.acceptance_results.negative_control' "$SUMMARY_FILE")"
+  transfer_result="$(jq -r '.acceptance_results.transfer_control' "$SUMMARY_FILE")"
+  stock_result="$(jq -r '.acceptance_results.stock_vs_patched' "$SUMMARY_FILE")"
+  lane_summary="$(jq -r '(.lane_counts // []) | map("\(.lane):\(.count)") | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  result_summary="$(jq -r '(.result_counts // []) | map("\(.result_class):\(.count)") | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  benchmark_families="$(jq -r '(.benchmark_contract.benchmark_families // []) | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  benchmark_tasks="$(jq -r '(.benchmark_contract.benchmark_task_ids // []) | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  qualification_status="$(jq -r '.qualification_contract.qualification_status // "unknown"' "$SUMMARY_FILE")"
+  qualification_ready="$(jq -r '.qualification_contract.ready_for_qualification_claim // false' "$SUMMARY_FILE")"
+  qualification_reasons="$(jq -r '(.qualification_contract.qualification_reasons // []) | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  manifest_sha256="$(jq -r '.rerun_identity.manifest_sha256 // "unknown"' "$SUMMARY_FILE")"
+  comparison_scope="$(jq -r '.rerun_identity.comparison_scope // "unknown"' "$SUMMARY_FILE")"
+  rerun_lanes="$(jq -r '(.rerun_identity.lane_set // []) | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  rerun_substrates="$(jq -r '(.rerun_identity.substrate_set // []) | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  rerun_defenses="$(jq -r '(.rerun_identity.defense_mode_set // []) | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  rerun_runners="$(jq -r '(.rerun_identity.runner_kind_set // []) | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  rerun_controls="$(jq -r '(.rerun_identity.control_kind_set // []) | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  rerun_tracks="$(jq -r '(.rerun_identity.evidence_track_set // []) | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
+  rerun_fixtures="$(jq -r '(.rerun_identity.fixture_id_set // []) | if length == 0 then "none" else join(", ") end' "$SUMMARY_FILE")"
 
   {
-    printf '# pwnkit Qualification Bundle\n\n'
-    printf 'scanner-qualification evidence bundle packaged from the independent `#174` track.\n\n'
+    if [[ "$claim_posture" == "benchmark_capability_only" ]]; then
+      printf '# pwnkit Benchmark Bundle\n\n'
+      printf 'benchmark-capability evidence bundle packaged from the independent `#174` track.\n\n'
+    else
+      printf '# pwnkit Qualification Bundle\n\n'
+      printf 'scanner-qualification evidence bundle packaged from the independent `#174` track.\n\n'
+    fi
     printf '## Scope\n\n'
     printf -- '- boundary: `scanner_qualification`\n'
+    printf -- '- claim posture: `%s`\n' "$claim_posture"
+    printf -- '- qualification status: `%s`\n' "$qualification_status"
+    printf -- '- ready for qualification claim: `%s`\n' "$qualification_ready"
+    printf -- '- qualification reasons: `%s`\n' "$qualification_reasons"
     printf -- '- completed variants: `%s`\n' "$completed"
     printf -- '- planned variants: `%s`\n' "$planned"
     printf -- '- blocked variants: `%s`\n' "$blocked"
     printf -- '- missing variants: `%s`\n' "$missing"
-    printf -- '- positive control completed: `%s`\n' "$positive_done"
-    printf -- '- negative control completed: `%s`\n' "$negative_done"
-    printf -- '- transfer control completed: `%s`\n' "$transfer_done"
-    printf -- '- stock-vs-patched completed: `%s`\n\n' "$stock_done"
+    if [[ "$claim_posture" == "benchmark_capability_only" ]]; then
+      printf -- '- benchmark families: `%s`\n' "$benchmark_families"
+      printf -- '- benchmark task ids: `%s`\n' "$benchmark_tasks"
+    else
+      printf -- '- positive control completed: `%s`\n' "$positive_done"
+      printf -- '- negative control completed: `%s`\n' "$negative_done"
+      printf -- '- transfer control completed: `%s`\n' "$transfer_done"
+      printf -- '- stock-vs-patched completed: `%s`\n' "$stock_done"
+      printf -- '- positive control result: `%s`\n' "$positive_result"
+      printf -- '- negative control result: `%s`\n' "$negative_result"
+      printf -- '- transfer control result: `%s`\n' "$transfer_result"
+      printf -- '- stock-vs-patched result: `%s`\n' "$stock_result"
+    fi
+    printf -- '- lane counts: `%s`\n' "$lane_summary"
+    printf -- '- result counts: `%s`\n\n' "$result_summary"
+    printf '## Rerun Identity\n\n'
+    printf -- '- manifest sha256: `%s`\n' "$manifest_sha256"
+    printf -- '- comparison scope: `%s`\n' "$comparison_scope"
+    printf -- '- lanes: `%s`\n' "$rerun_lanes"
+    printf -- '- substrates: `%s`\n' "$rerun_substrates"
+    printf -- '- defense modes: `%s`\n' "$rerun_defenses"
+    printf -- '- runner kinds: `%s`\n' "$rerun_runners"
+    printf -- '- control kinds: `%s`\n' "$rerun_controls"
+    printf -- '- evidence tracks: `%s`\n' "$rerun_tracks"
+    printf -- '- fixture ids: `%s`\n\n' "$rerun_fixtures"
     printf '## Contents\n\n'
     printf -- '- `qualification-report.md`: markdown review summary for the matrix.\n'
     printf -- '- `pwnkit-qualification-matrix.json`: collected machine-readable matrix summary.\n'

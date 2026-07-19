@@ -147,10 +147,12 @@ It records positive-control, transfer-control, direct-only negative-control,
 and stock-vs-patched comparison slots separately from M3. The negative-control
 path uses the dedicated simple owned target profile through
 `examples/qualification/run-pwnkit-direct-qualification-sample.sh`, the
-stock-vs-patched path compares one `upstream_current` local sample against the
-canonical `local_patched_pwnkit` sample through
-`examples/qualification/run-pwnkit-stock-vs-patched-qualification-sample.sh`,
-and the VM-backed Kali variants still flow through the existing wrappers. In
+default positive and transfer controls now use the `upstream_current`
+scanner track from the main `0sec-labs/pwnkit` checkout, and the
+stock-vs-patched path remains available only as an explicit historical
+comparison through
+`examples/qualification/run-pwnkit-stock-vs-patched-qualification-sample.sh`.
+The VM-backed Kali variants still flow through the existing wrappers. In
 dry-run mode the matrix also writes `vm-spool-plan.json` so those VM
 requirements stay explicit without pretending the repo already owns a real VM
 provisioner:
@@ -168,6 +170,11 @@ examples/qualification/package-pwnkit-qualification-matrix.sh \
   /tmp/eidolon-pwnkit-qualification \
   /tmp/eidolon-pwnkit-qualification-bundle
 ```
+
+The collected matrix summary now carries explicit `result_class`
+(`pass` / `fail` / `inconclusive`) plus lane, substrate, and defense-mode
+fields so scanner qualification claims stay separate from Eidolon defensive
+claims and reruns remain comparable.
 
 To exercise the direct-only negative-control sample by itself:
 

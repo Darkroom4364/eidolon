@@ -101,6 +101,10 @@ validate_spool_plan() {
     and (.vm_profiles | all(
       .vm_profile != null
       and (.vm_profile | type == "string")
+      and (.lane == null or (.lane | type == "string"))
+      and (.benchmark_family == null or (.benchmark_family | type == "string"))
+      and (.substrate == null or (.substrate | type == "string"))
+      and (.defense_mode == null or (.defense_mode | type == "string"))
       and .runner_kinds != null
       and (.runner_kinds | type == "array")
       and .control_kinds != null
@@ -447,6 +451,12 @@ main() {
       '($spool[0].vm_profiles[] | select(.vm_profile == $vm_profile)) as $profile
       | {
           vm_profile: $vm_profile,
+          claim_posture: "scanner_qualification_only",
+          evaluation_lane_version: 1,
+          lane: ($profile.lane // "unspecified"),
+          benchmark_family: ($profile.benchmark_family // null),
+          substrate: ($profile.substrate // $network_topology),
+          defense_mode: ($profile.defense_mode // "unspecified"),
           machine_name: $machine_name,
           distro: $distro,
           dry_run: $dry_run,
@@ -461,6 +471,12 @@ main() {
           runner_script: $runner_script,
           sample_dir: $sample_dir,
           host_prerequisite: $host_prerequisite,
+          artifact_identity: {
+            artifact_kind: "pwnkit_qualification_orbstack_vm_spool_profile",
+            vm_profile: $vm_profile,
+            machine_name: $machine_name,
+            sample_dir: $sample_dir
+          },
           host_repo_root: $host_repo_root,
           host_pwnkit_source_dir: $host_pwnkit_source_dir,
           helper_script: $helper_script,
@@ -478,6 +494,8 @@ main() {
       schema_version: 1,
       run_kind: "pwnkit_qualification_orbstack_vm_spool_manifest",
       boundary: "scanner_qualification",
+      claim_posture: "scanner_qualification_only",
+      evaluation_lane_version: 1,
       generated_at: (now | todateiso8601),
       spool_plan: $spool_plan,
       output_dir: $output_dir,

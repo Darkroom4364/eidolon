@@ -27,6 +27,9 @@ write_matrix_dir() {
       {
         variant_id: "kali_transfer",
         enabled: true,
+        lane: "kali_vm_transfer",
+        substrate: "kali_vm_orbstack_nodeport",
+        defense_mode: "comparison",
         control_kind: "transfer_control",
         hypothesis_id: "kali_transfer",
         hypothesis: "kali transfer control",
@@ -38,6 +41,9 @@ write_matrix_dir() {
       {
         variant_id: "disabled_variant",
         enabled: false,
+        lane: "kali_vm_transfer",
+        substrate: "kali_vm_same_vm_loopback",
+        defense_mode: "comparison",
         control_kind: "transfer_control",
         hypothesis_id: "disabled_variant",
         hypothesis: "disabled",
@@ -212,9 +218,17 @@ test_runner_spools_executes_collects_and_refreshes() {
 
   jq -e '
     .run_kind == "pwnkit_qualification_orbstack_vm_variant_run"
+    and .claim_posture == "scanner_qualification_only"
+    and .evaluation_lane_version == 1
     and .variant_id == "kali_transfer"
+    and .lane == "kali_vm_transfer"
+    and .substrate == "kali_vm_orbstack_nodeport"
+    and .defense_mode == "comparison"
     and .machine_name == "eidolon-qual-kali-orbstack"
     and .run_count == 2
+    and .budget.planned_run_count == 2
+    and .artifact_identity.artifact_kind == "pwnkit_qualification_orbstack_vm_variant_run"
+    and .artifact_identity.vm_profile == "kali_vm_to_orbstack_nodeport"
     and (.observability.watcher_script | endswith("/examples/qualification/watch-pwnkit-qualification-vm-run.sh"))
     and .observability.vm_sample_dir == "/tmp/eidolon-pwnkit-qualification-kali-orbstack"
   ' "$matrix_dir/kali_transfer/vm-run-manifest.json" >/dev/null

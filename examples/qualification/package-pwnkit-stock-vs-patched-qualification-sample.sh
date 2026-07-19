@@ -57,6 +57,18 @@ redact_parity_json() {
     def omitted_sample_path: "<sample-path-omitted>";
     .tracks.upstream_current.sample_path = omitted_sample_path
     | .tracks.local_patched_pwnkit.sample_path = omitted_sample_path
+    | .artifact_identity = (
+        if (.artifact_identity // null) == null then
+          null
+        else
+          (.artifact_identity
+            + {
+                upstream_sample_source: omitted_sample_path,
+                local_patched_sample_source: omitted_sample_path,
+                parity_source: "<parity-source-omitted>"
+              })
+        end
+      )
     | .redaction = {
         sample_paths_omitted: true
       }
@@ -71,12 +83,33 @@ redact_sample_summary() {
     def omitted_sample_path: "<sample-path-omitted>";
     .tracks.upstream_current.sample_path = omitted_sample_path
     | .tracks.local_patched_pwnkit.sample_path = omitted_sample_path
+    | .artifact_identity = (
+        if (.artifact_identity // null) == null then
+          null
+        else
+          (.artifact_identity
+            + {
+                upstream_sample_source: omitted_sample_path,
+                local_patched_sample_source: omitted_sample_path,
+                parity_source: "<parity-source-omitted>"
+              })
+        end
+      )
     | .artifacts |= [
         .[] |
         if (.sample_path // null) == null then
           .
         else
-          . + {sample_path: omitted_sample_path}
+          . + {
+            sample_path: omitted_sample_path,
+            artifact_identity: (
+              if (.artifact_identity // null) == null then
+                null
+              else
+                (.artifact_identity + {sample_path: omitted_sample_path})
+              end
+            )
+          }
         end
       ]
     | .redaction = {
@@ -92,6 +125,7 @@ write_readme() {
   {
     printf '# pwnkit Stock-vs-Patched Qualification Sample\n\n'
     printf 'scanner-qualification stock-vs-patched comparison bundle.\n\n'
+    printf 'lane: `eidolon_owned_target`; defense: `comparison`.\n\n'
     printf '## Contents\n\n'
     printf -- '- `pwnkit-stability-sample.json`: top-level stock-vs-patched qualification summary.\n'
     printf -- '- `pwnkit-parity.json`: redacted parity comparison between the upstream-current and canonical local-patched tracks.\n'

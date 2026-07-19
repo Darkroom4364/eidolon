@@ -17,6 +17,20 @@ write_sample() {
   "schema_version": 1,
   "run_kind": "pwnkit_direct_qualification_sample",
   "boundary": "scanner_qualification",
+  "claim_posture": "scanner_qualification_only",
+  "evaluation_lane_version": 1,
+  "lane": "eidolon_owned_target",
+  "benchmark_family": null,
+  "defense_mode": "none",
+  "substrate": "host_local",
+  "artifact_identity": {
+    "artifact_kind": "pwnkit_direct_qualification_sample",
+    "source_artifact_count": 1
+  },
+  "budget": {
+    "observed_artifact_count": 1,
+    "observed_valid_summary_count": 1
+  },
   "generated_at": "2026-06-29T00:00:00Z",
   "artifact_count": 1,
   "valid_summary_count": 1,
@@ -44,6 +58,9 @@ write_sample() {
   "mixed_evidence_tracks": false,
   "unknown_evidence_track_count": 0,
   "runner_environments": ["host_mac"],
+  "substrate_counts": [
+    {"substrate": "host_local", "count": 1}
+  ],
   "runner_network_topologies": ["same_host_loopback"],
   "tool_fingerprint_summary": [],
   "source_checkout": {
@@ -80,6 +97,14 @@ write_sample() {
     {
       "artifact_dir": "/private/tmp/direct-source",
       "present": true,
+      "lane": "eidolon_owned_target",
+      "benchmark_family": null,
+      "defense_mode": "none",
+      "substrate": "host_local",
+      "artifact_identity": {
+        "artifact_kind": "pwnkit_direct_qualification_run",
+        "artifact_dir": "/private/tmp/direct-source"
+      },
       "evidence_track": "local_patched_pwnkit",
       "runner_git_head": "fixture-head",
       "runner_package_version": "fixture-version",
@@ -179,7 +204,15 @@ test_packager_creates_bundle() {
   [[ -f "$bundle_dir/run-1/pwnkit-summary.redacted.json" ]]
   [[ -f "$bundle_dir/SHA256SUMS" ]]
   rg -q 'scanner-qualification direct-only negative-control bundle' "$bundle_dir/README.md"
+  rg -q 'lane: `eidolon_owned_target`; defense: `none`.' "$bundle_dir/README.md"
   rg -q '<source-artifact-path-omitted>' "$bundle_dir/pwnkit-stability-sample.json"
+  jq -e '
+    .lane == "eidolon_owned_target"
+    and .defense_mode == "none"
+    and .substrate == "host_local"
+    and .artifact_identity.artifact_kind == "pwnkit_direct_qualification_sample"
+    and .artifacts[0].artifact_identity.artifact_dir == "<source-artifact-path-omitted>"
+  ' "$bundle_dir/pwnkit-stability-sample.json" >/dev/null
 }
 
 test_packager_creates_bundle

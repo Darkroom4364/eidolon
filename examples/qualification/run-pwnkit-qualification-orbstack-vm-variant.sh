@@ -130,6 +130,10 @@ load_variant_metadata() {
   VARIANT_ENABLED="$(jq -r 'if has("enabled") then .enabled else true end' <<<"$VARIANT_META")"
   [[ "$VARIANT_ENABLED" == "true" ]] || fail "variant is disabled or blocked: $VARIANT_ID"
 
+  VARIANT_LANE="$(jq -r '.lane // "unspecified"' <<<"$VARIANT_META")"
+  VARIANT_BENCHMARK_FAMILY="$(jq -r '.benchmark_family // empty' <<<"$VARIANT_META")"
+  VARIANT_SUBSTRATE="$(jq -r '.substrate // "unspecified"' <<<"$VARIANT_META")"
+  VARIANT_DEFENSE_MODE="$(jq -r '.defense_mode // "unspecified"' <<<"$VARIANT_META")"
   VARIANT_RUNNER_KIND="$(jq -r '.runner_kind' <<<"$VARIANT_META")"
   VARIANT_VM_PROFILE="$(jq -r '.vm_profile // empty' <<<"$VARIANT_META")"
   VARIANT_RUN_COUNT="$(jq -r '.run_count // 1' <<<"$VARIANT_META")"
@@ -205,6 +209,10 @@ write_vm_run_manifest() {
     --arg machine_name "$MACHINE_NAME" \
     --arg vm_profile "$VARIANT_VM_PROFILE" \
     --arg runner_kind "$VARIANT_RUNNER_KIND" \
+    --arg lane "$VARIANT_LANE" \
+    --arg benchmark_family "$VARIANT_BENCHMARK_FAMILY" \
+    --arg substrate "$VARIANT_SUBSTRATE" \
+    --arg defense_mode "$VARIANT_DEFENSE_MODE" \
     --arg run_count "$VARIANT_RUN_COUNT" \
     --arg vm_sample_dir "$VM_SAMPLE_DIR" \
     --arg host_bundle_dir "$HOST_BUNDLE_DIR" \
@@ -214,8 +222,24 @@ write_vm_run_manifest() {
       schema_version: 1,
       run_kind: "pwnkit_qualification_orbstack_vm_variant_run",
       boundary: "scanner_qualification",
+      claim_posture: "scanner_qualification_only",
+      evaluation_lane_version: 1,
       generated_at: (now | todateiso8601),
       variant_id: $variant_id,
+      lane: $lane,
+      benchmark_family: (if $benchmark_family == "" then null else $benchmark_family end),
+      substrate: $substrate,
+      defense_mode: $defense_mode,
+      artifact_identity: {
+        artifact_kind: "pwnkit_qualification_orbstack_vm_variant_run",
+        variant_id: $variant_id,
+        vm_profile: $vm_profile,
+        machine_name: $machine_name,
+        vm_sample_dir: $vm_sample_dir
+      },
+      budget: {
+        planned_run_count: ($run_count | tonumber)
+      },
       matrix_dir: $matrix_dir,
       spool_manifest: $spool_manifest,
       helper_script: $helper_script,

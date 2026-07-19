@@ -58,6 +58,14 @@ redact_sample_summary() {
       schema_version,
       run_kind,
       boundary,
+      claim_posture,
+      evaluation_lane_version,
+      lane,
+      benchmark_family,
+      defense_mode,
+      substrate,
+      artifact_identity,
+      budget,
       generated_at,
       artifact_count,
       valid_summary_count,
@@ -75,6 +83,7 @@ redact_sample_summary() {
       mixed_evidence_tracks,
       unknown_evidence_track_count,
       runner_environments,
+      substrate_counts,
       runner_network_topologies,
       tool_fingerprint_summary,
       source_checkout,
@@ -88,6 +97,17 @@ redact_sample_summary() {
           artifact_dir: omitted_source_path,
           present,
           missing_reason,
+          lane,
+          benchmark_family,
+          defense_mode,
+          substrate,
+          artifact_identity: (
+            if (.artifact_identity // null) == null then
+              null
+            else
+              (.artifact_identity + {artifact_dir: omitted_source_path})
+            end
+          ),
           evidence_track,
           runner_git_head,
           runner_package_version,
@@ -203,6 +223,7 @@ write_readme() {
   {
     printf '# pwnkit Direct Qualification Sample\n\n'
     printf 'scanner-qualification direct-only negative-control bundle.\n\n'
+    printf 'lane: `eidolon_owned_target`; defense: `none`.\n\n'
     printf '## Contents\n\n'
     printf -- '- `pwnkit-stability-sample.json`: aggregate direct-only qualification summary.\n'
     printf -- '- `run-*/pwnkit-summary.redacted.json`: redacted per-run direct scan summaries.\n'
