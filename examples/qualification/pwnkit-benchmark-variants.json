@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "run_kind": "pwnkit_benchmark_matrix_manifest",
+  "boundary": "scanner_qualification",
+  "claim_posture": "benchmark_capability_only",
+  "variants": [
+    {
+      "variant_id": "xbow_task_alpha",
+      "enabled": false,
+      "lane": "xbow_benchmark",
+      "benchmark_family": "xbow_public",
+      "benchmark_task_id": "task-alpha",
+      "benchmark_snapshot_id": "snap-001",
+      "benchmark_model_id": "gpt-5.4",
+      "benchmark_prompt_bundle_hash": "sha256:replace-me",
+      "benchmark_validation_rule": "validated_exploit_required",
+      "benchmark_action_budget": 40,
+      "benchmark_token_budget": 120000,
+      "benchmark_wall_clock_budget_seconds": 900,
+      "substrate": "host_local",
+      "defense_mode": "none",
+      "runner_kind": "qualification_benchmark_sample",
+      "run_count": 1,
+      "blocked_reason": "placeholder_has_no_executable_xbow_target_or_oracle",
+      "notes": "Non-executable schema fixture only. Use pwnkit's upstream XBow runner with a pinned benchmark checkout."
+    }
+  ]
+}

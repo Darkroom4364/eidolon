@@ -191,6 +191,118 @@ examples/qualification/package-pwnkit-stock-vs-patched-qualification-sample.sh \
   /tmp/eidolon-pwnkit-stock-compare-bundle
 ```
 
+Use that comparison path only when you deliberately need to compare the new
+`upstream_current` baseline against older `local_patched_pwnkit` artifacts.
+
+To exercise a benchmark-capability sample without blending it into scanner
+qualification or Eidolon defensive claims:
+
+```sh
+EIDOLON_PWNKIT_BENCHMARK_FAMILY=xbow_public \
+EIDOLON_PWNKIT_BENCHMARK_TASK_ID=task-alpha \
+EIDOLON_PWNKIT_BENCHMARK_SNAPSHOT_ID=snap-001 \
+EIDOLON_PWNKIT_BENCHMARK_VALIDATION_RULE=validated_exploit_required \
+examples/qualification/run-pwnkit-benchmark-sample.sh \
+  1 \
+  /tmp/eidolon-pwnkit-benchmark
+examples/qualification/package-pwnkit-benchmark-sample.sh \
+  /tmp/eidolon-pwnkit-benchmark \
+  /tmp/eidolon-pwnkit-benchmark-bundle
+```
+
+To run a benchmark-only matrix for multiple XBow-style tasks and emit a
+benchmark scoreboard:
+
+```sh
+examples/qualification/run-pwnkit-benchmark-matrix.sh \
+  examples/qualification/pwnkit-benchmark-variants.json \
+  /tmp/eidolon-pwnkit-benchmark-matrix
+examples/qualification/report-pwnkit-benchmark-matrix.sh \
+  /tmp/eidolon-pwnkit-benchmark-matrix
+examples/qualification/package-pwnkit-benchmark-matrix.sh \
+  /tmp/eidolon-pwnkit-benchmark-matrix \
+  /tmp/eidolon-pwnkit-benchmark-matrix-bundle
+```
+
+The benchmark matrix stays benchmark-only. It records validated / invalidated /
+inconclusive task outcomes plus task identity, snapshot identity, budgets, and
+rerun-comparability fields without turning those results into Eidolon defensive
+claims.
+
+Both the benchmark sample wrapper and the sample packager now fail closed on a
+dedicated benchmark-sample contract check, so missing benchmark identity or
+claim-unsafe raw evidence-track shape is rejected before packaging or matrix
+comparison.
+
+To convert a benchmark task export into the benchmark-matrix manifest:
+
+```sh
+examples/qualification/import-pwnkit-benchmark-tasks.sh \
+  /tmp/xbow-tasks.jsonl \
+  /tmp/eidolon-pwnkit-benchmark-variants.json
+```
+
+The importer accepts either a JSON array or JSONL task stream and maps
+benchmark task identity into the dedicated `pwnkit_benchmark_matrix_manifest`
+contract.
+
+The importer now fails closed on a dedicated task-export contract check, so
+duplicate benchmark task ids, variant-id collisions after normalization, and
+non-positive benchmark budgets are rejected before manifest generation.
+
+To preflight an external benchmark task export before import, emit the task-set
+summary directly:
+
+```sh
+examples/qualification/report-pwnkit-benchmark-task-export.sh \
+  /tmp/xbow-tasks.jsonl
+```
+
+For the benchmark-provider contract and handoff expectations, see
+[`../docs/xbow-benchmark-handoff.md`](../docs/xbow-benchmark-handoff.md).
+For the first real imported run procedure, see
+[`../docs/xbow-first-run-checklist.md`](../docs/xbow-first-run-checklist.md).
+
+The repo also carries a sample task export so the full import -> run -> package
+path can be exercised without hand-authoring a manifest:
+
+```sh
+examples/qualification/import-pwnkit-benchmark-tasks.sh \
+  examples/qualification/pwnkit-benchmark-tasks.sample.jsonl \
+  /tmp/eidolon-pwnkit-benchmark-imported.json
+examples/qualification/run-pwnkit-benchmark-matrix.sh \
+  /tmp/eidolon-pwnkit-benchmark-imported.json \
+  /tmp/eidolon-pwnkit-benchmark-imported-run
+examples/qualification/package-pwnkit-benchmark-matrix.sh \
+  /tmp/eidolon-pwnkit-benchmark-imported-run \
+  /tmp/eidolon-pwnkit-benchmark-imported-bundle
+```
+
+Imported manifests now retain task-export sha256, format, and imported-task
+count so later benchmark reports and bundles can show which external task
+export produced the run.
+
+To run the full external-task workflow in one benchmark-only path:
+
+```sh
+examples/qualification/run-pwnkit-benchmark-imported-matrix.sh \
+  /tmp/xbow-tasks.jsonl \
+  /tmp/eidolon-pwnkit-benchmark-imported
+```
+
+To compare two benchmark matrices and check whether the score delta is actually
+comparable:
+
+```sh
+examples/qualification/compare-pwnkit-benchmark-matrices.sh \
+  /tmp/eidolon-pwnkit-benchmark-matrix-a \
+  /tmp/eidolon-pwnkit-benchmark-matrix-b
+```
+
+The comparer treats prompt-bundle, validation-rule, and benchmark-budget
+mismatches as non-comparable so XBow-style score changes do not get credited to
+scanner differences when the task contract changed.
+
 The initial matrix reuses existing runners:
 
 - `examples/m3/run-pwnkit-sample.sh`
