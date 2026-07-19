@@ -53,7 +53,8 @@ Environment:
                          session-minted bait surfaces in `edge-session-index.md`.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME
                           Keep only sessions whose latest exported minted bait
-                          outcome matches `matched_session_value` or
+                          outcome matches `matched_session_value`,
+                          `expired_session_value`, `replay_seen`, or
                           `session_value_mismatch`.
   EIDOLON_SHIELD_EDGE_SESSION_INDEX_AUTHENTICATED_RULE_REJECTION_LABEL
                          Keep only sessions whose latest authenticated
@@ -243,6 +244,23 @@ render_edge_session_index() {
             unobserved_bait_ids: ($active_ids | map(. as $bait_id | select($observed_active_ids | index($bait_id) == null)))
           }
       end;
+    def minted_outcome_summary_inline($summary):
+      [
+        (if ($summary.matched_session_value // 0) > 0 then
+          code("matched_session_value") + " " + code($summary.matched_session_value)
+        else empty end),
+        (if ($summary.expired_session_value // 0) > 0 then
+          code("expired_session_value") + " " + code($summary.expired_session_value)
+        else empty end),
+        (if ($summary.replay_seen // 0) > 0 then
+          code("replay_seen") + " " + code($summary.replay_seen)
+        else empty end),
+        (if ($summary.session_value_mismatch // 0) > 0 then
+          code("session_value_mismatch") + " " + code($summary.session_value_mismatch)
+        else empty end)
+      ]
+      | map(select(. != ""))
+      | if length == 0 then code("none") else join(", ") end;
     def trusted_soften_summary($match):
       if $match == null then
         code("none")
@@ -547,14 +565,15 @@ render_edge_session_index() {
           end
         ),
         "",
-        "| Session | Observed | Request | Policy | Action | Authenticated Rule Rejection | Local Trust Rejection | Trusted Soften Context | Minted Evidence | Latest Mint Outcome | Minted Coverage | Reason Codes |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Session | Observed | Request | Policy | Action | Authenticated Rule Rejection | Local Trust Rejection | Trusted Soften Context | Minted Evidence | Minted Outcome Summary | Latest Mint Outcome | Minted Coverage | Reason Codes |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         (
           $shown
           | to_entries[]
           | .value as $value
           | ($value.deployment_context // {}) as $deployment
           | ($value.evidence.bait_header_value_mints // []) as $mint_audits
+          | ($value.evidence.bait_header_value_mint_outcome_summary // {}) as $mint_outcome_summary
           | ($value.evidence.latest_bait_header_value_mint // null) as $latest_mint
           | ($value.evidence.authenticated_ingress_rule_rejection_histories // [])
             as $authenticated_rule_rejection_histories
@@ -597,6 +616,8 @@ render_edge_session_index() {
                    | join(", "))
                 end
               )
+            + " | "
+            + minted_outcome_summary_inline($mint_outcome_summary)
             + " | "
             + (
                 if $latest_mint == null then
@@ -945,6 +966,23 @@ render_selected_session_summary() {
         optional_line("detection_score"; ($score.detection_score // 0 | if . > 0 then code(.) else empty end))
       ]
       | map(select(. != ""));
+    def minted_outcome_summary_line($summary):
+      [
+        (if ($summary.matched_session_value // 0) > 0 then
+          code("matched_session_value") + " " + code($summary.matched_session_value)
+        else empty end),
+        (if ($summary.expired_session_value // 0) > 0 then
+          code("expired_session_value") + " " + code($summary.expired_session_value)
+        else empty end),
+        (if ($summary.replay_seen // 0) > 0 then
+          code("replay_seen") + " " + code($summary.replay_seen)
+        else empty end),
+        (if ($summary.session_value_mismatch // 0) > 0 then
+          code("session_value_mismatch") + " " + code($summary.session_value_mismatch)
+        else empty end)
+      ]
+      | map(select(. != ""))
+      | if length == 0 then empty else join(", ") end;
     (if type == "array" then .[0] else . end) as $export
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
@@ -953,6 +991,7 @@ render_selected_session_summary() {
     | ($export.local_ingress_trust_scope_rejection // null) as $local_trust_rejection
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
+    | ($export.evidence.bait_header_value_mint_outcome_summary // {}) as $mint_outcome_summary
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
     | ($export.evidence.authenticated_ingress_rule_rejection_histories // [])
       as $authenticated_rule_rejection_histories
@@ -1237,6 +1276,7 @@ render_selected_session_summary() {
             + code(.kind)
             + "]"
         ),
+        optional_line("Minted proof outcomes"; minted_outcome_summary_line($mint_outcome_summary)),
         optional_line("Latest minted outcome"; (
           if $latest_mint != null then
             code($latest_mint.status)
@@ -1650,10 +1690,10 @@ fi
 
 if [[ -n "$SESSION_INDEX_LATEST_MINT_OUTCOME" ]]; then
   case "$SESSION_INDEX_LATEST_MINT_OUTCOME" in
-    matched_session_value|session_value_mismatch)
+    matched_session_value|expired_session_value|replay_seen|session_value_mismatch)
       ;;
     *)
-      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME must be matched_session_value or session_value_mismatch"
+      fail "EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME must be matched_session_value, expired_session_value, replay_seen, or session_value_mismatch"
       ;;
   esac
 fi

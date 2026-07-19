@@ -59,7 +59,7 @@ JSON
     ;;
   "-n shield-system get configmap eidolon-shield-bait-profile -o json")
     cat <<'JSON'
-{"metadata":{"name":"eidolon-shield-bait-profile"},"data":{"bait-profile.json":"{\"profile_id\":\"orbstack_default_m3_catalog\",\"baits\":[{\"id\":\"rel_2025_04_b7f2\",\"surface\":\"/docs/legacy-import\",\"surface_kind\":\"docs\",\"expected_action\":{\"header_name\":\"X-Migration-Trace\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"mig\"}}},{\"id\":\"openapi_reconcile_trace\",\"surface\":\"/openapi.json\",\"surface_kind\":\"open_api\",\"expected_action\":{\"header_name\":\"X-OpenAPI-Trace\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"oapi\"}}},{\"id\":\"fake_service_token\",\"surface\":\"/docs/service-token\",\"surface_kind\":\"token\",\"expected_action\":{\"header_name\":\"X-Api-Key\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"svc\"}}}]}"}}
+{"metadata":{"name":"eidolon-shield-bait-profile"},"data":{"bait-profile.json":"{\"profile_id\":\"orbstack_default_m3_catalog\",\"baits\":[{\"id\":\"rel_2025_04_b7f2\",\"surface\":\"/docs/legacy-import\",\"surface_kind\":\"docs\",\"expected_action\":{\"header_name\":\"X-Migration-Trace\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"mig\",\"proof_window_seconds\":60}}},{\"id\":\"openapi_reconcile_trace\",\"surface\":\"/openapi.json\",\"surface_kind\":\"open_api\",\"expected_action\":{\"header_name\":\"X-OpenAPI-Trace\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"oapi\",\"proof_window_seconds\":60}}},{\"id\":\"fake_service_token\",\"surface\":\"/docs/service-token\",\"surface_kind\":\"token\",\"expected_action\":{\"header_name\":\"X-Api-Key\",\"header_value_mint\":{\"kind\":\"session_hmac_sha256_v1\",\"prefix\":\"svc\",\"proof_window_seconds\":60}}}]}"}}
 JSON
     ;;
   "-n shield-system get configmap eidolon-shield-ingress-trust-config -o json")
@@ -114,10 +114,13 @@ test_json_status_reports_edge_and_pvc() {
       and (.bait_profile.polymorphic_baits | length) == 3
       and .bait_profile.polymorphic_baits[0].bait_id == "rel_2025_04_b7f2"
       and .bait_profile.polymorphic_baits[0].prefix == "mig"
+      and .bait_profile.polymorphic_baits[0].proof_window_seconds == 60
       and .bait_profile.polymorphic_baits[1].bait_id == "openapi_reconcile_trace"
       and .bait_profile.polymorphic_baits[1].prefix == "oapi"
+      and .bait_profile.polymorphic_baits[1].proof_window_seconds == 60
       and .bait_profile.polymorphic_baits[2].bait_id == "fake_service_token"
       and .bait_profile.polymorphic_baits[2].prefix == "svc"
+      and .bait_profile.polymorphic_baits[2].proof_window_seconds == 60
       and .ingress_trust.configmap_name == "eidolon-shield-ingress-trust-config"
       and (.ingress_trust.trusted_soften_scopes | length) == 1
       and .ingress_trust.trusted_soften_scopes[0].label == "docs-crawler"
@@ -153,7 +156,7 @@ test_human_status_mentions_running_components() {
   rg -q 'trusted-ingress: transport-auth enabled' <<<"$output"
   rg -q 'trusted-soften-scopes: docs-crawler -> /docs \(match /docs, /openapi.json; methods GET; ua eidolon-docs-crawler; host 127.0.0.1, localhost; source 192.168.194.1/32; headers X-Eidolon-Trusted-Actor; expires 2999-06-05T12:00:00Z\)' <<<"$output"
   rg -q 'bait-signing: enabled' <<<"$output"
-  rg -q 'polymorphic-baits: /docs/legacy-import -> X-Migration-Trace \[mig\], /openapi.json -> X-OpenAPI-Trace \[oapi\], /docs/service-token -> X-Api-Key \[svc\]' <<<"$output"
+  rg -q 'polymorphic-baits: /docs/legacy-import -> X-Migration-Trace \[mig, 60s\], /openapi.json -> X-OpenAPI-Trace \[oapi, 60s\], /docs/service-token -> X-Api-Key \[svc, 60s\]' <<<"$output"
   rg -q 'target: 2/2 ready' <<<"$output"
   rg -q 'proxy-state: Bound 1Gi \(local-path\)' <<<"$output"
 }

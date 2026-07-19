@@ -245,7 +245,7 @@ jq -e \
     and ((.kind.reason // "") | contains("detection_score=2"))
     and ((.kind.reason // "") | contains("recon_score=5"))
     and ((.kind.reason // "") | contains("recon_rate_limit_threshold=5"))
-    and ((.kind.reason // "") | contains("persistence_class=discovery_recon"))
+    and .kind.persistence.pre_containment_persistence_class == "discovery_recon"
   ' <<<"$policy_changed_json" >/dev/null \
   || fail "session ${session_id} rate-limited transition reason did not preserve the expected weighted detection-backed recon facts"
 

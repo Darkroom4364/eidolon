@@ -258,8 +258,7 @@ jq -e \
   || fail "session ${session_id} blocked transition reason did not match the depth-limit persistence path"
 
 jq -e '
-  (.kind.reason // "")
-  | contains("post_containment_persistence_kind=controlled_reality_depth_limit")
+  .kind.persistence.post_containment_persistence_kind == "controlled_reality_depth_limit"
 ' <<<"$blocked_transition_json" >/dev/null \
   || fail "session ${session_id} blocked transition reason did not preserve the structured depth-limit persistence marker"
 

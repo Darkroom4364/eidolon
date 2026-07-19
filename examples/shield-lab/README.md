@@ -71,6 +71,8 @@ Keep out of the private repo:
   smoke-suspicious-linked-bait-aggregation-orbstack.sh
   smoke-suspicious-hidden-route-aggregation-orbstack.sh
   smoke-suspicious-js-helper-aggregation-orbstack.sh
+  smoke-hidden-route-controlled-reality-orbstack.sh
+  smoke-js-helper-controlled-reality-orbstack.sh
   smoke-suspicious-linked-fanout-aggregation-orbstack.sh
   smoke-suspicious-openapi-linked-fanout-aggregation-orbstack.sh
   smoke-suspicious-openapi-orbstack.sh
@@ -271,8 +273,11 @@ Validate those ingress-side runtime paths directly on the live OrbStack shield:
 ```sh
 examples/shield-lab/smoke-trusted-ingress-orbstack.sh
 examples/shield-lab/smoke-session-minted-legacy-import-orbstack.sh
+examples/shield-lab/smoke-session-minted-expired-legacy-import-orbstack.sh
 examples/shield-lab/smoke-session-minted-service-token-orbstack.sh
+examples/shield-lab/smoke-session-minted-expired-service-token-orbstack.sh
 examples/shield-lab/smoke-session-minted-openapi-orbstack.sh
+examples/shield-lab/smoke-session-minted-expired-openapi-orbstack.sh
 examples/shield-lab/smoke-suspicious-promotion-orbstack.sh
 examples/shield-lab/smoke-suspicious-aggregated-recon-orbstack.sh
 examples/shield-lab/smoke-suspicious-decoy-write-aggregation-orbstack.sh
@@ -310,6 +315,13 @@ itself. Edge export now also records whether the latest minted legacy-import
 bait-shaped action carried a `matched_session_value` or a
 `session_value_mismatch`.
 
+The expired legacy-import smoke proves the negative side of that same docs-path
+proof contract: once an already-exposed `/docs/legacy-import` minted value ages
+past its proof window, replaying it on `/api/v2/import/reconcile` still records
+`bait_action_observed` with `expired_session_value`, stays on the normal
+`protected_upstream` path instead of entering controlled reality, and exports
+only the safe mint metadata plus the expiry outcome.
+
 The service-token smoke proves the token-side default-lab polymorphic bait
 slice: the `/docs/service-token` surface now mints a distinct `X-Api-Key`
 value per session, the same session sees a stable value across repeated
@@ -318,6 +330,13 @@ stays uncorrelated and falls back to upstream behavior, and the exact action
 export preserves only safe mint metadata, not the value itself. Edge export now
 also records whether the latest minted bait-shaped action carried a
 `matched_session_value` or a `session_value_mismatch`.
+
+The expired service-token smoke proves the negative side of that same minted
+proof contract: once an already-exposed `/docs/service-token` value ages past
+its proof window, replaying it on `/api/v2/import/reconcile` still records
+`bait_action_observed` with `expired_session_value`, stays on the normal
+`protected_upstream` path instead of entering controlled reality, and exports
+only the safe mint metadata plus the expiry outcome.
 
 The OpenAPI mint smoke proves the discovery-side default-lab polymorphic
 slice: the owned `/openapi.json` surface now mints a distinct
@@ -329,10 +348,29 @@ value itself. Edge export now also records whether the latest minted OpenAPI
 bait-shaped action carried a `matched_session_value` or a
 `session_value_mismatch`.
 
-The remaining hidden-route and JS-helper bait classes stay static on purpose as
-negative controls. They keep fixed header values across sessions even when bait
-signing is enabled, so the lab can still separate “session-minted polymorphism”
-from “ordinary static bait” during evaluation.
+The expired OpenAPI smoke proves the negative side of the discovery-path proof
+contract too: once an already-exposed `/openapi.json` minted example ages past
+its proof window, replaying it on `/api/v2/import/reconcile` still records
+`bait_action_observed` with `expired_session_value`, stays on the normal
+`protected_upstream` path instead of entering controlled reality, and exports
+only the safe mint metadata plus the expiry outcome.
+
+The JS-helper controlled-reality smoke proves a broader, non-OpenAPI bait
+action path: the owned `/assets/import-helper.js` surface exposes a static
+helper manifest, the same session replays the instructed `X-Import-Worker`
+header on `/api/v2/import/reconcile`, and the runtime records correlated
+`bait_action_observed` evidence plus a controlled-reality export without any
+mint-specific audit fields. That gives the lab one committed same-session
+action proof outside the docs/service-token/OpenAPI mint family.
+
+The hidden-route controlled-reality smoke proves the same broader shape for a
+docs-adjacent static route: the owned `/customer/import-recovery-checklist`
+surface exposes a static `X-Hidden-Route-Trace` instruction, the same session
+replays that header on `/api/v2/import/reconcile`, and the runtime again
+records correlated `bait_action_observed` evidence plus a controlled-reality
+export without any mint-specific audit fields. Hidden-route and JS-helper now
+serve as static-bait counterparts to the minted docs/service-token/OpenAPI
+family rather than only as passive negative controls.
 
 The suspicious-promotion smoke proves the first M5 graduated-enforcement slice: one
 authenticated advisory discovery request is promoted from `observe` to
@@ -385,8 +423,8 @@ advisory-assisted contributor carries through the next pre-containment rung
 too: after one same-session top-level `/docs` follow-up has already moved the
 session into `rate_limited`, a repeated `/docs` retry now moves it into
 `blocked`, while edge export preserves the authenticated detection IDs plus the
-structured `pre_containment_persistence_class=discovery_recon` and
-`pre_containment_persistence_kind=discovery_recon_retry` fields.
+structured `pre_containment_persistence_class: discovery_recon` and
+`pre_containment_persistence_kind: discovery_recon_retry` policy fields.
 
 An adjacent OpenAPI aggregation smoke proves the first target-side-only
 aggregated `observe -> suspicious` path: one medium-score
@@ -831,18 +869,23 @@ configured, the same deployment and session-level trusted soften context now
 also includes `user_agent_substrings`, `hosts`, and `source_cidrs`, so
 operators can distinguish path-only allowlisting from agent-family, host-bound,
 or network-bound allowlisting in both live and offline review.
-When
-`evidence.latest_bait_header_value_mint` is present, the markdown summaries now
-also show whether the latest minted bait-shaped action was a
-`matched_session_value` or `session_value_mismatch`.
+When minted bait evidence is present, the markdown summaries now also show a
+session-level `evidence.bait_header_value_mint_outcome_summary` count view for
+`matched_session_value`, `expired_session_value`, `replay_seen`, and
+`session_value_mismatch`. When
+`evidence.latest_bait_header_value_mint` is present, the summaries still keep
+the latest request-scoped minted outcome alongside that aggregate view.
 
 `--top <N>` ranks sessions by enforcement severity and recency first, so
 operators can pull a compact high-signal slice before exporting a full bundle.
 `--min-polymorphic-coverage <N>` narrows that set further to sessions that
 observed at least `N` active session-minted bait surfaces. `--latest-mint-outcome
-<matched_session_value|session_value_mismatch>` narrows the export to sessions
-whose latest minted bait-shaped action either matched the same session or
-mismatched, which is useful for replay triage. `--trusted-soften-label <label>`
+<matched_session_value|expired_session_value|replay_seen|session_value_mismatch>`
+narrows the export to sessions by the latest request-scoped minted outcome
+only. Use that when you want to isolate the most recent minted proof result on
+the exported request; use `evidence.bait_header_value_mint_outcome_summary`
+when you want the full session-level count view across matched, expired,
+replayed, and mismatched minted actions. `--trusted-soften-label <label>`
 narrows the export to sessions that actually matched one local trusted soften
 scope, and `--trusted-soften-path-softened <true|false>` splits those sessions
 into requests that were or were not inside that narrower bait-soften subset.
@@ -885,7 +928,7 @@ EIDOLON_SHIELD_EDGE_SESSION_INDEX_MIN_POLYMORPHIC_COVERAGE=2 \
 ```
 
 If you want the bundle-local `edge-session-index.md` to keep only sessions that
-share one latest minted outcome, set:
+share one latest request-scoped minted outcome, set:
 
 ```sh
 EIDOLON_SHIELD_EDGE_SESSION_INDEX_LATEST_MINT_OUTCOME=session_value_mismatch \

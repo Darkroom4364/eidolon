@@ -248,8 +248,7 @@ jq -e \
   || fail "session ${session_id} blocked transition reason did not match the repeated escape path"
 
 jq -e '
-  (.kind.reason // "")
-  | contains("post_containment_persistence_kind=controlled_reality_branch_escape")
+  .kind.persistence.post_containment_persistence_kind == "controlled_reality_branch_escape"
 ' <<<"$blocked_transition_json" >/dev/null \
   || fail "session ${session_id} blocked transition reason did not preserve the structured branch-escape persistence marker"
 

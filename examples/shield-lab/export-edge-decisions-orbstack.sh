@@ -46,7 +46,7 @@ Options:
   --min-polymorphic-coverage <N>
                          Keep only sessions that observed at least N active
                          session-minted bait surfaces.
-  --latest-mint-outcome <matched_session_value|session_value_mismatch>
+  --latest-mint-outcome <matched_session_value|expired_session_value|replay_seen|session_value_mismatch>
                          Keep only sessions whose latest exported minted bait
                          outcome matches the given status.
   --authenticated-rule-rejection-label <label>
@@ -654,6 +654,23 @@ render_markdown_export() {
         optional_line("detection_score"; ($score.detection_score // 0 | if . > 0 then code(.) else empty end))
       ]
       | map(select(. != ""));
+    def minted_outcome_summary_line($summary):
+      [
+        (if ($summary.matched_session_value // 0) > 0 then
+          code("matched_session_value") + " " + code($summary.matched_session_value)
+        else empty end),
+        (if ($summary.expired_session_value // 0) > 0 then
+          code("expired_session_value") + " " + code($summary.expired_session_value)
+        else empty end),
+        (if ($summary.replay_seen // 0) > 0 then
+          code("replay_seen") + " " + code($summary.replay_seen)
+        else empty end),
+        (if ($summary.session_value_mismatch // 0) > 0 then
+          code("session_value_mismatch") + " " + code($summary.session_value_mismatch)
+        else empty end)
+      ]
+      | map(select(. != ""))
+      | if length == 0 then empty else join(", ") end;
     . as $export
     | ($export.ingress_signals // {}) as $signals
     | ($export.discovery_recon_score // {}) as $score
@@ -662,6 +679,7 @@ render_markdown_export() {
     | ($export.local_ingress_trust_scope_rejection // null) as $local_trust_rejection
     | ($export.trusted_ingress_soften_match // null) as $trusted_soften_match
     | ($export.evidence.bait_header_value_mints // []) as $mint_audits
+    | ($export.evidence.bait_header_value_mint_outcome_summary // {}) as $mint_outcome_summary
     | ($export.evidence.latest_bait_header_value_mint // null) as $latest_mint
     | ($export.evidence.authenticated_ingress_rule_rejection_histories // [])
       as $authenticated_rule_rejection_histories
@@ -1018,6 +1036,7 @@ render_markdown_export() {
             + code(.kind)
             + "]"
         ),
+        optional_line("Minted proof outcomes"; minted_outcome_summary_line($mint_outcome_summary)),
         optional_line("Latest minted outcome"; (
           if $latest_mint != null then
             code($latest_mint.status)
@@ -1348,10 +1367,10 @@ fi
 
 if [[ -n "$LATEST_MINT_OUTCOME" ]]; then
   case "$LATEST_MINT_OUTCOME" in
-    matched_session_value|session_value_mismatch)
+    matched_session_value|expired_session_value|replay_seen|session_value_mismatch)
       ;;
     *)
-      fail "--latest-mint-outcome must be matched_session_value or session_value_mismatch"
+      fail "--latest-mint-outcome must be matched_session_value, expired_session_value, replay_seen, or session_value_mismatch"
       ;;
   esac
 fi
@@ -1480,7 +1499,8 @@ if status_json="$(read_status_json 2>/dev/null)" && [[ -n "$status_json" ]]; the
                 surface_kind,
                 header_name,
                 kind,
-                prefix
+                prefix,
+                proof_window_seconds
               }
           ],
           authenticated_trusted_ingress_rules: [

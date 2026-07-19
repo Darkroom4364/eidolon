@@ -155,7 +155,8 @@ status_json="$(jq -n \
             surface_kind: .surface_kind,
             header_name: .expected_action.header_name,
             kind: .expected_action.header_value_mint.kind,
-            prefix: .expected_action.header_value_mint.prefix
+            prefix: .expected_action.header_value_mint.prefix,
+            proof_window_seconds: (.expected_action.header_value_mint.proof_window_seconds // null)
           }
       ];
     def trusted_soften_scopes:
@@ -470,7 +471,17 @@ jq -r '
     else
       "polymorphic-baits: " + (
         .bait_profile.polymorphic_baits
-        | map("\(.surface) -> \(.header_name) [\(.prefix)]")
+        | map(
+            "\(.surface) -> \(.header_name) [\(.prefix)"
+            + (
+                if (.proof_window_seconds // null) == null then
+                  ""
+                else
+                  ", \(.proof_window_seconds)s"
+                end
+              )
+            + "]"
+          )
         | join(", ")
       )
     end

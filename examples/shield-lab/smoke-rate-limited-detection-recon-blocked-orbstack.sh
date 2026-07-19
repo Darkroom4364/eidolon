@@ -272,8 +272,8 @@ jq -e \
     and ((.kind.reason // "") | contains("detection_score=2"))
     and ((.kind.reason // "") | contains("recon_score=5"))
     and ((.kind.reason // "") | contains("recon_block_threshold=5"))
-    and ((.kind.reason // "") | contains("persistence_class=discovery_recon"))
-    and ((.kind.reason // "") | contains("persistence_kind=discovery_recon_retry"))
+    and .kind.persistence.pre_containment_persistence_class == "discovery_recon"
+    and .kind.persistence.pre_containment_persistence_kind == "discovery_recon_retry"
   ' <<<"$blocked_transition_json" >/dev/null \
   || fail "session ${session_id} blocked transition reason did not preserve the expected detection-backed recon facts"
 
@@ -317,8 +317,6 @@ jq -e '
   and ((.fields.policy_reason // "") | contains("rate-limited discovery recon retry moved session to blocked"))
   and ((.fields.policy_reason // "") | contains("detection_count=2"))
   and ((.fields.policy_reason // "") | contains("detection_score=2"))
-  and ((.fields.policy_reason // "") | contains("persistence_class=discovery_recon"))
-  and ((.fields.policy_reason // "") | contains("persistence_kind=discovery_recon_retry"))
 ' <<<"$surface_debug_json" >/dev/null \
   || fail "session ${session_id} did not keep the blocked detection-backed recon retry reason on the Eidolon-owned enforcement path"
 
