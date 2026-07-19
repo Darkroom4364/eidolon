@@ -401,3 +401,108 @@ Status checklist:
   request-scoped `authenticated_entries` for transport-authenticated strong
   explicit claims such as `signed_agent`
 - [ ] Prepare the external-readiness note and release checklist
+
+## Near-Term Work Queue
+
+This queue folds the latest research pass into issue-ready follow-on work
+without changing the milestone order above. It is subordinate to the mandatory
+[engineering operating policy](engineering-operating-policy.md) and its safety
+gate.
+
+### Safety Defects
+
+The known defects are tracked by `#213`. They are high-priority bugs; they do
+not block the runtime, evidence, microVM, or research queues below:
+
+1. Integrity-protect session identity and prevent attacker-selected rotation
+   from resetting policy or evidence state (`#207`).
+2. Fail closed every recognized unsafe bait action shape, including expired,
+   replayed, malformed, and mismatched proofs (`#208`).
+3. Exclude rejected or unlinked observations from confirmed evidence and
+   scoring (`#209`).
+4. Add request-level correlation across runtime events, policy decisions,
+   reports, and exports (`#210`).
+5. Bound state and logs, define retention and eviction, and recover safely from
+   partial persistent writes (`#211`).
+6. Canonicalize or reject ambiguous request targets before policy evaluation
+   and forwarding (`#212`).
+7. Enforce the merge gate with complete CI coverage and protected `main`
+   governance (`#214`).
+
+### Runtime
+
+1. Upgrade session-minted bait from "unique value" to "single-use proof" with
+   explicit expiry, replay cache, and `Cache-Control: private, no-store` on
+   proof-bearing responses.
+2. Diversify bait classes until at least one non-OpenAPI class produces stable
+   same-session action and evidence, instead of adding more policy heuristics
+   around the current confirmed path.
+3. Build one stronger deterministic controlled-reality branch with stable IDs,
+   state continuity, and verification-surviving artifacts rather than broad
+   fake-world expansion.
+4. Make persistence metadata first-class in runtime and export instead of
+   deriving meaning from freeform reason strings.
+5. Extract the request-evaluation spine out of
+   `crates/eidolon-proxy/src/main.rs` so policy, persistence, and routing
+   changes stop landing in one file.
+
+### Evidence And Export
+
+1. Add stage-level evidence as linked facts and inferred claims such as
+   `near_miss`, `replay_seen`, and `contained_after_execution` without
+   exploding `EventKind`.
+2. Tighten disclosure and redaction policy before any stronger export-sealing
+   work so signatures do not harden oversharing.
+3. Add a signed ingress-appraisal shape with explicit downgrade and rejection
+   reasons so trusted-ingress softening stays explainable.
+4. Treat SCITT/COSE plus RFC3161 timestamping as a follow-on after the smaller
+   signed claim set and disclosure policy are stable.
+
+### MicroVM
+
+1. Extend the current `examples/microvm/` scaffold into a real spooler/control
+   lane for bounded exploit validation runs.
+2. Keep Firecracker as the target high-risk guest lane, but use
+   destroy/recreate as the default reset model instead of snapshot-heavy fanout.
+3. Keep guest networking explicit and minimal, with export over controlled
+   channels rather than repo mounts.
+4. Keep XBow benchmark execution separate from Eidolon's defensive proof claims
+   so benchmark work does not redefine the product center.
+
+### Research Backlog
+
+1. Evaluate behavior-first shaping only on Eidolon-owned bait surfaces and only
+   as advisory shaping, not attribution or primary trust.
+2. Keep Kubernetes/eBPF fusion narrow and advisory, focused on reduction and
+   operator narrative rather than raw telemetry collection.
+3. Prototype SPIFFE/SPIRE or equivalent short-lived workload identity for
+   internal machine trust before widening browser-trust ambitions.
+4. Define the four evaluation lanes explicitly in repo tooling and reporting:
+   Eidolon owned-target, XBow-style benchmark, Kali/VM transfer, and future
+   microVM transfer.
+5. Add a minimal cross-lane run schema that keeps scanner capability,
+   substrate quality, and Eidolon defensive effect as separate fields instead
+   of one blended headline.
+6. Build the response-side agent degradation lane — compliance probes, rule
+   accumulation, degradation, and containment economics — per
+   [agent-degradation-lane.md](agent-degradation-lane.md), under the gate-scope
+   carve-out.
+
+### Priority Preference
+
+Prefer closing the safety defects (`#207`-`#214`) over expanding surfaces —
+they protect Eidolon's strongest claims. This is a preference, not a gate:
+bait-class diversification, controlled-reality branches, M5 ladder branches,
+ingress or edge trust permutations, export work, live microVM execution,
+benchmark and telemetry expansion, and the response-side agent degradation
+lane ([agent-degradation-lane.md](agent-degradation-lane.md)) all proceed
+without waiting for the defects to close.
+
+### Explicitly Postponed
+
+- Broad fake-enterprise controlled reality
+- Browser trust as a strong general identity primitive
+- Broad environment watermarking as a core provenance claim
+- Snapshot-first microVM architecture
+- Strong cryptographic sealing of current exports before disclosure policy is fixed
+- Treating XBow-style benchmark success as evidence of Eidolon defensive value

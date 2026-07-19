@@ -68,7 +68,9 @@ Eidolon is licensed under the Apache License, Version 2.0.
 
 This project is intended for defensive use on owned or authorized systems. Contributions and reports must stay within that boundary: no hack-back, malware, real exploit bait, real secrets, third-party targeting, or attacker infrastructure compromise.
 
-For details, see [SECURITY.md](SECURITY.md), [docs/safety.md](docs/safety.md), and [docs/threat-model.md](docs/threat-model.md).
+For details, see [SECURITY.md](SECURITY.md), [docs/safety.md](docs/safety.md),
+[docs/threat-model.md](docs/threat-model.md), and the advisory
+[engineering operating policy](docs/engineering-operating-policy.md).
 
 ## Core Primitive
 
@@ -129,6 +131,7 @@ docs/
   architecture.md
   learning-hardness.md
   threat-model.md
+  engineering-operating-policy.md
   mvp-plan.md
   safety.md
   lab.md
@@ -148,8 +151,10 @@ examples/
 
 ## Current Status
 
-M3 and M4 are complete on `main`. Current work is in M5: adaptive bait policy
-and shield hardening.
+M3 is complete on `main`. The core M4 edge-operations slice is merged, but the
+M4 milestone remains open for its outstanding export and safety documentation
+work. The known safety defects tracked by `#213` are high-priority bugs; they
+inform review but do not block M5 or other expansion.
 
 The repository already includes:
 
@@ -163,9 +168,12 @@ The repository already includes:
 - an OrbStack shield-lab deployment with live status, evidence export,
   edge-decision export, trusted-ingress smoke checks, and Kali VM validation
 
-The current gap is no longer basic proxy plumbing. The main product work is
-graduated multi-signal policy that keeps ingress identity, advisory risk
-signals, runtime evidence, policy state, and enforcement separate.
+Closing the safety defects — protected session identity, fail-closed
+bait-action routing, request-linked causal evidence, and bounded recoverable
+state — is a standing priority alongside feature work.
+
+For the advisory work order and review standard, see
+[docs/engineering-operating-policy.md](docs/engineering-operating-policy.md).
 
 For the end-state definition, see [docs/completed-project.md](docs/completed-project.md).
 

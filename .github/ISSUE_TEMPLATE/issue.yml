@@ -2,6 +2,18 @@ name: Issue
 description: Report a bug, propose a feature, or suggest documentation work.
 title: "[Issue]: "
 body:
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: Use the engineering operating policy; violated safety invariants are bugs.
+      options:
+        - P0 - safety bypass or false confirmed verdict
+        - P1 - causal, durability, parser, disclosure, or isolation risk
+        - P2 - important hardening or maintainability work
+        - P3 - feature, research, documentation, or deferred work
+    validations:
+      required: true
   - type: textarea
     id: summary
     attributes:
@@ -20,7 +32,7 @@ body:
     id: safety
     attributes:
       label: Safety notes
-      description: Note any bait, decoy, credential-like value, endpoint, logging, or controlled-reality behavior involved.
+      description: Name the engineering-policy invariant affected and note any bait, decoy, credential-like value, endpoint, logging, or controlled-reality behavior involved.
     validations:
       required: true
   - type: textarea
