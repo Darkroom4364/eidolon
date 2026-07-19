@@ -25,9 +25,10 @@ make_access_token() {
 init_fake_pwnkit_checkout() {
   local repo="$1"
 
-  git -C "$repo" init -q
+  git -C "$repo" init -q -b main
   git -C "$repo" config user.email "eidolon@example.test"
   git -C "$repo" config user.name "Eidolon Test"
+  git -C "$repo" remote add origin https://github.com/0sec-labs/pwnkit.git
   mkdir -p "$repo/dist"
 
   cat > "$repo/package.json" <<'JSON'
@@ -45,6 +46,19 @@ JS
     git -C "$repo" commit -q -m "fixture pwnkit"
   git -C "$repo" update-ref refs/remotes/origin/main HEAD
   touch "$repo/dist/pwnkit.js"
+}
+
+write_exit_code_pwnkit() {
+  local path="$1"
+
+  cat > "$path" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' '{"findings":[{"id":"fixture-finding","title":"fixture"}]}'
+exit "${FIXTURE_EXIT_CODE:?}"
+SH
+  chmod +x "$path"
 }
 
 test_help_mentions_local_source_checkout() {
@@ -77,6 +91,8 @@ test_default_source_dir_resolves_local_checkout() {
       and .pwnkit.source_dir == $repo
       and .pwnkit.entry_path == $entry
       and .pwnkit.package_version == "9.8.7"
+      and .pwnkit.git_branch == "main"
+      and .pwnkit.remote_origin.fetch_url == "https://github.com/0sec-labs/pwnkit.git"
       and .pwnkit.origin_main.in_sync == true
     ' "$artifact/pwnkit-runner-metadata.json" >/dev/null
 }
@@ -126,6 +142,9 @@ test_source_checkout_metadata_records_version_and_origin_sync() {
     and (.pwnkit.git_head | type == "string")
     and (.pwnkit.git_head_short | length) == 12
     and .pwnkit.git_dirty == false
+    and .pwnkit.git_branch == "main"
+    and .pwnkit.remote_origin.fetch_url == "https://github.com/0sec-labs/pwnkit.git"
+    and .pwnkit.remote_origin.push_url == "https://github.com/0sec-labs/pwnkit.git"
     and .pwnkit.origin_main.head == .pwnkit.git_head
     and .pwnkit.origin_main.head_short == .pwnkit.git_head_short
     and .pwnkit.origin_main.ahead == 0
@@ -994,6 +1013,145 @@ SH
   ! rg -q 'sensitive-api-detail' "$artifact/pwnkit-direct.stderr.log"
 }
 
+test_does_not_retry_recovered_transient_agent_event() {
+  local artifact
+  local fake_pwnkit
+  local attempt_file
+  artifact="$(new_temp_dir)"
+  fake_pwnkit="$artifact/fake-pwnkit"
+  attempt_file="$artifact/attempt-count.txt"
+
+  cat > "$fake_pwnkit" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+db_path=""
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --db-path)
+      db_path="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+attempt=1
+if [[ -f "$FIXTURE_ATTEMPT_FILE" ]]; then
+  attempt="$(( $(cat "$FIXTURE_ATTEMPT_FILE") + 1 ))"
+fi
+printf '%s\n' "$attempt" > "$FIXTURE_ATTEMPT_FILE"
+
+sqlite3 "$db_path" '
+  create table pipeline_events (
+    id text primary key,
+    scanId text not null,
+    stage text not null,
+    eventType text not null,
+    findingId text,
+    agentRole text,
+    payload text not null default "{}",
+    timestamp integer not null
+  );
+'
+payload="$(jq -cn \
+  --arg error "transient (retry 1/3): ChatGPT (Codex backend) API error: 503" \
+  '{error:$error}')"
+escaped_payload="$(printf '%s' "$payload" | sed "s/'/''/g")"
+sqlite3 "$db_path" "
+  insert into pipeline_events
+    (id, scanId, stage, eventType, findingId, agentRole, payload, timestamp)
+  values
+    ('recovered-retry', 'scan-1', 'attack', 'agent_error', null, 'attack', '$escaped_payload', 1);
+"
+
+printf '{"findings":[]}\n'
+SH
+  chmod +x "$fake_pwnkit"
+
+  EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    EIDOLON_M3_PWNKIT_MAX_ATTEMPTS=2 \
+    FIXTURE_ATTEMPT_FILE="$attempt_file" \
+    PWNKIT_BIN="$fake_pwnkit" \
+    "$RUNNER" direct "$artifact" >/dev/null
+
+  [[ "$(cat "$attempt_file")" == "1" ]]
+  [[ ! -d "$artifact/private/pwnkit-direct-attempt-1" ]]
+  [[ "$(sqlite3 "$artifact/pwnkit-direct.db" \
+    "select count(*) from pipeline_events where eventType = 'agent_error';")" == "1" ]]
+}
+
+test_accepts_findings_exit_code_one() {
+  local artifact
+  local fake_pwnkit
+  artifact="$(new_temp_dir)"
+  fake_pwnkit="$artifact/fake-pwnkit"
+  write_exit_code_pwnkit "$fake_pwnkit"
+
+  FIXTURE_EXIT_CODE=1 \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    PWNKIT_BIN="$fake_pwnkit" \
+    "$RUNNER" direct "$artifact" >/dev/null
+
+  jq -e '(.findings | length) == 1' "$artifact/pwnkit-direct.json" >/dev/null
+  jq -e '.status == "completed_with_findings" and .exit_code == 1' \
+    "$artifact/tool-results/pwnkit-direct-attempt-1.json" >/dev/null
+}
+
+test_rejects_cost_ceiling_exit_with_partial_findings() {
+  local artifact
+  local fake_pwnkit
+  local output_file
+  local status=0
+  artifact="$(new_temp_dir)"
+  fake_pwnkit="$artifact/fake-pwnkit"
+  output_file="$artifact/runner-output.log"
+  write_exit_code_pwnkit "$fake_pwnkit"
+
+  FIXTURE_EXIT_CODE=4 \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    PWNKIT_BIN="$fake_pwnkit" \
+    "$RUNNER" direct "$artifact" > "$output_file" 2>&1 || status="$?"
+
+  [[ "$status" -eq 4 ]]
+  rg -q 'stopped at its cost ceiling' "$output_file"
+  jq -e '(.findings | length) == 1' "$artifact/pwnkit-direct.json" >/dev/null
+  jq -e '.status == "cost_ceiling_exceeded" and .exit_code == 4' \
+    "$artifact/tool-results/pwnkit-direct-attempt-1.json" >/dev/null
+}
+
+test_rejects_reused_leg_artifacts() {
+  local artifact
+  local fake_pwnkit
+  local output_file
+  local status=0
+  artifact="$(new_temp_dir)"
+  fake_pwnkit="$artifact/fake-pwnkit"
+  output_file="$artifact/reuse-output.log"
+  write_exit_code_pwnkit "$fake_pwnkit"
+
+  FIXTURE_EXIT_CODE=0 \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    PWNKIT_BIN="$fake_pwnkit" \
+    "$RUNNER" direct "$artifact" >/dev/null
+
+  FIXTURE_EXIT_CODE=0 \
+    EIDOLON_LAB_TARGET_URL=http://127.0.0.1:9101 \
+    EIDOLON_LAB_PROXY_URL=http://127.0.0.1:9102 \
+    PWNKIT_BIN="$fake_pwnkit" \
+    "$RUNNER" direct "$artifact" > "$output_file" 2>&1 || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'refusing to reuse pwnkit direct artifacts' "$output_file"
+  rg -q 'SQLite rows cannot mix across scans' "$output_file"
+}
+
 test_does_not_retry_codex_backend_auth_error_attempt() {
   local artifact
   local fake_pwnkit
@@ -1174,6 +1332,10 @@ test_retries_direct_wall_clock_timeout_attempt
 test_records_eidolon_wall_clock_timeout_without_in_place_retry
 test_retries_transient_codex_backend_timeout_attempt
 test_retries_transient_codex_backend_api_error_attempt
+test_does_not_retry_recovered_transient_agent_event
+test_accepts_findings_exit_code_one
+test_rejects_cost_ceiling_exit_with_partial_findings
+test_rejects_reused_leg_artifacts
 test_does_not_retry_codex_backend_auth_error_attempt
 test_does_not_retry_stateful_eidolon_transient_timeout_in_place
 

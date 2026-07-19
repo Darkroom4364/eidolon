@@ -202,6 +202,8 @@ run_summary() {
          coalesce(stage, 'unknown') as stage,
          coalesce(agentRole, 'unknown') as agent_role,
          case
+           when lower(coalesce(json_extract(payload, '$.error'), '')) like 'transient (retry %'
+             then 'recovered_transient_retry'
            when lower(coalesce(json_extract(payload, '$.error'), '')) like '%refresh token%'
              or lower(coalesce(json_extract(payload, '$.error'), '')) like '%token refresh failed%'
              then 'codex_token_refresh_failed'
@@ -235,6 +237,56 @@ run_summary() {
      from classified
      group by stage, agent_role, error_class
      order by stage, agent_role, error_class;")"
+
+  local scan_records="[]"
+  if sqlite_table_exists "$db_file" "scans"; then
+    scan_records="$(sqlite_json "$db_file" \
+      "select
+         id as scan_id,
+         target,
+         depth,
+         runtime,
+         mode,
+         status,
+         startedAt as started_at,
+         completedAt as completed_at,
+         durationMs as duration_ms,
+         case when json_valid(summary) then json_extract(summary, '$.totalAttacks') end
+           as total_attacks,
+         case when json_valid(summary) then json_extract(summary, '$.totalFindings') end
+           as total_findings
+       from scans
+       order by startedAt, id;")"
+  fi
+
+  local agent_sessions="[]"
+  if sqlite_table_exists "$db_file" "agent_sessions"; then
+    agent_sessions="$(sqlite_json "$db_file" \
+      "select
+         agentRole as agent_role,
+         turnCount as turn_count,
+         status,
+         createdAt as created_at,
+         updatedAt as updated_at
+       from agent_sessions
+       order by createdAt, id;")"
+  fi
+
+  local terminal_events="[]"
+  if sqlite_table_exists "$db_file" "pipeline_events"; then
+    terminal_events="$(sqlite_json "$db_file" \
+      "select eventType as event_type, count(*) as count
+       from pipeline_events
+       where eventType in (
+         'scan_start',
+         'scan_complete',
+         'scan_error',
+         'scan_aborted',
+         'agent_error'
+       )
+       group by eventType
+       order by eventType;")"
+  fi
 
   local event_count
   local tool_artifacts
@@ -271,18 +323,27 @@ run_summary() {
   local crawl_artifacts_file
   local agent_errors_file
   local db_findings_file
+  local scan_records_file
+  local agent_sessions_file
+  local terminal_events_file
   tool_counts_file="$(tmp_json_file "$label-tool-counts")"
   http_requests_file="$(tmp_json_file "$label-http-requests")"
   bash_http_outputs_file="$(tmp_json_file "$label-bash-http-outputs")"
   crawl_artifacts_file="$(tmp_json_file "$label-crawl-artifacts")"
   agent_errors_file="$(tmp_json_file "$label-agent-errors")"
   db_findings_file="$(tmp_json_file "$label-db-findings")"
+  scan_records_file="$(tmp_json_file "$label-scan-records")"
+  agent_sessions_file="$(tmp_json_file "$label-agent-sessions")"
+  terminal_events_file="$(tmp_json_file "$label-terminal-events")"
   write_json_file "$tool_counts_file" "$tool_counts"
   write_json_file "$http_requests_file" "$http_requests"
   write_json_file "$bash_http_outputs_file" "$bash_http_outputs"
   write_json_file "$crawl_artifacts_file" "$crawl_artifacts"
   write_json_file "$agent_errors_file" "$agent_errors"
   write_json_file "$db_findings_file" "$db_findings"
+  write_json_file "$scan_records_file" "$scan_records"
+  write_json_file "$agent_sessions_file" "$agent_sessions"
+  write_json_file "$terminal_events_file" "$terminal_events"
 
   jq -n \
     --arg label "$label" \
@@ -296,6 +357,9 @@ run_summary() {
     --slurpfile crawl_artifacts_json "$crawl_artifacts_file" \
     --slurpfile agent_errors_json "$agent_errors_file" \
     --slurpfile db_findings_json "$db_findings_file" \
+    --slurpfile scan_records_json "$scan_records_file" \
+    --slurpfile agent_sessions_json "$agent_sessions_file" \
+    --slurpfile terminal_events_json "$terminal_events_file" \
     '($report_json[0] // {}) as $report
      | ($tool_counts_json[0] // []) as $tool_counts
      | ($http_requests_json[0] // []) as $http_requests
@@ -303,11 +367,13 @@ run_summary() {
      | ($crawl_artifacts_json[0] // []) as $crawl_artifacts
      | ($agent_errors_json[0] // []) as $agent_errors
      | ($db_findings_json[0] // []) as $db_findings
+     | ($scan_records_json[0] // []) as $scan_records
+     | ($agent_sessions_json[0] // []) as $agent_sessions
+     | ($terminal_events_json[0] // []) as $terminal_events
      | def path_without_origin($url):
        ($url // "")
        | sub("^https?://[^/]+"; "")
        | if . == "" then "/" else . end;
-     def path_from_url: path_without_origin(.url);
      def safe_path_from_url($url):
        path_without_origin($url)
        | split("#")[0]
@@ -354,16 +420,20 @@ run_summary() {
                )
              ),
              url: null,
-             path: $path,
+             path: safe_path_from_url($path),
              status: (($http_status.status // null) | if . == null then null else tonumber end),
              source: "bash_http_output",
-             evidence_label: $block.label
+             evidence_label: (($explicit.method // "GET") + " " + safe_path_from_url($path))
            }
        ];
      def structured_http_requests:
        $http_requests
-       | map(. + {
-           path: path_from_url,
+       | map({
+           timestamp_ms,
+           method,
+           url: null,
+           path: safe_path_from_url(.url),
+           status,
            source: "http_request",
            evidence_label: null
          });
@@ -731,8 +801,17 @@ run_summary() {
        };
      def agent_error_diagnostics:
        ($agent_errors // []) as $errors
+       | ($errors | map(select(.error_class != "recovered_transient_retry")))
+         as $terminal_errors
+       | ($errors | map(select(.error_class == "recovered_transient_retry")))
+         as $recovered_transient_errors
        | {
-           count: ($errors | map(.count) | add // 0),
+           event_count: ($errors | map(.count) | add // 0),
+           count: ($terminal_errors | map(.count) | add // 0),
+           terminal_count: ($terminal_errors | map(.count) | add // 0),
+           recovered_transient_count: (
+             $recovered_transient_errors | map(.count) | add // 0
+           ),
            stage_counts: (
              $errors
              | sort_by(.stage, .agentRole)
@@ -749,10 +828,19 @@ run_summary() {
              | group_by(.error_class)
              | map({
                  error_class: .[0].error_class,
+               count: (map(.count) | add)
+             })
+           ),
+           terminal_class_counts: (
+             $terminal_errors
+             | sort_by(.error_class)
+             | group_by(.error_class)
+             | map({
+                 error_class: .[0].error_class,
                  count: (map(.count) | add)
                })
            ),
-           has_agent_error: (($errors | map(.count) | add // 0) > 0),
+           has_agent_error: (($terminal_errors | map(.count) | add // 0) > 0),
            has_codex_token_refresh_failure: any(
              $errors[];
              .error_class == "codex_token_refresh_failed"
@@ -774,6 +862,151 @@ run_summary() {
              .error_class == "codex_backend_timeout"
            )
          };
+     def terminal_event_count($event_type):
+       [
+         $terminal_events[]
+         | select(.event_type == $event_type)
+         | (.count // 0)
+       ]
+       | add // 0;
+     def session_status_counts:
+       $agent_sessions
+       | sort_by(.status)
+       | group_by(.status)
+       | map({status: .[0].status, count: length});
+     def latest_agent_sessions:
+       $agent_sessions
+       | sort_by(.agent_role, .created_at, .updated_at)
+       | group_by(.agent_role)
+       | map(last);
+     def latest_session_status_counts:
+       latest_agent_sessions
+       | sort_by(.status)
+       | group_by(.status)
+       | map({status: .[0].status, count: length});
+     def nonterminal_sessions:
+       [
+         latest_agent_sessions[]
+         | select((.status // "unknown") != "completed")
+         | {
+             agent_role: (.agent_role // "unknown"),
+             turn_count: (.turn_count // 0),
+             status: (.status // "unknown")
+           }
+       ];
+     def execution_contract:
+       ($scan_records | last // null) as $scan
+       | (agent_error_diagnostics) as $agent_errors_summary
+       | (nonterminal_sessions) as $nonterminal_sessions
+       | ([
+           if $artifact_status != "present" then
+             "missing_final_report"
+           else empty end,
+           if ($scan_records | length) == 0 then
+             "missing_scan_record"
+           else empty end,
+           if ($scan_records | length) > 1 then
+             "multiple_scan_records"
+           else empty end,
+           if ($scan.status // null) == "failed" then
+             "scan_status_failed"
+           elif $scan != null and ($scan.status // "unknown") != "completed" then
+             "scan_status_nonterminal"
+           else empty end,
+           if terminal_event_count("scan_error") > 0 then
+             "scan_error_event"
+           else empty end,
+           if terminal_event_count("scan_complete") == 0 then
+             "missing_scan_complete_event"
+           else empty end,
+           if terminal_event_count("scan_aborted") > 0 then
+             "scan_aborted_event"
+           else empty end,
+           if ($agent_errors_summary.count // 0) > 0 then
+             "agent_error_event"
+           else empty end,
+           if $scan != null
+             and ($scan.mode // null) == "web"
+             and ($agent_sessions | length) == 0 then
+             "missing_agent_sessions"
+           else empty end,
+           if ($nonterminal_sessions | length) > 0 then
+             "nonterminal_agent_session"
+           else empty end,
+           if ($report.costCeilingExceeded // false) == true then
+             "cost_ceiling_exceeded"
+           else empty end
+         ] | unique) as $reason_codes
+       | ([
+           if ($agent_errors_summary.recovered_transient_count // 0) > 0 then
+             "recovered_transient_agent_retry"
+           else empty end,
+           if db_active_finding_count > finding_count then
+             "active_db_findings_omitted_from_final_json"
+           else empty end,
+           if finding_count > db_active_finding_count then
+             "final_json_findings_missing_from_active_db"
+           else empty end,
+           if $scan != null
+             and ($scan.total_findings // null) != null
+             and ($scan.total_findings != db_saved_finding_count) then
+             "scan_summary_findings_mismatch_db"
+           else empty end
+         ] | unique) as $diagnostic_codes
+       | {
+           sources: {
+             execution_lifecycle: "pwnkit_sqlite",
+             persisted_findings: "pwnkit_sqlite",
+             final_report: "pwnkit_final_json"
+           },
+           result_class: (
+             if ($scan.status // null) == "failed"
+               or terminal_event_count("scan_error") > 0 then
+               "fail"
+             elif ($reason_codes | length) > 0 then
+               "inconclusive"
+             else
+               "pass"
+             end
+           ),
+           reason_codes: $reason_codes,
+           diagnostic_codes: $diagnostic_codes,
+           scan_record_count: ($scan_records | length),
+           scan: (
+             if $scan == null then null else {
+               scan_id: $scan.scan_id,
+               target: $scan.target,
+               depth: $scan.depth,
+               runtime: $scan.runtime,
+               mode: $scan.mode,
+               status: $scan.status,
+               started_at: $scan.started_at,
+               completed_at: $scan.completed_at,
+               duration_ms: $scan.duration_ms,
+               summary: {
+                 total_attacks: $scan.total_attacks,
+                 total_findings: $scan.total_findings
+               }
+             } end
+           ),
+           terminal_event_counts: $terminal_events,
+           agent_sessions: {
+             count: ($agent_sessions | length),
+             status_counts: session_status_counts,
+             latest_role_count: (latest_agent_sessions | length),
+             latest_status_counts: latest_session_status_counts,
+             nonterminal_count: ($nonterminal_sessions | length),
+             latest_roles: latest_agent_sessions,
+             history: $agent_sessions
+           },
+           finding_counts: {
+             final_json: finding_count,
+             db_saved: db_saved_finding_count,
+             db_active: db_active_finding_count
+           },
+           report_exit_reason: ($report.exitReason // null),
+           cost_ceiling_exceeded: ($report.costCeilingExceeded // false)
+         };
      {
       label: $label,
       artifact_status: $artifact_status,
@@ -784,6 +1017,7 @@ run_summary() {
       final_json_finding_count: finding_count,
       db_saved_finding_count: db_saved_finding_count,
       db_active_finding_count: db_active_finding_count,
+      execution_contract: execution_contract,
       finding_diagnostics: finding_diagnostics,
       finding_reconciliation: finding_reconciliation,
       warnings: ($report.warnings // []),
@@ -793,7 +1027,11 @@ run_summary() {
         tool_counts: $tool_counts,
         bash_http_output_requests: (bash_output_requests | length),
         crawl_artifacts: crawl_artifact_summaries,
-        agent_errors: (agent_error_diagnostics.count)
+        agent_error_events: (agent_error_diagnostics.event_count),
+        agent_errors: (agent_error_diagnostics.terminal_count),
+        recovered_transient_agent_retries: (
+          agent_error_diagnostics.recovered_transient_count
+        )
       },
       agent_error_diagnostics: agent_error_diagnostics,
       target_evidence_diagnostics: target_evidence_diagnostics,
@@ -810,6 +1048,18 @@ proxy_summary() {
       request_count: 0,
       kind_counts: [],
       routing_counts: [],
+      event_integrity: {
+        raw_event_count: 0,
+        canonical_event_count: 0,
+        identical_duplicate_record_count: 0,
+        conflicting_event_id_count: 0,
+        conflicting_record_count: 0,
+        invalid_identifier_record_count: 0,
+        identical_duplicates: [],
+        conflicts: [],
+        warnings: [],
+        invalid_identifier_facts: []
+      },
       counts: {
         bait_exposures: 0,
         bait_actions: 0,
@@ -834,37 +1084,309 @@ proxy_summary() {
      | sub("\\.[0-9]+Z$"; "Z")
      | fromdateiso8601?) as $seconds
     | if $seconds == null then null else ($seconds * 1000) end;
-  def indexed_events:
+  def raw_indexed_events:
     to_entries | map({event_index: .key, event: .value});
+  def safe_path($path):
+    if ($path | type) == "string" then
+      ($path | split("#")[0] | split("?")[0])
+      | if . == "" then "/" else . end
+    else
+      $path
+    end;
+  def nonempty_string:
+    type == "string" and length > 0;
+  def valid_uuid:
+    type == "string"
+    and test("^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$");
+  def valid_evidence_token:
+    type == "string"
+    and (utf8bytelength >= 1 and utf8bytelength <= 128)
+    and test("^[A-Za-z0-9][A-Za-z0-9._:-]*$");
+  def valid_header_name:
+    type == "string"
+    and (utf8bytelength >= 1 and utf8bytelength <= 128)
+    and test("^[!#$%&\\u0027*+\\-.^_`|~0-9A-Za-z]+$");
+  def valid_bait_identifier:
+    valid_evidence_token;
+  def valid_bait_event($entry):
+    ($entry.event | .session_id | valid_uuid)
+    and ($entry.event.id | valid_uuid)
+    and ($entry.event.kind.bait_id | valid_bait_identifier)
+    and ($entry.event.kind.exposure_id | valid_bait_identifier);
+  def valid_event_identifiers($entry):
+    ($entry.event.id | valid_uuid)
+    and ($entry.event.session_id | valid_uuid)
+    and (
+      ($entry.event.kind.type != "bait_exposed" and $entry.event.kind.type != "bait_action_observed")
+      or valid_bait_event($entry)
+    );
+  def valid_event_identity($entry):
+    ($entry.event.id | valid_uuid)
+    and ($entry.event.session_id | valid_uuid);
+  def trustworthy_indexed_event:
+    (.event | has("id"))
+    and (.event.id | valid_uuid)
+    and (.event.session_id | valid_uuid);
+  def event_canonicalization_status($events; $entry):
+    if ((valid_event_identity($entry)) | not) then
+      "invalid_identifier_types"
+    elif ((valid_event_identifiers($entry)) | not) then
+      "invalid_bait_identifier"
+    else
+      (
+        $events
+        | map(select(
+            (. | trustworthy_indexed_event)
+            and .event.id == $entry.event.id
+          ))
+      ) as $same_event_id
+      | if ($same_event_id | map(.event) | unique | length) > 1 then
+          "conflicting_duplicate_id"
+        elif $entry.event_index == ($same_event_id | map(.event_index) | min) then
+          "canonical"
+        else
+          "identical_duplicate_id"
+        end
+    end;
+  def classified_events:
+    raw_indexed_events as $events
+    | [
+        $events[] as $entry
+        | $entry + {
+            canonicalization_status: event_canonicalization_status($events; $entry)
+          }
+      ];
+  def indexed_events:
+    classified_events
+    | map(select(
+        .canonicalization_status == "canonical"
+        or .canonicalization_status == "invalid_bait_identifier"
+      ));
+  def sanitized_mint_audit($audit):
+    if ($audit | type) == "object" then
+      ({ }
+       + if ($audit | has("header_name")) then {header_name: $audit.header_name} else {} end
+       + if ($audit | has("kind")) then {kind: $audit.kind} else {} end
+       + if ($audit | has("prefix")) then {prefix: $audit.prefix} else {} end)
+    else
+      $audit
+    end;
+  def sanitized_event_fact($entry):
+    $entry.event as $event
+    | ($event.kind // {}) as $kind
+    | ({
+        event_index: $entry.event_index,
+        event_id: (if ($event | has("id")) then $event.id else null end),
+        session_id: $event.session_id,
+        kind_type: ($kind.type // null)
+      }
+      + if ($kind | has("bait_id")) then {bait_id: $kind.bait_id} else {} end
+      + if ($kind | has("exposure_id")) then {exposure_id: $kind.exposure_id} else {} end
+      + if ($kind | has("method")) then {method: $kind.method} else {} end
+      + if ($kind | has("path")) then {path: safe_path($kind.path)} else {} end
+      + if ($kind | has("surface")) then {surface: safe_path($kind.surface)} else {} end
+      + if ($kind | has("status")) then {status: $kind.status} else {} end
+      + if ($kind | has("header_value_mint"))
+        then {header_value_mint: sanitized_mint_audit($kind.header_value_mint)}
+        else {}
+        end
+      + if ($kind | has("header_value_mint_status"))
+        then {header_value_mint_status: $kind.header_value_mint_status}
+        else {}
+        end);
+  def event_integrity:
+    classified_events as $events
+    | ($events | map(select(.canonicalization_status == "canonical"))) as $canonical
+    | ($events | map(select(.canonicalization_status == "identical_duplicate_id"))) as $duplicates
+    | ($events | map(select(.canonicalization_status == "conflicting_duplicate_id"))) as $conflicts
+    | ($events | map(select(
+        .canonicalization_status == "invalid_identifier_types"
+        or .canonicalization_status == "invalid_bait_identifier"
+      ))) as $invalid
+    | {
+        raw_event_count: ($events | length),
+        canonical_event_count: ($canonical | length),
+        identical_duplicate_record_count: ($duplicates | length),
+        conflicting_event_id_count: (
+          $conflicts | group_by(.event.id) | length
+        ),
+        conflicting_record_count: ($conflicts | length),
+        invalid_identifier_record_count: ($invalid | length),
+        identical_duplicates: ($duplicates | map(sanitized_event_fact(.))),
+        conflicts: (
+          $conflicts
+          | group_by(.event.id)
+          | map({
+              event_id: .[0].event.id,
+              session_ids: (map(.event.session_id) | unique),
+              records: map(sanitized_event_fact(.))
+            })
+        ),
+        warnings: (
+          $conflicts
+          | group_by(.event.id)
+          | map({
+              code: "event_id_conflict",
+              event_id: .[0].event.id,
+              session_ids: (map(.event.session_id) | unique),
+              variant_count: length,
+              message: "Event ID was reused with conflicting content or session identity; all variants excluded from confirmation."
+            })
+        ),
+        invalid_identifier_facts: (
+          $invalid
+          | group_by(.event)
+          | map({
+              occurrence_count: length,
+              event_indexes: map(.event_index),
+              record: sanitized_event_fact(.[0])
+            })
+        )
+      };
   def exposures:
     [
       indexed_events[]
       | select(.event.kind.type == "bait_exposed")
-      | {
+      | ({
           event_index,
           observed_at: .event.observed_at,
           observed_at_ms: event_observed_at_ms(.event),
+          event_id: .event.id,
+          canonicalization_status: .canonicalization_status,
           session_id: .event.session_id,
           bait_id: .event.kind.bait_id,
           exposure_id: .event.kind.exposure_id,
-          surface: .event.kind.surface
+          surface: safe_path(.event.kind.surface)
         }
+        + if (.event.kind | has("header_value_mint"))
+          then {header_value_mint: .event.kind.header_value_mint}
+          else {}
+          end)
     ];
-  def actions:
+  def raw_actions:
     [
       indexed_events[]
       | select(.event.kind.type == "bait_action_observed")
-      | {
+      | .event as $event
+      | $event.kind as $kind
+      | ({
           event_index,
-          observed_at: .event.observed_at,
-          observed_at_ms: event_observed_at_ms(.event),
-          session_id: .event.session_id,
-          bait_id: .event.kind.bait_id,
-          exposure_id: (.event.kind.exposure_id // null),
-          method: .event.kind.method,
-          path: .event.kind.path
+          observed_at: $event.observed_at,
+          observed_at_ms: event_observed_at_ms($event),
+          session_id: $event.session_id,
+          bait_id: $kind.bait_id,
+          exposure_id: (if ($kind | has("exposure_id")) then $kind.exposure_id else null end),
+          method: $kind.method,
+          path: safe_path($kind.path),
+          status: (if ($kind | has("status")) then $kind.status else "unknown" end),
+          canonicalization_status: .canonicalization_status
         }
+        + if ($event | has("id")) then {event_id: $event.id} else {} end
+        + if ($kind | has("header_value_mint"))
+          then {header_value_mint: $kind.header_value_mint}
+          else {}
+          end
+        + if ($kind | has("header_value_mint_status"))
+          then {header_value_mint_status: $kind.header_value_mint_status}
+          else {}
+          end)
     ];
+  def valid_mint_audit:
+    if type != "object" then
+      false
+    elif keys != ["header_name", "kind", "prefix"] then
+      false
+    else
+      (.header_name | valid_header_name)
+      and .kind == "session_hmac_sha256_v1"
+      and (.prefix | valid_evidence_token)
+    end;
+  def accepted_action:
+    .status == "accepted"
+    and (
+      if has("header_value_mint") or has("header_value_mint_status") then
+        has("header_value_mint")
+        and has("header_value_mint_status")
+        and (.header_value_mint | valid_mint_audit)
+        and .header_value_mint_status == "matched_session_value"
+      else
+        true
+      end
+    );
+  def trustworthy_event_id:
+    has("event_id") and (.event_id | valid_uuid);
+  def valid_exposure_identifiers:
+    (.event_id | valid_uuid)
+    and (.session_id | valid_uuid)
+    and (.bait_id | valid_bait_identifier)
+    and (.exposure_id | valid_bait_identifier);
+  def valid_action_identifiers:
+    (. | trustworthy_event_id)
+    and (.session_id | valid_uuid)
+    and (.bait_id | valid_bait_identifier)
+    and (.exposure_id | valid_bait_identifier);
+  def semantic_exposure_conflicts:
+    classified_events
+    | map(select(
+        .canonicalization_status == "canonical"
+        and .event.kind.type == "bait_exposed"
+        and valid_bait_event(.)
+      ))
+    | group_by([.event.session_id, .event.kind.bait_id, .event.kind.exposure_id])
+    | map(select((map(.event) | unique | length) > 1))
+    | map({
+        session_id: .[0].event.session_id,
+        bait_id: .[0].event.kind.bait_id,
+        exposure_id: .[0].event.kind.exposure_id,
+        variant_count: length,
+        variant_kind_types: (map(.event.kind.type) | unique),
+        event_ids: (map(.event.id) | unique)
+      });
+  def semantic_conflict_for($exposure; $conflicts):
+    any($conflicts[];
+      .session_id == $exposure.session_id
+      and .bait_id == $exposure.bait_id
+      and .exposure_id == $exposure.exposure_id
+    );
+  def matched_exposure($exposures; $action):
+    [
+      $exposures[]
+      | select(
+          (. | valid_exposure_identifiers)
+          and .session_id == $action.session_id
+          and .bait_id == $action.bait_id
+          and .exposure_id == $action.exposure_id
+          and ((.event_index // -1) < ($action.event_index // -1))
+        )
+    ]
+    | if length == 0 then null else max_by(.event_index) end;
+  def mint_consistency($exposure; $action):
+    if $exposure == null then
+      {status: "not_evaluated", reason: "no_valid_prior_matching_exposure"}
+    elif ($exposure | has("header_value_mint")) then
+      if (($exposure.header_value_mint | valid_mint_audit) | not) then
+        {status: "inconsistent", reason: "malformed_exposure_mint_audit"}
+      elif (($action | has("header_value_mint")) | not)
+        and (($action | has("header_value_mint_status")) | not) then
+        {status: "inconsistent", reason: "missing_action_mint_audit"}
+      elif (($action | has("header_value_mint")) | not)
+        or (($action | has("header_value_mint_status")) | not) then
+        {status: "inconsistent", reason: "partial_action_mint_audit"}
+      elif (($action.header_value_mint | valid_mint_audit) | not) then
+        {status: "inconsistent", reason: "malformed_action_mint_audit"}
+      elif $action.header_value_mint_status != "matched_session_value" then
+        {status: "inconsistent", reason: "action_mint_status_not_matched"}
+      elif $action.header_value_mint != $exposure.header_value_mint then
+        {status: "inconsistent", reason: "action_mint_coordinates_mismatch"}
+      else
+        {status: "consistent", reason: "matching_minted_exposure"}
+      end
+    elif ($action | has("header_value_mint"))
+      or ($action | has("header_value_mint_status")) then
+      {status: "inconsistent", reason: "action_mint_on_static_exposure"}
+    else
+      {status: "consistent", reason: "static_exposure_and_action"}
+    end;
   def controlled_reality_entries:
     [
       indexed_events[]
@@ -887,26 +1409,34 @@ proxy_summary() {
           observed_at_ms: event_observed_at_ms(.event),
           session_id: .event.session_id,
           method: .event.kind.method,
-          path: .event.kind.path,
+          path: safe_path(.event.kind.path),
           routing_decision: .event.kind.routing_decision
         }
     ];
-  def confirm_actions($exposures):
+  def confirm_actions($exposures; $semantic_conflicts):
     map(
-      . as $action
-      | . + {
-          same_session_confirmed: (
-            ($action.exposure_id != null)
-            and any(
-              $exposures[];
-              .session_id == $action.session_id
-              and .bait_id == $action.bait_id
-              and .exposure_id == $action.exposure_id
-              and ((.event_index // -1) < ($action.event_index // -1))
-            )
-          )
-        }
-    );
+        . as $action
+        | matched_exposure($exposures; $action) as $matched_exposure
+        | mint_consistency($matched_exposure; $action) as $mint_consistency
+        | $action
+          + {
+              matched_exposure_event_index: ($matched_exposure.event_index // null),
+              mint_consistency: $mint_consistency.status,
+              mint_consistency_reason: $mint_consistency.reason,
+              same_session_confirmed: (
+                $action.canonicalization_status == "canonical"
+                and ($action | valid_action_identifiers)
+                and ($action | accepted_action)
+                and $matched_exposure != null
+                and $mint_consistency.status == "consistent"
+                and (any($semantic_conflicts[];
+                  .session_id == $action.session_id
+                  and .bait_id == $action.bait_id
+                  and .exposure_id == $action.exposure_id
+                ) | not)
+              )
+            }
+      );
   def bait_matrix($exposures; $actions):
     ([ $exposures[].bait_id, $actions[].bait_id ] | unique) as $ids
     | [
@@ -932,27 +1462,32 @@ proxy_summary() {
             )
           }
       ];
-  exposures as $bait_exposures
-  | (actions | confirm_actions($bait_exposures)) as $bait_actions
+  semantic_exposure_conflicts as $semantic_conflicts
+  | (exposures | map(select(semantic_conflict_for(.; $semantic_conflicts) | not))) as $bait_exposures
+  | (raw_actions | confirm_actions($bait_exposures; $semantic_conflicts)) as $bait_actions
   | controlled_reality_entries as $controlled_reality_entries
   | request_paths as $request_paths
   | (bait_matrix($bait_exposures; $bait_actions)) as $bait_matrix
   | {
     present: true,
-    event_count: length,
+    event_count: (indexed_events | length),
     request_count: ($request_paths | length),
     kind_counts: (
-      map(.kind.type)
+      indexed_events
+      | map(.event.kind.type)
       | sort
       | group_by(.)
       | map({kind: .[0], count: length})
     ),
     routing_counts: (
-      map(select(.kind.routing_decision != null) | .kind.routing_decision)
+      indexed_events
+      | map(select(.event.kind.routing_decision != null) | .event.kind.routing_decision)
       | sort
       | group_by(.)
       | map({routing_decision: .[0], count: length})
     ),
+    event_integrity: event_integrity,
+    semantic_exposure_conflicts: $semantic_conflicts,
     counts: {
       bait_exposures: ($bait_exposures | length),
       bait_actions: ($bait_actions | length),
@@ -1012,23 +1547,9 @@ jq -n \
    | def unique_paths($run): ($run.requested_paths | map(.path) | unique);
    def target_without_fragment($target): (($target // "") | sub("#.*$"; ""));
    def path_without_query($path): (target_without_fragment($path) | sub("\\?.*$"; ""));
-   def redacted_query($query):
-     ($query
-      | split("&")
-      | map(
-          select(length > 0)
-          | (split("=")[0]) as $key
-          | if $key == "" then "<redacted>" else "\($key)=<redacted>" end
-        )) as $pairs
-     | if ($pairs | length) == 0 then "<redacted>" else ($pairs | join("&")) end;
    def redacted_target($target):
-     target_without_fragment($target) as $without_fragment
-     | ($without_fragment | sub("\\?.*$"; "")) as $path
-     | ($without_fragment
-        | if contains("?") then sub("^[^?]*\\?"; "") else null end) as $query
-     | $path
-       + (if $query == null then "" else "?" + redacted_query($query) end)
-       + (if (($target // "") | contains("#")) then "#<redacted>" else "" end);
+     path_without_query($target)
+     | if . == "" then "/" else . end;
    def crawl_artifact_start_paths:
      ($eidolon.pwnkit_events.crawl_artifacts // [])
      | map(.start_path // null)
@@ -1074,6 +1595,22 @@ jq -n \
              )
            }
        ];
+   def accepted_action:
+     .status == "accepted"
+     and (
+       if has("header_value_mint") or has("header_value_mint_status") then
+         has("header_value_mint")
+         and has("header_value_mint_status")
+         and (.header_value_mint | type) == "object"
+         and (.header_value_mint | keys) == ["header_name", "kind", "prefix"]
+         and (.header_value_mint.header_name | type) == "string"
+         and .header_value_mint.kind == "session_hmac_sha256_v1"
+         and (.header_value_mint.prefix | type) == "string"
+         and .header_value_mint_status == "matched_session_value"
+       else
+         true
+       end
+     );
    def correlated_target_requests:
      [
        ($eidolon.requested_paths // [])[] as $pwnkit
@@ -1159,7 +1696,9 @@ jq -n \
      [
        correlated_bait_actions[] as $action
        | select(
-           ($action.exposure_id != null)
+           $action.same_session_confirmed == true
+           and ($action | accepted_action)
+           and ($action.exposure_id != null)
            and any(
              correlated_bait_exposures[];
              .session_id == $action.session_id
@@ -1170,6 +1709,30 @@ jq -n \
          )
        | $action
      ];
+   def distinct_correlated_exposures:
+     correlated_bait_exposures
+     | map(select(
+         (.event_id | type) == "string" and (.event_id | length) > 0
+         and (.session_id | type) == "string" and (.session_id | length) > 0
+         and (.bait_id | type) == "string" and (.bait_id | length) > 0
+         and (.exposure_id | type) == "string" and (.exposure_id | length) > 0
+       ))
+     | unique_by(.session_id, .bait_id, .exposure_id);
+   def confirmed_follow_rate:
+     distinct_correlated_exposures as $exposures
+     | if ($exposures | length) == 0 then
+         0
+       else
+         ([
+            $exposures[] as $exposure
+            | select(any(
+                correlated_confirmed_bait_actions[];
+                .session_id == $exposure.session_id
+                and .bait_id == $exposure.bait_id
+                and .exposure_id == $exposure.exposure_id
+              ))
+          ] | length) / ($exposures | length)
+       end;
    def correlated_controlled_reality_entries:
      [
        ($proxy.bait_events.controlled_reality_entries // [])[] as $entry
@@ -1220,7 +1783,7 @@ jq -n \
            same_session_confirmed_bait_action_count: ($confirmed_actions | length),
            controlled_reality_entry_count: ($controlled_entries | length),
            same_session_confirmation_possible: (
-             ($correlated_exposures | length) > 0 and ($correlated_actions | length) > 0
+             ($confirmed_actions | length) > 0
            )
          }
      end;
@@ -1644,16 +2207,10 @@ jq -n \
     },
     metrics: {
       bait_follow_rate: (
-        if ((correlated_bait_exposures | length) > 0)
-        then ((correlated_bait_actions | length) / (correlated_bait_exposures | length))
-        else 0
-        end
+        confirmed_follow_rate
       ),
       same_session_confirmed_bait_follow_rate: (
-        if ((correlated_bait_exposures | length) > 0)
-        then ((correlated_confirmed_bait_actions | length) / (correlated_bait_exposures | length))
-        else 0
-        end
+        confirmed_follow_rate
       ),
       real_surface_requests_after_containment: (
         null
@@ -1664,13 +2221,22 @@ jq -n \
     notes: [
       "pwnkit source builds currently persist target-tool activity as pipeline_events.eventType=tool_artifact.",
       "target_interaction_observed requires at least one pwnkit HTTP artifact to match an Eidolon proxy request by method, path, and a 30 second timestamp window.",
-      "bait_follow_rate counts bait-shaped actions whether or not the action preserved the original exposure session.",
-      "same_session_confirmed_bait_follow_rate counts only bait actions whose exposure_id matches a prior bait exposure in the same session.",
+      "bait_follow_rate is bounded to 0..1 and counts distinct valid correlated exposures followed by at least one confirmed action; rejected, unknown, unlinked, malformed, and contradictory actions remain visible but unscored.",
+      "same_session_confirmed_bait_follow_rate requires canonical action and exposure records with non-empty string event_id, session_id, bait_id, and exposure_id fields and accepted status-consistent linkage.",
+      "Static exposures confirm only static accepted actions. Minted exposures require complete structurally valid action mint metadata, status=matched_session_value, and exact equality of the non-secret header_name, kind, and prefix audit coordinates with the matched exposure.",
+      "mint_consistency preserves malformed, missing, partial, mismatched, forged, and static/minted contradictory audits as visible inconsistent evidence that scores zero.",
+      "All proxy events are canonicalized by non-empty string event ID across the complete stream before evidence extraction; identical records reduce once and every conflicting variant is excluded from derived evidence.",
+      "event_integrity preserves sanitized duplicate, conflict, warning, and deduplicated invalid-ID facts without exposing raw event content.",
+      "Collector-emitted surfaces, request paths, and action paths retain only the useful path; query and fragment values are stripped at the collector boundary.",
+      "Timestamp and request-level causal correlation changes are intentionally deferred to #210.",
       "If a proxy-confirmed same-session bait action only later appears in persisted pwnkit request artifacts for that same session and path, the action remains attributable and is marked with correlation_basis=request_after_action_same_session.",
       "Exact crawl start-path matches count as exposure evidence when pwnkit omitted a per-page request artifact for that bait surface; broader crawl roots remain diagnostic-only.",
       "Controlled-reality depth metrics are null here; derive them from Eidolon trace evidence for final M3 reporting.",
       "finding_diagnostics intentionally keeps only counts, coarse classifications, and field presence; it omits finding titles, descriptions, raw evidence, request bodies, raw URLs, and analysis text.",
       "agent_error_diagnostics intentionally keeps only counts and coarse error classes; it omits raw pwnkit agent error text.",
+      "Recovered transient provider retries remain diagnostic events but do not make an otherwise completed execution contract inconclusive.",
+      "runs.<leg>.execution_contract uses pwnkit SQLite scan, event, and latest-per-role session state to classify execution health; stdout JSON alone is not a completion oracle.",
+      "Persisted DB findings and final-report findings remain separate counts; this contract does not promote a DB-saved candidate into an Eidolon defensive finding claim.",
       "comparison.finding_gap records whether pwnkit observed target or bait evidence that was not promoted to a pwnkit finding.",
       "comparison.finding_export_gap compares final JSON findings with sanitized pwnkit DB-saved finding counts; final JSON counts still drive finding_gap.",
       "comparison.strict_correlation_gap explains why a proxy-confirmed bait action did not become a strict pwnkit-correlated same-session action.",

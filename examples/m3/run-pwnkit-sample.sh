@@ -276,7 +276,8 @@ summary_has_only_transient_agent_errors() {
     [
       .runs.direct.agent_error_diagnostics.class_counts[]?,
       .runs.eidolon.agent_error_diagnostics.class_counts[]?
-    ] as $classes
+    ]
+    | map(select(.error_class != "recovered_transient_retry")) as $classes
     | ($classes | map(.count // 0) | add // 0) > 0
     and all(
       $classes[];

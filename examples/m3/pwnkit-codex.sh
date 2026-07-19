@@ -115,7 +115,10 @@ fatal.
 
 Current pwnkit builds may append a human `cost: ...` footer after the JSON report.
 The runner stores raw stdout as `pwnkit-<leg>.stdout.log` and normalizes the JSON
-report into `pwnkit-<leg>.json` before validation.
+report into `pwnkit-<leg>.json` before validation. It also preserves
+`pwnkit-<leg>.db`; collectors use that SQLite scan/event/session ledger for
+execution health and keep DB-saved candidate findings distinct from final JSON
+findings.
 
 The preflight mode validates local runner plumbing, writes scope files and
 `pwnkit-runner-metadata.json`, and exits before running pwnkit scans.
@@ -818,12 +821,15 @@ write_runner_metadata() {
   local pwnkit_git_head=""
   local pwnkit_git_head_short=""
   local pwnkit_git_head_time=""
+  local pwnkit_git_branch=""
   local pwnkit_package_version=""
   local pwnkit_git_dirty=""
   local pwnkit_origin_main_head=""
   local pwnkit_origin_main_head_short=""
   local pwnkit_origin_main_ahead=""
   local pwnkit_origin_main_behind=""
+  local pwnkit_origin_fetch_url=""
+  local pwnkit_origin_push_url=""
   local origin_relation=""
   local allow_stale_dist
   local pin_session
@@ -843,6 +849,7 @@ write_runner_metadata() {
         pwnkit_git_head_short="${pwnkit_git_head:0:12}"
       fi
       pwnkit_git_head_time="$(git -C "$pwnkit_repo_dir" log -1 --format=%ct 2>/dev/null || true)"
+      pwnkit_git_branch="$(git -C "$pwnkit_repo_dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
       if [[ -f "$pwnkit_repo_dir/package.json" ]]; then
         pwnkit_package_version="$(jq -r '.version // empty' "$pwnkit_repo_dir/package.json" 2>/dev/null || true)"
       fi
@@ -850,6 +857,8 @@ write_runner_metadata() {
       if [[ -n "$(git -C "$pwnkit_repo_dir" status --porcelain 2>/dev/null)" ]]; then
         pwnkit_git_dirty=true
       fi
+      pwnkit_origin_fetch_url="$(git -C "$pwnkit_repo_dir" remote get-url origin 2>/dev/null || true)"
+      pwnkit_origin_push_url="$(git -C "$pwnkit_repo_dir" remote get-url --push origin 2>/dev/null || true)"
       pwnkit_origin_main_head="$(git -C "$pwnkit_repo_dir" rev-parse refs/remotes/origin/main 2>/dev/null || true)"
       if [[ -n "$pwnkit_origin_main_head" ]]; then
         pwnkit_origin_main_head_short="${pwnkit_origin_main_head:0:12}"
@@ -893,11 +902,14 @@ write_runner_metadata() {
     --arg pwnkit_git_head "$pwnkit_git_head" \
     --arg pwnkit_git_head_short "$pwnkit_git_head_short" \
     --arg pwnkit_git_head_time "$pwnkit_git_head_time" \
+    --arg pwnkit_git_branch "$pwnkit_git_branch" \
     --arg pwnkit_git_dirty "$pwnkit_git_dirty" \
     --arg pwnkit_origin_main_head "$pwnkit_origin_main_head" \
     --arg pwnkit_origin_main_head_short "$pwnkit_origin_main_head_short" \
     --arg pwnkit_origin_main_ahead "$pwnkit_origin_main_ahead" \
     --arg pwnkit_origin_main_behind "$pwnkit_origin_main_behind" \
+    --arg pwnkit_origin_fetch_url "$pwnkit_origin_fetch_url" \
+    --arg pwnkit_origin_push_url "$pwnkit_origin_push_url" \
     --arg pwnkit_fixture_id "$EIDOLON_M3_PWNKIT_FIXTURE_ID" \
     --arg pwnkit_evidence_track "$EIDOLON_M3_PWNKIT_EVIDENCE_TRACK" \
     --arg pwnkit_codex_auth_source "$PWNKIT_CODEX_AUTH_SOURCE" \
@@ -1010,9 +1022,20 @@ write_runner_metadata() {
           else ($pwnkit_git_head_time | tonumber)
           end
         ),
+        git_branch: (
+          if $pwnkit_git_branch == "" then null else $pwnkit_git_branch end
+        ),
         git_dirty: (
           if $pwnkit_git_dirty == "" then null else ($pwnkit_git_dirty == "true") end
         ),
+        remote_origin: {
+          fetch_url: (
+            if $pwnkit_origin_fetch_url == "" then null else $pwnkit_origin_fetch_url end
+          ),
+          push_url: (
+            if $pwnkit_origin_push_url == "" then null else $pwnkit_origin_push_url end
+          )
+        },
         origin_main: {
           head: (
             if $pwnkit_origin_main_head == "" then null else $pwnkit_origin_main_head end
@@ -1156,7 +1179,11 @@ pwnkit_agent_error_count() {
   local db_file="$1"
 
   pwnkit_db_scalar "$db_file" \
-    "select count(*) from pipeline_events where eventType = 'agent_error';"
+    "select count(*)
+     from pipeline_events
+     where eventType = 'agent_error'
+       and lower(coalesce(json_extract(payload, '$.error'), ''))
+         not like 'transient (retry %';"
 }
 
 pwnkit_transient_agent_error_count() {
@@ -1167,6 +1194,8 @@ pwnkit_transient_agent_error_count() {
        select lower(coalesce(json_extract(payload, '$.error'), '')) as error
        from pipeline_events
        where eventType = 'agent_error'
+         and lower(coalesce(json_extract(payload, '$.error'), ''))
+           not like 'transient (retry %'
      )
      select count(*) from agent_errors
      where error not like '%refresh token%'
@@ -1341,6 +1370,19 @@ run_scan() {
     --rate-limit "$PWNKIT_RATE_LIMIT"
   )
 
+  local existing_artifact
+  for existing_artifact in \
+    "$output_json" \
+    "$output_stdout" \
+    "$output_db" \
+    "$output_stderr"; do
+    if [[ -e "$existing_artifact" ]]; then
+      echo "error: refusing to reuse pwnkit $label artifacts; path already exists: $existing_artifact" >&2
+      echo "       use a fresh artifact directory so SQLite rows cannot mix across scans" >&2
+      return 2
+    fi
+  done
+
   case "$label" in
     eidolon)
       scope_file="$PWNKIT_EIDOLON_SCOPE_FILE"
@@ -1444,10 +1486,14 @@ run_scan() {
     if valid_pwnkit_report "$output_json"; then
       report_valid=true
       finding_count_value="$(finding_count "$output_json")"
-      if [[ "$exit_code" -eq 0 || "$finding_count_value" -gt 0 ]]; then
+      if [[ "$exit_code" -eq 0 ]]; then
         action_outcome="completed"
+      elif [[ "$exit_code" -eq 1 && "$finding_count_value" -gt 0 ]]; then
+        action_outcome="completed_with_findings"
+      elif [[ "$exit_code" -eq 4 ]]; then
+        action_outcome="cost_ceiling_exceeded"
       else
-        action_outcome="report_without_findings"
+        action_outcome="report_after_failure"
       fi
     elif [[ "$transient_error_count" -gt 0 ]]; then
       action_outcome="transient_backend_error"
@@ -1535,10 +1581,17 @@ run_scan() {
     return 2
   fi
 
-  if valid_pwnkit_report "$output_json" && has_findings "$output_json"; then
-    echo "warning: pwnkit $label exited $exit_code after writing a valid report with $(finding_count "$output_json") findings; continuing" \
+  if [[ "$exit_code" -eq 1 ]] \
+    && valid_pwnkit_report "$output_json" \
+    && has_findings "$output_json"; then
+    echo "warning: pwnkit $label exited 1 after writing a valid report with $(finding_count "$output_json") findings; continuing" \
       >&2
     return 0
+  fi
+
+  if [[ "$exit_code" -eq 4 ]]; then
+    echo "error: pwnkit $label stopped at its cost ceiling; partial artifacts are diagnostic only" >&2
+    return 4
   fi
 
   if valid_pwnkit_report "$output_json"; then

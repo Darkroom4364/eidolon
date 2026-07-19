@@ -69,8 +69,10 @@ export EIDOLON_M3_PWNKIT_EVIDENCE_TRACK=local_patched_pwnkit
 The Kali wrapper fails closed if `local_patched_pwnkit` is set without a
 fixture id, or if `upstream_current` is set while a fixture id is also present.
 
-For the validated June 2 canonical local patched fixture, use the dedicated
-wrapper instead of setting those variables by hand:
+The default path should now be `upstream_current` from the main
+`0sec-labs/pwnkit` checkout. Use the dedicated local-patched wrapper only when
+you are intentionally reproducing or comparing against older historical
+artifacts:
 
 ```sh
 cd ~/Projects/eidolon
