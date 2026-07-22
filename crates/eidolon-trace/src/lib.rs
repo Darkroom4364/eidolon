@@ -6,7 +6,7 @@ mod timeline;
 
 pub use evidence::{
     evidence_bundle_for_timeline, BaitActionEvidence, BaitExposureEvidence, BaselineComparison,
-    EvidenceBundle, ObservedSurface, PolicyEventEvidence, PolicyEvidenceKind,
+    EvidenceBundle, ObservedSurface, PolicyEventEvidence, PolicyEvidenceKind, ProofOutcome,
 };
 pub use reader::{read_events_jsonl, read_events_jsonl_file, TraceReadError};
 pub use report::{

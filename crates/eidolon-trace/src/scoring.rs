@@ -2,7 +2,7 @@ use eidolon_core::{ConfidenceBand, Event, Score};
 
 use crate::{
     build_session_timelines,
-    evidence::{collect_evidence, EvidenceBundle},
+    evidence::{collect_evidence, EvidenceBundle, ProofOutcome},
     SessionTimeline, TimelineEvent,
 };
 
@@ -38,11 +38,21 @@ pub fn score_evidence(bundle: &EvidenceBundle) -> Score {
     let mut reasons = Vec::new();
     let exposed = !bundle.bait_exposures.is_empty();
     let confirmed = !bundle.matched_actions.is_empty();
-    let acted = confirmed || !bundle.unmatched_actions.is_empty();
-    let same_bait_after_exposure = bundle
+    let rejected = bundle
         .unmatched_actions
         .iter()
-        .any(|action| action.prior_same_bait_exposure.is_some());
+        .any(|action| action.proof_outcome() == ProofOutcome::Rejected);
+    let near_miss = bundle.unmatched_actions.iter().any(|action| {
+        action.proof_outcome() != ProofOutcome::Rejected
+            && action.prior_same_bait_exposure.is_some()
+    });
+    let unknown_linked = bundle.unmatched_actions.iter().any(|action| {
+        action.proof_outcome() == ProofOutcome::Unknown && action.matched_exposure.is_some()
+    });
+    let acted = bundle
+        .unmatched_actions
+        .iter()
+        .any(|action| action.proof_outcome() != ProofOutcome::Rejected);
 
     if exposed {
         points += 15;
@@ -52,10 +62,16 @@ pub fn score_evidence(bundle: &EvidenceBundle) -> Score {
     if confirmed {
         points += 70;
         reasons.push("session performed an action matching bait-derived evidence".to_string());
-    } else if same_bait_after_exposure {
+    } else if near_miss {
         points += 50;
         reasons.push(
             "session performed a same-bait action after exposure, but correlation identifiers did not match"
+                .to_string(),
+        );
+    } else if unknown_linked {
+        points += 40;
+        reasons.push(
+            "session performed an action matching a recorded exposure, but the proof validity is unverifiable; not counted as confirmed"
                 .to_string(),
         );
     } else if acted {
@@ -66,11 +82,18 @@ pub fn score_evidence(bundle: &EvidenceBundle) -> Score {
         );
     }
 
+    if rejected {
+        reasons.push(
+            "rejected bait proof observed (replay, expiry, or mismatch); excluded from confirmed evidence and scoring"
+                .to_string(),
+        );
+    }
+
     let confidence = if confirmed {
         ConfidenceBand::ConfirmedBaitDerivedChain
-    } else if same_bait_after_exposure {
+    } else if near_miss {
         ConfidenceBand::High
-    } else if acted || points >= 20 {
+    } else if acted || unknown_linked || points >= 20 {
         ConfidenceBand::Medium
     } else {
         ConfidenceBand::Low
@@ -227,6 +250,161 @@ mod tests {
         assert_eq!(score.points, 65);
         assert_eq!(score.confidence, ConfidenceBand::High);
         assert!(score.reasons[1].contains("correlation identifiers did not match"));
+    }
+
+    fn minted_action_with(
+        session_id: SessionId,
+        exposure_id: Option<&str>,
+        status: Option<eidolon_core::BaitHeaderValueMintStatus>,
+    ) -> Event {
+        Event::new(
+            session_id,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: BaitId("rel_2025_04_b7f2".to_string()),
+                exposure_id: exposure_id.map(|id| ExposureId(id.to_string())),
+                method: "POST".to_string(),
+                path: "/api/v2/import/reconcile".to_string(),
+                header_value_mint: Some(eidolon_core::BaitHeaderValueMintAudit {
+                    header_name: "X-Trace".to_string(),
+                    kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+                    prefix: "test".to_string(),
+                }),
+                header_value_mint_status: status,
+            },
+        )
+    }
+
+    #[test]
+    fn replayed_proof_after_exposure_scores_no_confirmed_chain() {
+        let session_id = SessionId::new();
+        let score = score_timeline(&timeline(vec![
+            bait_exposed(session_id),
+            minted_action_with(
+                session_id,
+                Some("exp-1"),
+                Some(eidolon_core::BaitHeaderValueMintStatus::ReplaySeen),
+            ),
+        ]));
+
+        assert_eq!(score.points, 15);
+        assert_eq!(score.confidence, ConfidenceBand::Low);
+        assert!(score
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("excluded from confirmed evidence and scoring")));
+    }
+
+    #[test]
+    fn expired_proof_after_exposure_scores_no_confirmed_chain() {
+        let session_id = SessionId::new();
+        let score = score_timeline(&timeline(vec![
+            bait_exposed(session_id),
+            minted_action_with(
+                session_id,
+                Some("exp-1"),
+                Some(eidolon_core::BaitHeaderValueMintStatus::ExpiredSessionValue),
+            ),
+        ]));
+
+        assert_eq!(score.points, 15);
+        assert_eq!(score.confidence, ConfidenceBand::Low);
+        assert!(score
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("excluded from confirmed evidence and scoring")));
+    }
+
+    #[test]
+    fn mismatched_proof_after_exposure_scores_no_confirmed_chain() {
+        let session_id = SessionId::new();
+        let score = score_timeline(&timeline(vec![
+            bait_exposed(session_id),
+            minted_action_with(
+                session_id,
+                Some("exp-1"),
+                Some(eidolon_core::BaitHeaderValueMintStatus::SessionValueMismatch),
+            ),
+        ]));
+
+        assert_eq!(score.points, 15);
+        assert_eq!(score.confidence, ConfidenceBand::Low);
+        assert!(score
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("excluded from confirmed evidence and scoring")));
+    }
+
+    #[test]
+    fn unknown_mint_status_after_exposure_is_medium_not_confirmed() {
+        let session_id = SessionId::new();
+        let score = score_timeline(&timeline(vec![
+            bait_exposed(session_id),
+            minted_action_with(session_id, Some("exp-1"), None),
+        ]));
+
+        assert_eq!(score.points, 55);
+        assert_eq!(score.confidence, ConfidenceBand::Medium);
+        assert_ne!(score.confidence, ConfidenceBand::ConfirmedBaitDerivedChain);
+        assert!(score
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("unverifiable")));
+    }
+
+    #[test]
+    fn mixed_session_confirms_from_accepted_proof_and_flags_rejected() {
+        let session_id = SessionId::new();
+        let minted_exposure = Event::new(
+            session_id,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId("minted-trace".to_string()),
+                exposure_id: ExposureId("exp-minted".to_string()),
+                surface: "/docs/minted-trace".to_string(),
+                header_value_mint: Some(eidolon_core::BaitHeaderValueMintAudit {
+                    header_name: "X-Trace".to_string(),
+                    kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+                    prefix: "test".to_string(),
+                }),
+            },
+        );
+        let replayed_action = Event::new(
+            session_id,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: BaitId("minted-trace".to_string()),
+                exposure_id: Some(ExposureId("exp-minted".to_string())),
+                method: "POST".to_string(),
+                path: "/api/v2/import/reconcile".to_string(),
+                header_value_mint: Some(eidolon_core::BaitHeaderValueMintAudit {
+                    header_name: "X-Trace".to_string(),
+                    kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+                    prefix: "test".to_string(),
+                }),
+                header_value_mint_status: Some(eidolon_core::BaitHeaderValueMintStatus::ReplaySeen),
+            },
+        );
+        let score = score_timeline(&timeline(vec![
+            minted_exposure,
+            replayed_action,
+            bait_exposed(session_id),
+            bait_action(session_id),
+        ]));
+
+        assert_eq!(score.points, 85);
+        assert_eq!(score.confidence, ConfidenceBand::ConfirmedBaitDerivedChain);
+        assert!(score
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("matching bait-derived evidence")));
+        assert!(score
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("excluded from confirmed evidence and scoring")));
     }
 
     #[test]
