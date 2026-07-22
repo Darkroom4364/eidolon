@@ -346,11 +346,13 @@ operator-provided credentials. Treat unscoped authenticated pwnkit artifacts as
 invalid for M3 pinned-session conclusions.
 
 For a session-control replay probe, set `EIDOLON_M3_PIN_SESSION=1` on the
-pwnkit command. The runner gives only the Eidolon leg one generated
-`eidolon_session` cookie and records the UUID in
-`$ART/pinned-eidolon-session-id.txt`. This is useful when testing whether an
-observed marker replay can become same-session evidence without seeding the
-marker itself.
+pwnkit command. The runner mints one signed `eidolon_session` cookie from the
+Eidolon proxy (or takes a full cookie value from `EIDOLON_M3_SESSION_COOKIE`),
+gives it only to the Eidolon leg, and records the bare session UUID in
+`$ART/pinned-eidolon-session-id.txt`. Raw unsigned UUID pins are no longer
+accepted; `EIDOLON_M3_SESSION_ID` was removed because the proxy rejects
+unsigned cookies. This is useful when testing whether an observed marker
+replay can become same-session evidence without seeding the marker itself.
 
 When that file is present, the pwnkit and agent-trace collectors emit a
 `pinned_session` object. `proxy_request_count` answers whether the proxy saw

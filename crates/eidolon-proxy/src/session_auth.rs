@@ -1,0 +1,1500 @@
+//! Integrity-protected session identity for the Shield runtime.
+//!
+//! This module implements the session side of GitHub issue `#207`:
+//!
+//! - session cookies carry an HMAC-SHA256 proof over an explicit format
+//!   version, key version, issue time, and session UUID, so clients can no
+//!   longer choose or forge authoritative session IDs;
+//! - invalid, tampered, stale, or unknown cookies are classified into
+//!   deterministic [`CookieOutcome`] audit outcomes instead of being silently
+//!   ignored or adopted;
+//! - cookie discard/rotation is absorbed by a bounded direct-peer continuity
+//!   map that re-binds the peer to its existing session and carries an
+//!   enforcement floor, so rotation cannot reset policy or evidence state;
+//!   recoveries are cooldown-limited so rapid rotation cannot amplify
+//!   evidence or store churn either;
+//! - key rotation is explicit: cookies signed by retired key versions still
+//!   verify and are transparently re-minted under the active version.
+//!
+//! The continuity map is in-memory, capacity-bounded, and TTL-bounded. It is
+//! a safety net for enforcement state, not a general identity primitive, and
+//! it intentionally avoids any invasive browser fingerprinting.
+
+use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::net::IpAddr;
+
+use eidolon_core::{PolicyState, SessionId};
+use hmac::{Hmac, Mac};
+use serde::Deserialize;
+use sha2::Sha256;
+
+use crate::session::{SESSION_COOKIE_ATTRIBUTES, SESSION_COOKIE_NAME};
+
+type SessionMac = Hmac<Sha256>;
+
+/// Cookie payload format tag. Bump when the payload layout changes.
+pub const COOKIE_FORMAT_TAG: &str = "v1";
+
+/// Default server-side cookie lifetime: 7 days.
+pub const DEFAULT_COOKIE_LIFETIME_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Default continuity record lifetime: 24 hours without a fresh request.
+pub const DEFAULT_CONTINUITY_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Minimum gap between continuity recoveries for one peer.
+///
+/// The first cookie-less or invalid-cookie request inside the gap re-binds to
+/// the peer's existing session; further requests mint fresh sessions that
+/// still inherit the peer's enforcement floor. This bounds evidence churn and
+/// policy-store growth under rapid rotation while keeping enforcement
+/// rotation-proof, and it gives operators a deterministic way to mint
+/// additional distinct lab sessions from one host.
+pub const CONTINUITY_RECOVERY_COOLDOWN_SECS: u64 = 60;
+
+/// Default bound on tracked direct peers for continuity recovery.
+pub const DEFAULT_CONTINUITY_CAPACITY: usize = 4096;
+
+/// Tolerance for cookies whose issue time is slightly ahead of the proxy clock.
+pub const MAX_FUTURE_SKEW_SECS: u64 = 300;
+
+const MAC_HEX_CHARS: usize = 64;
+const SESSION_KEY_BYTES: usize = 32;
+
+/// Deterministic audit outcome for the presented session cookie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookieOutcome {
+    /// No session cookie was present on the request.
+    Absent,
+    /// The cookie carried a valid proof and an acceptable age.
+    Valid,
+    /// The cookie value could not be parsed into the expected shape.
+    Malformed,
+    /// The cookie named a key version the proxy does not hold.
+    UnknownKeyVersion,
+    /// The cookie proof did not verify under the named key version.
+    BadSignature,
+    /// The cookie was validly signed but older than the configured lifetime.
+    Expired,
+}
+
+impl CookieOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Valid => "valid",
+            Self::Malformed => "malformed",
+            Self::UnknownKeyVersion => "unknown_key_version",
+            Self::BadSignature => "bad_signature",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// Relationship between the key version that signed a valid cookie and the
+/// currently active signing key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyStatus {
+    /// The cookie was signed with the active key version.
+    Active,
+    /// The cookie was signed with a retired (previous) key version and is
+    /// re-minted under the active version on the response.
+    Previous,
+}
+
+impl KeyStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Previous => "previous",
+        }
+    }
+}
+
+/// Outcome of bounded direct-peer continuity recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuityOutcome {
+    /// A valid cookie made continuity recovery unnecessary.
+    NotApplicable,
+    /// No fresh continuity record existed for the direct peer.
+    NoRecord,
+    /// The peer was re-bound to its existing session after the cookie was
+    /// missing, invalid, tampered, stale, or unknown.
+    Recovered,
+    /// A recovery already happened inside the cooldown window, so a fresh
+    /// session was minted that still inherits the peer's enforcement floor.
+    CooldownLimited,
+}
+
+impl ContinuityOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::NoRecord => "no_record",
+            Self::Recovered => "recovered",
+            Self::CooldownLimited => "cooldown_limited",
+        }
+    }
+}
+
+/// Result of resolving one request's session identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionResolution {
+    pub session_id: SessionId,
+    pub cookie_outcome: CookieOutcome,
+    /// Signing-key relationship for valid cookies; `None` otherwise.
+    pub key_status: Option<KeyStatus>,
+    /// Key version named by the cookie when it could be parsed.
+    pub presented_key_version: Option<u32>,
+    /// Key version the proxy currently mints with.
+    pub active_key_version: u32,
+    pub continuity_outcome: ContinuityOutcome,
+    /// Minimum enforcement state carried over peer continuity. Applied by the
+    /// caller against freshly loaded policy state so rotation cannot reset
+    /// enforcement.
+    pub enforcement_floor: Option<PolicyState>,
+    /// Full `Set-Cookie` header value to attach to the response, if any.
+    pub set_cookie_value: Option<String>,
+}
+
+impl SessionResolution {
+    /// Whether the session came from a valid authenticated cookie.
+    pub fn from_cookie(&self) -> bool {
+        matches!(self.cookie_outcome, CookieOutcome::Valid)
+    }
+}
+
+/// One versioned HMAC signing key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionKeyVersion {
+    pub version: u32,
+    pub key: [u8; SESSION_KEY_BYTES],
+}
+
+/// JSON key-file shape for `--session-signing-key-file`:
+///
+/// ```json
+/// {
+///   "active_key_version": 2,
+///   "keys": [
+///     {"version": 1, "key_hex": "<64 lowercase hex chars>"},
+///     {"version": 2, "key_hex": "<64 lowercase hex chars>"}
+///   ]
+/// }
+/// ```
+///
+/// All listed versions verify cookies; only `active_key_version` mints.
+/// Rotate by adding the new version, marking it active, and removing retired
+/// versions once their cookies have aged out of the cookie lifetime.
+#[derive(Debug, Deserialize)]
+pub struct SessionKeyFile {
+    pub active_key_version: u32,
+    pub keys: Vec<SessionKeyFileEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionKeyFileEntry {
+    pub version: u32,
+    pub key_hex: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContinuityRecord {
+    session_id: SessionId,
+    floor: Option<PolicyState>,
+    last_seen: u64,
+    last_recovery_at: Option<u64>,
+    recovery_count: u32,
+}
+
+/// Issues, verifies, and recovers session identities.
+#[derive(Debug, Clone)]
+pub struct SessionAuthority {
+    keys: Vec<SessionKeyVersion>,
+    active_key_version: u32,
+    cookie_lifetime_secs: u64,
+    continuity_ttl_secs: u64,
+    continuity_capacity: usize,
+    continuity: HashMap<IpAddr, ContinuityRecord>,
+    continuity_order: VecDeque<IpAddr>,
+}
+
+impl SessionAuthority {
+    /// Build an authority from an explicit key set. `active_key_version` must
+    /// be present in `keys`; every listed version verifies cookies.
+    pub fn new(keys: Vec<SessionKeyVersion>, active_key_version: u32) -> io::Result<Self> {
+        if keys.is_empty() {
+            return Err(invalid_data("session signing key set must not be empty"));
+        }
+        let mut versions: Vec<u32> = keys.iter().map(|key| key.version).collect();
+        versions.sort_unstable();
+        versions.dedup();
+        if versions.len() != keys.len() {
+            return Err(invalid_data("session signing key versions must be unique"));
+        }
+        if !keys.iter().any(|key| key.version == active_key_version) {
+            return Err(invalid_data(format!(
+                "active session signing key version {active_key_version} is not present in the key set"
+            )));
+        }
+
+        Ok(Self {
+            keys,
+            active_key_version,
+            cookie_lifetime_secs: DEFAULT_COOKIE_LIFETIME_SECS,
+            continuity_ttl_secs: DEFAULT_CONTINUITY_TTL_SECS,
+            continuity_capacity: DEFAULT_CONTINUITY_CAPACITY,
+            continuity: HashMap::new(),
+            continuity_order: VecDeque::new(),
+        })
+    }
+
+    /// Parse and validate a JSON key file. See [`SessionKeyFile`] for the
+    /// expected shape.
+    pub fn from_key_file_json(bytes: &[u8]) -> io::Result<Self> {
+        let key_file: SessionKeyFile = serde_json::from_slice(bytes).map_err(|error| {
+            invalid_data(format!("could not parse session signing key file: {error}"))
+        })?;
+        let mut keys = Vec::with_capacity(key_file.keys.len());
+        for entry in &key_file.keys {
+            keys.push(SessionKeyVersion {
+                version: entry.version,
+                key: decode_key_hex(&entry.key_hex).ok_or_else(|| {
+                    invalid_data(format!(
+                        "session signing key version {} must be 64 hex characters",
+                        entry.version
+                    ))
+                })?,
+            });
+        }
+
+        Self::new(keys, key_file.active_key_version)
+    }
+
+    /// Build an authority with a random ephemeral key. Cookies minted under an
+    /// ephemeral key stop verifying when the process restarts; deployments
+    /// that need restart-stable sessions must configure a key file.
+    pub fn ephemeral() -> Self {
+        let mut key = [0u8; SESSION_KEY_BYTES];
+        key[..16].copy_from_slice(&SessionId::new().0.into_bytes());
+        key[16..].copy_from_slice(&SessionId::new().0.into_bytes());
+        Self::new(vec![SessionKeyVersion { version: 1, key }], 1)
+            .expect("ephemeral single-key authority is always valid")
+    }
+
+    pub fn active_key_version(&self) -> u32 {
+        self.active_key_version
+    }
+
+    pub fn key_version_count(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Mint the opaque cookie value (without attributes) for a session.
+    pub fn mint_cookie_value(&self, session_id: SessionId, iat: u64) -> String {
+        let payload = format!(
+            "{}.{}.{}.{}",
+            COOKIE_FORMAT_TAG, self.active_key_version, iat, session_id.0
+        );
+        format!(
+            "{}.{}",
+            payload,
+            self.sign_with(self.active_key_version, &payload)
+        )
+    }
+
+    /// Mint the full `Set-Cookie` header value for a session.
+    pub fn mint_set_cookie_value(&self, session_id: SessionId, iat: u64) -> String {
+        format!(
+            "{}={}; {}",
+            SESSION_COOKIE_NAME,
+            self.mint_cookie_value(session_id, iat),
+            SESSION_COOKIE_ATTRIBUTES
+        )
+    }
+
+    /// Resolve the session identity for one request.
+    ///
+    /// `headers` is an iterator of lowercase-insensitive header name/value
+    /// pairs, `peer_ip` is the direct TCP peer, and `now` is the current UNIX
+    /// time in seconds.
+    pub fn resolve<I, N, V>(
+        &mut self,
+        headers: I,
+        peer_ip: Option<IpAddr>,
+        now: u64,
+    ) -> SessionResolution
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: AsRef<str>,
+        V: AsRef<str>,
+    {
+        self.evict_expired_continuity(now);
+
+        let raw_cookie = session_cookie_value(headers);
+        let Some(raw_cookie) = raw_cookie else {
+            return self.recover_or_mint(peer_ip, now, CookieOutcome::Absent, None);
+        };
+
+        match self.verify(&raw_cookie, now) {
+            Ok(verified) => {
+                let key_status = if verified.key_version == self.active_key_version {
+                    KeyStatus::Active
+                } else {
+                    KeyStatus::Previous
+                };
+                if let Some(peer_ip) = peer_ip {
+                    self.bind_continuity(peer_ip, verified.session_id, now, true);
+                }
+                let set_cookie_value = match key_status {
+                    KeyStatus::Active => None,
+                    KeyStatus::Previous => {
+                        Some(self.mint_set_cookie_value(verified.session_id, now))
+                    }
+                };
+                SessionResolution {
+                    session_id: verified.session_id,
+                    cookie_outcome: CookieOutcome::Valid,
+                    key_status: Some(key_status),
+                    presented_key_version: Some(verified.key_version),
+                    active_key_version: self.active_key_version,
+                    continuity_outcome: ContinuityOutcome::NotApplicable,
+                    enforcement_floor: None,
+                    set_cookie_value,
+                }
+            }
+            Err((outcome, presented_key_version)) => {
+                self.recover_or_mint(peer_ip, now, outcome, presented_key_version)
+            }
+        }
+    }
+
+    /// Record the peer's current enforcement state so a later cookie rotation
+    /// re-inherits at least this state through the enforcement floor.
+    ///
+    /// The floor is monotonic for the lifetime of the continuity record: it
+    /// never decreases while the record is fresh.
+    pub fn note_enforcement(
+        &mut self,
+        peer_ip: Option<IpAddr>,
+        session_id: SessionId,
+        state: PolicyState,
+        now: u64,
+    ) {
+        let Some(peer_ip) = peer_ip else {
+            return;
+        };
+        self.evict_expired_continuity(now);
+        let record = self.continuity_entry(peer_ip, session_id, now);
+        record.floor = Some(match record.floor {
+            Some(existing) if enforcement_rank(existing) >= enforcement_rank(state) => existing,
+            _ => state,
+        });
+    }
+
+    fn recover_or_mint(
+        &mut self,
+        peer_ip: Option<IpAddr>,
+        now: u64,
+        cookie_outcome: CookieOutcome,
+        presented_key_version: Option<u32>,
+    ) -> SessionResolution {
+        if let Some(peer_ip) = peer_ip {
+            if let Some(record) = self.continuity.get(&peer_ip).copied() {
+                if record.last_seen + self.continuity_ttl_secs > now {
+                    let recovery_open = match record.last_recovery_at {
+                        Some(last_recovery_at) => {
+                            now >= last_recovery_at + CONTINUITY_RECOVERY_COOLDOWN_SECS
+                        }
+                        None => true,
+                    };
+                    if recovery_open {
+                        let recovery_count = record.recovery_count.saturating_add(1);
+                        self.continuity.insert(
+                            peer_ip,
+                            ContinuityRecord {
+                                last_seen: now,
+                                last_recovery_at: Some(now),
+                                recovery_count,
+                                ..record
+                            },
+                        );
+                        return SessionResolution {
+                            session_id: record.session_id,
+                            cookie_outcome,
+                            key_status: None,
+                            presented_key_version,
+                            active_key_version: self.active_key_version,
+                            continuity_outcome: ContinuityOutcome::Recovered,
+                            enforcement_floor: record.floor,
+                            set_cookie_value: Some(
+                                self.mint_set_cookie_value(record.session_id, now),
+                            ),
+                        };
+                    }
+
+                    // Recovery is inside the cooldown window: mint a fresh
+                    // session so rapid rotation cannot amplify evidence or
+                    // store churn, but keep the peer's enforcement floor so it
+                    // cannot reset enforcement either.
+                    let session_id = SessionId::new();
+                    self.continuity.insert(
+                        peer_ip,
+                        ContinuityRecord {
+                            session_id,
+                            last_seen: now,
+                            ..record
+                        },
+                    );
+                    return SessionResolution {
+                        session_id,
+                        cookie_outcome,
+                        key_status: None,
+                        presented_key_version,
+                        active_key_version: self.active_key_version,
+                        continuity_outcome: ContinuityOutcome::CooldownLimited,
+                        enforcement_floor: record.floor,
+                        set_cookie_value: Some(self.mint_set_cookie_value(session_id, now)),
+                    };
+                }
+            }
+        }
+
+        let session_id = SessionId::new();
+        if let Some(peer_ip) = peer_ip {
+            self.bind_continuity(peer_ip, session_id, now, true);
+        }
+        SessionResolution {
+            session_id,
+            cookie_outcome,
+            key_status: None,
+            presented_key_version,
+            active_key_version: self.active_key_version,
+            continuity_outcome: ContinuityOutcome::NoRecord,
+            enforcement_floor: None,
+            set_cookie_value: Some(self.mint_set_cookie_value(session_id, now)),
+        }
+    }
+
+    fn verify(&self, raw: &str, now: u64) -> Result<VerifiedCookie, (CookieOutcome, Option<u32>)> {
+        let mut parts = raw.split('.');
+        let (Some(tag), Some(version), Some(iat), Some(uuid), Some(mac), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return Err((CookieOutcome::Malformed, None));
+        };
+        if tag != COOKIE_FORMAT_TAG {
+            return Err((CookieOutcome::Malformed, None));
+        }
+        let key_version: u32 = version
+            .parse()
+            .map_err(|_| (CookieOutcome::Malformed, None))?;
+        let presented_key_version = Some(key_version);
+        let iat: u64 = iat
+            .parse()
+            .map_err(|_| (CookieOutcome::Malformed, presented_key_version))?;
+        let session_uuid = uuid::Uuid::parse_str(uuid)
+            .map_err(|_| (CookieOutcome::Malformed, presented_key_version))?;
+        let mac_bytes =
+            decode_mac_hex(mac).ok_or((CookieOutcome::Malformed, presented_key_version))?;
+
+        let Some(key) = self
+            .keys
+            .iter()
+            .find(|key| key.version == key_version)
+            .map(|key| key.key)
+        else {
+            return Err((CookieOutcome::UnknownKeyVersion, presented_key_version));
+        };
+
+        let payload = format!("{tag}.{key_version}.{iat}.{session_uuid}");
+        let mut mac_verifier =
+            <SessionMac as Mac>::new_from_slice(&key).expect("HMAC-SHA256 accepts any key length");
+        mac_verifier.update(b"eidolon-session:");
+        mac_verifier.update(payload.as_bytes());
+        if mac_verifier.verify_slice(&mac_bytes).is_err() {
+            return Err((CookieOutcome::BadSignature, presented_key_version));
+        }
+
+        if iat > now + MAX_FUTURE_SKEW_SECS {
+            return Err((CookieOutcome::Malformed, presented_key_version));
+        }
+        if now > iat + self.cookie_lifetime_secs {
+            return Err((CookieOutcome::Expired, presented_key_version));
+        }
+
+        Ok(VerifiedCookie {
+            session_id: SessionId(session_uuid),
+            key_version,
+        })
+    }
+
+    fn sign_with(&self, key_version: u32, payload: &str) -> String {
+        let key = self
+            .keys
+            .iter()
+            .find(|key| key.version == key_version)
+            .expect("signing requires a known key version")
+            .key;
+        let mut mac =
+            <SessionMac as Mac>::new_from_slice(&key).expect("HMAC-SHA256 accepts any key length");
+        Mac::update(&mut mac, b"eidolon-session:");
+        Mac::update(&mut mac, payload.as_bytes());
+        let bytes = mac.finalize().into_bytes();
+        encode_hex(&bytes)
+    }
+
+    fn bind_continuity(
+        &mut self,
+        peer_ip: IpAddr,
+        session_id: SessionId,
+        now: u64,
+        reanchor: bool,
+    ) {
+        if self.continuity.contains_key(&peer_ip) {
+            let record = self
+                .continuity
+                .get_mut(&peer_ip)
+                .expect("presence checked above");
+            record.session_id = session_id;
+            record.last_seen = now;
+            if reanchor {
+                record.recovery_count = 0;
+            }
+            return;
+        }
+
+        while self.continuity.len() >= self.continuity_capacity {
+            let Some(oldest) = self.continuity_order.pop_front() else {
+                break;
+            };
+            self.continuity.remove(&oldest);
+        }
+        self.continuity.insert(
+            peer_ip,
+            ContinuityRecord {
+                session_id,
+                floor: None,
+                last_seen: now,
+                last_recovery_at: None,
+                recovery_count: 0,
+            },
+        );
+        self.continuity_order.push_back(peer_ip);
+    }
+
+    fn continuity_entry(
+        &mut self,
+        peer_ip: IpAddr,
+        session_id: SessionId,
+        now: u64,
+    ) -> &mut ContinuityRecord {
+        self.bind_continuity(peer_ip, session_id, now, false);
+        self.continuity
+            .get_mut(&peer_ip)
+            .expect("bind_continuity guarantees the record exists")
+    }
+
+    fn evict_expired_continuity(&mut self, now: u64) {
+        let ttl = self.continuity_ttl_secs;
+        self.continuity
+            .retain(|_, record| record.last_seen + ttl > now);
+        self.continuity_order
+            .retain(|peer| self.continuity.contains_key(peer));
+    }
+}
+
+struct VerifiedCookie {
+    session_id: SessionId,
+    key_version: u32,
+}
+
+/// Extract the first `eidolon_session` cookie value from request headers.
+///
+/// Only the first occurrence is considered; additional duplicates are
+/// ignored, which keeps ambiguous repeated cookies deterministic.
+fn session_cookie_value<I, N, V>(headers: I) -> Option<String>
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
+    for (name, value) in headers {
+        if !name.as_ref().eq_ignore_ascii_case("cookie") {
+            continue;
+        }
+        for pair in value.as_ref().split(';') {
+            let pair = pair.trim();
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if name.trim() == SESSION_COOKIE_NAME && !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Total ordering of policy states for enforcement-floor comparison.
+///
+/// `Blocked` outranks every other state; `ControlledReality` is treated as
+/// deeper containment than `RateLimited`. The floor never downgrades a
+/// session, so ties and parallel rungs resolve to the already-loaded state.
+pub fn enforcement_rank(state: PolicyState) -> u8 {
+    match state {
+        PolicyState::Normal => 0,
+        PolicyState::Observe => 1,
+        PolicyState::Suspicious => 2,
+        PolicyState::RateLimited => 3,
+        PolicyState::ControlledReality => 4,
+        PolicyState::Blocked => 5,
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn decode_hex_nibble(char: u8) -> Option<u8> {
+    match char {
+        b'0'..=b'9' => Some(char - b'0'),
+        b'a'..=b'f' => Some(char - b'a' + 10),
+        b'A'..=b'F' => Some(char - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_key_hex(raw: &str) -> Option<[u8; SESSION_KEY_BYTES]> {
+    let bytes = raw.as_bytes();
+    if bytes.len() != SESSION_KEY_BYTES * 2 {
+        return None;
+    }
+    let mut key = [0u8; SESSION_KEY_BYTES];
+    for (index, chunk) in bytes.chunks_exact(2).enumerate() {
+        key[index] = (decode_hex_nibble(chunk[0])? << 4) | decode_hex_nibble(chunk[1])?;
+    }
+    Some(key)
+}
+
+fn decode_mac_hex(raw: &str) -> Option<Vec<u8>> {
+    let bytes = raw.as_bytes();
+    if bytes.len() != MAC_HEX_CHARS {
+        return None;
+    }
+    let mut out = Vec::with_capacity(MAC_HEX_CHARS / 2);
+    for chunk in bytes.chunks_exact(2) {
+        out.push((decode_hex_nibble(chunk[0])? << 4) | decode_hex_nibble(chunk[1])?);
+    }
+    Some(out)
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 1_750_000_000;
+
+    fn test_key(fill: u8) -> [u8; SESSION_KEY_BYTES] {
+        [fill; SESSION_KEY_BYTES]
+    }
+
+    fn test_authority() -> SessionAuthority {
+        SessionAuthority::new(
+            vec![SessionKeyVersion {
+                version: 1,
+                key: test_key(0x42),
+            }],
+            1,
+        )
+        .expect("test authority should build")
+    }
+
+    fn peer() -> IpAddr {
+        "127.0.0.1".parse().expect("peer IP should parse")
+    }
+
+    fn cookie_header(value: &str) -> [(&'static str, String); 1] {
+        [("Cookie", format!("{}={}", SESSION_COOKIE_NAME, value))]
+    }
+
+    #[test]
+    fn minted_cookie_roundtrips() {
+        let mut authority = test_authority();
+        let session_id = SessionId::new();
+        let value = authority.mint_cookie_value(session_id, NOW);
+
+        let resolution = authority.resolve(cookie_header(&value), Some(peer()), NOW + 10);
+
+        assert_eq!(resolution.session_id, session_id);
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Valid);
+        assert_eq!(resolution.key_status, Some(KeyStatus::Active));
+        assert_eq!(resolution.presented_key_version, Some(1));
+        assert_eq!(resolution.active_key_version, 1);
+        assert_eq!(
+            resolution.continuity_outcome,
+            ContinuityOutcome::NotApplicable
+        );
+        assert_eq!(resolution.enforcement_floor, None);
+        assert_eq!(resolution.set_cookie_value, None);
+        assert!(resolution.from_cookie());
+    }
+
+    #[test]
+    fn previous_key_version_verifies_and_is_reminted() {
+        let mut authority = SessionAuthority::new(
+            vec![
+                SessionKeyVersion {
+                    version: 1,
+                    key: test_key(0x42),
+                },
+                SessionKeyVersion {
+                    version: 2,
+                    key: test_key(0x43),
+                },
+            ],
+            2,
+        )
+        .expect("two-version authority should build");
+        let session_id = SessionId::new();
+        let old_value = {
+            let payload = format!("{}.{}.{}.{}", COOKIE_FORMAT_TAG, 1, NOW, session_id.0);
+            format!("{}.{}", payload, authority.sign_with(1, &payload))
+        };
+
+        let resolution = authority.resolve(cookie_header(&old_value), Some(peer()), NOW + 10);
+
+        assert_eq!(resolution.session_id, session_id);
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Valid);
+        assert_eq!(resolution.key_status, Some(KeyStatus::Previous));
+        assert_eq!(resolution.presented_key_version, Some(1));
+        assert_eq!(resolution.active_key_version, 2);
+        let set_cookie = resolution
+            .set_cookie_value
+            .expect("previous-key cookie should be re-minted");
+        assert!(set_cookie.contains(&format!("{}.", COOKIE_FORMAT_TAG)));
+        assert!(set_cookie.contains(".2."));
+    }
+
+    #[test]
+    fn forged_session_id_is_not_adopted() {
+        let mut authority = test_authority();
+        let forged = format!(
+            "{}.1.{}.{}.{}",
+            COOKIE_FORMAT_TAG,
+            NOW,
+            SessionId::new().0,
+            "0".repeat(MAC_HEX_CHARS)
+        );
+
+        let resolution = authority.resolve(cookie_header(&forged), Some(peer()), NOW);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::BadSignature);
+        assert_ne!(resolution.session_id.0.to_string(), forged);
+        assert!(!resolution.from_cookie());
+        assert!(resolution.set_cookie_value.is_some());
+    }
+
+    #[test]
+    fn unsigned_legacy_uuid_cookie_is_malformed() {
+        let mut authority = test_authority();
+        let legacy = SessionId::new().0.to_string();
+
+        let resolution = authority.resolve(cookie_header(&legacy), Some(peer()), NOW);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Malformed);
+        assert_ne!(resolution.session_id.0.to_string(), legacy);
+    }
+
+    #[test]
+    fn unknown_key_version_is_reported() {
+        let mut authority = test_authority();
+        let session_id = SessionId::new();
+        let payload = format!("{}.9.{}.{}", COOKIE_FORMAT_TAG, NOW, session_id.0);
+        let value = format!("{}.{}", payload, authority.sign_with(1, &payload));
+
+        let resolution = authority.resolve(cookie_header(&value), Some(peer()), NOW);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::UnknownKeyVersion);
+        assert_eq!(resolution.presented_key_version, Some(9));
+    }
+
+    #[test]
+    fn expired_cookie_is_reported_and_not_adopted() {
+        let mut authority = test_authority();
+        let session_id = SessionId::new();
+        let stale_iat = NOW - DEFAULT_COOKIE_LIFETIME_SECS - 10;
+        let value = authority.mint_cookie_value(session_id, stale_iat);
+
+        let resolution = authority.resolve(cookie_header(&value), Some(peer()), NOW);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Expired);
+        assert_ne!(resolution.session_id, session_id);
+    }
+
+    #[test]
+    fn future_dated_cookie_is_malformed() {
+        let mut authority = test_authority();
+        let session_id = SessionId::new();
+        let value = authority.mint_cookie_value(session_id, NOW + MAX_FUTURE_SKEW_SECS + 60);
+
+        let resolution = authority.resolve(cookie_header(&value), Some(peer()), NOW);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Malformed);
+        assert_ne!(resolution.session_id, session_id);
+    }
+
+    #[test]
+    fn absent_cookie_mints_new_session() {
+        let mut authority = test_authority();
+
+        let resolution = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Absent);
+        assert_eq!(resolution.continuity_outcome, ContinuityOutcome::NoRecord);
+        assert!(resolution.set_cookie_value.is_some());
+    }
+
+    #[test]
+    fn discarded_cookie_recovers_existing_peer_session() {
+        let mut authority = test_authority();
+        let original = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+        assert_eq!(original.continuity_outcome, ContinuityOutcome::NoRecord);
+
+        let rotated = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 5);
+
+        assert_eq!(rotated.session_id, original.session_id);
+        assert_eq!(rotated.cookie_outcome, CookieOutcome::Absent);
+        assert_eq!(rotated.continuity_outcome, ContinuityOutcome::Recovered);
+        assert!(rotated.set_cookie_value.is_some());
+    }
+
+    #[test]
+    fn rapid_second_discard_mints_fresh_session_but_keeps_enforcement_floor() {
+        let mut authority = test_authority();
+        let original = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+        authority.note_enforcement(
+            Some(peer()),
+            original.session_id,
+            PolicyState::Blocked,
+            NOW + 1,
+        );
+
+        let first = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 5);
+        assert_eq!(first.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(first.session_id, original.session_id);
+        assert_eq!(first.enforcement_floor, Some(PolicyState::Blocked));
+
+        let second = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 6);
+        assert_eq!(
+            second.continuity_outcome,
+            ContinuityOutcome::CooldownLimited
+        );
+        assert_ne!(second.session_id, original.session_id);
+        assert_eq!(second.enforcement_floor, Some(PolicyState::Blocked));
+        assert!(second.set_cookie_value.is_some());
+    }
+
+    #[test]
+    fn recovery_reopens_after_cooldown_window() {
+        let mut authority = test_authority();
+        let original = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+
+        let first = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 5);
+        assert_eq!(first.continuity_outcome, ContinuityOutcome::Recovered);
+
+        let limited = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 6);
+        assert_eq!(
+            limited.continuity_outcome,
+            ContinuityOutcome::CooldownLimited
+        );
+
+        let reopened = authority.resolve(
+            [("Host", "proxy.local")],
+            Some(peer()),
+            NOW + 6 + CONTINUITY_RECOVERY_COOLDOWN_SECS,
+        );
+        assert_eq!(reopened.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(reopened.session_id, limited.session_id);
+        assert_ne!(reopened.session_id, original.session_id);
+    }
+
+    #[test]
+    fn forged_cookie_after_rotation_recovers_original_session() {
+        let mut authority = test_authority();
+        let original = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+        let forged = format!(
+            "{}.1.{}.{}.{}",
+            COOKIE_FORMAT_TAG,
+            NOW,
+            SessionId::new().0,
+            "f".repeat(MAC_HEX_CHARS)
+        );
+
+        let resolution = authority.resolve(cookie_header(&forged), Some(peer()), NOW + 5);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::BadSignature);
+        assert_eq!(resolution.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(resolution.session_id, original.session_id);
+    }
+
+    #[test]
+    fn enforcement_floor_is_monotonic_and_survives_rotation() {
+        let mut authority = test_authority();
+        let original = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+        authority.note_enforcement(
+            Some(peer()),
+            original.session_id,
+            PolicyState::Blocked,
+            NOW + 1,
+        );
+        authority.note_enforcement(
+            Some(peer()),
+            original.session_id,
+            PolicyState::Observe,
+            NOW + 2,
+        );
+
+        let rotated = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 5);
+
+        assert_eq!(rotated.session_id, original.session_id);
+        assert_eq!(rotated.enforcement_floor, Some(PolicyState::Blocked));
+    }
+
+    #[test]
+    fn enforcement_floor_applies_to_new_session_after_ttl_expiry() {
+        let mut authority = test_authority();
+        let original = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+        authority.note_enforcement(
+            Some(peer()),
+            original.session_id,
+            PolicyState::Blocked,
+            NOW + 1,
+        );
+
+        let after_expiry = authority.resolve(
+            [("Host", "proxy.local")],
+            Some(peer()),
+            NOW + DEFAULT_CONTINUITY_TTL_SECS + 10,
+        );
+
+        assert_eq!(after_expiry.continuity_outcome, ContinuityOutcome::NoRecord);
+        assert_ne!(after_expiry.session_id, original.session_id);
+        assert_eq!(after_expiry.enforcement_floor, None);
+    }
+
+    #[test]
+    fn distinct_peers_do_not_share_continuity() {
+        let mut authority = test_authority();
+        let first = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+        let other_peer: IpAddr = "127.0.0.2".parse().expect("peer IP should parse");
+
+        let second = authority.resolve([("Host", "proxy.local")], Some(other_peer), NOW + 1);
+
+        assert_ne!(second.session_id, first.session_id);
+        assert_eq!(second.continuity_outcome, ContinuityOutcome::NoRecord);
+    }
+
+    #[test]
+    fn none_peer_ip_disables_continuity() {
+        let mut authority = test_authority();
+        let first = authority.resolve([("Host", "proxy.local")], None, NOW);
+        let second = authority.resolve([("Host", "proxy.local")], None, NOW + 1);
+
+        assert_eq!(first.continuity_outcome, ContinuityOutcome::NoRecord);
+        assert_eq!(second.continuity_outcome, ContinuityOutcome::NoRecord);
+        assert_ne!(second.session_id, first.session_id);
+    }
+
+    #[test]
+    fn continuity_map_is_capacity_bounded() {
+        let mut authority = SessionAuthority {
+            continuity_capacity: 2,
+            ..test_authority()
+        };
+        let peer_a = peer();
+        let peer_b: IpAddr = "127.0.0.2".parse().expect("peer IP should parse");
+        let peer_c: IpAddr = "127.0.0.3".parse().expect("peer IP should parse");
+
+        authority.resolve([("Host", "proxy.local")], Some(peer_a), NOW);
+        authority.resolve([("Host", "proxy.local")], Some(peer_b), NOW + 1);
+        authority.resolve([("Host", "proxy.local")], Some(peer_c), NOW + 2);
+
+        assert_eq!(authority.continuity.len(), 2);
+        assert!(!authority.continuity.contains_key(&peer_a));
+
+        let recovered_b = authority.resolve([("Host", "proxy.local")], Some(peer_b), NOW + 3);
+        assert_eq!(recovered_b.continuity_outcome, ContinuityOutcome::Recovered);
+    }
+
+    #[test]
+    fn first_cookie_occurrence_wins_over_duplicates() {
+        let mut authority = test_authority();
+        let session_id = SessionId::new();
+        let valid = authority.mint_cookie_value(session_id, NOW);
+        let headers = [(
+            "Cookie",
+            format!(
+                "{}=garbage; {}={}",
+                SESSION_COOKIE_NAME, SESSION_COOKIE_NAME, valid
+            ),
+        )];
+
+        let resolution = authority.resolve(headers, Some(peer()), NOW);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Malformed);
+        assert_ne!(resolution.session_id, session_id);
+    }
+
+    #[test]
+    fn key_file_roundtrip_and_validation() {
+        let json = br#"{
+            "active_key_version": 2,
+            "keys": [
+                {"version": 1, "key_hex": "4242424242424242424242424242424242424242424242424242424242424242"},
+                {"version": 2, "key_hex": "4343434343434343434343434343434343434343434343434343434343434343"}
+            ]
+        }"#;
+        let authority =
+            SessionAuthority::from_key_file_json(json).expect("valid key file should parse");
+        assert_eq!(authority.active_key_version(), 2);
+        assert_eq!(authority.key_version_count(), 2);
+
+        let missing_active = br#"{
+            "active_key_version": 3,
+            "keys": [
+                {"version": 1, "key_hex": "4242424242424242424242424242424242424242424242424242424242424242"}
+            ]
+        }"#;
+        assert!(SessionAuthority::from_key_file_json(missing_active).is_err());
+
+        let bad_hex = br#"{
+            "active_key_version": 1,
+            "keys": [
+                {"version": 1, "key_hex": "not-hex"}
+            ]
+        }"#;
+        assert!(SessionAuthority::from_key_file_json(bad_hex).is_err());
+
+        let duplicates = br#"{
+            "active_key_version": 1,
+            "keys": [
+                {"version": 1, "key_hex": "4242424242424242424242424242424242424242424242424242424242424242"},
+                {"version": 1, "key_hex": "4343434343434343434343434343434343434343434343434343434343434343"}
+            ]
+        }"#;
+        assert!(SessionAuthority::from_key_file_json(duplicates).is_err());
+    }
+
+    #[test]
+    fn set_cookie_value_carries_stable_attributes() {
+        let authority = test_authority();
+        let session_id = SessionId::new();
+
+        let value = authority.mint_set_cookie_value(session_id, NOW);
+
+        assert!(value.starts_with(&format!("{}={}.1.", SESSION_COOKIE_NAME, COOKIE_FORMAT_TAG)));
+        assert!(value.contains("Path=/"));
+        assert!(value.contains("HttpOnly"));
+        assert!(value.contains("SameSite=Lax"));
+        assert!(!value.contains("Domain="));
+        assert!(!value.contains("Secure"));
+    }
+
+    #[test]
+    fn documented_constant_values_are_pinned() {
+        assert_eq!(DEFAULT_COOKIE_LIFETIME_SECS, 604_800);
+        assert_eq!(DEFAULT_CONTINUITY_TTL_SECS, 86_400);
+        assert_eq!(CONTINUITY_RECOVERY_COOLDOWN_SECS, 60);
+        assert_eq!(DEFAULT_CONTINUITY_CAPACITY, 4096);
+        assert_eq!(MAX_FUTURE_SKEW_SECS, 300);
+    }
+
+    #[test]
+    fn empty_key_set_is_rejected() {
+        let error = SessionAuthority::new(vec![], 1).expect_err("empty key set must fail");
+
+        assert!(
+            error.to_string().contains("must not be empty"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn non_adjacent_duplicate_key_versions_are_rejected() {
+        let result = SessionAuthority::new(
+            vec![
+                SessionKeyVersion {
+                    version: 1,
+                    key: test_key(0x42),
+                },
+                SessionKeyVersion {
+                    version: 2,
+                    key: test_key(0x43),
+                },
+                SessionKeyVersion {
+                    version: 1,
+                    key: test_key(0x44),
+                },
+            ],
+            1,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ephemeral_authority_roundtrips_and_distinct_instances_diverge() {
+        let mut authority = SessionAuthority::ephemeral();
+        let mut other = SessionAuthority::ephemeral();
+
+        assert_eq!(authority.active_key_version(), 1);
+        assert_eq!(authority.key_version_count(), 1);
+        assert_ne!(authority.keys[0].key[..16], [0u8; 16]);
+        assert_ne!(authority.keys[0].key[16..], [0u8; 16]);
+        assert_ne!(authority.keys[0].key, other.keys[0].key);
+
+        let session_id = SessionId::new();
+        let cookie = authority.mint_cookie_value(session_id, NOW);
+
+        let own = authority.resolve(cookie_header(&cookie), Some(peer()), NOW);
+        assert_eq!(own.cookie_outcome, CookieOutcome::Valid);
+        assert_eq!(own.session_id, session_id);
+
+        let foreign = other.resolve(cookie_header(&cookie), Some(peer()), NOW);
+        assert_eq!(foreign.cookie_outcome, CookieOutcome::BadSignature);
+        assert_ne!(foreign.session_id, session_id);
+    }
+
+    #[test]
+    fn valid_cookie_rebinds_peer_continuity_to_latest_session() {
+        let mut authority = test_authority();
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        let cookie_a = authority.mint_cookie_value(session_a, NOW);
+        let cookie_b = authority.mint_cookie_value(session_b, NOW);
+
+        let presented_a = authority.resolve(cookie_header(&cookie_a), Some(peer()), NOW);
+        assert_eq!(presented_a.cookie_outcome, CookieOutcome::Valid);
+
+        let discarded = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 1);
+        assert_eq!(discarded.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(discarded.session_id, session_a);
+
+        let presented_b = authority.resolve(cookie_header(&cookie_b), Some(peer()), NOW + 2);
+        assert_eq!(presented_b.cookie_outcome, CookieOutcome::Valid);
+
+        let after_cooldown = authority.resolve(
+            [("Host", "proxy.local")],
+            Some(peer()),
+            NOW + 1 + CONTINUITY_RECOVERY_COOLDOWN_SECS,
+        );
+        assert_eq!(
+            after_cooldown.continuity_outcome,
+            ContinuityOutcome::Recovered
+        );
+        assert_eq!(after_cooldown.session_id, session_b);
+    }
+
+    #[test]
+    fn valid_cookie_rebind_refreshes_continuity_freshness() {
+        let mut authority = test_authority();
+        authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+        authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 1);
+
+        let session_b = SessionId::new();
+        let cookie_b = authority.mint_cookie_value(session_b, NOW + 2);
+        let presented_b = authority.resolve(cookie_header(&cookie_b), Some(peer()), NOW + 2);
+        assert_eq!(presented_b.cookie_outcome, CookieOutcome::Valid);
+
+        // Just before the TTL horizon measured from the rebind, the record
+        // must still be fresh; a stale rebind timestamp would expire it here.
+        let late = authority.resolve(
+            [("Host", "proxy.local")],
+            Some(peer()),
+            NOW + 2 + DEFAULT_CONTINUITY_TTL_SECS - 1,
+        );
+        assert_eq!(late.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(late.session_id, session_b);
+    }
+
+    #[test]
+    fn minted_cookie_matches_golden_vector() {
+        let authority = SessionAuthority::from_key_file_json(
+            br#"{
+                "active_key_version": 1,
+                "keys": [
+                    {"version": 1, "key_hex": "4242424242424242424242424242424242424242424242424242424242424242"}
+                ]
+            }"#,
+        )
+        .expect("golden key file should parse");
+        let session_id = SessionId(
+            uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+                .expect("fixed uuid should parse"),
+        );
+
+        let cookie = authority.mint_cookie_value(session_id, NOW);
+
+        assert_eq!(
+            cookie,
+            "v1.1.1750000000.11111111-1111-4111-8111-111111111111.\
+             37975ff83d3bc77fdbbd41755a89f1b228e1bd746ef1d754f7a6d54b72cb3646"
+        );
+    }
+
+    #[test]
+    fn continuity_ttl_boundary_is_exact() {
+        let mut at_boundary = test_authority();
+        let original = at_boundary.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+
+        let expired = at_boundary.resolve(
+            [("Host", "proxy.local")],
+            Some(peer()),
+            NOW + DEFAULT_CONTINUITY_TTL_SECS,
+        );
+        assert_eq!(expired.continuity_outcome, ContinuityOutcome::NoRecord);
+        assert_ne!(expired.session_id, original.session_id);
+
+        let mut just_before = test_authority();
+        let original = just_before.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+
+        let still_valid = just_before.resolve(
+            [("Host", "proxy.local")],
+            Some(peer()),
+            NOW + DEFAULT_CONTINUITY_TTL_SECS - 1,
+        );
+        assert_eq!(still_valid.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(still_valid.session_id, original.session_id);
+    }
+
+    #[test]
+    fn wrong_format_tag_is_malformed_even_with_a_valid_signature() {
+        let mut authority = test_authority();
+        let session_id = SessionId::new();
+        let payload = format!("v2.1.{}.{}", NOW, session_id.0);
+        let cookie = format!("{}.{}", payload, authority.sign_with(1, &payload));
+
+        let resolution = authority.resolve(cookie_header(&cookie), Some(peer()), NOW);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Malformed);
+        assert_ne!(resolution.session_id, session_id);
+    }
+
+    #[test]
+    fn non_hex_mac_is_malformed_not_bad_signature() {
+        let mut authority = test_authority();
+        let session_id = SessionId::new();
+        let cookie = format!(
+            "{}.1.{}.{}.{}",
+            COOKIE_FORMAT_TAG,
+            NOW,
+            session_id.0,
+            "z".repeat(MAC_HEX_CHARS)
+        );
+
+        let resolution = authority.resolve(cookie_header(&cookie), Some(peer()), NOW);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Malformed);
+    }
+
+    #[test]
+    fn wrong_length_hex_mac_is_malformed() {
+        let mut authority = test_authority();
+        let session_id = SessionId::new();
+        let short_mac = format!(
+            "{}.1.{}.{}.{}",
+            COOKIE_FORMAT_TAG,
+            NOW,
+            session_id.0,
+            "a".repeat(MAC_HEX_CHARS - 1)
+        );
+
+        let resolution = authority.resolve(cookie_header(&short_mac), Some(peer()), NOW);
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Malformed);
+    }
+
+    #[test]
+    fn non_hex_key_in_key_file_is_rejected() {
+        let json = br#"{
+            "active_key_version": 1,
+            "keys": [
+                {"version": 1, "key_hex": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}
+            ]
+        }"#;
+
+        assert!(SessionAuthority::from_key_file_json(json).is_err());
+    }
+
+    #[test]
+    fn wrong_length_key_in_key_file_is_rejected() {
+        let json = br#"{
+            "active_key_version": 1,
+            "keys": [
+                {"version": 1, "key_hex": "4242"}
+            ]
+        }"#;
+
+        assert!(SessionAuthority::from_key_file_json(json).is_err());
+    }
+
+    #[test]
+    fn hex_codec_decodes_both_cases_and_rejects_non_hex() {
+        assert_eq!(decode_hex_nibble(b'0'), Some(0));
+        assert_eq!(decode_hex_nibble(b'9'), Some(9));
+        assert_eq!(decode_hex_nibble(b'a'), Some(10));
+        assert_eq!(decode_hex_nibble(b'f'), Some(15));
+        assert_eq!(decode_hex_nibble(b'A'), Some(10));
+        assert_eq!(decode_hex_nibble(b'F'), Some(15));
+        assert_eq!(decode_hex_nibble(b'g'), None);
+        assert_eq!(decode_hex_nibble(b' '), None);
+
+        let bytes = [0x00, 0xab, 0xff, 0x10];
+        assert_eq!(encode_hex(&bytes), "00abff10");
+        assert_eq!(
+            decode_mac_hex("00abff10"),
+            None,
+            "short inputs must not decode as a mac"
+        );
+    }
+
+    #[test]
+    fn enforcement_ranks_are_strictly_ordered() {
+        let ladder = [
+            PolicyState::Normal,
+            PolicyState::Observe,
+            PolicyState::Suspicious,
+            PolicyState::RateLimited,
+            PolicyState::ControlledReality,
+            PolicyState::Blocked,
+        ];
+
+        for pair in ladder.windows(2) {
+            assert!(
+                enforcement_rank(pair[0]) < enforcement_rank(pair[1]),
+                "{:?} must outrank {:?}",
+                pair[1],
+                pair[0]
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_pairs_in_non_cookie_headers_are_ignored() {
+        let mut authority = test_authority();
+        let session_id = SessionId::new();
+        let cookie = authority.mint_cookie_value(session_id, NOW);
+
+        let resolution = authority.resolve(
+            [("X-Forwarded-Cookie", format!("eidolon_session={cookie}"))],
+            Some(peer()),
+            NOW,
+        );
+
+        assert_eq!(resolution.cookie_outcome, CookieOutcome::Absent);
+        assert_ne!(resolution.session_id, session_id);
+    }
+
+    #[test]
+    fn note_enforcement_creates_a_record_for_an_unseen_peer() {
+        let mut authority = test_authority();
+        let session_id = SessionId::new();
+
+        authority.note_enforcement(Some(peer()), session_id, PolicyState::RateLimited, NOW);
+
+        let resolution = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 1);
+        assert_eq!(resolution.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(resolution.session_id, session_id);
+        assert_eq!(resolution.enforcement_floor, Some(PolicyState::RateLimited));
+    }
+
+    #[test]
+    fn expired_continuity_records_are_evicted_from_the_map() {
+        let mut authority = test_authority();
+        let stale_peer: IpAddr = "127.0.0.9".parse().expect("peer IP should parse");
+        authority.resolve([("Host", "proxy.local")], Some(stale_peer), NOW);
+        authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+        assert_eq!(authority.continuity.len(), 2);
+
+        let after_expiry = NOW + DEFAULT_CONTINUITY_TTL_SECS + 10;
+        authority.resolve([("Host", "proxy.local")], Some(peer()), after_expiry);
+
+        assert!(!authority.continuity.contains_key(&stale_peer));
+        assert_eq!(authority.continuity.len(), 1);
+        assert_eq!(
+            authority.continuity_order.len(),
+            authority.continuity.len(),
+            "eviction must keep the FIFO order deque in sync with the map"
+        );
+        assert!(!authority.continuity_order.contains(&stale_peer));
+
+        authority.resolve([("Host", "proxy.local")], Some(stale_peer), NOW + 1);
+        assert_eq!(authority.continuity.len(), 2);
+        authority.note_enforcement(
+            Some(peer()),
+            SessionId::new(),
+            PolicyState::Observe,
+            after_expiry,
+        );
+        assert!(!authority.continuity.contains_key(&stale_peer));
+    }
+
+    #[test]
+    fn recovery_count_tracks_recoveries_and_resets_on_valid_cookie() {
+        let mut authority = test_authority();
+        authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+
+        let first = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 5);
+        assert_eq!(first.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(
+            authority
+                .continuity
+                .get(&peer())
+                .map(|record| record.recovery_count),
+            Some(1)
+        );
+
+        let limited = authority.resolve([("Host", "proxy.local")], Some(peer()), NOW + 6);
+        assert_eq!(
+            limited.continuity_outcome,
+            ContinuityOutcome::CooldownLimited
+        );
+        assert_eq!(
+            authority
+                .continuity
+                .get(&peer())
+                .map(|record| record.recovery_count),
+            Some(1),
+            "cooldown-limited mints must not count as recoveries"
+        );
+
+        let cookie = authority.mint_cookie_value(limited.session_id, NOW + 7);
+        let presented = authority.resolve(cookie_header(&cookie), Some(peer()), NOW + 7);
+        assert_eq!(presented.cookie_outcome, CookieOutcome::Valid);
+        assert_eq!(
+            authority
+                .continuity
+                .get(&peer())
+                .map(|record| record.recovery_count),
+            Some(0),
+            "a valid cookie must re-anchor the peer"
+        );
+    }
+}
