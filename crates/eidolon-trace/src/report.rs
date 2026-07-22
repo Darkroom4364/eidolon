@@ -4,11 +4,12 @@ use eidolon_core::{
     BaitHeaderValueMintAudit, BaitHeaderValueMintStatus,
     EdgeAuthenticatedIngressRuleRejectionHistory, EdgeBaitHeaderValueMintAudit, EdgeEvidenceRef,
     EdgeLocalIngressTrustScopeRejectionHistory, EdgeObservedBaitHeaderValueMint,
-    EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestRef,
-    EdgeTrustedIngressSoftenHistory, EidolonEdgeDecisionExport, EventKind, IngressAdvisorySignals,
-    PolicyState, PostContainmentPersistenceKind, PreContainmentPersistenceClass,
-    PreContainmentPersistenceKind, RoutingDecision, POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY,
-    PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY, TRUSTED_INGRESS_CONTRACT_VERSION,
+    EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestLinkage,
+    EdgeRequestRef, EdgeTrustedIngressSoftenHistory, EidolonEdgeDecisionExport, EventKind,
+    IngressAdvisorySignals, PolicyState, PostContainmentPersistenceKind,
+    PreContainmentPersistenceClass, PreContainmentPersistenceKind, RoutingDecision,
+    POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY, PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY,
+    TRUSTED_INGRESS_CONTRACT_VERSION,
 };
 
 use crate::evidence::{trace_metric_summary_for_timeline, ProofOutcome};
@@ -304,18 +305,36 @@ pub fn edge_decision_export_for_evidence(
         discovery_recon_score,
         request_routing_decision,
     ) = latest_request;
-    let latest_policy_routing_event = bundle
+    let linked_request_id = request_event.event.request_id;
+    let event_belongs_to_linked_request = |event_ref: &TimelineEventRef| -> bool {
+        let Some(linked_request_id) = linked_request_id else {
+            return false;
+        };
+        timeline_event_by_ref(timeline, *event_ref)
+            .is_some_and(|event| event.event.request_id == Some(linked_request_id))
+    };
+    let request_linkage = if linked_request_id.is_some() {
+        EdgeRequestLinkage::Linked
+    } else {
+        EdgeRequestLinkage::UnknownLegacy
+    };
+    let latest_policy_routing_event = bundle.policy_events.iter().rev().find(|event| {
+        event.routing_decision.is_some() && event_belongs_to_linked_request(&event.event_ref)
+    });
+    let fallback_policy_snapshot_event = latest_policy_routing_event.or(bundle
         .policy_events
-        .iter()
-        .rev()
-        .find(|event| event.routing_decision.is_some());
-    let fallback_policy_snapshot_event =
-        latest_policy_routing_event.or(bundle.policy_events.last());
+        .last()
+        .filter(|event| event_belongs_to_linked_request(&event.event_ref)));
     let policy_state = fallback_policy_snapshot_event
         .map(|event| event.policy_state)
-        .or(bundle.policy_state)
+        .or(if linked_request_id.is_some() {
+            bundle.policy_state
+        } else {
+            None
+        })
         .unwrap_or(request_event.event.policy_state);
-    let latest_policy_reason_event = preferred_policy_reason_event(bundle, policy_state);
+    let latest_policy_reason_event = preferred_policy_reason_event(bundle, policy_state)
+        .filter(|event| event_belongs_to_linked_request(&event.event_ref));
     let routing_decision = latest_policy_routing_event
         .and_then(|event| event.routing_decision)
         .unwrap_or(request_routing_decision);
@@ -336,7 +355,11 @@ pub fn edge_decision_export_for_evidence(
         contract_version: TRUSTED_INGRESS_CONTRACT_VERSION.to_string(),
         observed_at: request_event.event.observed_at,
         session_id: bundle.session_id,
-        request: EdgeRequestRef { method, path },
+        request: EdgeRequestRef {
+            method,
+            path,
+            request_id: linked_request_id,
+        },
         ingress_identity,
         authenticated_ingress_rule_rejection,
         local_ingress_trust_scope_rejection,
@@ -360,6 +383,7 @@ pub fn edge_decision_export_for_evidence(
                 [latest_policy_reason_event, latest_policy_routing_event],
             ),
             bundle_ref: format!("session:{}", bundle.session_id.0),
+            request_linkage,
             authenticated_ingress_rule_rejection_histories:
                 edge_authenticated_ingress_rule_rejection_histories(timeline),
             local_ingress_trust_scope_rejection_histories:
@@ -607,45 +631,16 @@ fn latest_request_bait_action_event<'a>(
     timeline: &'a SessionTimeline,
     request_event: &TimelineEvent,
 ) -> Option<&'a TimelineEvent> {
-    let request_index = timeline
-        .events
-        .iter()
-        .position(|event| event.event_ref() == request_event.event_ref())?;
+    // Strict causal join: only a bait action carrying this request's explicit
+    // id belongs to it. Legacy events without request ids are not joined by
+    // window or method/path heuristics (engineering operating policy invariant
+    // 5); the caller degrades the export to `unknown_legacy` instead.
+    let linked_request_id = request_event.event.request_id?;
 
-    let EventKind::RequestSeen { method, path, .. } = &request_event.event.kind else {
-        return None;
-    };
-
-    let previous_request_index = timeline.events[..request_index]
-        .iter()
-        .rposition(|event| matches!(event.event.kind, EventKind::RequestSeen { .. }));
-    let next_request_index = timeline.events[request_index + 1..]
-        .iter()
-        .position(|event| matches!(event.event.kind, EventKind::RequestSeen { .. }))
-        .map(|offset| request_index + 1 + offset);
-    let window_start = previous_request_index.map_or(0, |index| index + 1);
-    let window_end = next_request_index.unwrap_or(timeline.events.len());
-
-    timeline.events[window_start..window_end]
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, event)| {
-            let event_index = window_start + offset;
-            match &event.event.kind {
-                EventKind::BaitActionObserved {
-                    method: action_method,
-                    path: action_path,
-                    ..
-                } if action_method == method && action_path == path => Some((event_index, event)),
-                _ => None,
-            }
-        })
-        .min_by_key(|(event_index, _)| {
-            let distance = event_index.abs_diff(request_index);
-            let precedes_request = *event_index < request_index;
-            (distance, precedes_request)
-        })
-        .map(|(_, event)| event)
+    timeline.events.iter().rev().find(|event| {
+        event.event.request_id == Some(linked_request_id)
+            && matches!(event.event.kind, EventKind::BaitActionObserved { .. })
+    })
 }
 
 fn edge_observed_bait_header_value_mint(
@@ -1180,7 +1175,8 @@ mod tests {
         BaitId, DiscoveryReconScore, EdgeRecommendedAction, Event, EventKind, EventSource,
         ExposureId, IngressActorKind, IngressAdvisorySignals, IngressIdentity,
         IngressIdentitySource, IngressTrustTier, IngressVerificationStrength, PolicyState,
-        RoutingDecision, SafeHeaderObservation, SessionId, TRUSTED_INGRESS_CONTRACT_VERSION,
+        RequestId, RoutingDecision, SafeHeaderObservation, SessionId,
+        TRUSTED_INGRESS_CONTRACT_VERSION,
     };
 
     use crate::{evidence_bundle_for_timeline, TimelineEvent};
@@ -1630,6 +1626,7 @@ mod tests {
     #[test]
     fn edge_decision_export_uses_allow_for_trusted_bait_softening() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -1682,7 +1679,8 @@ mod tests {
                     },
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -1691,7 +1689,8 @@ mod tests {
                     routing_decision: RoutingDecision::ProtectedUpstream,
                     reason: "trusted ingress identity suppressed bait surface intervention before runtime suspicion was established".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -1801,6 +1800,7 @@ mod tests {
     #[test]
     fn edge_decision_export_preserves_trusted_soften_history_after_containment() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -1842,7 +1842,8 @@ mod tests {
                     },
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -1884,7 +1885,8 @@ mod tests {
                     },
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -1895,7 +1897,8 @@ mod tests {
                     reason: "session recon discovery-surface fanout promoted request to suspicious"
                         .to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -1918,7 +1921,8 @@ mod tests {
                     },
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -1929,7 +1933,8 @@ mod tests {
                     reason: "confirmed bait-derived action moved session into controlled reality"
                         .to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -1938,7 +1943,8 @@ mod tests {
                     status: 202,
                     routing_decision: RoutingDecision::ControlledReality,
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2119,6 +2125,7 @@ mod tests {
     #[test]
     fn edge_decision_export_includes_deduped_bait_header_value_mint_audits() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let mint = BaitHeaderValueMintAudit {
             header_name: "X-Minted-Trace".to_string(),
             kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
@@ -2141,7 +2148,8 @@ mod tests {
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::SurfaceController,
@@ -2152,7 +2160,8 @@ mod tests {
                     surface: "/docs/minted-trace".to_string(),
                     header_value_mint: Some(mint.clone()),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2169,7 +2178,8 @@ mod tests {
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ControlledReality,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::BaitEngine,
@@ -2182,8 +2192,9 @@ mod tests {
                     header_value_mint: Some(mint),
                     header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
                 },
-            ),
-            policy(session_id),
+            )
+            .with_request_id(rid),
+            policy(session_id).with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2214,7 +2225,95 @@ mod tests {
     }
 
     #[test]
-    fn edge_decision_export_pairs_preceding_bait_action_with_latest_request() {
+    fn edge_decision_export_never_combines_events_from_interleaved_requests() {
+        let session_id = SessionId::new();
+        let rid_a = RequestId::new();
+        let rid_b = RequestId::new();
+        let rate_limit_reason = "repeated same-bait near misses moved session to rate limit";
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Suspicious,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
+                    local_ingress_trust_scope_rejection: None,
+                    trusted_ingress_soften_match: None,
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::RateLimited,
+                },
+            )
+            .with_request_id(rid_a),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::PolicyDecision {
+                    routing_decision: RoutingDecision::RateLimited,
+                    reason: rate_limit_reason.to_string(),
+                },
+            )
+            .with_request_id(rid_a),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::RateLimitApplied {
+                    reason: rate_limit_reason.to_string(),
+                },
+            )
+            .with_request_id(rid_a),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs/legacy-import".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
+                    local_ingress_trust_scope_rejection: None,
+                    trusted_ingress_soften_match: None,
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::ProtectedUpstream,
+                },
+            )
+            .with_request_id(rid_b),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(export.request.request_id, Some(rid_b));
+        assert_eq!(export.evidence.request_linkage, EdgeRequestLinkage::Linked);
+        assert_eq!(
+            export.policy.routing_decision,
+            RoutingDecision::ProtectedUpstream,
+            "export for request B must not inherit request A's rate-limit routing"
+        );
+        assert!(
+            !export.policy.reason.contains("near misses"),
+            "export for request B must not inherit request A's policy reason"
+        );
+        let request_b_event_id = timeline.events[3].event.id;
+        assert_eq!(
+            export.evidence.event_ids,
+            vec![request_b_event_id],
+            "export event ids must not mix events from different requests"
+        );
+    }
+
+    #[test]
+    fn edge_decision_export_marks_legacy_unlinked_sessions_unknown() {
         let session_id = SessionId::new();
         let mint = BaitHeaderValueMintAudit {
             header_name: "X-Minted-Trace".to_string(),
@@ -2227,8 +2326,8 @@ mod tests {
                 EventSource::Proxy,
                 PolicyState::Observe,
                 EventKind::RequestSeen {
-                    method: "GET".to_string(),
-                    path: "/docs/minted-trace".to_string(),
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
                     safe_headers: Vec::new(),
                     ingress_identity: IngressIdentity::default(),
                     authenticated_ingress_rule_rejection: None,
@@ -2256,13 +2355,99 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitActionObserved {
                     bait_id: BaitId("minted_trace".to_string()),
+                    exposure_id: Some(ExposureId("exp-minted".to_string())),
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    header_value_mint: Some(mint),
+                    header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+                },
+            ),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::Observe,
+                EventKind::PolicyDecision {
+                    routing_decision: RoutingDecision::EidolonOwned,
+                    reason: "bait-derived action intercepted".to_string(),
+                },
+            ),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(
+            export.evidence.request_linkage,
+            EdgeRequestLinkage::UnknownLegacy
+        );
+        assert_eq!(export.request.request_id, None);
+        assert_eq!(export.policy.state, PolicyState::Observe);
+        assert_eq!(
+            export.policy.routing_decision,
+            RoutingDecision::ProtectedUpstream
+        );
+        assert_eq!(export.policy.reason, "latest request routing decision");
+        assert_eq!(export.evidence.latest_bait_header_value_mint, None);
+        assert_eq!(export.evidence.event_ids, vec![timeline.events[0].event.id]);
+    }
+
+    #[test]
+    fn edge_decision_export_pairs_bait_action_with_same_request_id() {
+        let session_id = SessionId::new();
+        let surface_rid = RequestId::new();
+        let rid = RequestId::new();
+        let mint = BaitHeaderValueMintAudit {
+            header_name: "X-Minted-Trace".to_string(),
+            kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+            prefix: "minted".to_string(),
+        };
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs/minted-trace".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
+                    local_ingress_trust_scope_rejection: None,
+                    trusted_ingress_soften_match: None,
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::ProtectedUpstream,
+                },
+            )
+            .with_request_id(surface_rid),
+            Event::new(
+                session_id,
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    exposure_id: ExposureId("exp-minted".to_string()),
+                    surface: "/docs/minted-trace".to_string(),
+                    header_value_mint: Some(mint.clone()),
+                },
+            )
+            .with_request_id(surface_rid),
+            Event::new(
+                session_id,
+                EventSource::BaitEngine,
+                PolicyState::Observe,
+                EventKind::BaitActionObserved {
+                    bait_id: BaitId("minted_trace".to_string()),
                     exposure_id: None,
                     method: "POST".to_string(),
                     path: "/api/v2/import/reconcile".to_string(),
                     header_value_mint: Some(mint),
                     header_value_mint_status: Some(BaitHeaderValueMintStatus::SessionValueMismatch),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2279,7 +2464,8 @@ mod tests {
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2289,6 +2475,8 @@ mod tests {
 
         assert_eq!(export.request.method, "POST");
         assert_eq!(export.request.path, "/api/v2/import/reconcile");
+        assert_eq!(export.request.request_id, Some(rid));
+        assert_eq!(export.evidence.request_linkage, EdgeRequestLinkage::Linked);
         assert_eq!(
             export.evidence.latest_bait_header_value_mint,
             Some(EdgeObservedBaitHeaderValueMint {
@@ -2303,8 +2491,98 @@ mod tests {
     }
 
     #[test]
+    fn edge_decision_export_does_not_pair_bait_action_from_other_request_id() {
+        let session_id = SessionId::new();
+        let surface_rid = RequestId::new();
+        let other_rid = RequestId::new();
+        let rid = RequestId::new();
+        let mint = BaitHeaderValueMintAudit {
+            header_name: "X-Minted-Trace".to_string(),
+            kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+            prefix: "minted".to_string(),
+        };
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs/minted-trace".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
+                    local_ingress_trust_scope_rejection: None,
+                    trusted_ingress_soften_match: None,
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::ProtectedUpstream,
+                },
+            )
+            .with_request_id(surface_rid),
+            Event::new(
+                session_id,
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    exposure_id: ExposureId("exp-minted".to_string()),
+                    surface: "/docs/minted-trace".to_string(),
+                    header_value_mint: Some(mint.clone()),
+                },
+            )
+            .with_request_id(surface_rid),
+            Event::new(
+                session_id,
+                EventSource::BaitEngine,
+                PolicyState::Observe,
+                EventKind::BaitActionObserved {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    exposure_id: None,
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    header_value_mint: Some(mint),
+                    header_value_mint_status: Some(BaitHeaderValueMintStatus::SessionValueMismatch),
+                },
+            )
+            .with_request_id(other_rid),
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
+                    local_ingress_trust_scope_rejection: None,
+                    trusted_ingress_soften_match: None,
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::ProtectedUpstream,
+                },
+            )
+            .with_request_id(rid),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(export.request.method, "POST");
+        assert_eq!(export.request.path, "/api/v2/import/reconcile");
+        assert_eq!(export.request.request_id, Some(rid));
+        assert_eq!(export.evidence.request_linkage, EdgeRequestLinkage::Linked);
+        assert_eq!(export.evidence.latest_bait_header_value_mint, None);
+        assert_eq!(export.evidence.event_ids.len(), 1);
+    }
+
+    #[test]
     fn edge_decision_export_groups_rate_limited_discovery_recon_into_shared_family() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -2333,7 +2611,8 @@ mod tests {
                     },
                     routing_decision: RoutingDecision::RateLimited,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -2343,7 +2622,8 @@ mod tests {
                     to: PolicyState::RateLimited,
                     reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2351,7 +2631,8 @@ mod tests {
                 EventKind::RateLimitApplied {
                     reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2378,6 +2659,7 @@ mod tests {
     #[test]
     fn edge_decision_export_groups_rate_limited_same_bait_near_miss_into_shared_family() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -2395,7 +2677,8 @@ mod tests {
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::RateLimited,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -2405,7 +2688,8 @@ mod tests {
                     to: PolicyState::RateLimited,
                     reason: "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2413,7 +2697,8 @@ mod tests {
                 EventKind::RateLimitApplied {
                     reason: "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2440,6 +2725,7 @@ mod tests {
     #[test]
     fn edge_decision_export_prefers_structured_rate_limit_reason_over_generic_policy_decision() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -2470,7 +2756,8 @@ mod tests {
                     },
                     routing_decision: RoutingDecision::RateLimited,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -2478,7 +2765,8 @@ mod tests {
                 EventKind::RateLimitApplied {
                     reason: "suspicious discovery recon persistence moved session to rate limited: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=2 distinct_surfaces=1 query_seen=true legacy_openapi_query_seen=false linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=2 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=0 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=2 recon_score=5 recon_rate_limit_threshold=5 persistence_class=discovery_recon".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -2487,7 +2775,8 @@ mod tests {
                     routing_decision: RoutingDecision::RateLimited,
                     reason: "rate limited policy throttles the request".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2496,7 +2785,8 @@ mod tests {
                     status: 429,
                     routing_decision: RoutingDecision::RateLimited,
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2526,6 +2816,7 @@ mod tests {
     #[test]
     fn edge_decision_export_groups_repeated_escape_block_into_shared_family() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -2543,7 +2834,8 @@ mod tests {
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -2553,7 +2845,8 @@ mod tests {
                     to: PolicyState::Blocked,
                     reason: "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects attempt_count=2 post_containment_persistence_kind=controlled_reality_branch_escape".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2562,7 +2855,8 @@ mod tests {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2591,6 +2885,7 @@ mod tests {
     #[test]
     fn edge_decision_export_groups_repeated_near_miss_block_into_shared_family() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -2608,7 +2903,8 @@ mod tests {
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -2618,7 +2914,8 @@ mod tests {
                     to: PolicyState::Blocked,
                     reason: "rate-limited same-bait near miss retry moved session to blocked: path=/api/v2/import/reconcile bait_id=rel_2025_04_b7f2 persistence_class=same_bait_near_miss persistence_kind=same_bait_near_miss_retry".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2627,7 +2924,8 @@ mod tests {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2661,6 +2959,7 @@ mod tests {
     #[test]
     fn edge_decision_export_groups_repeated_discovery_recon_block_into_shared_family() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -2689,7 +2988,8 @@ mod tests {
                     },
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -2699,7 +2999,8 @@ mod tests {
                     to: PolicyState::Blocked,
                     reason: "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_class=discovery_recon persistence_kind=discovery_recon_retry".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2708,7 +3009,8 @@ mod tests {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2742,6 +3044,7 @@ mod tests {
     #[test]
     fn edge_decision_export_groups_blind_write_recon_block_into_write_family() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -2770,7 +3073,8 @@ mod tests {
                     },
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -2780,7 +3084,8 @@ mod tests {
                     to: PolicyState::Blocked,
                     reason: "rate-limited discovery recon retry moved session to blocked: path=/api/v2/import/validate actor_kind=agentic_browser vendor_score=35 discovery_requests=1 distinct_surfaces=1 query_seen=true legacy_openapi_query_seen=false linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=true decoy_write_probe_count=2 decoy_write_probe_path_classes=2 detection_count=0 repeated_discovery_score=0 query_score=1 legacy_openapi_query_score=0 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=3 decoy_write_probe_path_fanout_bonus=1 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_class=write_recon persistence_kind=write_recon_retry".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2789,7 +3094,8 @@ mod tests {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2823,6 +3129,7 @@ mod tests {
     #[test]
     fn edge_decision_export_groups_depth_limit_block_into_shared_family() {
         let session_id = SessionId::new();
+        let rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -2840,7 +3147,8 @@ mod tests {
                     discovery_recon_score: Default::default(),
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -2850,7 +3158,8 @@ mod tests {
                     to: PolicyState::Blocked,
                     reason: "controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4 post_containment_persistence_kind=controlled_reality_depth_limit".to_string(),
                 },
-            ),
+            )
+            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2859,7 +3168,8 @@ mod tests {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
-            ),
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(

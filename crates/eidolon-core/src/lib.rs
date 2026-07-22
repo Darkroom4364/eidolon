@@ -1052,7 +1052,10 @@ mod tests {
 
         let linked = event.with_request_id(RequestId::new());
         assert!(linked.request_id.is_some());
-        let serialized = must_ok(serde_json::to_value(&linked), "linked event should serialize");
+        let serialized = must_ok(
+            serde_json::to_value(&linked),
+            "linked event should serialize",
+        );
         let reparsed: Event = must_ok(
             serde_json::from_value(serialized),
             "linked event should reparse",
