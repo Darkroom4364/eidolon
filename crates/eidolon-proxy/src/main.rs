@@ -31,6 +31,7 @@ use eidolon_proxy::{
     policy::{self, InterventionMode},
     policy_store::PolicyStateStore,
     session::{self, SessionContext},
+    session_auth::{enforcement_rank, SessionAuthority},
     surface::{
         rewrite_response_body, HtmlInsertion, OpenApiPathInsertion, RewritePlan, SurfaceAction,
         SurfaceController, SurfaceHeader, SurfaceRequestMeta, SurfaceResponse, SurfaceResponseMeta,
@@ -158,6 +159,7 @@ struct ProxyConfig {
     debug_log_path: Option<PathBuf>,
     bait_profile_path: Option<PathBuf>,
     bait_signing_secret_path: Option<PathBuf>,
+    session_signing_key_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
     trusted_bait_soften_path_prefixes: Vec<String>,
@@ -240,6 +242,14 @@ impl CliAction {
                         &mut builder.bait_signing_secret_path,
                         flag,
                         parse_bait_signing_secret_path(&value)?,
+                    )?;
+                }
+                "--session-signing-key-file" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.session_signing_key_path,
+                        flag,
+                        parse_session_signing_key_path(&value)?,
                     )?;
                 }
                 "--ingress-trust-config" => {
@@ -335,6 +345,7 @@ struct ConfigBuilder {
     debug_log_path: Option<PathBuf>,
     bait_profile_path: Option<PathBuf>,
     bait_signing_secret_path: Option<PathBuf>,
+    session_signing_key_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
     trusted_bait_soften_path_prefixes: Vec<String>,
@@ -364,6 +375,7 @@ impl ConfigBuilder {
             debug_log_path: self.debug_log_path,
             bait_profile_path: self.bait_profile_path,
             bait_signing_secret_path: self.bait_signing_secret_path,
+            session_signing_key_path: self.session_signing_key_path,
             ingress_trust_config_path: self.ingress_trust_config_path,
             ingress_transport_auth_secret_path: self.ingress_transport_auth_secret_path,
             trusted_bait_soften_path_prefixes: if self.trusted_bait_soften_path_prefixes.is_empty()
@@ -670,6 +682,18 @@ fn parse_bait_signing_secret_path(raw: &str) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
+fn parse_session_signing_key_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = parse_file_path(raw, "session signing key")?;
+    if !path.is_file() {
+        return Err(ConfigError::new(format!(
+            "session signing key path must be an existing file: `{}`",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
 fn parse_ingress_trust_config_path(raw: &str) -> Result<PathBuf, ConfigError> {
     let path = parse_file_path(raw, "ingress trust config")?;
     if !path.is_file() {
@@ -923,6 +947,18 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         Some(path) => Some(Arc::new(Mutex::new(FileDebugLogWriter::open(path)?))),
         None => None,
     };
+    let (session_authority, session_signing_mode) = match &config.session_signing_key_path {
+        Some(path) => (
+            SessionAuthority::from_key_file_json(&fs::read(path)?)?,
+            "configured",
+        ),
+        None => (SessionAuthority::ephemeral(), "ephemeral"),
+    };
+    let session_signing_debug = json!({
+        "mode": session_signing_mode,
+        "active_key_version": session_authority.active_key_version(),
+        "key_version_count": session_authority.key_version_count(),
+    });
     let bait_exposures = BaitExposureStore::from_event_log(&config.event_log_path)?;
     let restored_bait_exposure_count = bait_exposures.len();
     let now = SystemTime::now()
@@ -946,6 +982,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         policy_store: Arc::new(Mutex::new(PolicyStateStore::open(
             &config.policy_state_path,
         )?)),
+        session_authority: Arc::new(Mutex::new(session_authority)),
         controlled_reality_config: config.controlled_reality_config,
         controlled_reality: Arc::new(ControlledRealityResponder),
         surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
@@ -976,6 +1013,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
             },
             "bait_profile": bait_profile_debug,
             "bait_signing_enabled": bait_signing_secret.is_some(),
+            "session_signing": session_signing_debug,
             "restored_consumed_bait_proof_count": restored_consumed_bait_proof_count,
             "ingress_identity_rule_count": runtime.ingress_identity_resolver.len(),
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
@@ -1015,6 +1053,7 @@ struct ProxyRuntime {
     debug_log: Option<Arc<Mutex<FileDebugLogWriter>>>,
     intervention_control_path: PathBuf,
     policy_store: Arc<Mutex<PolicyStateStore>>,
+    session_authority: Arc<Mutex<SessionAuthority>>,
     controlled_reality_config: ControlledRealityConfig,
     controlled_reality: Arc<ControlledRealityResponder>,
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
@@ -2200,8 +2239,24 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let surface_request = surface_request_meta(&request, &path);
     let owns_configured_unsafe_bait_action =
         owns_configured_unsafe_bait_action(runtime, &surface_request);
-    let session = effective_session_context(runtime, &request, &surface_request, client_peer_ip);
+    let session = effective_session_context(runtime, &request, &surface_request, client_peer_ip)?;
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
+    if let Some(floor) = session.enforcement_floor {
+        if enforcement_rank(floor) > enforcement_rank(policy_state) {
+            write_debug(
+                runtime,
+                "session_enforcement_floor_applied",
+                Some(session.session_id),
+                json!({
+                    "loaded_policy_state": policy_state,
+                    "enforcement_floor": floor,
+                }),
+            )?;
+            set_policy_state_for_session(runtime, session.session_id, floor)?;
+            policy_state = floor;
+        }
+    }
+    note_session_enforcement(runtime, client_peer_ip, session.session_id, policy_state);
     let starting_policy_state = policy_state;
     let mut policy_reason_override = None;
     let discovery_recon_state =
@@ -3438,6 +3493,24 @@ fn policy_state_for_session(
     Ok(store.policy_state(session_id))
 }
 
+/// Best-effort enforcement-floor feedback for peer continuity. The policy
+/// store remains authoritative; a poisoned authority lock only weakens the
+/// rotation-abuse safety net for later requests, never current routing.
+fn note_session_enforcement(
+    runtime: &ProxyRuntime,
+    client_peer_ip: Option<IpAddr>,
+    session_id: SessionId,
+    policy_state: PolicyState,
+) {
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    if let Ok(mut authority) = runtime.session_authority.lock() {
+        authority.note_enforcement(client_peer_ip, session_id, policy_state, now_unix_secs);
+    }
+}
+
 fn set_policy_state_for_session(
     runtime: &ProxyRuntime,
     session_id: SessionId,
@@ -4138,10 +4211,42 @@ fn effective_session_context(
     request: &HttpRequest,
     surface_request: &SurfaceRequestMeta,
     client_peer_ip: Option<IpAddr>,
-) -> SessionContext {
+) -> io::Result<SessionContext> {
     let headers: Vec<(&str, &str)> = header_pairs(&request.headers).collect();
     let request_host = effective_request_host(request);
-    let mut session = session::derive_session_from_headers(headers.iter().copied());
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let mut session = {
+        let mut authority = runtime
+            .session_authority
+            .lock()
+            .map_err(|_| io::Error::other("session authority lock poisoned"))?;
+        session::derive_session_from_headers(
+            &mut authority,
+            headers.iter().copied(),
+            client_peer_ip,
+            now_unix_secs,
+        )
+    };
+    write_debug(
+        runtime,
+        "session_resolved",
+        Some(session.session_id),
+        json!({
+            "session_source": match session.source {
+                session::SessionSource::Cookie => "cookie",
+                session::SessionSource::Generated => "generated",
+            },
+            "cookie_outcome": session.cookie_outcome.as_str(),
+            "key_status": session.key_status.map(|status| status.as_str()),
+            "presented_key_version": session.presented_key_version,
+            "active_key_version": session.active_key_version,
+            "continuity_outcome": session.continuity_outcome.as_str(),
+            "enforcement_floor": session.enforcement_floor,
+        }),
+    )?;
     session.ingress_identity = session::authenticated_ingress_identity_from_headers(
         headers.iter().copied(),
         runtime.ingress_transport_auth_secret.as_deref(),
@@ -4197,7 +4302,7 @@ fn effective_session_context(
         .map(|scope| scope.bait_soften_path_prefixes.clone());
     session.ingress_identity = merged_identity;
 
-    session
+    Ok(session)
 }
 
 fn trusted_ingress_soften_match(
@@ -5115,6 +5220,9 @@ Options:
   --bait-signing-secret-file <PATH>
                          Shared-secret file used to mint and verify
                          session-bound bait header values for mint-enabled profiles
+  --session-signing-key-file <PATH>
+                         JSON session signing key ring. When omitted, sessions are
+                         minted under an ephemeral key that changes on restart
   --ingress-trust-config <PATH>
                          JSON ingress trust config for local allowlists and trusted
                          automation claims
@@ -5302,6 +5410,7 @@ mod tests {
             debug_log: None,
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller,
@@ -5348,6 +5457,7 @@ mod tests {
             )))),
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
@@ -5381,6 +5491,7 @@ mod tests {
             debug_log: None,
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
@@ -5416,6 +5527,7 @@ mod tests {
             debug_log: None,
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
@@ -5615,8 +5727,7 @@ mod tests {
     }
 
     fn set_runtime_policy_state(runtime: &ProxyRuntime, cookie: &str, policy_state: PolicyState) {
-        let session_id =
-            session::session_id_from_cookie_header(cookie).expect("cookie should contain session");
+        let session_id = session_id_from_cookie(cookie).expect("cookie should contain session");
         set_policy_state_for_session(runtime, session_id, policy_state)
             .expect("policy state should set");
     }
@@ -5827,8 +5938,42 @@ mod tests {
         read_http_response(&mut &response[..]).expect("downstream response should parse")
     }
 
+    const TEST_SESSION_KEY: [u8; 32] = [0x5a; 32];
+
+    fn test_session_authority() -> SessionAuthority {
+        SessionAuthority::new(
+            vec![eidolon_proxy::session_auth::SessionKeyVersion {
+                version: 1,
+                key: TEST_SESSION_KEY,
+            }],
+            1,
+        )
+        .expect("test session authority should build")
+    }
+
+    fn now_unix_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default()
+    }
+
+    fn minted_cookie_value(session_id: SessionId) -> String {
+        test_session_authority().mint_cookie_value(session_id, now_unix_secs())
+    }
+
+    fn session_id_from_cookie(cookie: &str) -> Option<SessionId> {
+        let value = cookie.strip_prefix("eidolon_session=")?;
+        let mut parts = value.split('.');
+        parts.next()?;
+        parts.next()?;
+        parts.next()?;
+        let uuid = uuid::Uuid::parse_str(parts.next()?).ok()?;
+        Some(SessionId(uuid))
+    }
+
     fn cookie_header() -> String {
-        format!("eidolon_session={}", SessionId::new().0)
+        format!("eidolon_session={}", minted_cookie_value(SessionId::new()))
     }
 
     fn request_with_cookie(
@@ -6878,9 +7023,9 @@ mod tests {
             Some(Arc::clone(&signing_secret)),
         );
         let session_a = SessionId::new();
-        let cookie_a = format!("eidolon_session={}", session_a.0);
+        let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
         let session_b = SessionId::new();
-        let cookie_b = format!("eidolon_session={}", session_b.0);
+        let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
         let rendered_a = render_bait_for_session(&bait, session_a, Some(signing_secret.as_ref()))
             .expect("session A bait should render")
             .into_owned();
@@ -6993,7 +7138,7 @@ mod tests {
             .clone();
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
-        let cookie = format!("eidolon_session={}", session.0);
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session));
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -7056,7 +7201,7 @@ mod tests {
             .clone();
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
-        let cookie = format!("eidolon_session={}", session.0);
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session));
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -7119,7 +7264,7 @@ mod tests {
             .clone();
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
-        let cookie = format!("eidolon_session={}", session.0);
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session));
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -7203,7 +7348,7 @@ mod tests {
             .clone();
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
-        let cookie = format!("eidolon_session={}", session.0);
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -7272,9 +7417,9 @@ mod tests {
             Some(Arc::clone(&signing_secret)),
         );
         let session_a = SessionId::new();
-        let cookie_a = format!("eidolon_session={}", session_a.0);
+        let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
         let session_b = SessionId::new();
-        let cookie_b = format!("eidolon_session={}", session_b.0);
+        let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
         let rendered_a = render_bait_for_session(&bait, session_a, Some(signing_secret.as_ref()))
             .expect("session A bait should render")
             .into_owned();
@@ -7657,7 +7802,13 @@ mod tests {
 
     #[test]
     fn downstream_headers_remove_transfer_encoding_and_duplicate_singletons() {
-        let session = session::derive_session_from_headers([("Cookie", cookie_header())]);
+        let mut authority = test_session_authority();
+        let session = session::derive_session_from_headers(
+            &mut authority,
+            [("Cookie", cookie_header())],
+            None,
+            now_unix_secs(),
+        );
         let mut response = HttpResponse {
             version: "HTTP/1.1".to_string(),
             status: 200,
@@ -13959,7 +14110,7 @@ mod tests {
     fn runtime_correlates_bait_action_after_exposure_store_rebuild() {
         let event_log_path = unique_temp_path("rehydrated-bait-action-events.jsonl");
         let session_id = SessionId::new();
-        let cookie = format!("eidolon_session={}", session_id.0);
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session_id));
         let bait = BaitRegistry::m3_catalog()
             .bait_for_class(BaitClass::Docs)
             .expect("docs bait should exist")
@@ -14870,8 +15021,8 @@ mod tests {
         let secret: Arc<str> = Arc::from("mint-secret");
         let session_a = SessionId::new();
         let session_b = SessionId::new();
-        let cookie_a = format!("eidolon_session={}", session_a.0);
-        let cookie_b = format!("eidolon_session={}", session_b.0);
+        let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
+        let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -15498,6 +15649,118 @@ mod tests {
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
         assert_event_type_absent(&event_log_path, "bait_exposed");
+    }
+
+    #[test]
+    fn runtime_forged_session_cookie_is_not_adopted() {
+        let event_log_path = unique_temp_path("forged-cookie-events.jsonl");
+        let debug_log_path = unique_temp_path("forged-cookie-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("forged-cookie-control.txt"),
+        );
+        let forged_uuid = SessionId::new().0;
+        let forged_cookie = format!(
+            "eidolon_session=v1.1.{}.{}.{}",
+            now_unix_secs(),
+            forged_uuid,
+            "0".repeat(64)
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/docs/legacy-import", &forged_cookie),
+        ));
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_ne!(
+            request_event["session_id"].as_str(),
+            Some(forged_uuid.to_string().as_str())
+        );
+        let set_cookie = response
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("set-cookie"))
+            .expect("forged cookie should be replaced with a minted one");
+        assert!(set_cookie.value.starts_with("eidolon_session=v1.1."));
+        assert!(!set_cookie.value.contains(&forged_uuid.to_string()));
+
+        let session_debug = first_debug_event(&debug_log_path, "session_resolved");
+        assert_eq!(session_debug["fields"]["cookie_outcome"], "bad_signature");
+        assert_eq!(session_debug["fields"]["continuity_outcome"], "no_record");
+    }
+
+    #[test]
+    fn runtime_rapid_cookie_rotation_cannot_reset_blocked_enforcement() {
+        let event_log_path = unique_temp_path("rotation-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("rotation-blocked-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("rotation-blocked-control.txt"),
+        );
+        let cookie = cookie_header();
+        let session_id = session_id_from_cookie(&cookie).expect("cookie should parse");
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Blocked);
+
+        let first = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        assert_eq!(first.status, 403);
+
+        // The attacker discards the cookie, presents a forged one, and rotates
+        // again; every request must stay blocked under the enforcement floor.
+        // A freshly proxy-minted cookie for an unseen session is not a
+        // realistic attacker capability (minting always flows through
+        // continuity recovery), so the rotation shapes here are discard,
+        // forgery, and malformed values.
+        let forged_cookie = format!(
+            "eidolon_session=v1.1.{}.{}.{}",
+            now_unix_secs(),
+            SessionId::new().0,
+            "1".repeat(64)
+        );
+        for attempt in 0..3 {
+            let request = match attempt {
+                0 => request_with_cookie("GET", "/docs/legacy-import", &forged_cookie, &[]),
+                1 => b"GET /docs/legacy-import HTTP/1.1\r\nHost: proxy.local\r\n\r\n".to_vec(),
+                _ => request_with_cookie(
+                    "GET",
+                    "/docs/legacy-import",
+                    "eidolon_session=rotated-garbage",
+                    &[],
+                ),
+            };
+            let response =
+                parse_downstream_response(&run_runtime_request(runtime.clone(), &request));
+            assert_eq!(response.status, 403, "attempt {attempt} must stay blocked");
+        }
+
+        assert_eq!(
+            policy_state_for_session(&runtime, session_id).expect("policy state should load"),
+            PolicyState::Blocked
+        );
+        let resolutions = debug_events(&debug_log_path, "session_resolved");
+        let recovered = resolutions
+            .iter()
+            .filter(|event| event["fields"]["continuity_outcome"] == "recovered")
+            .count();
+        let cooldown_limited = resolutions
+            .iter()
+            .filter(|event| event["fields"]["continuity_outcome"] == "cooldown_limited")
+            .count();
+        assert_eq!(recovered, 1);
+        assert_eq!(cooldown_limited, 2);
     }
 
     #[test]

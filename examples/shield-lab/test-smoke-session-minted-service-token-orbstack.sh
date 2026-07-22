@@ -15,7 +15,7 @@ write_fixture_state() {
 {"schema_version":2,"id":"11111111-1111-1111-1111-111111111111","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-11T18:35:00Z","source":"surface_controller","policy_state":"observe","kind":{"type":"bait_exposed","bait_id":"fake_service_token","exposure_id":"exp-a1","surface":"/docs/service-token","header_value_mint":{"header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}}}
 {"schema_version":2,"id":"22222222-2222-2222-2222-222222222222","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-11T18:35:01Z","source":"surface_controller","policy_state":"observe","kind":{"type":"bait_exposed","bait_id":"fake_service_token","exposure_id":"exp-a2","surface":"/docs/service-token","header_value_mint":{"header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}}}
 {"schema_version":2,"id":"33333333-3333-3333-3333-333333333333","session_id":"22222222-2222-4222-8222-222222222222","observed_at":"2026-06-11T18:35:02Z","source":"surface_controller","policy_state":"observe","kind":{"type":"bait_exposed","bait_id":"fake_service_token","exposure_id":"exp-b1","surface":"/docs/service-token","header_value_mint":{"header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}}}
-{"schema_version":2,"id":"44444444-4444-4444-4444-444444444444","session_id":"22222222-2222-4222-8222-222222222222","observed_at":"2026-06-11T18:35:02Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"POST","path":"/api/v2/import/reconcile","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"routing_decision":"protected_upstream"}}
+{"schema_version":2,"id":"44444444-4444-4444-4444-444444444444","session_id":"22222222-2222-4222-8222-222222222222","observed_at":"2026-06-11T18:35:02Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"POST","path":"/api/v2/import/reconcile","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"routing_decision":"eidolon_owned"}}
 {"schema_version":2,"id":"55555555-5555-5555-5555-555555555555","session_id":"22222222-2222-4222-8222-222222222222","observed_at":"2026-06-11T18:35:02Z","source":"bait_engine","policy_state":"observe","kind":{"type":"bait_action_observed","bait_id":"fake_service_token","exposure_id":null,"method":"POST","path":"/api/v2/import/reconcile","header_value_mint":{"header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}}}
 {"schema_version":2,"id":"66666666-6666-6666-6666-666666666666","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-11T18:35:03Z","source":"proxy","policy_state":"observe","kind":{"type":"request_seen","method":"POST","path":"/api/v2/import/reconcile","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"routing_decision":"controlled_reality"}}
 {"schema_version":2,"id":"77777777-7777-7777-7777-777777777777","session_id":"11111111-1111-4111-8111-111111111111","observed_at":"2026-06-11T18:35:03Z","source":"bait_engine","policy_state":"observe","kind":{"type":"bait_action_observed","bait_id":"fake_service_token","exposure_id":"exp-a2","method":"POST","path":"/api/v2/import/reconcile","header_value_mint":{"header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}}}
@@ -128,9 +128,9 @@ BODY
     ;;
   "POST|http://127.0.0.1:31080/api/v2/import/reconcile|eidolon_session=22222222-2222-4222-8222-222222222222")
     [[ "$api_key" == "svc_fixture_session_alpha" ]]
-    printf 'HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
+    printf 'HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
     cat > "$body_file" <<'BODY'
-{"error":"not_found"}
+{"status":"blocked","synthetic":true,"reason":"configured unsafe bait action failed closed","path":"/api/v2/import/reconcile"}
 BODY
     ;;
   *)
@@ -171,7 +171,7 @@ JSON
     ;;
   "22222222-2222-4222-8222-222222222222")
     cat <<'JSON'
-{"contract_version":"2026-06-05.v1","observed_at":"2026-06-11T18:35:02Z","session_id":"22222222-2222-4222-8222-222222222222","request":{"method":"POST","path":"/api/v2/import/reconcile"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"observe","routing_decision":"protected_upstream","reason":"latest request routing decision"},"evidence":{"event_schema_version":2,"event_ids":["44444444-4444-4444-4444-444444444444","55555555-5555-5555-5555-555555555555"],"bundle_ref":"session:22222222-2222-4222-8222-222222222222","bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"session_value_mismatch"}},"edge_recommendation":{"action":"observe","reason_codes":["protected_upstream"]}}
+{"contract_version":"2026-06-05.v1","observed_at":"2026-06-11T18:35:02Z","session_id":"22222222-2222-4222-8222-222222222222","request":{"method":"POST","path":"/api/v2/import/reconcile"},"ingress_identity":{"source":"none","trust_tier":"none"},"policy":{"state":"observe","routing_decision":"eidolon_owned","reason":"configured unsafe bait action failed closed after proof rejection"},"evidence":{"event_schema_version":2,"event_ids":["44444444-4444-4444-4444-444444444444","55555555-5555-5555-5555-555555555555"],"bundle_ref":"session:22222222-2222-4222-8222-222222222222","bait_header_value_mints":[{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}],"latest_bait_header_value_mint":{"bait_id":"fake_service_token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc","status":"session_value_mismatch"}},"edge_recommendation":{"action":"observe","reason_codes":["eidolon_owned"]}}
 JSON
     ;;
   *)

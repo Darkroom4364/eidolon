@@ -104,8 +104,8 @@ changes before collecting evidence. The runner refuses obviously stale
 It also generates and passes one pwnkit `--scope` file per scan leg; this is
 required for current pwnkit shell-mode auth injection and target enforcement.
 
-To run the session-control variant, pin the Eidolon leg to one generated
-`eidolon_session` cookie:
+To run the session-control variant, pin the Eidolon leg to one proxy-minted
+signed `eidolon_session` cookie:
 
 ```sh
 EIDOLON_M3_PIN_SESSION=1 examples/m3/pwnkit-codex.sh all "$ART"

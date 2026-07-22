@@ -134,6 +134,10 @@ examples/metrics/collect-benign.sh /tmp/eidolon-proxy-benign.jsonl
 
 The proxy assigns a first-party `eidolon_session` cookie when no valid session cookie is present. The cookie is host-only, `HttpOnly`, `SameSite=Lax`, scoped to `/`, and intentionally omits `Secure` for local HTTP Lab use.
 
+Session cookies are authenticated. The value has the form `v1.<key-version>.<issued-at>.<session-uuid>.<hmac-sha256-hex>`; the proxy verifies the proof, key version, and server-side age before accepting a cookie. A missing, malformed, forged, unknown-key, or expired cookie never supplies the session identity: the request receives a proxy-minted session instead, and the deterministic outcome (`absent`, `valid`, `malformed`, `unknown_key_version`, `bad_signature`, `expired`) is recorded in the server-side debug log as a `session_resolved` audit event together with the continuity outcome. Cookie discard or rapid rotation from one direct peer is absorbed by a bounded continuity map (24h TTL, 4096 peers, one recovery per 60s cooldown): the peer is re-bound to its existing session with its enforcement floor intact, and excess rotation mints fresh sessions that still inherit that floor, so rotation cannot reset policy or evidence state. The floor ranks `blocked` highest and never downgrades an already-loaded state.
+
+Signing keys come from `--session-signing-key-file <PATH>` with JSON shape `{"active_key_version": 2, "keys": [{"version": 1, "key_hex": "<64 hex>"}, {"version": 2, "key_hex": "<64 hex>"}]}`. Every listed version verifies cookies; only the active version mints. Rotate by adding the new version, marking it active, and dropping retired versions once cookies older than the 7-day server-side lifetime have aged out. Cookies signed by a retired-but-listed version are accepted and transparently re-minted under the active version on the response. Without a key file the proxy generates an ephemeral key at startup: sessions survive within one process lifetime, but a restart rejects all outstanding cookies and the in-memory continuity map is empty, so enforcement then rests on the persisted policy store only. Deployments that need restart-stable sessions and continuity must configure a key file; key files are secrets and must stay outside the event and debug logs.
+
 The event log is JSONL. Request events record method, path, policy state, routing decision, session ID, and selected safe header presence. They do not log request bodies or header values.
 
 The intervention control file is read per request. If it contains `disabled`, `disable`, `off`, or `0`, interventions are disabled without restarting the proxy and traffic is forwarded to protected upstream.
@@ -164,8 +168,8 @@ Validate the M1 proxy narrowly:
 - `/docs` is audited as `rewritten_upstream` only when the successful-response safe M3 discovery-link rewrite actually changes the response.
 - `/docs/legacy-import` is served as an Eidolon-owned response while interventions are enabled.
 - `/openapi.json` and `/openapi.json?eidolon_surface=legacy-import` are audited as `rewritten_upstream` only when the OpenAPI rewrite actually changes the response.
-- A missing or invalid `eidolon_session` cookie receives a new first-party session cookie.
-- Multiple requests with the same valid session cookie produce events with the same session ID.
+- A missing, malformed, forged, or expired `eidolon_session` cookie receives a new proxy-minted session cookie and a deterministic `session_resolved` audit outcome.
+- Multiple requests with the same valid session cookie produce events with the same session ID, and repeated cookie-less requests from one direct peer re-bind to the continuity session instead of fragmenting state.
 - `/tmp/eidolon-events.jsonl` contains request events with routing and policy state, without request bodies or header values.
 - Updating `/tmp/eidolon-interventions.txt` to an off value disables interventions for the next request without restarting the proxy.
 

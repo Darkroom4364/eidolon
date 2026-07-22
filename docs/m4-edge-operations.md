@@ -101,6 +101,22 @@ Important trust boundary:
 - the OrbStack overlay now mounts a cluster-local transport-auth secret so the
   accepted trusted-ingress path can be smoke-tested live on the deployment too
 
+Session identity on this deployment:
+
+- the shield proxy authenticates `eidolon_session` cookies (HMAC-SHA256 over a
+  versioned key) and rejects unsigned, forged, or expired values with
+  deterministic `session_resolved` audit outcomes
+- the current manifests do not pass `--session-signing-key-file`, so the proxy
+  runs with an ephemeral per-process key: a pod restart rejects all
+  outstanding cookies and clears the in-memory peer-continuity map, while the
+  PVC-backed policy store survives
+- for restart-stable sessions and continuity, mount a JSON key ring (same
+  secret pattern as the transport-auth secret) and pass
+  `--session-signing-key-file`; rotate by adding the new version as active and
+  dropping retired versions after the 7-day cookie lifetime
+- the explicit-cookie smoke scripts mint their session cookies from the live
+  edge instead of generating raw UUIDs; cookie-jar smokes are unaffected
+
 Recorded labels:
 
 - `runner_environment = kali_vm`
