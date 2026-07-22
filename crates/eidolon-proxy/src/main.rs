@@ -26,7 +26,7 @@ use eidolon_proxy::{
         DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH, MAX_TARPIT_DELAY,
     },
     debug_log::FileDebugLogWriter,
-    event_log::FileEventLogWriter,
+    event_log::{read_jsonl_reconstruction, FileEventLogWriter},
     ingress_identity::{self, IngressIdentityResolver},
     policy::{self, InterventionMode},
     policy_store::PolicyStateStore,
@@ -961,6 +961,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     });
     let bait_exposures = BaitExposureStore::from_event_log(&config.event_log_path)?;
     let restored_bait_exposure_count = bait_exposures.len();
+    let restored_bait_exposure_torn_tail_line = bait_exposures.torn_tail_line;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -972,6 +973,10 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         now,
     )?;
     let restored_consumed_bait_proof_count = consumed_bait_proofs.consumed.len();
+    let restored_consumed_bait_proof_torn_tail_line = consumed_bait_proofs.torn_tail_line;
+    let policy_store = PolicyStateStore::open(&config.policy_state_path)?;
+    let policy_store_eviction = policy_store.last_eviction_stats();
+    let policy_store_session_count = policy_store.len();
     let runtime = ProxyRuntime {
         upstream: config.upstream,
         event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
@@ -979,9 +984,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         )?)),
         debug_log,
         intervention_control_path: config.intervention_control_path,
-        policy_store: Arc::new(Mutex::new(PolicyStateStore::open(
-            &config.policy_state_path,
-        )?)),
+        policy_store: Arc::new(Mutex::new(policy_store)),
         session_authority: Arc::new(Mutex::new(session_authority)),
         controlled_reality_config: config.controlled_reality_config,
         controlled_reality: Arc::new(ControlledRealityResponder),
@@ -1015,10 +1018,26 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
             "bait_signing_enabled": bait_signing_secret.is_some(),
             "session_signing": session_signing_debug,
             "restored_consumed_bait_proof_count": restored_consumed_bait_proof_count,
+            "restored_consumed_bait_proof_torn_tail_line": restored_consumed_bait_proof_torn_tail_line,
+            "event_log_bytes": std::fs::metadata(&config.event_log_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            "policy_state_bytes": std::fs::metadata(&config.policy_state_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
             "ingress_identity_rule_count": runtime.ingress_identity_resolver.len(),
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
             "trusted_bait_soften_path_prefixes": runtime.trusted_bait_soften_path_prefixes,
             "restored_bait_exposure_count": restored_bait_exposure_count,
+            "restored_bait_exposure_torn_tail_line": restored_bait_exposure_torn_tail_line,
+            "policy_store": {
+                "session_count": policy_store_session_count,
+                "ttl_evicted": policy_store_eviction.ttl_evicted,
+                "lru_evicted": policy_store_eviction.lru_evicted,
+                "protected_overflow": policy_store_eviction.protected_overflow,
+                "max_sessions": eidolon_proxy::policy_store::MAX_POLICY_SESSIONS,
+                "session_ttl_secs": eidolon_proxy::policy_store::POLICY_SESSION_TTL_SECS,
+            },
             "debug_log_visibility": "server_side_only",
         }),
     )?;
@@ -1071,11 +1090,13 @@ struct ProxyRuntime {
 struct BaitExposureStore {
     exposures: HashMap<(SessionId, BaitId), ExposureId>,
     exposure_order: VecDeque<(SessionId, BaitId)>,
+    torn_tail_line: Option<usize>,
 }
 
 #[derive(Debug, Default)]
 struct ConsumedBaitProofStore {
     consumed: HashMap<(SessionId, BaitId, String), u64>,
+    torn_tail_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1098,17 +1119,27 @@ impl ConsumedBaitProofStore {
             Err(error) => return Err(error),
         };
         let mut store = Self::default();
-        for (line_index, line) in BufReader::new(file).lines().enumerate() {
-            let line = line?;
+        let source = read_jsonl_reconstruction(BufReader::new(file))?;
+        for (line_index, line) in source.lines.iter().enumerate() {
+            let line_number = line_index + 1;
             if line.trim().is_empty() {
                 continue;
             }
-            let event: Event = serde_json::from_str(&line).map_err(|error| {
-                invalid_data(format!(
-                    "could not rebuild consumed bait proof store from event log line {}: {error}",
-                    line_index + 1
-                ))
-            })?;
+            let event: Event = match serde_json::from_str(line) {
+                Ok(event) => event,
+                Err(_error) if source.is_torn_tail(line_index) => {
+                    store.torn_tail_line = Some(line_number);
+                    eprintln!(
+                        "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    return Err(invalid_data(format!(
+                        "could not rebuild consumed bait proof store from event log line {line_number}: {error}"
+                    )))
+                }
+            };
             if event.schema_version != EVENT_SCHEMA_VERSION {
                 return Err(invalid_data(format!(
                     "could not rebuild consumed bait proof store from event log line {}: unsupported schema version {}",
@@ -1218,20 +1249,31 @@ impl BaitExposureStore {
     }
 
     fn from_event_log_reader(reader: impl BufRead) -> io::Result<Self> {
+        let source = read_jsonl_reconstruction(reader)?;
         let mut store = Self::default();
+        let mut torn_tail_line = None;
 
-        for (line_index, line) in reader.lines().enumerate() {
+        for (line_index, line) in source.lines.iter().enumerate() {
             let line_number = line_index + 1;
-            let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
 
-            let value: Value = serde_json::from_str(&line).map_err(|error| {
-                invalid_data(format!(
-                    "could not rebuild bait exposure store from event log line {line_number}: {error}"
-                ))
-            })?;
+            let value: Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(_error) if source.is_torn_tail(line_index) => {
+                    torn_tail_line = Some(line_number);
+                    eprintln!(
+                        "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    return Err(invalid_data(format!(
+                        "could not rebuild bait exposure store from event log line {line_number}: {error}"
+                    )))
+                }
+            };
             let schema_version = value
                 .get("schema_version")
                 .and_then(Value::as_u64)
@@ -1262,6 +1304,7 @@ impl BaitExposureStore {
             }
         }
 
+        store.torn_tail_line = torn_tail_line;
         Ok(store)
     }
 
@@ -3552,10 +3595,15 @@ fn policy_state_for_session(
     runtime: &ProxyRuntime,
     session_id: SessionId,
 ) -> io::Result<PolicyState> {
-    let store = runtime
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let mut store = runtime
         .policy_store
         .lock()
         .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+    store.note_session_seen(session_id, now_unix_secs);
 
     Ok(store.policy_state(session_id))
 }
@@ -3588,7 +3636,20 @@ fn set_policy_state_for_session(
         .lock()
         .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
 
-    store.set_policy_state(session_id, policy_state)
+    let result = store.set_policy_state(session_id, policy_state);
+    if let Err(error) = &result {
+        write_debug(
+            runtime,
+            "policy_persist_failed",
+            Some(session_id),
+            json!({
+                "policy_state": policy_state,
+                "error": error.to_string(),
+            }),
+        )?;
+    }
+
+    result
 }
 
 fn note_reality_escape_attempt_for_session(
@@ -8248,6 +8309,66 @@ mod tests {
             "unsupported schema_version {}; expected {EVENT_SCHEMA_VERSION}",
             EVENT_SCHEMA_VERSION + 1
         )));
+    }
+
+    fn bait_exposed_jsonl_line(session_id: SessionId) -> String {
+        serde_json::to_string(&Event::new(
+            session_id,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId("torn-bait".to_string()),
+                exposure_id: ExposureId("torn-exposure".to_string()),
+                surface: "/docs".to_string(),
+                header_value_mint: None,
+            },
+        ))
+        .expect("event should serialize")
+    }
+
+    #[test]
+    fn torn_final_event_log_line_is_tolerated_and_reported() {
+        let session_id = SessionId::new();
+        let valid = bait_exposed_jsonl_line(session_id);
+        let truncated = "{\"schema_version\":2,\"id\":\"half-written";
+
+        let store =
+            BaitExposureStore::from_event_log_reader(Cursor::new(format!("{valid}\n{truncated}")))
+                .expect("crash-torn tail should be tolerated");
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.torn_tail_line, Some(2));
+    }
+
+    #[test]
+    fn mid_file_corruption_fails_reconstruction_loudly() {
+        let session_id = SessionId::new();
+        let valid = bait_exposed_jsonl_line(session_id);
+
+        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!(
+            "{{not json}}\n{valid}\n"
+        )))
+        .expect_err("mid-file corruption must fail");
+
+        assert!(error
+            .to_string()
+            .contains("could not rebuild bait exposure store from event log line 1"));
+    }
+
+    #[test]
+    fn truncated_final_line_with_trailing_newline_is_corruption_not_a_tear() {
+        let session_id = SessionId::new();
+        let valid = bait_exposed_jsonl_line(session_id);
+        let truncated = "{\"schema_version\":2,\"id\":\"half-written";
+
+        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!(
+            "{valid}\n{truncated}\n"
+        )))
+        .expect_err("corrupt final line with trailing newline must fail");
+
+        assert!(error
+            .to_string()
+            .contains("could not rebuild bait exposure store from event log line 2"));
     }
 
     #[test]

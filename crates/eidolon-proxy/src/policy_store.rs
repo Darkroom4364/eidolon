@@ -10,16 +10,45 @@ use serde::{Deserialize, Serialize};
 
 pub const POLICY_STORE_SCHEMA_VERSION: u16 = 1;
 
+/// Maximum retained session policy records. Enforcement states (rate
+/// limited, controlled reality, blocked) are never evicted for cardinality;
+/// lower rungs are evicted oldest-first once TTL and cardinality apply.
+pub const MAX_POLICY_SESSIONS: usize = 8192;
+
+/// Time after which a session record that never rose above `Suspicious` may
+/// be evicted. Enforcement states are never TTL-evicted either (safety note:
+/// eviction must not turn a known contained or blocked session into an
+/// unqualified benign session).
+pub const POLICY_SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Policy states that must never be evicted, by TTL or cardinality.
+fn is_eviction_protected(policy_state: PolicyState) -> bool {
+    matches!(
+        policy_state,
+        PolicyState::RateLimited | PolicyState::ControlledReality | PolicyState::Blocked
+    )
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyStateStore {
     path: Option<PathBuf>,
     records: HashMap<SessionId, SessionPolicyRecord>,
+    last_eviction: EvictionStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPolicyRecord {
     pub policy_state: PolicyState,
     pub controlled_reality_depth: u32,
+    #[serde(default)]
+    pub last_seen_unix_secs: u64,
     #[serde(default)]
     pub reality_escape_attempt_count: u32,
     #[serde(default)]
@@ -38,11 +67,26 @@ pub struct SessionPolicyRecord {
     pub discovery_decoy_write_probe_fanout: crate::policy::DecoyWriteProbeFanout,
 }
 
+/// Outcome of one eviction pass, for operator visibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EvictionStats {
+    pub ttl_evicted: usize,
+    pub lru_evicted: usize,
+    pub protected_overflow: usize,
+}
+
+impl EvictionStats {
+    pub fn is_clean(&self) -> bool {
+        self.ttl_evicted == 0 && self.lru_evicted == 0 && self.protected_overflow == 0
+    }
+}
+
 impl SessionPolicyRecord {
     pub fn new(policy_state: PolicyState) -> Self {
         Self {
             policy_state,
             controlled_reality_depth: 0,
+            last_seen_unix_secs: 0,
             reality_escape_attempt_count: 0,
             discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout::default(),
             discovery_request_count: 0,
@@ -74,6 +118,8 @@ struct StoredSessionPolicy {
     #[serde(default)]
     controlled_reality_depth: u32,
     #[serde(default)]
+    last_seen_unix_secs: u64,
+    #[serde(default)]
     reality_escape_attempt_count: u32,
     #[serde(default)]
     discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout,
@@ -100,10 +146,16 @@ impl PolicyStateStore {
         Self {
             path: None,
             records: HashMap::new(),
+            last_eviction: EvictionStats::default(),
         }
     }
 
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_at(path, current_unix_secs())
+    }
+
+    /// Open the store with an explicit "now" (test hook for eviction runs).
+    pub fn open_at(path: impl AsRef<Path>, now: u64) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let records = match fs::read(&path) {
             Ok(bytes) if bytes.is_empty() => {
@@ -116,11 +168,80 @@ impl PolicyStateStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => HashMap::new(),
             Err(error) => return Err(error),
         };
-
-        Ok(Self {
+        let mut store = Self {
             path: Some(path),
             records,
-        })
+            last_eviction: EvictionStats::default(),
+        };
+
+        // Legacy records written before last_seen tracking get one grace
+        // window: they are grandfathered to now instead of being mass-evicted
+        // on the first load after upgrade.
+        for record in store.records.values_mut() {
+            if record.last_seen_unix_secs == 0 {
+                record.last_seen_unix_secs = now;
+            }
+        }
+
+        let stats = store.evict(now);
+        store.last_eviction = stats;
+        if !stats.is_clean() {
+            store.persist()?;
+        }
+
+        Ok(store)
+    }
+
+    /// Eviction outcome from the last `open`/`open_at` call.
+    pub fn last_eviction_stats(&self) -> EvictionStats {
+        self.last_eviction
+    }
+
+    /// Evict TTL-expired lower-rung records and enforce cardinality oldest-
+    /// first among evictable rungs. Enforcement states (rate limited,
+    /// controlled reality, blocked) are never evicted; their overflow is
+    /// reported instead of evicted.
+    pub fn evict(&mut self, now: u64) -> EvictionStats {
+        let mut stats = EvictionStats::default();
+
+        self.records.retain(|_, record| {
+            if is_eviction_protected(record.policy_state) {
+                return true;
+            }
+            let fresh = record.last_seen_unix_secs + POLICY_SESSION_TTL_SECS > now;
+            if !fresh {
+                stats.ttl_evicted += 1;
+            }
+            fresh
+        });
+
+        while self.records.len() > MAX_POLICY_SESSIONS {
+            let Some(oldest) = self
+                .records
+                .iter()
+                .filter(|(_, record)| !is_eviction_protected(record.policy_state))
+                .min_by_key(|(session_id, record)| (record.last_seen_unix_secs, session_id.0))
+                .map(|(session_id, _)| *session_id)
+            else {
+                break;
+            };
+            self.records.remove(&oldest);
+            stats.lru_evicted += 1;
+        }
+
+        if self.records.len() > MAX_POLICY_SESSIONS {
+            stats.protected_overflow = self.records.len() - MAX_POLICY_SESSIONS;
+        }
+
+        stats
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
     }
 
     pub fn policy_state(&self, session_id: SessionId) -> PolicyState {
@@ -129,6 +250,29 @@ impl PolicyStateStore {
 
     pub fn record(&self, session_id: SessionId) -> SessionPolicyRecord {
         self.records.get(&session_id).copied().unwrap_or_default()
+    }
+
+    /// Refresh a session's in-memory freshness marker without persisting
+    /// (persistence of `last_seen` rides on the next mutating operation).
+    pub fn note_session_seen(&mut self, session_id: SessionId, now: u64) {
+        if let Some(record) = self.records.get_mut(&session_id) {
+            record.last_seen_unix_secs = now;
+        }
+    }
+
+    fn insert_record(&mut self, session_id: SessionId, record: SessionPolicyRecord) {
+        let mut record = record;
+        record.last_seen_unix_secs = current_unix_secs();
+        if !self.records.contains_key(&session_id) && self.records.len() >= MAX_POLICY_SESSIONS {
+            let stats = self.evict(record.last_seen_unix_secs);
+            if stats.lru_evicted > 0 {
+                eprintln!(
+                    "eidolon policy store: evicted {} least-recent sessions at capacity",
+                    stats.lru_evicted
+                );
+            }
+        }
+        self.records.insert(session_id, record);
     }
 
     pub fn set_policy_state(
@@ -144,14 +288,14 @@ impl PolicyStateStore {
                 record.reality_escape_attempt_count = 0;
             }
         }
-        self.records.insert(session_id, record);
+        self.insert_record(session_id, record);
         self.persist()
     }
 
     pub fn increment_controlled_reality_depth(&mut self, session_id: SessionId) -> io::Result<u32> {
         let mut record = self.record(session_id);
         record.controlled_reality_depth = record.controlled_reality_depth.saturating_add(1);
-        self.records.insert(session_id, record);
+        self.insert_record(session_id, record);
         self.persist()?;
         Ok(record.controlled_reality_depth)
     }
@@ -159,7 +303,7 @@ impl PolicyStateStore {
     pub fn note_reality_escape_attempt(&mut self, session_id: SessionId) -> io::Result<u32> {
         let mut record = self.record(session_id);
         record.reality_escape_attempt_count = record.reality_escape_attempt_count.saturating_add(1);
-        self.records.insert(session_id, record);
+        self.insert_record(session_id, record);
         self.persist()?;
         Ok(record.reality_escape_attempt_count)
     }
@@ -171,7 +315,7 @@ impl PolicyStateStore {
         }
 
         record.reality_escape_attempt_count = 0;
-        self.records.insert(session_id, record);
+        self.insert_record(session_id, record);
         self.persist()
     }
 
@@ -187,7 +331,7 @@ impl PolicyStateStore {
         record.discovery_request_count = record.discovery_request_count.saturating_add(1);
         record.discovery_query_seen |= query_present;
         record.discovery_legacy_openapi_query_seen |= legacy_openapi_query_seen;
-        self.records.insert(session_id, record);
+        self.insert_record(session_id, record);
         self.persist()?;
         Ok(discovery_recon_state(record))
     }
@@ -200,7 +344,7 @@ impl PolicyStateStore {
         let mut record = self.record(session_id);
         record.discovery_linked_bait_surface_fanout =
             record.discovery_linked_bait_surface_fanout.mark(kind);
-        self.records.insert(session_id, record);
+        self.insert_record(session_id, record);
         self.persist()?;
         Ok(discovery_recon_state(record))
     }
@@ -217,7 +361,7 @@ impl PolicyStateStore {
             .min(crate::policy::discovery_recon_decoy_write_probe_count_cap());
         record.discovery_decoy_write_probe_fanout =
             record.discovery_decoy_write_probe_fanout.mark(kind);
-        self.records.insert(session_id, record);
+        self.insert_record(session_id, record);
         self.persist()?;
         Ok(discovery_recon_state(record))
     }
@@ -234,6 +378,7 @@ impl PolicyStateStore {
                 session_id: *session_id,
                 policy_state: record.policy_state,
                 controlled_reality_depth: record.controlled_reality_depth,
+                last_seen_unix_secs: record.last_seen_unix_secs,
                 reality_escape_attempt_count: record.reality_escape_attempt_count,
                 discovery_surface_fanout: record.discovery_surface_fanout,
                 discovery_request_count: record.discovery_request_count,
@@ -275,6 +420,7 @@ impl PolicyStateStore {
 
         file.write_all(&serialized)?;
         file.flush()?;
+        file.sync_all()?;
         fs::rename(temp_path, path)
     }
 }
@@ -359,6 +505,7 @@ fn deserialize_records(
                 SessionPolicyRecord {
                     policy_state: session.policy_state,
                     controlled_reality_depth: session.controlled_reality_depth,
+                    last_seen_unix_secs: session.last_seen_unix_secs,
                     reality_escape_attempt_count: session.reality_escape_attempt_count,
                     discovery_surface_fanout: session.discovery_surface_fanout,
                     discovery_request_count: session.discovery_request_count,
@@ -409,6 +556,148 @@ mod tests {
     #[test]
     fn policy_store_schema_version_matches_current_contract() {
         assert_eq!(POLICY_STORE_SCHEMA_VERSION, 1);
+    }
+
+    fn store_with(records: Vec<(SessionId, PolicyState, u64)>) -> PolicyStateStore {
+        PolicyStateStore {
+            path: None,
+            records: records
+                .into_iter()
+                .map(|(session_id, policy_state, last_seen)| {
+                    (
+                        session_id,
+                        SessionPolicyRecord {
+                            last_seen_unix_secs: last_seen,
+                            ..SessionPolicyRecord::new(policy_state)
+                        },
+                    )
+                })
+                .collect(),
+            last_eviction: EvictionStats::default(),
+        }
+    }
+
+    #[test]
+    fn eviction_removes_ttl_stale_low_rungs_but_never_enforcement_states() {
+        let stale = 1_000;
+        let now = stale + POLICY_SESSION_TTL_SECS + 10;
+        let mut store = store_with(vec![
+            (SessionId::new(), PolicyState::Normal, stale),
+            (SessionId::new(), PolicyState::Observe, stale),
+            (SessionId::new(), PolicyState::Suspicious, stale),
+            (SessionId::new(), PolicyState::RateLimited, stale),
+            (SessionId::new(), PolicyState::ControlledReality, stale),
+            (SessionId::new(), PolicyState::Blocked, stale),
+            (SessionId::new(), PolicyState::Normal, now),
+        ]);
+
+        let stats = store.evict(now);
+
+        assert_eq!(stats.ttl_evicted, 3);
+        assert_eq!(stats.lru_evicted, 0);
+        assert_eq!(store.len(), 4);
+        assert!(store
+            .records
+            .values()
+            .all(|record| is_eviction_protected(record.policy_state)
+                || record.last_seen_unix_secs == now));
+    }
+
+    #[test]
+    fn cardinality_evicts_oldest_evictable_sessions_first() {
+        let base = 2_000;
+        let mut records: Vec<(SessionId, PolicyState, u64)> = Vec::new();
+        let mut protected_ids = Vec::new();
+        for index in 0..MAX_POLICY_SESSIONS + 2 {
+            if index % 10 == 0 {
+                let session_id = SessionId::new();
+                protected_ids.push(session_id);
+                records.push((session_id, PolicyState::Blocked, base + index as u64));
+            } else {
+                records.push((SessionId::new(), PolicyState::Observe, base + index as u64));
+            }
+        }
+        let oldest_observe = records[1].0;
+        let mut store = store_with(records);
+
+        let stats = store.evict(base + 100_000);
+
+        assert_eq!(store.len(), MAX_POLICY_SESSIONS);
+        assert_eq!(stats.lru_evicted, 2);
+        assert_eq!(stats.protected_overflow, 0);
+        assert!(!store.records.contains_key(&oldest_observe));
+        assert!(protected_ids
+            .iter()
+            .all(|session_id| store.records.contains_key(session_id)));
+    }
+
+    #[test]
+    fn enforcement_only_overflow_is_reported_not_evicted() {
+        let base = 3_000;
+        let records: Vec<(SessionId, PolicyState, u64)> = (0..MAX_POLICY_SESSIONS + 3)
+            .map(|index| (SessionId::new(), PolicyState::Blocked, base + index as u64))
+            .collect();
+        let mut store = store_with(records);
+
+        let stats = store.evict(base + 100_000);
+
+        assert_eq!(stats.lru_evicted, 0);
+        assert_eq!(stats.ttl_evicted, 0);
+        assert_eq!(stats.protected_overflow, 3);
+        assert_eq!(store.len(), MAX_POLICY_SESSIONS + 3);
+    }
+
+    #[test]
+    fn legacy_zero_timestamps_are_grandfathered_not_mass_evicted() {
+        let path = unique_temp_path("legacy-zero-last-seen");
+        let session_id = SessionId::new();
+        let stored = serde_json::json!({
+            "schema_version": 1,
+            "sessions": [
+                {
+                    "session_id": session_id.0,
+                    "policy_state": "observe",
+                    "controlled_reality_depth": 0
+                }
+            ]
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&stored).expect("stored should serialize"),
+        )
+        .expect("stored should write");
+
+        let now = 4_000;
+        let store = PolicyStateStore::open_at(&path, now).expect("store should open");
+
+        assert_eq!(store.record(session_id).last_seen_unix_secs, now);
+        assert_eq!(store.policy_state(session_id), PolicyState::Observe);
+    }
+
+    #[test]
+    fn mutations_refresh_last_seen_and_persist_it() {
+        let path = unique_temp_path("last-seen-roundtrip");
+        let session_id = SessionId::new();
+
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        store
+            .set_policy_state(session_id, PolicyState::Suspicious)
+            .expect("state should persist");
+        let seen = store.record(session_id).last_seen_unix_secs;
+        assert!(seen > 0);
+
+        let reopened = PolicyStateStore::open(&path).expect("store should reopen");
+        assert_eq!(reopened.record(session_id).last_seen_unix_secs, seen);
+    }
+
+    #[test]
+    fn note_session_seen_refreshes_freshness_in_memory_only() {
+        let session_id = SessionId::new();
+        let mut store = store_with(vec![(session_id, PolicyState::Observe, 100)]);
+
+        store.note_session_seen(session_id, 500);
+
+        assert_eq!(store.record(session_id).last_seen_unix_secs, 500);
     }
 
     #[test]
