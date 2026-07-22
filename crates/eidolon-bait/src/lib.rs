@@ -251,6 +251,37 @@ impl BaitRegistry {
                 header_value_mint_status: None,
             })
     }
+
+    /// Returns the first registered bait whose expected-action method and path
+    /// match the request, regardless of any expected header name or value.
+    ///
+    /// This is the fail-closed registration check for unsafe bait action
+    /// shapes: membership depends only on the configured method and path,
+    /// never on proof presence or validity.
+    pub fn match_unsafe_action_shape(&self, method: &str, path: &str) -> Option<BaitActionMatch> {
+        self.baits
+            .iter()
+            .find(|bait| unsafe_action_shape_matches(&bait.expected_action, method, path))
+            .cloned()
+            .map(|bait| BaitActionMatch {
+                bait,
+                header_value_mint_status: None,
+            })
+    }
+
+    /// Lists every configured unsafe bait action shape as `(method, path)`
+    /// pairs, for startup registration audits.
+    pub fn unsafe_action_shapes(&self) -> Vec<(String, String)> {
+        self.baits
+            .iter()
+            .map(|bait| {
+                (
+                    bait.expected_action.method.to_ascii_uppercase(),
+                    bait.expected_action.path.clone(),
+                )
+            })
+            .collect()
+    }
 }
 
 pub fn m3_baits() -> Vec<Bait> {
@@ -297,7 +328,7 @@ fn action_shape_matches(
     path: &str,
     headers: &[(&str, &str)],
 ) -> bool {
-    if !expected.method.eq_ignore_ascii_case(method) || expected.path != path {
+    if !unsafe_action_shape_matches(expected, method, path) {
         return false;
     }
 
@@ -308,6 +339,10 @@ fn action_shape_matches(
         (None, Some(_)) => false,
         (None, None) => true,
     }
+}
+
+fn unsafe_action_shape_matches(expected: &ExpectedAction, method: &str, path: &str) -> bool {
+    expected.method.eq_ignore_ascii_case(method) && expected.path == path
 }
 
 fn exact_action_matches(
@@ -635,6 +670,62 @@ mod tests {
             matched.map(|matched| matched.bait.id),
             Some(BaitId("rel_2025_04_b7f2".to_string()))
         );
+    }
+
+    #[test]
+    fn match_unsafe_action_shape_matches_method_and_path_regardless_of_headers() {
+        let registry = demo_registry();
+
+        let without_headers =
+            registry.match_unsafe_action_shape("POST", "/api/v2/import/reconcile");
+        let with_wrong_headers =
+            registry.match_unsafe_action_shape("post", "/api/v2/import/reconcile");
+
+        assert_eq!(
+            without_headers.map(|matched| matched.bait.id),
+            Some(BaitId("rel_2025_04_b7f2".to_string()))
+        );
+        assert_eq!(
+            with_wrong_headers.map(|matched| matched.bait.id),
+            Some(BaitId("rel_2025_04_b7f2".to_string()))
+        );
+    }
+
+    #[test]
+    fn match_unsafe_action_shape_rejects_unknown_paths_and_methods() {
+        let registry = demo_registry();
+
+        assert_eq!(
+            registry.match_unsafe_action_shape("POST", "/api/v2/import/other"),
+            None
+        );
+        assert_eq!(
+            registry.match_unsafe_action_shape("GET", "/api/v2/import/reconcile"),
+            None
+        );
+    }
+
+    #[test]
+    fn match_action_shape_rejects_unknown_path_even_with_expected_header() {
+        let registry = demo_registry();
+
+        let matched = registry.match_action_shape(
+            "POST",
+            "/api/v2/import/other",
+            [("X-Migration-Trace", "rel_2025_04_b7f2")],
+        );
+
+        assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn unsafe_action_shapes_lists_every_registered_action() {
+        let registry = BaitRegistry::m3_catalog();
+
+        let shapes = registry.unsafe_action_shapes();
+
+        assert!(shapes.contains(&("POST".to_string(), DECOY_RECONCILE_PATH.to_string())));
+        assert_eq!(shapes.len(), 5);
     }
 
     #[test]

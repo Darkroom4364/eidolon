@@ -1,9 +1,15 @@
+use std::net::IpAddr;
+
 use chrono::{DateTime, Utc};
 use eidolon_core::{
     AuthenticatedIngressRuleRejection, EdgeRecommendedAction, IngressActorKind,
     IngressAdvisorySignals, IngressIdentity, IngressIdentitySource, IngressTrustTier,
     IngressVerificationStrength, LocalIngressTrustScopeRejection, SessionId,
     TrustedIngressSoftenMatch,
+};
+
+use crate::session_auth::{
+    ContinuityOutcome, CookieOutcome, KeyStatus, SessionAuthority, SessionResolution,
 };
 
 /// Request header carrying first-party cookies.
@@ -66,32 +72,40 @@ pub enum SessionSource {
 pub struct SessionContext {
     pub session_id: SessionId,
     pub source: SessionSource,
+    pub cookie_outcome: CookieOutcome,
+    pub key_status: Option<KeyStatus>,
+    pub presented_key_version: Option<u32>,
+    pub active_key_version: u32,
+    pub continuity_outcome: ContinuityOutcome,
+    pub enforcement_floor: Option<eidolon_core::PolicyState>,
     pub ingress_identity: IngressIdentity,
     pub authenticated_ingress_rule_rejection: Option<AuthenticatedIngressRuleRejection>,
     pub local_ingress_trust_scope_rejection: Option<LocalIngressTrustScopeRejection>,
     pub ingress_signals: IngressAdvisorySignals,
     pub trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
     pub trusted_bait_soften_path_prefixes: Option<Vec<String>>,
+    set_cookie_value: Option<String>,
 }
 
 impl SessionContext {
     /// Whether the response should include a `Set-Cookie` header.
     pub fn should_set_cookie(&self) -> bool {
-        matches!(self.source, SessionSource::Generated)
+        self.set_cookie_value.is_some()
     }
 
     /// Formats a `Set-Cookie` value when this request created a new session.
     pub fn set_cookie_value(&self) -> Option<String> {
-        self.should_set_cookie()
-            .then(|| format_set_cookie(self.session_id))
+        self.set_cookie_value.clone()
     }
 }
 
-/// Derive a session from request headers or create a new generated context.
-///
-/// Header names are matched case-insensitively. Malformed cookie pairs and
-/// non-UUID values for the Eidolon session cookie are ignored.
-pub fn derive_session_from_headers<I, N, V>(headers: I) -> SessionContext
+/// Authenticate a session cookie or recover a bounded direct-peer continuity session.
+pub fn derive_session_from_headers<I, N, V>(
+    authority: &mut SessionAuthority,
+    headers: I,
+    peer_ip: Option<IpAddr>,
+    now: u64,
+) -> SessionContext
 where
     I: IntoIterator<Item = (N, V)>,
     N: AsRef<str>,
@@ -112,32 +126,41 @@ where
             .map(|(name, value)| (name.as_str(), value.as_str())),
     );
 
-    if let Some(session_id) = session_id_from_headers(
+    let resolution = authority.resolve(
         headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
-    ) {
-        SessionContext {
-            session_id,
-            source: SessionSource::Cookie,
-            ingress_identity,
-            authenticated_ingress_rule_rejection: None,
-            local_ingress_trust_scope_rejection: None,
-            ingress_signals,
-            trusted_ingress_soften_match: None,
-            trusted_bait_soften_path_prefixes: None,
-        }
-    } else {
-        SessionContext {
-            session_id: SessionId::new(),
-            source: SessionSource::Generated,
-            ingress_identity,
-            authenticated_ingress_rule_rejection: None,
-            local_ingress_trust_scope_rejection: None,
-            ingress_signals,
-            trusted_ingress_soften_match: None,
-            trusted_bait_soften_path_prefixes: None,
-        }
+        peer_ip,
+        now,
+    );
+    context_from_resolution(resolution, ingress_identity, ingress_signals)
+}
+
+fn context_from_resolution(
+    resolution: SessionResolution,
+    ingress_identity: IngressIdentity,
+    ingress_signals: IngressAdvisorySignals,
+) -> SessionContext {
+    SessionContext {
+        session_id: resolution.session_id,
+        source: if resolution.from_cookie() {
+            SessionSource::Cookie
+        } else {
+            SessionSource::Generated
+        },
+        cookie_outcome: resolution.cookie_outcome,
+        key_status: resolution.key_status,
+        presented_key_version: resolution.presented_key_version,
+        active_key_version: resolution.active_key_version,
+        continuity_outcome: resolution.continuity_outcome,
+        enforcement_floor: resolution.enforcement_floor,
+        ingress_identity,
+        authenticated_ingress_rule_rejection: None,
+        local_ingress_trust_scope_rejection: None,
+        ingress_signals,
+        trusted_ingress_soften_match: None,
+        trusted_bait_soften_path_prefixes: None,
+        set_cookie_value: resolution.set_cookie_value,
     }
 }
 
@@ -306,48 +329,6 @@ where
     )
 }
 
-/// Return the first valid Eidolon session found in any inbound `Cookie` header.
-pub fn session_id_from_headers<I, N, V>(headers: I) -> Option<SessionId>
-where
-    I: IntoIterator<Item = (N, V)>,
-    N: AsRef<str>,
-    V: AsRef<str>,
-{
-    headers
-        .into_iter()
-        .filter(|(name, _)| name.as_ref().eq_ignore_ascii_case(COOKIE_HEADER_NAME))
-        .find_map(|(_, value)| session_id_from_cookie_header(value.as_ref()))
-}
-
-/// Parse one raw `Cookie` header value for the Eidolon session cookie.
-pub fn session_id_from_cookie_header(header_value: &str) -> Option<SessionId> {
-    header_value
-        .split(';')
-        .filter_map(cookie_pair)
-        .filter(|(name, _)| *name == SESSION_COOKIE_NAME)
-        .find_map(|(_, value)| parse_session_id(value))
-}
-
-/// Format a local-lab `Set-Cookie` header value for a generated session.
-pub fn format_set_cookie(session_id: SessionId) -> String {
-    format!(
-        "{}={}; {}",
-        SESSION_COOKIE_NAME, session_id.0, SESSION_COOKIE_ATTRIBUTES
-    )
-}
-
-fn cookie_pair(raw: &str) -> Option<(&str, &str)> {
-    let (name, value) = raw.trim().split_once('=')?;
-    let name = name.trim();
-    let value = value.trim();
-
-    (!name.is_empty() && !value.is_empty()).then_some((name, value))
-}
-
-fn parse_session_id(value: &str) -> Option<SessionId> {
-    Some(SessionId(value.parse().ok()?))
-}
-
 fn parse_ingress_identity_source(value: &str) -> Option<IngressIdentitySource> {
     Some(match value {
         "none" => IngressIdentitySource::None,
@@ -453,16 +434,36 @@ fn stale_ingress_identity_to_weakly_asserted(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_auth::SessionKeyVersion;
+
+    const NOW: u64 = 1_750_000_000;
+
+    fn test_session_authority() -> SessionAuthority {
+        SessionAuthority::new(
+            vec![SessionKeyVersion {
+                version: 1,
+                key: [0x42; 32],
+            }],
+            1,
+        )
+        .expect("test session authority should build")
+    }
 
     #[test]
     fn uses_existing_valid_cookie() {
+        let mut authority = test_session_authority();
         let expected = SessionId::new();
-        let cookie = format!("{}={}", SESSION_COOKIE_NAME, expected.0);
+        let cookie = format!(
+            "{}={}",
+            SESSION_COOKIE_NAME,
+            authority.mint_cookie_value(expected, NOW)
+        );
 
-        let context = derive_session_from_headers([("Cookie", cookie)]);
+        let context = derive_session_from_headers(&mut authority, [("Cookie", cookie)], None, NOW);
 
         assert_eq!(context.session_id, expected);
         assert_eq!(context.source, SessionSource::Cookie);
+        assert_eq!(context.cookie_outcome, CookieOutcome::Valid);
         assert_eq!(context.ingress_identity, IngressIdentity::default());
         assert_eq!(context.ingress_signals, IngressAdvisorySignals::default());
         assert!(!context.should_set_cookie());
@@ -471,24 +472,34 @@ mod tests {
 
     #[test]
     fn generates_session_when_cookie_absent() {
-        let context = derive_session_from_headers([("Host", "127.0.0.1:8080")]);
+        let mut authority = test_session_authority();
+
+        let context =
+            derive_session_from_headers(&mut authority, [("Host", "127.0.0.1:8080")], None, NOW);
 
         assert_eq!(context.source, SessionSource::Generated);
+        assert_eq!(context.cookie_outcome, CookieOutcome::Absent);
         assert_eq!(context.ingress_identity, IngressIdentity::default());
         assert_eq!(context.ingress_signals, IngressAdvisorySignals::default());
         assert!(context.should_set_cookie());
-        assert_eq!(
-            context.set_cookie_value(),
-            Some(format_set_cookie(context.session_id))
-        );
+        let set_cookie = context.set_cookie_value().expect("cookie should be minted");
+        assert!(set_cookie.starts_with(&format!("{}=v1.1.", SESSION_COOKIE_NAME)));
+        assert!(set_cookie.contains(&context.session_id.0.to_string()));
     }
 
     #[test]
     fn generates_session_when_cookie_is_invalid() {
-        let context =
-            derive_session_from_headers([("Cookie", "eidolon_session=not-a-uuid; other=value")]);
+        let mut authority = test_session_authority();
+
+        let context = derive_session_from_headers(
+            &mut authority,
+            [("Cookie", "eidolon_session=not-a-uuid; other=value")],
+            None,
+            NOW,
+        );
 
         assert_eq!(context.source, SessionSource::Generated);
+        assert_eq!(context.cookie_outcome, CookieOutcome::Malformed);
         assert_eq!(context.ingress_identity, IngressIdentity::default());
         assert_eq!(context.ingress_signals, IngressAdvisorySignals::default());
         assert!(context.should_set_cookie());
@@ -496,16 +507,20 @@ mod tests {
 
     #[test]
     fn finds_valid_session_among_multiple_cookies() {
+        let mut authority = test_session_authority();
         let expected = SessionId::new();
+        let minted = authority.mint_cookie_value(expected, NOW);
         let cookie = format!(
-            "theme=light; malformed; {}=not-a-uuid; other=value; {}={}",
-            SESSION_COOKIE_NAME, SESSION_COOKIE_NAME, expected.0
+            "theme=light; malformed; other=value; {}={}",
+            SESSION_COOKIE_NAME, minted
         );
 
-        let context = derive_session_from_headers([
-            ("Host", "127.0.0.1:8080".to_string()),
-            ("cookie", cookie),
-        ]);
+        let context = derive_session_from_headers(
+            &mut authority,
+            [("Host", "127.0.0.1:8080".to_string()), ("cookie", cookie)],
+            None,
+            NOW,
+        );
 
         assert_eq!(context.session_id, expected);
         assert_eq!(context.source, SessionSource::Cookie);
@@ -515,28 +530,18 @@ mod tests {
     }
 
     #[test]
-    fn cookie_pair_rejects_empty_names_and_values() {
-        assert_eq!(cookie_pair("=value"), None);
-        assert_eq!(cookie_pair("eidolon_session="), None);
-        assert_eq!(
-            cookie_pair(" eidolon_session = value "),
-            Some(("eidolon_session", "value"))
-        );
-    }
-
-    #[test]
     fn formats_set_cookie_for_local_http_lab() {
+        let authority = test_session_authority();
         let session_id = SessionId::new();
 
-        let value = format_set_cookie(session_id);
+        let value = authority.mint_set_cookie_value(session_id, NOW);
 
-        assert_eq!(
-            value,
-            format!(
-                "{}={}; Path={}; HttpOnly; SameSite={}",
-                SESSION_COOKIE_NAME, session_id.0, SESSION_COOKIE_PATH, SESSION_COOKIE_SAME_SITE
-            )
-        );
+        assert!(value.starts_with(&format!("{}=v1.1.", SESSION_COOKIE_NAME)));
+        assert!(value.contains(&session_id.0.to_string()));
+        assert!(value.ends_with(&format!(
+            "; Path={}; HttpOnly; SameSite={}",
+            SESSION_COOKIE_PATH, SESSION_COOKIE_SAME_SITE
+        )));
         assert!(!value.contains("Domain="));
         assert!(!value.contains("Max-Age="));
         assert!(!value.contains("Expires="));
@@ -545,16 +550,23 @@ mod tests {
 
     #[test]
     fn derives_normalized_ingress_identity_from_headers() {
-        let context = derive_session_from_headers([
-            ("Host", "proxy.local"),
-            (INGRESS_IDENTITY_SOURCE_HEADER_NAME, "operator_override"),
-            (INGRESS_TRUST_TIER_HEADER_NAME, "allowlisted"),
-            (INGRESS_IDENTITY_LABEL_HEADER_NAME, "internal-crawler"),
-            (
-                INGRESS_IDENTITY_EXPIRES_AT_HEADER_NAME,
-                "2999-06-04T12:00:00Z",
-            ),
-        ]);
+        let mut authority = test_session_authority();
+
+        let context = derive_session_from_headers(
+            &mut authority,
+            [
+                ("Host", "proxy.local"),
+                (INGRESS_IDENTITY_SOURCE_HEADER_NAME, "operator_override"),
+                (INGRESS_TRUST_TIER_HEADER_NAME, "allowlisted"),
+                (INGRESS_IDENTITY_LABEL_HEADER_NAME, "internal-crawler"),
+                (
+                    INGRESS_IDENTITY_EXPIRES_AT_HEADER_NAME,
+                    "2999-06-04T12:00:00Z",
+                ),
+            ],
+            None,
+            NOW,
+        );
 
         assert_eq!(context.source, SessionSource::Generated);
         assert_eq!(
@@ -591,21 +603,28 @@ mod tests {
 
     #[test]
     fn derives_advisory_ingress_signals_from_headers() {
-        let context = derive_session_from_headers([
-            ("Host", "proxy.local"),
-            (INGRESS_VERIFICATION_STRENGTH_HEADER_NAME, "cryptographic"),
-            (INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
-            (INGRESS_VERIFIED_CATEGORY_HEADER_NAME, "AI Assistant"),
-            (INGRESS_ATTESTATION_REF_HEADER_NAME, "jkt:sha256:ba3e64"),
-            (INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
-            (
-                INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
-                "automation_likelihood_inverse",
-            ),
-            (INGRESS_VENDOR_SCORE_SCALE_HEADER_NAME, "1-99"),
-            (INGRESS_DETECTION_IDS_HEADER_NAME, "3355446, 445566"),
-            (INGRESS_EDGE_ACTION_HEADER_NAME, "allow"),
-        ]);
+        let mut authority = test_session_authority();
+
+        let context = derive_session_from_headers(
+            &mut authority,
+            [
+                ("Host", "proxy.local"),
+                (INGRESS_VERIFICATION_STRENGTH_HEADER_NAME, "cryptographic"),
+                (INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                (INGRESS_VERIFIED_CATEGORY_HEADER_NAME, "AI Assistant"),
+                (INGRESS_ATTESTATION_REF_HEADER_NAME, "jkt:sha256:ba3e64"),
+                (INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
+                (
+                    INGRESS_VENDOR_SCORE_KIND_HEADER_NAME,
+                    "automation_likelihood_inverse",
+                ),
+                (INGRESS_VENDOR_SCORE_SCALE_HEADER_NAME, "1-99"),
+                (INGRESS_DETECTION_IDS_HEADER_NAME, "3355446, 445566"),
+                (INGRESS_EDGE_ACTION_HEADER_NAME, "allow"),
+            ],
+            None,
+            NOW,
+        );
 
         assert_eq!(
             context.ingress_signals,

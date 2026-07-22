@@ -3,7 +3,7 @@ use eidolon_core::PreContainmentPersistenceKind;
 use eidolon_core::{
     BaitId, Event, EventKind, EventSource, IngressActorKind, IngressAdvisorySignals,
     IngressIdentity, PolicyPersistenceMetadata, PolicyState, PostContainmentPersistenceKind,
-    PreContainmentPersistenceClass, RoutingDecision, SessionId,
+    PreContainmentPersistenceClass, RequestId, RoutingDecision, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -820,7 +820,11 @@ pub fn decide_for_state(
     }
 }
 
-pub fn policy_intervention_event(session_id: SessionId, decision: &PolicyDecision) -> Event {
+pub fn policy_intervention_event(
+    session_id: SessionId,
+    request_id: RequestId,
+    decision: &PolicyDecision,
+) -> Event {
     let kind = match decision.routing_decision {
         RoutingDecision::ControlledReality => EventKind::ControlledRealityEntered {
             reason: decision.reason.clone(),
@@ -843,9 +847,14 @@ pub fn policy_intervention_event(session_id: SessionId, decision: &PolicyDecisio
         decision.policy_state,
         kind,
     )
+    .with_request_id(request_id)
 }
 
-pub fn policy_changed_event(session_id: SessionId, transition: &PolicyTransition) -> Event {
+pub fn policy_changed_event(
+    session_id: SessionId,
+    request_id: RequestId,
+    transition: &PolicyTransition,
+) -> Event {
     Event::new(
         session_id,
         EventSource::PolicyRouter,
@@ -857,10 +866,12 @@ pub fn policy_changed_event(session_id: SessionId, transition: &PolicyTransition
             persistence: transition.persistence.clone(),
         },
     )
+    .with_request_id(request_id)
 }
 
 pub fn response_audit_event(
     session_id: SessionId,
+    request_id: RequestId,
     decision: &PolicyDecision,
     status: u16,
 ) -> Event {
@@ -873,10 +884,12 @@ pub fn response_audit_event(
             routing_decision: decision.routing_decision,
         },
     )
+    .with_request_id(request_id)
 }
 
 pub fn reality_escape_attempt_event(
     session_id: SessionId,
+    request_id: RequestId,
     policy_state: PolicyState,
     method: impl Into<String>,
     path: impl Into<String>,
@@ -895,6 +908,7 @@ pub fn reality_escape_attempt_event(
             persistence: PolicyPersistenceMetadata::default(),
         },
     )
+    .with_request_id(request_id)
 }
 
 fn snake_case_actor_kind(actor_kind: IngressActorKind) -> &'static str {
@@ -2409,7 +2423,7 @@ mod tests {
         let transition = transition_after_correlated_bait_action(PolicyState::Observe)
             .expect("observe should transition");
 
-        let event = policy_changed_event(session_id, &transition);
+        let event = policy_changed_event(session_id, RequestId::new(), &transition);
 
         assert_eq!(event.session_id, session_id);
         assert_eq!(event.source, EventSource::PolicyRouter);
@@ -2430,7 +2444,7 @@ mod tests {
         let session_id = SessionId::new();
         let decision = decide_for_state(PolicyState::RateLimited, InterventionMode::Enabled);
 
-        let event = policy_intervention_event(session_id, &decision);
+        let event = policy_intervention_event(session_id, RequestId::new(), &decision);
 
         assert_eq!(event.session_id, session_id);
         assert_eq!(event.source, EventSource::PolicyRouter);
@@ -2447,7 +2461,7 @@ mod tests {
         let session_id = SessionId::new();
         let decision = decide_for_state(PolicyState::ControlledReality, InterventionMode::Disabled);
 
-        let event = policy_intervention_event(session_id, &decision);
+        let event = policy_intervention_event(session_id, RequestId::new(), &decision);
 
         assert_eq!(event.session_id, session_id);
         assert_eq!(event.source, EventSource::PolicyRouter);
@@ -2471,7 +2485,7 @@ mod tests {
             "response body was rewritten",
         );
 
-        let event = response_audit_event(session_id, &decision, 203);
+        let event = response_audit_event(session_id, RequestId::new(), &decision, 203);
 
         assert_eq!(event.session_id, session_id);
         assert_eq!(event.source, EventSource::Proxy);
