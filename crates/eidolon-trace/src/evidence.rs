@@ -52,6 +52,58 @@ pub struct BaitActionEvidence {
     pub prior_same_bait_exposure: Option<TimelineEventRef>,
 }
 
+/// Validity classification of the proof attached to a bait action.
+///
+/// Only `Accepted` actions may count as confirmed bait-derived evidence
+/// (engineering operating policy invariant 3). `Rejected` and `Unknown`
+/// actions remain visible as direct facts but never confirm a chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofOutcome {
+    /// A fresh session-minted proof matched, or the bait carries no mint
+    /// concept (static bait) so no proof validity applies.
+    Accepted,
+    /// The proof was replayed, expired, or mismatched.
+    Rejected,
+    /// The bait is mint-enabled but no outcome status was recorded, for
+    /// example historical events predating status auditing.
+    Unknown,
+}
+
+/// Classify a bait action's proof from its mint audit metadata and recorded
+/// outcome status. Static baits (no mint audit) are accepted by construction;
+/// mint-enabled baits require an explicit accepted status, and historical
+/// events without a status degrade to `Unknown` rather than confirmed.
+pub fn proof_outcome(
+    header_value_mint: &Option<BaitHeaderValueMintAudit>,
+    header_value_mint_status: Option<BaitHeaderValueMintStatus>,
+) -> ProofOutcome {
+    match header_value_mint_status {
+        Some(BaitHeaderValueMintStatus::MatchedSessionValue) => ProofOutcome::Accepted,
+        Some(
+            BaitHeaderValueMintStatus::ReplaySeen
+            | BaitHeaderValueMintStatus::ExpiredSessionValue
+            | BaitHeaderValueMintStatus::SessionValueMismatch
+            | BaitHeaderValueMintStatus::ReplayStateCapacityExceeded
+            | BaitHeaderValueMintStatus::MissingSessionValue
+            | BaitHeaderValueMintStatus::MalformedSessionValue,
+        ) => ProofOutcome::Rejected,
+        None => {
+            if header_value_mint.is_some() {
+                ProofOutcome::Unknown
+            } else {
+                ProofOutcome::Accepted
+            }
+        }
+    }
+}
+
+impl BaitActionEvidence {
+    pub fn proof_outcome(&self) -> ProofOutcome {
+        proof_outcome(&self.header_value_mint, self.header_value_mint_status)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyEventEvidence {
     pub event_ref: TimelineEventRef,
@@ -215,7 +267,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     prior_same_bait_exposure,
                 };
 
-                if matched_exposure.is_some() {
+                if matched_exposure.is_some() && action.proof_outcome() == ProofOutcome::Accepted {
                     bundle.matched_actions.push(action);
                 } else {
                     bundle.unmatched_actions.push(action);
@@ -668,6 +720,198 @@ mod tests {
         assert_eq!(bundle.score.points, 0);
         assert_eq!(bundle.score.confidence, eidolon_core::ConfidenceBand::Low);
         assert!(bundle.score.reasons.is_empty());
+    }
+
+    fn mint_audit() -> BaitHeaderValueMintAudit {
+        BaitHeaderValueMintAudit {
+            header_name: "X-Trace".to_string(),
+            kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+            prefix: "test".to_string(),
+        }
+    }
+
+    fn minted_action(
+        session_id: SessionId,
+        exposure_id: Option<&str>,
+        status: Option<BaitHeaderValueMintStatus>,
+    ) -> Event {
+        Event::new(
+            session_id,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: BaitId("bait-1".to_string()),
+                exposure_id: exposure_id.map(|id| ExposureId(id.to_string())),
+                method: "POST".to_string(),
+                path: "/api/v2/import/reconcile".to_string(),
+                header_value_mint: Some(mint_audit()),
+                header_value_mint_status: status,
+            },
+        )
+    }
+
+    fn minted_exposure(session_id: SessionId) -> Event {
+        Event::new(
+            session_id,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId("bait-1".to_string()),
+                exposure_id: ExposureId("exp-1".to_string()),
+                surface: "/docs/legacy-import".to_string(),
+                header_value_mint: Some(mint_audit()),
+            },
+        )
+    }
+
+    #[test]
+    fn proof_outcome_classifies_accepted_rejected_and_unknown() {
+        let mint = Some(mint_audit());
+
+        assert_eq!(proof_outcome(&mint, None), ProofOutcome::Unknown);
+        assert_eq!(
+            proof_outcome(&mint, Some(BaitHeaderValueMintStatus::MatchedSessionValue)),
+            ProofOutcome::Accepted
+        );
+        assert_eq!(
+            proof_outcome(&mint, Some(BaitHeaderValueMintStatus::ReplaySeen)),
+            ProofOutcome::Rejected
+        );
+        assert_eq!(
+            proof_outcome(&mint, Some(BaitHeaderValueMintStatus::ExpiredSessionValue)),
+            ProofOutcome::Rejected
+        );
+        assert_eq!(
+            proof_outcome(&mint, Some(BaitHeaderValueMintStatus::SessionValueMismatch)),
+            ProofOutcome::Rejected
+        );
+
+        // Static baits carry no mint concept and are accepted by construction.
+        assert_eq!(proof_outcome(&None, None), ProofOutcome::Accepted);
+    }
+
+    #[test]
+    fn replayed_proof_with_linked_exposure_is_not_confirmed() {
+        let session_id = SessionId::new();
+        let bundle = collect_evidence(&timeline(vec![
+            minted_exposure(session_id),
+            minted_action(
+                session_id,
+                Some("exp-1"),
+                Some(BaitHeaderValueMintStatus::ReplaySeen),
+            ),
+        ]));
+
+        assert!(bundle.matched_actions.is_empty());
+        assert_eq!(bundle.unmatched_actions.len(), 1);
+        assert_eq!(
+            bundle.unmatched_actions[0].proof_outcome(),
+            ProofOutcome::Rejected
+        );
+        assert!(bundle.unmatched_actions[0].matched_exposure.is_some());
+    }
+
+    #[test]
+    fn expired_proof_with_linked_exposure_is_not_confirmed() {
+        let session_id = SessionId::new();
+        let bundle = collect_evidence(&timeline(vec![
+            minted_exposure(session_id),
+            minted_action(
+                session_id,
+                Some("exp-1"),
+                Some(BaitHeaderValueMintStatus::ExpiredSessionValue),
+            ),
+        ]));
+
+        assert!(bundle.matched_actions.is_empty());
+        assert_eq!(bundle.unmatched_actions.len(), 1);
+        assert_eq!(
+            bundle.unmatched_actions[0].proof_outcome(),
+            ProofOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn mismatched_proof_with_linked_exposure_is_not_confirmed() {
+        let session_id = SessionId::new();
+        let bundle = collect_evidence(&timeline(vec![
+            minted_exposure(session_id),
+            minted_action(
+                session_id,
+                Some("exp-1"),
+                Some(BaitHeaderValueMintStatus::SessionValueMismatch),
+            ),
+        ]));
+
+        assert!(bundle.matched_actions.is_empty());
+        assert_eq!(bundle.unmatched_actions.len(), 1);
+        assert_eq!(
+            bundle.unmatched_actions[0].proof_outcome(),
+            ProofOutcome::Rejected
+        );
+    }
+
+    #[test]
+    fn historical_mint_action_without_status_degrades_to_unknown() {
+        let session_id = SessionId::new();
+        let bundle = collect_evidence(&timeline(vec![
+            minted_exposure(session_id),
+            minted_action(session_id, Some("exp-1"), None),
+        ]));
+
+        assert!(bundle.matched_actions.is_empty());
+        assert_eq!(bundle.unmatched_actions.len(), 1);
+        assert_eq!(
+            bundle.unmatched_actions[0].proof_outcome(),
+            ProofOutcome::Unknown
+        );
+        assert!(bundle.unmatched_actions[0].matched_exposure.is_some());
+    }
+
+    #[test]
+    fn accepted_mint_proof_with_linked_exposure_is_confirmed() {
+        let session_id = SessionId::new();
+        let bundle = collect_evidence(&timeline(vec![
+            minted_exposure(session_id),
+            minted_action(
+                session_id,
+                Some("exp-1"),
+                Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            ),
+        ]));
+
+        assert_eq!(bundle.matched_actions.len(), 1);
+        assert_eq!(
+            bundle.matched_actions[0].proof_outcome(),
+            ProofOutcome::Accepted
+        );
+        assert!(bundle.unmatched_actions.is_empty());
+    }
+
+    #[test]
+    fn mixed_session_confirms_only_from_accepted_proofs() {
+        let session_id = SessionId::new();
+        let bundle = collect_evidence(&timeline(vec![
+            minted_exposure(session_id),
+            minted_action(
+                session_id,
+                Some("exp-1"),
+                Some(BaitHeaderValueMintStatus::ReplaySeen),
+            ),
+            exposure(session_id),
+            action(session_id, Some("exp-1")),
+        ]));
+
+        assert_eq!(bundle.matched_actions.len(), 1);
+        assert_eq!(
+            bundle.matched_actions[0].proof_outcome(),
+            ProofOutcome::Accepted
+        );
+        assert_eq!(bundle.unmatched_actions.len(), 1);
+        assert_eq!(
+            bundle.unmatched_actions[0].proof_outcome(),
+            ProofOutcome::Rejected
+        );
     }
 
     #[test]
