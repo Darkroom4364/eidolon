@@ -16,8 +16,8 @@ use std::{
 use eidolon_bait::{docs_for_bait, render_bait_for_session, BaitRegistry};
 use eidolon_core::{
     Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, DiscoveryReconScore, Event, EventKind,
-    EventSource, ExposureId, HeaderValueMint, PolicyState, RoutingDecision, SafeHeaderObservation,
-    SessionId, EVENT_SCHEMA_VERSION,
+    EventSource, ExposureId, HeaderValueMint, PolicyState, RequestId, RoutingDecision,
+    SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
 };
 use eidolon_proxy::{
     controlled_reality::{
@@ -2237,9 +2237,16 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
     let path = normalized_event_path(&request)?;
     let surface_request = surface_request_meta(&request, &path);
+    let request_id = RequestId::new();
     let owns_configured_unsafe_bait_action =
         owns_configured_unsafe_bait_action(runtime, &surface_request);
-    let session = effective_session_context(runtime, &request, &surface_request, client_peer_ip)?;
+    let session = effective_session_context(
+        runtime,
+        &request,
+        &surface_request,
+        client_peer_ip,
+        request_id,
+    )?;
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
     if let Some(floor) = session.enforcement_floor {
         if enforcement_rank(floor) > enforcement_rank(policy_state) {
@@ -2285,7 +2292,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             set_policy_state_for_session(runtime, session.session_id, transition.to)?;
             write_event(
                 &runtime.event_log,
-                &policy::policy_changed_event(session.session_id, &transition),
+                &policy::policy_changed_event(session.session_id, request_id, &transition),
             )?;
             policy_state = transition.to;
         } else if let Some(transition) = policy::transition_to_suspicious_from_discovery_fanout(
@@ -2307,7 +2314,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             set_policy_state_for_session(runtime, session.session_id, transition.to)?;
             write_event(
                 &runtime.event_log,
-                &policy::policy_changed_event(session.session_id, &transition),
+                &policy::policy_changed_event(session.session_id, request_id, &transition),
             )?;
             policy_state = transition.to;
         } else if let Some(transition) =
@@ -2337,7 +2344,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             set_policy_state_for_session(runtime, session.session_id, transition.to)?;
             write_event(
                 &runtime.event_log,
-                &policy::policy_changed_event(session.session_id, &transition),
+                &policy::policy_changed_event(session.session_id, request_id, &transition),
             )?;
             policy_state = transition.to;
         }
@@ -2371,7 +2378,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
+                    &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
                 policy_state = transition.to;
@@ -2400,7 +2407,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
+                    &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
                 policy_reason_override = Some(transition.reason);
@@ -2498,6 +2505,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             session: &session,
             request: &request,
             path: &path,
+            request_id,
             decision: &decision,
             discovery_recon_score,
             discovery_recon_threshold,
@@ -2538,7 +2546,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                     write_event(
                         &runtime.event_log,
-                        &policy::policy_changed_event(session.session_id, &transition),
+                        &policy::policy_changed_event(session.session_id, request_id, &transition),
                     )?;
                     let blocked_decision = policy::PolicyDecision::new(
                         transition.to,
@@ -2573,6 +2581,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                         session: &session,
                         request: &request,
                         path: &path,
+                        request_id,
                         decision: &blocked_decision,
                         discovery_recon_score,
                         discovery_recon_threshold,
@@ -2649,6 +2658,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         &session,
         &request,
         &surface_request,
+        request_id,
         &effective_decision,
     )? {
         write_debug(
@@ -2664,7 +2674,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         set_policy_state_for_session(runtime, session.session_id, transition.to)?;
         write_event(
             &runtime.event_log,
-            &policy::policy_changed_event(session.session_id, &transition),
+            &policy::policy_changed_event(session.session_id, request_id, &transition),
         )?;
         let blocked_decision = policy::PolicyDecision::new(
             transition.to,
@@ -2700,6 +2710,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             session: &session,
             request: &request,
             path: &path,
+            request_id,
             decision: &blocked_decision,
             discovery_recon_score,
             discovery_recon_threshold,
@@ -2783,6 +2794,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     &request,
                     &path,
                     &session,
+                    request_id,
                     &effective_decision,
                     discovery_recon_score,
                     discovery_recon_threshold,
@@ -2791,6 +2803,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             let action_exposure_id = write_bait_action_observed_event(
                 runtime,
                 &session,
+                request_id,
                 decision.policy_state,
                 &action_match.bait,
                 &request.method,
@@ -2815,7 +2828,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             let mut response = if !proof_accepted {
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                    &policy::policy_intervention_event(
+                        session.session_id,
+                        request_id,
+                        &effective_decision,
+                    ),
                 )?;
                 surface_response_to_http(
                     runtime
@@ -2839,7 +2856,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
+                    &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 let (action, controlled_transition) = controlled_reality_action(
                     runtime,
@@ -2865,7 +2882,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     )?;
                     write_event(
                         &runtime.event_log,
-                        &policy::policy_changed_event(session.session_id, &controlled_transition),
+                        &policy::policy_changed_event(
+                            session.session_id,
+                            request_id,
+                            &controlled_transition,
+                        ),
                     )?;
                     policy::PolicyDecision::new(
                         controlled_transition.to,
@@ -2877,14 +2898,22 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 };
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                    &policy::policy_intervention_event(
+                        session.session_id,
+                        request_id,
+                        &effective_decision,
+                    ),
                 )?;
                 direct_surface_response(action)
                     .expect("controlled reality action should produce direct response")
             } else {
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                    &policy::policy_intervention_event(
+                        session.session_id,
+                        request_id,
+                        &effective_decision,
+                    ),
                 )?;
                 bait_action_synthetic_response()
             };
@@ -2893,6 +2922,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 &runtime.event_log,
                 &policy::response_audit_event(
                     session.session_id,
+                    request_id,
                     &effective_decision,
                     response.status,
                 ),
@@ -2928,6 +2958,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             let prior_same_bait_exposure = write_bait_action_near_miss_event(
                 runtime,
                 &session,
+                request_id,
                 decision.policy_state,
                 &action_shape_match.bait,
                 &request.method,
@@ -2965,7 +2996,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
+                    &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 let response =
                     rate_limited_response(runtime.controlled_reality_config.retry_after_seconds);
@@ -2981,6 +3012,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     session: &session,
                     request: &request,
                     path: &path,
+                    request_id,
                     decision: &effective_decision,
                     discovery_recon_score,
                     discovery_recon_threshold,
@@ -3015,6 +3047,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             let prior_same_bait_exposure = write_bait_action_near_miss_event(
                 runtime,
                 &session,
+                request_id,
                 decision.policy_state,
                 &action_shape_match.bait,
                 &request.method,
@@ -3054,7 +3087,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
+                    &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 effective_decision = policy::PolicyDecision::new(
                     transition.to,
@@ -3067,6 +3100,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     session: &session,
                     request: &request,
                     path: &path,
+                    request_id,
                     decision: &effective_decision,
                     discovery_recon_score,
                     discovery_recon_threshold,
@@ -3101,6 +3135,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             session: &session,
             request: &request,
             path: &path,
+            request_id,
             decision: &rejected_decision,
             discovery_recon_score,
             discovery_recon_threshold,
@@ -3124,10 +3159,12 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 &request,
                 &path,
                 &session,
+                request_id,
                 &effective_decision,
                 discovery_recon_score,
                 discovery_recon_threshold,
             ),
+            request_id,
             &effective_decision,
             intervention_mode,
             surface_requested_intervention,
@@ -3142,6 +3179,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             write_bait_exposed_event(
                 runtime,
                 &session,
+                request_id,
                 decision.policy_state,
                 bait,
                 surface_request.path.clone(),
@@ -3149,7 +3187,12 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         }
         write_event(
             &runtime.event_log,
-            &policy::response_audit_event(session.session_id, &effective_decision, response.status),
+            &policy::response_audit_event(
+                session.session_id,
+                request_id,
+                &effective_decision,
+                response.status,
+            ),
         )?;
         write_debug(
             runtime,
@@ -3181,6 +3224,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             &request,
             &path,
             &session,
+            request_id,
             &upstream_request_decision,
             discovery_recon_score,
             discovery_recon_threshold,
@@ -3189,7 +3233,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     if intervention_mode == InterventionMode::Disabled {
         write_event(
             &runtime.event_log,
-            &policy::policy_intervention_event(session.session_id, &upstream_request_decision),
+            &policy::policy_intervention_event(
+                session.session_id,
+                request_id,
+                &upstream_request_decision,
+            ),
         )?;
     }
 
@@ -3290,15 +3338,27 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     if surface_requested_intervention {
         write_event(
             &runtime.event_log,
-            &policy::policy_intervention_event(session.session_id, &effective_decision),
+            &policy::policy_intervention_event(session.session_id, request_id, &effective_decision),
         )?;
     }
     if let Some((bait, surface)) = pending_bait_exposure {
-        write_bait_exposed_event(runtime, &session, decision.policy_state, &bait, surface)?;
+        write_bait_exposed_event(
+            runtime,
+            &session,
+            request_id,
+            decision.policy_state,
+            &bait,
+            surface,
+        )?;
     }
     write_event(
         &runtime.event_log,
-        &policy::response_audit_event(session.session_id, &effective_decision, response.status),
+        &policy::response_audit_event(
+            session.session_id,
+            request_id,
+            &effective_decision,
+            response.status,
+        ),
     )?;
     write_debug(
         runtime,
@@ -3355,6 +3415,7 @@ fn maybe_transition_to_blocked_from_reality_escape_attempt(
     session: &SessionContext,
     request: &HttpRequest,
     surface_request: &SurfaceRequestMeta,
+    request_id: RequestId,
     decision: &policy::PolicyDecision,
 ) -> io::Result<Option<policy::PolicyTransition>> {
     if decision.policy_state != PolicyState::ControlledReality {
@@ -3395,6 +3456,7 @@ fn maybe_transition_to_blocked_from_reality_escape_attempt(
         &runtime.event_log,
         &policy::reality_escape_attempt_event(
             session.session_id,
+            request_id,
             decision.policy_state,
             request.method.clone(),
             redacted_event_target(&surface_request.path),
@@ -3418,6 +3480,7 @@ struct DirectResponseContext<'a> {
     session: &'a SessionContext,
     request: &'a HttpRequest,
     path: &'a str,
+    request_id: RequestId,
     decision: &'a policy::PolicyDecision,
     discovery_recon_score: policy::DiscoveryReconAggregationScore,
     discovery_recon_threshold: u8,
@@ -3433,6 +3496,7 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
         session,
         request,
         path,
+        request_id,
         decision,
         discovery_recon_score,
         discovery_recon_threshold,
@@ -3447,10 +3511,12 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
             request,
             path,
             session,
+            request_id,
             decision,
             discovery_recon_score,
             discovery_recon_threshold,
         ),
+        request_id,
         decision,
         intervention_mode,
         surface_requested_intervention,
@@ -3460,13 +3526,14 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
     apply_response_headers(&mut response, session);
     write_event(
         &runtime.event_log,
-        &policy::response_audit_event(session.session_id, decision, response.status),
+        &policy::response_audit_event(session.session_id, request_id, decision, response.status),
     )?;
     write_debug(
         runtime,
         "response_served",
         Some(session.session_id),
         json!({
+            "request_id": request_id.0,
             "route": "direct_response",
             "decision": {
                 "policy_state": decision.policy_state,
@@ -3760,6 +3827,7 @@ fn upstream_request_decision(
 fn write_bait_exposed_event(
     runtime: &ProxyRuntime,
     session: &SessionContext,
+    request_id: RequestId,
     policy_state: PolicyState,
     bait: &Bait,
     surface: impl Into<String>,
@@ -3783,7 +3851,8 @@ fn write_bait_exposed_event(
                 surface: redacted_event_target(&surface),
                 header_value_mint: bait.header_value_mint_audit(),
             },
-        ),
+        )
+        .with_request_id(request_id),
     )?;
 
     exposures.record_exposure(session.session_id, bait.id.clone(), exposure_id.clone());
@@ -3792,6 +3861,7 @@ fn write_bait_exposed_event(
         "bait_exposed",
         Some(session.session_id),
         json!({
+            "request_id": request_id.0,
             "bait_id": &bait.id,
             "bait_class": bait.bait_class,
             "surface": debug_path(&bait.surface),
@@ -3828,6 +3898,7 @@ struct BaitActionObservation<'a> {
 fn write_bait_action_observed_event_with_exposure(
     runtime: &ProxyRuntime,
     session: &SessionContext,
+    request_id: RequestId,
     policy_state: PolicyState,
     observation: BaitActionObservation<'_>,
 ) -> io::Result<()> {
@@ -3854,7 +3925,8 @@ fn write_bait_action_observed_event_with_exposure(
                 header_value_mint: bait.header_value_mint_audit(),
                 header_value_mint_status,
             },
-        ),
+        )
+        .with_request_id(request_id),
     )?;
 
     write_debug(
@@ -3862,6 +3934,7 @@ fn write_bait_action_observed_event_with_exposure(
         "bait_action_observed",
         Some(session.session_id),
         json!({
+            "request_id": request_id.0,
             "bait_id": &bait.id,
             "method": method,
             "path": debug_path(path),
@@ -3873,9 +3946,15 @@ fn write_bait_action_observed_event_with_exposure(
     )
 }
 
+// Eight arguments are intrinsic to the audit payload (runtime, session,
+// request linkage, policy state, and the observed bait action shape); the
+// sibling with_exposure variant already uses the observation struct, so
+// packing these separately would only add an artificial partial-struct type.
+#[allow(clippy::too_many_arguments)]
 fn write_bait_action_observed_event(
     runtime: &ProxyRuntime,
     session: &SessionContext,
+    request_id: RequestId,
     policy_state: PolicyState,
     bait: &Bait,
     method: &str,
@@ -3894,6 +3973,7 @@ fn write_bait_action_observed_event(
     write_bait_action_observed_event_with_exposure(
         runtime,
         session,
+        request_id,
         policy_state,
         BaitActionObservation {
             bait,
@@ -3911,6 +3991,7 @@ fn write_bait_action_observed_event(
 fn write_bait_action_near_miss_event(
     runtime: &ProxyRuntime,
     session: &SessionContext,
+    request_id: RequestId,
     policy_state: PolicyState,
     bait: &Bait,
     method: &str,
@@ -3920,6 +4001,7 @@ fn write_bait_action_near_miss_event(
     write_bait_action_observed_event_with_exposure(
         runtime,
         session,
+        request_id,
         policy_state,
         BaitActionObservation {
             bait,
@@ -4099,6 +4181,7 @@ fn request_seen_event(
     request: &HttpRequest,
     path: &str,
     session: &SessionContext,
+    request_id: RequestId,
     decision: &policy::PolicyDecision,
     discovery_recon_score: policy::DiscoveryReconAggregationScore,
     discovery_recon_threshold: u8,
@@ -4127,11 +4210,13 @@ fn request_seen_event(
             routing_decision: decision.routing_decision,
         },
     )
+    .with_request_id(request_id)
 }
 
 fn write_request_and_policy_events(
     runtime: &ProxyRuntime,
     request_event: &Event,
+    request_id: RequestId,
     decision: &policy::PolicyDecision,
     intervention_mode: InterventionMode,
     surface_requested_intervention: bool,
@@ -4144,7 +4229,7 @@ fn write_request_and_policy_events(
     {
         write_event(
             &runtime.event_log,
-            &policy::policy_intervention_event(request_event.session_id, decision),
+            &policy::policy_intervention_event(request_event.session_id, request_id, decision),
         )?;
     }
 
@@ -4211,6 +4296,7 @@ fn effective_session_context(
     request: &HttpRequest,
     surface_request: &SurfaceRequestMeta,
     client_peer_ip: Option<IpAddr>,
+    request_id: RequestId,
 ) -> io::Result<SessionContext> {
     let headers: Vec<(&str, &str)> = header_pairs(&request.headers).collect();
     let request_host = effective_request_host(request);
@@ -4235,6 +4321,7 @@ fn effective_session_context(
         "session_resolved",
         Some(session.session_id),
         json!({
+            "request_id": request_id.0,
             "session_source": match session.source {
                 session::SessionSource::Cookie => "cookie",
                 session::SessionSource::Generated => "generated",
@@ -15649,6 +15736,101 @@ mod tests {
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
         assert_event_type_absent(&event_log_path, "bait_exposed");
+    }
+
+    #[test]
+    fn runtime_mints_one_request_id_per_request_and_stamps_every_event() {
+        let event_log_path = unique_temp_path("request-id-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("request-id-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        let first = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        let second = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        assert_eq!(first.status, 200);
+        assert_eq!(second.status, 200);
+
+        let events = event_values(&event_log_path);
+        assert!(events.iter().all(|event| event["request_id"].is_string()));
+        let request_ids: std::collections::HashSet<&str> = events
+            .iter()
+            .filter_map(|event| event["request_id"].as_str())
+            .collect();
+        assert_eq!(
+            request_ids.len(),
+            2,
+            "each request must mint exactly one opaque request id"
+        );
+
+        let mut request_seen_count: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut response_served_count: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for event in &events {
+            let Some(request_id) = event["request_id"].as_str() else {
+                continue;
+            };
+            match event["kind"]["type"].as_str() {
+                Some("request_seen") => {
+                    *request_seen_count.entry(request_id).or_default() += 1;
+                }
+                Some("response_served") => {
+                    *response_served_count.entry(request_id).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+        for request_id in request_ids {
+            assert_eq!(
+                request_seen_count.get(request_id),
+                Some(&1),
+                "request {request_id} must have exactly one request_seen event"
+            );
+            assert_eq!(
+                response_served_count.get(request_id),
+                Some(&1),
+                "request {request_id} must have exactly one response_served event"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_request_id_events_round_trip_through_trace_reader() {
+        let event_log_path = unique_temp_path("request-id-reader-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("request-id-reader-control.txt"),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/docs/legacy-import", &cookie_header()),
+        ));
+        assert_eq!(response.status, 200);
+
+        let events = event_values(&event_log_path);
+        let first_request_id = events
+            .iter()
+            .find_map(|event| event["request_id"].as_str())
+            .expect("proxy must stamp a request id");
+        assert!(
+            uuid::Uuid::parse_str(first_request_id).is_ok(),
+            "request id must be an opaque UUID"
+        );
+        assert_ne!(
+            first_request_id, "00000000-0000-0000-0000-000000000000",
+            "request id must not encode meaningful data"
+        );
     }
 
     #[test]

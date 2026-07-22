@@ -41,6 +41,18 @@ Rule-based confidence score produced by Eidolon's trace layer.
 
 For direct benign baseline traffic before the proxy/trace pipeline exists, this is represented as `0`.
 
+A confirmed bait-derived chain requires an *accepted* proof: a fresh
+session-minted value match, or a static bait with no mint concept. Replayed,
+expired, and mismatched proofs remain visible as direct facts but are
+excluded from confirmed matching and contribute no confirmed-chain score;
+mint-enabled actions with no recorded status (for example historical events)
+degrade to unknown rather than confirmed.
+
+Chain membership is decided per request: every request-derived event carries
+an opaque `request_id`, and reducers join by it. Exports mark sessions whose
+events predate request identifiers as `request_linkage: unknown_legacy`
+instead of joining them by session-wide recency heuristics.
+
 ### `real_surface_requests_after_containment`
 
 Number of requests to protected target routes after a session enters controlled reality.
