@@ -409,16 +409,19 @@ unset and require `origin_main.in_sync == true` plus `git_dirty == false` for
 current-main claims.
 
 To test whether an observed replay can preserve one Eidolon Lab session without
-seeding any bait markers, pin the Eidolon leg to a generated session cookie:
+seeding any bait markers, pin the Eidolon leg to a proxy-minted session cookie:
 
 ```sh
 EIDOLON_M3_PIN_SESSION=1 examples/m3/pwnkit-codex.sh all "$ART"
 ```
 
-The runner writes the generated UUID to
-`$ART/pinned-eidolon-session-id.txt` and passes it only as the
-`eidolon_session` cookie for the Eidolon scan leg. This is a session-control
-experiment, not a marker-seeding experiment.
+The runner mints a signed `eidolon_session` cookie from the Eidolon proxy
+(signed cookies are mandatory; raw UUID pins are rejected), writes the bare
+session UUID to `$ART/pinned-eidolon-session-id.txt`, and passes the full
+cookie value only as the `eidolon_session` cookie for the Eidolon scan leg.
+Set `EIDOLON_M3_SESSION_COOKIE` to supply an already-minted cookie value
+instead. This is a session-control experiment, not a marker-seeding
+experiment.
 
 Some pwnkit builds exit nonzero when findings are present even after writing a
 valid JSON report. The runner keeps those reports and continues the comparison;

@@ -17,7 +17,7 @@ HEADER_NAME="${EIDOLON_SHIELD_SESSION_MINTED_OPENAPI_HEADER_NAME:-X-OpenAPI-Trac
 HEADER_PREFIX="${EIDOLON_SHIELD_SESSION_MINTED_OPENAPI_HEADER_PREFIX:-oapi}"
 MINTED_VALUE_PATTERN="${EIDOLON_SHIELD_SESSION_MINTED_OPENAPI_VALUE_PATTERN:-oapi_[0-9a-f]+}"
 LEGACY_STATIC_MARKER="${EIDOLON_SHIELD_SESSION_MINTED_OPENAPI_LEGACY_STATIC_MARKER:-openapi_2026_05_f3a1}"
-REPLAY_EXPECTED_HTTP_CODE="${EIDOLON_SHIELD_SESSION_MINTED_OPENAPI_REPLAY_EXPECTED_HTTP_CODE:-404}"
+REPLAY_EXPECTED_HTTP_CODE="${EIDOLON_SHIELD_SESSION_MINTED_OPENAPI_REPLAY_EXPECTED_HTTP_CODE:-202}"
 SESSION_A="${EIDOLON_SHIELD_SESSION_MINTED_OPENAPI_SESSION_A:-}"
 SESSION_B="${EIDOLON_SHIELD_SESSION_MINTED_OPENAPI_SESSION_B:-}"
 
@@ -98,7 +98,22 @@ extract_minted_value() {
   printf '%s' "$value"
 }
 
-resolve_session_id() {
+mint_session_cookie() {
+  local headers value
+
+  headers="$(curl_cmd -fsS -D - -o /dev/null "${edge_url}/")" \
+    || fail "could not mint an eidolon_session cookie from ${edge_url}/"
+  value="$(
+    printf '%s\n' "$headers" \
+      | tr -d '\r' \
+      | sed -n 's/^[Ss]et-[Cc]ookie:[[:space:]]*eidolon_session=\([^;[:space:]]*\).*$/\1/p' \
+      | head -n 1
+  )"
+  [[ -n "$value" ]] || fail "shield edge did not issue an eidolon_session cookie"
+  printf '%s' "$value"
+}
+
+resolve_session_cookie() {
   local current_value="$1"
 
   if [[ -n "$current_value" ]]; then
@@ -106,7 +121,18 @@ resolve_session_id() {
     return
   fi
 
-  uuidgen | tr '[:upper:]' '[:lower:]'
+  mint_session_cookie
+}
+
+session_uuid_from_cookie_value() {
+  local value="$1"
+
+  if [[ "$value" == v1.*.*.*.* ]]; then
+    printf '%s' "$value" | cut -d. -f4
+    return
+  fi
+
+  printf '%s' "$value"
 }
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -120,9 +146,7 @@ require_command jq
 require_command mktemp
 require_command awk
 require_command grep
-if [[ -z "$SESSION_A" || -z "$SESSION_B" ]]; then
-  require_command uuidgen
-fi
+require_command cut
 
 context="$(kubectl_cmd config current-context)"
 if [[ "$context" != "$EXPECTED_CONTEXT" ]]; then
@@ -137,8 +161,10 @@ edge_url="http://${EDGE_HOST}:${edge_node_port}"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/eidolon-session-minted-openapi.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 resolve_edge_export_bin
-SESSION_A="$(resolve_session_id "$SESSION_A")"
-SESSION_B="$(resolve_session_id "$SESSION_B")"
+SESSION_A_COOKIE="$(resolve_session_cookie "$SESSION_A")"
+SESSION_A="$(session_uuid_from_cookie_value "$SESSION_A_COOKIE")"
+SESSION_B_COOKIE="$(resolve_session_cookie "$SESSION_B")"
+SESSION_B="$(session_uuid_from_cookie_value "$SESSION_B_COOKIE")"
 
 a1_headers="$tmp_dir/a1.headers"
 a1_body="$tmp_dir/a1.body"
@@ -157,19 +183,19 @@ edge_export_b_file="$tmp_dir/edge-export-b.json"
 curl_cmd -fsS \
   -D "$a1_headers" \
   -o "$a1_body" \
-  -H "Cookie: eidolon_session=${SESSION_A}" \
+  -H "Cookie: eidolon_session=${SESSION_A_COOKIE}" \
   "${edge_url}${SURFACE_PATH}"
 
 curl_cmd -fsS \
   -D "$a2_headers" \
   -o "$a2_body" \
-  -H "Cookie: eidolon_session=${SESSION_A}" \
+  -H "Cookie: eidolon_session=${SESSION_A_COOKIE}" \
   "${edge_url}${SURFACE_PATH}"
 
 curl_cmd -fsS \
   -D "$b1_headers" \
   -o "$b1_body" \
-  -H "Cookie: eidolon_session=${SESSION_B}" \
+  -H "Cookie: eidolon_session=${SESSION_B_COOKIE}" \
   "${edge_url}${SURFACE_PATH}"
 
 for body in "$a1_body" "$a2_body" "$b1_body"; do
@@ -191,7 +217,7 @@ curl_cmd -sS \
   -X POST \
   -D "$replay_headers" \
   -o "$replay_body" \
-  -H "Cookie: eidolon_session=${SESSION_B}" \
+  -H "Cookie: eidolon_session=${SESSION_B_COOKIE}" \
   -H "${HEADER_NAME}: ${value_a1}" \
   "${edge_url}${ACTION_PATH}"
 
@@ -206,7 +232,7 @@ curl_cmd -sS \
   -X POST \
   -D "$action_headers" \
   -o "$action_body" \
-  -H "Cookie: eidolon_session=${SESSION_A}" \
+  -H "Cookie: eidolon_session=${SESSION_A_COOKIE}" \
   -H "${HEADER_NAME}: ${value_a1}" \
   "${edge_url}${ACTION_PATH}"
 
@@ -321,9 +347,9 @@ replay_request_json="$(
 
 jq -e '
     .policy_state == "observe"
-    and .kind.routing_decision == "protected_upstream"
+    and .kind.routing_decision == "eidolon_owned"
   ' <<<"$replay_request_json" >/dev/null \
-  || fail "session ${SESSION_B} replay request did not stay on the protected-upstream path"
+  || fail "session ${SESSION_B} replay request was not held Eidolon-owned (fail closed)"
 
 jq -e -s \
   --arg session_id "$SESSION_B" '
@@ -452,7 +478,7 @@ jq -e \
     and .[0].request.method == "POST"
     and .[0].request.path == $path
     and .[0].policy.state == "observe"
-    and .[0].policy.routing_decision == "protected_upstream"
+    and .[0].policy.routing_decision == "eidolon_owned"
     and .[0].evidence.latest_bait_header_value_mint == {
       "bait_id": $bait_id,
       "header_name": $header_name,

@@ -59,7 +59,22 @@ read_proxy_state_file() {
   kubectl_cmd -n shield-system exec deploy/eidolon-shield-proxy -- sh -lc "cat /var/lib/eidolon/$basename"
 }
 
-resolve_session_id() {
+mint_session_cookie() {
+  local headers value
+
+  headers="$(curl_cmd -fsS -D - -o /dev/null "${edge_url}/")" \
+    || fail "could not mint an eidolon_session cookie from ${edge_url}/"
+  value="$(
+    printf '%s\n' "$headers" \
+      | tr -d '\r' \
+      | sed -n 's/^[Ss]et-[Cc]ookie:[[:space:]]*eidolon_session=\([^;[:space:]]*\).*$/\1/p' \
+      | head -n 1
+  )"
+  [[ -n "$value" ]] || fail "shield edge did not issue an eidolon_session cookie"
+  printf '%s' "$value"
+}
+
+resolve_session_cookie() {
   local current_value="$1"
 
   if [[ -n "$current_value" ]]; then
@@ -67,7 +82,18 @@ resolve_session_id() {
     return
   fi
 
-  uuidgen | tr '[:upper:]' '[:lower:]'
+  mint_session_cookie
+}
+
+session_uuid_from_cookie_value() {
+  local value="$1"
+
+  if [[ "$value" == v1.*.*.*.* ]]; then
+    printf '%s' "$value" | cut -d. -f4
+    return
+  fi
+
+  printf '%s' "$value"
 }
 
 extract_hidden_route_value() {
@@ -108,9 +134,7 @@ require_command mktemp
 require_command awk
 require_command grep
 require_command sed
-if [[ -z "$SESSION_ID" ]]; then
-  require_command uuidgen
-fi
+require_command cut
 
 context="$(kubectl_cmd config current-context)"
 if [[ "$context" != "$EXPECTED_CONTEXT" ]]; then
@@ -124,7 +148,8 @@ edge_url="http://${EDGE_HOST}:${edge_node_port}"
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/eidolon-hidden-route-controlled-reality.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
-SESSION_ID="$(resolve_session_id "$SESSION_ID")"
+SESSION_COOKIE="$(resolve_session_cookie "$SESSION_ID")"
+SESSION_ID="$(session_uuid_from_cookie_value "$SESSION_COOKIE")"
 
 surface_headers="$tmp_dir/surface.headers"
 surface_body="$tmp_dir/surface.md"
@@ -136,7 +161,7 @@ edge_export_file="$tmp_dir/edge-export.json"
 curl_cmd -fsS \
   -D "$surface_headers" \
   -o "$surface_body" \
-  -H "Cookie: eidolon_session=${SESSION_ID}" \
+  -H "Cookie: eidolon_session=${SESSION_COOKIE}" \
   "${edge_url}${SURFACE_PATH}"
 
 surface_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print code}' "$surface_headers")"
@@ -152,7 +177,7 @@ curl_cmd -sS \
   -X POST \
   -D "$action_headers" \
   -o "$action_body" \
-  -H "Cookie: eidolon_session=${SESSION_ID}" \
+  -H "Cookie: eidolon_session=${SESSION_COOKIE}" \
   -H "${EXPECTED_HEADER_NAME}: ${header_value}" \
   "${edge_url}${ACTION_PATH}"
 

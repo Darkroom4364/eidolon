@@ -19,7 +19,7 @@ usage() {
 Usage: examples/shield-lab/smoke-session-minted-expired-legacy-import-orbstack.sh
 
 Validates that an already-observed expired session-minted legacy-import action
-stayed on the protected-upstream path and exported as `expired_session_value`.
+was held Eidolon-owned (fail closed) and exported as `expired_session_value`.
 
 This script reads the proxy event log either from the live OrbStack cluster or
 from `EIDOLON_SHIELD_LOCAL_STATE_DIR`, then verifies both the raw event and the
@@ -127,9 +127,9 @@ request_seen_json="$(
 
 jq -e '
     .policy_state == "observe"
-    and .kind.routing_decision == "protected_upstream"
+    and .kind.routing_decision == "eidolon_owned"
   ' <<<"$request_seen_json" >/dev/null \
-  || fail "session ${SESSION_ID} expired minted proof did not stay on the protected-upstream path"
+  || fail "session ${SESSION_ID} expired minted proof was not held Eidolon-owned (fail closed)"
 
 jq -e -s \
   --arg session_id "$SESSION_ID" '
@@ -162,7 +162,7 @@ jq -e \
     and .[0].request.method == "POST"
     and .[0].request.path == $path
     and .[0].policy.state == "observe"
-    and .[0].policy.routing_decision == "protected_upstream"
+    and .[0].policy.routing_decision == "eidolon_owned"
     and .[0].evidence.latest_bait_header_value_mint == {
       "bait_id": $bait_id,
       "header_name": $header_name,
@@ -173,4 +173,4 @@ jq -e \
   ' "$edge_export_file" >/dev/null \
   || fail "session ${SESSION_ID} edge export did not preserve the expected expired minted-proof outcome"
 
-echo "session-minted expired legacy-import smoke ok: session ${SESSION_ID} stayed protected-upstream and exported expired_session_value without containment"
+echo "session-minted expired legacy-import smoke ok: session ${SESSION_ID} was held Eidolon-owned (fail closed) and exported expired_session_value without containment"
