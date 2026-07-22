@@ -25,6 +25,27 @@ impl Default for SessionId {
     }
 }
 
+/// Opaque identifier of one request handled by the proxy.
+///
+/// Random v4 UUID: it encodes no secrets, client identity, or request data.
+/// Every event derived from a request carries this id so reducers can join
+/// policy, bait-action, routing, rejection, and response decisions to the
+/// exact request that caused them (engineering operating policy invariant 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RequestId(pub Uuid);
+
+impl RequestId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for RequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BaitId(pub String);
 
@@ -613,6 +634,8 @@ pub struct Event {
     pub schema_version: u16,
     pub id: Uuid,
     pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<RequestId>,
     pub observed_at: DateTime<Utc>,
     pub source: EventSource,
     pub policy_state: PolicyState,
@@ -630,11 +653,18 @@ impl Event {
             schema_version: EVENT_SCHEMA_VERSION,
             id: Uuid::new_v4(),
             session_id,
+            request_id: None,
             observed_at: Utc::now(),
             source,
             policy_state,
             kind,
         }
+    }
+
+    /// Attach the opaque id of the request this event was derived from.
+    pub fn with_request_id(mut self, request_id: RequestId) -> Self {
+        self.request_id = Some(request_id);
+        self
     }
 }
 
@@ -680,6 +710,27 @@ pub enum EdgeRecommendedAction {
 pub struct EdgeRequestRef {
     pub method: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<RequestId>,
+}
+
+/// Whether an edge export was assembled from events linked by explicit
+/// request identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeRequestLinkage {
+    /// All contributing events share the exported request's explicit id.
+    Linked,
+    /// The underlying events predate request identifiers, so no causal join
+    /// was possible; no heuristic cross-event join was attempted.
+    #[default]
+    UnknownLegacy,
+}
+
+impl EdgeRequestLinkage {
+    pub fn unknown_legacy() -> Self {
+        Self::UnknownLegacy
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -700,6 +751,8 @@ pub struct EdgeEvidenceRef {
     pub event_schema_version: u16,
     pub event_ids: Vec<Uuid>,
     pub bundle_ref: String,
+    #[serde(default = "EdgeRequestLinkage::unknown_legacy")]
+    pub request_linkage: EdgeRequestLinkage,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authenticated_ingress_rule_rejection_histories:
         Vec<EdgeAuthenticatedIngressRuleRejectionHistory>,
@@ -969,6 +1022,54 @@ mod tests {
     #[test]
     fn event_schema_version_is_the_m2_5_contract_version() {
         assert_eq!(EVENT_SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn event_without_request_id_parses_as_legacy_and_roundtrips_with_id() {
+        let legacy = json!({
+            "schema_version": 2,
+            "id": Uuid::new_v4(),
+            "session_id": SessionId::new(),
+            "observed_at": Utc::now(),
+            "source": "proxy",
+            "policy_state": "observe",
+            "kind": {
+                "type": "bait_action_observed",
+                "bait_id": "bait-1",
+                "exposure_id": null,
+                "method": "POST",
+                "path": "/api/v2/import/reconcile",
+                "header_value_mint": null,
+                "header_value_mint_status": null
+            }
+        });
+
+        let event: Event = must_ok(
+            serde_json::from_value(legacy),
+            "legacy event without request_id should parse",
+        );
+        assert_eq!(event.request_id, None);
+
+        let linked = event.with_request_id(RequestId::new());
+        assert!(linked.request_id.is_some());
+        let serialized = must_ok(serde_json::to_value(&linked), "linked event should serialize");
+        let reparsed: Event = must_ok(
+            serde_json::from_value(serialized),
+            "linked event should reparse",
+        );
+        assert_eq!(reparsed.request_id, linked.request_id);
+    }
+
+    #[test]
+    fn edge_request_linkage_defaults_to_unknown_legacy() {
+        assert_eq!(
+            EdgeRequestLinkage::default(),
+            EdgeRequestLinkage::UnknownLegacy
+        );
+        assert_eq!(
+            EdgeRequestLinkage::unknown_legacy(),
+            EdgeRequestLinkage::UnknownLegacy
+        );
     }
 
     #[test]
@@ -1452,6 +1553,7 @@ mod tests {
             request: EdgeRequestRef {
                 method: "GET".to_string(),
                 path: "/openapi.json".to_string(),
+                request_id: None,
             },
             ingress_identity: IngressIdentity {
                 source: IngressIdentitySource::VerifiedBot,
@@ -1526,6 +1628,7 @@ mod tests {
                 event_schema_version: EVENT_SCHEMA_VERSION,
                 event_ids: vec![Uuid::new_v4()],
                 bundle_ref: "session:ref".to_string(),
+                request_linkage: EdgeRequestLinkage::UnknownLegacy,
                 authenticated_ingress_rule_rejection_histories: Vec::new(),
                 local_ingress_trust_scope_rejection_histories: vec![
                     EdgeLocalIngressTrustScopeRejectionHistory {
