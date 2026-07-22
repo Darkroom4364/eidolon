@@ -11,7 +11,7 @@ use eidolon_core::{
     PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY, TRUSTED_INGRESS_CONTRACT_VERSION,
 };
 
-use crate::evidence::trace_metric_summary_for_timeline;
+use crate::evidence::{trace_metric_summary_for_timeline, ProofOutcome};
 use crate::{
     evidence_bundle_for_timeline, BaitActionEvidence, BaitExposureEvidence, EvidenceBundle,
     SessionTimeline, TimelineEvent, TimelineEventRef,
@@ -1002,10 +1002,44 @@ fn exposure_by_ref(
 }
 
 fn unconfirmed_action_reason(action: &BaitActionEvidence) -> &'static str {
-    if action.prior_same_bait_exposure.is_some() {
-        "same bait was exposed earlier, but the action did not carry the matching exposure identifier"
-    } else {
-        "no prior matching exposure was recorded for this session"
+    match action.proof_outcome() {
+        ProofOutcome::Rejected => match action.header_value_mint_status {
+            Some(BaitHeaderValueMintStatus::ReplaySeen) => {
+                "proof rejected as a replay; excluded from confirmed evidence"
+            }
+            Some(BaitHeaderValueMintStatus::ExpiredSessionValue) => {
+                "proof rejected as expired; excluded from confirmed evidence"
+            }
+            Some(BaitHeaderValueMintStatus::SessionValueMismatch) => {
+                "proof rejected as mismatched; excluded from confirmed evidence"
+            }
+            Some(BaitHeaderValueMintStatus::ReplayStateCapacityExceeded) => {
+                "proof rejected because replay capacity was exceeded; excluded from confirmed evidence"
+            }
+            Some(BaitHeaderValueMintStatus::MissingSessionValue) => {
+                "proof rejected because the session proof was missing; excluded from confirmed evidence"
+            }
+            Some(BaitHeaderValueMintStatus::MalformedSessionValue) => {
+                "proof rejected as malformed; excluded from confirmed evidence"
+            }
+            Some(BaitHeaderValueMintStatus::MatchedSessionValue) | None => {
+                "proof rejected; excluded from confirmed evidence"
+            }
+        },
+        ProofOutcome::Unknown => {
+            if action.matched_exposure.is_some() {
+                "exposure matched, but the proof validity is unverifiable (no status recorded)"
+            } else {
+                "no status recorded for a mint-enabled bait proof; not counted as confirmed"
+            }
+        }
+        ProofOutcome::Accepted => {
+            if action.prior_same_bait_exposure.is_some() {
+                "same bait was exposed earlier, but the action did not carry the matching exposure identifier"
+            } else {
+                "no prior matching exposure was recorded for this session"
+            }
+        }
     }
 }
 
@@ -1269,6 +1303,47 @@ mod tests {
                 header_value_mint_status: None,
             },
         )
+    }
+
+    #[test]
+    fn report_labels_rejected_linked_action_only_as_rejected() {
+        let session_id = SessionId::new();
+        let mint_audit = eidolon_core::BaitHeaderValueMintAudit {
+            header_name: "X-Trace".to_string(),
+            kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+            prefix: "test".to_string(),
+        };
+        let minted_exposure = Event::new(
+            session_id,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId("minted-trace".to_string()),
+                exposure_id: ExposureId("exp-1".to_string()),
+                surface: "/docs/minted-trace".to_string(),
+                header_value_mint: Some(mint_audit.clone()),
+            },
+        );
+        let replayed_action = Event::new(
+            session_id,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: BaitId("minted-trace".to_string()),
+                exposure_id: Some(ExposureId("exp-1".to_string())),
+                method: "POST".to_string(),
+                path: "/api/v2/import/reconcile".to_string(),
+                header_value_mint: Some(mint_audit),
+                header_value_mint_status: Some(eidolon_core::BaitHeaderValueMintStatus::ReplaySeen),
+            },
+        );
+
+        let report = render_markdown_report(&timeline(vec![minted_exposure, replayed_action]));
+
+        assert!(report.contains("- No confirmed bait exposure to action chain."));
+        assert!(report.contains("proof rejected as a replay; excluded from confirmed evidence"));
+        assert!(report.contains("unconfirmed bait-shaped action"));
+        assert!(!report.contains("confirmed match"));
     }
 
     fn policy(session_id: SessionId) -> Event {
