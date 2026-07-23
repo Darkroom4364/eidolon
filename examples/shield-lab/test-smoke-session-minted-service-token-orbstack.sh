@@ -58,6 +58,25 @@ body_file=""
 cookie=""
 api_key=""
 request_url=""
+proof_cache_control="${EIDOLON_TEST_PROOF_CACHE_CONTROL:-No-Store, PRIVATE}"
+proof_etag="${EIDOLON_TEST_PROOF_ETAG:-}"
+proof_last_modified="${EIDOLON_TEST_PROOF_LAST_MODIFIED:-}"
+printf -v fixture_tag_a '%024d' 0
+printf -v fixture_tag_b '%024d' 1
+session_a_value="svc_w5ac7f6_${fixture_tag_a}"
+session_b_value="svc_w5ac7f6_${fixture_tag_b}"
+
+write_proof_headers() {
+  printf 'HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\nCache-Control: %s\r\n' \
+    "$proof_cache_control" > "$headers_file"
+  if [[ -n "$proof_etag" ]]; then
+    printf 'ETag: %s\r\n' "$proof_etag" >> "$headers_file"
+  fi
+  if [[ -n "$proof_last_modified" ]]; then
+    printf 'Last-Modified: %s\r\n' "$proof_last_modified" >> "$headers_file"
+  fi
+  printf '\r\n' >> "$headers_file"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -96,38 +115,24 @@ done
 
 case "${method}|${request_url}|${cookie}" in
   "GET|http://127.0.0.1:31080/docs/service-token|eidolon_session=11111111-1111-4111-8111-111111111111")
-    printf 'HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\n\r\n' > "$headers_file"
-    cat > "$body_file" <<'BODY'
-# Customer Service Token
-
-Use `X-Api-Key: svc_fixture_session_alpha` with:
-
-```http
-POST /api/v2/import/reconcile
-```
-BODY
+    write_proof_headers
+    printf '# Customer Service Token\n\nUse `%s: %s` with:\n\n```http\nPOST /api/v2/import/reconcile\n```\n' \
+      "X-Api-Key" "$session_a_value" > "$body_file"
     ;;
   "GET|http://127.0.0.1:31080/docs/service-token|eidolon_session=22222222-2222-4222-8222-222222222222")
-    printf 'HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\n\r\n' > "$headers_file"
-    cat > "$body_file" <<'BODY'
-# Customer Service Token
-
-Use `X-Api-Key: svc_fixture_session_bravo` with:
-
-```http
-POST /api/v2/import/reconcile
-```
-BODY
+    write_proof_headers
+    printf '# Customer Service Token\n\nUse `%s: %s` with:\n\n```http\nPOST /api/v2/import/reconcile\n```\n' \
+      "X-Api-Key" "$session_b_value" > "$body_file"
     ;;
   "POST|http://127.0.0.1:31080/api/v2/import/reconcile|eidolon_session=11111111-1111-4111-8111-111111111111")
-    [[ "$api_key" == "svc_fixture_session_alpha" ]]
+    [[ "$api_key" == "$session_a_value" ]]
     printf 'HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
     cat > "$body_file" <<'BODY'
 {"write_committed":false,"branch":"customer-import-repair"}
 BODY
     ;;
   "POST|http://127.0.0.1:31080/api/v2/import/reconcile|eidolon_session=22222222-2222-4222-8222-222222222222")
-    [[ "$api_key" == "svc_fixture_session_alpha" ]]
+    [[ "$api_key" == "$session_a_value" ]]
     printf 'HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
     cat > "$body_file" <<'BODY'
 {"status":"blocked","synthetic":true,"reason":"configured unsafe bait action failed closed","path":"/api/v2/import/reconcile"}
@@ -198,8 +203,7 @@ test_smoke_script_verifies_default_session_minted_service_token() {
   output="$(
     EIDOLON_SHIELD_SESSION_MINTED_SERVICE_TOKEN_SESSION_A=11111111-1111-4111-8111-111111111111 \
       EIDOLON_SHIELD_SESSION_MINTED_SERVICE_TOKEN_SESSION_B=22222222-2222-4222-8222-222222222222 \
-      EIDOLON_SHIELD_SESSION_MINTED_SERVICE_TOKEN_VALUE_PATTERN='svc_fixture_[a-z_]+' \
-    KUBECTL_BIN="$temp_dir/kubectl" \
+      KUBECTL_BIN="$temp_dir/kubectl" \
       CURL_BIN="$temp_dir/curl" \
       EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
       EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
@@ -212,6 +216,70 @@ test_smoke_script_verifies_default_session_minted_service_token() {
   rg -q 'cross-session replay stayed uncorrelated' <<<"$output"
 }
 
+assert_smoke_rejects_cache_headers() {
+  local cache_control="$1"
+  local etag="$2"
+  local last_modified="$3"
+  local expected="$4"
+  local temp_dir
+  local state_dir
+  local output
+
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  if output="$(
+    EIDOLON_TEST_PROOF_CACHE_CONTROL="$cache_control" \
+      EIDOLON_TEST_PROOF_ETAG="$etag" \
+      EIDOLON_TEST_PROOF_LAST_MODIFIED="$last_modified" \
+      EIDOLON_SHIELD_SESSION_MINTED_SERVICE_TOKEN_SESSION_A=11111111-1111-4111-8111-111111111111 \
+      EIDOLON_SHIELD_SESSION_MINTED_SERVICE_TOKEN_SESSION_B=22222222-2222-4222-8222-222222222222 \
+      KUBECTL_BIN="$temp_dir/kubectl" \
+      CURL_BIN="$temp_dir/curl" \
+      EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$SMOKE_SCRIPT" 2>&1
+  )"; then
+    echo "expected service-token smoke to reject unsafe proof cache headers" >&2
+    exit 1
+  fi
+
+  rg -q "$expected" <<<"$output"
+}
+
 test_smoke_script_verifies_default_session_minted_service_token
+assert_smoke_rejects_cache_headers \
+  'private' \
+  '' \
+  '' \
+  'missing Cache-Control directive no-store'
+assert_smoke_rejects_cache_headers \
+  'no-store' \
+  '' \
+  '' \
+  'missing Cache-Control directive private'
+assert_smoke_rejects_cache_headers \
+  'private, no-store=3600' \
+  '' \
+  '' \
+  'missing Cache-Control directive no-store'
+assert_smoke_rejects_cache_headers \
+  'private=1, no-store' \
+  '' \
+  '' \
+  'missing Cache-Control directive private'
+assert_smoke_rejects_cache_headers \
+  'private, no-store' \
+  '"stale-proof"' \
+  '' \
+  'exposed a stale ETag or Last-Modified validator'
+assert_smoke_rejects_cache_headers \
+  'private, no-store' \
+  '' \
+  'Wed, 22 Jul 2026 10:00:00 GMT' \
+  'exposed a stale ETag or Last-Modified validator'
 
 printf 'shield-lab session-minted service-token smoke checks passed\n'
