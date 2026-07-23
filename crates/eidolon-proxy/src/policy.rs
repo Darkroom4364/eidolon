@@ -290,7 +290,7 @@ pub fn transition_to_suspicious_from_ingress_signals(
     }
     if !discovery_path_prefixes
         .iter()
-        .any(|prefix| path.starts_with(prefix))
+        .any(|prefix| ingress_identity::path_matches_segment_prefix(path, prefix))
     {
         return None;
     }
@@ -1047,9 +1047,22 @@ mod tests {
                 ..Default::default()
             },
         );
+        let near_prefix = transition_to_suspicious_from_ingress_signals(
+            PolicyState::Observe,
+            "/docs2",
+            &["/docs".to_string(), "/openapi.json".to_string()],
+            &IngressIdentity::default(),
+            &IngressAdvisorySignals {
+                actor_kind: IngressActorKind::AutonomousAgent,
+                vendor_score: Some(12),
+                vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
+                ..Default::default()
+            },
+        );
 
         assert_eq!(high_score, None);
         assert_eq!(non_discovery, None);
+        assert_eq!(near_prefix, None);
     }
 
     #[test]

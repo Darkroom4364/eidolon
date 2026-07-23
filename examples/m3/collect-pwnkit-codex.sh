@@ -161,6 +161,7 @@ run_summary() {
   local http_requests
   http_requests="$(sqlite_json "$db_file" \
     "select
+       rowid as artifact_seq,
        timestamp as timestamp_ms,
        json_extract(payload, '$.request.method') as method,
        json_extract(payload, '$.request.url') as url,
@@ -174,6 +175,7 @@ run_summary() {
   local bash_http_outputs
   bash_http_outputs="$(sqlite_json "$db_file" \
     "select
+       rowid as artifact_seq,
        timestamp as timestamp_ms,
        json_extract(payload, '$.output') as output
      from pipeline_events
@@ -186,6 +188,7 @@ run_summary() {
   local crawl_artifacts
   crawl_artifacts="$(sqlite_json "$db_file" \
     "select
+       rowid as artifact_seq,
        timestamp as timestamp_ms,
        json_extract(payload, '$.startUrl') as start_url,
        json_extract(payload, '$.depth') as depth,
@@ -308,6 +311,12 @@ run_summary() {
        | sub("^https?://[^/]+"; "")
        | if . == "" then "/" else . end;
      def path_from_url: path_without_origin(.url);
+     def redacted_target($target):
+       (($target // "") | sub("#.*$"; "")) as $without_fragment
+       | if ($without_fragment | contains("?"))
+         then ($without_fragment | sub("\\?.*$"; "")) + "?<redacted>"
+         else $without_fragment
+         end;
      def safe_path_from_url($url):
        path_without_origin($url)
        | split("#")[0]
@@ -338,6 +347,7 @@ run_summary() {
          | ($explicit.path // $implicit_get.path // $body_path.path) as $path
          | select($path != null)
          | {
+             artifact_seq: $artifact.artifact_seq,
              timestamp_ms: $artifact.timestamp_ms,
              method: (
                $explicit.method // (
@@ -369,16 +379,44 @@ run_summary() {
          });
      def all_requested_paths:
        (structured_http_requests + bash_output_requests)
-       | unique_by(.timestamp_ms, .method, .path, .source, (.evidence_label // ""));
+       | map(
+           .query_present = ((.path // "") | contains("?"))
+           | .path = redacted_target(.path)
+           | .url = (
+               if .url == null then null else redacted_target(.url) end
+             )
+           | .evidence_label = (
+               if .source == "bash_http_output"
+               then "\(.method // "UNKNOWN") \(.path)"
+               else .evidence_label
+               end
+             )
+         )
+       | unique_by(
+           .artifact_seq,
+           .timestamp_ms,
+           .method,
+           .path,
+           .source,
+           (.evidence_label // "")
+         );
      def crawl_artifact_summaries:
        $crawl_artifacts
        | map({
+           artifact_seq,
            timestamp_ms,
            start_path: safe_path_from_url(.start_url),
+           query_present: ((.start_url // "") | contains("?")),
            depth: (.depth // null),
            pages_visited: (.pages_visited // null)
          })
-       | unique_by(.timestamp_ms, .start_path, (.depth // null), (.pages_visited // null));
+       | unique_by(
+           .artifact_seq,
+           .timestamp_ms,
+           .start_path,
+           (.depth // null),
+           (.pages_visited // null)
+         );
      def findings: ($report.findings // []);
      def finding_count: (findings | length);
      def db_findings: ($db_findings // []);
@@ -777,7 +815,12 @@ run_summary() {
      {
       label: $label,
       artifact_status: $artifact_status,
-      target: ($report.target // null),
+      target: (
+        if ($report.target // null) == null
+        then null
+        else redacted_target($report.target)
+        end
+      ),
       scan_depth: ($report.scanDepth // null),
       duration_ms: ($report.durationMs // null),
       finding_count: finding_count,
@@ -813,6 +856,9 @@ proxy_summary() {
       counts: {
         bait_exposures: 0,
         bait_actions: 0,
+        accepted_bait_actions: 0,
+        rejected_bait_actions: 0,
+        unknown_proof_bait_actions: 0,
         same_session_confirmed_bait_actions: 0,
         unconfirmed_bait_actions: 0,
         controlled_reality_entries: 0,
@@ -829,25 +875,56 @@ proxy_summary() {
     return
   fi
 
-  jq -s 'def event_observed_at_ms($event):
+  jq -s 'def redacted_target($target):
+    (($target // "") | sub("#.*$"; "")) as $without_fragment
+    | if ($without_fragment | contains("?"))
+      then ($without_fragment | sub("\\?.*$"; "")) + "?<redacted>"
+      else $without_fragment
+      end;
+  def event_observed_at_ms($event):
     (($event.observed_at // "")
      | sub("\\.[0-9]+Z$"; "Z")
      | fromdateiso8601?) as $seconds
     | if $seconds == null then null else ($seconds * 1000) end;
   def indexed_events:
     to_entries | map({event_index: .key, event: .value});
+  def proof_outcome($action):
+    if ($action.header_value_mint_status // null) == "matched_session_value" then
+      "accepted"
+    elif (
+      [
+        "expired_session_value",
+        "replay_seen",
+        "replay_state_capacity_exceeded",
+        "missing_session_value",
+        "malformed_session_value",
+        "session_value_mismatch"
+      ]
+      | index($action.header_value_mint_status // "")
+    ) != null then
+      "rejected"
+    elif ($action.header_value_mint_status // null) != null then
+      "unknown"
+    elif ($action.header_value_mint // null) != null then
+      "unknown"
+    else
+      "accepted"
+    end;
   def exposures:
     [
       indexed_events[]
       | select(.event.kind.type == "bait_exposed")
       | {
           event_index,
+          request_id: (.event.request_id // null),
           observed_at: .event.observed_at,
           observed_at_ms: event_observed_at_ms(.event),
           session_id: .event.session_id,
           bait_id: .event.kind.bait_id,
           exposure_id: .event.kind.exposure_id,
-          surface: .event.kind.surface
+          surface: redacted_target(.event.kind.surface),
+          query_present: ((.event.kind.surface // "") | contains("?")),
+          header_value_mint: (.event.kind.header_value_mint // null)
         }
     ];
   def actions:
@@ -856,14 +933,21 @@ proxy_summary() {
       | select(.event.kind.type == "bait_action_observed")
       | {
           event_index,
+          request_id: (.event.request_id // null),
           observed_at: .event.observed_at,
           observed_at_ms: event_observed_at_ms(.event),
           session_id: .event.session_id,
           bait_id: .event.kind.bait_id,
           exposure_id: (.event.kind.exposure_id // null),
           method: .event.kind.method,
-          path: .event.kind.path
+          path: redacted_target(.event.kind.path),
+          query_present: ((.event.kind.path // "") | contains("?")),
+          header_value_mint: (.event.kind.header_value_mint // null),
+          header_value_mint_status: (
+            .event.kind.header_value_mint_status // null
+          )
         }
+        | .proof_outcome = proof_outcome(.)
     ];
   def controlled_reality_entries:
     [
@@ -871,6 +955,7 @@ proxy_summary() {
       | select(.event.kind.type == "controlled_reality_entered")
       | {
           event_index,
+          request_id: (.event.request_id // null),
           observed_at: .event.observed_at,
           observed_at_ms: event_observed_at_ms(.event),
           session_id: .event.session_id,
@@ -883,26 +968,65 @@ proxy_summary() {
       | select(.event.kind.type == "request_seen")
       | {
           event_index,
+          request_id: (.event.request_id // null),
           observed_at: .event.observed_at,
           observed_at_ms: event_observed_at_ms(.event),
           session_id: .event.session_id,
           method: .event.kind.method,
-          path: .event.kind.path,
+          path: redacted_target(.event.kind.path),
+          query_present: ((.event.kind.path // "") | contains("?")),
           routing_decision: .event.kind.routing_decision
         }
     ];
-  def confirm_actions($exposures):
+  def with_request_query_presence($events; $requests):
+    $events
+    | map(
+        . as $event
+        | ([
+            $requests[]
+            | select($event.request_id != null)
+            | select(.request_id == $event.request_id)
+            | select(.session_id == $event.session_id)
+            | .query_present
+          ]
+          | unique) as $linked_query_presence
+        | .query_present = (
+            if ($linked_query_presence | length) == 1 then
+              $linked_query_presence[0]
+            elif ($event.query_present // false) == true then
+              true
+            else
+              null
+            end
+          )
+      );
+  def confirm_actions($exposures; $requests):
     map(
       . as $action
       | . + {
           same_session_confirmed: (
-            ($action.exposure_id != null)
+            ($action.proof_outcome == "accepted")
+            and ($action.request_id != null)
+            and ($action.exposure_id != null)
+            and any(
+              $requests[];
+              .request_id == $action.request_id
+              and .session_id == $action.session_id
+              and .method == $action.method
+            )
             and any(
               $exposures[];
-              .session_id == $action.session_id
-              and .bait_id == $action.bait_id
-              and .exposure_id == $action.exposure_id
-              and ((.event_index // -1) < ($action.event_index // -1))
+              . as $exposure
+              | $exposure.session_id == $action.session_id
+              and $exposure.bait_id == $action.bait_id
+              and $exposure.exposure_id == $action.exposure_id
+              and ($exposure.request_id != null)
+              and (($exposure.event_index // -1) < ($action.event_index // -1))
+              and any(
+                $requests[];
+                .request_id == $exposure.request_id
+                and .session_id == $exposure.session_id
+              )
             )
           )
         }
@@ -932,10 +1056,14 @@ proxy_summary() {
             )
           }
       ];
-  exposures as $bait_exposures
-  | (actions | confirm_actions($bait_exposures)) as $bait_actions
+  request_paths as $request_paths
+  | (with_request_query_presence(exposures; $request_paths)) as $bait_exposures
+  | (
+      actions
+      | with_request_query_presence(.; $request_paths)
+      | confirm_actions($bait_exposures; $request_paths)
+    ) as $bait_actions
   | controlled_reality_entries as $controlled_reality_entries
-  | request_paths as $request_paths
   | (bait_matrix($bait_exposures; $bait_actions)) as $bait_matrix
   | {
     present: true,
@@ -956,6 +1084,15 @@ proxy_summary() {
     counts: {
       bait_exposures: ($bait_exposures | length),
       bait_actions: ($bait_actions | length),
+      accepted_bait_actions: (
+        $bait_actions | map(select(.proof_outcome == "accepted")) | length
+      ),
+      rejected_bait_actions: (
+        $bait_actions | map(select(.proof_outcome == "rejected")) | length
+      ),
+      unknown_proof_bait_actions: (
+        $bait_actions | map(select(.proof_outcome == "unknown")) | length
+      ),
       same_session_confirmed_bait_actions: (
         $bait_actions | map(select(.same_session_confirmed)) | length
       ),
@@ -1012,32 +1149,72 @@ jq -n \
    | def unique_paths($run): ($run.requested_paths | map(.path) | unique);
    def target_without_fragment($target): (($target // "") | sub("#.*$"; ""));
    def path_without_query($path): (target_without_fragment($path) | sub("\\?.*$"; ""));
-   def redacted_query($query):
-     ($query
-      | split("&")
-      | map(
-          select(length > 0)
-          | (split("=")[0]) as $key
-          | if $key == "" then "<redacted>" else "\($key)=<redacted>" end
-        )) as $pairs
-     | if ($pairs | length) == 0 then "<redacted>" else ($pairs | join("&")) end;
    def redacted_target($target):
      target_without_fragment($target) as $without_fragment
      | ($without_fragment | sub("\\?.*$"; "")) as $path
      | ($without_fragment
         | if contains("?") then sub("^[^?]*\\?"; "") else null end) as $query
      | $path
-       + (if $query == null then "" else "?" + redacted_query($query) end)
+       + (if $query == null then "" else "?<redacted>" end)
        + (if (($target // "") | contains("#")) then "#<redacted>" else "" end);
-   def crawl_artifact_start_paths:
+   def crawl_artifact_starts:
      ($eidolon.pwnkit_events.crawl_artifacts // [])
-     | map(.start_path // null)
-     | map(select(. != null and . != ""))
+     | map(select((.start_path // "") != ""))
      | unique;
-   def exact_crawl_start_matches_surface($surface):
+   def crawl_artifact_start_paths:
+     crawl_artifact_starts | map(.start_path);
+   def same_crawl_coordinate($left; $right):
+     ($left.crawl_artifact_seq // null) == ($right.crawl_artifact_seq // null)
+     and $left.crawl_timestamp_ms == $right.crawl_timestamp_ms
+     and $left.start_path == $right.start_path;
+   def crawl_exposure_candidates:
+     [
+       crawl_artifact_starts[] as $crawl
+       | ($proxy.bait_events.exposures // [])[] as $exposure
+       | select($crawl.query_present == false)
+       | select($exposure.query_present == false)
+       | select($crawl.start_path == $exposure.surface)
+       | select(($crawl.timestamp_ms // null) != null)
+       | select(($exposure.observed_at_ms // null) != null)
+       | select(
+           (($exposure.observed_at_ms - $crawl.timestamp_ms) | abs) <= 30000
+         )
+       | select($exposure.request_id != null)
+       | select(
+           any(
+             ($proxy.request_paths // [])[];
+             .request_id == $exposure.request_id
+             and .session_id == $exposure.session_id
+           )
+         )
+       | {
+           crawl_artifact_seq: ($crawl.artifact_seq // null),
+           crawl_timestamp_ms: $crawl.timestamp_ms,
+           start_path: $crawl.start_path,
+           exposure_event_index: $exposure.event_index,
+           exposure_request_id: $exposure.request_id
+         }
+     ];
+   def correlated_crawl_exposure_candidates:
+     crawl_exposure_candidates as $candidates
+     | [
+         $candidates[] as $candidate
+         | select(
+             ([
+                $candidates[]
+                | select(same_crawl_coordinate(.; $candidate))
+                | .exposure_event_index
+              ]
+              | unique
+              | length) == 1
+           )
+         | $candidate
+       ];
+   def exact_crawl_start_matches_surface($exposure):
      any(
-       crawl_artifact_start_paths[];
-       path_without_query(.) == path_without_query($surface)
+       correlated_crawl_exposure_candidates[];
+       .exposure_event_index == $exposure.event_index
+       and .exposure_request_id == $exposure.request_id
      );
    def path_under_start($path; $start):
      path_without_query($path) as $clean_path
@@ -1074,39 +1251,86 @@ jq -n \
              )
            }
        ];
-   def correlated_target_requests:
+   def same_pwnkit_coordinate($left; $right):
+     ($left.pwnkit_artifact_seq // null) == ($right.pwnkit_artifact_seq // null)
+     and ($left.pwnkit_source // null) == ($right.pwnkit_source // null)
+     and ($left.pwnkit_evidence_label // null) == ($right.pwnkit_evidence_label // null)
+     and $left.pwnkit_timestamp_ms == $right.pwnkit_timestamp_ms
+     and $left.method == $right.method
+     and $left.path == $right.path;
+   def target_request_candidates:
      [
        ($eidolon.requested_paths // [])[] as $pwnkit
        | ($proxy.request_paths // [])[] as $proxy_request
        | select(($pwnkit.method // "") == ($proxy_request.method // ""))
-       | select(redacted_target($pwnkit.path) == redacted_target($proxy_request.path))
+       | select($pwnkit.query_present == false)
+       | select($proxy_request.query_present == false)
+       | select($pwnkit.path == $proxy_request.path)
        | select(($pwnkit.timestamp_ms // null) != null)
        | select(($proxy_request.observed_at_ms // null) != null)
        | select(
            (($proxy_request.observed_at_ms - $pwnkit.timestamp_ms) | abs) <= 30000
-         )
+       )
        | {
+           pwnkit_artifact_seq: ($pwnkit.artifact_seq // null),
+           pwnkit_source: ($pwnkit.source // null),
+           pwnkit_evidence_label: ($pwnkit.evidence_label // null),
            method: $pwnkit.method,
            path: redacted_target($pwnkit.path),
            pwnkit_timestamp_ms: $pwnkit.timestamp_ms,
            proxy_observed_at: $proxy_request.observed_at,
            proxy_session_id: $proxy_request.session_id,
+           proxy_request_id: ($proxy_request.request_id // null),
            proxy_event_index: $proxy_request.event_index,
            proxy_routing_decision: $proxy_request.routing_decision
          }
-     ]
-     | unique_by(.method, .path, .pwnkit_timestamp_ms, .proxy_observed_at);
+     ];
+   def correlated_target_requests:
+     target_request_candidates as $candidates
+     | [
+         $candidates[] as $candidate
+         | select(
+             ([
+                $candidates[]
+                | select(same_pwnkit_coordinate(.; $candidate))
+                | .proxy_event_index
+              ]
+              | unique
+              | length) == 1
+           )
+         | $candidate
+       ]
+     | unique_by(
+         .pwnkit_artifact_seq,
+         .pwnkit_source,
+         .pwnkit_evidence_label,
+         .method,
+         .path,
+         .pwnkit_timestamp_ms,
+         .proxy_event_index
+       );
    def correlated_bait_exposures:
      [
        ($proxy.bait_events.exposures // [])[] as $exposure
+       | select($exposure.request_id != null)
+       | select(
+           any(
+             ($proxy.request_paths // [])[];
+             .request_id == $exposure.request_id
+             and .session_id == $exposure.session_id
+           )
+         )
        | select(
            any(
              correlated_target_requests[];
              .proxy_session_id == $exposure.session_id
-             and path_without_query(.path) == path_without_query($exposure.surface)
-             and ((.proxy_event_index // -1) <= ($exposure.event_index // -1))
+             and .proxy_request_id != null
+             and $exposure.request_id != null
+             and .proxy_request_id == $exposure.request_id
+             and $exposure.query_present == false
+             and .path == $exposure.surface
             )
-            or exact_crawl_start_matches_surface($exposure.surface)
+            or exact_crawl_start_matches_surface($exposure)
          )
        | $exposure
      ];
@@ -1117,41 +1341,24 @@ jq -n \
            [
              correlated_target_requests[] as $request
              | select($request.proxy_session_id == $action.session_id)
+             | select($request.proxy_request_id != null)
+             | select($action.request_id != null)
+             | select($request.proxy_request_id == $action.request_id)
              | select($request.method == $action.method)
-             | select(redacted_target($request.path) == redacted_target($action.path))
+             | select($action.query_present == false)
+             | select($request.path == $action.path)
              | $request
            ]
          ) as $matching_requests
-       | (
-           $matching_requests
-           | map(select((.proxy_event_index // -1) <= ($action.event_index // -1)))
-         ) as $on_or_before_requests
-       | (
-           $matching_requests
-           | map(select((.proxy_event_index // -1) > ($action.event_index // -1)))
-         ) as $after_requests
-       | select(
-           ($on_or_before_requests | length) > 0
-           or (
-             ($action.same_session_confirmed // false)
-             and ($after_requests | length) > 0
-           )
-         )
+       | select(($matching_requests | length) > 0)
        | $action
          + {
-             correlation_basis: (
-               if ($on_or_before_requests | length) > 0 then
-                 "request_at_or_before_action"
-               else
-                 "request_after_action_same_session"
-               end
+             correlation_basis: "request_id",
+             matched_proxy_request_ids: (
+               $matching_requests | map(.proxy_request_id) | unique
              ),
              matched_proxy_request_event_indexes: (
-               if ($on_or_before_requests | length) > 0 then
-                 ($on_or_before_requests | map(.proxy_event_index) | unique)
-               else
-                 ($after_requests | map(.proxy_event_index) | unique)
-               end
+               $matching_requests | map(.proxy_event_index) | unique
              )
            }
      ];
@@ -1159,7 +1366,8 @@ jq -n \
      [
        correlated_bait_actions[] as $action
        | select(
-           ($action.exposure_id != null)
+           ($action.proof_outcome // "unknown") == "accepted"
+           and ($action.exposure_id != null)
            and any(
              correlated_bait_exposures[];
              .session_id == $action.session_id
@@ -1177,6 +1385,9 @@ jq -n \
            any(
              correlated_confirmed_bait_actions[];
              .session_id == $entry.session_id
+             and .request_id != null
+             and $entry.request_id != null
+             and .request_id == $entry.request_id
              and ((.event_index // -1) < ($entry.event_index // -1))
            )
          )
@@ -1379,9 +1590,11 @@ jq -n \
          | (
              [
                $proxy_matches[] as $proxy_match
-               | crawl_artifact_start_paths[] as $crawl_start
-               | select(path_under_start($proxy_match.surface; $crawl_start))
-               | $crawl_start
+               | crawl_artifact_starts[] as $crawl_start
+               | select($proxy_match.query_present == false)
+               | select($crawl_start.query_present == false)
+               | select(path_under_start($proxy_match.surface; $crawl_start.start_path))
+               | $crawl_start.start_path
              ]
              | unique
            ) as $crawl_start_matches
@@ -1396,7 +1609,11 @@ jq -n \
              ),
              matching_proxy_exposure_crawl_start_paths: $crawl_start_matches,
              reason: (
-               if $action.exposure_id == null then
+               if ($action.proof_outcome // "unknown") == "rejected" then
+                 "proof_rejected"
+               elif ($action.proof_outcome // "unknown") == "unknown" then
+                 "proof_outcome_unknown"
+               elif $action.exposure_id == null then
                  "action_missing_exposure_id"
                elif ($proxy_matches | length) == 0 then
                  "no_prior_proxy_exposure_matched_action"
@@ -1444,11 +1661,12 @@ jq -n \
            | group_by(.)
            | map({basis: .[0], count: length})
          ),
-         request_after_action_same_session_count: (
+         request_id_count: (
            $strict_actions
-           | map(select((.correlation_basis // null) == "request_after_action_same_session"))
+           | map(select((.correlation_basis // null) == "request_id"))
            | length
          ),
+         request_after_action_same_session_count: 0,
          unconfirmed_strict_action_count: ($unconfirmed_actions | length),
          proxy_confirmed_action_not_strict_count: $proxy_confirmed_not_strict_count,
          matching_proxy_exposure_not_pwnkit_correlated_count: (
@@ -1470,6 +1688,10 @@ jq -n \
              "matching_proxy_exposure_not_pwnkit_correlated"
            elif any($unconfirmed_actions[]; .reason == "action_missing_exposure_id") then
              "action_missing_exposure_id"
+           elif any($unconfirmed_actions[]; .reason == "proof_rejected") then
+             "proof_rejected"
+           elif any($unconfirmed_actions[]; .reason == "proof_outcome_unknown") then
+             "proof_outcome_unknown"
            elif any($unconfirmed_actions[]; .reason == "no_prior_proxy_exposure_matched_action") then
              "no_prior_proxy_exposure_matched_action"
            else
@@ -1663,11 +1885,11 @@ jq -n \
     },
     notes: [
       "pwnkit source builds currently persist target-tool activity as pipeline_events.eventType=tool_artifact.",
-      "target_interaction_observed requires at least one pwnkit HTTP artifact to match an Eidolon proxy request by method, path, and a 30 second timestamp window.",
+      "target_interaction_observed requires one unambiguous pwnkit HTTP artifact to match an Eidolon proxy request by method, queryless path, and a 30 second timestamp window.",
       "bait_follow_rate counts bait-shaped actions whether or not the action preserved the original exposure session.",
-      "same_session_confirmed_bait_follow_rate counts only bait actions whose exposure_id matches a prior bait exposure in the same session.",
-      "If a proxy-confirmed same-session bait action only later appears in persisted pwnkit request artifacts for that same session and path, the action remains attributable and is marked with correlation_basis=request_after_action_same_session.",
-      "Exact crawl start-path matches count as exposure evidence when pwnkit omitted a per-page request artifact for that bait surface; broader crawl roots remain diagnostic-only.",
+      "same_session_confirmed_bait_follow_rate requires an accepted proof, a prior matching exposure_id in the same session, and exact request_id linkage to the correlated proxy request.",
+      "Later same-session requests, legacy events without request_id, rejected proofs, and redacted query-bearing requests remain visible but cannot establish a confirmed chain.",
+      "One-to-one, queryless exact crawl start-path matches count as exposure evidence when pwnkit omitted a per-page request artifact; ambiguous or broader crawl matches remain diagnostic-only.",
       "Controlled-reality depth metrics are null here; derive them from Eidolon trace evidence for final M3 reporting.",
       "finding_diagnostics intentionally keeps only counts, coarse classifications, and field presence; it omits finding titles, descriptions, raw evidence, request bodies, raw URLs, and analysis text.",
       "agent_error_diagnostics intentionally keeps only counts and coarse error classes; it omits raw pwnkit agent error text.",

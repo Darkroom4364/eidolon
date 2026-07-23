@@ -145,10 +145,11 @@ pinned session in `3/3` runs, reached same-session confirmed bait action in
 runs. Two runs emitted positive differential Eidolon final JSON findings, while
 one strict controlled-reality run still emitted zero Eidolon final JSON
 findings despite a saved active DB finding. One of the positive runs required a
-later same-session request artifact to preserve the strict action attribution,
-and the collector now records that as
-`correlation_basis=request_after_action_same_session`. Treat the active open
-question as:
+later same-session request artifact under the collector contract used at the
+time. The current collector no longer treats that as causal: strict action
+attribution requires exact proxy `request_id` linkage and an accepted proof.
+Treat that historical run as unconfirmed unless it is reproduced under the
+current contract. The active open question remains:
 
 ```text
 Why does upstream-current pwnkit still leave one strict controlled-reality run
