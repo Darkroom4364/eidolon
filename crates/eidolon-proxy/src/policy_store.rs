@@ -314,10 +314,9 @@ impl PolicyStateStore {
                     <= now
         });
         if stale {
-            let previous_record = self
-                .records
-                .remove(&session_id)
-                .expect("stale record was just observed");
+            let Some(previous_record) = self.records.remove(&session_id) else {
+                return Ok(());
+            };
             let previous_eviction = self.last_eviction;
             self.last_eviction = EvictionStats {
                 ttl_evicted: 1,
