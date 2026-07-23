@@ -16,7 +16,7 @@ PROMOTION_PATH="${EIDOLON_SHIELD_RATE_LIMITED_DETECTION_RECON_BLOCKED_PROMOTION_
 PROMOTION_PATH_PREFIX="${EIDOLON_SHIELD_RATE_LIMITED_DETECTION_RECON_BLOCKED_PROMOTION_PATH_PREFIX:-/docs}"
 RATE_LIMIT_PATH="${EIDOLON_SHIELD_RATE_LIMITED_DETECTION_RECON_BLOCKED_RATE_LIMIT_PATH:-/docs}"
 BLOCKED_PATH="${EIDOLON_SHIELD_RATE_LIMITED_DETECTION_RECON_BLOCKED_BLOCKED_PATH:-/docs}"
-EXPECTED_BAIT_MARKER="${EIDOLON_SHIELD_RATE_LIMITED_DETECTION_RECON_BLOCKED_BAIT_MARKER:-X-Migration-Trace: rel_2025_04_b7f2}"
+EXPECTED_BAIT_MARKER="${EIDOLON_SHIELD_RATE_LIMITED_DETECTION_RECON_BLOCKED_BAIT_MARKER:-X-Migration-Trace: mig_w}"
 EXPECTED_RETRY_AFTER="${EIDOLON_SHIELD_RATE_LIMITED_DETECTION_RECON_BLOCKED_RETRY_AFTER:-30}"
 ACTOR_KIND="${EIDOLON_SHIELD_RATE_LIMITED_DETECTION_RECON_BLOCKED_ACTOR_KIND:-agentic_browser}"
 VENDOR_SCORE="${EIDOLON_SHIELD_RATE_LIMITED_DETECTION_RECON_BLOCKED_VENDOR_SCORE:-35}"
@@ -272,10 +272,10 @@ jq -e \
     and ((.kind.reason // "") | contains("detection_score=2"))
     and ((.kind.reason // "") | contains("recon_score=5"))
     and ((.kind.reason // "") | contains("recon_block_threshold=5"))
-    and ((.kind.reason // "") | contains("persistence_class=discovery_recon"))
-    and ((.kind.reason // "") | contains("persistence_kind=discovery_recon_retry"))
+    and .persistence.pre_containment_persistence_class == "discovery_recon"
+    and .persistence.pre_containment_persistence_kind == "discovery_recon_retry"
   ' <<<"$blocked_transition_json" >/dev/null \
-  || fail "session ${session_id} blocked transition reason did not preserve the expected detection-backed recon facts"
+  || fail "session ${session_id} blocked transition did not preserve the expected detection-backed recon facts and persistence metadata"
 
 read_proxy_state_file debug.jsonl > "$debug_file"
 request_debug_json="$(
@@ -317,8 +317,6 @@ jq -e '
   and ((.fields.policy_reason // "") | contains("rate-limited discovery recon retry moved session to blocked"))
   and ((.fields.policy_reason // "") | contains("detection_count=2"))
   and ((.fields.policy_reason // "") | contains("detection_score=2"))
-  and ((.fields.policy_reason // "") | contains("persistence_class=discovery_recon"))
-  and ((.fields.policy_reason // "") | contains("persistence_kind=discovery_recon_retry"))
 ' <<<"$surface_debug_json" >/dev/null \
   || fail "session ${session_id} did not keep the blocked detection-backed recon retry reason on the Eidolon-owned enforcement path"
 

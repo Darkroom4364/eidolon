@@ -15,9 +15,10 @@ ENTRY_ACTION_PATH="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_ENTRY_ACTION_PATH
 ENTRY_ACTION_PATH_PREFIX="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_ENTRY_ACTION_PATH_PREFIX:-/api/v2/import/reconcile}"
 ESCAPE_PATH="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_ESCAPE_PATH:-/api/v1/projects}"
 ESCAPE_PATH_PREFIX="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_ESCAPE_PATH_PREFIX:-/api/v1/projects}"
-EXPECTED_BAIT_MARKER="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_BAIT_MARKER:-X-Migration-Trace: rel_2025_04_b7f2}"
+EXPECTED_BAIT_MARKER="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_BAIT_MARKER:-X-Migration-Trace: mig_w}"
 EXACT_HEADER_NAME="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_HEADER_NAME:-X-Migration-Trace}"
-EXACT_HEADER_VALUE="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_HEADER_VALUE:-rel_2025_04_b7f2}"
+EXACT_HEADER_VALUE="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_HEADER_VALUE:-}"
+MINTED_VALUE_PATTERN="${EIDOLON_SHIELD_CONTROLLED_REALITY_BLOCKED_VALUE_PATTERN:-mig_w[0-9a-f]+_[0-9a-f]+}"
 
 usage() {
   cat <<'USAGE'
@@ -78,6 +79,15 @@ SH
   chmod +x "$EDGE_EXPORT_BIN"
 }
 
+extract_minted_value() {
+  local file="$1"
+  local value
+
+  value="$(grep -Eom1 "$MINTED_VALUE_PATTERN" "$file" || true)"
+  [[ -n "$value" ]] || fail "could not extract a minted legacy-import trace value from $file"
+  printf '%s' "$value"
+}
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
@@ -127,6 +137,10 @@ exposure_http_code="$(awk 'BEGIN{IGNORECASE=1} /^HTTP\// {code=$2} END{print cod
 [[ "$exposure_http_code" == "200" ]] || fail "expected HTTP 200 from controlled-reality blocked exposure request, got: ${exposure_http_code:-none}"
 grep -Fq "$EXPECTED_BAIT_MARKER" "$exposure_body" \
   || fail "controlled-reality blocked exposure request did not receive the expected baited surface"
+
+if [[ -z "$EXACT_HEADER_VALUE" ]]; then
+  EXACT_HEADER_VALUE="$(extract_minted_value "$exposure_body")"
+fi
 
 curl_cmd -sS \
   -X POST \
@@ -248,10 +262,10 @@ jq -e \
   || fail "session ${session_id} blocked transition reason did not match the repeated escape path"
 
 jq -e '
-  (.kind.reason // "")
-  | contains("post_containment_persistence_kind=controlled_reality_branch_escape")
+  .persistence.post_containment_persistence_kind
+  == "controlled_reality_branch_escape"
 ' <<<"$blocked_transition_json" >/dev/null \
-  || fail "session ${session_id} blocked transition reason did not preserve the structured branch-escape persistence marker"
+  || fail "session ${session_id} blocked transition did not preserve structured branch-escape persistence metadata"
 
 blocked_response_json="$(
   jq -c -e -s \

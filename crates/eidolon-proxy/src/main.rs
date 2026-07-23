@@ -16,8 +16,8 @@ use std::{
 use eidolon_bait::{docs_for_bait, render_bait_for_session, BaitRegistry};
 use eidolon_core::{
     Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, DiscoveryReconScore, Event, EventKind,
-    EventSource, ExposureId, HeaderValueMint, PolicyState, RequestId, RoutingDecision,
-    SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
+    EventSource, ExposureId, HeaderValueMint, PersistenceMetadata, PolicyState, RequestId,
+    RoutingDecision, SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
 };
 use eidolon_proxy::{
     controlled_reality::{
@@ -3064,7 +3064,7 @@ fn handle_connection(
     }
     note_session_enforcement(runtime, client_peer_ip, session.session_id, policy_state);
     let starting_policy_state = policy_state;
-    let mut policy_reason_override = None;
+    let mut policy_transition_override = None;
     let discovery_recon_state =
         update_discovery_recon_state_for_request(runtime, session.session_id, &surface_request)?;
     let discovery_recon_score =
@@ -3180,6 +3180,7 @@ fn handle_connection(
                     &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
+                policy_transition_override = Some(transition.clone());
                 policy_state = transition.to;
             }
         } else if starting_policy_state == PolicyState::RateLimited {
@@ -3209,7 +3210,7 @@ fn handle_connection(
                     &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
-                policy_reason_override = Some(transition.reason);
+                policy_transition_override = Some(transition.clone());
                 policy_state = transition.to;
             }
         }
@@ -3315,9 +3316,8 @@ fn handle_connection(
     }
 
     let mut decision = policy::decide_for_state(policy_state, intervention_mode);
-    if let Some(reason) = policy_reason_override {
-        decision =
-            policy::PolicyDecision::new(decision.policy_state, decision.routing_decision, reason);
+    if let Some(transition) = policy_transition_override {
+        decision = transition.decision(decision.routing_decision);
     }
     let controller_surface_action = if intervention_mode.interventions_enabled() {
         match decision.routing_decision {
@@ -3347,11 +3347,7 @@ fn handle_connection(
                         &runtime.event_log,
                         &policy::policy_changed_event(session.session_id, request_id, &transition),
                     )?;
-                    let blocked_decision = policy::PolicyDecision::new(
-                        transition.to,
-                        action.routing_decision(),
-                        transition.reason.clone(),
-                    );
+                    let blocked_decision = transition.decision(action.routing_decision());
                     write_debug(
                         runtime,
                         "surface_action_selected",
@@ -3430,7 +3426,8 @@ fn handle_connection(
         trusted_ingress_softening_reason
             .clone()
             .unwrap_or_else(|| decision.reason.clone()),
-    );
+    )
+    .with_persistence(decision.persistence);
     let surface_requested_intervention =
         !matches!(&candidate_surface_action, SurfaceAction::ProtectedUpstream);
     write_debug(
@@ -3475,11 +3472,7 @@ fn handle_connection(
             &runtime.event_log,
             &policy::policy_changed_event(session.session_id, request_id, &transition),
         )?;
-        let blocked_decision = policy::PolicyDecision::new(
-            transition.to,
-            RoutingDecision::EidolonOwned,
-            transition.reason.clone(),
-        );
+        let blocked_decision = transition.decision(RoutingDecision::EidolonOwned);
         let blocked_response = surface_text_response(403, "blocked by eidolon policy\n");
         let blocked_surface_action = SurfaceAction::EidolonOwned {
             response: blocked_response.clone(),
@@ -3581,15 +3574,7 @@ fn handle_connection(
                 mint_status,
                 None | Some(BaitHeaderValueMintStatus::MatchedSessionValue)
             );
-            effective_decision = policy::PolicyDecision::new(
-                decision.policy_state,
-                RoutingDecision::EidolonOwned,
-                if proof_accepted {
-                    "bait-derived decoy action intercepted before protected upstream"
-                } else {
-                    "rejected bait proof failed closed before protected upstream"
-                },
-            );
+            effective_decision = bait_action_interception_decision(&decision, proof_accepted);
             write_event(
                 &runtime.event_log,
                 &request_seen_event(
@@ -3690,13 +3675,14 @@ fn handle_connection(
                             &controlled_transition,
                         ),
                     )?;
-                    policy::PolicyDecision::new(
-                        controlled_transition.to,
-                        action.routing_decision(),
-                        controlled_transition.reason.clone(),
-                    )
+                    controlled_transition.decision(action.routing_decision())
                 } else {
-                    direct_surface_decision(transition.to, &action, transition.reason)
+                    direct_surface_decision(
+                        transition.to,
+                        &action,
+                        transition.reason,
+                        transition.persistence,
+                    )
                 };
                 write_event(
                     &runtime.event_log,
@@ -3806,8 +3792,12 @@ fn handle_connection(
                     reason: transition.reason.clone(),
                     response: response.clone(),
                 };
-                effective_decision =
-                    direct_surface_decision(transition.to, &action, transition.reason);
+                effective_decision = direct_surface_decision(
+                    transition.to,
+                    &action,
+                    transition.reason,
+                    transition.persistence,
+                );
                 return write_direct_response(DirectResponseContext {
                     client_stream,
                     runtime,
@@ -3891,11 +3881,7 @@ fn handle_connection(
                     &runtime.event_log,
                     &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
-                effective_decision = policy::PolicyDecision::new(
-                    transition.to,
-                    RoutingDecision::EidolonOwned,
-                    transition.reason.clone(),
-                );
+                effective_decision = transition.decision(RoutingDecision::EidolonOwned);
                 return write_direct_response(DirectResponseContext {
                     client_stream,
                     runtime,
@@ -3954,6 +3940,7 @@ fn handle_connection(
             decision.policy_state,
             &surface_action,
             decision.reason.clone(),
+            decision.persistence,
         );
         write_request_and_policy_events(
             runtime,
@@ -4019,6 +4006,7 @@ fn handle_connection(
         decision.policy_state,
         &surface_action,
         effective_decision.reason.clone(),
+        effective_decision.persistence,
     );
     write_event(
         &runtime.event_log,
@@ -4656,15 +4644,18 @@ fn upstream_request_decision(
     policy_state: PolicyState,
     surface_action: &SurfaceAction,
     default_reason: String,
+    persistence: PersistenceMetadata,
 ) -> policy::PolicyDecision {
-    match surface_action {
+    let decision = match surface_action {
         SurfaceAction::RewrittenUpstream { .. } => policy::PolicyDecision::new(
             policy_state,
             RoutingDecision::ProtectedUpstream,
             "surface controller requested upstream response rewrite; request forwarded to protected upstream before rewrite outcome",
         ),
         _ => policy::PolicyDecision::protected_upstream(policy_state, default_reason),
-    }
+    };
+
+    decision.with_persistence(persistence)
 }
 
 fn write_bait_exposed_event(
@@ -4946,8 +4937,9 @@ fn direct_surface_decision(
     policy_state: PolicyState,
     action: &SurfaceAction,
     default_reason: String,
+    persistence: PersistenceMetadata,
 ) -> policy::PolicyDecision {
-    match action {
+    let decision = match action {
         SurfaceAction::ProtectedUpstream => {
             policy::PolicyDecision::protected_upstream(policy_state, default_reason)
         }
@@ -4972,7 +4964,25 @@ fn direct_surface_decision(
             RoutingDecision::RewrittenUpstream,
             "surface controller requested upstream response rewrite",
         ),
-    }
+    };
+
+    decision.with_persistence(persistence)
+}
+
+fn bait_action_interception_decision(
+    decision: &policy::PolicyDecision,
+    proof_accepted: bool,
+) -> policy::PolicyDecision {
+    policy::PolicyDecision::new(
+        decision.policy_state,
+        RoutingDecision::EidolonOwned,
+        if proof_accepted {
+            "bait-derived decoy action intercepted before protected upstream"
+        } else {
+            "rejected bait proof failed closed before protected upstream"
+        },
+    )
+    .with_persistence(decision.persistence)
 }
 
 fn surface_text_response(status: u16, body: impl Into<Vec<u8>>) -> SurfaceResponse {
@@ -5368,6 +5378,7 @@ fn request_seen_event(
             routing_decision: decision.routing_decision,
         },
     )
+    .with_persistence(decision.persistence)
     .with_request_id(request_id)
 }
 
@@ -12036,9 +12047,10 @@ mod tests {
         assert!(policy_changes[1]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_rate_limit_threshold=5")));
-        assert!(policy_changes[1]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+        assert_eq!(
+            policy_changes[1]["persistence"]["pre_containment_persistence_class"],
+            "discovery_recon"
+        );
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -12168,7 +12180,6 @@ mod tests {
             request_events[2]["kind"]["discovery_recon_score"]["threshold"],
             5
         );
-
         let policy_changes = events_of_type(&event_log_path, "policy_changed");
         assert_eq!(policy_changes.len(), 3);
         assert_eq!(policy_changes[2]["kind"]["from"], "rate_limited");
@@ -12205,12 +12216,14 @@ mod tests {
         assert!(policy_changes[2]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_block_threshold=5")));
-        assert!(policy_changes[2]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
-        assert!(policy_changes[2]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_kind=discovery_recon_retry")));
+        assert_eq!(
+            policy_changes[2]["persistence"]["pre_containment_persistence_class"],
+            "discovery_recon"
+        );
+        assert_eq!(
+            policy_changes[2]["persistence"]["pre_containment_persistence_kind"],
+            "discovery_recon_retry"
+        );
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -12267,12 +12280,6 @@ mod tests {
         assert!(surface_debugs[2]["fields"]["policy_reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("detection_score=2")));
-        assert!(surface_debugs[2]["fields"]["policy_reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
-        assert!(surface_debugs[2]["fields"]["policy_reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_kind=discovery_recon_retry")));
         assert_eq!(
             surface_debugs[2]["fields"]["surface_action"]["type"],
             "eidolon_owned"
@@ -12896,9 +12903,10 @@ mod tests {
         assert!(policy_changes[1]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_rate_limit_threshold=5")));
-        assert!(policy_changes[1]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+        assert_eq!(
+            policy_changes[1]["persistence"]["pre_containment_persistence_class"],
+            "discovery_recon"
+        );
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -13082,9 +13090,10 @@ mod tests {
         assert!(policy_changes[1]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_rate_limit_threshold=5")));
-        assert!(policy_changes[1]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=discovery_recon")));
+        assert_eq!(
+            policy_changes[1]["persistence"]["pre_containment_persistence_class"],
+            "discovery_recon"
+        );
 
         assert_event_type_absent(&event_log_path, "bait_action_observed");
 
@@ -13711,12 +13720,14 @@ mod tests {
         assert!(policy_changes[2]["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("recon_score=5")));
-        assert!(policy_changes[2]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_kind=write_recon_retry")));
-        assert!(policy_changes[2]["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=write_recon")));
+        assert_eq!(
+            policy_changes[2]["persistence"]["pre_containment_persistence_class"],
+            "write_recon"
+        );
+        assert_eq!(
+            policy_changes[2]["persistence"]["pre_containment_persistence_kind"],
+            "write_recon_retry"
+        );
 
         assert_event_type_absent(&event_log_path, "bait_action_observed");
 
@@ -13938,7 +13949,7 @@ mod tests {
         assert_eq!(surface_debugs[2]["fields"]["policy_state"], "blocked");
         assert_eq!(
             surface_debugs[2]["fields"]["policy_reason"],
-            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5 persistence_class=discovery_recon persistence_kind=discovery_recon_retry"
+            "rate-limited discovery recon retry moved session to blocked: path=/docs actor_kind=agentic_browser vendor_score=35 discovery_requests=3 distinct_surfaces=2 query_seen=true legacy_openapi_query_seen=true linked_bait_surface_seen=false linked_bait_surface_classes=0 decoy_write_probe_seen=false decoy_write_probe_count=0 decoy_write_probe_path_classes=0 detection_count=0 repeated_discovery_score=2 query_score=1 legacy_openapi_query_score=2 linked_bait_surface_score=0 linked_bait_class_fanout_bonus=0 decoy_write_probe_score=0 decoy_write_probe_path_fanout_bonus=0 detection_score=0 recon_score=5 recon_block_threshold=5"
         );
         assert_eq!(
             surface_debugs[2]["fields"]["surface_action"]["type"],
@@ -17464,9 +17475,10 @@ mod tests {
             .is_some_and(|reason| reason.contains(
                 "suspicious same-bait near miss after exposure moved session to rate limited"
             )));
-        assert!(policy_changed["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("persistence_class=same_bait_near_miss")));
+        assert_eq!(
+            policy_changed["persistence"]["pre_containment_persistence_class"],
+            "same_bait_near_miss"
+        );
         let request_seen = events_of_type(&event_log_path, "request_seen")
             .into_iter()
             .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
@@ -18591,10 +18603,10 @@ mod tests {
         assert!(blocked_change["kind"]["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("depth=3")));
-        assert!(blocked_change["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason
-                .contains("post_containment_persistence_kind=controlled_reality_depth_limit")));
+        assert_eq!(
+            blocked_change["persistence"]["post_containment_persistence_kind"],
+            "controlled_reality_depth_limit"
+        );
 
         let blocked_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()
@@ -18721,10 +18733,10 @@ mod tests {
             .is_some_and(|reason| reason.contains(
                 "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked"
             )));
-        assert!(blocked_change["kind"]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason
-                .contains("post_containment_persistence_kind=controlled_reality_branch_escape")));
+        assert_eq!(
+            blocked_change["persistence"]["post_containment_persistence_kind"],
+            "controlled_reality_branch_escape"
+        );
 
         let blocked_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()
@@ -19193,6 +19205,25 @@ mod tests {
         );
         assert_eq!(redacted_event_target("/docs?"), "/docs?<redacted>");
         assert_eq!(redacted_event_target("/docs"), "/docs");
+    }
+
+    #[test]
+    fn rejected_bait_action_preserves_transition_persistence_metadata() {
+        let transition_decision = policy::PolicyDecision::new(
+            PolicyState::RateLimited,
+            RoutingDecision::RateLimited,
+            "suspicious write recon persistence moved session to rate limited",
+        )
+        .with_persistence(PersistenceMetadata::pre_containment(
+            eidolon_core::PreContainmentPersistenceClass::WriteRecon,
+        ));
+
+        let intercepted = bait_action_interception_decision(&transition_decision, false);
+
+        assert_eq!(intercepted.policy_state, PolicyState::RateLimited);
+        assert_eq!(intercepted.routing_decision, RoutingDecision::EidolonOwned);
+        assert_eq!(intercepted.persistence, transition_decision.persistence);
+        assert!(intercepted.reason.contains("rejected bait proof"));
     }
 
     #[test]
