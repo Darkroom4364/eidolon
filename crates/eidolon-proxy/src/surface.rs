@@ -96,11 +96,19 @@ impl SurfaceResponseMeta {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResponseCachePolicy {
+    #[default]
+    Preserve,
+    PrivateNoStore,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SurfaceResponse {
     pub status: u16,
     pub headers: Vec<SurfaceHeader>,
     pub body: Vec<u8>,
+    pub cache_policy: ResponseCachePolicy,
 }
 
 impl SurfaceResponse {
@@ -109,7 +117,13 @@ impl SurfaceResponse {
             status,
             headers,
             body: body.into(),
+            cache_policy: ResponseCachePolicy::Preserve,
         }
+    }
+
+    pub fn with_cache_policy(mut self, cache_policy: ResponseCachePolicy) -> Self {
+        self.cache_policy = cache_policy;
+        self
     }
 }
 
@@ -175,31 +189,41 @@ impl SurfaceController for ProtectedUpstreamController {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct RewritePlan {
     pub operation: Option<RewriteOperation>,
+    pub cache_policy: ResponseCachePolicy,
 }
 
 impl RewritePlan {
     pub fn html(insertion: HtmlInsertion) -> Self {
         Self {
             operation: Some(RewriteOperation::Html(insertion)),
+            cache_policy: ResponseCachePolicy::Preserve,
         }
     }
 
     pub fn robots_txt(appendix: RobotsTxtAppend) -> Self {
         Self {
             operation: Some(RewriteOperation::RobotsTxt(appendix)),
+            cache_policy: ResponseCachePolicy::Preserve,
         }
     }
 
     pub fn openapi_paths(insertions: Vec<OpenApiPathInsertion>) -> Self {
         Self {
             operation: Some(RewriteOperation::OpenApiPaths(insertions)),
+            cache_policy: ResponseCachePolicy::Preserve,
         }
     }
 
     pub fn json_fields(fields: Vec<JsonFieldInsertion>) -> Self {
         Self {
             operation: Some(RewriteOperation::JsonFields(fields)),
+            cache_policy: ResponseCachePolicy::Preserve,
         }
+    }
+
+    pub fn with_cache_policy(mut self, cache_policy: ResponseCachePolicy) -> Self {
+        self.cache_policy = cache_policy;
+        self
     }
 
     pub fn is_empty(&self) -> bool {

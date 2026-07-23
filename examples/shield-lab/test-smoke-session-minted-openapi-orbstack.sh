@@ -59,6 +59,21 @@ body_file=""
 cookie=""
 trace_header=""
 request_url=""
+proof_cache_control="${EIDOLON_TEST_PROOF_CACHE_CONTROL:-No-Store, PRIVATE}"
+proof_etag="${EIDOLON_TEST_PROOF_ETAG:-}"
+proof_last_modified="${EIDOLON_TEST_PROOF_LAST_MODIFIED:-}"
+
+write_proof_headers() {
+  printf 'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nCache-Control: %s\r\n' \
+    "$proof_cache_control" > "$headers_file"
+  if [[ -n "$proof_etag" ]]; then
+    printf 'ETag: %s\r\n' "$proof_etag" >> "$headers_file"
+  fi
+  if [[ -n "$proof_last_modified" ]]; then
+    printf 'Last-Modified: %s\r\n' "$proof_last_modified" >> "$headers_file"
+  fi
+  printf '\r\n' >> "$headers_file"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -97,26 +112,26 @@ done
 
 case "${method}|${request_url}|${cookie}" in
   "GET|http://127.0.0.1:31080/openapi.json|eidolon_session=11111111-1111-4111-8111-111111111111")
-    printf 'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
+    write_proof_headers
     cat > "$body_file" <<'BODY'
-{"openapi":"3.0.3","info":{"title":"Customer import recovery schema","version":"0.0.0-eidolon"},"paths":{"/api/v2/import/reconcile":{"post":{"parameters":[{"name":"X-OpenAPI-Trace","schema":{"example":"oapi_8d1c3e5add241c2b77c72180"}}]}}}}
+{"openapi":"3.0.3","info":{"title":"Customer import recovery schema","version":"0.0.0-eidolon"},"paths":{"/api/v2/import/reconcile":{"post":{"parameters":[{"name":"X-OpenAPI-Trace","schema":{"example":"oapi_w5ac7f6_8d1c3e5add241c2b77c72180"}}]}}}}
 BODY
     ;;
   "GET|http://127.0.0.1:31080/openapi.json|eidolon_session=22222222-2222-4222-8222-222222222222")
-    printf 'HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
+    write_proof_headers
     cat > "$body_file" <<'BODY'
-{"openapi":"3.0.3","info":{"title":"Customer import recovery schema","version":"0.0.0-eidolon"},"paths":{"/api/v2/import/reconcile":{"post":{"parameters":[{"name":"X-OpenAPI-Trace","schema":{"example":"oapi_37dfde370fb3c688eaeb145c"}}]}}}}
+{"openapi":"3.0.3","info":{"title":"Customer import recovery schema","version":"0.0.0-eidolon"},"paths":{"/api/v2/import/reconcile":{"post":{"parameters":[{"name":"X-OpenAPI-Trace","schema":{"example":"oapi_w5ac7f6_37dfde370fb3c688eaeb145c"}}]}}}}
 BODY
     ;;
   "POST|http://127.0.0.1:31080/api/v2/import/reconcile|eidolon_session=11111111-1111-4111-8111-111111111111")
-    [[ "$trace_header" == "oapi_8d1c3e5add241c2b77c72180" ]]
+    [[ "$trace_header" == "oapi_w5ac7f6_8d1c3e5add241c2b77c72180" ]]
     printf 'HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
     cat > "$body_file" <<'BODY'
 {"write_committed":false,"branch":"customer-import-repair"}
 BODY
     ;;
   "POST|http://127.0.0.1:31080/api/v2/import/reconcile|eidolon_session=22222222-2222-4222-8222-222222222222")
-    [[ "$trace_header" == "oapi_8d1c3e5add241c2b77c72180" ]]
+    [[ "$trace_header" == "oapi_w5ac7f6_8d1c3e5add241c2b77c72180" ]]
     printf 'HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
     cat > "$body_file" <<'BODY'
 {"status":"blocked","synthetic":true,"reason":"configured unsafe bait action failed closed","path":"/api/v2/import/reconcile"}
@@ -200,6 +215,70 @@ test_smoke_script_verifies_default_session_minted_openapi_bait() {
   rg -q 'cross-session replay stayed uncorrelated' <<<"$output"
 }
 
+assert_smoke_rejects_cache_headers() {
+  local cache_control="$1"
+  local etag="$2"
+  local last_modified="$3"
+  local expected="$4"
+  local temp_dir
+  local state_dir
+  local output
+
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+
+  if output="$(
+    EIDOLON_TEST_PROOF_CACHE_CONTROL="$cache_control" \
+      EIDOLON_TEST_PROOF_ETAG="$etag" \
+      EIDOLON_TEST_PROOF_LAST_MODIFIED="$last_modified" \
+      EIDOLON_SHIELD_SESSION_MINTED_OPENAPI_SESSION_A=11111111-1111-4111-8111-111111111111 \
+      EIDOLON_SHIELD_SESSION_MINTED_OPENAPI_SESSION_B=22222222-2222-4222-8222-222222222222 \
+      KUBECTL_BIN="$temp_dir/kubectl" \
+      CURL_BIN="$temp_dir/curl" \
+      EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      "$SMOKE_SCRIPT" 2>&1
+  )"; then
+    echo "expected OpenAPI smoke to reject unsafe proof cache headers" >&2
+    exit 1
+  fi
+
+  rg -q "$expected" <<<"$output"
+}
+
 test_smoke_script_verifies_default_session_minted_openapi_bait
+assert_smoke_rejects_cache_headers \
+  'private' \
+  '' \
+  '' \
+  'missing Cache-Control directive no-store'
+assert_smoke_rejects_cache_headers \
+  'no-store' \
+  '' \
+  '' \
+  'missing Cache-Control directive private'
+assert_smoke_rejects_cache_headers \
+  'private, no-store=3600' \
+  '' \
+  '' \
+  'missing Cache-Control directive no-store'
+assert_smoke_rejects_cache_headers \
+  'private=1, no-store' \
+  '' \
+  '' \
+  'missing Cache-Control directive private'
+assert_smoke_rejects_cache_headers \
+  'private, no-store' \
+  '"stale-proof"' \
+  '' \
+  'exposed a stale ETag or Last-Modified validator'
+assert_smoke_rejects_cache_headers \
+  'private, no-store' \
+  '' \
+  'Wed, 22 Jul 2026 10:00:00 GMT' \
+  'exposed a stale ETag or Last-Modified validator'
 
 printf 'shield-lab session-minted OpenAPI smoke checks passed\n'

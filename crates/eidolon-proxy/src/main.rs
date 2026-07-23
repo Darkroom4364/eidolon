@@ -33,8 +33,9 @@ use eidolon_proxy::{
     session::{self, SessionContext},
     session_auth::{enforcement_rank, SessionAuthority},
     surface::{
-        rewrite_response_body, HtmlInsertion, OpenApiPathInsertion, RewritePlan, SurfaceAction,
-        SurfaceController, SurfaceHeader, SurfaceRequestMeta, SurfaceResponse, SurfaceResponseMeta,
+        rewrite_response_body, HtmlInsertion, OpenApiPathInsertion, ResponseCachePolicy,
+        RewritePlan, SurfaceAction, SurfaceController, SurfaceHeader, SurfaceRequestMeta,
+        SurfaceResponse, SurfaceResponseMeta,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,7 @@ const DEFAULT_EVENT_LOG: &str = "/tmp/eidolon-events.jsonl";
 const DEFAULT_INTERVENTION_CONTROL: &str = "/tmp/eidolon-interventions.txt";
 const DEFAULT_POLICY_STATE: &str = "/tmp/eidolon-policy-state.json";
 const DEFAULT_TRUSTED_BAIT_SOFTEN_PREFIXES: &[&str] = &["/docs", "/openapi.json"];
+const SESSION_PROOF_CACHE_CONTROL: &str = "private, no-store";
 const DOCS_DISCOVERY_TARGET: &str = "/docs";
 const OPENAPI_DISCOVERY_TARGET: &str = "/openapi.json";
 const REJECTED_REQUEST_TARGET: &str = "/__eidolon_rejected_target__";
@@ -2476,11 +2478,13 @@ impl SurfaceController for M1DemoSurfaceController {
                 render_bait_for_session(bait, session_id, self.bait_signing_secret.as_deref())
                     .map_err(|error| invalid_data(error.to_string()))?;
 
+            let cache_policy = generated_openapi_cache_policy(&bait, &self.content.openapi);
             return Ok(SurfaceAction::RewrittenUpstream {
                 plan: RewritePlan::openapi_paths(vec![openapi_path_insertion_for_bait(
                     &bait,
                     &self.content.openapi,
-                )]),
+                )])
+                .with_cache_policy(cache_policy),
             });
         }
 
@@ -2676,7 +2680,7 @@ fn bait_surface_response(bait: &Bait, content: &BaitContentOverrides) -> Surface
         );
     }
 
-    match bait.bait_class {
+    let response = match bait.bait_class {
         BaitClass::Docs => SurfaceResponse::new(
             200,
             vec![SurfaceHeader::new(
@@ -2718,6 +2722,12 @@ fn bait_surface_response(bait: &Bait, content: &BaitContentOverrides) -> Surface
             javascript_for_bait(bait),
         ),
         BaitClass::OpenApi => surface_text_response(404, "openapi bait is exposed by rewrite\n"),
+    };
+
+    if bait.bait_class != BaitClass::OpenApi && bait.header_value_mint_audit().is_some() {
+        response.with_cache_policy(ResponseCachePolicy::PrivateNoStore)
+    } else {
+        response
     }
 }
 
@@ -2838,6 +2848,7 @@ fn owned_openapi_discovery_response(
     bait: &Bait,
     openapi: &OpenApiOperationOverride,
 ) -> SurfaceResponse {
+    let cache_policy = generated_openapi_cache_policy(bait, openapi);
     let insertion = openapi_path_insertion_for_bait(bait, openapi);
     let mut paths = Map::new();
     paths.insert(insertion.path, insertion.path_item);
@@ -2858,8 +2869,20 @@ fn owned_openapi_discovery_response(
                 "application/json; charset=utf-8",
             )],
             body,
-        ),
+        )
+        .with_cache_policy(cache_policy),
         Err(_) => surface_text_response(500, "failed to render owned openapi discovery response\n"),
+    }
+}
+
+fn generated_openapi_cache_policy(
+    bait: &Bait,
+    openapi: &OpenApiOperationOverride,
+) -> ResponseCachePolicy {
+    if openapi.path_item.is_none() && bait.header_value_mint_audit().is_some() {
+        ResponseCachePolicy::PrivateNoStore
+    } else {
+        ResponseCachePolicy::Preserve
     }
 }
 
@@ -2901,8 +2924,8 @@ fn default_openapi_reconcile_request_body() -> Value {
     })
 }
 
-fn is_success_status(status: u16) -> bool {
-    (200..300).contains(&status)
+fn is_rewriteable_response_status(status: u16) -> bool {
+    status == 200
 }
 
 fn handle_connection(
@@ -4020,7 +4043,18 @@ fn handle_connection(
         )?;
     }
 
-    let upstream_request = request.to_upstream_bytes(&runtime.upstream)?;
+    let upstream_cache_policy = match &surface_action {
+        SurfaceAction::RewrittenUpstream { plan } => plan.cache_policy,
+        _ => ResponseCachePolicy::Preserve,
+    };
+    let mut upstream_request_source = request.clone();
+    let stripped_cache_request_headers =
+        if upstream_cache_policy == ResponseCachePolicy::PrivateNoStore {
+            strip_session_proof_cache_request_headers(&mut upstream_request_source)
+        } else {
+            0
+        };
+    let upstream_request = upstream_request_source.to_upstream_bytes(&runtime.upstream)?;
     write_debug(
         runtime,
         "upstream_request_forwarding",
@@ -4031,6 +4065,7 @@ fn handle_connection(
             "query_present": debug_query_present(&path),
             "connect_addr": runtime.upstream.connect_addr.as_str(),
             "request_bytes": upstream_request.len(),
+            "session_proof_cache_request_headers_stripped": stripped_cache_request_headers,
         }),
     )?;
     let mut upstream_stream = connect_upstream(&runtime.upstream)?;
@@ -4052,7 +4087,7 @@ fn handle_connection(
     let mut pending_bait_exposure = None;
     if let SurfaceAction::RewrittenUpstream { plan } = surface_action {
         let meta = surface_response_meta(&response, &path);
-        if is_success_status(response.status) {
+        if is_rewriteable_response_status(response.status) {
             let outcome = rewrite_response_body(&meta, &response.body, &plan);
             write_debug(
                 runtime,
@@ -4069,6 +4104,7 @@ fn handle_connection(
                 }),
             )?;
             if outcome.is_rewritten() {
+                response.cache_policy = plan.cache_policy;
                 effective_decision = policy::PolicyDecision::new(
                     decision.policy_state,
                     RoutingDecision::RewrittenUpstream,
@@ -4100,7 +4136,7 @@ fn handle_connection(
                 "surface_rewrite_skipped",
                 Some(session.session_id),
                 json!({
-                    "reason": "non_success_upstream_response",
+                    "reason": "non_200_upstream_response",
                     "status": response.status,
                     "plan": debug_rewrite_plan(&plan),
                 }),
@@ -4108,7 +4144,7 @@ fn handle_connection(
             effective_decision = policy::PolicyDecision::new(
                 decision.policy_state,
                 RoutingDecision::ProtectedUpstream,
-                "surface controller skipped rewrite for non-success upstream response",
+                "surface controller skipped rewrite for non-200 upstream response",
             );
         }
     }
@@ -4846,6 +4882,25 @@ fn header_pairs(headers: &[HttpHeader]) -> impl Iterator<Item = (&str, &str)> {
         .map(|header| (header.name.as_str(), header.value.as_str()))
 }
 
+fn strip_session_proof_cache_request_headers(request: &mut HttpRequest) -> usize {
+    const CACHE_CONDITIONAL_AND_RANGE_HEADERS: &[&str] = &[
+        "If-Match",
+        "If-Modified-Since",
+        "If-None-Match",
+        "If-Range",
+        "If-Unmodified-Since",
+        "Range",
+    ];
+
+    let original_len = request.headers.len();
+    request.headers.retain(|header| {
+        !CACHE_CONDITIONAL_AND_RANGE_HEADERS
+            .iter()
+            .any(|name| header.name.eq_ignore_ascii_case(name))
+    });
+    original_len - request.headers.len()
+}
+
 fn surface_request_meta(request: &HttpRequest, path: &str) -> SurfaceRequestMeta {
     SurfaceRequestMeta::new(
         request.method.clone(),
@@ -4945,6 +5000,7 @@ fn surface_response_to_http(response: SurfaceResponse) -> HttpResponse {
             })
             .collect(),
         body: response.body,
+        cache_policy: response.cache_policy,
     }
 }
 
@@ -5406,6 +5462,70 @@ fn apply_response_headers(
     if let Some(set_cookie) = session.set_cookie_value() {
         response.append_header(session::SET_COOKIE_HEADER_NAME, set_cookie);
     }
+
+    apply_response_cache_policy(response);
+}
+
+fn apply_response_cache_policy(response: &mut HttpResponse) {
+    if response.cache_policy != ResponseCachePolicy::PrivateNoStore {
+        return;
+    }
+
+    for name in [
+        "Accept-Ranges",
+        "Age",
+        "CDN-Cache-Control",
+        "Cloudflare-CDN-Cache-Control",
+        "Content-Digest",
+        "Content-MD5",
+        "Content-Range",
+        "Digest",
+        "ETag",
+        "Expires",
+        "Last-Modified",
+        "Repr-Digest",
+        "Surrogate-Control",
+        "X-Accel-Expires",
+    ] {
+        response.remove_header(name);
+    }
+
+    response.set_header("Cache-Control", SESSION_PROOF_CACHE_CONTROL);
+    ensure_vary_cookie(response);
+}
+
+fn ensure_vary_cookie(response: &mut HttpResponse) {
+    let mut vary_tokens = Vec::new();
+    for value in response
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("vary"))
+        .map(|header| header.value.as_str())
+    {
+        for token in value
+            .split(',')
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            if token == "*" {
+                return;
+            }
+            if !vary_tokens
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(token))
+            {
+                vary_tokens.push(token.to_string());
+            }
+        }
+    }
+
+    if !vary_tokens
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("cookie"))
+    {
+        vary_tokens.push("Cookie".to_string());
+    }
+    response.set_header("Vary", vary_tokens.join(", "));
 }
 
 fn write_event(log: &Arc<Mutex<FileEventLogWriter>>, event: &Event) -> io::Result<()> {
@@ -5808,6 +5928,7 @@ struct HttpResponse {
     reason: String,
     headers: Vec<HttpHeader>,
     body: Vec<u8>,
+    cache_policy: ResponseCachePolicy,
 }
 
 impl HttpRequest {
@@ -6243,6 +6364,7 @@ fn parse_http_response_head(head: &[u8]) -> io::Result<HttpResponse> {
         reason: reason.to_string(),
         headers,
         body: Vec::new(),
+        cache_policy: ResponseCachePolicy::Preserve,
     })
 }
 
@@ -6919,6 +7041,31 @@ mod tests {
         }"##
     }
 
+    fn session_minted_openapi_profile_json() -> &'static str {
+        r##"{
+          "schema_version": 1,
+          "profile_id": "session_minted_openapi",
+          "baits": [
+            {
+              "id": "minted_openapi_trace",
+              "bait_class": "open_api",
+              "surface": "/openapi.json",
+              "surface_kind": "open_api",
+              "expected_action": {
+                "method": "POST",
+                "path": "/api/v2/import/reconcile",
+                "header_name": "X-OpenAPI-Trace",
+                "header_value_mint": {
+                  "kind": "session_hmac_sha256_v1",
+                  "prefix": "oapi",
+                  "proof_window_seconds": 60
+                }
+              }
+            }
+          ]
+        }"##
+    }
+
     fn alternate_write_probe_profile_json() -> &'static str {
         r##"{
           "schema_version": 1,
@@ -7340,6 +7487,17 @@ mod tests {
         .into_bytes()
     }
 
+    fn cacheable_json_response(status: u16, reason: &str, body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nCache-Control: public, max-age=3600\r\nCDN-Cache-Control: public, max-age=3600\r\nCloudflare-CDN-Cache-Control: public, max-age=3600\r\nSurrogate-Control: max-age=3600\r\nX-Accel-Expires: 3600\r\nETag: \"upstream-v1\"\r\nLast-Modified: Tue, 21 Jul 2026 10:00:00 GMT\r\nExpires: Tue, 21 Jul 2026 11:00:00 GMT\r\nContent-Digest: sha-256=:dGVzdA==:\r\nRepr-Digest: sha-256=:dGVzdA==:\r\nDigest: sha-256=dGVzdA==\r\nContent-MD5: dGVzdA==\r\nAge: 30\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 0-{}/{}\r\nVary: Accept-Encoding\r\nContent-Length: {}\r\n\r\n{}",
+            body.len().saturating_sub(1),
+            body.len(),
+            body.len(),
+            body
+        )
+        .into_bytes()
+    }
+
     fn html_rewrite_action(snippet: &str) -> SurfaceAction {
         SurfaceAction::RewrittenUpstream {
             plan: RewritePlan::html(HtmlInsertion::new(snippet)),
@@ -7437,6 +7595,38 @@ mod tests {
             .filter(|header| header.name.eq_ignore_ascii_case(name))
             .map(|header| header.value.as_str())
             .collect()
+    }
+
+    fn assert_session_proof_cache_safety(response: &HttpResponse) {
+        assert_eq!(
+            header_values(response, "cache-control"),
+            vec![SESSION_PROOF_CACHE_CONTROL]
+        );
+        for name in [
+            "accept-ranges",
+            "age",
+            "cdn-cache-control",
+            "cloudflare-cdn-cache-control",
+            "content-digest",
+            "content-md5",
+            "content-range",
+            "digest",
+            "etag",
+            "expires",
+            "last-modified",
+            "repr-digest",
+            "surrogate-control",
+            "x-accel-expires",
+        ] {
+            assert!(
+                header_values(response, name).is_empty(),
+                "proof response retained stale {name} metadata"
+            );
+        }
+        assert!(header_values(response, "vary")
+            .iter()
+            .flat_map(|value| value.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("cookie")));
     }
 
     #[test]
@@ -8296,6 +8486,75 @@ mod tests {
     }
 
     #[test]
+    fn proof_cache_policy_requires_generated_minted_content() {
+        let docs_path = write_bait_profile(session_minted_profile_json());
+        let docs_profile = load_bait_profile(&docs_path).expect("minted docs profile should load");
+        let docs_bait = docs_profile
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted docs bait should exist");
+        let rendered_docs =
+            render_bait_for_session(docs_bait, SessionId::new(), Some("mint-secret"))
+                .expect("minted docs bait should render");
+
+        let generated_docs =
+            bait_surface_response(&rendered_docs, &BaitContentOverrides::default());
+        assert_eq!(
+            generated_docs.cache_policy,
+            ResponseCachePolicy::PrivateNoStore
+        );
+
+        let overridden_docs = bait_surface_response(
+            &rendered_docs,
+            &BaitContentOverrides {
+                surfaces: HashMap::from([(
+                    rendered_docs.id.0.clone(),
+                    SurfaceContentOverride {
+                        status: Some(200),
+                        content_type: Some("text/plain".to_string()),
+                        body: "static override without a minted value".to_string(),
+                    },
+                )]),
+                ..BaitContentOverrides::default()
+            },
+        );
+        assert_eq!(overridden_docs.cache_policy, ResponseCachePolicy::Preserve);
+
+        let openapi_path = write_bait_profile(session_minted_openapi_profile_json());
+        let openapi_profile =
+            load_bait_profile(&openapi_path).expect("minted OpenAPI profile should load");
+        let openapi_bait = openapi_profile
+            .registry
+            .bait_for_surface("/openapi.json")
+            .expect("minted OpenAPI bait should exist");
+        let rendered_openapi =
+            render_bait_for_session(openapi_bait, SessionId::new(), Some("mint-secret"))
+                .expect("minted OpenAPI bait should render");
+        assert_eq!(
+            owned_openapi_discovery_response(
+                &rendered_openapi,
+                &OpenApiOperationOverride::default()
+            )
+            .cache_policy,
+            ResponseCachePolicy::PrivateNoStore
+        );
+
+        let static_openapi_override = OpenApiOperationOverride {
+            path_item: Some(json!({"post": {"summary": "static override"}})),
+            ..OpenApiOperationOverride::default()
+        };
+        assert_eq!(
+            owned_openapi_discovery_response(&rendered_openapi, &static_openapi_override)
+                .cache_policy,
+            ResponseCachePolicy::Preserve
+        );
+        assert_eq!(
+            generated_openapi_cache_policy(&rendered_openapi, &static_openapi_override),
+            ResponseCachePolicy::Preserve
+        );
+    }
+
+    #[test]
     fn javascript_bait_uses_json_escaped_values() {
         let bait = Bait {
             id: BaitId("js_escape".to_string()),
@@ -8468,6 +8727,9 @@ mod tests {
         assert_eq!(response_a.status, 200);
         assert_eq!(response_a_repeat.status, 200);
         assert_eq!(response_b.status, 200);
+        assert_session_proof_cache_safety(&response_a);
+        assert_session_proof_cache_safety(&response_a_repeat);
+        assert_session_proof_cache_safety(&response_b);
 
         let body_a = must_ok(String::from_utf8(response_a.body), "body should be utf8");
         let body_a_repeat = must_ok(
@@ -8526,6 +8788,146 @@ mod tests {
         );
         assert_eq!(exposure["kind"]["header_value_mint"]["prefix"], "minted");
         assert!(!exposure.to_string().contains(&header_value_a));
+    }
+
+    #[test]
+    fn runtime_session_minted_openapi_rewrite_is_private_no_store() {
+        let path = write_bait_profile(session_minted_openapi_profile_json());
+        let loaded = load_bait_profile(&path).expect("minted OpenAPI profile should load");
+        let event_log_path = unique_temp_path("session-minted-openapi-cache-events.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([cacheable_json_response(200, "OK", original)]);
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("session-minted-openapi-cache-control.txt"),
+            loaded,
+            Some(Arc::from("mint-secret")),
+        );
+        let cookie = cookie_header();
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/openapi.json",
+                &cookie,
+                &[
+                    ("If-Modified-Since", "Tue, 21 Jul 2026 10:00:00 GMT"),
+                    ("If-None-Match", "\"upstream-v1\""),
+                    ("If-Range", "\"upstream-v1\""),
+                    ("Range", "bytes=0-99"),
+                ],
+            ),
+        ));
+        let upstream_requests = upstream_recorder.finish();
+
+        assert_eq!(response.status, 200);
+        assert_session_proof_cache_safety(&response);
+        let vary = header_values(&response, "vary").join(",");
+        assert!(vary
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("accept-encoding")));
+        let document: Value =
+            serde_json::from_slice(&response.body).expect("rewritten OpenAPI should be JSON");
+        let minted_example = document["paths"]["/api/v2/import/reconcile"]["post"]["parameters"][0]
+            ["schema"]["example"]
+            .as_str()
+            .expect("rewritten OpenAPI should contain a minted example");
+        assert!(minted_example.starts_with("oapi_"));
+
+        assert_eq!(upstream_requests.len(), 1);
+        let forwarded = String::from_utf8_lossy(&upstream_requests[0]).to_ascii_lowercase();
+        for name in [
+            "if-modified-since:",
+            "if-none-match:",
+            "if-range:",
+            "range:",
+        ] {
+            assert!(
+                !forwarded.contains(name),
+                "proof rewrite forwarded cache request header {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_session_minted_openapi_refusal_preserves_upstream_cache_headers() {
+        let path = write_bait_profile(session_minted_openapi_profile_json());
+        let loaded = load_bait_profile(&path).expect("minted OpenAPI profile should load");
+        let event_log_path = unique_temp_path("session-minted-openapi-refusal-events.jsonl");
+        let original = r#"{"openapi": invalid"#;
+        let (upstream, upstream_handle) =
+            spawn_upstream(cacheable_json_response(200, "OK", original));
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("session-minted-openapi-refusal-control.txt"),
+            loaded,
+            Some(Arc::from("mint-secret")),
+        );
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/openapi.json")));
+        upstream_handle.join().expect("upstream thread should join");
+
+        assert_eq!(response.body, original.as_bytes());
+        assert_eq!(
+            header_values(&response, "cache-control"),
+            vec!["public, max-age=3600"]
+        );
+        assert_eq!(header_values(&response, "etag"), vec!["\"upstream-v1\""]);
+        assert_eq!(
+            header_values(&response, "last-modified"),
+            vec!["Tue, 21 Jul 2026 10:00:00 GMT"]
+        );
+        assert!(header_values(&response, "vary")
+            .iter()
+            .flat_map(|value| value.split(','))
+            .all(|token| !token.trim().eq_ignore_ascii_case("cookie")));
+        assert_event_type_absent(&event_log_path, "bait_exposed");
+    }
+
+    #[test]
+    fn runtime_session_minted_openapi_does_not_rewrite_partial_response() {
+        let path = write_bait_profile(session_minted_openapi_profile_json());
+        let loaded = load_bait_profile(&path).expect("minted OpenAPI profile should load");
+        let event_log_path = unique_temp_path("session-minted-openapi-partial-events.jsonl");
+        let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
+        let upstream_response = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: application/json\r\nCache-Control: public, max-age=3600\r\nETag: \"upstream-v1\"\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\n\r\n{}",
+            original.len() - 1,
+            original.len(),
+            original.len(),
+            original
+        )
+        .into_bytes();
+        let (upstream, upstream_handle) = spawn_upstream(upstream_response);
+        let runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("session-minted-openapi-partial-control.txt"),
+            loaded,
+            Some(Arc::from("mint-secret")),
+        );
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/openapi.json")));
+        upstream_handle.join().expect("upstream thread should join");
+
+        assert_eq!(response.status, 206);
+        assert_eq!(response.body, original.as_bytes());
+        assert_eq!(
+            header_values(&response, "cache-control"),
+            vec!["public, max-age=3600"]
+        );
+        let expected_content_range = format!("bytes 0-{}/{}", original.len() - 1, original.len());
+        assert_eq!(
+            header_values(&response, "content-range"),
+            vec![expected_content_range.as_str()]
+        );
+        assert_event_type_absent(&event_log_path, "bait_exposed");
     }
 
     #[test]
@@ -9712,6 +10114,7 @@ mod tests {
                 },
             ],
             body: b"ok".to_vec(),
+            cache_policy: ResponseCachePolicy::Preserve,
         };
 
         apply_response_headers(&mut response, &session, "GET");
@@ -9743,6 +10146,7 @@ mod tests {
                 value: "99".to_string(),
             }],
             body: Vec::new(),
+            cache_policy: ResponseCachePolicy::Preserve,
         };
         apply_response_headers(&mut head, &session, "HEAD");
         assert_eq!(header_values(&head, "content-length"), vec!["99"]);
@@ -9759,6 +10163,7 @@ mod tests {
                 value: "7".to_string(),
             }],
             body: b"ignored".to_vec(),
+            cache_policy: ResponseCachePolicy::Preserve,
         };
         apply_response_headers(&mut no_content, &session, "GET");
         assert!(header_values(&no_content, "content-length").is_empty());
@@ -10753,6 +11158,7 @@ mod tests {
                 value: "2".to_string(),
             }],
             body: b"ok".to_vec(),
+            cache_policy: ResponseCachePolicy::Preserve,
         };
 
         response.set_header("Connection", "close");
@@ -16353,6 +16759,7 @@ mod tests {
         let response =
             parse_downstream_response(&run_runtime_request(runtime, &get_request("/openapi.json")));
         must_join(upstream_handle.join(), "upstream thread should join");
+        assert!(header_values(&response, "cache-control").is_empty());
         let rewritten: Value = serde_json::from_slice(&response.body).unwrap();
 
         assert!(rewritten["paths"]["/api/v2/import/reconcile"].is_object());
@@ -16374,7 +16781,8 @@ mod tests {
     fn runtime_default_controller_does_not_rewrite_unknown_openapi_query() {
         let event_log_path = unique_temp_path("unknown-openapi-query-events.jsonl");
         let original = r#"{"openapi":"3.0.3","info":{"title":"demo","version":"0"},"paths":{}}"#;
-        let (upstream, upstream_handle) = spawn_upstream(json_response(original));
+        let (upstream, upstream_handle) =
+            spawn_upstream(cacheable_json_response(200, "OK", original));
         let runtime = test_runtime_with_m1_controller(
             upstream,
             &event_log_path,
@@ -16388,6 +16796,15 @@ mod tests {
         upstream_handle.join().expect("upstream thread should join");
 
         assert_eq!(response.body, original.as_bytes());
+        assert_eq!(
+            header_values(&response, "cache-control"),
+            vec!["public, max-age=3600"]
+        );
+        assert_eq!(header_values(&response, "etag"), vec!["\"upstream-v1\""]);
+        assert_eq!(
+            header_values(&response, "last-modified"),
+            vec!["Tue, 21 Jul 2026 10:00:00 GMT"]
+        );
         assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
         assert_event_routing(&event_log_path, "response_served", "protected_upstream");
         assert_event_type_absent(&event_log_path, "policy_decision");
@@ -16449,7 +16866,7 @@ mod tests {
         assert_eq!(response.status, 404);
         assert_eq!(response.body, original.as_bytes());
         assert_event_routing(&event_log_path, "request_seen", "protected_upstream");
-        assert_policy_decision_reason_contains(&event_log_path, "non-success upstream response");
+        assert_policy_decision_reason_contains(&event_log_path, "non-200 upstream response");
         assert_event_routing(&event_log_path, "response_served", "protected_upstream");
         assert_event_type_absent(&event_log_path, "bait_exposed");
     }
@@ -16477,6 +16894,7 @@ mod tests {
                 runtime.clone(),
                 &get_request(&bait.surface),
             ));
+            assert!(header_values(&response, "cache-control").is_empty());
             let body = String::from_utf8(response.body).expect("body should be utf8");
             let header_name = bait.expected_action.header_name.as_deref().unwrap();
             let header_value = bait.expected_action.header_value.as_deref().unwrap();
