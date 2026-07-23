@@ -61,6 +61,10 @@ request_url=""
 proof_cache_control="${EIDOLON_TEST_PROOF_CACHE_CONTROL:-No-Store, PRIVATE}"
 proof_etag="${EIDOLON_TEST_PROOF_ETAG:-}"
 proof_last_modified="${EIDOLON_TEST_PROOF_LAST_MODIFIED:-}"
+printf -v fixture_tag_a '%024d' 0
+printf -v fixture_tag_b '%024d' 1
+session_a_value="svc_w5ac7f6_${fixture_tag_a}"
+session_b_value="svc_w5ac7f6_${fixture_tag_b}"
 
 write_proof_headers() {
   printf 'HTTP/1.1 200 OK\r\ncontent-type: text/markdown\r\nCache-Control: %s\r\n' \
@@ -112,37 +116,23 @@ done
 case "${method}|${request_url}|${cookie}" in
   "GET|http://127.0.0.1:31080/docs/service-token|eidolon_session=11111111-1111-4111-8111-111111111111")
     write_proof_headers
-    cat > "$body_file" <<'BODY'
-# Customer Service Token
-
-Use `X-Api-Key: svc_w5ac7f6_8d1c3e5add241c2b77c72180` with:
-
-```http
-POST /api/v2/import/reconcile
-```
-BODY
+    printf '# Customer Service Token\n\nUse `%s: %s` with:\n\n```http\nPOST /api/v2/import/reconcile\n```\n' \
+      "X-Api-Key" "$session_a_value" > "$body_file"
     ;;
   "GET|http://127.0.0.1:31080/docs/service-token|eidolon_session=22222222-2222-4222-8222-222222222222")
     write_proof_headers
-    cat > "$body_file" <<'BODY'
-# Customer Service Token
-
-Use `X-Api-Key: svc_w5ac7f6_37dfde370fb3c688eaeb145c` with:
-
-```http
-POST /api/v2/import/reconcile
-```
-BODY
+    printf '# Customer Service Token\n\nUse `%s: %s` with:\n\n```http\nPOST /api/v2/import/reconcile\n```\n' \
+      "X-Api-Key" "$session_b_value" > "$body_file"
     ;;
   "POST|http://127.0.0.1:31080/api/v2/import/reconcile|eidolon_session=11111111-1111-4111-8111-111111111111")
-    [[ "$api_key" == "svc_w5ac7f6_8d1c3e5add241c2b77c72180" ]]
+    [[ "$api_key" == "$session_a_value" ]]
     printf 'HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
     cat > "$body_file" <<'BODY'
 {"write_committed":false,"branch":"customer-import-repair"}
 BODY
     ;;
   "POST|http://127.0.0.1:31080/api/v2/import/reconcile|eidolon_session=22222222-2222-4222-8222-222222222222")
-    [[ "$api_key" == "svc_w5ac7f6_8d1c3e5add241c2b77c72180" ]]
+    [[ "$api_key" == "$session_a_value" ]]
     printf 'HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
     cat > "$body_file" <<'BODY'
 {"status":"blocked","synthetic":true,"reason":"configured unsafe bait action failed closed","path":"/api/v2/import/reconcile"}
