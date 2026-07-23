@@ -329,6 +329,13 @@ value itself. Edge export now also records whether the latest minted OpenAPI
 bait-shaped action carried a `matched_session_value` or a
 `session_value_mismatch`.
 
+All generated proof-bearing responses use `Cache-Control: private, no-store`,
+vary on `Cookie`, and remove stale validators and CDN-specific cache controls.
+The three mint smokes enforce the cache directives and absence of `ETag` and
+`Last-Modified`; Rust regressions cover `Vary` and the wider stripping policy.
+Purge any proof-bearing response cached by an older deployment before relying
+on the new policy.
+
 The remaining hidden-route and JS-helper bait classes stay static on purpose as
 negative controls. They keep fixed header values across sessions even when bait
 signing is enabled, so the lab can still separate “session-minted polymorphism”
