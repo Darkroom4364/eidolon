@@ -138,8 +138,10 @@ requires one unambiguous Host authority, and stores only a fixed placeholder
 for rejected targets. Query components are fully redacted in events, reports,
 and edge exports. This does not make that parser a production boundary.
 
-Before any production-readiness claim, the request-spine work in `#197` must
-move ingress and upstream HTTP handling to Hyper/Tower. Keep-alive,
+The request-evaluation work in `#197` separates policy and routing evaluation
+from this transport loop; it does not turn the custom parser into a production
+boundary. Before any production-readiness claim, ingress and upstream HTTP
+handling still need a separate Hyper/Tower migration. Keep-alive,
 multiplexing, upgrades, and additional transfer codings must not be added to
 the custom parser. Until that replacement lands, the custom boundary remains
 limited to owned Lab traffic with connection caps, I/O deadlines, bounded
@@ -285,6 +287,26 @@ High-confidence bait-derived autonomous recon/action chain observed
 The policy router decides what happens next.
 
 The policy router consumes trace/scoring output and emits explicit state transitions with reasons. The proxy should treat policy state as input, not as hidden scoring logic.
+
+The runtime request evaluator exposes pure stages around that router:
+
+```text
+starting policy + normalized path + ingress appraisal + recon state
+  -> initial policy transitions + route plan
+
+surface, trust, proof, containment, and rewrite facts
+  -> follow-up transitions + audited routing decisions
+
+all stages
+  -> typed persistence metadata + score thresholds
+```
+
+The proxy remains responsible for applying and auditing returned transitions,
+collecting stateful facts, calling the surface controller, and performing
+network I/O. Policy, persistence, trust-softening, containment, and rewrite
+decision semantics stay in the evaluator. This keeps future signal weighting
+and ingress appraisal changes testable without adding more decision logic to
+the connection handler.
 
 Policy state values serialize in snake_case:
 

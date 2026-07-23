@@ -4,6 +4,7 @@ pub mod event_log;
 pub mod ingress_identity;
 pub mod policy;
 pub mod policy_store;
+pub mod request_evaluation;
 pub mod session;
 pub mod session_auth;
 pub mod surface;
