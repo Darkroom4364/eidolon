@@ -383,13 +383,12 @@ Status checklist:
 - [ ] Broaden the narrow hand-tuned transitions into a more general
   multi-signal aggregation plane
 - [x] Per-session signed polymorphic bait generation exists on `main`:
-  HMAC-minted bait values verify
-  deterministically, default OrbStack enables session-minted docs, OpenAPI,
-  and service-token surfaces, replay mismatches are audited and exported as
-  structured `matched_session_value` versus `session_value_mismatch`
-  outcomes, operator exports can filter by minted coverage and latest outcome,
-  and the remaining hidden-route and JS-helper bait classes stay static as
-  explicit negative controls
+  HMAC-minted bait values verify deterministically as expiring single-use
+  proofs, replay and mismatch outcomes remain audited and request-linked in
+  export, and generated proof responses are private, non-storable, and free of
+  stale validators or overriding CDN cache controls. Default OrbStack enables
+  session-minted docs, OpenAPI, and service-token surfaces, while hidden-route
+  and JS-helper classes remain static negative controls
   (`main`)
 - [ ] Expand deployment-safe allowlists and verified crawler handling beyond
   the current trusted-ingress slice; per-entry local allowlist

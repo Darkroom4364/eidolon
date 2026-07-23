@@ -2489,6 +2489,106 @@ mod tests {
     }
 
     #[test]
+    fn edge_decision_export_preserves_same_session_proof_replay() {
+        let session_id = SessionId::new();
+        let accepted_rid = RequestId::new();
+        let replay_rid = RequestId::new();
+        let mint = BaitHeaderValueMintAudit {
+            header_name: "X-Minted-Trace".to_string(),
+            kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+            prefix: "minted".to_string(),
+        };
+        let action_request = |request_id| {
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::RequestSeen {
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
+                    local_ingress_trust_scope_rejection: None,
+                    trusted_ingress_soften_match: None,
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::EidolonOwned,
+                },
+            )
+            .with_request_id(request_id)
+        };
+        let observed_action = |request_id, status| {
+            Event::new(
+                session_id,
+                EventSource::BaitEngine,
+                PolicyState::Observe,
+                EventKind::BaitActionObserved {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    exposure_id: Some(ExposureId("exp-minted".to_string())),
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    header_value_mint: Some(mint.clone()),
+                    header_value_mint_status: Some(status),
+                },
+            )
+            .with_request_id(request_id)
+        };
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    exposure_id: ExposureId("exp-minted".to_string()),
+                    surface: "/docs/minted-trace".to_string(),
+                    header_value_mint: Some(mint.clone()),
+                },
+            ),
+            action_request(accepted_rid),
+            observed_action(accepted_rid, BaitHeaderValueMintStatus::MatchedSessionValue),
+            action_request(replay_rid),
+            observed_action(replay_rid, BaitHeaderValueMintStatus::ReplaySeen),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+        let serialized = match serde_json::to_value(&export) {
+            Ok(value) => value,
+            Err(error) => panic!("edge decision export should serialize: {error}"),
+        };
+
+        assert_eq!(export.request.request_id, Some(replay_rid));
+        assert_eq!(export.evidence.request_linkage, EdgeRequestLinkage::Linked);
+        assert_eq!(
+            export
+                .evidence
+                .latest_bait_header_value_mint
+                .as_ref()
+                .map(|mint| mint.status),
+            Some(BaitHeaderValueMintStatus::ReplaySeen)
+        );
+        assert_eq!(
+            serialized["evidence"]["latest_bait_header_value_mint"]["status"],
+            serde_json::json!("replay_seen")
+        );
+        assert!(export
+            .evidence
+            .event_ids
+            .contains(&timeline.events[4].event.id));
+        assert!(
+            !export
+                .evidence
+                .event_ids
+                .contains(&timeline.events[2].event.id),
+            "the prior accepted action must not be joined to the replay request"
+        );
+    }
+
+    #[test]
     fn edge_decision_export_does_not_pair_bait_action_from_other_request_id() {
         let session_id = SessionId::new();
         let surface_rid = RequestId::new();

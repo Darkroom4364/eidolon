@@ -15,7 +15,7 @@ ACTION_PATH="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_ACTION_PATH:-/api/v2/
 EXPECTED_BAIT_ID="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_BAIT_ID:-rel_2025_04_b7f2}"
 HEADER_NAME="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_HEADER_NAME:-X-Migration-Trace}"
 HEADER_PREFIX="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_HEADER_PREFIX:-mig}"
-MINTED_VALUE_PATTERN="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_VALUE_PATTERN:-mig_[0-9a-f]+}"
+MINTED_VALUE_PATTERN="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_VALUE_PATTERN:-mig_w[0-9a-f]+_[0-9a-f]+}"
 LEGACY_STATIC_MARKER="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_LEGACY_STATIC_MARKER:-rel_2025_04_b7f2}"
 REPLAY_EXPECTED_HTTP_CODE="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_REPLAY_EXPECTED_HTTP_CODE:-403}"
 SESSION_A="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_SESSION_A:-}"
@@ -88,6 +88,56 @@ extract_minted_value() {
   printf '%s' "$value"
 }
 
+cache_control_has_bare_directive() {
+  local headers_file="$1"
+  local expected="$2"
+
+  awk -v expected="$expected" '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      colon = index(line, ":")
+      if (colon == 0) {
+        next
+      }
+
+      name = substr(line, 1, colon - 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      if (tolower(name) != "cache-control") {
+        next
+      }
+
+      value = substr(line, colon + 1)
+      directive_count = split(value, directives, ",")
+      for (i = 1; i <= directive_count; i++) {
+        directive = directives[i]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", directive)
+        if (index(directive, "=") == 0 && tolower(directive) == expected) {
+          found = 1
+        }
+      }
+    }
+    END {
+      exit found ? 0 : 1
+    }
+  ' "$headers_file"
+}
+
+assert_proof_response_cache_headers() {
+  local headers_file="$1"
+  local label="$2"
+  local directive
+
+  for directive in private no-store; do
+    cache_control_has_bare_directive "$headers_file" "$directive" \
+      || fail "$label response is missing bare Cache-Control directive $directive"
+  done
+
+  if grep -Eiq '^[[:space:]]*(etag|last-modified)[[:space:]]*:' "$headers_file"; then
+    fail "$label response exposed a stale ETag or Last-Modified validator"
+  fi
+}
+
 mint_session_cookie() {
   local headers value
 
@@ -152,6 +202,9 @@ edge_url="http://${EDGE_HOST}:${edge_node_port}"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/eidolon-session-minted-legacy-import.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 resolve_edge_export_bin
+if [[ -z "$SESSION_A" || -z "$SESSION_B" ]]; then
+  mint_session_cookie >/dev/null
+fi
 SESSION_A_COOKIE="$(resolve_session_cookie "$SESSION_A")"
 SESSION_A="$(session_uuid_from_cookie_value "$SESSION_A_COOKIE")"
 SESSION_B_COOKIE="$(resolve_session_cookie "$SESSION_B")"
@@ -188,6 +241,10 @@ curl_cmd -fsS \
   -o "$b1_body" \
   -H "Cookie: eidolon_session=${SESSION_B_COOKIE}" \
   "${edge_url}${SURFACE_PATH}"
+
+assert_proof_response_cache_headers "$a1_headers" "first session A legacy-import surface"
+assert_proof_response_cache_headers "$a2_headers" "repeated session A legacy-import surface"
+assert_proof_response_cache_headers "$b1_headers" "session B legacy-import surface"
 
 for body in "$a1_body" "$a2_body" "$b1_body"; do
   if grep -Fq "$LEGACY_STATIC_MARKER" "$body"; then
