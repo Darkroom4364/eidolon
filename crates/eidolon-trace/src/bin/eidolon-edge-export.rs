@@ -426,8 +426,9 @@ mod tests {
     #[test]
     fn selects_single_timeline_and_emits_export() {
         let session_id = SessionId::new();
+        let request_id = eidolon_core::RequestId::new();
         let path = write_events(&[
-            request_event(session_id, "/docs/legacy-import"),
+            request_event(session_id, "/docs/legacy-import").with_request_id(request_id),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -436,7 +437,8 @@ mod tests {
                     routing_decision: RoutingDecision::ProtectedUpstream,
                     reason: "trusted ingress identity suppressed bait surface intervention before runtime suspicion was established".to_string(),
                 },
-            ),
+            )
+            .with_request_id(request_id),
         ]);
         let events = must_ok(read_events_jsonl_file(&path), "events should parse");
         let timelines = build_session_timelines(events);

@@ -16,8 +16,8 @@ use std::{
 use eidolon_bait::{docs_for_bait, render_bait_for_session, BaitRegistry};
 use eidolon_core::{
     Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, DiscoveryReconScore, Event, EventKind,
-    EventSource, ExposureId, HeaderValueMint, PolicyState, RoutingDecision, SafeHeaderObservation,
-    SessionId, EVENT_SCHEMA_VERSION,
+    EventSource, ExposureId, HeaderValueMint, PolicyState, RequestId, RoutingDecision,
+    SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
 };
 use eidolon_proxy::{
     controlled_reality::{
@@ -26,11 +26,12 @@ use eidolon_proxy::{
         DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH, MAX_TARPIT_DELAY,
     },
     debug_log::FileDebugLogWriter,
-    event_log::FileEventLogWriter,
+    event_log::{read_jsonl_reconstruction, FileEventLogWriter},
     ingress_identity::{self, IngressIdentityResolver},
     policy::{self, InterventionMode},
     policy_store::PolicyStateStore,
     session::{self, SessionContext},
+    session_auth::{enforcement_rank, SessionAuthority},
     surface::{
         rewrite_response_body, HtmlInsertion, OpenApiPathInsertion, RewritePlan, SurfaceAction,
         SurfaceController, SurfaceHeader, SurfaceRequestMeta, SurfaceResponse, SurfaceResponseMeta,
@@ -158,6 +159,7 @@ struct ProxyConfig {
     debug_log_path: Option<PathBuf>,
     bait_profile_path: Option<PathBuf>,
     bait_signing_secret_path: Option<PathBuf>,
+    session_signing_key_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
     trusted_bait_soften_path_prefixes: Vec<String>,
@@ -240,6 +242,14 @@ impl CliAction {
                         &mut builder.bait_signing_secret_path,
                         flag,
                         parse_bait_signing_secret_path(&value)?,
+                    )?;
+                }
+                "--session-signing-key-file" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.session_signing_key_path,
+                        flag,
+                        parse_session_signing_key_path(&value)?,
                     )?;
                 }
                 "--ingress-trust-config" => {
@@ -335,6 +345,7 @@ struct ConfigBuilder {
     debug_log_path: Option<PathBuf>,
     bait_profile_path: Option<PathBuf>,
     bait_signing_secret_path: Option<PathBuf>,
+    session_signing_key_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
     trusted_bait_soften_path_prefixes: Vec<String>,
@@ -364,6 +375,7 @@ impl ConfigBuilder {
             debug_log_path: self.debug_log_path,
             bait_profile_path: self.bait_profile_path,
             bait_signing_secret_path: self.bait_signing_secret_path,
+            session_signing_key_path: self.session_signing_key_path,
             ingress_trust_config_path: self.ingress_trust_config_path,
             ingress_transport_auth_secret_path: self.ingress_transport_auth_secret_path,
             trusted_bait_soften_path_prefixes: if self.trusted_bait_soften_path_prefixes.is_empty()
@@ -670,6 +682,18 @@ fn parse_bait_signing_secret_path(raw: &str) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
+fn parse_session_signing_key_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = parse_file_path(raw, "session signing key")?;
+    if !path.is_file() {
+        return Err(ConfigError::new(format!(
+            "session signing key path must be an existing file: `{}`",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
 fn parse_ingress_trust_config_path(raw: &str) -> Result<PathBuf, ConfigError> {
     let path = parse_file_path(raw, "ingress trust config")?;
     if !path.is_file() {
@@ -923,8 +947,21 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         Some(path) => Some(Arc::new(Mutex::new(FileDebugLogWriter::open(path)?))),
         None => None,
     };
+    let (session_authority, session_signing_mode) = match &config.session_signing_key_path {
+        Some(path) => (
+            SessionAuthority::from_key_file_json(&fs::read(path)?)?,
+            "configured",
+        ),
+        None => (SessionAuthority::ephemeral(), "ephemeral"),
+    };
+    let session_signing_debug = json!({
+        "mode": session_signing_mode,
+        "active_key_version": session_authority.active_key_version(),
+        "key_version_count": session_authority.key_version_count(),
+    });
     let bait_exposures = BaitExposureStore::from_event_log(&config.event_log_path)?;
     let restored_bait_exposure_count = bait_exposures.len();
+    let restored_bait_exposure_torn_tail_line = bait_exposures.torn_tail_line;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -936,6 +973,10 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         now,
     )?;
     let restored_consumed_bait_proof_count = consumed_bait_proofs.consumed.len();
+    let restored_consumed_bait_proof_torn_tail_line = consumed_bait_proofs.torn_tail_line;
+    let policy_store = PolicyStateStore::open(&config.policy_state_path)?;
+    let policy_store_eviction = policy_store.last_eviction_stats();
+    let policy_store_session_count = policy_store.len();
     let runtime = ProxyRuntime {
         upstream: config.upstream,
         event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
@@ -943,9 +984,8 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         )?)),
         debug_log,
         intervention_control_path: config.intervention_control_path,
-        policy_store: Arc::new(Mutex::new(PolicyStateStore::open(
-            &config.policy_state_path,
-        )?)),
+        policy_store: Arc::new(Mutex::new(policy_store)),
+        session_authority: Arc::new(Mutex::new(session_authority)),
         controlled_reality_config: config.controlled_reality_config,
         controlled_reality: Arc::new(ControlledRealityResponder),
         surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
@@ -976,11 +1016,28 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
             },
             "bait_profile": bait_profile_debug,
             "bait_signing_enabled": bait_signing_secret.is_some(),
+            "session_signing": session_signing_debug,
             "restored_consumed_bait_proof_count": restored_consumed_bait_proof_count,
+            "restored_consumed_bait_proof_torn_tail_line": restored_consumed_bait_proof_torn_tail_line,
+            "event_log_bytes": std::fs::metadata(&config.event_log_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            "policy_state_bytes": std::fs::metadata(&config.policy_state_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
             "ingress_identity_rule_count": runtime.ingress_identity_resolver.len(),
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
             "trusted_bait_soften_path_prefixes": runtime.trusted_bait_soften_path_prefixes,
             "restored_bait_exposure_count": restored_bait_exposure_count,
+            "restored_bait_exposure_torn_tail_line": restored_bait_exposure_torn_tail_line,
+            "policy_store": {
+                "session_count": policy_store_session_count,
+                "ttl_evicted": policy_store_eviction.ttl_evicted,
+                "lru_evicted": policy_store_eviction.lru_evicted,
+                "protected_overflow": policy_store_eviction.protected_overflow,
+                "max_sessions": eidolon_proxy::policy_store::MAX_POLICY_SESSIONS,
+                "session_ttl_secs": eidolon_proxy::policy_store::POLICY_SESSION_TTL_SECS,
+            },
             "debug_log_visibility": "server_side_only",
         }),
     )?;
@@ -1015,6 +1072,7 @@ struct ProxyRuntime {
     debug_log: Option<Arc<Mutex<FileDebugLogWriter>>>,
     intervention_control_path: PathBuf,
     policy_store: Arc<Mutex<PolicyStateStore>>,
+    session_authority: Arc<Mutex<SessionAuthority>>,
     controlled_reality_config: ControlledRealityConfig,
     controlled_reality: Arc<ControlledRealityResponder>,
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
@@ -1032,11 +1090,13 @@ struct ProxyRuntime {
 struct BaitExposureStore {
     exposures: HashMap<(SessionId, BaitId), ExposureId>,
     exposure_order: VecDeque<(SessionId, BaitId)>,
+    torn_tail_line: Option<usize>,
 }
 
 #[derive(Debug, Default)]
 struct ConsumedBaitProofStore {
     consumed: HashMap<(SessionId, BaitId, String), u64>,
+    torn_tail_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1059,17 +1119,27 @@ impl ConsumedBaitProofStore {
             Err(error) => return Err(error),
         };
         let mut store = Self::default();
-        for (line_index, line) in BufReader::new(file).lines().enumerate() {
-            let line = line?;
+        let source = read_jsonl_reconstruction(BufReader::new(file))?;
+        for (line_index, line) in source.lines.iter().enumerate() {
+            let line_number = line_index + 1;
             if line.trim().is_empty() {
                 continue;
             }
-            let event: Event = serde_json::from_str(&line).map_err(|error| {
-                invalid_data(format!(
-                    "could not rebuild consumed bait proof store from event log line {}: {error}",
-                    line_index + 1
-                ))
-            })?;
+            let event: Event = match serde_json::from_str(line) {
+                Ok(event) => event,
+                Err(_error) if source.is_torn_tail(line_index) => {
+                    store.torn_tail_line = Some(line_number);
+                    eprintln!(
+                        "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    return Err(invalid_data(format!(
+                        "could not rebuild consumed bait proof store from event log line {line_number}: {error}"
+                    )))
+                }
+            };
             if event.schema_version != EVENT_SCHEMA_VERSION {
                 return Err(invalid_data(format!(
                     "could not rebuild consumed bait proof store from event log line {}: unsupported schema version {}",
@@ -1179,20 +1249,31 @@ impl BaitExposureStore {
     }
 
     fn from_event_log_reader(reader: impl BufRead) -> io::Result<Self> {
+        let source = read_jsonl_reconstruction(reader)?;
         let mut store = Self::default();
+        let mut torn_tail_line = None;
 
-        for (line_index, line) in reader.lines().enumerate() {
+        for (line_index, line) in source.lines.iter().enumerate() {
             let line_number = line_index + 1;
-            let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
 
-            let value: Value = serde_json::from_str(&line).map_err(|error| {
-                invalid_data(format!(
-                    "could not rebuild bait exposure store from event log line {line_number}: {error}"
-                ))
-            })?;
+            let value: Value = match serde_json::from_str(line) {
+                Ok(value) => value,
+                Err(_error) if source.is_torn_tail(line_index) => {
+                    torn_tail_line = Some(line_number);
+                    eprintln!(
+                        "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    return Err(invalid_data(format!(
+                        "could not rebuild bait exposure store from event log line {line_number}: {error}"
+                    )))
+                }
+            };
             let schema_version = value
                 .get("schema_version")
                 .and_then(Value::as_u64)
@@ -1223,6 +1304,7 @@ impl BaitExposureStore {
             }
         }
 
+        store.torn_tail_line = torn_tail_line;
         Ok(store)
     }
 
@@ -2198,10 +2280,33 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
     let path = normalized_event_path(&request)?;
     let surface_request = surface_request_meta(&request, &path);
+    let request_id = RequestId::new();
     let owns_configured_unsafe_bait_action =
         owns_configured_unsafe_bait_action(runtime, &surface_request);
-    let session = effective_session_context(runtime, &request, &surface_request, client_peer_ip);
+    let session = effective_session_context(
+        runtime,
+        &request,
+        &surface_request,
+        client_peer_ip,
+        request_id,
+    )?;
     let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
+    if let Some(floor) = session.enforcement_floor {
+        if enforcement_rank(floor) > enforcement_rank(policy_state) {
+            write_debug(
+                runtime,
+                "session_enforcement_floor_applied",
+                Some(session.session_id),
+                json!({
+                    "loaded_policy_state": policy_state,
+                    "enforcement_floor": floor,
+                }),
+            )?;
+            set_policy_state_for_session(runtime, session.session_id, floor)?;
+            policy_state = floor;
+        }
+    }
+    note_session_enforcement(runtime, client_peer_ip, session.session_id, policy_state);
     let starting_policy_state = policy_state;
     let mut policy_reason_override = None;
     let discovery_recon_state =
@@ -2230,7 +2335,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             set_policy_state_for_session(runtime, session.session_id, transition.to)?;
             write_event(
                 &runtime.event_log,
-                &policy::policy_changed_event(session.session_id, &transition),
+                &policy::policy_changed_event(session.session_id, request_id, &transition),
             )?;
             policy_state = transition.to;
         } else if let Some(transition) = policy::transition_to_suspicious_from_discovery_fanout(
@@ -2252,7 +2357,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             set_policy_state_for_session(runtime, session.session_id, transition.to)?;
             write_event(
                 &runtime.event_log,
-                &policy::policy_changed_event(session.session_id, &transition),
+                &policy::policy_changed_event(session.session_id, request_id, &transition),
             )?;
             policy_state = transition.to;
         } else if let Some(transition) =
@@ -2282,7 +2387,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             set_policy_state_for_session(runtime, session.session_id, transition.to)?;
             write_event(
                 &runtime.event_log,
-                &policy::policy_changed_event(session.session_id, &transition),
+                &policy::policy_changed_event(session.session_id, request_id, &transition),
             )?;
             policy_state = transition.to;
         }
@@ -2316,7 +2421,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
+                    &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
                 policy_state = transition.to;
@@ -2345,7 +2450,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
+                    &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
                 policy_reason_override = Some(transition.reason);
@@ -2443,6 +2548,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             session: &session,
             request: &request,
             path: &path,
+            request_id,
             decision: &decision,
             discovery_recon_score,
             discovery_recon_threshold,
@@ -2483,7 +2589,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                     write_event(
                         &runtime.event_log,
-                        &policy::policy_changed_event(session.session_id, &transition),
+                        &policy::policy_changed_event(session.session_id, request_id, &transition),
                     )?;
                     let blocked_decision = policy::PolicyDecision::new(
                         transition.to,
@@ -2518,6 +2624,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                         session: &session,
                         request: &request,
                         path: &path,
+                        request_id,
                         decision: &blocked_decision,
                         discovery_recon_score,
                         discovery_recon_threshold,
@@ -2594,6 +2701,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         &session,
         &request,
         &surface_request,
+        request_id,
         &effective_decision,
     )? {
         write_debug(
@@ -2609,7 +2717,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         set_policy_state_for_session(runtime, session.session_id, transition.to)?;
         write_event(
             &runtime.event_log,
-            &policy::policy_changed_event(session.session_id, &transition),
+            &policy::policy_changed_event(session.session_id, request_id, &transition),
         )?;
         let blocked_decision = policy::PolicyDecision::new(
             transition.to,
@@ -2645,6 +2753,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             session: &session,
             request: &request,
             path: &path,
+            request_id,
             decision: &blocked_decision,
             discovery_recon_score,
             discovery_recon_threshold,
@@ -2728,6 +2837,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     &request,
                     &path,
                     &session,
+                    request_id,
                     &effective_decision,
                     discovery_recon_score,
                     discovery_recon_threshold,
@@ -2736,6 +2846,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             let action_exposure_id = write_bait_action_observed_event(
                 runtime,
                 &session,
+                request_id,
                 decision.policy_state,
                 &action_match.bait,
                 &request.method,
@@ -2760,7 +2871,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             let mut response = if !proof_accepted {
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                    &policy::policy_intervention_event(
+                        session.session_id,
+                        request_id,
+                        &effective_decision,
+                    ),
                 )?;
                 surface_response_to_http(
                     runtime
@@ -2784,7 +2899,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
+                    &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 let (action, controlled_transition) = controlled_reality_action(
                     runtime,
@@ -2810,7 +2925,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     )?;
                     write_event(
                         &runtime.event_log,
-                        &policy::policy_changed_event(session.session_id, &controlled_transition),
+                        &policy::policy_changed_event(
+                            session.session_id,
+                            request_id,
+                            &controlled_transition,
+                        ),
                     )?;
                     policy::PolicyDecision::new(
                         controlled_transition.to,
@@ -2822,14 +2941,22 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 };
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                    &policy::policy_intervention_event(
+                        session.session_id,
+                        request_id,
+                        &effective_decision,
+                    ),
                 )?;
                 direct_surface_response(action)
                     .expect("controlled reality action should produce direct response")
             } else {
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_intervention_event(session.session_id, &effective_decision),
+                    &policy::policy_intervention_event(
+                        session.session_id,
+                        request_id,
+                        &effective_decision,
+                    ),
                 )?;
                 bait_action_synthetic_response()
             };
@@ -2838,6 +2965,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 &runtime.event_log,
                 &policy::response_audit_event(
                     session.session_id,
+                    request_id,
                     &effective_decision,
                     response.status,
                 ),
@@ -2873,6 +3001,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             let prior_same_bait_exposure = write_bait_action_near_miss_event(
                 runtime,
                 &session,
+                request_id,
                 decision.policy_state,
                 &action_shape_match.bait,
                 &request.method,
@@ -2910,7 +3039,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
+                    &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 let response =
                     rate_limited_response(runtime.controlled_reality_config.retry_after_seconds);
@@ -2926,6 +3055,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     session: &session,
                     request: &request,
                     path: &path,
+                    request_id,
                     decision: &effective_decision,
                     discovery_recon_score,
                     discovery_recon_threshold,
@@ -2960,6 +3090,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             let prior_same_bait_exposure = write_bait_action_near_miss_event(
                 runtime,
                 &session,
+                request_id,
                 decision.policy_state,
                 &action_shape_match.bait,
                 &request.method,
@@ -2999,7 +3130,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 set_policy_state_for_session(runtime, session.session_id, transition.to)?;
                 write_event(
                     &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, &transition),
+                    &policy::policy_changed_event(session.session_id, request_id, &transition),
                 )?;
                 effective_decision = policy::PolicyDecision::new(
                     transition.to,
@@ -3012,6 +3143,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                     session: &session,
                     request: &request,
                     path: &path,
+                    request_id,
                     decision: &effective_decision,
                     discovery_recon_score,
                     discovery_recon_threshold,
@@ -3046,6 +3178,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             session: &session,
             request: &request,
             path: &path,
+            request_id,
             decision: &rejected_decision,
             discovery_recon_score,
             discovery_recon_threshold,
@@ -3069,10 +3202,12 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 &request,
                 &path,
                 &session,
+                request_id,
                 &effective_decision,
                 discovery_recon_score,
                 discovery_recon_threshold,
             ),
+            request_id,
             &effective_decision,
             intervention_mode,
             surface_requested_intervention,
@@ -3087,6 +3222,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             write_bait_exposed_event(
                 runtime,
                 &session,
+                request_id,
                 decision.policy_state,
                 bait,
                 surface_request.path.clone(),
@@ -3094,7 +3230,12 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         }
         write_event(
             &runtime.event_log,
-            &policy::response_audit_event(session.session_id, &effective_decision, response.status),
+            &policy::response_audit_event(
+                session.session_id,
+                request_id,
+                &effective_decision,
+                response.status,
+            ),
         )?;
         write_debug(
             runtime,
@@ -3126,6 +3267,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             &request,
             &path,
             &session,
+            request_id,
             &upstream_request_decision,
             discovery_recon_score,
             discovery_recon_threshold,
@@ -3134,7 +3276,11 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     if intervention_mode == InterventionMode::Disabled {
         write_event(
             &runtime.event_log,
-            &policy::policy_intervention_event(session.session_id, &upstream_request_decision),
+            &policy::policy_intervention_event(
+                session.session_id,
+                request_id,
+                &upstream_request_decision,
+            ),
         )?;
     }
 
@@ -3235,15 +3381,27 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     if surface_requested_intervention {
         write_event(
             &runtime.event_log,
-            &policy::policy_intervention_event(session.session_id, &effective_decision),
+            &policy::policy_intervention_event(session.session_id, request_id, &effective_decision),
         )?;
     }
     if let Some((bait, surface)) = pending_bait_exposure {
-        write_bait_exposed_event(runtime, &session, decision.policy_state, &bait, surface)?;
+        write_bait_exposed_event(
+            runtime,
+            &session,
+            request_id,
+            decision.policy_state,
+            &bait,
+            surface,
+        )?;
     }
     write_event(
         &runtime.event_log,
-        &policy::response_audit_event(session.session_id, &effective_decision, response.status),
+        &policy::response_audit_event(
+            session.session_id,
+            request_id,
+            &effective_decision,
+            response.status,
+        ),
     )?;
     write_debug(
         runtime,
@@ -3300,6 +3458,7 @@ fn maybe_transition_to_blocked_from_reality_escape_attempt(
     session: &SessionContext,
     request: &HttpRequest,
     surface_request: &SurfaceRequestMeta,
+    request_id: RequestId,
     decision: &policy::PolicyDecision,
 ) -> io::Result<Option<policy::PolicyTransition>> {
     if decision.policy_state != PolicyState::ControlledReality {
@@ -3340,6 +3499,7 @@ fn maybe_transition_to_blocked_from_reality_escape_attempt(
         &runtime.event_log,
         &policy::reality_escape_attempt_event(
             session.session_id,
+            request_id,
             decision.policy_state,
             request.method.clone(),
             redacted_event_target(&surface_request.path),
@@ -3363,6 +3523,7 @@ struct DirectResponseContext<'a> {
     session: &'a SessionContext,
     request: &'a HttpRequest,
     path: &'a str,
+    request_id: RequestId,
     decision: &'a policy::PolicyDecision,
     discovery_recon_score: policy::DiscoveryReconAggregationScore,
     discovery_recon_threshold: u8,
@@ -3378,6 +3539,7 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
         session,
         request,
         path,
+        request_id,
         decision,
         discovery_recon_score,
         discovery_recon_threshold,
@@ -3392,10 +3554,12 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
             request,
             path,
             session,
+            request_id,
             decision,
             discovery_recon_score,
             discovery_recon_threshold,
         ),
+        request_id,
         decision,
         intervention_mode,
         surface_requested_intervention,
@@ -3405,13 +3569,14 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
     apply_response_headers(&mut response, session);
     write_event(
         &runtime.event_log,
-        &policy::response_audit_event(session.session_id, decision, response.status),
+        &policy::response_audit_event(session.session_id, request_id, decision, response.status),
     )?;
     write_debug(
         runtime,
         "response_served",
         Some(session.session_id),
         json!({
+            "request_id": request_id.0,
             "route": "direct_response",
             "decision": {
                 "policy_state": decision.policy_state,
@@ -3430,12 +3595,35 @@ fn policy_state_for_session(
     runtime: &ProxyRuntime,
     session_id: SessionId,
 ) -> io::Result<PolicyState> {
-    let store = runtime
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let mut store = runtime
         .policy_store
         .lock()
         .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+    store.note_session_seen(session_id, now_unix_secs);
 
     Ok(store.policy_state(session_id))
+}
+
+/// Best-effort enforcement-floor feedback for peer continuity. The policy
+/// store remains authoritative; a poisoned authority lock only weakens the
+/// rotation-abuse safety net for later requests, never current routing.
+fn note_session_enforcement(
+    runtime: &ProxyRuntime,
+    client_peer_ip: Option<IpAddr>,
+    session_id: SessionId,
+    policy_state: PolicyState,
+) {
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    if let Ok(mut authority) = runtime.session_authority.lock() {
+        authority.note_enforcement(client_peer_ip, session_id, policy_state, now_unix_secs);
+    }
 }
 
 fn set_policy_state_for_session(
@@ -3448,7 +3636,20 @@ fn set_policy_state_for_session(
         .lock()
         .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
 
-    store.set_policy_state(session_id, policy_state)
+    let result = store.set_policy_state(session_id, policy_state);
+    if let Err(error) = &result {
+        write_debug(
+            runtime,
+            "policy_persist_failed",
+            Some(session_id),
+            json!({
+                "policy_state": policy_state,
+                "error": error.to_string(),
+            }),
+        )?;
+    }
+
+    result
 }
 
 fn note_reality_escape_attempt_for_session(
@@ -3687,6 +3888,7 @@ fn upstream_request_decision(
 fn write_bait_exposed_event(
     runtime: &ProxyRuntime,
     session: &SessionContext,
+    request_id: RequestId,
     policy_state: PolicyState,
     bait: &Bait,
     surface: impl Into<String>,
@@ -3710,7 +3912,8 @@ fn write_bait_exposed_event(
                 surface: redacted_event_target(&surface),
                 header_value_mint: bait.header_value_mint_audit(),
             },
-        ),
+        )
+        .with_request_id(request_id),
     )?;
 
     exposures.record_exposure(session.session_id, bait.id.clone(), exposure_id.clone());
@@ -3719,6 +3922,7 @@ fn write_bait_exposed_event(
         "bait_exposed",
         Some(session.session_id),
         json!({
+            "request_id": request_id.0,
             "bait_id": &bait.id,
             "bait_class": bait.bait_class,
             "surface": debug_path(&bait.surface),
@@ -3755,6 +3959,7 @@ struct BaitActionObservation<'a> {
 fn write_bait_action_observed_event_with_exposure(
     runtime: &ProxyRuntime,
     session: &SessionContext,
+    request_id: RequestId,
     policy_state: PolicyState,
     observation: BaitActionObservation<'_>,
 ) -> io::Result<()> {
@@ -3781,7 +3986,8 @@ fn write_bait_action_observed_event_with_exposure(
                 header_value_mint: bait.header_value_mint_audit(),
                 header_value_mint_status,
             },
-        ),
+        )
+        .with_request_id(request_id),
     )?;
 
     write_debug(
@@ -3789,6 +3995,7 @@ fn write_bait_action_observed_event_with_exposure(
         "bait_action_observed",
         Some(session.session_id),
         json!({
+            "request_id": request_id.0,
             "bait_id": &bait.id,
             "method": method,
             "path": debug_path(path),
@@ -3800,9 +4007,15 @@ fn write_bait_action_observed_event_with_exposure(
     )
 }
 
+// Eight arguments are intrinsic to the audit payload (runtime, session,
+// request linkage, policy state, and the observed bait action shape); the
+// sibling with_exposure variant already uses the observation struct, so
+// packing these separately would only add an artificial partial-struct type.
+#[allow(clippy::too_many_arguments)]
 fn write_bait_action_observed_event(
     runtime: &ProxyRuntime,
     session: &SessionContext,
+    request_id: RequestId,
     policy_state: PolicyState,
     bait: &Bait,
     method: &str,
@@ -3821,6 +4034,7 @@ fn write_bait_action_observed_event(
     write_bait_action_observed_event_with_exposure(
         runtime,
         session,
+        request_id,
         policy_state,
         BaitActionObservation {
             bait,
@@ -3838,6 +4052,7 @@ fn write_bait_action_observed_event(
 fn write_bait_action_near_miss_event(
     runtime: &ProxyRuntime,
     session: &SessionContext,
+    request_id: RequestId,
     policy_state: PolicyState,
     bait: &Bait,
     method: &str,
@@ -3847,6 +4062,7 @@ fn write_bait_action_near_miss_event(
     write_bait_action_observed_event_with_exposure(
         runtime,
         session,
+        request_id,
         policy_state,
         BaitActionObservation {
             bait,
@@ -4026,6 +4242,7 @@ fn request_seen_event(
     request: &HttpRequest,
     path: &str,
     session: &SessionContext,
+    request_id: RequestId,
     decision: &policy::PolicyDecision,
     discovery_recon_score: policy::DiscoveryReconAggregationScore,
     discovery_recon_threshold: u8,
@@ -4054,11 +4271,13 @@ fn request_seen_event(
             routing_decision: decision.routing_decision,
         },
     )
+    .with_request_id(request_id)
 }
 
 fn write_request_and_policy_events(
     runtime: &ProxyRuntime,
     request_event: &Event,
+    request_id: RequestId,
     decision: &policy::PolicyDecision,
     intervention_mode: InterventionMode,
     surface_requested_intervention: bool,
@@ -4071,7 +4290,7 @@ fn write_request_and_policy_events(
     {
         write_event(
             &runtime.event_log,
-            &policy::policy_intervention_event(request_event.session_id, decision),
+            &policy::policy_intervention_event(request_event.session_id, request_id, decision),
         )?;
     }
 
@@ -4138,10 +4357,44 @@ fn effective_session_context(
     request: &HttpRequest,
     surface_request: &SurfaceRequestMeta,
     client_peer_ip: Option<IpAddr>,
-) -> SessionContext {
+    request_id: RequestId,
+) -> io::Result<SessionContext> {
     let headers: Vec<(&str, &str)> = header_pairs(&request.headers).collect();
     let request_host = effective_request_host(request);
-    let mut session = session::derive_session_from_headers(headers.iter().copied());
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let mut session = {
+        let mut authority = runtime
+            .session_authority
+            .lock()
+            .map_err(|_| io::Error::other("session authority lock poisoned"))?;
+        session::derive_session_from_headers(
+            &mut authority,
+            headers.iter().copied(),
+            client_peer_ip,
+            now_unix_secs,
+        )
+    };
+    write_debug(
+        runtime,
+        "session_resolved",
+        Some(session.session_id),
+        json!({
+            "request_id": request_id.0,
+            "session_source": match session.source {
+                session::SessionSource::Cookie => "cookie",
+                session::SessionSource::Generated => "generated",
+            },
+            "cookie_outcome": session.cookie_outcome.as_str(),
+            "key_status": session.key_status.map(|status| status.as_str()),
+            "presented_key_version": session.presented_key_version,
+            "active_key_version": session.active_key_version,
+            "continuity_outcome": session.continuity_outcome.as_str(),
+            "enforcement_floor": session.enforcement_floor,
+        }),
+    )?;
     session.ingress_identity = session::authenticated_ingress_identity_from_headers(
         headers.iter().copied(),
         runtime.ingress_transport_auth_secret.as_deref(),
@@ -4197,7 +4450,7 @@ fn effective_session_context(
         .map(|scope| scope.bait_soften_path_prefixes.clone());
     session.ingress_identity = merged_identity;
 
-    session
+    Ok(session)
 }
 
 fn trusted_ingress_soften_match(
@@ -5115,6 +5368,9 @@ Options:
   --bait-signing-secret-file <PATH>
                          Shared-secret file used to mint and verify
                          session-bound bait header values for mint-enabled profiles
+  --session-signing-key-file <PATH>
+                         JSON session signing key ring. When omitted, sessions are
+                         minted under an ephemeral key that changes on restart
   --ingress-trust-config <PATH>
                          JSON ingress trust config for local allowlists and trusted
                          automation claims
@@ -5302,6 +5558,7 @@ mod tests {
             debug_log: None,
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller,
@@ -5348,6 +5605,7 @@ mod tests {
             )))),
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
@@ -5381,6 +5639,7 @@ mod tests {
             debug_log: None,
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
@@ -5416,6 +5675,7 @@ mod tests {
             debug_log: None,
             intervention_control_path,
             policy_store: Arc::new(Mutex::new(PolicyStateStore::in_memory())),
+            session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
@@ -5615,8 +5875,7 @@ mod tests {
     }
 
     fn set_runtime_policy_state(runtime: &ProxyRuntime, cookie: &str, policy_state: PolicyState) {
-        let session_id =
-            session::session_id_from_cookie_header(cookie).expect("cookie should contain session");
+        let session_id = session_id_from_cookie(cookie).expect("cookie should contain session");
         set_policy_state_for_session(runtime, session_id, policy_state)
             .expect("policy state should set");
     }
@@ -5827,8 +6086,42 @@ mod tests {
         read_http_response(&mut &response[..]).expect("downstream response should parse")
     }
 
+    const TEST_SESSION_KEY: [u8; 32] = [0x5a; 32];
+
+    fn test_session_authority() -> SessionAuthority {
+        SessionAuthority::new(
+            vec![eidolon_proxy::session_auth::SessionKeyVersion {
+                version: 1,
+                key: TEST_SESSION_KEY,
+            }],
+            1,
+        )
+        .expect("test session authority should build")
+    }
+
+    fn now_unix_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default()
+    }
+
+    fn minted_cookie_value(session_id: SessionId) -> String {
+        test_session_authority().mint_cookie_value(session_id, now_unix_secs())
+    }
+
+    fn session_id_from_cookie(cookie: &str) -> Option<SessionId> {
+        let value = cookie.strip_prefix("eidolon_session=")?;
+        let mut parts = value.split('.');
+        parts.next()?;
+        parts.next()?;
+        parts.next()?;
+        let uuid = uuid::Uuid::parse_str(parts.next()?).ok()?;
+        Some(SessionId(uuid))
+    }
+
     fn cookie_header() -> String {
-        format!("eidolon_session={}", SessionId::new().0)
+        format!("eidolon_session={}", minted_cookie_value(SessionId::new()))
     }
 
     fn request_with_cookie(
@@ -6878,9 +7171,9 @@ mod tests {
             Some(Arc::clone(&signing_secret)),
         );
         let session_a = SessionId::new();
-        let cookie_a = format!("eidolon_session={}", session_a.0);
+        let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
         let session_b = SessionId::new();
-        let cookie_b = format!("eidolon_session={}", session_b.0);
+        let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
         let rendered_a = render_bait_for_session(&bait, session_a, Some(signing_secret.as_ref()))
             .expect("session A bait should render")
             .into_owned();
@@ -6993,7 +7286,7 @@ mod tests {
             .clone();
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
-        let cookie = format!("eidolon_session={}", session.0);
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session));
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -7056,7 +7349,7 @@ mod tests {
             .clone();
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
-        let cookie = format!("eidolon_session={}", session.0);
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session));
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -7119,7 +7412,7 @@ mod tests {
             .clone();
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
-        let cookie = format!("eidolon_session={}", session.0);
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session));
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -7203,7 +7496,7 @@ mod tests {
             .clone();
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
-        let cookie = format!("eidolon_session={}", session.0);
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -7272,9 +7565,9 @@ mod tests {
             Some(Arc::clone(&signing_secret)),
         );
         let session_a = SessionId::new();
-        let cookie_a = format!("eidolon_session={}", session_a.0);
+        let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
         let session_b = SessionId::new();
-        let cookie_b = format!("eidolon_session={}", session_b.0);
+        let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
         let rendered_a = render_bait_for_session(&bait, session_a, Some(signing_secret.as_ref()))
             .expect("session A bait should render")
             .into_owned();
@@ -7657,7 +7950,13 @@ mod tests {
 
     #[test]
     fn downstream_headers_remove_transfer_encoding_and_duplicate_singletons() {
-        let session = session::derive_session_from_headers([("Cookie", cookie_header())]);
+        let mut authority = test_session_authority();
+        let session = session::derive_session_from_headers(
+            &mut authority,
+            [("Cookie", cookie_header())],
+            None,
+            now_unix_secs(),
+        );
         let mut response = HttpResponse {
             version: "HTTP/1.1".to_string(),
             status: 200,
@@ -8010,6 +8309,66 @@ mod tests {
             "unsupported schema_version {}; expected {EVENT_SCHEMA_VERSION}",
             EVENT_SCHEMA_VERSION + 1
         )));
+    }
+
+    fn bait_exposed_jsonl_line(session_id: SessionId) -> String {
+        serde_json::to_string(&Event::new(
+            session_id,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId("torn-bait".to_string()),
+                exposure_id: ExposureId("torn-exposure".to_string()),
+                surface: "/docs".to_string(),
+                header_value_mint: None,
+            },
+        ))
+        .expect("event should serialize")
+    }
+
+    #[test]
+    fn torn_final_event_log_line_is_tolerated_and_reported() {
+        let session_id = SessionId::new();
+        let valid = bait_exposed_jsonl_line(session_id);
+        let truncated = "{\"schema_version\":2,\"id\":\"half-written";
+
+        let store =
+            BaitExposureStore::from_event_log_reader(Cursor::new(format!("{valid}\n{truncated}")))
+                .expect("crash-torn tail should be tolerated");
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.torn_tail_line, Some(2));
+    }
+
+    #[test]
+    fn mid_file_corruption_fails_reconstruction_loudly() {
+        let session_id = SessionId::new();
+        let valid = bait_exposed_jsonl_line(session_id);
+
+        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!(
+            "{{not json}}\n{valid}\n"
+        )))
+        .expect_err("mid-file corruption must fail");
+
+        assert!(error
+            .to_string()
+            .contains("could not rebuild bait exposure store from event log line 1"));
+    }
+
+    #[test]
+    fn truncated_final_line_with_trailing_newline_is_corruption_not_a_tear() {
+        let session_id = SessionId::new();
+        let valid = bait_exposed_jsonl_line(session_id);
+        let truncated = "{\"schema_version\":2,\"id\":\"half-written";
+
+        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!(
+            "{valid}\n{truncated}\n"
+        )))
+        .expect_err("corrupt final line with trailing newline must fail");
+
+        assert!(error
+            .to_string()
+            .contains("could not rebuild bait exposure store from event log line 2"));
     }
 
     #[test]
@@ -13959,7 +14318,7 @@ mod tests {
     fn runtime_correlates_bait_action_after_exposure_store_rebuild() {
         let event_log_path = unique_temp_path("rehydrated-bait-action-events.jsonl");
         let session_id = SessionId::new();
-        let cookie = format!("eidolon_session={}", session_id.0);
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session_id));
         let bait = BaitRegistry::m3_catalog()
             .bait_for_class(BaitClass::Docs)
             .expect("docs bait should exist")
@@ -14870,8 +15229,8 @@ mod tests {
         let secret: Arc<str> = Arc::from("mint-secret");
         let session_a = SessionId::new();
         let session_b = SessionId::new();
-        let cookie_a = format!("eidolon_session={}", session_a.0);
-        let cookie_b = format!("eidolon_session={}", session_b.0);
+        let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
+        let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -15498,6 +15857,213 @@ mod tests {
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
         assert_event_type_absent(&event_log_path, "bait_exposed");
+    }
+
+    #[test]
+    fn runtime_mints_one_request_id_per_request_and_stamps_every_event() {
+        let event_log_path = unique_temp_path("request-id-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("request-id-control.txt"),
+        );
+        let cookie = cookie_header();
+
+        let first = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        let second = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        assert_eq!(first.status, 200);
+        assert_eq!(second.status, 200);
+
+        let events = event_values(&event_log_path);
+        assert!(events.iter().all(|event| event["request_id"].is_string()));
+        let request_ids: std::collections::HashSet<&str> = events
+            .iter()
+            .filter_map(|event| event["request_id"].as_str())
+            .collect();
+        assert_eq!(
+            request_ids.len(),
+            2,
+            "each request must mint exactly one opaque request id"
+        );
+
+        let mut request_seen_count: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut response_served_count: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for event in &events {
+            let Some(request_id) = event["request_id"].as_str() else {
+                continue;
+            };
+            match event["kind"]["type"].as_str() {
+                Some("request_seen") => {
+                    *request_seen_count.entry(request_id).or_default() += 1;
+                }
+                Some("response_served") => {
+                    *response_served_count.entry(request_id).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+        for request_id in request_ids {
+            assert_eq!(
+                request_seen_count.get(request_id),
+                Some(&1),
+                "request {request_id} must have exactly one request_seen event"
+            );
+            assert_eq!(
+                response_served_count.get(request_id),
+                Some(&1),
+                "request {request_id} must have exactly one response_served event"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_request_id_events_round_trip_through_trace_reader() {
+        let event_log_path = unique_temp_path("request-id-reader-events.jsonl");
+        let runtime = test_runtime_with_m1_controller(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("request-id-reader-control.txt"),
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/docs/legacy-import", &cookie_header()),
+        ));
+        assert_eq!(response.status, 200);
+
+        let events = event_values(&event_log_path);
+        let first_request_id = events
+            .iter()
+            .find_map(|event| event["request_id"].as_str())
+            .expect("proxy must stamp a request id");
+        assert!(
+            uuid::Uuid::parse_str(first_request_id).is_ok(),
+            "request id must be an opaque UUID"
+        );
+        assert_ne!(
+            first_request_id, "00000000-0000-0000-0000-000000000000",
+            "request id must not encode meaningful data"
+        );
+    }
+
+    #[test]
+    fn runtime_forged_session_cookie_is_not_adopted() {
+        let event_log_path = unique_temp_path("forged-cookie-events.jsonl");
+        let debug_log_path = unique_temp_path("forged-cookie-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("forged-cookie-control.txt"),
+        );
+        let forged_uuid = SessionId::new().0;
+        let forged_cookie = format!(
+            "eidolon_session=v1.1.{}.{}.{}",
+            now_unix_secs(),
+            forged_uuid,
+            "0".repeat(64)
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie("/docs/legacy-import", &forged_cookie),
+        ));
+
+        let request_event = first_event_of_type(&event_log_path, "request_seen");
+        assert_ne!(
+            request_event["session_id"].as_str(),
+            Some(forged_uuid.to_string().as_str())
+        );
+        let set_cookie = response
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("set-cookie"))
+            .expect("forged cookie should be replaced with a minted one");
+        assert!(set_cookie.value.starts_with("eidolon_session=v1.1."));
+        assert!(!set_cookie.value.contains(&forged_uuid.to_string()));
+
+        let session_debug = first_debug_event(&debug_log_path, "session_resolved");
+        assert_eq!(session_debug["fields"]["cookie_outcome"], "bad_signature");
+        assert_eq!(session_debug["fields"]["continuity_outcome"], "no_record");
+    }
+
+    #[test]
+    fn runtime_rapid_cookie_rotation_cannot_reset_blocked_enforcement() {
+        let event_log_path = unique_temp_path("rotation-blocked-events.jsonl");
+        let debug_log_path = unique_temp_path("rotation-blocked-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            must_ok(
+                parse_upstream(DEFAULT_UPSTREAM, false),
+                "default upstream should parse",
+            ),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("rotation-blocked-control.txt"),
+        );
+        let cookie = cookie_header();
+        let session_id = session_id_from_cookie(&cookie).expect("cookie should parse");
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::Blocked);
+
+        let first = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/docs/legacy-import", &cookie),
+        ));
+        assert_eq!(first.status, 403);
+
+        // The attacker discards the cookie, presents a forged one, and rotates
+        // again; every request must stay blocked under the enforcement floor.
+        // A freshly proxy-minted cookie for an unseen session is not a
+        // realistic attacker capability (minting always flows through
+        // continuity recovery), so the rotation shapes here are discard,
+        // forgery, and malformed values.
+        let forged_cookie = format!(
+            "eidolon_session=v1.1.{}.{}.{}",
+            now_unix_secs(),
+            SessionId::new().0,
+            "1".repeat(64)
+        );
+        for attempt in 0..3 {
+            let request = match attempt {
+                0 => request_with_cookie("GET", "/docs/legacy-import", &forged_cookie, &[]),
+                1 => b"GET /docs/legacy-import HTTP/1.1\r\nHost: proxy.local\r\n\r\n".to_vec(),
+                _ => request_with_cookie(
+                    "GET",
+                    "/docs/legacy-import",
+                    "eidolon_session=rotated-garbage",
+                    &[],
+                ),
+            };
+            let response =
+                parse_downstream_response(&run_runtime_request(runtime.clone(), &request));
+            assert_eq!(response.status, 403, "attempt {attempt} must stay blocked");
+        }
+
+        assert_eq!(
+            policy_state_for_session(&runtime, session_id).expect("policy state should load"),
+            PolicyState::Blocked
+        );
+        let resolutions = debug_events(&debug_log_path, "session_resolved");
+        let recovered = resolutions
+            .iter()
+            .filter(|event| event["fields"]["continuity_outcome"] == "recovered")
+            .count();
+        let cooldown_limited = resolutions
+            .iter()
+            .filter(|event| event["fields"]["continuity_outcome"] == "cooldown_limited")
+            .count();
+        assert_eq!(recovered, 1);
+        assert_eq!(cooldown_limited, 2);
     }
 
     #[test]
