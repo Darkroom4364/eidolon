@@ -243,8 +243,8 @@ The current M5 slice is intentionally narrow:
   same-session, same-bait action near miss after prior exposure on
   `/api/v2/import/reconcile`; the unmatched bait-shaped action is preserved as
   evidence, but only already-suspicious sessions are throttled, and the
-  rate-limited reason now carries the shared pre-containment
-  `persistence_class`
+  rate-limited event now carries the shared typed pre-containment persistence
+  class
 - edge export now carries that same `pre_containment_persistence` family for
   rate-limited sessions too, with class-level detail like `discovery_recon`
   or `same_bait_near_miss`, so operators can group persistence before the
@@ -262,12 +262,12 @@ The current M5 slice is intentionally narrow:
   session once, keeping blocked rare and tied to explicit retry behavior
 - edge export now groups that pre-containment blocked path under the shared
   `pre_containment_persistence` reason-code family with the detail code
-  `same_bait_near_miss_retry`, and the proxy now stamps both the shared
-  `persistence_class` and the blocked-only `persistence_kind` directly into the
-  blocked reason instead of relying on export-side heuristics
+  `same_bait_near_miss_retry`, and the proxy stamps both the shared class and
+  blocked-only retry kind into event persistence metadata instead of reason
+  text
 - edge export now groups the adjacent recon-driven blocked retry under that
   same `pre_containment_persistence` family with the detail code
-  `discovery_recon_retry` from those same explicit reason markers
+  `discovery_recon_retry` from the same typed event metadata
 - the authenticated `detection_ids` contributor is now proven across both the
   `suspicious -> rate_limited` and `rate_limited -> blocked` discovery-recon
   rungs, so advisory detections now influence more than first-contact

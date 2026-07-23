@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use eidolon_core::{
     BaitHeaderValueMintAudit, BaitHeaderValueMintStatus, BaitId, EventKind, ExposureId,
-    PolicyState, RoutingDecision, Score, SessionId,
+    PersistenceMetadata, PolicyState, RoutingDecision, Score, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -115,6 +115,8 @@ pub struct PolicyEventEvidence {
     pub to_policy_state: Option<PolicyState>,
     pub status: Option<u16>,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "PersistenceMetadata::is_empty")]
+    pub persistence: PersistenceMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +288,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                 to_policy_state: None,
                 status: Some(*status),
                 reason: None,
+                persistence: timeline_event.event.persistence,
             }),
             EventKind::PolicyDecision {
                 routing_decision,
@@ -299,6 +302,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                 to_policy_state: None,
                 status: None,
                 reason: Some(reason.clone()),
+                persistence: timeline_event.event.persistence,
             }),
             EventKind::PolicyChanged { from, to, reason } => {
                 bundle.policy_events.push(PolicyEventEvidence {
@@ -310,6 +314,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     to_policy_state: Some(*to),
                     status: None,
                     reason: Some(reason.clone()),
+                    persistence: timeline_event.event.persistence,
                 });
             }
             EventKind::ControlledRealityEntered { reason } => {
@@ -322,6 +327,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     to_policy_state: None,
                     status: None,
                     reason: Some(reason.clone()),
+                    persistence: timeline_event.event.persistence,
                 });
             }
             EventKind::RateLimitApplied { reason } => {
@@ -334,6 +340,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     to_policy_state: None,
                     status: None,
                     reason: Some(reason.clone()),
+                    persistence: timeline_event.event.persistence,
                 });
             }
             EventKind::RealityEscapeAttempt {
@@ -350,6 +357,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                     to_policy_state: None,
                     status: None,
                     reason: Some(reason.clone()),
+                    persistence: timeline_event.event.persistence,
                 });
             }
             EventKind::RequestSeen { .. } => {}

@@ -20,15 +20,15 @@ write_fixture_state() {
 {"schema_version":2,"id":"66666666-6666-6666-6666-666666666666","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:02Z","source":"proxy","policy_state":"controlled_reality","kind":{"type":"response_served","status":202,"routing_decision":"controlled_reality"}}
 {"schema_version":2,"id":"77777777-7777-7777-7777-777777777777","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:06Z","source":"policy_router","policy_state":"controlled_reality","kind":{"type":"rate_limit_applied","reason":"controlled reality action depth 5 exceeded limit 4; tarpit delay 25ms"}}
 {"schema_version":2,"id":"88888888-8888-8888-8888-888888888888","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:06Z","source":"proxy","policy_state":"controlled_reality","kind":{"type":"response_served","status":429,"routing_decision":"rate_limited"}}
-{"schema_version":2,"id":"99999999-9999-9999-9999-999999999999","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:07Z","source":"policy_router","policy_state":"blocked","kind":{"type":"policy_changed","from":"controlled_reality","to":"blocked","reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4 post_containment_persistence_kind=controlled_reality_depth_limit"}}
+{"schema_version":2,"id":"99999999-9999-9999-9999-999999999999","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","persistence":{"post_containment_persistence_kind":"controlled_reality_depth_limit"},"observed_at":"2026-06-09T17:00:07Z","source":"policy_router","policy_state":"blocked","kind":{"type":"policy_changed","from":"controlled_reality","to":"blocked","reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4"}}
 {"schema_version":2,"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:07Z","source":"proxy","policy_state":"blocked","kind":{"type":"request_seen","method":"GET","path":"/api/v2/import/reconcile","safe_headers":[],"ingress_identity":{"source":"none","trust_tier":"none"},"routing_decision":"eidolon_owned"}}
-{"schema_version":2,"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:07Z","source":"policy_router","policy_state":"blocked","kind":{"type":"policy_decision","routing_decision":"eidolon_owned","reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4 post_containment_persistence_kind=controlled_reality_depth_limit"}}
+{"schema_version":2,"id":"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","persistence":{"post_containment_persistence_kind":"controlled_reality_depth_limit"},"observed_at":"2026-06-09T17:00:07Z","source":"policy_router","policy_state":"blocked","kind":{"type":"policy_decision","routing_decision":"eidolon_owned","reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4"}}
 {"schema_version":2,"id":"cccccccc-cccc-cccc-cccc-cccccccccccc","session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8","observed_at":"2026-06-09T17:00:07Z","source":"proxy","policy_state":"blocked","kind":{"type":"response_served","status":403,"routing_decision":"eidolon_owned"}}
 JSONL
 
   cat > "$dir/debug.jsonl" <<'JSONL'
-{"event":"controlled_reality_action_selected","fields":{"depth":6,"depth_limit":4,"tarpit_ms":25,"transition":{"from":"controlled_reality","to":"blocked","reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4 post_containment_persistence_kind=controlled_reality_depth_limit"},"action":{"type":"eidolon_owned","response_status":403}},"observed_at_unix_ms":1781014807000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8"}
-{"event":"surface_action_selected","fields":{"policy_state":"blocked","policy_routing_decision":"eidolon_owned","policy_reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4 post_containment_persistence_kind=controlled_reality_depth_limit","controller_surface_action":{"type":"eidolon_owned","response_status":403},"candidate_surface_action":{"type":"eidolon_owned","response_status":403},"surface_action":{"type":"eidolon_owned","response_status":403},"surface_requested_intervention":true,"trusted_bait_soften_path_prefixes":["/docs","/openapi.json"],"trusted_ingress_softened_surface":false,"trusted_ingress_softening_reason":null},"observed_at_unix_ms":1781014807001,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8"}
+{"event":"controlled_reality_action_selected","fields":{"depth":6,"depth_limit":4,"tarpit_ms":25,"transition":{"from":"controlled_reality","to":"blocked","reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4"},"action":{"type":"eidolon_owned","response_status":403}},"observed_at_unix_ms":1781014807000,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8"}
+{"event":"surface_action_selected","fields":{"policy_state":"blocked","policy_routing_decision":"eidolon_owned","policy_reason":"controlled-reality probe continued after depth-limit throttle and moved session to blocked: path=/api/v2/import/reconcile depth=6 depth_limit=4","controller_surface_action":{"type":"eidolon_owned","response_status":403},"candidate_surface_action":{"type":"eidolon_owned","response_status":403},"surface_action":{"type":"eidolon_owned","response_status":403},"surface_requested_intervention":true,"trusted_bait_soften_path_prefixes":["/docs","/openapi.json"],"trusted_ingress_softened_surface":false,"trusted_ingress_softening_reason":null},"observed_at_unix_ms":1781014807001,"run_kind":"eidolon_proxy_debug","schema_version":1,"session_id":"1f612f75-2ce8-4de0-9536-0e08df0b38a8"}
 JSONL
 }
 
@@ -125,7 +125,7 @@ case "$request_count" in
     cat > "$body_file" <<'HTML'
 # Customer Import Notes
 
-Use `X-Migration-Trace: rel_2025_04_b7f2` with:
+Use `X-Migration-Trace: mig_w5ac7f6_8d1c3e5add241c2b77c72180` with:
 
 ```http
 POST /api/v2/import/reconcile
@@ -136,7 +136,7 @@ HTML
     [[ "$method" == "POST" ]]
     [[ -n "$cookie_read" && -f "$cookie_read" ]]
     [[ -n "$cookie_write" ]]
-    [[ "$trace_header" == "rel_2025_04_b7f2" ]]
+    [[ "$trace_header" == "mig_w5ac7f6_8d1c3e5add241c2b77c72180" ]]
     [[ "$request_url" == "http://127.0.0.1:31080/api/v2/import/reconcile" ]]
     printf 'HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\n\r\n' > "$headers_file"
     printf '{"status":"queued","synthetic":true,"write_committed":false}\n' > "$body_file"

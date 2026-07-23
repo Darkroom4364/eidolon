@@ -316,9 +316,9 @@ Status checklist:
   and repeated blind write-target fanout persistence can now also hit that
   same blocked rung directly after the second distinct unsafe probe caused
   rate limiting
-  and the `suspicious -> rate_limited` rung now stamps a shared
-  `persistence_class` marker so the rate-limit and blocked transitions reuse
-  the same pre-containment persistence classifier
+  and the `suspicious -> rate_limited` rung now stamps shared typed persistence
+  metadata so the rate-limit and blocked transitions reuse the same
+  pre-containment classifier
   and edge export now surfaces that same shared family for rate-limited
   sessions with class-level detail before sessions ever hit the blocked rung
   and `EidolonEdgeDecisionExport.policy` now carries that pre-containment
@@ -329,13 +329,14 @@ Status checklist:
   downstream consumers to scrape `reason_codes`
   and edge export now distinguishes that direct blind write retry as
   `write_recon_retry` instead of the broader `discovery_recon_retry`
-  and those pre-containment blocked detail codes now come from an explicit
-  proxy-stamped `persistence_class` plus blocked-only `persistence_kind`
-  instead of report-side string heuristics
+  and those pre-containment blocked detail codes now come from explicit
+  proxy-stamped event metadata rather than report-side string heuristics
   and blocked post-containment exports now also carry a structured
   `post_containment_persistence_kind` field for branch-escape versus
   depth-limit persistence instead of forcing downstream consumers to scrape
   `reason_codes`
+  and runtime events, evidence bundles, reports, and edge exports now share
+  that typed persistence contract without parsing free-form reason text
   (`main`)
 - [x] First advisory-assisted aggregated suspicious-promotion path exists for
   medium-score query-bearing discovery plus authenticated detection IDs

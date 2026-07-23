@@ -79,10 +79,13 @@ Every event should include:
 - schema version
 - event id
 - session id
+- request id for request-derived events
 - timestamp
 - source component
 - current policy state
 - reason or correlation fields when applicable
+- typed persistence metadata when a rate-limit or blocked decision represents
+  pre-containment or post-containment persistence
 
 Request events should log method, path, selected safe header metadata,
 normalized ingress identity metadata, and routing decision. They should not log
@@ -90,6 +93,12 @@ request bodies or secrets by default.
 
 `policy_decision` records an audited routing decision without claiming the policy state changed. `policy_changed` is reserved for actual state transitions where `from` and `to` differ.
 `controlled_reality_entered` and `rate_limit_applied` are per-request enforcement markers, not policy-state transition events. `reality_escape_attempt` records a contained session requesting outside the configured controlled branch without logging request bodies or secret values.
+
+Persistence classification is carried in the event-level `persistence` object
+and copied unchanged through evidence, reports, and edge export. Free-form
+`reason` text is operator context only and is never parsed to create
+persistence semantics. Missing metadata on an older event remains unknown
+rather than being inferred.
 
 ## 1. Edge Boundary
 
