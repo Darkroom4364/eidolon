@@ -16,20 +16,21 @@ use std::{
 use eidolon_bait::{docs_for_bait, render_bait_for_session, BaitRegistry};
 use eidolon_core::{
     Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, DiscoveryReconScore, Event, EventKind,
-    EventSource, ExposureId, HeaderValueMint, PersistenceMetadata, PolicyState, RequestId,
-    RoutingDecision, SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
+    EventSource, ExposureId, HeaderValueMint, PolicyState, RequestId, RoutingDecision,
+    SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
 };
 use eidolon_proxy::{
     controlled_reality::{
-        is_unsafe_method, rate_limited_response, ControlledRealityConfig,
-        ControlledRealityResponder, DECOY_RECONCILE_PATH, DEFAULT_RETRY_AFTER_SECONDS,
-        DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH, MAX_TARPIT_DELAY,
+        rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
+        DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+        MAX_TARPIT_DELAY,
     },
     debug_log::FileDebugLogWriter,
     event_log::{read_jsonl_reconstruction, FileEventLogWriter, JsonlTailRepairOutcome},
     ingress_identity::{self, IngressIdentityResolver},
     policy::{self, InterventionMode},
     policy_store::PolicyStateStore,
+    request_evaluation::{self, RequestEvaluationInput, RequestPolicyFacts},
     session::{self, SessionContext},
     session_auth::{enforcement_rank, SessionAuthority},
     surface::{
@@ -2345,7 +2346,7 @@ fn validate_action_path(label: &str, value: &str) -> Result<(), ConfigError> {
             "{label} must be a canonical path-only value without a query string or fragment"
         )));
     }
-    let canonical = canonical_action_route_path(value).map_err(|reason| {
+    let canonical = request_evaluation::canonical_action_route_path(value).map_err(|reason| {
         ConfigError::new(format!(
             "{label} must be a canonical path-only value: {reason}"
         ))
@@ -2357,40 +2358,6 @@ fn validate_action_path(label: &str, value: &str) -> Result<(), ConfigError> {
     }
 
     Ok(())
-}
-
-fn canonical_action_route_path(target: &str) -> Result<String, &'static str> {
-    let raw_path_end = target
-        .char_indices()
-        .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index))
-        .unwrap_or(target.len());
-    let raw_path = &target[..raw_path_end];
-    let bytes = raw_path.as_bytes();
-    let mut canonical = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            canonical.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        if index + 2 >= bytes.len() {
-            return Err("percent escape is incomplete");
-        }
-        let high = hex_value(bytes[index + 1]).ok_or("percent escape is not hexadecimal")?;
-        let low = hex_value(bytes[index + 2]).ok_or("percent escape is not hexadecimal")?;
-        canonical.push((high << 4) | low);
-        index += 3;
-    }
-
-    let decoded =
-        String::from_utf8(canonical).map_err(|_| "percent escape decodes to invalid UTF-8")?;
-    let decoded_path_end = decoded
-        .char_indices()
-        .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index))
-        .unwrap_or(decoded.len());
-    Ok(decoded[..decoded_path_end].to_string())
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -2499,117 +2466,6 @@ fn is_openapi_discovery_request(request: &SurfaceRequestMeta, bait: &Bait) -> bo
             request.query.as_deref(),
             None | Some(LEGACY_IMPORT_OPENAPI_QUERY)
         )
-}
-
-fn is_legacy_openapi_discovery_query(request: &SurfaceRequestMeta) -> bool {
-    request.method == "GET"
-        && request.path == OPENAPI_DISCOVERY_TARGET
-        && request.query.as_deref() == Some(LEGACY_IMPORT_OPENAPI_QUERY)
-}
-
-fn linked_bait_surface_kind(
-    runtime: &ProxyRuntime,
-    request: &SurfaceRequestMeta,
-) -> Option<policy::LinkedBaitSurfaceKind> {
-    if request.method != "GET" {
-        return None;
-    }
-
-    runtime
-        .bait_registry
-        .baits()
-        .iter()
-        .find(|bait| bait.bait_class != BaitClass::OpenApi && bait.surface == request.path)
-        .map(|_| {
-            if request.path.starts_with("/docs/") {
-                policy::LinkedBaitSurfaceKind::Docs
-            } else if request.path.starts_with("/assets/") {
-                policy::LinkedBaitSurfaceKind::Assets
-            } else {
-                policy::LinkedBaitSurfaceKind::Other
-            }
-        })
-}
-
-fn is_blind_decoy_write_probe(
-    runtime: &ProxyRuntime,
-    session_id: SessionId,
-    request: &SurfaceRequestMeta,
-) -> bool {
-    blind_decoy_write_probe_path_kind(runtime, session_id, request).is_some()
-}
-
-fn blind_decoy_write_probe_path_kind(
-    runtime: &ProxyRuntime,
-    session_id: SessionId,
-    request: &SurfaceRequestMeta,
-) -> Option<policy::DecoyWriteProbePathKind> {
-    if !matches!(request.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
-        return None;
-    }
-
-    let headers: Vec<(&str, &str)> = surface_header_pairs(&request.headers).collect();
-    if runtime
-        .bait_registry
-        .match_action_for_session(
-            &request.method,
-            &request.path,
-            headers.iter().copied(),
-            session_id,
-            runtime.bait_signing_secret.as_deref(),
-        )
-        .ok()
-        .flatten()
-        .is_some()
-        || runtime
-            .bait_registry
-            .match_action_shape(&request.method, &request.path, headers.iter().copied())
-            .is_some()
-    {
-        return None;
-    }
-
-    runtime.bait_registry.baits().iter().find(|bait| {
-        bait.expected_action
-            .method
-            .eq_ignore_ascii_case(&request.method)
-            && bait.expected_action.path == request.path
-            && bait.expected_action.header_name.is_some()
-    })?;
-
-    Some(if request.path == DECOY_RECONCILE_PATH {
-        policy::DecoyWriteProbePathKind::Reconcile
-    } else {
-        policy::DecoyWriteProbePathKind::Other
-    })
-}
-
-fn is_aggregated_discovery_recon_candidate_request(
-    runtime: &ProxyRuntime,
-    session_id: SessionId,
-    request: &SurfaceRequestMeta,
-) -> bool {
-    discovery_surface_kind(runtime, request).is_some()
-        || linked_bait_surface_kind(runtime, request).is_some()
-        || is_blind_decoy_write_probe(runtime, session_id, request)
-}
-
-fn discovery_surface_kind(
-    runtime: &ProxyRuntime,
-    request: &SurfaceRequestMeta,
-) -> Option<policy::DiscoverySurfaceKind> {
-    if request.method != "GET" {
-        return None;
-    }
-    if request.path == DOCS_DISCOVERY_TARGET {
-        return Some(policy::DiscoverySurfaceKind::Docs);
-    }
-
-    runtime
-        .bait_registry
-        .bait_for_class(BaitClass::OpenApi)
-        .filter(|bait| is_openapi_discovery_request(request, bait))
-        .map(|_| policy::DiscoverySurfaceKind::OpenApi)
 }
 
 fn m3_docs_discovery_html(bait_registry: &BaitRegistry, content: &BaitContentOverrides) -> String {
@@ -3005,8 +2861,6 @@ fn handle_connection(
     };
     let surface_request = surface_request_meta(&request, &path);
     let request_id = RequestId::new();
-    let owns_configured_unsafe_bait_action =
-        owns_configured_unsafe_bait_action(runtime, &surface_request);
     let session = effective_session_context(
         runtime,
         &request,
@@ -3063,158 +2917,39 @@ fn handle_connection(
         }
     }
     note_session_enforcement(runtime, client_peer_ip, session.session_id, policy_state);
-    let starting_policy_state = policy_state;
-    let mut policy_transition_override = None;
-    let discovery_recon_state =
-        update_discovery_recon_state_for_request(runtime, session.session_id, &surface_request)?;
-    let discovery_recon_score =
-        policy::aggregated_discovery_recon_score(&session.ingress_signals, discovery_recon_state);
-    let mut discovery_recon_threshold = policy::discovery_recon_aggregation_score_threshold();
-    if intervention_mode.interventions_enabled() {
-        if let Some(transition) = policy::transition_to_suspicious_from_ingress_signals(
-            policy_state,
-            &surface_request.path,
-            &runtime.trusted_bait_soften_path_prefixes,
-            &session.ingress_identity,
-            &session.ingress_signals,
-        ) {
-            write_debug(
-                runtime,
-                "policy_transition_selected",
-                Some(session.session_id),
-                json!({
-                    "from": transition.from,
-                    "to": transition.to,
-                    "reason": transition.reason.as_str(),
-                }),
-            )?;
-            set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-            write_event(
-                &runtime.event_log,
-                &policy::policy_changed_event(session.session_id, request_id, &transition),
-            )?;
-            policy_state = transition.to;
-        } else if let Some(transition) = policy::transition_to_suspicious_from_discovery_fanout(
-            policy_state,
-            &surface_request.path,
-            &session.ingress_identity,
-            discovery_recon_state.fanout,
-        ) {
-            write_debug(
-                runtime,
-                "policy_transition_selected",
-                Some(session.session_id),
-                json!({
-                    "from": transition.from,
-                    "to": transition.to,
-                    "reason": transition.reason.as_str(),
-                }),
-            )?;
-            set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-            write_event(
-                &runtime.event_log,
-                &policy::policy_changed_event(session.session_id, request_id, &transition),
-            )?;
-            policy_state = transition.to;
-        } else if let Some(transition) =
-            policy::transition_to_suspicious_from_aggregated_discovery_recon(
-                policy_state,
-                &surface_request.path,
-                is_aggregated_discovery_recon_candidate_request(
-                    runtime,
-                    session.session_id,
-                    &surface_request,
-                ),
-                &session.ingress_identity,
-                &session.ingress_signals,
-                discovery_recon_state,
-            )
-        {
-            write_debug(
-                runtime,
-                "policy_transition_selected",
-                Some(session.session_id),
-                json!({
-                    "from": transition.from,
-                    "to": transition.to,
-                    "reason": transition.reason.as_str(),
-                }),
-            )?;
-            set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-            write_event(
-                &runtime.event_log,
-                &policy::policy_changed_event(session.session_id, request_id, &transition),
-            )?;
-            policy_state = transition.to;
-        }
-        if starting_policy_state == PolicyState::Suspicious {
-            if let Some(transition) =
-                policy::transition_to_rate_limited_from_suspicious_discovery_recon(
-                    policy_state,
-                    &surface_request.path,
-                    discovery_surface_kind(runtime, &surface_request).is_some(),
-                    blind_decoy_write_probe_path_kind(
-                        runtime,
-                        session.session_id,
-                        &surface_request,
-                    )
-                    .is_some(),
-                    &session.ingress_identity,
-                    &session.ingress_signals,
-                    discovery_recon_state,
-                )
-            {
-                write_debug(
-                    runtime,
-                    "policy_transition_selected",
-                    Some(session.session_id),
-                    json!({
-                        "from": transition.from,
-                        "to": transition.to,
-                        "reason": transition.reason.as_str(),
-                    }),
-                )?;
-                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-                write_event(
-                    &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, request_id, &transition),
-                )?;
-                discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
-                policy_transition_override = Some(transition.clone());
-                policy_state = transition.to;
-            }
-        } else if starting_policy_state == PolicyState::RateLimited {
-            if let Some(transition) = policy::transition_to_blocked_from_repeated_discovery_recon(
-                policy_state,
-                &surface_request.path,
-                discovery_surface_kind(runtime, &surface_request).is_some(),
-                blind_decoy_write_probe_path_kind(runtime, session.session_id, &surface_request)
-                    .is_some(),
-                &session.ingress_identity,
-                &session.ingress_signals,
-                discovery_recon_state,
-            ) {
-                write_debug(
-                    runtime,
-                    "policy_transition_selected",
-                    Some(session.session_id),
-                    json!({
-                        "from": transition.from,
-                        "to": transition.to,
-                        "reason": transition.reason.as_str(),
-                    }),
-                )?;
-                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-                write_event(
-                    &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, request_id, &transition),
-                )?;
-                discovery_recon_threshold = policy::discovery_recon_rate_limit_score_threshold();
-                policy_transition_override = Some(transition.clone());
-                policy_state = transition.to;
-            }
-        }
+    let request_facts =
+        request_evaluation::classify_request(request_evaluation::RequestClassificationInput {
+            bait_registry: &runtime.bait_registry,
+            request: &surface_request,
+            session_id: session.session_id,
+            bait_signing_secret: runtime.bait_signing_secret.as_deref(),
+            docs_discovery_target: DOCS_DISCOVERY_TARGET,
+            canonical_openapi_discovery_target: OPENAPI_DISCOVERY_TARGET,
+            legacy_openapi_query: LEGACY_IMPORT_OPENAPI_QUERY,
+        });
+    let discovery_recon_state = update_discovery_recon_state_for_request(
+        runtime,
+        session.session_id,
+        &surface_request,
+        request_facts,
+    )?;
+    let evaluation = request_evaluation::evaluate_request(RequestEvaluationInput {
+        starting_policy_state: policy_state,
+        intervention_mode,
+        path: &surface_request.path,
+        trusted_bait_soften_path_prefixes: &runtime.trusted_bait_soften_path_prefixes,
+        ingress_identity: &session.ingress_identity,
+        ingress_signals: &session.ingress_signals,
+        discovery_recon_state,
+        request_facts,
+    });
+    for transition in &evaluation.transitions {
+        apply_policy_transition(runtime, session.session_id, request_id, transition)?;
     }
+    policy_state = evaluation.decision.policy_state;
+    let discovery_recon_score = evaluation.discovery_recon_score;
+    let discovery_recon_threshold = evaluation.discovery_recon_threshold;
+    let decision = evaluation.decision;
     write_debug(
         runtime,
         "request_received",
@@ -3277,7 +3012,9 @@ fn handle_connection(
         }),
     )?;
 
-    if !intervention_mode.interventions_enabled() && owns_configured_unsafe_bait_action {
+    if !intervention_mode.interventions_enabled()
+        && request_facts.owns_configured_unsafe_bait_action
+    {
         let response = runtime
             .controlled_reality
             .fail_closed_bait_action_response(&surface_request);
@@ -3293,11 +3030,8 @@ fn handle_connection(
                 "response_body_len": response.body.len(),
             }),
         )?;
-        let decision = policy::PolicyDecision::new(
-            policy_state,
-            RoutingDecision::EidolonOwned,
-            "interventions disabled; configured unsafe bait action failed closed",
-        );
+        let decision =
+            request_evaluation::interventions_disabled_bait_action_decision(policy_state);
 
         return write_direct_response(DirectResponseContext {
             client_stream,
@@ -3315,121 +3049,103 @@ fn handle_connection(
         });
     }
 
-    let mut decision = policy::decide_for_state(policy_state, intervention_mode);
-    if let Some(transition) = policy_transition_override {
-        decision = transition.decision(decision.routing_decision);
-    }
-    let controller_surface_action = if intervention_mode.interventions_enabled() {
-        match decision.routing_decision {
-            RoutingDecision::ProtectedUpstream => runtime
-                .surface_controller
-                .decide(&surface_request, session.session_id)?,
-            RoutingDecision::ControlledReality => {
-                let (action, transition) = controlled_reality_action(
+    let controller_surface_action = match request_evaluation::initial_route_plan(
+        &decision,
+        intervention_mode,
+    ) {
+        request_evaluation::InitialRoutePlan::ProtectedUpstream => SurfaceAction::ProtectedUpstream,
+        request_evaluation::InitialRoutePlan::SurfaceController => runtime
+            .surface_controller
+            .decide(&surface_request, session.session_id)?,
+        request_evaluation::InitialRoutePlan::ControlledReality => {
+            let (action, transition) = controlled_reality_action(
+                runtime,
+                session.session_id,
+                &surface_request,
+                decision.reason.clone(),
+            )?;
+            if let Some(transition) = transition {
+                apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
+                let blocked_decision = transition.decision(action.routing_decision());
+                write_debug(
                     runtime,
-                    session.session_id,
-                    &surface_request,
-                    decision.reason.clone(),
+                    "surface_action_selected",
+                    Some(session.session_id),
+                    json!({
+                        "policy_state": blocked_decision.policy_state,
+                        "policy_routing_decision": blocked_decision.routing_decision,
+                        "policy_reason": blocked_decision.reason.as_str(),
+                        "controller_surface_action": debug_surface_action(&action),
+                        "candidate_surface_action": debug_surface_action(&action),
+                        "surface_action": debug_surface_action(&action),
+                        "surface_requested_intervention": true,
+                        "trusted_ingress_softened_surface": false,
+                        "trusted_ingress_softening_reason": Value::Null,
+                        "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
+                        "trusted_ingress_local_soften_path_prefixes":
+                            &session.trusted_bait_soften_path_prefixes,
+                    }),
                 )?;
-                if let Some(transition) = transition {
-                    write_debug(
-                        runtime,
-                        "policy_transition_selected",
-                        Some(session.session_id),
-                        json!({
-                            "from": transition.from,
-                            "to": transition.to,
-                            "reason": transition.reason.as_str(),
-                        }),
-                    )?;
-                    set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-                    write_event(
-                        &runtime.event_log,
-                        &policy::policy_changed_event(session.session_id, request_id, &transition),
-                    )?;
-                    let blocked_decision = transition.decision(action.routing_decision());
-                    write_debug(
-                        runtime,
-                        "surface_action_selected",
-                        Some(session.session_id),
-                        json!({
-                            "policy_state": blocked_decision.policy_state,
-                            "policy_routing_decision": blocked_decision.routing_decision,
-                            "policy_reason": blocked_decision.reason.as_str(),
-                            "controller_surface_action": debug_surface_action(&action),
-                            "candidate_surface_action": debug_surface_action(&action),
-                            "surface_action": debug_surface_action(&action),
-                            "surface_requested_intervention": true,
-                            "trusted_ingress_softened_surface": false,
-                            "trusted_ingress_softening_reason": Value::Null,
-                            "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
-                            "trusted_ingress_local_soften_path_prefixes":
-                                &session.trusted_bait_soften_path_prefixes,
-                        }),
-                    )?;
-                    let SurfaceAction::EidolonOwned { response } = action else {
-                        panic!("blocked controlled-reality action should be eidolon owned");
-                    };
-                    return write_direct_response(DirectResponseContext {
-                        client_stream,
-                        runtime,
-                        session: &session,
-                        request: &request,
-                        path: &path,
-                        request_id,
-                        decision: &blocked_decision,
-                        discovery_recon_score,
-                        discovery_recon_threshold,
-                        response,
-                        intervention_mode,
-                        surface_requested_intervention: true,
-                    });
-                }
-                action
+                let SurfaceAction::EidolonOwned { response } = action else {
+                    panic!("blocked controlled-reality action should be eidolon owned");
+                };
+                return write_direct_response(DirectResponseContext {
+                    client_stream,
+                    runtime,
+                    session: &session,
+                    request: &request,
+                    path: &path,
+                    request_id,
+                    decision: &blocked_decision,
+                    discovery_recon_score,
+                    discovery_recon_threshold,
+                    response,
+                    intervention_mode,
+                    surface_requested_intervention: true,
+                });
             }
-            RoutingDecision::RateLimited => SurfaceAction::RateLimited {
-                reason: decision.reason.clone(),
-                response: rate_limited_response(
-                    runtime.controlled_reality_config.retry_after_seconds,
-                ),
-            },
-            RoutingDecision::EidolonOwned => SurfaceAction::EidolonOwned {
-                response: surface_text_response(403, "blocked by eidolon policy\n"),
-            },
-            RoutingDecision::RewrittenUpstream => {
-                return Err(invalid_data(
-                    "policy requested rewritten upstream without a surface rewrite plan",
-                ));
-            }
+            action
         }
-    } else {
-        SurfaceAction::ProtectedUpstream
+        request_evaluation::InitialRoutePlan::RateLimited => SurfaceAction::RateLimited {
+            reason: decision.reason.clone(),
+            response: rate_limited_response(runtime.controlled_reality_config.retry_after_seconds),
+        },
+        request_evaluation::InitialRoutePlan::Blocked => SurfaceAction::EidolonOwned {
+            response: surface_text_response(403, "blocked by eidolon policy\n"),
+        },
+        request_evaluation::InitialRoutePlan::InvalidRewrittenUpstream => {
+            return Err(invalid_data(
+                "policy requested rewritten upstream without a surface rewrite plan",
+            ));
+        }
     };
-    let candidate_surface_action = strengthen_surface_action_for_suspicious_discovery(
+    let suspicious_discovery_plan = request_evaluation::suspicious_discovery_plan(
+        decision.policy_state,
+        &controller_surface_action,
+        request_facts,
+    );
+    let candidate_surface_action = render_suspicious_discovery_action(
         runtime,
         session.session_id,
-        decision.policy_state,
-        &surface_request,
         controller_surface_action.clone(),
+        suspicious_discovery_plan,
     )?;
-    let (surface_action, trusted_ingress_softening_reason) =
-        maybe_soften_surface_action_for_trusted_ingress(
-            &runtime.trusted_bait_soften_path_prefixes,
-            &session,
-            decision.policy_state,
-            &surface_request,
-            candidate_surface_action.clone(),
-        );
-    let mut effective_decision = policy::PolicyDecision::new(
-        decision.policy_state,
-        surface_action.routing_decision(),
-        trusted_ingress_softening_reason
-            .clone()
-            .unwrap_or_else(|| decision.reason.clone()),
-    )
-    .with_persistence(decision.persistence);
-    let surface_requested_intervention =
-        !matches!(&candidate_surface_action, SurfaceAction::ProtectedUpstream);
+    let surface_evaluation =
+        request_evaluation::evaluate_surface(request_evaluation::SurfaceEvaluationInput {
+            policy_decision: &decision,
+            candidate_action: candidate_surface_action.clone(),
+            trusted_bait_soften_path_prefixes: &runtime.trusted_bait_soften_path_prefixes,
+            local_trusted_bait_soften_path_prefixes: session
+                .trusted_bait_soften_path_prefixes
+                .as_deref(),
+            ingress_identity: &session.ingress_identity,
+            request_method: &surface_request.method,
+            request_path: &surface_request.path,
+        });
+    let surface_action = surface_evaluation.action;
+    let trusted_ingress_softening_reason = surface_evaluation.trusted_ingress_softening_reason;
+    let mut effective_decision = surface_evaluation.decision;
+    let surface_requested_intervention = surface_evaluation.requested_intervention;
     write_debug(
         runtime,
         "surface_action_selected",
@@ -3457,21 +3173,7 @@ fn handle_connection(
         request_id,
         &effective_decision,
     )? {
-        write_debug(
-            runtime,
-            "policy_transition_selected",
-            Some(session.session_id),
-            json!({
-                "from": transition.from,
-                "to": transition.to,
-                "reason": transition.reason.as_str(),
-            }),
-        )?;
-        set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-        write_event(
-            &runtime.event_log,
-            &policy::policy_changed_event(session.session_id, request_id, &transition),
-        )?;
+        apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
         let blocked_decision = transition.decision(RoutingDecision::EidolonOwned);
         let blocked_response = surface_text_response(403, "blocked by eidolon policy\n");
         let blocked_surface_action = SurfaceAction::EidolonOwned {
@@ -3513,7 +3215,7 @@ fn handle_connection(
     }
 
     if intervention_mode.interventions_enabled()
-        && (surface_action_can_reach_upstream(&surface_action)
+        && (request_evaluation::surface_action_can_reach_upstream(&surface_action)
             || (decision.policy_state == PolicyState::RateLimited
                 && matches!(&surface_action, SurfaceAction::RateLimited { .. })))
     {
@@ -3574,7 +3276,8 @@ fn handle_connection(
                 mint_status,
                 None | Some(BaitHeaderValueMintStatus::MatchedSessionValue)
             );
-            effective_decision = bait_action_interception_decision(&decision, proof_accepted);
+            effective_decision =
+                request_evaluation::bait_action_interception_decision(&decision, proof_accepted);
             write_event(
                 &runtime.event_log,
                 &request_seen_event(
@@ -3626,25 +3329,12 @@ fn handle_connection(
                         .controlled_reality
                         .fail_closed_bait_action_response(&surface_request),
                 )
-            } else if let Some(transition) =
-                policy::transition_after_correlated_bait_action(decision.policy_state)
-                    .filter(|_| action_exposure_id.is_some())
-            {
-                write_debug(
-                    runtime,
-                    "policy_transition_selected",
-                    Some(session.session_id),
-                    json!({
-                        "from": transition.from,
-                        "to": transition.to,
-                        "reason": transition.reason.as_str(),
-                    }),
-                )?;
-                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-                write_event(
-                    &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, request_id, &transition),
-                )?;
+            } else if let Some(transition) = request_evaluation::correlated_bait_action_transition(
+                decision.policy_state,
+                proof_accepted,
+                action_exposure_id.is_some(),
+            ) {
+                apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
                 let (action, controlled_transition) = controlled_reality_action(
                     runtime,
                     session.session_id,
@@ -3652,32 +3342,15 @@ fn handle_connection(
                     transition.reason.clone(),
                 )?;
                 effective_decision = if let Some(controlled_transition) = controlled_transition {
-                    write_debug(
-                        runtime,
-                        "policy_transition_selected",
-                        Some(session.session_id),
-                        json!({
-                            "from": controlled_transition.from,
-                            "to": controlled_transition.to,
-                            "reason": controlled_transition.reason.as_str(),
-                        }),
-                    )?;
-                    set_policy_state_for_session(
+                    apply_policy_transition(
                         runtime,
                         session.session_id,
-                        controlled_transition.to,
-                    )?;
-                    write_event(
-                        &runtime.event_log,
-                        &policy::policy_changed_event(
-                            session.session_id,
-                            request_id,
-                            &controlled_transition,
-                        ),
+                        request_id,
+                        &controlled_transition,
                     )?;
                     controlled_transition.decision(action.routing_decision())
                 } else {
-                    direct_surface_decision(
+                    request_evaluation::direct_surface_decision(
                         transition.to,
                         &action,
                         transition.reason,
@@ -3736,7 +3409,7 @@ fn handle_connection(
     }
 
     if intervention_mode.interventions_enabled()
-        && surface_action_can_reach_upstream(&surface_action)
+        && request_evaluation::surface_action_can_reach_upstream(&surface_action)
     {
         if let Some(action_shape_match) = runtime.bait_registry.match_action_shape(
             &request.method,
@@ -3765,34 +3438,20 @@ fn handle_connection(
                 }),
             )?;
 
-            if let Some(transition) = policy::transition_to_rate_limited_from_same_bait_near_miss(
+            if let Some(transition) = request_evaluation::same_bait_near_miss_transition(
                 decision.policy_state,
                 &surface_request.path,
                 &action_shape_match.bait.id,
                 prior_same_bait_exposure,
             ) {
-                write_debug(
-                    runtime,
-                    "policy_transition_selected",
-                    Some(session.session_id),
-                    json!({
-                        "from": transition.from,
-                        "to": transition.to,
-                        "reason": transition.reason.as_str(),
-                    }),
-                )?;
-                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-                write_event(
-                    &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, request_id, &transition),
-                )?;
+                apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
                 let response =
                     rate_limited_response(runtime.controlled_reality_config.retry_after_seconds);
                 let action = SurfaceAction::RateLimited {
                     reason: transition.reason.clone(),
                     response: response.clone(),
                 };
-                effective_decision = direct_surface_decision(
+                effective_decision = request_evaluation::direct_surface_decision(
                     transition.to,
                     &action,
                     transition.reason,
@@ -3858,29 +3517,13 @@ fn handle_connection(
                 }),
             )?;
 
-            if let Some(transition) =
-                policy::transition_to_blocked_from_repeated_same_bait_near_miss(
-                    decision.policy_state,
-                    &surface_request.path,
-                    &action_shape_match.bait.id,
-                    prior_same_bait_exposure,
-                )
-            {
-                write_debug(
-                    runtime,
-                    "policy_transition_selected",
-                    Some(session.session_id),
-                    json!({
-                        "from": transition.from,
-                        "to": transition.to,
-                        "reason": transition.reason.as_str(),
-                    }),
-                )?;
-                set_policy_state_for_session(runtime, session.session_id, transition.to)?;
-                write_event(
-                    &runtime.event_log,
-                    &policy::policy_changed_event(session.session_id, request_id, &transition),
-                )?;
+            if let Some(transition) = request_evaluation::same_bait_near_miss_transition(
+                decision.policy_state,
+                &surface_request.path,
+                &action_shape_match.bait.id,
+                prior_same_bait_exposure,
+            ) {
+                apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
                 effective_decision = transition.decision(RoutingDecision::EidolonOwned);
                 return write_direct_response(DirectResponseContext {
                     client_stream,
@@ -3900,12 +3543,11 @@ fn handle_connection(
         }
     }
 
-    if owns_configured_unsafe_bait_action && surface_action_can_reach_upstream(&surface_action) {
-        let rejected_decision = policy::PolicyDecision::new(
-            decision.policy_state,
-            RoutingDecision::EidolonOwned,
-            "configured unsafe bait action failed closed after proof rejection",
-        );
+    if request_facts.owns_configured_unsafe_bait_action
+        && request_evaluation::surface_action_can_reach_upstream(&surface_action)
+    {
+        let rejected_decision =
+            request_evaluation::fail_closed_unsafe_bait_action_decision(&decision);
         write_debug(
             runtime,
             "bait_action_rejected_fail_closed",
@@ -3936,7 +3578,7 @@ fn handle_connection(
     }
 
     if let Some(mut response) = direct_surface_response(surface_action.clone()) {
-        effective_decision = direct_surface_decision(
+        effective_decision = request_evaluation::direct_surface_decision(
             decision.policy_state,
             &surface_action,
             decision.reason.clone(),
@@ -4002,7 +3644,7 @@ fn handle_connection(
         return client_stream.flush();
     }
 
-    let upstream_request_decision = upstream_request_decision(
+    let upstream_request_decision = request_evaluation::upstream_request_decision(
         decision.policy_state,
         &surface_action,
         effective_decision.reason.clone(),
@@ -4093,10 +3735,9 @@ fn handle_connection(
             )?;
             if outcome.is_rewritten() {
                 response.cache_policy = plan.cache_policy;
-                effective_decision = policy::PolicyDecision::new(
-                    decision.policy_state,
-                    RoutingDecision::RewrittenUpstream,
-                    "surface controller rewrote upstream response",
+                effective_decision = request_evaluation::rewrite_response_decision(
+                    &effective_decision,
+                    request_evaluation::RewriteEvaluation::Rewritten,
                 );
                 if let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::OpenApi) {
                     if is_openapi_discovery_request(&surface_request, bait) {
@@ -4105,16 +3746,14 @@ fn handle_connection(
                     }
                 }
             } else if let Some(refusal) = outcome.refusal() {
-                effective_decision = policy::PolicyDecision::new(
-                    decision.policy_state,
-                    RoutingDecision::ProtectedUpstream,
-                    format!("surface controller rewrite refused; forwarded original upstream response: {refusal}"),
+                effective_decision = request_evaluation::rewrite_response_decision(
+                    &effective_decision,
+                    request_evaluation::RewriteEvaluation::Refused(refusal.to_string()),
                 );
             } else {
-                effective_decision = policy::PolicyDecision::new(
-                    decision.policy_state,
-                    RoutingDecision::ProtectedUpstream,
-                    "surface controller rewrite made no changes; forwarded original upstream response",
+                effective_decision = request_evaluation::rewrite_response_decision(
+                    &effective_decision,
+                    request_evaluation::RewriteEvaluation::Unchanged,
                 );
             }
             response.body = outcome.into_body();
@@ -4129,10 +3768,9 @@ fn handle_connection(
                     "plan": debug_rewrite_plan(&plan),
                 }),
             )?;
-            effective_decision = policy::PolicyDecision::new(
-                decision.policy_state,
-                RoutingDecision::ProtectedUpstream,
-                "surface controller skipped rewrite for non-200 upstream response",
+            effective_decision = request_evaluation::rewrite_response_decision(
+                &effective_decision,
+                request_evaluation::RewriteEvaluation::SkippedNonSuccess,
             );
         }
     }
@@ -4180,37 +3818,6 @@ fn handle_connection(
 
     client_stream.write_all(&response.to_http_bytes_for_method(&request.method))?;
     client_stream.flush()
-}
-
-fn owns_configured_unsafe_bait_action(
-    runtime: &ProxyRuntime,
-    request: &SurfaceRequestMeta,
-) -> bool {
-    if !is_unsafe_method(&request.method) {
-        return false;
-    }
-
-    let incoming_path = canonical_action_route_path(&request.target);
-    runtime.bait_registry.baits().iter().any(|bait| {
-        if !bait
-            .expected_action
-            .method
-            .eq_ignore_ascii_case(&request.method)
-        {
-            return false;
-        }
-
-        match (
-            canonical_action_route_path(&bait.expected_action.path),
-            incoming_path.as_ref(),
-        ) {
-            (Ok(expected), Ok(incoming)) => expected == incoming.as_str(),
-            _ => {
-                bait.expected_action.path == request.path
-                    || bait.expected_action.path == request.target
-            }
-        }
-    })
 }
 
 fn maybe_transition_to_blocked_from_reality_escape_attempt(
@@ -4268,13 +3875,11 @@ fn maybe_transition_to_blocked_from_reality_escape_attempt(
         ),
     )?;
 
-    Ok(
-        policy::transition_to_blocked_from_repeated_reality_escape_attempt(
-            decision.policy_state,
-            &surface_request.path,
-            attempt_count,
-        ),
-    )
+    Ok(request_evaluation::reality_escape_transition(
+        decision.policy_state,
+        &surface_request.path,
+        attempt_count,
+    ))
 }
 
 struct DirectResponseContext<'a> {
@@ -4422,6 +4027,29 @@ fn set_policy_state_for_session(
     result
 }
 
+fn apply_policy_transition(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    request_id: RequestId,
+    transition: &policy::PolicyTransition,
+) -> io::Result<()> {
+    write_debug(
+        runtime,
+        "policy_transition_selected",
+        Some(session_id),
+        json!({
+            "from": transition.from,
+            "to": transition.to,
+            "reason": transition.reason.as_str(),
+        }),
+    )?;
+    set_policy_state_for_session(runtime, session_id, transition.to)?;
+    write_event(
+        &runtime.event_log,
+        &policy::policy_changed_event(session_id, request_id, transition),
+    )
+}
+
 fn note_reality_escape_attempt_for_session(
     runtime: &ProxyRuntime,
     session_id: SessionId,
@@ -4450,26 +4078,27 @@ fn update_discovery_recon_state_for_request(
     runtime: &ProxyRuntime,
     session_id: SessionId,
     request: &SurfaceRequestMeta,
+    request_facts: RequestPolicyFacts,
 ) -> io::Result<policy::DiscoveryReconState> {
     let mut store = runtime
         .policy_store
         .lock()
         .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
 
-    if let Some(kind) = discovery_surface_kind(runtime, request) {
+    if let Some(kind) = request_facts.discovery_surface {
         return store.note_discovery_surface_request(
             session_id,
             kind,
             request.query.is_some(),
-            is_legacy_openapi_discovery_query(request),
+            request_facts.legacy_openapi_discovery_query,
         );
     }
 
-    if let Some(kind) = linked_bait_surface_kind(runtime, request) {
+    if let Some(kind) = request_facts.linked_bait_surface {
         return store.note_linked_bait_surface_request(session_id, kind);
     }
 
-    if let Some(kind) = blind_decoy_write_probe_path_kind(runtime, session_id, request) {
+    if let Some(kind) = request_facts.blind_decoy_write_probe {
         return store.note_decoy_write_probe(session_id, kind);
     }
 
@@ -4511,7 +4140,7 @@ fn controlled_reality_action(
         if !tarpit_delay.is_zero() {
             thread::sleep(tarpit_delay);
         }
-        let transition = policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+        let transition = request_evaluation::controlled_reality_depth_transition(
             PolicyState::ControlledReality,
             &request.path,
             depth,
@@ -4594,68 +4223,41 @@ fn bait_exposure_for_direct_surface<'a>(
         })
 }
 
-fn strengthen_surface_action_for_suspicious_discovery(
+fn render_suspicious_discovery_action(
     runtime: &ProxyRuntime,
     session_id: SessionId,
-    policy_state: PolicyState,
-    surface_request: &SurfaceRequestMeta,
     controller_surface_action: SurfaceAction,
+    plan: request_evaluation::SuspiciousDiscoveryPlan,
 ) -> io::Result<SurfaceAction> {
-    if policy_state != PolicyState::Suspicious
-        || surface_request.method != "GET"
-        || !matches!(
-            &controller_surface_action,
-            SurfaceAction::RewrittenUpstream { .. }
-        )
-    {
-        return Ok(controller_surface_action);
+    match plan {
+        request_evaluation::SuspiciousDiscoveryPlan::Preserve => Ok(controller_surface_action),
+        request_evaluation::SuspiciousDiscoveryPlan::ServeDocsBait => {
+            let bait = runtime
+                .bait_registry
+                .bait_for_class(BaitClass::Docs)
+                .ok_or_else(|| invalid_data("docs discovery plan referenced a missing bait"))?;
+            let bait =
+                render_bait_for_session(bait, session_id, runtime.bait_signing_secret.as_deref())
+                    .map_err(|error| invalid_data(error.to_string()))?;
+
+            Ok(SurfaceAction::EidolonOwned {
+                response: bait_surface_response(&bait, &runtime.bait_content),
+            })
+        }
+        request_evaluation::SuspiciousDiscoveryPlan::ServeOpenApiBait => {
+            let bait = runtime
+                .bait_registry
+                .bait_for_class(BaitClass::OpenApi)
+                .ok_or_else(|| invalid_data("OpenAPI discovery plan referenced a missing bait"))?;
+            let bait =
+                render_bait_for_session(bait, session_id, runtime.bait_signing_secret.as_deref())
+                    .map_err(|error| invalid_data(error.to_string()))?;
+
+            Ok(SurfaceAction::EidolonOwned {
+                response: owned_openapi_discovery_response(&bait, &runtime.bait_content.openapi),
+            })
+        }
     }
-
-    if surface_request.path == DOCS_DISCOVERY_TARGET {
-        let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::Docs) else {
-            return Ok(controller_surface_action);
-        };
-        let bait =
-            render_bait_for_session(bait, session_id, runtime.bait_signing_secret.as_deref())
-                .map_err(|error| invalid_data(error.to_string()))?;
-
-        return Ok(SurfaceAction::EidolonOwned {
-            response: bait_surface_response(&bait, &runtime.bait_content),
-        });
-    }
-
-    let Some(bait) = runtime.bait_registry.bait_for_class(BaitClass::OpenApi) else {
-        return Ok(controller_surface_action);
-    };
-    if surface_request.path != OPENAPI_DISCOVERY_TARGET
-        || !is_openapi_discovery_request(surface_request, bait)
-    {
-        return Ok(controller_surface_action);
-    }
-    let bait = render_bait_for_session(bait, session_id, runtime.bait_signing_secret.as_deref())
-        .map_err(|error| invalid_data(error.to_string()))?;
-
-    Ok(SurfaceAction::EidolonOwned {
-        response: owned_openapi_discovery_response(&bait, &runtime.bait_content.openapi),
-    })
-}
-
-fn upstream_request_decision(
-    policy_state: PolicyState,
-    surface_action: &SurfaceAction,
-    default_reason: String,
-    persistence: PersistenceMetadata,
-) -> policy::PolicyDecision {
-    let decision = match surface_action {
-        SurfaceAction::RewrittenUpstream { .. } => policy::PolicyDecision::new(
-            policy_state,
-            RoutingDecision::ProtectedUpstream,
-            "surface controller requested upstream response rewrite; request forwarded to protected upstream before rewrite outcome",
-        ),
-        _ => policy::PolicyDecision::protected_upstream(policy_state, default_reason),
-    };
-
-    decision.with_persistence(persistence)
 }
 
 fn write_bait_exposed_event(
@@ -4861,12 +4463,6 @@ fn bait_action_synthetic_response() -> HttpResponse {
     surface_response_to_http(surface_text_response(202, "accepted\n"))
 }
 
-fn surface_header_pairs(headers: &[SurfaceHeader]) -> impl Iterator<Item = (&str, &str)> {
-    headers
-        .iter()
-        .map(|header| (header.name.as_str(), header.value.as_str()))
-}
-
 fn header_pairs(headers: &[HttpHeader]) -> impl Iterator<Item = (&str, &str)> {
     headers
         .iter()
@@ -4917,13 +4513,6 @@ fn surface_headers(headers: &[HttpHeader]) -> Vec<SurfaceHeader> {
         .collect()
 }
 
-fn surface_action_can_reach_upstream(action: &SurfaceAction) -> bool {
-    matches!(
-        action,
-        SurfaceAction::ProtectedUpstream | SurfaceAction::RewrittenUpstream { .. }
-    )
-}
-
 fn direct_surface_response(action: SurfaceAction) -> Option<HttpResponse> {
     match action {
         SurfaceAction::EidolonOwned { response }
@@ -4931,58 +4520,6 @@ fn direct_surface_response(action: SurfaceAction) -> Option<HttpResponse> {
         | SurfaceAction::RateLimited { response, .. } => Some(surface_response_to_http(response)),
         SurfaceAction::ProtectedUpstream | SurfaceAction::RewrittenUpstream { .. } => None,
     }
-}
-
-fn direct_surface_decision(
-    policy_state: PolicyState,
-    action: &SurfaceAction,
-    default_reason: String,
-    persistence: PersistenceMetadata,
-) -> policy::PolicyDecision {
-    let decision = match action {
-        SurfaceAction::ProtectedUpstream => {
-            policy::PolicyDecision::protected_upstream(policy_state, default_reason)
-        }
-        SurfaceAction::EidolonOwned { .. } => {
-            let reason = if policy_state == PolicyState::Blocked {
-                default_reason
-            } else {
-                "surface controller served eidolon-owned response".to_string()
-            };
-            policy::PolicyDecision::new(policy_state, RoutingDecision::EidolonOwned, reason)
-        }
-        SurfaceAction::ControlledReality { reason, .. } => policy::PolicyDecision::new(
-            policy_state,
-            RoutingDecision::ControlledReality,
-            reason.clone(),
-        ),
-        SurfaceAction::RateLimited { reason, .. } => {
-            policy::PolicyDecision::new(policy_state, RoutingDecision::RateLimited, reason.clone())
-        }
-        SurfaceAction::RewrittenUpstream { .. } => policy::PolicyDecision::new(
-            policy_state,
-            RoutingDecision::RewrittenUpstream,
-            "surface controller requested upstream response rewrite",
-        ),
-    };
-
-    decision.with_persistence(persistence)
-}
-
-fn bait_action_interception_decision(
-    decision: &policy::PolicyDecision,
-    proof_accepted: bool,
-) -> policy::PolicyDecision {
-    policy::PolicyDecision::new(
-        decision.policy_state,
-        RoutingDecision::EidolonOwned,
-        if proof_accepted {
-            "bait-derived decoy action intercepted before protected upstream"
-        } else {
-            "rejected bait proof failed closed before protected upstream"
-        },
-    )
-    .with_persistence(decision.persistence)
 }
 
 fn surface_text_response(status: u16, body: impl Into<Vec<u8>>) -> SurfaceResponse {
@@ -5677,51 +5214,6 @@ fn trusted_ingress_soften_match(
         required_header_names: trust.required_header_names.clone(),
         verified_categories: trust.verified_categories.clone(),
     })
-}
-
-fn maybe_soften_surface_action_for_trusted_ingress(
-    trusted_bait_soften_path_prefixes: &[String],
-    session: &SessionContext,
-    policy_state: PolicyState,
-    surface_request: &SurfaceRequestMeta,
-    surface_action: SurfaceAction,
-) -> (SurfaceAction, Option<String>) {
-    if !matches!(policy_state, PolicyState::Normal | PolicyState::Observe) {
-        return (surface_action, None);
-    }
-    if surface_request.method != "GET" {
-        return (surface_action, None);
-    }
-    if !ingress_identity::softens_bait_surface_exposure(&session.ingress_identity) {
-        return (surface_action, None);
-    }
-    if !trusted_bait_soften_path_prefixes
-        .iter()
-        .any(|prefix| ingress_identity::path_matches_segment_prefix(&surface_request.path, prefix))
-    {
-        return (surface_action, None);
-    }
-    if let Some(local_soften_path_prefixes) = &session.trusted_bait_soften_path_prefixes {
-        if !local_soften_path_prefixes.iter().any(|prefix| {
-            ingress_identity::path_matches_segment_prefix(&surface_request.path, prefix)
-        }) {
-            return (surface_action, None);
-        }
-    }
-    if !matches!(
-        &surface_action,
-        SurfaceAction::EidolonOwned { .. } | SurfaceAction::RewrittenUpstream { .. }
-    ) {
-        return (surface_action, None);
-    }
-
-    (
-        SurfaceAction::ProtectedUpstream,
-        Some(
-            "trusted ingress identity suppressed bait surface intervention before runtime suspicion was established"
-                .to_string(),
-        ),
-    )
 }
 
 fn write_debug(
@@ -6702,7 +6194,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use eidolon_core::{ExpectedAction, SessionId, SurfaceKind};
+    use eidolon_core::{ExpectedAction, PersistenceMetadata, SessionId, SurfaceKind};
     use eidolon_proxy::surface::{HtmlInsertion, RewritePlan};
     use serde_json::Value;
 
@@ -19218,7 +18710,8 @@ mod tests {
             eidolon_core::PreContainmentPersistenceClass::WriteRecon,
         ));
 
-        let intercepted = bait_action_interception_decision(&transition_decision, false);
+        let intercepted =
+            request_evaluation::bait_action_interception_decision(&transition_decision, false);
 
         assert_eq!(intercepted.policy_state, PolicyState::RateLimited);
         assert_eq!(intercepted.routing_decision, RoutingDecision::EidolonOwned);
