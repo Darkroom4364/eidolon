@@ -150,8 +150,10 @@ examples/
 ## Current Status
 
 M3 is complete on `main`. The core M4 edge-operations slice is merged, but the
-M4 milestone remains open for `#46` and `#47`. Broader M5 feature expansion is
-paused behind the engineering safety gate tracked by `#213`.
+M4 milestone remains open for `#46` and `#47`. Issue `#213` recorded a
+one-time advisory engineering review, not a global release, feature, or merge
+gate. Its findings `#207` through `#212` were resolved independently, and
+proposed repository-wide enforcement in `#214` was retired.
 
 The repository already includes:
 
@@ -165,12 +167,13 @@ The repository already includes:
 - an OrbStack shield-lab deployment with live status, evidence export,
   edge-decision export, trusted-ingress smoke checks, and Kali VM validation
 
-The current priority is closing the documented safety gate by implementing and
-proving fail-closed bait-action routing, correct evidence classification,
-protected session identity, request-linked causality, bounded state, canonical
-request targets, and enforced merge checks.
+The `#213` review strengthened the merged baseline through fail-closed
+bait-action routing, correct evidence classification, protected session
+identity, request-linked causality, bounded state, and canonical request
+targets. Those corrections do not by themselves make a production-readiness
+claim.
 
-For the required work order and merge gate, see
+For the recommended work order and review standards, see
 [docs/engineering-operating-policy.md](docs/engineering-operating-policy.md).
 
 For the end-state definition, see [docs/completed-project.md](docs/completed-project.md).

@@ -1,10 +1,9 @@
 # Engineering Operating Policy
 
-Status: active project policy; automated repository enforcement is incomplete
-and tracked by `#214`
+Status: active engineering guidance
 
-This document defines Eidolon's default engineering order, safety invariants,
-evidence discipline, and merge gate. It applies to runtime, Lab, Shield,
+This document defines Eidolon's default priority guidance, safety invariants,
+evidence discipline, and review standards. It applies to runtime, Lab, Shield,
 deployment, export, pwnkit integration, and benchmark work.
 
 ## Product Center
@@ -22,10 +21,12 @@ owned semantic bait
 Research, infrastructure, telemetry, and benchmark work support this chain.
 They do not replace it and must not redefine its claims.
 
-## Required Safety Invariants
+## Safety Invariants
 
-These are merge requirements and target properties. They are not claims about
-current `main`; known violations are tracked by the safety gate below.
+These are design and review standards for relevant changes. They are not
+claims that current `main` exhaustively satisfies every target, and they do
+not create a repository-wide feature freeze. Violations are tracked and
+prioritized independently.
 
 1. Eidolon operates only on owned or explicitly authorized systems.
 2. A recognized unsafe bait action shape never reaches the protected upstream.
@@ -48,9 +49,9 @@ current `main`; known violations are tracked by the safety gate below.
 10. Secrets, bodies, cookies, query values, sensitive path segments, and
     incidental personal data are minimized before export or signing.
 
-## Work Order
+## Priority Guidance
 
-Work proceeds in this order unless a documented emergency requires otherwise:
+When choosing among otherwise comparable work, prefer this order:
 
 1. Restore violated safety invariants and add adversarial regression tests.
 2. Establish causal correctness, bounded durability, and disclosure safety.
@@ -62,16 +63,19 @@ Work proceeds in this order unless a documented emergency requires otherwise:
 6. Expand benchmarks, microVM lanes, advisory telemetry, trust integrations,
    and cryptographic export mechanisms.
 
-An item lower in this list may be researched or documented while the safety
-gate is open, but it must not displace gate work or be presented as the current
-product priority.
+An item lower in this list may proceed in parallel when it does not weaken,
+bypass, or misrepresent a known invariant. It should not displace an urgent
+related defect or be presented as the current product priority without
+roadmap support.
 
-## Safety Gate
+## Historical Advisory Review
 
-The active gate is tracked by GitHub issue `#213`. Its runtime defects are
-`#207` through `#212`; CI and branch enforcement are tracked by `#214`.
+GitHub issue `#213` recorded a one-time advisory engineering review. It was
+not a release, feature, or merge gate. Findings `#207` through `#212` were
+tracked independently and closed after their regression work merged. Proposed
+repository-wide enforcement in `#214` was retired as not planned.
 
-Feature expansion is blocked while any of these conditions is known to exist:
+The review identified durable regression boundaries:
 
 - attacker-controlled session identity can reset policy or evidence state
 - a recognized unsafe bait action can be forwarded to the protected upstream
@@ -80,20 +84,9 @@ Feature expansion is blocked while any of these conditions is known to exist:
 - persistent state or logs are unbounded or cannot tolerate a partial tail
 - ambiguous request targets can receive a different policy and upstream meaning
 
-Current gate work proceeds as follows:
-
-1. Make every configured unsafe bait-action shape fail closed in `#208`, then
-   add the minimum replay and expiry outcome model required to complete it.
-2. Exclude rejected observations from confirmed evidence in `#209`.
-3. Design session identity in `#207` together with the lifetime, rotation, and
-   storage bounds required by `#211`.
-4. Define the canonical request-target contract required by `#212` before
-   freezing request-level event linkage in `#210`.
-5. Finish `#211`, `#212`, and repository enforcement in `#214` before resuming
-   feature expansion.
-
-Closing the gate requires executable regression coverage for both the expected
-path and the adversarial failure path. Documentation alone does not close it.
+A future regression against one of these boundaries should be tracked and
+prioritized by its scope and severity. It does not automatically freeze
+unrelated development.
 
 ## Evidence And Evaluation Rules
 
@@ -120,9 +113,9 @@ Every security-relevant change must state:
 A security-relevant branch is merge-ready only after applicable formatting,
 lint, Rust, shell fixture, and boundary-specific live checks pass. Any check
 that is not applicable or cannot run in CI must be identified with the reason,
-compensating evidence, and residual risk. CI and branch-protection parity are
-tracked by `#214`; until it closes, reviewers must enforce this gate manually
-rather than treating absent branch rules as approval.
+compensating evidence, and residual risk. Issues `#213` and `#214` add no
+separate manual or repository-wide gate beyond applicable normal review and
+CI.
 
 ## Issue Triage
 
@@ -132,8 +125,9 @@ rather than treating absent branch rules as approval.
   deployment isolation failure is at least `P1` until reviewed.
 - Architecture work must name the defect or invariant it enables; extraction
   is not an end in itself.
-- New feature work must explain why all open higher-priority safety defects do
-  not block it.
+- New feature work should identify related higher-priority safety defects and
+  explain why parallel work will not weaken, bypass, or overstate them.
+  Unrelated defects do not automatically block it.
 - Milestones and README status must describe merged, verified behavior rather
   than branch-local or planned behavior.
 
