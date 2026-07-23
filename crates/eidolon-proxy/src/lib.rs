@@ -5,4 +5,5 @@ pub mod ingress_identity;
 pub mod policy;
 pub mod policy_store;
 pub mod session;
+pub mod session_auth;
 pub mod surface;

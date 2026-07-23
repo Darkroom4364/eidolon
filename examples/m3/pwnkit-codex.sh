@@ -73,8 +73,16 @@ Environment:
                             tokens.refresh_token when no usable access token
                             exists.
   EIDOLON_M3_PIN_SESSION    If true, pass one fixed eidolon_session cookie to
-                            the Eidolon leg. Defaults to 0.
-  EIDOLON_M3_SESSION_ID     Optional UUID for EIDOLON_M3_PIN_SESSION.
+                            the Eidolon leg. Defaults to 0. The cookie value is
+                            minted by the Eidolon proxy (signed) unless
+                            EIDOLON_M3_SESSION_COOKIE provides one.
+  EIDOLON_M3_SESSION_COOKIE
+                            Optional full proxy-minted eidolon_session cookie
+                            value (v1.<key>.<iat>.<uuid>.<mac>) for
+                            EIDOLON_M3_PIN_SESSION.
+  EIDOLON_M3_SESSION_ID     Removed. Raw unsigned UUID cookies are rejected by
+                            the proxy; leave unset to auto-mint or use
+                            EIDOLON_M3_SESSION_COOKIE.
   EIDOLON_M3_ALLOW_STALE_PWNKIT_DIST
                             If true, skip the source-checkout dist freshness
                             guard. Defaults to 0.
@@ -821,20 +829,47 @@ write_runner_metadata() {
     }' > "$metadata_file"
 }
 
-new_session_id() {
-  if ! command -v uuidgen >/dev/null 2>&1; then
-    echo "error: EIDOLON_M3_PIN_SESSION requires uuidgen or EIDOLON_M3_SESSION_ID" >&2
+mint_eidolon_session_cookie() {
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "error: EIDOLON_M3_PIN_SESSION requires curl to mint a signed session cookie, or EIDOLON_M3_SESSION_COOKIE" >&2
     exit 2
   fi
 
-  uuidgen | tr '[:upper:]' '[:lower:]'
+  local headers value
+  headers="$(curl -fsS -D - -o /dev/null "${PROXY_URL}/")" || {
+    echo "error: could not mint an eidolon_session cookie from ${PROXY_URL}/" >&2
+    exit 2
+  }
+  value="$(
+    printf '%s\n' "$headers" \
+      | tr -d '\r' \
+      | sed -n 's/^[Ss]et-[Cc]ookie:[[:space:]]*eidolon_session=\([^;[:space:]]*\).*$/\1/p' \
+      | head -n 1
+  )"
+  if [[ -z "$value" ]]; then
+    echo "error: eidolon proxy at ${PROXY_URL} did not issue an eidolon_session cookie" >&2
+    exit 2
+  fi
+
+  printf '%s' "$value"
+}
+
+session_uuid_from_cookie_value() {
+  local value="$1"
+
+  if [[ "$value" == v1.*.*.*.* ]]; then
+    printf '%s' "$value" | cut -d. -f4
+    return
+  fi
+
+  printf '%s' "$value"
 }
 
 validate_session_id() {
   local session_id="$1"
 
   if [[ ! "$session_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-    echo "error: EIDOLON_M3_SESSION_ID must be a UUID, got: $session_id" >&2
+    echo "error: pinned Eidolon session must resolve to a bare UUID, got: $session_id" >&2
     exit 2
   fi
 }
@@ -844,7 +879,7 @@ write_eidolon_auth_file() {
   local auth_file="$ARTIFACT_DIR/pwnkit-$label-auth.json"
 
   printf '{"type":"cookie","value":"eidolon_session=%s"}\n' \
-    "$PINNED_EIDOLON_SESSION_ID" > "$auth_file"
+    "$PINNED_EIDOLON_SESSION_COOKIE" > "$auth_file"
   printf '%s\n' "$PINNED_EIDOLON_SESSION_ID" > "$ARTIFACT_DIR/pinned-eidolon-session-id.txt"
   printf '%s' "$auth_file"
 }
@@ -1237,9 +1272,18 @@ main() {
 
   PIN_EIDOLON_SESSION=false
   PINNED_EIDOLON_SESSION_ID=""
+  PINNED_EIDOLON_SESSION_COOKIE=""
   if truthy "$EIDOLON_M3_PIN_SESSION"; then
     PIN_EIDOLON_SESSION=true
-    PINNED_EIDOLON_SESSION_ID="${EIDOLON_M3_SESSION_ID:-$(new_session_id)}"
+    if [[ -n "${EIDOLON_M3_SESSION_ID:-}" ]]; then
+      echo "error: EIDOLON_M3_SESSION_ID pins an unsigned raw UUID, which the proxy now rejects; unset it to auto-mint a signed cookie, or set EIDOLON_M3_SESSION_COOKIE to a full proxy-minted cookie value" >&2
+      exit 2
+    fi
+    PINNED_EIDOLON_SESSION_COOKIE="${EIDOLON_M3_SESSION_COOKIE:-}"
+    if [[ -z "$PINNED_EIDOLON_SESSION_COOKIE" ]]; then
+      PINNED_EIDOLON_SESSION_COOKIE="$(mint_eidolon_session_cookie)"
+    fi
+    PINNED_EIDOLON_SESSION_ID="$(session_uuid_from_cookie_value "$PINNED_EIDOLON_SESSION_COOKIE")"
     validate_session_id "$PINNED_EIDOLON_SESSION_ID"
   fi
 

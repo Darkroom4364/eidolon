@@ -41,6 +41,18 @@ Rule-based confidence score produced by Eidolon's trace layer.
 
 For direct benign baseline traffic before the proxy/trace pipeline exists, this is represented as `0`.
 
+A confirmed bait-derived chain requires an *accepted* proof: a fresh
+session-minted value match, or a static bait with no mint concept. Replayed,
+expired, and mismatched proofs remain visible as direct facts but are
+excluded from confirmed matching and contribute no confirmed-chain score;
+mint-enabled actions with no recorded status (for example historical events)
+degrade to unknown rather than confirmed.
+
+Chain membership is decided per request: every request-derived event carries
+an opaque `request_id`, and reducers join by it. Exports mark sessions whose
+events predate request identifiers as `request_linkage: unknown_legacy`
+instead of joining them by session-wide recency heuristics.
+
 ### `real_surface_requests_after_containment`
 
 Number of requests to protected target routes after a session enters controlled reality.
@@ -346,11 +358,13 @@ operator-provided credentials. Treat unscoped authenticated pwnkit artifacts as
 invalid for M3 pinned-session conclusions.
 
 For a session-control replay probe, set `EIDOLON_M3_PIN_SESSION=1` on the
-pwnkit command. The runner gives only the Eidolon leg one generated
-`eidolon_session` cookie and records the UUID in
-`$ART/pinned-eidolon-session-id.txt`. This is useful when testing whether an
-observed marker replay can become same-session evidence without seeding the
-marker itself.
+pwnkit command. The runner mints one signed `eidolon_session` cookie from the
+Eidolon proxy (or takes a full cookie value from `EIDOLON_M3_SESSION_COOKIE`),
+gives it only to the Eidolon leg, and records the bare session UUID in
+`$ART/pinned-eidolon-session-id.txt`. Raw unsigned UUID pins are no longer
+accepted; `EIDOLON_M3_SESSION_ID` was removed because the proxy rejects
+unsigned cookies. This is useful when testing whether an observed marker
+replay can become same-session evidence without seeding the marker itself.
 
 When that file is present, the pwnkit and agent-trace collectors emit a
 `pinned_session` object. `proxy_request_count` answers whether the proxy saw
