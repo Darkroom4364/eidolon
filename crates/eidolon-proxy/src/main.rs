@@ -26,7 +26,7 @@ use eidolon_proxy::{
         DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH, MAX_TARPIT_DELAY,
     },
     debug_log::FileDebugLogWriter,
-    event_log::{read_jsonl_reconstruction, FileEventLogWriter},
+    event_log::{read_jsonl_reconstruction, FileEventLogWriter, JsonlTailRepairOutcome},
     ingress_identity::{self, IngressIdentityResolver},
     policy::{self, InterventionMode},
     policy_store::PolicyStateStore,
@@ -37,8 +37,9 @@ use eidolon_proxy::{
         SurfaceController, SurfaceHeader, SurfaceRequestMeta, SurfaceResponse, SurfaceResponseMeta,
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
@@ -55,7 +56,11 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 const MAX_BAIT_EXPOSURES: usize = 4096;
+const BAIT_EXPOSURE_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_CONSUMED_BAIT_PROOFS: usize = 4096;
+const MAX_BAIT_PROOF_TTL_SECS: u64 = 24 * 60 * 60;
+const BAIT_EXPOSURE_STATE_SCHEMA_VERSION: u16 = 1;
+const CONSUMED_PROOF_STATE_SCHEMA_VERSION: u16 = 1;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
@@ -986,9 +991,13 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         Some(path) => Some(load_ingress_transport_auth_secret(path)?),
         None => None,
     };
-    let debug_log = match &config.debug_log_path {
-        Some(path) => Some(Arc::new(Mutex::new(FileDebugLogWriter::open(path)?))),
-        None => None,
+    let (debug_log, debug_log_tail_repair) = match &config.debug_log_path {
+        Some(path) => {
+            let writer = FileDebugLogWriter::open(path)?;
+            let repair = writer.startup_tail_repair();
+            (Some(Arc::new(Mutex::new(writer))), Some(repair))
+        }
+        None => (None, None),
     };
     let (session_authority, session_signing_mode) = match &config.session_signing_key_path {
         Some(path) => (
@@ -1002,14 +1011,13 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         "active_key_version": session_authority.active_key_version(),
         "key_version_count": session_authority.key_version_count(),
     });
-    let bait_exposures = BaitExposureStore::from_event_log(&config.event_log_path)?;
+    let now = current_unix_secs();
+    let bait_exposures = BaitExposureStore::open_or_rebuild(&config.event_log_path, now)?;
     let restored_bait_exposure_count = bait_exposures.len();
+    let restored_bait_exposure_ttl_evicted = bait_exposures.ttl_evicted;
     let restored_bait_exposure_torn_tail_line = bait_exposures.torn_tail_line;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let consumed_bait_proofs = ConsumedBaitProofStore::from_event_log(
+    let bait_exposure_state_path = bait_exposures.path.clone();
+    let consumed_bait_proofs = ConsumedBaitProofStore::open_or_rebuild(
         &config.event_log_path,
         &bait_registry,
         bait_signing_secret.as_deref(),
@@ -1017,15 +1025,19 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     )?;
     let restored_consumed_bait_proof_count = consumed_bait_proofs.consumed.len();
     let restored_consumed_bait_proof_torn_tail_line = consumed_bait_proofs.torn_tail_line;
+    let consumed_proof_state_path = consumed_bait_proofs.path.clone();
+    let consumed_proof_migration_quarantine_until = consumed_bait_proofs.migration_quarantine_until;
     let policy_store = PolicyStateStore::open(&config.policy_state_path)?;
     let policy_store_eviction = policy_store.last_eviction_stats();
     let policy_store_session_count = policy_store.len();
+    let policy_store_fail_closed_for_unknown_sessions =
+        policy_store.fail_closed_for_unknown_sessions();
+    let event_log_writer = FileEventLogWriter::open(&config.event_log_path)?;
+    let event_log_tail_repair = event_log_writer.startup_tail_repair();
     let runtime = ProxyRuntime {
         upstream: config.upstream,
         client_request_deadline: CLIENT_REQUEST_DEADLINE,
-        event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
-            &config.event_log_path,
-        )?)),
+        event_log: Arc::new(Mutex::new(event_log_writer)),
         debug_log,
         intervention_control_path: config.intervention_control_path,
         policy_store: Arc::new(Mutex::new(policy_store)),
@@ -1063,6 +1075,10 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
             "session_signing": session_signing_debug,
             "restored_consumed_bait_proof_count": restored_consumed_bait_proof_count,
             "restored_consumed_bait_proof_torn_tail_line": restored_consumed_bait_proof_torn_tail_line,
+            "consumed_proof_state_path": consumed_proof_state_path,
+            "consumed_proof_migration_quarantine_until": consumed_proof_migration_quarantine_until,
+            "event_log_tail_repair": jsonl_tail_repair_debug(event_log_tail_repair),
+            "debug_log_tail_repair": debug_log_tail_repair.map(jsonl_tail_repair_debug),
             "event_log_bytes": std::fs::metadata(&config.event_log_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
@@ -1073,12 +1089,20 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
             "trusted_bait_soften_path_prefixes": runtime.trusted_bait_soften_path_prefixes,
             "restored_bait_exposure_count": restored_bait_exposure_count,
+            "restored_bait_exposure_ttl_evicted": restored_bait_exposure_ttl_evicted,
             "restored_bait_exposure_torn_tail_line": restored_bait_exposure_torn_tail_line,
+            "bait_exposure_store": {
+                "state_path": bait_exposure_state_path,
+                "max_records": MAX_BAIT_EXPOSURES,
+                "ttl_secs": BAIT_EXPOSURE_TTL_SECS,
+            },
             "policy_store": {
                 "session_count": policy_store_session_count,
                 "ttl_evicted": policy_store_eviction.ttl_evicted,
                 "lru_evicted": policy_store_eviction.lru_evicted,
-                "protected_overflow": policy_store_eviction.protected_overflow,
+                "protected_fail_closed_evicted": policy_store_eviction.protected_fail_closed_evicted,
+                "fail_closed_activated": policy_store_eviction.fail_closed_activated,
+                "fail_closed_for_unknown_sessions": policy_store_fail_closed_for_unknown_sessions,
                 "max_sessions": eidolon_proxy::policy_store::MAX_POLICY_SESSIONS,
                 "session_ttl_secs": eidolon_proxy::policy_store::POLICY_SESSION_TTL_SECS,
             },
@@ -1108,6 +1132,26 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     Ok(())
 }
 
+fn jsonl_tail_repair_debug(outcome: JsonlTailRepairOutcome) -> Value {
+    match outcome {
+        JsonlTailRepairOutcome::NotNeeded => json!({
+            "outcome": "not_needed",
+        }),
+        JsonlTailRepairOutcome::AppendedNewline { previous_len } => json!({
+            "outcome": "appended_newline",
+            "previous_len": previous_len,
+        }),
+        JsonlTailRepairOutcome::Truncated {
+            original_len,
+            repaired_len,
+        } => json!({
+            "outcome": "truncated",
+            "original_len": original_len,
+            "repaired_len": repaired_len,
+        }),
+    }
+}
+
 #[derive(Clone)]
 struct ProxyRuntime {
     upstream: UpstreamTarget,
@@ -1132,14 +1176,24 @@ struct ProxyRuntime {
 
 #[derive(Debug, Default)]
 struct BaitExposureStore {
-    exposures: HashMap<(SessionId, BaitId), ExposureId>,
+    path: Option<PathBuf>,
+    exposures: HashMap<(SessionId, BaitId), BaitExposureRecord>,
     exposure_order: VecDeque<(SessionId, BaitId)>,
+    ttl_evicted: usize,
     torn_tail_line: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct BaitExposureRecord {
+    exposure_id: ExposureId,
+    observed_at_unix_secs: u64,
 }
 
 #[derive(Debug, Default)]
 struct ConsumedBaitProofStore {
-    consumed: HashMap<(SessionId, BaitId, String), u64>,
+    path: Option<PathBuf>,
+    consumed: HashMap<(SessionId, BaitId, [u8; 32]), u64>,
+    migration_quarantine_until: Option<u64>,
     torn_tail_line: Option<usize>,
 }
 
@@ -1148,9 +1202,237 @@ enum ConsumeProofOutcome {
     Fresh,
     Replay,
     CapacityExceeded,
+    Unavailable,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredBaitExposureState {
+    schema_version: u16,
+    exposures: Vec<StoredBaitExposure>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredBaitExposure {
+    session_id: SessionId,
+    bait_id: BaitId,
+    exposure_id: ExposureId,
+    observed_at_unix_secs: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredConsumedProofState {
+    schema_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migration_quarantine_until: Option<u64>,
+    consumed: Vec<StoredConsumedProof>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredConsumedProof {
+    session_id: SessionId,
+    bait_id: BaitId,
+    proof_digest_hex: String,
+    expires_at_unix_secs: u64,
+}
+
+fn state_path_for_event_log(event_log_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = event_log_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AtomicStateWriteOutcome {
+    Durable,
+    CommittedDurabilityUncertain,
+}
+
+fn atomic_state_write(path: &Path, value: &impl Serialize) -> io::Result<AtomicStateWriteOutcome> {
+    atomic_state_write_with_parent_sync(path, value, sync_state_parent_directory)
+}
+
+fn atomic_state_write_with_parent_sync(
+    path: &Path,
+    value: &impl Serialize,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<AtomicStateWriteOutcome> {
+    let serialized = serde_json::to_vec_pretty(value)
+        .map_err(|error| invalid_data(format!("failed to serialize state: {error}")))?;
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(&serialized)?;
+    file.flush()?;
+    file.sync_all()?;
+    fs::rename(temp, path)?;
+    match sync_parent(path) {
+        Ok(()) => Ok(AtomicStateWriteOutcome::Durable),
+        Err(error) => {
+            eprintln!(
+                "eidolon persistence failure: state rename committed but parent directory sync failed for `{}`: {error}",
+                path.display()
+            );
+            Ok(AtomicStateWriteOutcome::CommittedDurabilityUncertain)
+        }
+    }
+}
+
+fn sync_state_parent_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn proof_digest(proof_value: &str) -> [u8; 32] {
+    Sha256::digest(proof_value.as_bytes()).into()
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn parse_digest_hex(value: &str) -> io::Result<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_data(
+            "consumed proof digest must contain exactly 64 hexadecimal characters",
+        ));
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)
+            .map_err(|_| invalid_data("consumed proof digest is invalid hexadecimal"))?;
+    }
+    Ok(digest)
+}
+
+fn event_log_history_exists(path: &Path) -> io::Result<bool> {
+    if fs::metadata(path)
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(base_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(false);
+    };
+    match fs::read_dir(parent) {
+        Ok(entries) => Ok(entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter_map(|name| name.strip_prefix(base_name).map(str::to_string))
+            .filter_map(|suffix| suffix.strip_prefix('.').map(str::to_string))
+            .any(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 impl ConsumedBaitProofStore {
+    fn open_or_rebuild(
+        event_log_path: &Path,
+        registry: &BaitRegistry,
+        signing_secret: Option<&str>,
+        now: u64,
+    ) -> io::Result<Self> {
+        let state_path = state_path_for_event_log(event_log_path, ".consumed-proofs.json");
+        match fs::read(&state_path) {
+            Ok(bytes) => Self::from_state_bytes(state_path, &bytes, now),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let history_exists = event_log_history_exists(event_log_path)?;
+                let mut store =
+                    Self::from_event_log(event_log_path, registry, signing_secret, now)?;
+                store.path = Some(state_path);
+                if history_exists {
+                    store.migration_quarantine_until =
+                        Some(now.saturating_add(MAX_BAIT_PROOF_TTL_SECS));
+                }
+                store.persist()?;
+                Ok(store)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn from_state_bytes(path: PathBuf, bytes: &[u8], now: u64) -> io::Result<Self> {
+        let stored: StoredConsumedProofState = serde_json::from_slice(bytes).map_err(|error| {
+            invalid_data(format!(
+                "failed to parse consumed proof state `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        if stored.schema_version != CONSUMED_PROOF_STATE_SCHEMA_VERSION {
+            return Err(invalid_data(format!(
+                "unsupported consumed proof state schema version {}",
+                stored.schema_version
+            )));
+        }
+        let mut consumed = HashMap::new();
+        for record in stored.consumed {
+            if record.expires_at_unix_secs <= now {
+                continue;
+            }
+            if record.expires_at_unix_secs.saturating_sub(now) > MAX_BAIT_PROOF_TTL_SECS {
+                return Err(invalid_data(
+                    "consumed proof state contains an expiry beyond the maximum proof lifetime",
+                ));
+            }
+            let key = (
+                record.session_id,
+                record.bait_id,
+                parse_digest_hex(&record.proof_digest_hex)?,
+            );
+            consumed
+                .entry(key)
+                .and_modify(|expiry: &mut u64| {
+                    *expiry = (*expiry).max(record.expires_at_unix_secs);
+                })
+                .or_insert(record.expires_at_unix_secs);
+            if consumed.len() > MAX_CONSUMED_BAIT_PROOFS {
+                return Err(invalid_data(
+                    "active consumed bait proof state exceeds configured capacity",
+                ));
+            }
+        }
+        let migration_quarantine_until = stored
+            .migration_quarantine_until
+            .filter(|until| *until > now);
+        let store = Self {
+            path: Some(path),
+            consumed,
+            migration_quarantine_until,
+            torn_tail_line: None,
+        };
+        store.persist()?;
+        Ok(store)
+    }
+
     fn from_event_log(
         path: &Path,
         registry: &BaitRegistry,
@@ -1224,7 +1506,7 @@ impl ConsumedBaitProofStore {
             if expires_at <= now {
                 continue;
             }
-            let key = (event.session_id, bait_id, proof_value);
+            let key = (event.session_id, bait_id, proof_digest(&proof_value));
             if let Some(existing_expiry) = store.consumed.get_mut(&key) {
                 *existing_expiry = expires_at;
                 continue;
@@ -1247,16 +1529,101 @@ impl ConsumedBaitProofStore {
         expires_at: u64,
         now: u64,
     ) -> ConsumeProofOutcome {
-        let key = (session_id, bait_id, proof_value);
-        self.consumed.retain(|_, expiry| *expiry > now);
-        if self.consumed.contains_key(&key) {
+        self.check_and_mark_with_persist(
+            session_id,
+            bait_id,
+            proof_value,
+            expires_at,
+            now,
+            Self::persist,
+        )
+    }
+
+    fn check_and_mark_with_persist(
+        &mut self,
+        session_id: SessionId,
+        bait_id: BaitId,
+        proof_value: String,
+        expires_at: u64,
+        now: u64,
+        persist: impl FnOnce(&Self) -> io::Result<AtomicStateWriteOutcome>,
+    ) -> ConsumeProofOutcome {
+        if expires_at <= now || expires_at.saturating_sub(now) > MAX_BAIT_PROOF_TTL_SECS {
+            return ConsumeProofOutcome::Unavailable;
+        }
+        let key = (session_id, bait_id, proof_digest(&proof_value));
+        let mut next = self.consumed.clone();
+        next.retain(|_, expiry| *expiry > now);
+        if next.contains_key(&key) {
+            self.consumed = next;
             return ConsumeProofOutcome::Replay;
         }
-        if self.consumed.len() >= MAX_CONSUMED_BAIT_PROOFS {
+        if self
+            .migration_quarantine_until
+            .is_some_and(|until| until > now)
+        {
+            self.consumed = next;
+            return ConsumeProofOutcome::Unavailable;
+        }
+        if next.len() >= MAX_CONSUMED_BAIT_PROOFS {
+            self.consumed = next;
             return ConsumeProofOutcome::CapacityExceeded;
         }
-        self.consumed.insert(key, expires_at);
-        ConsumeProofOutcome::Fresh
+        next.insert(key, expires_at);
+        let previous = std::mem::replace(&mut self.consumed, next);
+        let previous_quarantine = self.migration_quarantine_until.take();
+        match persist(self) {
+            Ok(AtomicStateWriteOutcome::Durable) => ConsumeProofOutcome::Fresh,
+            Ok(AtomicStateWriteOutcome::CommittedDurabilityUncertain) => {
+                ConsumeProofOutcome::Unavailable
+            }
+            Err(error) => {
+                self.consumed = previous;
+                self.migration_quarantine_until = previous_quarantine;
+                eprintln!("eidolon persistence failure: consumed proof state: {error}");
+                ConsumeProofOutcome::Unavailable
+            }
+        }
+    }
+
+    fn persist(&self) -> io::Result<AtomicStateWriteOutcome> {
+        let Some(path) = &self.path else {
+            return Ok(AtomicStateWriteOutcome::Durable);
+        };
+        let mut consumed: Vec<_> = self
+            .consumed
+            .iter()
+            .map(
+                |((session_id, bait_id, proof_digest), expires_at_unix_secs)| StoredConsumedProof {
+                    session_id: *session_id,
+                    bait_id: bait_id.clone(),
+                    proof_digest_hex: digest_hex(proof_digest),
+                    expires_at_unix_secs: *expires_at_unix_secs,
+                },
+            )
+            .collect();
+        consumed.sort_by(|left, right| {
+            (
+                left.expires_at_unix_secs,
+                left.session_id.0,
+                left.bait_id.0.as_str(),
+                left.proof_digest_hex.as_str(),
+            )
+                .cmp(&(
+                    right.expires_at_unix_secs,
+                    right.session_id.0,
+                    right.bait_id.0.as_str(),
+                    right.proof_digest_hex.as_str(),
+                ))
+        });
+        atomic_state_write(
+            path,
+            &StoredConsumedProofState {
+                schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                migration_quarantine_until: self.migration_quarantine_until,
+                consumed,
+            },
+        )
     }
 }
 
@@ -1282,17 +1649,77 @@ fn proof_expiry_epoch_seconds(bait: &Bait, proof_value: &str) -> io::Result<u64>
 }
 
 impl BaitExposureStore {
+    fn open_or_rebuild(event_log_path: &Path, now: u64) -> io::Result<Self> {
+        let state_path = state_path_for_event_log(event_log_path, ".exposures.json");
+        match fs::read(&state_path) {
+            Ok(bytes) => {
+                let store = Self::from_state_bytes(state_path, &bytes, now)?;
+                store.persist()?;
+                Ok(store)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut store = Self::from_event_log_at(event_log_path, now)?;
+                store.path = Some(state_path);
+                store.persist()?;
+                Ok(store)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn from_state_bytes(path: PathBuf, bytes: &[u8], now: u64) -> io::Result<Self> {
+        let stored: StoredBaitExposureState = serde_json::from_slice(bytes).map_err(|error| {
+            invalid_data(format!(
+                "failed to parse bait exposure state `{}`: {error}",
+                path.display()
+            ))
+        })?;
+        if stored.schema_version != BAIT_EXPOSURE_STATE_SCHEMA_VERSION {
+            return Err(invalid_data(format!(
+                "unsupported bait exposure state schema version {}",
+                stored.schema_version
+            )));
+        }
+        let mut store = Self {
+            path: None,
+            ..Self::default()
+        };
+        let mut records = stored.exposures;
+        records.sort_by_key(|record| (record.observed_at_unix_secs, record.session_id.0));
+        for record in records {
+            store.apply_record_exposure_at(
+                record.session_id,
+                record.bait_id,
+                record.exposure_id,
+                record.observed_at_unix_secs,
+                now,
+            );
+        }
+        store.path = Some(path);
+        Ok(store)
+    }
+
+    #[cfg(test)]
     fn from_event_log(path: &Path) -> io::Result<Self> {
+        Self::from_event_log_at(path, current_unix_secs())
+    }
+
+    fn from_event_log_at(path: &Path, now: u64) -> io::Result<Self> {
         let file = match fs::File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => return Err(error),
         };
 
-        Self::from_event_log_reader(BufReader::new(file))
+        Self::from_event_log_reader_at(BufReader::new(file), now)
     }
 
+    #[cfg(test)]
     fn from_event_log_reader(reader: impl BufRead) -> io::Result<Self> {
+        Self::from_event_log_reader_at(reader, current_unix_secs())
+    }
+
+    fn from_event_log_reader_at(reader: impl BufRead, now: u64) -> io::Result<Self> {
         let source = read_jsonl_reconstruction(reader)?;
         let mut store = Self::default();
         let mut torn_tail_line = None;
@@ -1344,7 +1771,15 @@ impl BaitExposureStore {
                 ..
             } = event.kind
             {
-                store.record_exposure(event.session_id, bait_id, exposure_id);
+                let observed_at_unix_secs =
+                    u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
+                store.apply_record_exposure_at(
+                    event.session_id,
+                    bait_id,
+                    exposure_id,
+                    observed_at_unix_secs,
+                    now,
+                );
             }
         }
 
@@ -1356,9 +1791,96 @@ impl BaitExposureStore {
         self.exposures.len()
     }
 
-    fn record_exposure(&mut self, session_id: SessionId, bait_id: BaitId, exposure_id: ExposureId) {
+    #[cfg(test)]
+    fn record_exposure(
+        &mut self,
+        session_id: SessionId,
+        bait_id: BaitId,
+        exposure_id: ExposureId,
+    ) -> io::Result<()> {
+        let now = current_unix_secs();
+        self.record_exposure_at(session_id, bait_id, exposure_id, now, now)
+    }
+
+    fn record_exposure_at(
+        &mut self,
+        session_id: SessionId,
+        bait_id: BaitId,
+        exposure_id: ExposureId,
+        observed_at_unix_secs: u64,
+        now: u64,
+    ) -> io::Result<()> {
+        self.record_exposure_at_with_persist(
+            session_id,
+            bait_id,
+            exposure_id,
+            observed_at_unix_secs,
+            now,
+            Self::persist,
+        )
+    }
+
+    fn record_exposure_at_with_persist(
+        &mut self,
+        session_id: SessionId,
+        bait_id: BaitId,
+        exposure_id: ExposureId,
+        observed_at_unix_secs: u64,
+        now: u64,
+        persist: impl FnOnce(&Self) -> io::Result<AtomicStateWriteOutcome>,
+    ) -> io::Result<()> {
+        let previous_exposures = self.exposures.clone();
+        let previous_order = self.exposure_order.clone();
+        let previous_ttl_evicted = self.ttl_evicted;
+        self.apply_record_exposure_at(session_id, bait_id, exposure_id, observed_at_unix_secs, now);
+        match persist(self) {
+            Ok(
+                AtomicStateWriteOutcome::Durable
+                | AtomicStateWriteOutcome::CommittedDurabilityUncertain,
+            ) => Ok(()),
+            Err(error) => {
+                self.exposures = previous_exposures;
+                self.exposure_order = previous_order;
+                self.ttl_evicted = previous_ttl_evicted;
+                eprintln!("eidolon persistence failure: bait exposure state: {error}");
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_record_exposure_at(
+        &mut self,
+        session_id: SessionId,
+        bait_id: BaitId,
+        exposure_id: ExposureId,
+        observed_at_unix_secs: u64,
+        now: u64,
+    ) {
+        self.prune_expired(now);
+        if observed_at_unix_secs.saturating_add(BAIT_EXPOSURE_TTL_SECS) <= now {
+            self.ttl_evicted += 1;
+            return;
+        }
+
         let key = (session_id, bait_id);
-        if self.exposures.insert(key.clone(), exposure_id).is_some() {
+        if self
+            .exposures
+            .get(&key)
+            .is_some_and(|existing| existing.observed_at_unix_secs > observed_at_unix_secs)
+        {
+            return;
+        }
+        if self
+            .exposures
+            .insert(
+                key.clone(),
+                BaitExposureRecord {
+                    exposure_id,
+                    observed_at_unix_secs,
+                },
+            )
+            .is_some()
+        {
             self.exposure_order.retain(|existing| existing != &key);
         }
         self.exposure_order.push_back(key);
@@ -1371,8 +1893,80 @@ impl BaitExposureStore {
     }
 
     fn exposure_for_action(&self, session_id: SessionId, bait_id: &BaitId) -> Option<ExposureId> {
-        self.exposures.get(&(session_id, bait_id.clone())).cloned()
+        self.exposure_for_action_at(session_id, bait_id, current_unix_secs())
     }
+
+    fn exposure_for_action_at(
+        &self,
+        session_id: SessionId,
+        bait_id: &BaitId,
+        now: u64,
+    ) -> Option<ExposureId> {
+        self.exposures
+            .get(&(session_id, bait_id.clone()))
+            .filter(|record| {
+                record
+                    .observed_at_unix_secs
+                    .saturating_add(BAIT_EXPOSURE_TTL_SECS)
+                    > now
+            })
+            .map(|record| record.exposure_id.clone())
+    }
+
+    fn prune_expired(&mut self, now: u64) {
+        let before = self.exposures.len();
+        self.exposures.retain(|_, record| {
+            record
+                .observed_at_unix_secs
+                .saturating_add(BAIT_EXPOSURE_TTL_SECS)
+                > now
+        });
+        self.ttl_evicted += before - self.exposures.len();
+        self.exposure_order
+            .retain(|key| self.exposures.contains_key(key));
+    }
+
+    fn persist(&self) -> io::Result<AtomicStateWriteOutcome> {
+        let Some(path) = &self.path else {
+            return Ok(AtomicStateWriteOutcome::Durable);
+        };
+        let mut exposures: Vec<_> = self
+            .exposures
+            .iter()
+            .map(|((session_id, bait_id), record)| StoredBaitExposure {
+                session_id: *session_id,
+                bait_id: bait_id.clone(),
+                exposure_id: record.exposure_id.clone(),
+                observed_at_unix_secs: record.observed_at_unix_secs,
+            })
+            .collect();
+        exposures.sort_by(|left, right| {
+            (
+                left.observed_at_unix_secs,
+                left.session_id.0,
+                left.bait_id.0.as_str(),
+            )
+                .cmp(&(
+                    right.observed_at_unix_secs,
+                    right.session_id.0,
+                    right.bait_id.0.as_str(),
+                ))
+        });
+        atomic_state_write(
+            path,
+            &StoredBaitExposureState {
+                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                exposures,
+            },
+        )
+    }
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1689,6 +2283,14 @@ fn validate_optional_header_value_mint(
     if mint.proof_window_seconds == Some(0) {
         return Err(ConfigError::new(format!(
             "{label}.proof_window_seconds must be greater than zero"
+        )));
+    }
+    if mint
+        .proof_window_seconds
+        .is_some_and(|window| window > MAX_BAIT_PROOF_TTL_SECS)
+    {
+        return Err(ConfigError::new(format!(
+            "{label}.proof_window_seconds must not exceed {MAX_BAIT_PROOF_TTL_SECS}"
         )));
     }
     Ok(())
@@ -2389,7 +2991,39 @@ fn handle_connection(
         client_peer_ip,
         request_id,
     )?;
-    let mut policy_state = policy_state_for_session(runtime, session.session_id)?;
+    let (mut policy_state, capacity_fail_closed) =
+        policy_state_resolution_for_session(runtime, session.session_id)?;
+    if capacity_fail_closed {
+        write_debug(
+            runtime,
+            "policy_capacity_fail_closed",
+            Some(session.session_id),
+            json!({
+                "request_id": request_id.0,
+                "policy_state": policy_state,
+                "max_sessions": eidolon_proxy::policy_store::MAX_POLICY_SESSIONS,
+            }),
+        )?;
+        let decision = policy::PolicyDecision::new(
+            PolicyState::Blocked,
+            RoutingDecision::EidolonOwned,
+            "policy state capacity saturated; unknown session failed closed",
+        );
+        return write_direct_response(DirectResponseContext {
+            client_stream,
+            runtime,
+            session: &session,
+            request: &request,
+            path: &path,
+            request_id,
+            decision: &decision,
+            discovery_recon_score: policy::DiscoveryReconAggregationScore::default(),
+            discovery_recon_threshold: policy::discovery_recon_aggregation_score_threshold(),
+            response: surface_text_response(503, "service temporarily unavailable\n"),
+            intervention_mode,
+            surface_requested_intervention: true,
+        });
+    }
     if let Some(floor) = session.enforcement_floor {
         if enforcement_rank(floor) > enforcement_rank(policy_state) {
             write_debug(
@@ -2914,6 +3548,9 @@ fn handle_connection(
                     ConsumeProofOutcome::Replay => BaitHeaderValueMintStatus::ReplaySeen,
                     ConsumeProofOutcome::CapacityExceeded => {
                         BaitHeaderValueMintStatus::ReplayStateCapacityExceeded
+                    }
+                    ConsumeProofOutcome::Unavailable => {
+                        BaitHeaderValueMintStatus::ReplayStateUnavailable
                     }
                 });
             }
@@ -3694,6 +4331,13 @@ fn policy_state_for_session(
     runtime: &ProxyRuntime,
     session_id: SessionId,
 ) -> io::Result<PolicyState> {
+    policy_state_resolution_for_session(runtime, session_id).map(|(state, _)| state)
+}
+
+fn policy_state_resolution_for_session(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+) -> io::Result<(PolicyState, bool)> {
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -3702,9 +4346,12 @@ fn policy_state_for_session(
         .policy_store
         .lock()
         .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
-    store.note_session_seen(session_id, now_unix_secs);
+    store.note_session_seen(session_id, now_unix_secs)?;
 
-    Ok(store.policy_state(session_id))
+    Ok((
+        store.policy_state(session_id),
+        store.uses_fail_closed_fallback(session_id),
+    ))
 }
 
 /// Best-effort enforcement-floor feedback for peer continuity. The policy
@@ -3994,28 +4641,33 @@ fn write_bait_exposed_event(
 ) -> io::Result<ExposureId> {
     let exposure_id = ExposureId(format!("exp-{}", SessionId::new().0));
     let surface = surface.into();
+    let event = Event::new(
+        session.session_id,
+        EventSource::SurfaceController,
+        policy_state,
+        EventKind::BaitExposed {
+            bait_id: bait.id.clone(),
+            exposure_id: exposure_id.clone(),
+            surface: redacted_event_target(&surface),
+            header_value_mint: bait.header_value_mint_audit(),
+        },
+    )
+    .with_request_id(request_id);
+    let observed_at_unix_secs = u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
     let mut exposures = runtime
         .bait_exposures
         .lock()
         .map_err(|_| io::Error::other("bait exposure store lock poisoned"))?;
 
-    write_event(
-        &runtime.event_log,
-        &Event::new(
-            session.session_id,
-            EventSource::SurfaceController,
-            policy_state,
-            EventKind::BaitExposed {
-                bait_id: bait.id.clone(),
-                exposure_id: exposure_id.clone(),
-                surface: redacted_event_target(&surface),
-                header_value_mint: bait.header_value_mint_audit(),
-            },
-        )
-        .with_request_id(request_id),
-    )?;
+    write_event(&runtime.event_log, &event)?;
 
-    exposures.record_exposure(session.session_id, bait.id.clone(), exposure_id.clone());
+    exposures.record_exposure_at(
+        session.session_id,
+        bait.id.clone(),
+        exposure_id.clone(),
+        observed_at_unix_secs,
+        current_unix_secs(),
+    )?;
     write_debug(
         runtime,
         "bait_exposed",
@@ -4757,10 +5409,14 @@ fn apply_response_headers(
 }
 
 fn write_event(log: &Arc<Mutex<FileEventLogWriter>>, event: &Event) -> io::Result<()> {
-    let mut log = log
+    let result = log
         .lock()
-        .map_err(|_| io::Error::other("event log lock poisoned"))?;
-    log.write_event(event)
+        .map_err(|_| io::Error::other("event log lock poisoned"))
+        .and_then(|mut log| log.write_event(event));
+    if let Err(error) = &result {
+        eprintln!("eidolon persistence failure: event log: {error}");
+    }
+    result
 }
 
 fn effective_session_context(
@@ -4960,10 +5616,14 @@ fn write_debug(
         "fields": fields,
     });
 
-    let mut log = log
+    let result = log
         .lock()
-        .map_err(|_| io::Error::other("debug log lock poisoned"))?;
-    log.write_record(&record)
+        .map_err(|_| io::Error::other("debug log lock poisoned"))
+        .and_then(|mut log| log.write_record(&record));
+    if let Err(error) = &result {
+        eprintln!("eidolon persistence failure: debug log: {error}");
+    }
+    result
 }
 
 fn debug_path(target: &str) -> String {
@@ -7621,6 +8281,21 @@ mod tests {
     }
 
     #[test]
+    fn minted_bait_profile_rejects_proof_windows_beyond_replay_retention() {
+        let profile = session_minted_profile_json().replace(
+            "\"proof_window_seconds\": 60",
+            &format!("\"proof_window_seconds\": {}", MAX_BAIT_PROOF_TTL_SECS + 1),
+        );
+        let path = write_bait_profile(&profile);
+
+        let error = load_bait_profile(&path).expect_err("overlong proof window must fail");
+
+        assert!(error
+            .to_string()
+            .contains("proof_window_seconds must not exceed"));
+    }
+
+    #[test]
     fn javascript_bait_uses_json_escaped_values() {
         let bait = Bait {
             id: BaitId("js_escape".to_string()),
@@ -7954,7 +8629,7 @@ mod tests {
                     (
                         SessionId::new(),
                         BaitId(format!("bait-{index}")),
-                        format!("proof-{index}"),
+                        proof_digest(&format!("proof-{index}")),
                     ),
                     u64::MAX,
                 );
@@ -8026,7 +8701,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let restored = ConsumedBaitProofStore::from_event_log(
+        let restored = ConsumedBaitProofStore::open_or_rebuild(
             &event_log,
             &loaded.registry,
             Some(secret.as_ref()),
@@ -8061,6 +8736,62 @@ mod tests {
             "replay_seen"
         );
         assert!(actions[1]["kind"]["exposure_id"].is_null());
+    }
+
+    #[test]
+    fn runtime_replay_persistence_failure_fails_closed_without_upstream_request() {
+        let path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&path).expect("profile");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("bait")
+            .clone();
+        let secret: Arc<str> = Arc::from("mint-secret");
+        let session = SessionId::new();
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
+            .expect("render")
+            .into_owned();
+        let name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("name")
+            .to_string();
+        let value = rendered.expected_action.header_value.expect("value");
+        let event_log = unique_temp_path("proof-persistence-failure-events.jsonl");
+        let (upstream, recorder) = spawn_recording_upstream([json_response(r#"{"unexpected":1}"#)]);
+        let mut runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log,
+            unique_temp_path("proof-persistence-failure-control.txt"),
+            loaded,
+            Some(secret),
+        );
+        runtime.consumed_bait_proofs = Arc::new(Mutex::new(ConsumedBaitProofStore {
+            path: Some(
+                unique_temp_path("missing-proof-persistence-parent").join("proof-state.json"),
+            ),
+            ..ConsumedBaitProofStore::default()
+        }));
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &post_request_with_cookie(&bait.expected_action.path, &cookie, &[(&name, &value)]),
+        ));
+
+        assert_eq!(response.status, 403);
+        assert!(
+            recorder.finish().is_empty(),
+            "proof persistence failure reached protected upstream"
+        );
+        let action = first_event_of_type(&event_log, "bait_action_observed");
+        assert_eq!(
+            action["kind"]["header_value_mint_status"],
+            "replay_state_unavailable"
+        );
+        assert!(action["kind"]["exposure_id"].is_null());
     }
 
     #[test]
@@ -9043,18 +9774,22 @@ mod tests {
         let mut store = BaitExposureStore::default();
         let oldest_session_id = SessionId::new();
         let oldest_bait_id = BaitId("oldest".to_string());
-        store.record_exposure(
-            oldest_session_id,
-            oldest_bait_id.clone(),
-            ExposureId("oldest-exposure".to_string()),
-        );
+        store
+            .record_exposure(
+                oldest_session_id,
+                oldest_bait_id.clone(),
+                ExposureId("oldest-exposure".to_string()),
+            )
+            .expect("exposure should record");
 
         for index in 0..MAX_BAIT_EXPOSURES {
-            store.record_exposure(
-                SessionId::new(),
-                BaitId(format!("bait-{index}")),
-                ExposureId(format!("exp-{index}")),
-            );
+            store
+                .record_exposure(
+                    SessionId::new(),
+                    BaitId(format!("bait-{index}")),
+                    ExposureId(format!("exp-{index}")),
+                )
+                .expect("exposure should record");
         }
 
         assert_eq!(store.exposures.len(), MAX_BAIT_EXPOSURES);
@@ -9068,35 +9803,92 @@ mod tests {
         let mut store = BaitExposureStore::default();
         let session_id = SessionId::new();
         let bait_id = BaitId("refreshable".to_string());
-        store.record_exposure(
-            session_id,
-            bait_id.clone(),
-            ExposureId("old-exposure".to_string()),
-        );
+        store
+            .record_exposure(
+                session_id,
+                bait_id.clone(),
+                ExposureId("old-exposure".to_string()),
+            )
+            .expect("exposure should record");
 
         for index in 0..MAX_BAIT_EXPOSURES - 1 {
-            store.record_exposure(
-                SessionId::new(),
-                BaitId(format!("bait-{index}")),
-                ExposureId(format!("exp-{index}")),
-            );
+            store
+                .record_exposure(
+                    SessionId::new(),
+                    BaitId(format!("bait-{index}")),
+                    ExposureId(format!("exp-{index}")),
+                )
+                .expect("exposure should record");
         }
-        store.record_exposure(
-            session_id,
-            bait_id.clone(),
-            ExposureId("new-exposure".to_string()),
-        );
-        store.record_exposure(
-            SessionId::new(),
-            BaitId("overflow".to_string()),
-            ExposureId("overflow-exp".to_string()),
-        );
+        store
+            .record_exposure(
+                session_id,
+                bait_id.clone(),
+                ExposureId("new-exposure".to_string()),
+            )
+            .expect("exposure should record");
+        store
+            .record_exposure(
+                SessionId::new(),
+                BaitId("overflow".to_string()),
+                ExposureId("overflow-exp".to_string()),
+            )
+            .expect("exposure should record");
 
         assert_eq!(store.exposures.len(), MAX_BAIT_EXPOSURES);
         assert_eq!(
             store.exposure_for_action(session_id, &bait_id),
             Some(ExposureId("new-exposure".to_string()))
         );
+    }
+
+    #[test]
+    fn bait_exposure_store_expires_records_by_ttl() {
+        let mut store = BaitExposureStore::default();
+        let session_id = SessionId::new();
+        let bait_id = BaitId("ttl-bait".to_string());
+        let exposure_id = ExposureId("ttl-exposure".to_string());
+        let observed_at = 1_000;
+
+        store
+            .record_exposure_at(
+                session_id,
+                bait_id.clone(),
+                exposure_id.clone(),
+                observed_at,
+                observed_at,
+            )
+            .expect("exposure should record");
+
+        assert_eq!(
+            store.exposure_for_action_at(
+                session_id,
+                &bait_id,
+                observed_at + BAIT_EXPOSURE_TTL_SECS - 1,
+            ),
+            Some(exposure_id)
+        );
+        assert_eq!(
+            store.exposure_for_action_at(
+                session_id,
+                &bait_id,
+                observed_at + BAIT_EXPOSURE_TTL_SECS,
+            ),
+            None
+        );
+
+        let fresh_session = SessionId::new();
+        store
+            .record_exposure_at(
+                fresh_session,
+                BaitId("fresh".to_string()),
+                ExposureId("fresh-exposure".to_string()),
+                observed_at + BAIT_EXPOSURE_TTL_SECS,
+                observed_at + BAIT_EXPOSURE_TTL_SECS,
+            )
+            .expect("fresh exposure should record");
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.ttl_evicted, 1);
     }
 
     #[test]
@@ -9162,6 +9954,364 @@ mod tests {
             ConsumeProofOutcome::Fresh
         );
         assert_eq!(store.consumed.len(), 1);
+    }
+
+    #[test]
+    fn consumed_proof_store_persists_replay_state_without_raw_proof_values() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&profile_path).expect("profile");
+        let event_log = unique_temp_path("consumed-proof-state.jsonl");
+        let session = SessionId::new();
+        let bait = BaitId("durable-proof".to_string());
+        let proof = "secret-proof-value".to_string();
+        let state_path = state_path_for_event_log(&event_log, ".consumed-proofs.json");
+
+        let mut store =
+            ConsumedBaitProofStore::open_or_rebuild(&event_log, &loaded.registry, None, 1_000)
+                .expect("store should open");
+        assert_eq!(
+            store.check_and_mark(session, bait.clone(), proof.clone(), 1_100, 1_000),
+            ConsumeProofOutcome::Fresh
+        );
+        drop(store);
+
+        let state = fs::read_to_string(&state_path).expect("state should persist");
+        assert!(
+            !state.contains(&proof),
+            "raw proof leaked into durable state"
+        );
+        assert!(state.contains(&digest_hex(&proof_digest(&proof))));
+
+        let mut reopened =
+            ConsumedBaitProofStore::open_or_rebuild(&event_log, &loaded.registry, None, 1_001)
+                .expect("store should reopen");
+        assert_eq!(
+            reopened.check_and_mark(session, bait, proof, 1_100, 1_001),
+            ConsumeProofOutcome::Replay
+        );
+    }
+
+    #[test]
+    fn clean_first_boot_sidecars_do_not_trigger_replay_quarantine() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&profile_path).expect("profile");
+        let event_log = unique_temp_path("clean-first-boot.jsonl");
+        let exposure_store =
+            BaitExposureStore::open_or_rebuild(&event_log, 1_000).expect("exposure store");
+        assert!(exposure_store.path.is_some());
+        drop(exposure_store);
+
+        let mut proof_store =
+            ConsumedBaitProofStore::open_or_rebuild(&event_log, &loaded.registry, None, 1_000)
+                .expect("proof store");
+
+        assert_eq!(proof_store.migration_quarantine_until, None);
+        assert_eq!(
+            proof_store.check_and_mark(
+                SessionId::new(),
+                BaitId("first-proof".to_string()),
+                "proof-value".to_string(),
+                1_100,
+                1_000,
+            ),
+            ConsumeProofOutcome::Fresh
+        );
+    }
+
+    #[test]
+    fn concurrent_duplicate_proof_consumption_accepts_exactly_once() {
+        let store = Arc::new(Mutex::new(ConsumedBaitProofStore::default()));
+        let session = SessionId::new();
+        let bait = BaitId("concurrent-proof".to_string());
+        let threads = (0..8)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let bait = bait.clone();
+                thread::spawn(move || {
+                    store.lock().expect("store lock").check_and_mark(
+                        session,
+                        bait,
+                        "same-proof".to_string(),
+                        1_100,
+                        1_000,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let outcomes = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("worker should join"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == ConsumeProofOutcome::Fresh)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == ConsumeProofOutcome::Replay)
+                .count(),
+            7
+        );
+    }
+
+    #[test]
+    fn consumed_proof_store_failed_persist_is_unavailable_and_rolls_back() {
+        let missing_parent = unique_temp_path("missing-consumed-proof-parent");
+        let mut store = ConsumedBaitProofStore {
+            path: Some(missing_parent.join("state.json")),
+            ..ConsumedBaitProofStore::default()
+        };
+
+        assert_eq!(
+            store.check_and_mark(
+                SessionId::new(),
+                BaitId("proof".to_string()),
+                "proof-value".to_string(),
+                1_100,
+                1_000,
+            ),
+            ConsumeProofOutcome::Unavailable
+        );
+        assert!(store.consumed.is_empty());
+    }
+
+    #[test]
+    fn consumed_proof_store_keeps_committed_state_when_directory_sync_is_uncertain() {
+        let mut store = ConsumedBaitProofStore::default();
+        let session = SessionId::new();
+        let bait = BaitId("committed-proof".to_string());
+        let proof = "committed-proof-value".to_string();
+
+        assert_eq!(
+            store.check_and_mark_with_persist(
+                session,
+                bait.clone(),
+                proof.clone(),
+                1_100,
+                1_000,
+                |_| { Ok(AtomicStateWriteOutcome::CommittedDurabilityUncertain) },
+            ),
+            ConsumeProofOutcome::Unavailable
+        );
+        assert_eq!(store.consumed.len(), 1);
+        assert_eq!(
+            store.check_and_mark(session, bait, proof, 1_100, 1_001),
+            ConsumeProofOutcome::Replay
+        );
+    }
+
+    #[test]
+    fn consumed_proof_store_migration_quarantine_survives_restart() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&profile_path).expect("profile");
+        let event_log = unique_temp_path("consumed-proof-migration.jsonl");
+        let session = SessionId::new();
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait")
+            .clone();
+        let now = 1_200;
+        let rendered =
+            eidolon_bait::render_bait_for_session_at(&bait, session, Some("mint-secret"), now)
+                .expect("proof should render")
+                .into_owned();
+        let known_proof = rendered.expected_action.header_value.expect("proof value");
+        let known_expiry =
+            proof_expiry_epoch_seconds(&bait, &known_proof).expect("proof expiry should parse");
+        let mut accepted = Event::new(
+            session,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: bait.id.clone(),
+                exposure_id: None,
+                method: "POST".to_string(),
+                path: bait.expected_action.path.clone(),
+                header_value_mint: bait.header_value_mint_audit(),
+                header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            },
+        );
+        accepted.observed_at = chrono::DateTime::from_timestamp(now as i64, 0).expect("timestamp");
+        fs::write(
+            &event_log,
+            format!(
+                "{}\n",
+                serde_json::to_string(&accepted).expect("event should serialize")
+            ),
+        )
+        .expect("history should write");
+        let unknown_proof = "unknown-proof".to_string();
+        let quarantine_until = now + MAX_BAIT_PROOF_TTL_SECS;
+
+        let mut store = ConsumedBaitProofStore::open_or_rebuild(
+            &event_log,
+            &loaded.registry,
+            Some("mint-secret"),
+            now,
+        )
+        .expect("migration should open");
+        assert_eq!(
+            store.check_and_mark(
+                session,
+                bait.id.clone(),
+                known_proof.clone(),
+                known_expiry,
+                now,
+            ),
+            ConsumeProofOutcome::Replay
+        );
+        assert_eq!(
+            store.check_and_mark(
+                session,
+                bait.id.clone(),
+                unknown_proof.clone(),
+                now + 100,
+                now,
+            ),
+            ConsumeProofOutcome::Unavailable
+        );
+        drop(store);
+
+        let mut quarantined = ConsumedBaitProofStore::open_or_rebuild(
+            &event_log,
+            &loaded.registry,
+            Some("mint-secret"),
+            now + 1,
+        )
+        .expect("quarantine should persist");
+        assert_eq!(
+            quarantined.check_and_mark(
+                session,
+                bait.id.clone(),
+                known_proof,
+                known_expiry,
+                now + 1,
+            ),
+            ConsumeProofOutcome::Replay
+        );
+        assert_eq!(
+            quarantined.check_and_mark(
+                session,
+                bait.id.clone(),
+                unknown_proof.clone(),
+                now + 100,
+                now + 1,
+            ),
+            ConsumeProofOutcome::Unavailable
+        );
+        drop(quarantined);
+
+        let mut recovered = ConsumedBaitProofStore::open_or_rebuild(
+            &event_log,
+            &loaded.registry,
+            Some("mint-secret"),
+            quarantine_until,
+        )
+        .expect("expired quarantine should clear");
+        assert_eq!(
+            recovered.check_and_mark(
+                session,
+                bait.id,
+                unknown_proof,
+                quarantine_until + 100,
+                quarantine_until,
+            ),
+            ConsumeProofOutcome::Fresh
+        );
+    }
+
+    #[test]
+    fn consumed_proof_store_rejects_invalid_expiry_without_mutation() {
+        let mut store = ConsumedBaitProofStore::default();
+        let session = SessionId::new();
+        let bait = BaitId("proof".to_string());
+
+        assert_eq!(
+            store.check_and_mark(session, bait.clone(), "expired".to_string(), 1_000, 1_000),
+            ConsumeProofOutcome::Unavailable
+        );
+        assert_eq!(
+            store.check_and_mark(
+                session,
+                bait,
+                "overlong".to_string(),
+                1_000 + MAX_BAIT_PROOF_TTL_SECS + 1,
+                1_000,
+            ),
+            ConsumeProofOutcome::Unavailable
+        );
+        assert!(store.consumed.is_empty());
+    }
+
+    #[test]
+    fn consumed_proof_state_rejects_over_capacity_on_restart() {
+        let path = unique_temp_path("over-capacity-proof-state.json");
+        let consumed = (0..MAX_CONSUMED_BAIT_PROOFS + 1)
+            .map(|index| StoredConsumedProof {
+                session_id: SessionId::new(),
+                bait_id: BaitId(format!("bait-{index}")),
+                proof_digest_hex: digest_hex(&proof_digest(&format!("proof-{index}"))),
+                expires_at_unix_secs: 1_100,
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed,
+        })
+        .expect("state should serialize");
+
+        let error = ConsumedBaitProofStore::from_state_bytes(path, &bytes, 1_000)
+            .expect_err("over-capacity replay state must fail startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("active consumed bait proof state exceeds configured capacity"));
+    }
+
+    #[test]
+    fn atomic_state_write_supports_relative_paths() {
+        let unique = unique_temp_path("relative-state.json");
+        let relative = PathBuf::from(unique.file_name().expect("unique file name"));
+
+        atomic_state_write(&relative, &json!({"healthy": true}))
+            .expect("relative state should persist");
+
+        let stored: Value = serde_json::from_slice(
+            &fs::read(&relative).expect("relative state should be readable"),
+        )
+        .expect("relative state should parse");
+        assert_eq!(stored["healthy"], true);
+        fs::remove_file(relative).expect("relative state should remove");
+    }
+
+    #[test]
+    fn atomic_state_write_distinguishes_post_rename_sync_failure() {
+        let path = unique_temp_path("post-rename-sync-failure.json");
+
+        let outcome =
+            atomic_state_write_with_parent_sync(&path, &json!({"committed": true}), |_| {
+                Err(io::Error::other("directory sync failed"))
+            })
+            .expect("rename should commit");
+
+        assert_eq!(
+            outcome,
+            AtomicStateWriteOutcome::CommittedDurabilityUncertain
+        );
+        let stored: Value = serde_json::from_slice(
+            &fs::read(&path).expect("committed state should remain readable"),
+        )
+        .expect("committed state should parse");
+        assert_eq!(stored["committed"], true);
+        fs::remove_file(path).expect("state should remove");
     }
 
     #[test]
@@ -9295,6 +10445,202 @@ mod tests {
         assert_eq!(
             store.exposure_for_action(session_id, &other_bait_id),
             Some(other_exposure_id)
+        );
+    }
+
+    #[test]
+    fn bait_exposure_store_committed_state_survives_log_loss() {
+        let event_log = unique_temp_path("exposure-state-log-loss.jsonl");
+        let session = SessionId::new();
+        let bait = BaitId("durable-bait".to_string());
+        let exposure = ExposureId("durable-exposure".to_string());
+        let mut store =
+            BaitExposureStore::open_or_rebuild(&event_log, 1_000).expect("store should open");
+        store
+            .record_exposure_at(session, bait.clone(), exposure.clone(), 1_000, 1_000)
+            .expect("exposure should persist");
+        drop(store);
+
+        fs::write(&event_log, "\n").expect("active log should exist");
+        fs::remove_file(&event_log).expect("active log should be removable");
+        let reopened = BaitExposureStore::open_or_rebuild(&event_log, 1_001)
+            .expect("state should survive event-log rotation or loss");
+        assert_eq!(
+            reopened.exposure_for_action_at(session, &bait, 1_001),
+            Some(exposure)
+        );
+    }
+
+    #[test]
+    fn bait_exposure_state_compacts_over_capacity_on_restart() {
+        let event_log = unique_temp_path("over-capacity-exposure-state.jsonl");
+        let state_path = state_path_for_event_log(&event_log, ".exposures.json");
+        let exposures = (0..MAX_BAIT_EXPOSURES + 3)
+            .map(|index| StoredBaitExposure {
+                session_id: SessionId::new(),
+                bait_id: BaitId(format!("bait-{index}")),
+                exposure_id: ExposureId(format!("exposure-{index}")),
+                observed_at_unix_secs: 1_000 + index as u64,
+            })
+            .collect();
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&StoredBaitExposureState {
+                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                exposures,
+            })
+            .expect("state should serialize"),
+        )
+        .expect("state should write");
+
+        let store = BaitExposureStore::open_or_rebuild(&event_log, 2_000)
+            .expect("over-capacity state should compact");
+
+        assert_eq!(store.len(), MAX_BAIT_EXPOSURES);
+        let persisted: StoredBaitExposureState =
+            serde_json::from_slice(&fs::read(&state_path).expect("compacted state should read"))
+                .expect("compacted state should parse");
+        assert_eq!(persisted.exposures.len(), MAX_BAIT_EXPOSURES);
+    }
+
+    #[test]
+    fn bait_exposure_store_does_not_recover_failed_commit_from_event_log() {
+        let event_log = unique_temp_path("exposure-failed-commit.jsonl");
+        let session = SessionId::new();
+        let bait = BaitId("failed-bait".to_string());
+        let exposure = ExposureId("failed-exposure".to_string());
+        let mut store =
+            BaitExposureStore::open_or_rebuild(&event_log, 1_000).expect("store should open");
+        let committed_state_path = store.path.clone().expect("state path");
+        let mut event = Event::new(
+            session,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: bait.clone(),
+                exposure_id: exposure.clone(),
+                surface: "/docs".to_string(),
+                header_value_mint: None,
+            },
+        );
+        event.observed_at = chrono::DateTime::from_timestamp(1_000, 0).expect("timestamp");
+        fs::write(
+            &event_log,
+            format!(
+                "{}\n",
+                serde_json::to_string(&event).expect("event should serialize")
+            ),
+        )
+        .expect("event log should write");
+        store.path = Some(unique_temp_path("missing-exposure-parent").join("state.json"));
+        store
+            .record_exposure_at(session, bait.clone(), exposure, 1_000, 1_000)
+            .expect_err("state persistence should fail");
+        drop(store);
+
+        assert!(committed_state_path.exists());
+        let reopened = BaitExposureStore::open_or_rebuild(&event_log, 1_001)
+            .expect("committed state should remain authoritative");
+
+        assert_eq!(reopened.exposure_for_action_at(session, &bait, 1_001), None);
+    }
+
+    #[test]
+    fn bait_exposure_store_failed_persist_rolls_back() {
+        let missing_parent = unique_temp_path("missing-exposure-parent");
+        let mut store = BaitExposureStore {
+            path: Some(missing_parent.join("state.json")),
+            ..BaitExposureStore::default()
+        };
+
+        let error = store
+            .record_exposure_at(
+                SessionId::new(),
+                BaitId("bait".to_string()),
+                ExposureId("exposure".to_string()),
+                1_000,
+                1_000,
+            )
+            .expect_err("failed persistence must be visible");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(store.exposures.is_empty());
+        assert!(store.exposure_order.is_empty());
+    }
+
+    #[test]
+    fn bait_exposure_store_keeps_committed_state_when_directory_sync_is_uncertain() {
+        let session = SessionId::new();
+        let bait = BaitId("committed-bait".to_string());
+        let exposure = ExposureId("committed-exposure".to_string());
+        let mut store = BaitExposureStore::default();
+
+        store
+            .record_exposure_at_with_persist(
+                session,
+                bait.clone(),
+                exposure.clone(),
+                1_000,
+                1_000,
+                |_| Ok(AtomicStateWriteOutcome::CommittedDurabilityUncertain),
+            )
+            .expect("committed exposure should not roll back");
+
+        assert_eq!(
+            store.exposure_for_action_at(session, &bait, 1_001),
+            Some(exposure)
+        );
+    }
+
+    #[test]
+    fn bait_exposure_store_rebuild_discards_expired_exposures() {
+        let stale_session = SessionId::new();
+        let fresh_session = SessionId::new();
+        let now = BAIT_EXPOSURE_TTL_SECS + 1_000;
+        let mut stale = Event::new(
+            stale_session,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId("stale".to_string()),
+                exposure_id: ExposureId("stale-exposure".to_string()),
+                surface: "/docs".to_string(),
+                header_value_mint: None,
+            },
+        );
+        stale.observed_at = chrono::DateTime::from_timestamp(999, 0).expect("timestamp");
+        let mut fresh = Event::new(
+            fresh_session,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId("fresh".to_string()),
+                exposure_id: ExposureId("fresh-exposure".to_string()),
+                surface: "/docs".to_string(),
+                header_value_mint: None,
+            },
+        );
+        fresh.observed_at =
+            chrono::DateTime::from_timestamp(i64::try_from(now - 1).expect("timestamp"), 0)
+                .expect("timestamp");
+        let jsonl = [stale, fresh]
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("event should serialize"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let store =
+            BaitExposureStore::from_event_log_reader_at(Cursor::new(format!("{jsonl}\n")), now)
+                .expect("event log should rebuild");
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.ttl_evicted, 1);
+        assert!(store
+            .exposure_for_action_at(stale_session, &BaitId("stale".to_string()), now)
+            .is_none());
+        assert_eq!(
+            store.exposure_for_action_at(fresh_session, &BaitId("fresh".to_string()), now),
+            Some(ExposureId("fresh-exposure".to_string()))
         );
     }
 
@@ -15264,6 +16610,47 @@ mod tests {
     }
 
     #[test]
+    fn runtime_policy_capacity_fallback_never_reaches_upstream_even_when_disabled() {
+        let event_log_path = unique_temp_path("capacity-fail-closed-events.jsonl");
+        let policy_path = unique_temp_path("capacity-fail-closed-policy.json");
+        let intervention_path = unique_temp_path("capacity-fail-closed-control.txt");
+        fs::write(&intervention_path, b"disabled\n").expect("control file should write");
+        fs::write(
+            &policy_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+                "fail_closed_for_unknown_sessions": true,
+                "sessions": [],
+            }))
+            .expect("policy state should serialize"),
+        )
+        .expect("policy state should write");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let mut runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            intervention_path,
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.policy_store = Arc::new(Mutex::new(
+            PolicyStateStore::open(&policy_path).expect("saturated policy store should open"),
+        ));
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/ordinary")));
+        let upstream_requests = upstream_recorder.finish();
+
+        assert_eq!(response.status, 503);
+        assert!(
+            upstream_requests.is_empty(),
+            "capacity fail-closed request reached protected upstream"
+        );
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+        assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+    }
+
+    #[test]
     fn runtime_correlates_same_session_bait_action_and_does_not_forward() {
         let event_log_path = unique_temp_path("bait-action-events.jsonl");
         let (upstream, upstream_recorder) =
@@ -15365,8 +16752,9 @@ mod tests {
                 .expect("bait exposure event should write");
         }
 
-        let restored_exposures = BaitExposureStore::from_event_log(&event_log_path)
-            .expect("bait exposure store should rebuild");
+        let restored_exposures =
+            BaitExposureStore::open_or_rebuild(&event_log_path, current_unix_secs())
+                .expect("bait exposure store should rebuild");
         let runtime = test_runtime_with_m1_controller_and_bait_exposures(
             closed_upstream(),
             &event_log_path,

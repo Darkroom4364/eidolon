@@ -8,11 +8,12 @@ use std::{
 use eidolon_core::{PolicyState, SessionId};
 use serde::{Deserialize, Serialize};
 
-pub const POLICY_STORE_SCHEMA_VERSION: u16 = 1;
+pub const POLICY_STORE_SCHEMA_VERSION: u16 = 2;
+const MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION: u16 = 1;
 
-/// Maximum retained session policy records. Enforcement states (rate
-/// limited, controlled reality, blocked) are never evicted for cardinality;
-/// lower rungs are evicted oldest-first once TTL and cardinality apply.
+/// Maximum retained session policy records. If enforcement-only churn reaches
+/// this bound, the store becomes fail-closed for unknown sessions before any
+/// protected record is removed.
 pub const MAX_POLICY_SESSIONS: usize = 8192;
 
 /// Time after which a session record that never rose above `Suspicious` may
@@ -40,6 +41,7 @@ fn current_unix_secs() -> u64 {
 pub struct PolicyStateStore {
     path: Option<PathBuf>,
     records: HashMap<SessionId, SessionPolicyRecord>,
+    fail_closed_for_unknown_sessions: bool,
     last_eviction: EvictionStats,
 }
 
@@ -72,12 +74,22 @@ pub struct SessionPolicyRecord {
 pub struct EvictionStats {
     pub ttl_evicted: usize,
     pub lru_evicted: usize,
-    pub protected_overflow: usize,
+    pub protected_fail_closed_evicted: usize,
+    pub fail_closed_activated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PolicyPersistOutcome {
+    Durable,
+    CommittedDurabilityUncertain,
 }
 
 impl EvictionStats {
     pub fn is_clean(&self) -> bool {
-        self.ttl_evicted == 0 && self.lru_evicted == 0 && self.protected_overflow == 0
+        self.ttl_evicted == 0
+            && self.lru_evicted == 0
+            && self.protected_fail_closed_evicted == 0
+            && !self.fail_closed_activated
     }
 }
 
@@ -108,6 +120,8 @@ impl Default for SessionPolicyRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredPolicyState {
     schema_version: u16,
+    #[serde(default)]
+    fail_closed_for_unknown_sessions: bool,
     sessions: Vec<StoredSessionPolicy>,
 }
 
@@ -146,6 +160,7 @@ impl PolicyStateStore {
         Self {
             path: None,
             records: HashMap::new(),
+            fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
         }
     }
@@ -157,20 +172,24 @@ impl PolicyStateStore {
     /// Open the store with an explicit "now" (test hook for eviction runs).
     pub fn open_at(path: impl AsRef<Path>, now: u64) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let records = match fs::read(&path) {
-            Ok(bytes) if bytes.is_empty() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("policy state store `{}` is empty", path.display()),
-                ));
-            }
-            Ok(bytes) => deserialize_records(&bytes, &path)?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => HashMap::new(),
-            Err(error) => return Err(error),
-        };
+        let (records, fail_closed_for_unknown_sessions, needs_schema_migration) =
+            match fs::read(&path) {
+                Ok(bytes) if bytes.is_empty() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("policy state store `{}` is empty", path.display()),
+                    ));
+                }
+                Ok(bytes) => deserialize_records(&bytes, &path)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    (HashMap::new(), false, false)
+                }
+                Err(error) => return Err(error),
+            };
         let mut store = Self {
             path: Some(path),
             records,
+            fail_closed_for_unknown_sessions,
             last_eviction: EvictionStats::default(),
         };
 
@@ -185,7 +204,7 @@ impl PolicyStateStore {
 
         let stats = store.evict(now);
         store.last_eviction = stats;
-        if !stats.is_clean() {
+        if !stats.is_clean() || needs_schema_migration {
             store.persist()?;
         }
 
@@ -198,9 +217,8 @@ impl PolicyStateStore {
     }
 
     /// Evict TTL-expired lower-rung records and enforce cardinality oldest-
-    /// first among evictable rungs. Enforcement states (rate limited,
-    /// controlled reality, blocked) are never evicted; their overflow is
-    /// reported instead of evicted.
+    /// first. If protected records alone exceed the bound, unknown sessions
+    /// become fail-closed before the oldest protected records are removed.
     pub fn evict(&mut self, now: u64) -> EvictionStats {
         let mut stats = EvictionStats::default();
 
@@ -208,7 +226,10 @@ impl PolicyStateStore {
             if is_eviction_protected(record.policy_state) {
                 return true;
             }
-            let fresh = record.last_seen_unix_secs + POLICY_SESSION_TTL_SECS > now;
+            let fresh = record
+                .last_seen_unix_secs
+                .saturating_add(POLICY_SESSION_TTL_SECS)
+                > now;
             if !fresh {
                 stats.ttl_evicted += 1;
             }
@@ -229,8 +250,22 @@ impl PolicyStateStore {
             stats.lru_evicted += 1;
         }
 
+        if self.activate_fail_closed_if_protected_saturated() {
+            stats.fail_closed_activated = true;
+        }
         if self.records.len() > MAX_POLICY_SESSIONS {
-            stats.protected_overflow = self.records.len() - MAX_POLICY_SESSIONS;
+            while self.records.len() > MAX_POLICY_SESSIONS {
+                let Some(oldest) = self
+                    .records
+                    .iter()
+                    .min_by_key(|(session_id, record)| (record.last_seen_unix_secs, session_id.0))
+                    .map(|(session_id, _)| *session_id)
+                else {
+                    break;
+                };
+                self.records.remove(&oldest);
+                stats.protected_fail_closed_evicted += 1;
+            }
         }
 
         stats
@@ -244,35 +279,152 @@ impl PolicyStateStore {
         self.records.is_empty()
     }
 
+    pub fn fail_closed_for_unknown_sessions(&self) -> bool {
+        self.fail_closed_for_unknown_sessions || self.is_protected_saturated()
+    }
+
+    pub fn uses_fail_closed_fallback(&self, session_id: SessionId) -> bool {
+        self.fail_closed_for_unknown_sessions() && !self.records.contains_key(&session_id)
+    }
+
     pub fn policy_state(&self, session_id: SessionId) -> PolicyState {
         self.record(session_id).policy_state
     }
 
     pub fn record(&self, session_id: SessionId) -> SessionPolicyRecord {
-        self.records.get(&session_id).copied().unwrap_or_default()
+        self.records.get(&session_id).copied().unwrap_or_else(|| {
+            if self.fail_closed_for_unknown_sessions() {
+                SessionPolicyRecord::new(PolicyState::Blocked)
+            } else {
+                SessionPolicyRecord::default()
+            }
+        })
     }
 
-    /// Refresh a session's in-memory freshness marker without persisting
-    /// (persistence of `last_seen` rides on the next mutating operation).
-    pub fn note_session_seen(&mut self, session_id: SessionId, now: u64) {
+    /// Expire stale lower-rung sessions before refreshing the current session.
+    ///
+    /// Persisting eviction before the refresh prevents an old session from
+    /// bypassing its TTL merely by returning after the window has elapsed.
+    pub fn note_session_seen(&mut self, session_id: SessionId, now: u64) -> io::Result<()> {
+        let stale = self.records.get(&session_id).is_some_and(|record| {
+            !is_eviction_protected(record.policy_state)
+                && record
+                    .last_seen_unix_secs
+                    .saturating_add(POLICY_SESSION_TTL_SECS)
+                    <= now
+        });
+        if stale {
+            let previous_record = self
+                .records
+                .remove(&session_id)
+                .expect("stale record was just observed");
+            let previous_eviction = self.last_eviction;
+            self.last_eviction = EvictionStats {
+                ttl_evicted: 1,
+                ..EvictionStats::default()
+            };
+            match self.persist() {
+                Ok(
+                    PolicyPersistOutcome::Durable
+                    | PolicyPersistOutcome::CommittedDurabilityUncertain,
+                ) => {}
+                Err(error) => {
+                    self.records.insert(session_id, previous_record);
+                    self.last_eviction = previous_eviction;
+                    eprintln!("eidolon persistence failure: policy state: {error}");
+                    return Err(error);
+                }
+            }
+            return Ok(());
+        }
         if let Some(record) = self.records.get_mut(&session_id) {
             record.last_seen_unix_secs = now;
         }
+        Ok(())
     }
 
     fn insert_record(&mut self, session_id: SessionId, record: SessionPolicyRecord) {
         let mut record = record;
         record.last_seen_unix_secs = current_unix_secs();
-        if !self.records.contains_key(&session_id) && self.records.len() >= MAX_POLICY_SESSIONS {
-            let stats = self.evict(record.last_seen_unix_secs);
-            if stats.lru_evicted > 0 {
+        let existed = match self.records.entry(session_id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(record);
+                true
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(record);
+                false
+            }
+        };
+        if existed {
+            let mut stats = EvictionStats::default();
+            if self.activate_fail_closed_if_protected_saturated() {
+                stats.fail_closed_activated = true;
                 eprintln!(
-                    "eidolon policy store: evicted {} least-recent sessions at capacity",
-                    stats.lru_evicted
+                    "eidolon policy store: protected capacity saturated; unknown sessions now fail closed"
                 );
             }
+            self.last_eviction = stats;
+            return;
         }
-        self.records.insert(session_id, record);
+
+        let mut stats = self.evict(current_unix_secs());
+        if !self.records.contains_key(&session_id) {
+            if !self.fail_closed_for_unknown_sessions {
+                self.fail_closed_for_unknown_sessions = true;
+                stats.fail_closed_activated = true;
+            }
+            eprintln!("eidolon policy store: capacity saturated; unknown sessions now fail closed");
+        } else if stats.lru_evicted > 0 {
+            eprintln!(
+                "eidolon policy store: evicted {} least-recent sessions at capacity",
+                stats.lru_evicted
+            );
+        }
+        self.last_eviction = stats;
+    }
+
+    fn is_protected_saturated(&self) -> bool {
+        self.records.len() >= MAX_POLICY_SESSIONS
+            && self
+                .records
+                .values()
+                .all(|record| is_eviction_protected(record.policy_state))
+    }
+
+    fn activate_fail_closed_if_protected_saturated(&mut self) -> bool {
+        if self.fail_closed_for_unknown_sessions || !self.is_protected_saturated() {
+            return false;
+        }
+        self.fail_closed_for_unknown_sessions = true;
+        true
+    }
+
+    fn mutate_and_persist<T>(&mut self, mutate: impl FnOnce(&mut Self) -> T) -> io::Result<T> {
+        self.mutate_and_persist_with(mutate, Self::persist)
+    }
+
+    fn mutate_and_persist_with<T>(
+        &mut self,
+        mutate: impl FnOnce(&mut Self) -> T,
+        persist: impl FnOnce(&Self) -> io::Result<PolicyPersistOutcome>,
+    ) -> io::Result<T> {
+        let previous_records = self.records.clone();
+        let previous_fail_closed = self.fail_closed_for_unknown_sessions;
+        let previous_eviction = self.last_eviction;
+        let result = mutate(self);
+        match persist(self) {
+            Ok(
+                PolicyPersistOutcome::Durable | PolicyPersistOutcome::CommittedDurabilityUncertain,
+            ) => Ok(result),
+            Err(error) => {
+                self.records = previous_records;
+                self.fail_closed_for_unknown_sessions = previous_fail_closed;
+                self.last_eviction = previous_eviction;
+                eprintln!("eidolon persistence failure: policy state: {error}");
+                Err(error)
+            }
+        }
     }
 
     pub fn set_policy_state(
@@ -280,43 +432,47 @@ impl PolicyStateStore {
         session_id: SessionId,
         policy_state: PolicyState,
     ) -> io::Result<()> {
-        let mut record = self.record(session_id);
-        if record.policy_state != policy_state {
-            record.policy_state = policy_state;
-            if policy_state != PolicyState::ControlledReality {
-                record.controlled_reality_depth = 0;
-                record.reality_escape_attempt_count = 0;
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            if record.policy_state != policy_state {
+                record.policy_state = policy_state;
+                if policy_state != PolicyState::ControlledReality {
+                    record.controlled_reality_depth = 0;
+                    record.reality_escape_attempt_count = 0;
+                }
             }
-        }
-        self.insert_record(session_id, record);
-        self.persist()
+            store.insert_record(session_id, record);
+        })
     }
 
     pub fn increment_controlled_reality_depth(&mut self, session_id: SessionId) -> io::Result<u32> {
-        let mut record = self.record(session_id);
-        record.controlled_reality_depth = record.controlled_reality_depth.saturating_add(1);
-        self.insert_record(session_id, record);
-        self.persist()?;
-        Ok(record.controlled_reality_depth)
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            record.controlled_reality_depth = record.controlled_reality_depth.saturating_add(1);
+            store.insert_record(session_id, record);
+            record.controlled_reality_depth
+        })
     }
 
     pub fn note_reality_escape_attempt(&mut self, session_id: SessionId) -> io::Result<u32> {
-        let mut record = self.record(session_id);
-        record.reality_escape_attempt_count = record.reality_escape_attempt_count.saturating_add(1);
-        self.insert_record(session_id, record);
-        self.persist()?;
-        Ok(record.reality_escape_attempt_count)
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            record.reality_escape_attempt_count =
+                record.reality_escape_attempt_count.saturating_add(1);
+            store.insert_record(session_id, record);
+            record.reality_escape_attempt_count
+        })
     }
 
     pub fn clear_reality_escape_attempts(&mut self, session_id: SessionId) -> io::Result<()> {
-        let mut record = self.record(session_id);
-        if record.reality_escape_attempt_count == 0 {
+        if self.record(session_id).reality_escape_attempt_count == 0 {
             return Ok(());
         }
-
-        record.reality_escape_attempt_count = 0;
-        self.insert_record(session_id, record);
-        self.persist()
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            record.reality_escape_attempt_count = 0;
+            store.insert_record(session_id, record);
+        })
     }
 
     pub fn note_discovery_surface_request(
@@ -326,14 +482,15 @@ impl PolicyStateStore {
         query_present: bool,
         legacy_openapi_query_seen: bool,
     ) -> io::Result<crate::policy::DiscoveryReconState> {
-        let mut record = self.record(session_id);
-        record.discovery_surface_fanout = record.discovery_surface_fanout.mark(kind);
-        record.discovery_request_count = record.discovery_request_count.saturating_add(1);
-        record.discovery_query_seen |= query_present;
-        record.discovery_legacy_openapi_query_seen |= legacy_openapi_query_seen;
-        self.insert_record(session_id, record);
-        self.persist()?;
-        Ok(discovery_recon_state(record))
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            record.discovery_surface_fanout = record.discovery_surface_fanout.mark(kind);
+            record.discovery_request_count = record.discovery_request_count.saturating_add(1);
+            record.discovery_query_seen |= query_present;
+            record.discovery_legacy_openapi_query_seen |= legacy_openapi_query_seen;
+            store.insert_record(session_id, record);
+            discovery_recon_state(record)
+        })
     }
 
     pub fn note_linked_bait_surface_request(
@@ -341,12 +498,13 @@ impl PolicyStateStore {
         session_id: SessionId,
         kind: crate::policy::LinkedBaitSurfaceKind,
     ) -> io::Result<crate::policy::DiscoveryReconState> {
-        let mut record = self.record(session_id);
-        record.discovery_linked_bait_surface_fanout =
-            record.discovery_linked_bait_surface_fanout.mark(kind);
-        self.insert_record(session_id, record);
-        self.persist()?;
-        Ok(discovery_recon_state(record))
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            record.discovery_linked_bait_surface_fanout =
+                record.discovery_linked_bait_surface_fanout.mark(kind);
+            store.insert_record(session_id, record);
+            discovery_recon_state(record)
+        })
     }
 
     pub fn note_decoy_write_probe(
@@ -354,21 +512,29 @@ impl PolicyStateStore {
         session_id: SessionId,
         kind: crate::policy::DecoyWriteProbePathKind,
     ) -> io::Result<crate::policy::DiscoveryReconState> {
-        let mut record = self.record(session_id);
-        record.discovery_decoy_write_probe_count = record
-            .discovery_decoy_write_probe_count
-            .saturating_add(1)
-            .min(crate::policy::discovery_recon_decoy_write_probe_count_cap());
-        record.discovery_decoy_write_probe_fanout =
-            record.discovery_decoy_write_probe_fanout.mark(kind);
-        self.insert_record(session_id, record);
-        self.persist()?;
-        Ok(discovery_recon_state(record))
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            record.discovery_decoy_write_probe_count = record
+                .discovery_decoy_write_probe_count
+                .saturating_add(1)
+                .min(crate::policy::discovery_recon_decoy_write_probe_count_cap());
+            record.discovery_decoy_write_probe_fanout =
+                record.discovery_decoy_write_probe_fanout.mark(kind);
+            store.insert_record(session_id, record);
+            discovery_recon_state(record)
+        })
     }
 
-    fn persist(&self) -> io::Result<()> {
+    fn persist(&self) -> io::Result<PolicyPersistOutcome> {
+        self.persist_with_parent_sync(sync_parent_directory)
+    }
+
+    fn persist_with_parent_sync(
+        &self,
+        sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> io::Result<PolicyPersistOutcome> {
         let Some(path) = &self.path else {
-            return Ok(());
+            return Ok(PolicyPersistOutcome::Durable);
         };
 
         let mut sessions: Vec<StoredSessionPolicy> = self
@@ -395,6 +561,7 @@ impl PolicyStateStore {
 
         let stored = StoredPolicyState {
             schema_version: POLICY_STORE_SCHEMA_VERSION,
+            fail_closed_for_unknown_sessions: self.fail_closed_for_unknown_sessions,
             sessions,
         };
         let serialized = serde_json::to_vec_pretty(&stored).map_err(|error| {
@@ -421,8 +588,30 @@ impl PolicyStateStore {
         file.write_all(&serialized)?;
         file.flush()?;
         file.sync_all()?;
-        fs::rename(temp_path, path)
+        fs::rename(temp_path, path)?;
+        match sync_parent(path) {
+            Ok(()) => Ok(PolicyPersistOutcome::Durable),
+            Err(error) => {
+                eprintln!(
+                    "eidolon persistence failure: policy state rename committed but parent directory sync failed for `{}`: {error}",
+                    path.display()
+                );
+                Ok(PolicyPersistOutcome::CommittedDurabilityUncertain)
+            }
+        }
     }
+}
+
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn discovery_recon_state(record: SessionPolicyRecord) -> crate::policy::DiscoveryReconState {
@@ -446,7 +635,7 @@ fn discovery_recon_state(record: SessionPolicyRecord) -> crate::policy::Discover
 fn deserialize_records(
     bytes: &[u8],
     path: &Path,
-) -> io::Result<HashMap<SessionId, SessionPolicyRecord>> {
+) -> io::Result<(HashMap<SessionId, SessionPolicyRecord>, bool, bool)> {
     let stored: StoredPolicyState = serde_json::from_slice(bytes).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -456,7 +645,9 @@ fn deserialize_records(
             ),
         )
     })?;
-    if stored.schema_version != POLICY_STORE_SCHEMA_VERSION {
+    if !(MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION..=POLICY_STORE_SCHEMA_VERSION)
+        .contains(&stored.schema_version)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -467,7 +658,13 @@ fn deserialize_records(
         ));
     }
 
-    Ok(stored
+    let needs_schema_migration = stored.schema_version != POLICY_STORE_SCHEMA_VERSION;
+    let fail_closed_for_unknown_sessions = if needs_schema_migration {
+        false
+    } else {
+        stored.fail_closed_for_unknown_sessions
+    };
+    let records = stored
         .sessions
         .into_iter()
         .map(|session| {
@@ -518,7 +715,12 @@ fn deserialize_records(
                 },
             )
         })
-        .collect())
+        .collect();
+    Ok((
+        records,
+        fail_closed_for_unknown_sessions,
+        needs_schema_migration,
+    ))
 }
 
 #[cfg(test)]
@@ -555,7 +757,7 @@ mod tests {
 
     #[test]
     fn policy_store_schema_version_matches_current_contract() {
-        assert_eq!(POLICY_STORE_SCHEMA_VERSION, 1);
+        assert_eq!(POLICY_STORE_SCHEMA_VERSION, 2);
     }
 
     fn store_with(records: Vec<(SessionId, PolicyState, u64)>) -> PolicyStateStore {
@@ -573,6 +775,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
         }
     }
@@ -624,7 +827,8 @@ mod tests {
 
         assert_eq!(store.len(), MAX_POLICY_SESSIONS);
         assert_eq!(stats.lru_evicted, 2);
-        assert_eq!(stats.protected_overflow, 0);
+        assert_eq!(stats.protected_fail_closed_evicted, 0);
+        assert!(!stats.fail_closed_activated);
         assert!(!store.records.contains_key(&oldest_observe));
         assert!(protected_ids
             .iter()
@@ -632,19 +836,145 @@ mod tests {
     }
 
     #[test]
-    fn enforcement_only_overflow_is_reported_not_evicted() {
+    fn enforcement_only_overflow_is_capped_and_unknown_sessions_fail_closed() {
         let base = 3_000;
         let records: Vec<(SessionId, PolicyState, u64)> = (0..MAX_POLICY_SESSIONS + 3)
             .map(|index| (SessionId::new(), PolicyState::Blocked, base + index as u64))
             .collect();
+        let oldest = records[0].0;
         let mut store = store_with(records);
 
         let stats = store.evict(base + 100_000);
 
         assert_eq!(stats.lru_evicted, 0);
         assert_eq!(stats.ttl_evicted, 0);
-        assert_eq!(stats.protected_overflow, 3);
-        assert_eq!(store.len(), MAX_POLICY_SESSIONS + 3);
+        assert_eq!(stats.protected_fail_closed_evicted, 3);
+        assert!(stats.fail_closed_activated);
+        assert_eq!(store.len(), MAX_POLICY_SESSIONS);
+        assert!(store.fail_closed_for_unknown_sessions());
+        assert!(!store.records.contains_key(&oldest));
+        assert_eq!(store.policy_state(oldest), PolicyState::Blocked);
+        assert_eq!(store.policy_state(SessionId::new()), PolicyState::Blocked);
+    }
+
+    #[test]
+    fn exact_protected_capacity_fails_closed_without_exceeding_the_bound() {
+        let records = (0..MAX_POLICY_SESSIONS)
+            .map(|index| (SessionId::new(), PolicyState::Blocked, 3_000 + index as u64))
+            .collect();
+        let mut store = store_with(records);
+
+        let stats = store.evict(100_000);
+
+        assert_eq!(store.len(), MAX_POLICY_SESSIONS);
+        assert_eq!(stats.protected_fail_closed_evicted, 0);
+        assert!(stats.fail_closed_activated);
+        assert!(store.fail_closed_for_unknown_sessions());
+        assert!(store.uses_fail_closed_fallback(SessionId::new()));
+    }
+
+    #[test]
+    fn last_evictable_record_becoming_protected_activates_fail_closed() {
+        let mutable_session = SessionId::new();
+        let mut records = (0..MAX_POLICY_SESSIONS - 1)
+            .map(|index| (SessionId::new(), PolicyState::Blocked, 4_000 + index as u64))
+            .collect::<Vec<_>>();
+        records.push((mutable_session, PolicyState::Observe, 10_000));
+        let mut store = store_with(records);
+
+        store
+            .set_policy_state(mutable_session, PolicyState::Blocked)
+            .expect("state should update");
+
+        assert_eq!(store.len(), MAX_POLICY_SESSIONS);
+        assert!(store.fail_closed_for_unknown_sessions());
+        assert!(store.uses_fail_closed_fallback(SessionId::new()));
+    }
+
+    #[test]
+    fn full_protected_store_rejects_new_lower_state_without_becoming_unbounded() {
+        let records = (0..MAX_POLICY_SESSIONS)
+            .map(|index| (SessionId::new(), PolicyState::Blocked, 4_000 + index as u64))
+            .collect();
+        let mut store = store_with(records);
+        let new_session = SessionId::new();
+
+        store
+            .set_policy_state(new_session, PolicyState::Suspicious)
+            .expect("in-memory mutation should succeed");
+
+        assert_eq!(store.len(), MAX_POLICY_SESSIONS);
+        assert!(store.fail_closed_for_unknown_sessions());
+        assert!(!store.records.contains_key(&new_session));
+        assert_eq!(store.policy_state(new_session), PolicyState::Blocked);
+    }
+
+    #[test]
+    fn fail_closed_saturation_survives_restart() {
+        let path = unique_temp_path("fail-closed-roundtrip");
+        let records = (0..MAX_POLICY_SESSIONS)
+            .map(|index| (SessionId::new(), PolicyState::Blocked, 5_000 + index as u64))
+            .collect();
+        let mut store = store_with(records);
+        store.path = Some(path.clone());
+        let stats = store.evict(100_000);
+        assert!(stats.fail_closed_activated);
+        store.persist().expect("saturated state should persist");
+
+        let reopened = PolicyStateStore::open(&path).expect("saturated store should reopen");
+
+        assert!(reopened.fail_closed_for_unknown_sessions());
+        assert_eq!(
+            reopened.policy_state(SessionId::new()),
+            PolicyState::Blocked
+        );
+        fs::remove_file(path).expect("store should remove");
+    }
+
+    #[test]
+    fn legacy_overlimit_protected_state_migrates_bounded_and_fail_closed() {
+        let path = unique_temp_path("legacy-overlimit");
+        let sessions = (0..MAX_POLICY_SESSIONS + 3)
+            .map(|index| {
+                serde_json::json!({
+                    "session_id": SessionId::new().0,
+                    "policy_state": "blocked",
+                    "controlled_reality_depth": 0,
+                    "last_seen_unix_secs": 6_000 + index as u64,
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "sessions": sessions,
+            }))
+            .expect("legacy state should serialize"),
+        )
+        .expect("legacy state should write");
+
+        let migrated = PolicyStateStore::open_at(&path, 100_000).expect("legacy state should open");
+
+        assert_eq!(migrated.len(), MAX_POLICY_SESSIONS);
+        assert!(migrated.fail_closed_for_unknown_sessions());
+        assert_eq!(
+            migrated.policy_state(SessionId::new()),
+            PolicyState::Blocked
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("migrated state should read"))
+                .expect("migrated state should parse");
+        assert_eq!(persisted["schema_version"], POLICY_STORE_SCHEMA_VERSION);
+        assert_eq!(persisted["fail_closed_for_unknown_sessions"], true);
+        assert_eq!(
+            persisted["sessions"]
+                .as_array()
+                .expect("sessions should be an array")
+                .len(),
+            MAX_POLICY_SESSIONS
+        );
+        fs::remove_file(path).expect("store should remove");
     }
 
     #[test]
@@ -672,6 +1002,10 @@ mod tests {
 
         assert_eq!(store.record(session_id).last_seen_unix_secs, now);
         assert_eq!(store.policy_state(session_id), PolicyState::Observe);
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("migrated store should read"))
+                .expect("migrated store should parse");
+        assert_eq!(migrated["schema_version"], POLICY_STORE_SCHEMA_VERSION);
     }
 
     #[test]
@@ -695,9 +1029,52 @@ mod tests {
         let session_id = SessionId::new();
         let mut store = store_with(vec![(session_id, PolicyState::Observe, 100)]);
 
-        store.note_session_seen(session_id, 500);
+        store
+            .note_session_seen(session_id, 500)
+            .expect("freshness update should succeed");
 
         assert_eq!(store.record(session_id).last_seen_unix_secs, 500);
+    }
+
+    #[test]
+    fn note_session_seen_expires_returning_stale_session_before_refresh() {
+        let path = unique_temp_path("returning-stale-session");
+        let session_id = SessionId::new();
+        let mut store = store_with(vec![(session_id, PolicyState::Suspicious, 100)]);
+        store.path = Some(path.clone());
+        store.persist().expect("initial state should persist");
+        let now = 100 + POLICY_SESSION_TTL_SECS;
+
+        store
+            .note_session_seen(session_id, now)
+            .expect("stale eviction should persist");
+
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.policy_state(session_id), PolicyState::Observe);
+        let reopened = PolicyStateStore::open_at(&path, now).expect("store should reopen");
+        assert_eq!(reopened.len(), 0);
+        fs::remove_file(path).expect("store should remove");
+    }
+
+    #[test]
+    fn stale_session_eviction_rolls_back_when_persistence_fails() {
+        let parent = unique_temp_path("stale-eviction-removed-parent");
+        fs::create_dir(&parent).expect("parent should create");
+        let path = parent.join("policy.json");
+        let session_id = SessionId::new();
+        let mut store = store_with(vec![(session_id, PolicyState::Suspicious, 100)]);
+        store.path = Some(path.clone());
+        store.persist().expect("initial state should persist");
+        fs::remove_file(path).expect("state should remove");
+        fs::remove_dir(parent).expect("parent should remove");
+
+        store
+            .note_session_seen(session_id, 100 + POLICY_SESSION_TTL_SECS)
+            .expect_err("stale eviction persistence should fail");
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.policy_state(session_id), PolicyState::Suspicious);
+        assert_eq!(store.record(session_id).last_seen_unix_secs, 100);
     }
 
     #[test]
@@ -723,6 +1100,49 @@ mod tests {
             reopened.policy_state(session_id),
             PolicyState::ControlledReality
         );
+    }
+
+    #[test]
+    fn failed_persist_rolls_back_in_memory_state() {
+        let parent = unique_temp_path("removed-parent");
+        fs::create_dir(&parent).expect("parent should create");
+        let path = parent.join("policy.json");
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        fs::remove_dir(&parent).expect("empty parent should remove");
+        let session_id = SessionId::new();
+
+        store
+            .set_policy_state(session_id, PolicyState::Blocked)
+            .expect_err("persistence should fail after parent removal");
+
+        assert!(store.is_empty());
+        assert_eq!(store.policy_state(session_id), PolicyState::Observe);
+        assert!(!store.fail_closed_for_unknown_sessions());
+    }
+
+    #[test]
+    fn committed_directory_sync_failure_keeps_policy_memory_and_disk_aligned() {
+        let path = unique_temp_path("committed-directory-sync-failure");
+        let session_id = SessionId::new();
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+
+        store
+            .mutate_and_persist_with(
+                |store| {
+                    store.insert_record(session_id, SessionPolicyRecord::new(PolicyState::Blocked));
+                },
+                |store| {
+                    store.persist_with_parent_sync(|_| {
+                        Err(io::Error::other("directory sync failed"))
+                    })
+                },
+            )
+            .expect("committed mutation should remain active");
+
+        assert_eq!(store.policy_state(session_id), PolicyState::Blocked);
+        let reopened = PolicyStateStore::open(&path).expect("committed state should reopen");
+        assert_eq!(reopened.policy_state(session_id), PolicyState::Blocked);
+        fs::remove_file(path).expect("store should remove");
     }
 
     #[cfg(unix)]

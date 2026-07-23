@@ -140,7 +140,9 @@ Signing keys come from `--session-signing-key-file <PATH>` with JSON shape `{"ac
 
 The event log is JSONL. Request events record method, path, policy state, routing decision, session ID, and selected safe header presence. They do not log request bodies or header values.
 
-Runtime state and logs are bounded. The policy store retains at most 8192 session records and evicts `Normal`/`Observe`/`Suspicious` records older than 7 days; enforcement states (`rate_limited`, `controlled_reality`, `blocked`) are never evicted by TTL or cardinality, and their overflow is reported instead. Writes go through a temp file, fsync, and rename, so a failed write cannot split memory and disk state. The JSONL event and debug logs rotate at 32 MiB to timestamped archives, keeping 3 archives plus the active segment per log. Startup reconstruction tolerates a crash-torn final line (ignored and reported) while still rejecting corruption anywhere else with the exact line number. The `proxy_started` debug record reports session counts, eviction outcomes, restored-state sizes, and any torn-tail line; rotation and persistence failures are also logged.
+Runtime state and logs are bounded. The policy store retains at most 8192 session records and evicts `Normal`/`Observe`/`Suspicious` records older than 7 days. If protected enforcement records alone fill that bound, a sticky persisted fallback makes every unknown session `blocked` before older protected metadata is removed, so capacity pressure cannot turn containment into an unqualified benign state. Exposure state retains at most 4096 records for 24 hours. Replay state retains at most 4096 proof digests until their configured expiry, and proof windows cannot exceed 24 hours; raw proof values are not persisted. On an upgrade where prior event history exists but the replay index does not, minted proof acceptance remains unavailable for one maximum proof window rather than risking replay-state loss.
+
+State writes go through a temp file, fsync, and rename, and failed writes roll back the corresponding in-memory mutation or fail the proof unavailable. The JSONL event and debug logs rotate at 32 MiB to collision-safe timestamped archives, keeping exactly 3 archives plus the active segment per log. Together those logs consume at most about 256 MiB before filesystem overhead, below the lab's 1 GiB PVC. Startup restores a missing newline or truncates only an invalid final fragment before appending, while corruption anywhere earlier still fails with the exact line number. The `proxy_started` debug record reports state counts, eviction/fallback outcomes, replay migration quarantine, and tail-repair details. Persistence failures use the exact `eidolon persistence failure:` marker.
 
 Every request handled by the proxy is assigned an opaque `request_id` (a random v4 UUID; it encodes no secrets, client identity, or request data). Every event derived from that request — `request_seen`, bait exposure and action events, policy decisions and changes, responses, rate limits, and reality-escape audits — carries that id, so concurrent requests sharing one session cookie can still be separated causally. Trace and edge-export reducers join events strictly by `request_id`; sessions whose events predate request identifiers are exported with `request_linkage: unknown_legacy` and no cross-event joins are attempted.
 
@@ -321,7 +323,12 @@ field for the docs crawler entry with OrbStack's first-party hosts
 `127.0.0.1` and `localhost` plus the NodePort gateway `192.168.194.1/32`, and
 when configured those scope records carry `hosts` and `source_cidrs`, so
 deployment-safe host and network narrowing are visible in the same operator
-view.
+view. Its `operator_health` object separately reports PVC pressure (degraded at
+85% used), persistence-failure markers from the full current proxy pod log,
+and reconstruction/tail-repair evidence. An active replay-migration quarantine
+reported by the latest `proxy_started` record also degrades reconstruction
+health until its deadline. Each probe is explicitly `healthy`, `degraded`, or
+`unavailable`.
 
 The paired bundle exporter, `examples/shield-lab/export-orbstack-evidence.sh`,
 now emits a compact `edge-session-index.md` by default and can optionally

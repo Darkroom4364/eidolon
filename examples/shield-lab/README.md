@@ -567,6 +567,14 @@ trusted soften scopes now also surface their `user_agent_substrings`, `hosts`,
 and `source_cidrs`, so agent-family, host-bound, and network-bound allowlist
 narrowing is visible alongside path-bound narrowing.
 
+The same status output includes `operator-health`. It reports PVC usage and
+marks 85% or higher as disk pressure, checks the full current proxy pod log for
+the exact `eidolon persistence failure:` marker, and reports startup
+reconstruction or JSONL tail repair. An active replay-migration quarantine in
+the latest `proxy_started` record also degrades reconstruction health. JSON
+output keeps each signal explicitly `healthy`, `degraded`, or `unavailable`; a
+failed probe is never presented as healthy.
+
 Smoke-check the trusted-ingress transport-auth path:
 
 ```sh
