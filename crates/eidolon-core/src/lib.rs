@@ -1,14 +1,11 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 pub const EVENT_SCHEMA_VERSION: u16 = 2;
 pub const TRUSTED_INGRESS_CONTRACT_VERSION: &str = "2026-06-05.v1";
 pub const PRE_CONTAINMENT_PERSISTENCE_REASON_FAMILY: &str = "pre_containment_persistence";
 pub const POST_CONTAINMENT_PERSISTENCE_REASON_FAMILY: &str = "post_containment_persistence";
-pub const PRE_CONTAINMENT_PERSISTENCE_CLASS_FIELD: &str = "persistence_class";
-pub const PRE_CONTAINMENT_PERSISTENCE_KIND_FIELD: &str = "persistence_kind";
-pub const POST_CONTAINMENT_PERSISTENCE_KIND_FIELD: &str = "post_containment_persistence_kind";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
@@ -388,54 +385,11 @@ impl PreContainmentPersistenceClass {
         }
     }
 
-    pub const fn marker(self) -> &'static str {
-        match self {
-            Self::DiscoveryRecon => "persistence_class=discovery_recon",
-            Self::WriteRecon => "persistence_class=write_recon",
-            Self::SameBaitNearMiss => "persistence_class=same_bait_near_miss",
-        }
-    }
-
     pub const fn blocked_kind(self) -> PreContainmentPersistenceKind {
         match self {
             Self::DiscoveryRecon => PreContainmentPersistenceKind::DiscoveryReconRetry,
             Self::WriteRecon => PreContainmentPersistenceKind::WriteReconRetry,
             Self::SameBaitNearMiss => PreContainmentPersistenceKind::SameBaitNearMissRetry,
-        }
-    }
-
-    pub fn from_reason(reason: &str) -> Option<Self> {
-        if let Some(class_code) = reason
-            .split_ascii_whitespace()
-            .find_map(|field| field.strip_prefix("persistence_class="))
-        {
-            return Self::from_code(class_code);
-        }
-
-        if reason
-            .contains("suspicious same-bait near miss after exposure moved session to rate limited")
-            || reason.contains("rate-limited same-bait near miss retry moved session to blocked")
-        {
-            return Some(Self::SameBaitNearMiss);
-        }
-
-        if let Some(kind) = PreContainmentPersistenceKind::from_reason(reason) {
-            return Some(match kind {
-                PreContainmentPersistenceKind::DiscoveryReconRetry => Self::DiscoveryRecon,
-                PreContainmentPersistenceKind::WriteReconRetry => Self::WriteRecon,
-                PreContainmentPersistenceKind::SameBaitNearMissRetry => Self::SameBaitNearMiss,
-            });
-        }
-
-        None
-    }
-
-    fn from_code(code: &str) -> Option<Self> {
-        match code {
-            "discovery_recon" => Some(Self::DiscoveryRecon),
-            "write_recon" => Some(Self::WriteRecon),
-            "same_bait_near_miss" => Some(Self::SameBaitNearMiss),
-            _ => None,
         }
     }
 }
@@ -456,54 +410,6 @@ impl PreContainmentPersistenceKind {
             Self::SameBaitNearMissRetry => "same_bait_near_miss_retry",
         }
     }
-
-    pub const fn marker(self) -> &'static str {
-        match self {
-            Self::DiscoveryReconRetry => "persistence_kind=discovery_recon_retry",
-            Self::WriteReconRetry => "persistence_kind=write_recon_retry",
-            Self::SameBaitNearMissRetry => "persistence_kind=same_bait_near_miss_retry",
-        }
-    }
-
-    pub fn from_reason(reason: &str) -> Option<Self> {
-        if let Some(detail_code) = reason
-            .split_ascii_whitespace()
-            .find_map(|field| field.strip_prefix("persistence_kind="))
-        {
-            return Self::from_detail_code(detail_code);
-        }
-        if let Some(class_code) = reason
-            .split_ascii_whitespace()
-            .find_map(|field| field.strip_prefix("persistence_class="))
-        {
-            return PreContainmentPersistenceClass::from_code(class_code)
-                .map(PreContainmentPersistenceClass::blocked_kind);
-        }
-
-        if reason.contains("rate-limited same-bait near miss retry moved session to blocked") {
-            return Some(Self::SameBaitNearMissRetry);
-        }
-
-        if reason.contains("rate-limited discovery recon retry moved session to blocked") {
-            if reason.contains("repeated_discovery_score=0")
-                && reason.contains("decoy_write_probe_path_fanout_bonus=1")
-            {
-                return Some(Self::WriteReconRetry);
-            }
-            return Some(Self::DiscoveryReconRetry);
-        }
-
-        None
-    }
-
-    fn from_detail_code(detail_code: &str) -> Option<Self> {
-        match detail_code {
-            "discovery_recon_retry" => Some(Self::DiscoveryReconRetry),
-            "write_recon_retry" => Some(Self::WriteReconRetry),
-            "same_bait_near_miss_retry" => Some(Self::SameBaitNearMissRetry),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,47 +426,150 @@ impl PostContainmentPersistenceKind {
             Self::ControlledRealityDepthLimit => "controlled_reality_depth_limit",
         }
     }
+}
 
-    pub const fn marker(self) -> &'static str {
-        match self {
-            Self::ControlledRealityBranchEscape => {
-                "post_containment_persistence_kind=controlled_reality_branch_escape"
-            }
-            Self::ControlledRealityDepthLimit => {
-                "post_containment_persistence_kind=controlled_reality_depth_limit"
-            }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct PersistenceMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pre_containment_persistence_class: Option<PreContainmentPersistenceClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pre_containment_persistence_kind: Option<PreContainmentPersistenceKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_containment_persistence_kind: Option<PostContainmentPersistenceKind>,
+}
+
+impl PersistenceMetadata {
+    pub const fn pre_containment(class: PreContainmentPersistenceClass) -> Self {
+        Self {
+            pre_containment_persistence_class: Some(class),
+            pre_containment_persistence_kind: None,
+            post_containment_persistence_kind: None,
         }
     }
 
-    pub fn from_reason(reason: &str) -> Option<Self> {
-        if let Some(detail_code) = reason
-            .split_ascii_whitespace()
-            .find_map(|field| field.strip_prefix("post_containment_persistence_kind="))
+    pub const fn pre_containment_retry(class: PreContainmentPersistenceClass) -> Self {
+        Self {
+            pre_containment_persistence_class: Some(class),
+            pre_containment_persistence_kind: Some(class.blocked_kind()),
+            post_containment_persistence_kind: None,
+        }
+    }
+
+    pub const fn post_containment(kind: PostContainmentPersistenceKind) -> Self {
+        Self {
+            pre_containment_persistence_class: None,
+            pre_containment_persistence_kind: None,
+            post_containment_persistence_kind: Some(kind),
+        }
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.pre_containment_persistence_class.is_none()
+            && self.pre_containment_persistence_kind.is_none()
+            && self.post_containment_persistence_kind.is_none()
+    }
+
+    pub const fn pre_containment_class(self) -> Option<PreContainmentPersistenceClass> {
+        self.pre_containment_persistence_class
+    }
+
+    pub const fn pre_containment_kind(self) -> Option<PreContainmentPersistenceKind> {
+        self.pre_containment_persistence_kind
+    }
+
+    pub const fn post_containment_kind(self) -> Option<PostContainmentPersistenceKind> {
+        self.post_containment_persistence_kind
+    }
+
+    pub const fn is_compatible_with_policy_state(self, policy_state: PolicyState) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+        if self.post_containment_persistence_kind.is_some()
+            || self.pre_containment_persistence_kind.is_some()
         {
-            return Self::from_detail_code(detail_code);
+            return matches!(policy_state, PolicyState::Blocked);
         }
 
-        if reason.contains(
-            "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked",
-        ) {
-            return Some(Self::ControlledRealityBranchEscape);
-        }
-
-        if reason.contains(
-            "controlled-reality probe continued after depth-limit throttle and moved session to blocked",
-        ) {
-            return Some(Self::ControlledRealityDepthLimit);
-        }
-
-        None
+        self.pre_containment_persistence_class.is_some()
+            && matches!(policy_state, PolicyState::RateLimited)
     }
 
-    fn from_detail_code(detail_code: &str) -> Option<Self> {
-        match detail_code {
-            "controlled_reality_branch_escape" => Some(Self::ControlledRealityBranchEscape),
-            "controlled_reality_depth_limit" => Some(Self::ControlledRealityDepthLimit),
-            _ => None,
+    const fn is_valid(self) -> bool {
+        matches!(
+            (
+                self.pre_containment_persistence_class,
+                self.pre_containment_persistence_kind,
+                self.post_containment_persistence_kind,
+            ),
+            (None, None, None)
+                | (
+                    Some(PreContainmentPersistenceClass::DiscoveryRecon),
+                    None,
+                    None
+                )
+                | (Some(PreContainmentPersistenceClass::WriteRecon), None, None)
+                | (
+                    Some(PreContainmentPersistenceClass::SameBaitNearMiss),
+                    None,
+                    None
+                )
+                | (
+                    Some(PreContainmentPersistenceClass::DiscoveryRecon),
+                    Some(PreContainmentPersistenceKind::DiscoveryReconRetry),
+                    None
+                )
+                | (
+                    Some(PreContainmentPersistenceClass::WriteRecon),
+                    Some(PreContainmentPersistenceKind::WriteReconRetry),
+                    None
+                )
+                | (
+                    Some(PreContainmentPersistenceClass::SameBaitNearMiss),
+                    Some(PreContainmentPersistenceKind::SameBaitNearMissRetry),
+                    None
+                )
+                | (
+                    None,
+                    None,
+                    Some(PostContainmentPersistenceKind::ControlledRealityBranchEscape)
+                )
+                | (
+                    None,
+                    None,
+                    Some(PostContainmentPersistenceKind::ControlledRealityDepthLimit)
+                )
+        )
+    }
+}
+
+#[derive(Deserialize)]
+struct PersistenceMetadataFields {
+    #[serde(default)]
+    pre_containment_persistence_class: Option<PreContainmentPersistenceClass>,
+    #[serde(default)]
+    pre_containment_persistence_kind: Option<PreContainmentPersistenceKind>,
+    #[serde(default)]
+    post_containment_persistence_kind: Option<PostContainmentPersistenceKind>,
+}
+
+impl<'de> Deserialize<'de> for PersistenceMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = PersistenceMetadataFields::deserialize(deserializer)?;
+        let metadata = Self {
+            pre_containment_persistence_class: fields.pre_containment_persistence_class,
+            pre_containment_persistence_kind: fields.pre_containment_persistence_kind,
+            post_containment_persistence_kind: fields.post_containment_persistence_kind,
+        };
+        if !metadata.is_valid() {
+            return Err(D::Error::custom(
+                "persistence metadata must describe one coherent pre-containment or post-containment classification",
+            ));
         }
+        Ok(metadata)
     }
 }
 
@@ -637,6 +646,8 @@ pub struct Event {
     pub session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<RequestId>,
+    #[serde(default, skip_serializing_if = "PersistenceMetadata::is_empty")]
+    pub persistence: PersistenceMetadata,
     pub observed_at: DateTime<Utc>,
     pub source: EventSource,
     pub policy_state: PolicyState,
@@ -655,6 +666,7 @@ impl Event {
             id: Uuid::new_v4(),
             session_id,
             request_id: None,
+            persistence: PersistenceMetadata::default(),
             observed_at: Utc::now(),
             source,
             policy_state,
@@ -665,6 +677,11 @@ impl Event {
     /// Attach the opaque id of the request this event was derived from.
     pub fn with_request_id(mut self, request_id: RequestId) -> Self {
         self.request_id = Some(request_id);
+        self
+    }
+
+    pub fn with_persistence(mut self, persistence: PersistenceMetadata) -> Self {
+        self.persistence = persistence;
         self
     }
 }
@@ -739,12 +756,8 @@ pub struct EdgePolicySnapshot {
     pub state: PolicyState,
     pub routing_decision: RoutingDecision,
     pub reason: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pre_containment_persistence_class: Option<PreContainmentPersistenceClass>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pre_containment_persistence_kind: Option<PreContainmentPersistenceKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub post_containment_persistence_kind: Option<PostContainmentPersistenceKind>,
+    #[serde(flatten)]
+    pub persistence: PersistenceMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1050,6 +1063,7 @@ mod tests {
             "legacy event without request_id should parse",
         );
         assert_eq!(event.request_id, None);
+        assert!(event.persistence.is_empty());
 
         let linked = event.with_request_id(RequestId::new());
         assert!(linked.request_id.is_some());
@@ -1356,55 +1370,88 @@ mod tests {
     }
 
     #[test]
-    fn pre_containment_persistence_kind_parses_explicit_marker() {
-        let reason = "rate-limited discovery recon retry moved session to blocked: path=/docs persistence_kind=discovery_recon_retry";
-
-        assert_eq!(
-            PreContainmentPersistenceKind::from_reason(reason),
-            Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
+    fn persistence_metadata_constructors_encode_coherent_stages() {
+        let rate_limited =
+            PersistenceMetadata::pre_containment(PreContainmentPersistenceClass::WriteRecon);
+        let blocked = PersistenceMetadata::pre_containment_retry(
+            PreContainmentPersistenceClass::SameBaitNearMiss,
         );
-    }
-
-    #[test]
-    fn pre_containment_persistence_kind_preserves_legacy_write_recon_fallback() {
-        let reason = "rate-limited discovery recon retry moved session to blocked: path=/api/v2/import/validate repeated_discovery_score=0 decoy_write_probe_path_fanout_bonus=1";
-
-        assert_eq!(
-            PreContainmentPersistenceKind::from_reason(reason),
-            Some(PreContainmentPersistenceKind::WriteReconRetry)
+        let post_containment = PersistenceMetadata::post_containment(
+            PostContainmentPersistenceKind::ControlledRealityBranchEscape,
         );
-    }
-
-    #[test]
-    fn pre_containment_persistence_kind_can_fall_back_to_class_marker() {
-        let reason =
-            "suspicious discovery recon persistence moved session to rate limited: path=/docs persistence_class=discovery_recon";
 
         assert_eq!(
-            PreContainmentPersistenceKind::from_reason(reason),
-            Some(PreContainmentPersistenceKind::DiscoveryReconRetry)
+            rate_limited.pre_containment_class(),
+            Some(PreContainmentPersistenceClass::WriteRecon)
         );
-    }
-
-    #[test]
-    fn pre_containment_persistence_class_parses_explicit_marker() {
-        let reason =
-            "suspicious same-bait near miss after exposure moved session to rate limited: path=/api/v2/import/reconcile persistence_class=same_bait_near_miss";
-
         assert_eq!(
-            PreContainmentPersistenceClass::from_reason(reason),
-            Some(PreContainmentPersistenceClass::SameBaitNearMiss)
+            blocked.pre_containment_kind(),
+            Some(PreContainmentPersistenceKind::SameBaitNearMissRetry)
         );
-    }
-
-    #[test]
-    fn post_containment_persistence_kind_parses_explicit_marker() {
-        let reason = "controlled session repeatedly probed outside the controlled-reality branch and moved session to blocked: path=/api/v1/projects post_containment_persistence_kind=controlled_reality_branch_escape";
-
         assert_eq!(
-            PostContainmentPersistenceKind::from_reason(reason),
+            post_containment.post_containment_kind(),
             Some(PostContainmentPersistenceKind::ControlledRealityBranchEscape)
         );
+    }
+
+    #[test]
+    fn event_persistence_metadata_is_optional_but_structured_when_present() {
+        let event = Event::new(
+            SessionId::new(),
+            EventSource::PolicyRouter,
+            PolicyState::Blocked,
+            EventKind::PolicyDecision {
+                routing_decision: RoutingDecision::EidolonOwned,
+                reason: "human-readable reason without machine markers".to_string(),
+            },
+        )
+        .with_persistence(PersistenceMetadata::pre_containment_retry(
+            PreContainmentPersistenceClass::DiscoveryRecon,
+        ));
+
+        let serialized = must_ok(serde_json::to_value(event), "event should serialize");
+        assert_eq!(
+            serialized["persistence"]["pre_containment_persistence_class"],
+            json!("discovery_recon")
+        );
+        assert_eq!(
+            serialized["persistence"]["pre_containment_persistence_kind"],
+            json!("discovery_recon_retry")
+        );
+    }
+
+    #[test]
+    fn persistence_metadata_rejects_contradictory_shapes() {
+        let mismatched = serde_json::from_value::<PersistenceMetadata>(json!({
+            "pre_containment_persistence_class": "write_recon",
+            "pre_containment_persistence_kind": "discovery_recon_retry"
+        }));
+        let mixed_stages = serde_json::from_value::<PersistenceMetadata>(json!({
+            "pre_containment_persistence_class": "discovery_recon",
+            "post_containment_persistence_kind": "controlled_reality_depth_limit"
+        }));
+
+        assert!(mismatched.is_err());
+        assert!(mixed_stages.is_err());
+    }
+
+    #[test]
+    fn persistence_metadata_matches_only_its_policy_stage() {
+        let rate_limited =
+            PersistenceMetadata::pre_containment(PreContainmentPersistenceClass::WriteRecon);
+        let blocked = PersistenceMetadata::pre_containment_retry(
+            PreContainmentPersistenceClass::DiscoveryRecon,
+        );
+        let post_containment = PersistenceMetadata::post_containment(
+            PostContainmentPersistenceKind::ControlledRealityBranchEscape,
+        );
+
+        assert!(rate_limited.is_compatible_with_policy_state(PolicyState::RateLimited));
+        assert!(!rate_limited.is_compatible_with_policy_state(PolicyState::Blocked));
+        assert!(blocked.is_compatible_with_policy_state(PolicyState::Blocked));
+        assert!(!blocked.is_compatible_with_policy_state(PolicyState::RateLimited));
+        assert!(post_containment.is_compatible_with_policy_state(PolicyState::Blocked));
+        assert!(!post_containment.is_compatible_with_policy_state(PolicyState::RateLimited));
     }
 
     #[test]
@@ -1618,14 +1665,8 @@ mod tests {
                 state: PolicyState::Observe,
                 routing_decision: RoutingDecision::ProtectedUpstream,
                 reason: "trusted ingress identity suppressed bait surface intervention before runtime suspicion was established".to_string(),
-                pre_containment_persistence_class: Some(
+                persistence: PersistenceMetadata::pre_containment_retry(
                     PreContainmentPersistenceClass::DiscoveryRecon,
-                ),
-                pre_containment_persistence_kind: Some(
-                    PreContainmentPersistenceKind::DiscoveryReconRetry,
-                ),
-                post_containment_persistence_kind: Some(
-                    PostContainmentPersistenceKind::ControlledRealityDepthLimit,
                 ),
             },
             evidence: EdgeEvidenceRef {
@@ -1853,7 +1894,18 @@ mod tests {
         );
         assert_eq!(
             serialized["policy"]["post_containment_persistence_kind"],
-            json!("controlled_reality_depth_limit")
+            serde_json::Value::Null
+        );
+
+        let reparsed: EidolonEdgeDecisionExport = must_ok(
+            serde_json::from_value(serialized),
+            "edge export with flattened persistence should reparse",
+        );
+        assert_eq!(
+            reparsed.policy.persistence,
+            PersistenceMetadata::pre_containment_retry(
+                PreContainmentPersistenceClass::DiscoveryRecon,
+            )
         );
     }
 }

@@ -392,8 +392,8 @@ advisory-assisted contributor carries through the next pre-containment rung
 too: after one same-session top-level `/docs` follow-up has already moved the
 session into `rate_limited`, a repeated `/docs` retry now moves it into
 `blocked`, while edge export preserves the authenticated detection IDs plus the
-structured `pre_containment_persistence_class=discovery_recon` and
-`pre_containment_persistence_kind=discovery_recon_retry` fields.
+typed `pre_containment_persistence_class` (`discovery_recon`) and
+`pre_containment_persistence_kind` (`discovery_recon_retry`) fields.
 
 An adjacent OpenAPI aggregation smoke proves the first target-side-only
 aggregated `observe -> suspicious` path: one medium-score

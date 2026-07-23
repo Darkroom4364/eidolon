@@ -272,7 +272,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use eidolon_core::{
         EdgeRecommendedAction, Event, EventKind, EventSource, IngressIdentity,
-        IngressIdentitySource, IngressTrustTier, PolicyState, RoutingDecision,
+        IngressIdentitySource, IngressTrustTier, PersistenceMetadata, PolicyState,
+        PreContainmentPersistenceClass, RoutingDecision, TrustedIngressSoftenMatch,
     };
     use uuid::Uuid;
 
@@ -353,6 +354,32 @@ mod tests {
         event
     }
 
+    fn softened_request_event(session_id: SessionId, path: &str) -> Event {
+        let mut event = request_event(session_id, path);
+        let EventKind::RequestSeen {
+            trusted_ingress_soften_match,
+            ..
+        } = &mut event.kind
+        else {
+            unreachable!("request_event always creates request_seen");
+        };
+        *trusted_ingress_soften_match = Some(TrustedIngressSoftenMatch {
+            label: Some("internal-crawler".to_string()),
+            source: IngressIdentitySource::LocalAllowlist,
+            trust_tier: IngressTrustTier::Allowlisted,
+            methods: vec!["GET".to_string()],
+            path_prefixes: vec!["/docs".to_string()],
+            bait_soften_path_prefixes: vec!["/docs".to_string()],
+            user_agent_substrings: Vec::new(),
+            hosts: Vec::new(),
+            source_cidrs: Vec::new(),
+            required_header_names: Vec::new(),
+            verified_categories: Vec::new(),
+            request_path_softened: true,
+        });
+        event
+    }
+
     #[test]
     fn parses_explicit_flags() {
         let events_path = unique_temp_path("parse-events.jsonl");
@@ -428,7 +455,8 @@ mod tests {
         let session_id = SessionId::new();
         let request_id = eidolon_core::RequestId::new();
         let path = write_events(&[
-            request_event(session_id, "/docs/legacy-import").with_request_id(request_id),
+            softened_request_event(session_id, "/docs/legacy-import")
+                .with_request_id(request_id),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -457,5 +485,64 @@ mod tests {
             export.edge_recommendation.action,
             EdgeRecommendedAction::Allow
         );
+    }
+
+    #[test]
+    fn file_pipeline_preserves_typed_persistence_metadata() {
+        let session_id = SessionId::new();
+        let request_id = eidolon_core::RequestId::new();
+        let persistence =
+            PersistenceMetadata::pre_containment(PreContainmentPersistenceClass::DiscoveryRecon);
+        let path = write_events(&[
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::RateLimited,
+                EventKind::RequestSeen {
+                    method: "GET".to_string(),
+                    path: "/docs".to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
+                    local_ingress_trust_scope_rejection: None,
+                    trusted_ingress_soften_match: None,
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::RateLimited,
+                },
+            )
+            .with_persistence(persistence)
+            .with_request_id(request_id),
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::RateLimitApplied {
+                    reason: "typed persistence without reason markers".to_string(),
+                },
+            )
+            .with_persistence(persistence)
+            .with_request_id(request_id),
+        ]);
+
+        let events = must_ok(read_events_jsonl_file(&path), "events should parse");
+        let timelines = build_session_timelines(events);
+        let timeline = must_ok(
+            select_timeline(&timelines, Some(session_id)),
+            "session should select",
+        );
+        let export = must_some(
+            edge_decision_export_for_timeline(timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(
+            export.policy.persistence.pre_containment_class(),
+            Some(PreContainmentPersistenceClass::DiscoveryRecon)
+        );
+        assert!(export
+            .edge_recommendation
+            .reason_codes
+            .contains(&"pre_containment_persistence".to_string()));
     }
 }

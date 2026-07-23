@@ -15,7 +15,7 @@ EDGE_EXPORT_BIN="${EIDOLON_EDGE_EXPORT_BIN:-}"
 PROMOTION_PATH="${EIDOLON_SHIELD_SUSPICIOUS_DETECTION_RECON_RATE_LIMIT_PROMOTION_PATH:-/docs?topic=imports}"
 PROMOTION_PATH_PREFIX="${EIDOLON_SHIELD_SUSPICIOUS_DETECTION_RECON_RATE_LIMIT_PROMOTION_PATH_PREFIX:-/docs}"
 FOLLOW_UP_PATH="${EIDOLON_SHIELD_SUSPICIOUS_DETECTION_RECON_RATE_LIMIT_FOLLOW_UP_PATH:-/docs}"
-EXPECTED_BAIT_MARKER="${EIDOLON_SHIELD_SUSPICIOUS_DETECTION_RECON_RATE_LIMIT_BAIT_MARKER:-X-Migration-Trace: rel_2025_04_b7f2}"
+EXPECTED_BAIT_MARKER="${EIDOLON_SHIELD_SUSPICIOUS_DETECTION_RECON_RATE_LIMIT_BAIT_MARKER:-X-Migration-Trace: mig_w}"
 EXPECTED_RETRY_AFTER="${EIDOLON_SHIELD_SUSPICIOUS_DETECTION_RECON_RATE_LIMIT_RETRY_AFTER:-30}"
 ACTOR_KIND="${EIDOLON_SHIELD_SUSPICIOUS_DETECTION_RECON_RATE_LIMIT_ACTOR_KIND:-agentic_browser}"
 VENDOR_SCORE="${EIDOLON_SHIELD_SUSPICIOUS_DETECTION_RECON_RATE_LIMIT_VENDOR_SCORE:-35}"
@@ -245,9 +245,9 @@ jq -e \
     and ((.kind.reason // "") | contains("detection_score=2"))
     and ((.kind.reason // "") | contains("recon_score=5"))
     and ((.kind.reason // "") | contains("recon_rate_limit_threshold=5"))
-    and ((.kind.reason // "") | contains("persistence_class=discovery_recon"))
+    and .persistence.pre_containment_persistence_class == "discovery_recon"
   ' <<<"$policy_changed_json" >/dev/null \
-  || fail "session ${session_id} rate-limited transition reason did not preserve the expected weighted detection-backed recon facts"
+  || fail "session ${session_id} rate-limited transition did not preserve the expected weighted detection-backed recon facts and persistence metadata"
 
 rate_limit_json="$(
   jq -c -e -s \
