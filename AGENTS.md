@@ -1,16 +1,16 @@
 # Eidolon Agent Instructions
 
 Before planning or changing Eidolon, read
-`docs/engineering-operating-policy.md`. Treat that policy as the default work
-order and review standard for every coding session. The active gate is tracked
-by GitHub issue `#213`; automated repository enforcement remains tracked by
-`#214`.
+`docs/engineering-operating-policy.md`. Treat that policy as the default
+engineering guidance and review standard for every coding session. GitHub
+issue `#213` records a one-time advisory engineering review, and `#214` was
+retired. Neither issue creates an active release, feature, or merge gate.
 
 ## Required Operating Rules
 
 - Keep work inside owned or explicitly authorized defensive environments.
-- Fix open safety-gate defects before adding policy states, trust variants,
-  telemetry, benchmark breadth, export sealing, or execution substrates.
+- Prioritize known invariant violations. Parallel feature work may proceed
+  when it does not weaken, bypass, or overstate those invariants.
 - Never forward a recognized unsafe bait action shape to the protected
   upstream, even when its proof is expired, replayed, malformed, or mismatched.
 - Never classify rejected, replayed, expired, mismatched, or unlinked evidence
