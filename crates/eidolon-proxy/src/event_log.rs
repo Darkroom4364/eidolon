@@ -321,20 +321,24 @@ fn prune_log_archives(path: &Path, fresh_archive: &Path, keep: usize) -> io::Res
         return Ok(());
     };
 
-    let mut archives: Vec<PathBuf> = std::fs::read_dir(parent)?
+    let mut archives: Vec<(PathBuf, String)> = std::fs::read_dir(parent)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|candidate| candidate != fresh_archive && archive_suffix(path, candidate).is_some())
+        .filter_map(|candidate| {
+            if candidate == fresh_archive {
+                return None;
+            }
+            let suffix = archive_suffix(path, &candidate)?.to_string();
+            Some((candidate, suffix))
+        })
         .collect();
-    archives.sort_by(|left, right| {
-        let left = archive_suffix(path, left).expect("archive was filtered");
-        let right = archive_suffix(path, right).expect("archive was filtered");
+    archives.sort_by(|(_, left), (_, right)| {
         left.len().cmp(&right.len()).then_with(|| left.cmp(right))
     });
 
     let old_archives_to_keep = keep.saturating_sub(1);
     let excess = archives.len().saturating_sub(old_archives_to_keep);
-    for stale in archives.into_iter().take(excess) {
+    for (stale, _) in archives.into_iter().take(excess) {
         std::fs::remove_file(stale)?;
     }
     if keep == 0 {
