@@ -102,6 +102,7 @@ pub enum BaitHeaderValueMintStatus {
     ExpiredSessionValue,
     ReplaySeen,
     ReplayStateCapacityExceeded,
+    ReplayStateUnavailable,
     MissingSessionValue,
     MalformedSessionValue,
     SessionValueMismatch,

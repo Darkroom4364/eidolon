@@ -5,6 +5,9 @@ KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
 CURL_BIN="${CURL_BIN:-curl}"
 EXPECTED_CONTEXT="${EIDOLON_SHIELD_EXPECT_CONTEXT:-orbstack}"
 EDGE_HOST="${EIDOLON_SHIELD_EDGE_HOST:-127.0.0.1}"
+DISK_PRESSURE_THRESHOLD_PERCENT=85
+PERSISTENCE_FAILURE_MARKER="eidolon persistence failure:"
+CURRENT_EPOCH_SECONDS="$(date -u +%s)"
 
 JSON_OUTPUT=0
 
@@ -109,6 +112,221 @@ if [[ -n "$target_edge_node_port" ]]; then
   fi
 fi
 
+proxy_pod_name="$(jq -r 'first((.items // [])[]?.metadata.name) // empty' <<<"$proxy_pods_json")"
+disk_health_status="unavailable"
+disk_total_kib=""
+disk_used_kib=""
+disk_available_kib=""
+disk_used_percent=""
+disk_pressure=null
+proxy_logs_available=false
+persistence_health_status="unavailable"
+persistence_failure_seen=null
+startup_debug_available=false
+reconstruction_health_status="unavailable"
+reconstruction_evidence_json='[]'
+reconstruction_startup_evidence_json='[]'
+
+if [[ -n "$proxy_pod_name" ]]; then
+  if disk_output="$(
+    kubectl_cmd -n shield-system exec "$proxy_pod_name" -- \
+      df -Pk /var/lib/eidolon 2>/dev/null
+  )"; then
+    disk_metrics="$(
+      awk '
+        NR > 1 && NF >= 5 {
+          total = $2
+          used = $3
+          available = $4
+          percent = $5
+        }
+        END {
+          gsub(/%/, "", percent)
+          if (total ~ /^[0-9]+$/ && used ~ /^[0-9]+$/ &&
+              available ~ /^[0-9]+$/ && percent ~ /^[0-9]+$/) {
+            printf "%s %s %s %s", total, used, available, percent
+          }
+        }
+      ' <<<"$disk_output"
+    )"
+    if [[ "$disk_metrics" =~ ^([0-9]+)\ ([0-9]+)\ ([0-9]+)\ ([0-9]+)$ ]]; then
+      disk_total_kib="${BASH_REMATCH[1]}"
+      disk_used_kib="${BASH_REMATCH[2]}"
+      disk_available_kib="${BASH_REMATCH[3]}"
+      disk_used_percent="$((10#${BASH_REMATCH[4]}))"
+      disk_pressure=false
+      disk_health_status="healthy"
+      if (( disk_used_percent >= DISK_PRESSURE_THRESHOLD_PERCENT )); then
+        disk_pressure=true
+        disk_health_status="degraded"
+      fi
+    fi
+  fi
+
+  proxy_logs=""
+  reconstruction_log_evidence_json='[]'
+  if proxy_logs="$(
+    kubectl_cmd -n shield-system logs "$proxy_pod_name" 2>/dev/null
+  )"; then
+    proxy_logs_available=true
+    persistence_failure_seen=false
+    persistence_health_status="healthy"
+    if [[ "$proxy_logs" == *"$PERSISTENCE_FAILURE_MARKER"* ]]; then
+      persistence_failure_seen=true
+      persistence_health_status="degraded"
+    fi
+
+    if [[ "$proxy_logs" == *"eidolon startup: ignoring crash-torn event log tail"* ||
+      "$proxy_logs" == *"eidolon startup: repaired crash-torn"* ||
+      "$proxy_logs" == *"eidolon log tail repair:"* ||
+      "$proxy_logs" == *"eidolon reconstruction degraded:"* ]]; then
+      reconstruction_log_evidence_json='[
+        {
+          "source": "pod_logs",
+          "signal": "torn_tail_or_repair"
+        }
+      ]'
+    fi
+  fi
+
+  startup_debug_json=null
+  if startup_debug_tail="$(
+    kubectl_cmd -n shield-system exec "$proxy_pod_name" -- \
+      tail -n 1000 /var/lib/eidolon/debug.jsonl 2>/dev/null
+  )"; then
+    startup_debug_json="$(
+      jq -Rsc '
+        [split("\n")[] | fromjson? | select(.event == "proxy_started")]
+        | last // null
+      ' <<<"$startup_debug_tail"
+    )"
+    if [[ "$startup_debug_json" != "null" ]]; then
+      startup_debug_available=true
+      reconstruction_startup_evidence_json="$(
+        jq -c --argjson now_epoch "$CURRENT_EPOCH_SECONDS" '
+          (.fields // {}) as $fields |
+          [
+            ($fields | to_entries[] |
+              select(
+                (
+                  .key == "restored_bait_exposure_torn_tail_line"
+                  or .key == "restored_consumed_bait_proof_torn_tail_line"
+                )
+                and .value != null
+              ) |
+              {
+                source: "startup_debug",
+                signal: .key,
+                value: .value
+              }),
+            (
+              ["event_log_tail_repair", "debug_log_tail_repair"][] as $signal |
+              ($fields[$signal] // null) as $repair |
+              select(
+                ($repair | type) == "object"
+                and (
+                  $repair.outcome == "appended_newline"
+                  or $repair.outcome == "truncated"
+                )
+              ) |
+              {
+                source: "startup_debug",
+                signal: $signal,
+                value: $repair
+              }
+            ),
+            (
+              ($fields.consumed_proof_migration_quarantine_until // null) as $until |
+              select(
+                ($until | type) == "number"
+                and $until > $now_epoch
+              ) |
+              {
+                source: "startup_debug",
+                signal: "consumed_proof_migration_quarantine_until",
+                state: "active",
+                value: $until
+              }
+            )
+          ]
+        ' <<<"$startup_debug_json"
+      )"
+    fi
+  fi
+
+  reconstruction_evidence_json="$(
+    jq -cn \
+      --argjson startup "$reconstruction_startup_evidence_json" \
+      --argjson logs "$reconstruction_log_evidence_json" \
+      '$startup + $logs'
+  )"
+  if [[ "$(jq 'length' <<<"$reconstruction_evidence_json")" -gt 0 ]]; then
+    reconstruction_health_status="degraded"
+  elif [[ "$startup_debug_available" == true ]]; then
+    reconstruction_health_status="healthy"
+  fi
+fi
+
+operator_health_status="unavailable"
+if [[ "$disk_health_status" == "degraded" ||
+  "$persistence_health_status" == "degraded" ||
+  "$reconstruction_health_status" == "degraded" ]]; then
+  operator_health_status="degraded"
+elif [[ "$disk_health_status" == "healthy" &&
+  "$persistence_health_status" == "healthy" &&
+  "$reconstruction_health_status" == "healthy" ]]; then
+  operator_health_status="healthy"
+fi
+
+operator_health_json="$(jq -n \
+  --arg status "$operator_health_status" \
+  --arg pod_name "$proxy_pod_name" \
+  --arg disk_status "$disk_health_status" \
+  --arg disk_total_kib "$disk_total_kib" \
+  --arg disk_used_kib "$disk_used_kib" \
+  --arg disk_available_kib "$disk_available_kib" \
+  --arg disk_used_percent "$disk_used_percent" \
+  --argjson disk_pressure "$disk_pressure" \
+  --arg persistence_status "$persistence_health_status" \
+  --arg persistence_marker "$PERSISTENCE_FAILURE_MARKER" \
+  --argjson persistence_failure_seen "$persistence_failure_seen" \
+  --argjson proxy_logs_available "$proxy_logs_available" \
+  --arg reconstruction_status "$reconstruction_health_status" \
+  --argjson startup_debug_available "$startup_debug_available" \
+  --argjson reconstruction_evidence "$reconstruction_evidence_json" \
+  --argjson disk_pressure_threshold "$DISK_PRESSURE_THRESHOLD_PERCENT" \
+  '
+    {
+      status: $status,
+      pod_name: (if $pod_name == "" then null else $pod_name end),
+      persistent_volume: {
+        status: $disk_status,
+        path: "/var/lib/eidolon",
+        pressure_threshold_percent: $disk_pressure_threshold,
+        pressure: $disk_pressure,
+        total_kib: (if $disk_total_kib == "" then null else ($disk_total_kib | tonumber) end),
+        used_kib: (if $disk_used_kib == "" then null else ($disk_used_kib | tonumber) end),
+        available_kib: (
+          if $disk_available_kib == "" then null else ($disk_available_kib | tonumber) end
+        ),
+        used_percent: (
+          if $disk_used_percent == "" then null else ($disk_used_percent | tonumber) end
+        )
+      },
+      persistence: {
+        status: $persistence_status,
+        marker: $persistence_marker,
+        failure_marker_seen: $persistence_failure_seen,
+        pod_logs_available: $proxy_logs_available
+      },
+      reconstruction: {
+        status: $reconstruction_status,
+        startup_debug_available: $startup_debug_available,
+        evidence: $reconstruction_evidence
+      }
+    }
+  ')"
+
 status_json="$(jq -n \
   --arg generated_at "$(date -u +%FT%TZ)" \
   --arg context "$context" \
@@ -130,6 +348,7 @@ status_json="$(jq -n \
   --argjson pvc "$pvc_json" \
   --argjson bait_profile_configmap "$bait_profile_configmap_json" \
   --argjson ingress_trust_configmap "$ingress_trust_configmap_json" \
+  --argjson operator_health "$operator_health_json" \
   '
     def bait_profile_document:
       ($bait_profile_configmap.data["bait-profile.json"]? // null) as $raw
@@ -294,7 +513,8 @@ status_json="$(jq -n \
         configmap_name: ($ingress_trust_configmap.metadata.name // null),
         authenticated_trusted_ingress_rules: authenticated_trusted_ingress_rules,
         trusted_soften_scopes: trusted_soften_scopes
-      }
+      },
+      operator_health: $operator_health
     }
   ')"
 
@@ -476,5 +696,19 @@ jq -r '
     end
   ),
   "target: \(.target.ready_replicas)/\(.target.replicas) ready, pods=\(.target.pod_names | join(", "))",
-  "proxy-state: \(.proxy_state.status) \(.proxy_state.bound_storage // .proxy_state.requested_storage // "unknown") (\(.proxy_state.storage_class // "no-storage-class"))"
+  "proxy-state: \(.proxy_state.status) \(.proxy_state.bound_storage // .proxy_state.requested_storage // "unknown") (\(.proxy_state.storage_class // "no-storage-class"))",
+  (
+    "operator-health: \(.operator_health.status) (disk=" +
+    (
+      if .operator_health.persistent_volume.status == "unavailable" then
+        "unavailable"
+      elif .operator_health.persistent_volume.pressure then
+        "\(.operator_health.persistent_volume.used_percent)% pressure"
+      else
+        "\(.operator_health.persistent_volume.used_percent)% used"
+      end
+    ) +
+    ", persistence=\(.operator_health.persistence.status)" +
+    ", reconstruction=\(.operator_health.reconstruction.status))"
+  )
 ' <<<"$status_json"
