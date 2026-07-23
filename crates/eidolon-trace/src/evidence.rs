@@ -85,6 +85,7 @@ pub fn proof_outcome(
             | BaitHeaderValueMintStatus::ExpiredSessionValue
             | BaitHeaderValueMintStatus::SessionValueMismatch
             | BaitHeaderValueMintStatus::ReplayStateCapacityExceeded
+            | BaitHeaderValueMintStatus::ReplayStateUnavailable
             | BaitHeaderValueMintStatus::MissingSessionValue
             | BaitHeaderValueMintStatus::MalformedSessionValue,
         ) => ProofOutcome::Rejected,

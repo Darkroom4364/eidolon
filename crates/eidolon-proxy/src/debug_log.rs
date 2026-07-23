@@ -6,7 +6,10 @@ use std::{
 
 use serde_json::Value;
 
-use crate::event_log::{rotate_log_if_oversized, rotate_log_now, LOG_ROTATE_BYTES};
+use crate::event_log::{
+    repair_jsonl_tail, report_jsonl_tail_repair, rotate_log_if_oversized, rotate_log_now,
+    JsonlTailRepairOutcome, LOG_ROTATE_BYTES,
+};
 
 pub type FileDebugLogWriter = DebugLogWriter<BufWriter<File>>;
 
@@ -15,10 +18,14 @@ pub struct DebugLogWriter<W> {
     reopen: Option<Box<dyn Fn() -> io::Result<W> + Send + Sync>>,
     path: Option<PathBuf>,
     current_len: u64,
+    startup_tail_repair: JsonlTailRepairOutcome,
 }
 
 impl FileDebugLogWriter {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let startup_tail_repair = repair_jsonl_tail(path.as_ref())?;
+        report_jsonl_tail_repair("debug", path.as_ref(), startup_tail_repair);
+
         if let Some(archive) = rotate_log_if_oversized(path.as_ref())? {
             eprintln!(
                 "eidolon log rotation: archived oversized debug log to {}",
@@ -63,6 +70,7 @@ impl FileDebugLogWriter {
             })),
             path: Some(path),
             current_len,
+            startup_tail_repair,
         })
     }
 }
@@ -74,7 +82,12 @@ impl<W: Write> DebugLogWriter<W> {
             reopen: None,
             path: None,
             current_len: 0,
+            startup_tail_repair: JsonlTailRepairOutcome::NotNeeded,
         }
+    }
+
+    pub fn startup_tail_repair(&self) -> JsonlTailRepairOutcome {
+        self.startup_tail_repair
     }
 
     pub fn write_record(&mut self, record: &Value) -> io::Result<()> {
@@ -160,6 +173,35 @@ mod tests {
             .write_record(&json!({"a": 1}))
             .expect_err("write failure should propagate");
         assert_eq!(error.to_string(), "write failed");
+    }
+
+    #[test]
+    fn debug_log_repairs_invalid_tail_before_append() {
+        use std::fs;
+
+        let path = unique_debug_temp_path("invalid-tail.jsonl");
+        fs::write(&path, b"{\"first\":true}\n{\"partial\":").expect("torn debug log should write");
+
+        let mut writer = super::FileDebugLogWriter::open(&path).expect("debug log should repair");
+        assert!(matches!(
+            writer.startup_tail_repair(),
+            crate::event_log::JsonlTailRepairOutcome::Truncated { .. }
+        ));
+        writer
+            .write_record(&json!({"second": true}))
+            .expect("record should append");
+        drop(writer);
+
+        let lines = fs::read_to_string(&path)
+            .expect("debug log should read")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("line should be valid JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["first"], true);
+        assert_eq!(lines[1]["second"], true);
+
+        fs::remove_file(path).expect("debug log should remove");
     }
 
     #[test]
