@@ -15,6 +15,8 @@ make_stub_bins() {
 #!/usr/bin/env bash
 set -euo pipefail
 
+fixture="${EIDOLON_STATUS_FIXTURE:-healthy}"
+
 case "$*" in
   "config current-context")
     printf 'orbstack\n'
@@ -66,6 +68,77 @@ JSON
     cat <<'JSON'
 {"metadata":{"name":"eidolon-shield-ingress-trust-config"},"data":{"ingress-trust.json":"{\"schema_version\":1,\"entries\":[{\"label\":\"docs-crawler\",\"source\":\"local_allowlist\",\"trust_tier\":\"allowlisted\",\"expires_at\":\"2999-06-05T12:00:00Z\",\"methods\":[\"GET\"],\"path_prefixes\":[\"/docs\",\"/openapi.json\"],\"bait_soften_path_prefixes\":[\"/docs\"],\"user_agent_substrings\":[\"eidolon-docs-crawler\"],\"hosts\":[\"127.0.0.1\",\"localhost\"],\"source_cidrs\":[\"192.168.194.1/32\"],\"required_headers\":[{\"name\":\"X-Eidolon-Trusted-Actor\",\"value\":\"docs-crawler\"}]}]}"}}
 JSON
+    ;;
+  "-n shield-system exec eidolon-shield-proxy-abc -- df -Pk /var/lib/eidolon")
+    case "$fixture" in
+      unavailable|mixed_degraded_unavailable)
+        exit 1
+        ;;
+      malformed_df)
+        printf 'not valid df output\n'
+        ;;
+      disk_pressure)
+        printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+        printf '/dev/disk1 1024 942 82 92%% /var/lib/eidolon\n'
+        ;;
+      *)
+        printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+        printf '/dev/disk1 1024 102 922 10%% /var/lib/eidolon\n'
+        ;;
+    esac
+    ;;
+  "-n shield-system logs eidolon-shield-proxy-abc")
+    case "$fixture" in
+      unavailable)
+        exit 1
+        ;;
+      persistence_failure|mixed_degraded_unavailable)
+        printf 'eidolon persistence failure: event log: fixture write failed\n'
+        ;;
+      persistence_failure_before_last_500)
+        printf 'eidolon persistence failure: event log: old fixture write failed\n'
+        for line_number in {1..501}; do
+          printf 'normal proxy log line %s\n' "$line_number"
+        done
+        ;;
+      reconstruction_degraded|reconstruction_log_only)
+        printf 'eidolon startup: ignoring crash-torn event log tail at line 7\n'
+        ;;
+      tail_repaired)
+        printf 'eidolon log tail repair: repaired crash-torn event log tail\n'
+        ;;
+      *)
+        printf 'eidolon proxy started\n'
+        ;;
+    esac
+    ;;
+  "-n shield-system exec eidolon-shield-proxy-abc -- tail -n 1000 /var/lib/eidolon/debug.jsonl")
+    case "$fixture" in
+      unavailable|reconstruction_log_only|mixed_degraded_unavailable)
+        exit 1
+        ;;
+      reconstruction_degraded)
+        cat <<'JSONL'
+{"event":"proxy_started","fields":{"restored_bait_exposure_torn_tail_line":7,"restored_consumed_bait_proof_torn_tail_line":null}}
+JSONL
+        ;;
+      tail_repaired)
+        cat <<'JSONL'
+{"event":"proxy_started","fields":{"event_log_tail_repair":{"outcome":"truncated"},"debug_log_tail_repair":{"outcome":"appended_newline"}}}
+JSONL
+        ;;
+      migration_quarantine_active)
+        cat <<'JSONL'
+{"event":"proxy_started","fields":{"consumed_proof_migration_quarantine_until":null}}
+{"event":"proxy_started","fields":{"consumed_proof_migration_quarantine_until":4102444800,"event_log_tail_repair":{"outcome":"not_needed"},"debug_log_tail_repair":{"outcome":"not_needed"}}}
+JSONL
+        ;;
+      *)
+        cat <<'JSONL'
+{"event":"proxy_started","fields":{"restored_bait_exposure_torn_tail_line":null,"restored_consumed_bait_proof_torn_tail_line":null,"event_log_tail_repair":{"outcome":"not_needed"},"debug_log_tail_repair":{"outcome":"not_needed"}}}
+JSONL
+        ;;
+    esac
     ;;
   *)
     echo "unexpected kubectl invocation: $*" >&2
@@ -131,6 +204,16 @@ test_json_status_reports_edge_and_pvc() {
       and .ingress_trust.trusted_soften_scopes[0].hosts == ["127.0.0.1", "localhost"]
       and .ingress_trust.trusted_soften_scopes[0].source_cidrs == ["192.168.194.1/32"]
       and .ingress_trust.trusted_soften_scopes[0].required_header_names == ["X-Eidolon-Trusted-Actor"]
+      and .operator_health.status == "healthy"
+      and .operator_health.pod_name == "eidolon-shield-proxy-abc"
+      and .operator_health.persistent_volume.status == "healthy"
+      and .operator_health.persistent_volume.used_percent == 10
+      and .operator_health.persistent_volume.pressure == false
+      and .operator_health.persistence.status == "healthy"
+      and .operator_health.persistence.failure_marker_seen == false
+      and .operator_health.reconstruction.status == "healthy"
+      and .operator_health.reconstruction.startup_debug_available == true
+      and .operator_health.reconstruction.evidence == []
     ' >/dev/null
 }
 
@@ -156,6 +239,7 @@ test_human_status_mentions_running_components() {
   rg -q 'polymorphic-baits: /docs/legacy-import -> X-Migration-Trace \[mig\], /openapi.json -> X-OpenAPI-Trace \[oapi\], /docs/service-token -> X-Api-Key \[svc\]' <<<"$output"
   rg -q 'target: 2/2 ready' <<<"$output"
   rg -q 'proxy-state: Bound 1Gi \(local-path\)' <<<"$output"
+  rg -q 'operator-health: healthy \(disk=10% used, persistence=healthy, reconstruction=healthy\)' <<<"$output"
 }
 
 test_json_status_reports_unreachable_edge_without_failing() {
@@ -183,8 +267,235 @@ SH
     ' >/dev/null
 }
 
+test_json_status_reports_disk_pressure_as_degraded() {
+  local temp_dir
+  temp_dir="$(new_temp_dir)"
+  make_stub_bins "$temp_dir"
+
+  EIDOLON_STATUS_FIXTURE=disk_pressure \
+    KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    "$STATUS_SCRIPT" --json \
+    | jq -e '
+      .operator_health.status == "degraded"
+      and .operator_health.persistent_volume.status == "degraded"
+      and .operator_health.persistent_volume.used_percent == 92
+      and .operator_health.persistent_volume.pressure == true
+      and .operator_health.persistent_volume.pressure_threshold_percent == 85
+    ' >/dev/null
+}
+
+test_json_status_reports_persistence_failure_as_degraded() {
+  local temp_dir
+  temp_dir="$(new_temp_dir)"
+  make_stub_bins "$temp_dir"
+
+  EIDOLON_STATUS_FIXTURE=persistence_failure \
+    KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    "$STATUS_SCRIPT" --json \
+    | jq -e '
+      .operator_health.status == "degraded"
+      and .operator_health.persistence.status == "degraded"
+      and .operator_health.persistence.marker == "eidolon persistence failure:"
+      and .operator_health.persistence.failure_marker_seen == true
+      and .operator_health.persistence.pod_logs_available == true
+    ' >/dev/null
+}
+
+test_json_status_finds_persistence_failure_before_last_500_lines() {
+  local temp_dir
+  temp_dir="$(new_temp_dir)"
+  make_stub_bins "$temp_dir"
+
+  EIDOLON_STATUS_FIXTURE=persistence_failure_before_last_500 \
+    KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    "$STATUS_SCRIPT" --json \
+    | jq -e '
+      .operator_health.status == "degraded"
+      and .operator_health.persistence.status == "degraded"
+      and .operator_health.persistence.failure_marker_seen == true
+      and .operator_health.persistence.pod_logs_available == true
+    ' >/dev/null
+}
+
+test_json_status_reports_degraded_reconstruction_evidence() {
+  local temp_dir
+  temp_dir="$(new_temp_dir)"
+  make_stub_bins "$temp_dir"
+
+  EIDOLON_STATUS_FIXTURE=reconstruction_degraded \
+    KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    "$STATUS_SCRIPT" --json \
+    | jq -e '
+      .operator_health.status == "degraded"
+      and .operator_health.reconstruction.status == "degraded"
+      and (
+        .operator_health.reconstruction.evidence
+        | any(
+            .source == "startup_debug"
+            and .signal == "restored_bait_exposure_torn_tail_line"
+            and .value == 7
+          )
+      )
+      and (
+        .operator_health.reconstruction.evidence
+        | any(.source == "pod_logs" and .signal == "torn_tail_or_repair")
+      )
+    ' >/dev/null
+}
+
+test_json_status_reports_active_migration_quarantine_as_degraded() {
+  local temp_dir
+  temp_dir="$(new_temp_dir)"
+  make_stub_bins "$temp_dir"
+
+  EIDOLON_STATUS_FIXTURE=migration_quarantine_active \
+    KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    "$STATUS_SCRIPT" --json \
+    | jq -e '
+      .operator_health.status == "degraded"
+      and .operator_health.reconstruction.status == "degraded"
+      and .operator_health.reconstruction.startup_debug_available == true
+      and (
+        .operator_health.reconstruction.evidence
+        | any(
+            .source == "startup_debug"
+            and .signal == "consumed_proof_migration_quarantine_until"
+            and .state == "active"
+            and .value == 4102444800
+          )
+      )
+    ' >/dev/null
+}
+
+test_json_status_reports_tail_repair_as_degraded() {
+  local temp_dir
+  temp_dir="$(new_temp_dir)"
+  make_stub_bins "$temp_dir"
+
+  EIDOLON_STATUS_FIXTURE=tail_repaired \
+    KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    "$STATUS_SCRIPT" --json \
+    | jq -e '
+      .operator_health.status == "degraded"
+      and .operator_health.reconstruction.status == "degraded"
+      and (
+        .operator_health.reconstruction.evidence
+        | any(
+            .source == "startup_debug"
+            and .signal == "event_log_tail_repair"
+            and .value.outcome == "truncated"
+          )
+      )
+      and (
+        .operator_health.reconstruction.evidence
+        | any(
+            .source == "startup_debug"
+            and .signal == "debug_log_tail_repair"
+            and .value.outcome == "appended_newline"
+          )
+      )
+      and (
+        .operator_health.reconstruction.evidence
+        | any(.source == "pod_logs" and .signal == "torn_tail_or_repair")
+      )
+    ' >/dev/null
+}
+
+test_json_status_uses_log_only_reconstruction_evidence() {
+  local temp_dir
+  temp_dir="$(new_temp_dir)"
+  make_stub_bins "$temp_dir"
+
+  EIDOLON_STATUS_FIXTURE=reconstruction_log_only \
+    KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    "$STATUS_SCRIPT" --json \
+    | jq -e '
+      .operator_health.status == "degraded"
+      and .operator_health.reconstruction.status == "degraded"
+      and .operator_health.reconstruction.startup_debug_available == false
+      and .operator_health.reconstruction.evidence == [
+        {
+          "source": "pod_logs",
+          "signal": "torn_tail_or_repair"
+        }
+      ]
+    ' >/dev/null
+}
+
+test_json_status_reports_unavailable_health_probes() {
+  local temp_dir
+  temp_dir="$(new_temp_dir)"
+  make_stub_bins "$temp_dir"
+
+  EIDOLON_STATUS_FIXTURE=unavailable \
+    KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    "$STATUS_SCRIPT" --json \
+    | jq -e '
+      .operator_health.status == "unavailable"
+      and .operator_health.persistent_volume.status == "unavailable"
+      and .operator_health.persistent_volume.pressure == null
+      and .operator_health.persistence.status == "unavailable"
+      and .operator_health.persistence.failure_marker_seen == null
+      and .operator_health.persistence.pod_logs_available == false
+      and .operator_health.reconstruction.status == "unavailable"
+      and .operator_health.reconstruction.startup_debug_available == false
+    ' >/dev/null
+}
+
+test_json_status_reports_mixed_degraded_and_unavailable_probes() {
+  local temp_dir
+  temp_dir="$(new_temp_dir)"
+  make_stub_bins "$temp_dir"
+
+  EIDOLON_STATUS_FIXTURE=mixed_degraded_unavailable \
+    KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    "$STATUS_SCRIPT" --json \
+    | jq -e '
+      .operator_health.status == "degraded"
+      and .operator_health.persistent_volume.status == "unavailable"
+      and .operator_health.persistence.status == "degraded"
+      and .operator_health.reconstruction.status == "unavailable"
+    ' >/dev/null
+}
+
+test_json_status_reports_malformed_disk_probe_as_unavailable() {
+  local temp_dir
+  temp_dir="$(new_temp_dir)"
+  make_stub_bins "$temp_dir"
+
+  EIDOLON_STATUS_FIXTURE=malformed_df \
+    KUBECTL_BIN="$temp_dir/kubectl" \
+    CURL_BIN="$temp_dir/curl" \
+    "$STATUS_SCRIPT" --json \
+    | jq -e '
+      .operator_health.status == "unavailable"
+      and .operator_health.persistent_volume.status == "unavailable"
+      and .operator_health.persistence.status == "healthy"
+      and .operator_health.reconstruction.status == "healthy"
+    ' >/dev/null
+}
+
 test_json_status_reports_edge_and_pvc
 test_human_status_mentions_running_components
 test_json_status_reports_unreachable_edge_without_failing
+test_json_status_reports_disk_pressure_as_degraded
+test_json_status_reports_persistence_failure_as_degraded
+test_json_status_finds_persistence_failure_before_last_500_lines
+test_json_status_reports_degraded_reconstruction_evidence
+test_json_status_reports_active_migration_quarantine_as_degraded
+test_json_status_reports_tail_repair_as_degraded
+test_json_status_uses_log_only_reconstruction_evidence
+test_json_status_reports_unavailable_health_probes
+test_json_status_reports_mixed_degraded_and_unavailable_probes
+test_json_status_reports_malformed_disk_probe_as_unavailable
 
 printf 'shield-lab status checks passed\n'

@@ -1011,6 +1011,9 @@ fn unconfirmed_action_reason(action: &BaitActionEvidence) -> &'static str {
             Some(BaitHeaderValueMintStatus::ReplayStateCapacityExceeded) => {
                 "proof rejected because replay capacity was exceeded; excluded from confirmed evidence"
             }
+            Some(BaitHeaderValueMintStatus::ReplayStateUnavailable) => {
+                "proof rejected because durable replay state was unavailable; excluded from confirmed evidence"
+            }
             Some(BaitHeaderValueMintStatus::MissingSessionValue) => {
                 "proof rejected because the session proof was missing; excluded from confirmed evidence"
             }

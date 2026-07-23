@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{self, BufRead, BufWriter, Write},
+    io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -8,15 +8,31 @@ use eidolon_core::Event;
 
 pub type FileEventLogWriter = EventLogWriter<BufWriter<File>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsonlTailRepairOutcome {
+    NotNeeded,
+    AppendedNewline {
+        previous_len: u64,
+    },
+    Truncated {
+        original_len: u64,
+        repaired_len: u64,
+    },
+}
+
 pub struct EventLogWriter<W> {
     sink: W,
     reopen: Option<Box<dyn Fn() -> io::Result<W> + Send + Sync>>,
     path: Option<PathBuf>,
     current_len: u64,
+    startup_tail_repair: JsonlTailRepairOutcome,
 }
 
 impl FileEventLogWriter {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let startup_tail_repair = repair_event_log_tail(path.as_ref())?;
+        report_jsonl_tail_repair("event", path.as_ref(), startup_tail_repair);
+
         if let Some(archive) = rotate_log_if_oversized(path.as_ref())? {
             eprintln!(
                 "eidolon log rotation: archived oversized event log to {}",
@@ -61,6 +77,7 @@ impl FileEventLogWriter {
             })),
             path: Some(path),
             current_len,
+            startup_tail_repair,
         })
     }
 }
@@ -72,7 +89,12 @@ impl<W: Write> EventLogWriter<W> {
             reopen: None,
             path: None,
             current_len: 0,
+            startup_tail_repair: JsonlTailRepairOutcome::NotNeeded,
         }
+    }
+
+    pub fn startup_tail_repair(&self) -> JsonlTailRepairOutcome {
+        self.startup_tail_repair
     }
 
     pub fn write_event(&mut self, event: &Event) -> io::Result<()> {
@@ -156,6 +178,103 @@ pub const LOG_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
 /// to roughly `LOG_ROTATE_BYTES * (LOG_ARCHIVES_KEPT + 1)` per log.
 pub const LOG_ARCHIVES_KEPT: usize = 3;
 
+/// Repair an incomplete final JSONL record before the file is opened for
+/// append. A valid final JSON value only needs its missing delimiter restored;
+/// an invalid tail is discarded back to the previous complete line.
+pub fn repair_jsonl_tail(path: &Path) -> io::Result<JsonlTailRepairOutcome> {
+    repair_jsonl_tail_with(path, |record| {
+        serde_json::from_slice::<serde_json::Value>(record).is_ok()
+    })
+}
+
+fn repair_event_log_tail(path: &Path) -> io::Result<JsonlTailRepairOutcome> {
+    repair_jsonl_tail_with(path, |record| {
+        serde_json::from_slice::<Event>(record).is_ok()
+    })
+}
+
+fn repair_jsonl_tail_with(
+    path: &Path,
+    is_valid_record: impl Fn(&[u8]) -> bool,
+) -> io::Result<JsonlTailRepairOutcome> {
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(JsonlTailRepairOutcome::NotNeeded);
+        }
+        Err(error) => return Err(error),
+    };
+    let original_len = file.metadata()?.len();
+    if original_len == 0 {
+        return Ok(JsonlTailRepairOutcome::NotNeeded);
+    }
+
+    let mut reader = BufReader::new(file.try_clone()?);
+    let mut line = Vec::new();
+    let mut line_start = 0_u64;
+    let mut line_number = 1_usize;
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            return Ok(JsonlTailRepairOutcome::NotNeeded);
+        }
+        let terminated = line.ends_with(b"\n");
+        let record = if terminated {
+            &line[..line.len() - 1]
+        } else {
+            line.as_slice()
+        };
+        let valid = record.iter().all(u8::is_ascii_whitespace) || is_valid_record(record);
+        if valid {
+            if terminated {
+                line_start = line_start.saturating_add(bytes_read as u64);
+                line_number += 1;
+                continue;
+            }
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+            file.sync_data()?;
+            return Ok(JsonlTailRepairOutcome::AppendedNewline {
+                previous_len: original_len,
+            });
+        }
+        if terminated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid JSONL record at line {line_number} in `{}`",
+                    path.display()
+                ),
+            ));
+        }
+
+        file.set_len(line_start)?;
+        file.sync_data()?;
+        return Ok(JsonlTailRepairOutcome::Truncated {
+            original_len,
+            repaired_len: line_start,
+        });
+    }
+}
+
+pub fn report_jsonl_tail_repair(log_name: &str, path: &Path, outcome: JsonlTailRepairOutcome) {
+    match outcome {
+        JsonlTailRepairOutcome::NotNeeded => {}
+        JsonlTailRepairOutcome::AppendedNewline { previous_len } => eprintln!(
+            "eidolon log tail repair: restored missing newline in {log_name} log `{}` after {previous_len} bytes",
+            path.display()
+        ),
+        JsonlTailRepairOutcome::Truncated {
+            original_len,
+            repaired_len,
+        } => eprintln!(
+            "eidolon log tail repair: truncated invalid final fragment in {log_name} log `{}` from {original_len} to {repaired_len} bytes",
+            path.display()
+        ),
+    }
+}
+
 /// Rotate `path` to a timestamped archive when its on-disk length already
 /// exceeds the rotation budget (used at open time). Returns the archive
 /// path when a rotation happened.
@@ -170,22 +289,34 @@ pub fn rotate_log_if_oversized(path: &Path) -> io::Result<Option<PathBuf>> {
     rotate_log_now(path).map(Some)
 }
 
-/// Rotate `path` unconditionally: rename it to `<path>.<unix_secs>` and
+/// Rotate `path` unconditionally: rename it to `<path>.<unix_nanos>` and
 /// prune archives beyond the retention budget. The caller reopens the
 /// active path afterwards.
 pub fn rotate_log_now(path: &Path) -> io::Result<PathBuf> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let archive = std::path::PathBuf::from(format!("{}.{now}", path.display()));
+    let archive = next_archive_path(path, now);
     std::fs::rename(path, &archive)?;
     prune_log_archives(path, &archive, LOG_ARCHIVES_KEPT)?;
     Ok(archive)
 }
 
+fn next_archive_path(path: &Path, initial_stamp: u128) -> PathBuf {
+    let mut stamp = initial_stamp;
+    loop {
+        let mut archive = path.as_os_str().to_os_string();
+        archive.push(format!(".{stamp:039}"));
+        let archive = PathBuf::from(archive);
+        if !archive.exists() {
+            return archive;
+        }
+        stamp = stamp.saturating_add(1);
+    }
+}
+
 fn prune_log_archives(path: &Path, fresh_archive: &Path, keep: usize) -> io::Result<()> {
-    let prefix = format!("{}.", path.display());
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -193,18 +324,31 @@ fn prune_log_archives(path: &Path, fresh_archive: &Path, keep: usize) -> io::Res
     let mut archives: Vec<PathBuf> = std::fs::read_dir(parent)?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|candidate| {
-            candidate.to_string_lossy().starts_with(&prefix) && candidate != fresh_archive
-        })
+        .filter(|candidate| candidate != fresh_archive && archive_suffix(path, candidate).is_some())
         .collect();
-    archives.sort();
+    archives.sort_by(|left, right| {
+        let left = archive_suffix(path, left).expect("archive was filtered");
+        let right = archive_suffix(path, right).expect("archive was filtered");
+        left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+    });
 
-    let excess = archives.len().saturating_sub(keep);
+    let old_archives_to_keep = keep.saturating_sub(1);
+    let excess = archives.len().saturating_sub(old_archives_to_keep);
     for stale in archives.into_iter().take(excess) {
         std::fs::remove_file(stale)?;
     }
+    if keep == 0 {
+        std::fs::remove_file(fresh_archive)?;
+    }
 
     Ok(())
+}
+
+fn archive_suffix<'a>(path: &Path, candidate: &'a Path) -> Option<&'a str> {
+    let base = path.file_name()?.to_str()?;
+    let candidate = candidate.file_name()?.to_str()?;
+    let suffix = candidate.strip_prefix(base)?.strip_prefix('.')?;
+    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(suffix)
 }
 
 #[cfg(test)]
@@ -217,7 +361,7 @@ mod tests {
     };
     use serde_json::Value;
 
-    use super::{EventLogWriter, FileEventLogWriter};
+    use super::{EventLogWriter, FileEventLogWriter, JsonlTailRepairOutcome};
 
     #[cfg(unix)]
     fn unique_temp_path(label: &str) -> std::path::PathBuf {
@@ -355,12 +499,180 @@ mod tests {
     }
 
     #[test]
+    fn valid_unterminated_json_is_delimited_before_append_and_stays_valid_after_restart() {
+        use std::fs;
+
+        let path = unique_temp_path("valid-unterminated.jsonl");
+        let first = serde_json::to_vec(&request_event("GET", "/first"))
+            .expect("first event should serialize");
+        fs::write(&path, &first).expect("unterminated event should write");
+
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should repair");
+        assert_eq!(
+            writer.startup_tail_repair(),
+            JsonlTailRepairOutcome::AppendedNewline {
+                previous_len: first.len() as u64
+            }
+        );
+        writer
+            .write_event(&request_event("GET", "/second"))
+            .expect("second event should append");
+        drop(writer);
+
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should reopen");
+        assert_eq!(
+            writer.startup_tail_repair(),
+            JsonlTailRepairOutcome::NotNeeded
+        );
+        writer
+            .write_event(&request_event("GET", "/third"))
+            .expect("third event should append");
+        drop(writer);
+
+        let lines = fs::read_to_string(&path)
+            .expect("event log should read")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("line should be valid JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["kind"]["path"], "/first");
+        assert_eq!(lines[1]["kind"]["path"], "/second");
+        assert_eq!(lines[2]["kind"]["path"], "/third");
+
+        fs::remove_file(path).expect("event log should remove");
+    }
+
+    #[test]
+    fn invalid_tail_is_truncated_before_append_and_stays_valid_after_restart() {
+        use std::fs;
+
+        let path = unique_temp_path("invalid-tail.jsonl");
+        let mut original =
+            serde_json::to_vec(&request_event("GET", "/first")).expect("event should serialize");
+        original.extend_from_slice(b"\n{\"schema_version\":");
+        let repaired_len = original
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .expect("fixture should contain a newline")
+            + 1;
+        fs::write(&path, &original).expect("torn event log should write");
+
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should repair");
+        assert_eq!(
+            writer.startup_tail_repair(),
+            JsonlTailRepairOutcome::Truncated {
+                original_len: original.len() as u64,
+                repaired_len: repaired_len as u64,
+            }
+        );
+        writer
+            .write_event(&request_event("GET", "/second"))
+            .expect("second event should append");
+        drop(writer);
+
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should reopen");
+        assert_eq!(
+            writer.startup_tail_repair(),
+            JsonlTailRepairOutcome::NotNeeded
+        );
+        writer
+            .write_event(&request_event("GET", "/third"))
+            .expect("third event should append");
+        drop(writer);
+
+        let lines = fs::read_to_string(&path)
+            .expect("event log should read")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("line should be valid JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["kind"]["path"], "/first");
+        assert_eq!(lines[1]["kind"]["path"], "/second");
+        assert_eq!(lines[2]["kind"]["path"], "/third");
+
+        fs::remove_file(path).expect("event log should remove");
+    }
+
+    #[test]
+    fn corrupt_complete_record_is_rejected_before_append() {
+        use std::fs;
+
+        let path = unique_temp_path("mid-file-corruption.jsonl");
+        let valid =
+            serde_json::to_string(&request_event("GET", "/first")).expect("event should serialize");
+        fs::write(&path, format!("{valid}\n{{not json}}\n"))
+            .expect("corrupt event log should write");
+
+        let error = FileEventLogWriter::open(&path)
+            .err()
+            .expect("complete corrupt record must fail startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 2"));
+        fs::remove_file(path).expect("event log should remove");
+    }
+
+    #[test]
+    fn valid_json_that_is_not_an_event_is_rejected_before_append() {
+        use std::fs;
+
+        let path = unique_temp_path("invalid-event-record.jsonl");
+        let valid =
+            serde_json::to_string(&request_event("GET", "/first")).expect("event should serialize");
+        fs::write(&path, format!("{valid}\n{{\"not\":\"an event\"}}\n"))
+            .expect("invalid event log should write");
+
+        let error = FileEventLogWriter::open(&path)
+            .err()
+            .expect("non-event JSON record must fail startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 2"));
+        fs::remove_file(path).expect("event log should remove");
+    }
+
+    #[test]
+    fn invalid_only_tail_is_truncated_to_empty_before_append() {
+        use std::fs;
+
+        let path = unique_temp_path("invalid-only-tail.jsonl");
+        let torn = b"{\"schema_version\":";
+        fs::write(&path, torn).expect("torn event log should write");
+
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should repair");
+        assert_eq!(
+            writer.startup_tail_repair(),
+            JsonlTailRepairOutcome::Truncated {
+                original_len: torn.len() as u64,
+                repaired_len: 0,
+            }
+        );
+        writer
+            .write_event(&request_event("GET", "/replacement"))
+            .expect("replacement event should append");
+        drop(writer);
+
+        let rendered = fs::read_to_string(&path).expect("event log should read");
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let value: Value = serde_json::from_str(lines[0]).expect("line should be valid JSON");
+        assert_eq!(value["kind"]["path"], "/replacement");
+
+        fs::remove_file(path).expect("event log should remove");
+    }
+
+    #[test]
     fn oversized_log_rotates_on_open_and_keeps_only_bounded_archives() {
         use std::fs;
 
         let path = unique_temp_path("oversized.jsonl");
-        let oversized = vec![b'x'; (super::LOG_ROTATE_BYTES + 1) as usize];
-        fs::write(&path, &oversized).expect("oversized log should write");
+        let event_line = format!(
+            "{}\n",
+            serde_json::to_string(&request_event("GET", "/oversized"))
+                .expect("event should serialize")
+        );
+        let repetitions = (super::LOG_ROTATE_BYTES as usize / event_line.len()) + 1;
+        fs::write(&path, event_line.repeat(repetitions)).expect("oversized log should write");
         for index in 0..5 {
             fs::write(
                 format!("{}.10000000{index}", path.display()),
@@ -387,14 +699,106 @@ mod tests {
             .collect();
         assert_eq!(
             archives.len(),
-            super::LOG_ARCHIVES_KEPT + 1,
-            "archives must stay within the retention budget (kept archives plus the fresh one)"
+            super::LOG_ARCHIVES_KEPT,
+            "archive budget must include the newly rotated segment"
+        );
+        let suffixes = archives
+            .iter()
+            .map(|archive| {
+                super::archive_suffix(&path, archive)
+                    .expect("archive suffix")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        for stale in ["100000000", "100000001", "100000002"] {
+            assert!(
+                !suffixes.iter().any(|suffix| suffix == stale),
+                "old archive {stale} should be pruned"
+            );
+        }
+        for retained in ["100000003", "100000004"] {
+            assert!(
+                suffixes.iter().any(|suffix| suffix == retained),
+                "new archive {retained} should be retained"
+            );
+        }
+        assert_eq!(
+            suffixes.iter().filter(|suffix| suffix.len() == 39).count(),
+            1,
+            "the fresh nanosecond archive must be retained"
         );
 
         fs::remove_file(&path).expect("active log should remove");
         for archive in archives {
             fs::remove_file(archive).expect("archive should remove");
         }
+    }
+
+    #[test]
+    fn oversized_corrupt_log_is_rejected_before_rotation() {
+        use std::fs;
+
+        let path = unique_temp_path("oversized-corrupt.jsonl");
+        let mut corrupt = vec![b'x'; (super::LOG_ROTATE_BYTES + 1) as usize];
+        *corrupt.last_mut().expect("fixture should not be empty") = b'\n';
+        fs::write(&path, &corrupt).expect("corrupt log should write");
+
+        let error = FileEventLogWriter::open(&path)
+            .err()
+            .expect("corrupt oversized log must fail startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("active corrupt log should remain")
+                .len(),
+            corrupt.len() as u64
+        );
+        let prefix = format!("{}.", path.display());
+        assert!(
+            fs::read_dir(path.parent().expect("temp dir"))
+                .expect("temp dir should read")
+                .filter_map(Result::ok)
+                .all(|entry| !entry.path().to_string_lossy().starts_with(&prefix)),
+            "corrupt active log must not be archived"
+        );
+        fs::remove_file(path).expect("corrupt log should remove");
+    }
+
+    #[test]
+    fn archive_name_skips_an_existing_timestamp() {
+        use std::fs;
+
+        let path = unique_temp_path("archive-collision.jsonl");
+        let occupied = super::next_archive_path(&path, 42);
+        fs::write(&occupied, b"occupied").expect("occupied archive should write");
+
+        let candidate = super::next_archive_path(&path, 42);
+
+        assert_ne!(candidate, occupied);
+        assert!(candidate
+            .to_string_lossy()
+            .ends_with("000000000000000000000000000000000000043"));
+
+        fs::remove_file(occupied).expect("occupied archive should remove");
+    }
+
+    #[test]
+    fn immediate_rotations_use_distinct_archive_names() {
+        use std::fs;
+
+        let path = unique_temp_path("distinct-archives.jsonl");
+        fs::write(&path, b"first\n").expect("first active log should write");
+        let first = super::rotate_log_now(&path).expect("first rotation should succeed");
+        fs::write(&path, b"second\n").expect("second active log should write");
+        let second = super::rotate_log_now(&path).expect("second rotation should succeed");
+
+        assert_ne!(first, second);
+        assert!(first.exists());
+        assert!(second.exists());
+
+        fs::remove_file(first).expect("first archive should remove");
+        fs::remove_file(second).expect("second archive should remove");
     }
 
     #[test]

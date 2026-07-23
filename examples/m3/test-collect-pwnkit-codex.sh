@@ -731,6 +731,7 @@ test_rejected_minted_proof_remains_visible_but_unconfirmed() {
     expired_session_value \
     replay_seen \
     replay_state_capacity_exceeded \
+    replay_state_unavailable \
     missing_session_value \
     malformed_session_value \
     session_value_mismatch; do
