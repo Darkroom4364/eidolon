@@ -282,7 +282,7 @@ pub fn edge_decision_export_for_evidence(
         Some((
             event,
             method.clone(),
-            path.clone(),
+            report_target(path),
             ingress_identity.clone(),
             authenticated_ingress_rule_rejection.clone(),
             local_ingress_trust_scope_rejection.clone(),
@@ -1114,35 +1114,13 @@ fn report_target(value: &str) -> String {
         });
 
     let mut redacted = path.to_string();
-    if let Some(query) = query {
-        redacted.push('?');
-        redacted.push_str(&redacted_query(query));
+    if query.is_some() {
+        redacted.push_str("?<redacted>");
     }
     if fragment.is_some() {
         redacted.push_str("#<redacted>");
     }
     redacted
-}
-
-fn redacted_query(query: &str) -> String {
-    let redacted_pairs: Vec<String> = query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let key = pair.split_once('=').map_or(pair, |(key, _)| key);
-            if key.is_empty() {
-                "<redacted>".to_string()
-            } else {
-                format!("{key}=<redacted>")
-            }
-        })
-        .collect();
-
-    if redacted_pairs.is_empty() {
-        "<redacted>".to_string()
-    } else {
-        redacted_pairs.join("&")
-    }
 }
 
 fn snake_case_debug(value: &impl std::fmt::Debug) -> String {
@@ -1606,9 +1584,26 @@ mod tests {
         assert!(!report.contains("fragment-secret"));
         assert!(!report.contains("surface-secret"));
         assert!(!report.contains("action-secret"));
-        assert!(report.contains("/oauth/callback?code=<redacted>&state=<redacted>#<redacted>"));
-        assert!(report.contains("/docs/legacy-import?download_token=<redacted>"));
-        assert!(report.contains("/api/v2/import/reconcile?api_key=<redacted>"));
+        assert!(report.contains("/oauth/callback?<redacted>#<redacted>"));
+        assert!(report.contains("/docs/legacy-import?<redacted>"));
+        assert!(report.contains("/api/v2/import/reconcile?<redacted>"));
+        assert_eq!(report_target("/docs?sk_live_secret"), "/docs?<redacted>");
+        assert_eq!(report_target("/docs?sk_live_secret=x"), "/docs?<redacted>");
+    }
+
+    #[test]
+    fn edge_export_redacts_the_entire_query_component() {
+        let session_id = SessionId::new();
+        let mut request = request(session_id);
+        let EventKind::RequestSeen { path, .. } = &mut request.kind else {
+            panic!("request helper must produce request_seen");
+        };
+        *path = "/docs?sk_live_secret=x".to_string();
+        let timeline = timeline(vec![request]);
+
+        let export = edge_decision_export_for_timeline(&timeline).expect("request should export");
+
+        assert_eq!(export.request.path, "/docs?<redacted>");
     }
 
     #[test]

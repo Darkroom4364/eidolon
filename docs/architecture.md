@@ -121,6 +121,22 @@ Axum/Hyper/Tower
 JSONL or SQLite event log
 ```
 
+### HTTP boundary decision
+
+The current v0 Lab proxy still uses a bounded, blocking HTTP/1 parser. The
+`#212` hardening rejects ambiguous request targets and unsupported framing,
+requires one unambiguous Host authority, and stores only a fixed placeholder
+for rejected targets. Query components are fully redacted in events, reports,
+and edge exports. This does not make that parser a production boundary.
+
+Before any production-readiness claim, the request-spine work in `#197` must
+move ingress and upstream HTTP handling to Hyper/Tower. Keep-alive,
+multiplexing, upgrades, and additional transfer codings must not be added to
+the custom parser. Until that replacement lands, the custom boundary remains
+limited to owned Lab traffic with connection caps, I/O deadlines, bounded
+headers and bodies, a fixed total request-read deadline, and fail-closed
+parsing.
+
 The hard part is not high-performance proxying. The hard part is causal trace reconstruction.
 
 ## 2. Surface Controller
