@@ -401,23 +401,21 @@ Status checklist:
   transport-authenticated strong explicit claims such as `signed_agent`
 - [ ] Prepare the external-readiness note and release checklist
 
-## Active Engineering Safety Gate
+## 2026 Engineering Review
 
-GitHub issue `#213` is the governing priority. Until it closes with merged
-adversarial regression coverage, the project does not prioritize additional
-policy states, bait or controlled-reality breadth, trust variants, benchmark
-expansion, microVM execution, telemetry expansion, or export sealing.
-Automated repository enforcement remains incomplete and is tracked by `#214`.
+GitHub issue `#213` recorded a one-time advisory engineering review, not a
+global release, feature, or merge gate. Its findings were tracked and resolved
+independently in `#207` through `#212`. Proposed repository-wide enforcement
+in `#214` was retired as not planned.
 
-The execution order is:
+The merged follow-up covers:
 
-1. Complete `#208` as a small PR series, beginning with Eidolon ownership of
-   every configured unsafe bait-action shape before proof validation.
-2. Complete `#209` so rejected observations remain visible facts without
-   confirmed-chain scoring.
-3. Design `#207` together with the lifetime, rotation, and bounded-storage
-   requirements in `#211`.
-4. Define `#212` canonical request-target semantics before freezing the `#210`
-   request-level event contract.
-5. Finish `#211`, `#212`, and repository-wide enforcement in `#214` before
-   resuming feature expansion.
+1. fail-closed handling for every recognized unsafe bait action (`#208`)
+2. rejected evidence remaining visible without confirmed-chain scoring (`#209`)
+3. protected session identity and rotation-resistant state (`#207`)
+4. request-level causal links across runtime and export (`#210`)
+5. bounded, recoverable runtime state and event logs (`#211`)
+6. canonical or rejected ambiguous request targets (`#212`)
+
+This review does not globally sequence the remaining roadmap. New work follows
+open issue priorities and the applicable invariants above.
