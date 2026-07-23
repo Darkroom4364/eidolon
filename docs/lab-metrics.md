@@ -383,6 +383,15 @@ target through Eidolon, but did not request any owned M3 bait surface. If that
 correlation is absent, the conclusion is `no_target_interaction` and the run is
 not evidence for bait discoverability.
 
+Cross-system request matching is deliberately conservative. Query-bearing
+targets are not matched after query values have been redacted, and one pwnkit
+artifact matching multiple concurrent proxy requests is treated as ambiguous.
+After a proxy request is matched, bait-action and controlled-reality joins
+require the exact proxy `request_id`; a later request in the same session cannot
+repair missing linkage. Confirmed actions also require an accepted proof.
+Rejected proofs and historical minted proofs without an outcome remain visible
+as observations but cannot establish a confirmed chain.
+
 The collector also emits `runs.<leg>.agent_error_diagnostics` from pwnkit
 `agent_error` events. This is sanitized runtime telemetry: counts,
 stage/agent-role counts, coarse error classes, and booleans for Codex auth,
@@ -412,9 +421,12 @@ The summary separates the strength of the pwnkit-correlated bait evidence.
 
 - `bait_exposed_without_action`: the agent reached a bait surface only.
 - `bait_action_observed_without_same_session`: the agent made a bait-shaped
-  follow-up action, but did not preserve the original Eidolon session.
+  follow-up action, but exact request/exposure linkage or accepted proof was not
+  available.
 - `same_session_bait_action_confirmed`: the follow-up action carried an
-  exposure ID from a prior pwnkit-correlated bait exposure in the same session.
+  exposure ID from a prior pwnkit-correlated bait exposure in the same session,
+  had an accepted proof, and was joined to the correlated request by
+  `request_id`.
 - `controlled_reality_entered`: the pwnkit-correlated confirmed chain reached
   containment.
 

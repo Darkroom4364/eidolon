@@ -237,6 +237,22 @@ pub fn merge_ingress_identity(
     }
 }
 
+/// Whether `path` matches `prefix` on a path-segment boundary: the whole
+/// prefix, optionally followed by more complete segments. `/docs` matches
+/// `/docs` and `/docs/x` but never `/docs2` or `/docsify` (#212).
+pub fn path_matches_segment_prefix(path: &str, prefix: &str) -> bool {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+    if prefix.is_empty() {
+        return path.starts_with('/');
+    }
+
+    path == prefix
+        || (path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.as_bytes()[prefix.len()] == b'/')
+}
+
 /// Return whether this identity is strong enough to suppress bait exposure
 /// while the session is still in an observe-only posture.
 pub fn softens_bait_surface_exposure(identity: &IngressIdentity) -> bool {
@@ -328,7 +344,7 @@ fn authenticated_rule_specificity(
     let matched_path_prefix_len = entry
         .path_prefixes
         .iter()
-        .filter(|prefix| path.starts_with(prefix.as_str()))
+        .filter(|prefix| path_matches_segment_prefix(path, prefix.as_str()))
         .map(|prefix| prefix.len())
         .max()
         .unwrap_or_default();
@@ -490,7 +506,7 @@ impl TrustedIngressEntry {
             && !self
                 .path_prefixes
                 .iter()
-                .any(|prefix| path.starts_with(prefix))
+                .any(|prefix| path_matches_segment_prefix(path, prefix))
         {
             return TrustedIngressEntryEvaluation::ScopeRejected(Box::new(
                 self.scope_rejection(LocalIngressTrustScopeRejectionReason::PathMismatch),
@@ -630,7 +646,7 @@ impl AuthenticatedTrustedIngressEntry {
             && !self
                 .path_prefixes
                 .iter()
-                .any(|prefix| path.starts_with(prefix))
+                .any(|prefix| path_matches_segment_prefix(path, prefix))
         {
             return AuthenticatedTrustedIngressEntryEvaluation::RuleRejected(
                 self.rule_rejection(AuthenticatedIngressRuleRejectionReason::PathMismatch),
@@ -1186,6 +1202,21 @@ mod tests {
             Some(value) => value,
             None => panic!("{context}"),
         }
+    }
+
+    #[test]
+    fn path_prefixes_match_only_complete_path_segments() {
+        assert!(path_matches_segment_prefix("/docs", "/docs"));
+        assert!(path_matches_segment_prefix("/docs/", "/docs"));
+        assert!(path_matches_segment_prefix("/docs/imports", "/docs"));
+        assert!(path_matches_segment_prefix("/docs?topic=imports", "/docs"));
+        assert!(path_matches_segment_prefix(
+            "/docs/imports?topic=legacy",
+            "/docs/"
+        ));
+        assert!(!path_matches_segment_prefix("/docs2", "/docs"));
+        assert!(!path_matches_segment_prefix("/docsify", "/docs"));
+        assert!(!path_matches_segment_prefix("/doc", "/docs"));
     }
 
     #[test]
