@@ -194,12 +194,15 @@ baseline. It already supported the stronger same-session containment claim on
 now best interpreted as historical pre-fix behavior rather than an active
 Eidolon-side blocker.
 
-The strict pwnkit-correlated collector changes remain important. It still
-correlates the standard request-at-or-before-action path, and it also supports
-exact crawl-start exposure confirmation plus later same-session request
-attribution when pwnkit persists the decisive request after the proxy has
-already recorded the bait action. Proxy-only actions without a matching pwnkit
-artifact still do not upgrade the strict claim.
+The strict pwnkit-correlated collector changes remain important. The current
+contract requires an unambiguous pwnkit-to-proxy request match, exact proxy
+`request_id` linkage for action and containment events, and an accepted proof.
+One-to-one queryless crawl-start matches may still support exposure evidence,
+but ambiguous crawl matches cannot, and a later request in the same session
+cannot repair missing action linkage.
+Proxy-only or rejected actions do not upgrade the strict claim. Historical
+samples that depended on the older fallback must be reproduced before their
+strict attribution is reused.
 
 The stale artifact did not support the stronger same-session or containment
 claims. Because the pwnkit bundle was stale, the recorded

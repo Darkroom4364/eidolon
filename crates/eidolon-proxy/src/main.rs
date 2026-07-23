@@ -10,7 +10,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use eidolon_bait::{docs_for_bait, render_bait_for_session, BaitRegistry};
@@ -48,14 +48,17 @@ const DEFAULT_POLICY_STATE: &str = "/tmp/eidolon-policy-state.json";
 const DEFAULT_TRUSTED_BAIT_SOFTEN_PREFIXES: &[&str] = &["/docs", "/openapi.json"];
 const DOCS_DISCOVERY_TARGET: &str = "/docs";
 const OPENAPI_DISCOVERY_TARGET: &str = "/openapi.json";
+const REJECTED_REQUEST_TARGET: &str = "/__eidolon_rejected_target__";
 const LEGACY_IMPORT_OPENAPI_QUERY: &str = "eidolon_surface=legacy-import";
 const DEFAULT_HTTP_PORT: u16 = 80;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 const MAX_BAIT_EXPOSURES: usize = 4096;
 const MAX_CONSUMED_BAIT_PROOFS: usize = 4096;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const CLIENT_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const SAFE_HEADER_NAMES: &[&str] = &[
@@ -829,6 +832,46 @@ fn configure_client_stream(stream: &TcpStream) -> io::Result<()> {
     configure_stream_timeouts(stream, CLIENT_IO_TIMEOUT, CLIENT_IO_TIMEOUT)
 }
 
+struct DeadlineTcpReader<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Instant,
+}
+
+impl<'a> DeadlineTcpReader<'a> {
+    fn new(stream: &'a mut TcpStream, timeout: Duration) -> Self {
+        Self {
+            stream,
+            deadline: Instant::now() + timeout,
+        }
+    }
+
+    fn timeout_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "HTTP request read deadline exceeded",
+        )
+    }
+}
+
+impl Read for DeadlineTcpReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(Self::timeout_error)?;
+        if remaining.is_zero() {
+            return Err(Self::timeout_error());
+        }
+
+        self.stream.set_read_timeout(Some(remaining))?;
+        let result = self.stream.read(buffer);
+        if Instant::now() >= self.deadline {
+            return Err(Self::timeout_error());
+        }
+        result
+    }
+}
+
 fn configure_upstream_stream(stream: &TcpStream) -> io::Result<()> {
     configure_stream_timeouts(stream, UPSTREAM_IO_TIMEOUT, UPSTREAM_IO_TIMEOUT)
 }
@@ -979,6 +1022,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     let policy_store_session_count = policy_store.len();
     let runtime = ProxyRuntime {
         upstream: config.upstream,
+        client_request_deadline: CLIENT_REQUEST_DEADLINE,
         event_log: Arc::new(Mutex::new(FileEventLogWriter::open(
             &config.event_log_path,
         )?)),
@@ -1049,8 +1093,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 if let Some(permit) = connection_limiter.try_acquire() {
                     let runtime = runtime.clone();
                     thread::spawn(move || {
-                        let _permit = permit;
-                        if let Err(error) = handle_connection(stream, &runtime) {
+                        if let Err(error) = handle_connection(stream, &runtime, permit) {
                             eprintln!("proxy connection error: {error}");
                         }
                     });
@@ -1068,6 +1111,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
 #[derive(Clone)]
 struct ProxyRuntime {
     upstream: UpstreamTarget,
+    client_request_deadline: Duration,
     event_log: Arc<Mutex<FileEventLogWriter>>,
     debug_log: Option<Arc<Mutex<FileDebugLogWriter>>>,
     intervention_control_path: PathBuf,
@@ -1444,9 +1488,9 @@ struct SurfaceContentOverride {
 
 impl SurfaceContentOverride {
     fn validate(&self, bait_id: &str) -> Result<(), ConfigError> {
-        if matches!(self.status, Some(status) if !(100..600).contains(&status)) {
+        if matches!(self.status, Some(status) if !(200..600).contains(&status)) {
             return Err(ConfigError::new(format!(
-                "content.surfaces.{bait_id}.status must be an HTTP status code"
+                "content.surfaces.{bait_id}.status must be a final HTTP status code (200-599)"
             )));
         }
         validate_optional_non_empty(
@@ -2259,13 +2303,22 @@ fn is_success_status(status: u16) -> bool {
     (200..300).contains(&status)
 }
 
-fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io::Result<()> {
+fn handle_connection(
+    mut client_stream: TcpStream,
+    runtime: &ProxyRuntime,
+    _permit: ConnectionPermit,
+) -> io::Result<()> {
     configure_client_stream(&client_stream)?;
 
     let client_peer_addr = client_stream.peer_addr().ok();
     let client_peer = client_peer_addr.as_ref().map(ToString::to_string);
     let client_peer_ip = client_peer_addr.map(|addr| addr.ip());
-    let Some(request) = read_http_request(&mut client_stream)? else {
+    let request = {
+        let mut reader =
+            DeadlineTcpReader::new(&mut client_stream, runtime.client_request_deadline);
+        read_http_request(&mut reader)?
+    };
+    let Some(request) = request else {
         write_debug(
             runtime,
             "connection_closed_without_request",
@@ -2278,7 +2331,53 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     };
 
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
-    let path = normalized_event_path(&request)?;
+    let path = match normalized_event_path(&request) {
+        Ok(path) => path,
+        Err(error) => {
+            // #212: ambiguous request targets are rejected with an audited
+            // 400 before any policy evaluation, recon accounting, or upstream
+            // forwarding. A fixed placeholder prevents the rejected spelling
+            // itself from leaking attacker-controlled data into evidence.
+            let request_id = RequestId::new();
+            let surface_request = surface_request_meta(&request, REJECTED_REQUEST_TARGET);
+            let session = effective_session_context(
+                runtime,
+                &request,
+                &surface_request,
+                client_peer_ip,
+                request_id,
+            )?;
+            write_debug(
+                runtime,
+                "ambiguous_request_target_rejected",
+                Some(session.session_id),
+                json!({
+                    "request_id": request_id.0,
+                    "method": request.method.as_str(),
+                    "error": error.to_string(),
+                }),
+            )?;
+            let decision = policy::PolicyDecision::new(
+                policy_state_for_session(runtime, session.session_id)?,
+                RoutingDecision::EidolonOwned,
+                "ambiguous HTTP request target rejected before policy evaluation",
+            );
+            return write_direct_response(DirectResponseContext {
+                client_stream,
+                runtime,
+                session: &session,
+                request: &request,
+                path: REJECTED_REQUEST_TARGET,
+                request_id,
+                decision: &decision,
+                discovery_recon_score: policy::DiscoveryReconAggregationScore::default(),
+                discovery_recon_threshold: policy::discovery_recon_aggregation_score_threshold(),
+                response: surface_text_response(400, "ambiguous request target\n"),
+                intervention_mode,
+                surface_requested_intervention: true,
+            });
+        }
+    };
     let surface_request = surface_request_meta(&request, &path);
     let request_id = RequestId::new();
     let owns_configured_unsafe_bait_action =
@@ -2960,7 +3059,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 )?;
                 bait_action_synthetic_response()
             };
-            apply_response_headers(&mut response, &session);
+            apply_response_headers(&mut response, &session, &request.method);
             write_event(
                 &runtime.event_log,
                 &policy::response_audit_event(
@@ -2985,7 +3084,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
                 }),
             )?;
 
-            client_stream.write_all(&response.to_http_bytes())?;
+            client_stream.write_all(&response.to_http_bytes_for_method(&request.method))?;
             return client_stream.flush();
         }
     }
@@ -3212,7 +3311,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             intervention_mode,
             surface_requested_intervention,
         )?;
-        apply_response_headers(&mut response, &session);
+        apply_response_headers(&mut response, &session, &request.method);
         if let Some(bait) = bait_exposure_for_direct_surface(
             &decision,
             &surface_action,
@@ -3252,7 +3351,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             }),
         )?;
 
-        client_stream.write_all(&response.to_http_bytes())?;
+        client_stream.write_all(&response.to_http_bytes_for_method(&request.method))?;
         return client_stream.flush();
     }
 
@@ -3301,7 +3400,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
     upstream_stream.write_all(&upstream_request)?;
     upstream_stream.flush()?;
 
-    let mut response = read_http_response(&mut upstream_stream)?;
+    let mut response = read_http_response_for_method(&mut upstream_stream, &request.method)?;
     write_debug(
         runtime,
         "upstream_response_received",
@@ -3376,7 +3475,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
             );
         }
     }
-    apply_response_headers(&mut response, &session);
+    apply_response_headers(&mut response, &session, &request.method);
 
     if surface_requested_intervention {
         write_event(
@@ -3418,7 +3517,7 @@ fn handle_connection(mut client_stream: TcpStream, runtime: &ProxyRuntime) -> io
         }),
     )?;
 
-    client_stream.write_all(&response.to_http_bytes())?;
+    client_stream.write_all(&response.to_http_bytes_for_method(&request.method))?;
     client_stream.flush()
 }
 
@@ -3566,7 +3665,7 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
     )?;
 
     let mut response = surface_response_to_http(response);
-    apply_response_headers(&mut response, session);
+    apply_response_headers(&mut response, session, &request.method);
     write_event(
         &runtime.event_log,
         &policy::response_audit_event(session.session_id, request_id, decision, response.status),
@@ -3587,7 +3686,7 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
         }),
     )?;
 
-    client_stream.write_all(&response.to_http_bytes())?;
+    client_stream.write_all(&response.to_http_bytes_for_method(&request.method))?;
     client_stream.flush()
 }
 
@@ -4213,7 +4312,297 @@ fn reason_phrase(status: u16) -> &'static str {
 }
 
 fn normalized_event_path(request: &HttpRequest) -> io::Result<String> {
-    Ok(normalize_request_target(&request.target)?.to_string())
+    if request.target == "*" && !request.method.eq_ignore_ascii_case("OPTIONS") {
+        return Err(invalid_data(
+            "HTTP asterisk-form request target is only valid for OPTIONS",
+        ));
+    }
+    let target = canonicalize_request_target(&request.target)?;
+    let host_header = validated_request_host_header(request)?;
+    let host_authority = normalized_request_authority(host_header)?;
+    if let Some(target_authority) = request_host_from_target(&request.target) {
+        let target_authority = normalized_request_authority(target_authority)?;
+        if target_authority != host_authority {
+            return Err(invalid_data(
+                "HTTP absolute-form authority conflicts with the Host header",
+            ));
+        }
+    }
+    Ok(target)
+}
+
+fn validated_request_host_header(request: &HttpRequest) -> io::Result<&str> {
+    let mut host_headers = request
+        .headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("host"))
+        .map(|header| header.value.trim());
+    let host = host_headers
+        .next()
+        .ok_or_else(|| invalid_data("HTTP request must contain exactly one Host header"))?;
+    if host_headers.next().is_some() {
+        return Err(invalid_data(
+            "HTTP request must contain exactly one Host header",
+        ));
+    }
+    validate_request_target_authority(host)?;
+    Ok(host)
+}
+
+/// Canonicalize an HTTP request target to the single representation shared by
+/// policy evaluation, bait matching, controlled reality, logging, and export
+/// (#212). The query is validated and normalized without decoding reserved
+/// bytes; the path is percent-decoded for unreserved characters only.
+///
+/// Everything ambiguous fails closed instead of being guessed: malformed
+/// absolute-form authorities, backslashes, fragments, control or non-ASCII
+/// bytes, characters outside the URI grammar, path parameters, interior empty
+/// segments (`//`), dot segments, invalid `%` sequences, and percent-encoded
+/// path bytes outside the unreserved set. Encoded dot segments are rejected
+/// after decoding. Normalization disagreements between upstream servers must
+/// never receive different policy meaning from a different spelling of the
+/// "same" path.
+fn canonicalize_request_target(target: &str) -> io::Result<String> {
+    if target
+        .bytes()
+        .any(|byte| matches!(byte, 0x00..=0x20 | 0x7F..=0xFF))
+    {
+        return Err(invalid_data(
+            "HTTP request target contains whitespace, control, or non-ASCII bytes",
+        ));
+    }
+    if target.contains('\\') {
+        return Err(invalid_data(
+            "HTTP request target must not contain backslashes",
+        ));
+    }
+    if target.contains('#') {
+        return Err(invalid_data(
+            "HTTP request target must not contain a fragment",
+        ));
+    }
+
+    let normalized = request_target_origin_form(target)?;
+    if normalized == "*" {
+        return Ok(normalized);
+    }
+
+    let (raw_path, query) = match normalized.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (normalized.as_str(), None),
+    };
+    if raw_path.starts_with("//") {
+        return Err(invalid_data(
+            "HTTP request target path must not start with `//`",
+        ));
+    }
+
+    let mut path = String::with_capacity(raw_path.len());
+    let raw_bytes = raw_path.as_bytes();
+    let mut index = 0;
+    while index < raw_bytes.len() {
+        let byte = raw_bytes[index];
+        match byte {
+            b'%' => {
+                if index + 2 >= raw_bytes.len() {
+                    return Err(invalid_data(
+                        "HTTP request target contains a truncated percent encoding",
+                    ));
+                }
+                let high = hex_value(raw_bytes[index + 1]).ok_or_else(|| {
+                    invalid_data("HTTP request target contains an invalid percent encoding")
+                })?;
+                let low = hex_value(raw_bytes[index + 2]).ok_or_else(|| {
+                    invalid_data("HTTP request target contains an invalid percent encoding")
+                })?;
+                let decoded = (high << 4) | low;
+                if is_unreserved_path_byte(decoded) {
+                    path.push(decoded as char);
+                } else {
+                    return Err(invalid_data(
+                        "HTTP request target contains a percent-encoded byte outside the unreserved set",
+                    ));
+                }
+                index += 3;
+            }
+            _ => {
+                if !is_raw_path_byte(byte) {
+                    return Err(invalid_data(
+                        "HTTP request target path contains a character outside the URI path grammar",
+                    ));
+                }
+                path.push(byte as char);
+                index += 1;
+            }
+        }
+    }
+
+    if path.contains("//") {
+        return Err(invalid_data(
+            "HTTP request target path must not contain empty interior segments (`//`)",
+        ));
+    }
+    if path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(invalid_data(
+            "HTTP request target path must not contain dot segments",
+        ));
+    }
+
+    Ok(match query {
+        Some(query) => format!("{path}?{}", canonicalize_request_query(query)?),
+        None => path,
+    })
+}
+
+fn canonicalize_request_query(query: &str) -> io::Result<String> {
+    let bytes = query.as_bytes();
+    let mut canonical = String::with_capacity(query.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            if !is_raw_query_byte(bytes[index]) {
+                return Err(invalid_data(
+                    "HTTP request query contains a character outside the URI query grammar",
+                ));
+            }
+            canonical.push(bytes[index] as char);
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len() {
+            return Err(invalid_data(
+                "HTTP request query contains a truncated percent encoding",
+            ));
+        }
+        let high = hex_value(bytes[index + 1]).ok_or_else(|| {
+            invalid_data("HTTP request query contains an invalid percent encoding")
+        })?;
+        let low = hex_value(bytes[index + 2]).ok_or_else(|| {
+            invalid_data("HTTP request query contains an invalid percent encoding")
+        })?;
+        let decoded = (high << 4) | low;
+        if is_unreserved_path_byte(decoded) {
+            canonical.push(decoded as char);
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            canonical.push('%');
+            canonical.push(HEX[(decoded >> 4) as usize] as char);
+            canonical.push(HEX[(decoded & 0x0F) as usize] as char);
+        }
+        index += 3;
+    }
+    Ok(canonical)
+}
+
+fn request_target_origin_form(target: &str) -> io::Result<String> {
+    if target.is_empty() {
+        return Err(invalid_data("HTTP request target cannot be empty"));
+    }
+    if target == "*" {
+        return Ok(target.to_string());
+    }
+    if target.starts_with('/') {
+        return Ok(target.to_string());
+    }
+
+    let Some(rest) = target.strip_prefix("http://") else {
+        return Err(invalid_data(
+            "HTTP request target must be origin-form or http absolute-form",
+        ));
+    };
+    let suffix_index = rest
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '/' | '?').then_some(index))
+        .unwrap_or(rest.len());
+    let authority = &rest[..suffix_index];
+    validate_request_target_authority(authority)?;
+
+    let suffix = &rest[suffix_index..];
+    if suffix.is_empty() {
+        Ok("/".to_string())
+    } else if suffix.starts_with('?') {
+        Ok(format!("/{suffix}"))
+    } else {
+        Ok(suffix.to_string())
+    }
+}
+
+fn validate_request_target_authority(authority: &str) -> io::Result<()> {
+    if authority.is_empty() {
+        return Err(invalid_data(
+            "HTTP absolute-form request target must name a non-empty authority",
+        ));
+    }
+    if authority.contains('@') || authority.contains('%') {
+        return Err(invalid_data(
+            "HTTP absolute-form request target authority must not contain userinfo or percent encoding",
+        ));
+    }
+
+    let (host, port) =
+        parse_authority(authority).map_err(|error| invalid_data(error.to_string()))?;
+    if port == Some(0) {
+        return Err(invalid_data(
+            "HTTP absolute-form request target port must not be 0",
+        ));
+    }
+
+    if authority.starts_with('[') {
+        host.parse::<std::net::Ipv6Addr>().map_err(|_| {
+            invalid_data("HTTP absolute-form bracketed authority must contain a valid IPv6 address")
+        })?;
+        return Ok(());
+    }
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    if host.split('.').any(|label| {
+        label.is_empty()
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+    }) {
+        return Err(invalid_data(
+            "HTTP absolute-form request target authority has an invalid host",
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_unreserved_path_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
+    )
+}
+
+fn is_sub_delimiter(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+    )
+}
+
+fn is_raw_path_byte(byte: u8) -> bool {
+    is_unreserved_path_byte(byte)
+        || (is_sub_delimiter(byte) && byte != b';')
+        || matches!(byte, b':' | b'@' | b'/')
+}
+
+fn is_raw_query_byte(byte: u8) -> bool {
+    is_raw_path_byte(byte) || byte == b'?'
 }
 
 fn event_discovery_recon_score(
@@ -4309,7 +4698,16 @@ fn safe_header_observations(headers: &[HttpHeader]) -> Vec<SafeHeaderObservation
         .collect()
 }
 
-fn apply_response_headers(response: &mut HttpResponse, session: &SessionContext) {
+fn apply_response_headers(
+    response: &mut HttpResponse,
+    session: &SessionContext,
+    request_method: &str,
+) {
+    let original_content_length = response
+        .headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+        .map(|header| header.value.clone());
     let connection_nominated_headers: Vec<String> = response
         .headers
         .iter()
@@ -4338,7 +4736,20 @@ fn apply_response_headers(response: &mut HttpResponse, session: &SessionContext)
     }
 
     response.set_header("Connection", "close");
-    response.set_header("Content-Length", response.body.len().to_string());
+    if (100..200).contains(&response.status) || response.status == 204 {
+        response.remove_header("Content-Length");
+    } else if request_method.eq_ignore_ascii_case("HEAD") || response.status == 304 {
+        if response.body.is_empty() {
+            response.remove_header("Content-Length");
+            if let Some(content_length) = original_content_length {
+                response.set_header("Content-Length", content_length);
+            }
+        } else {
+            response.set_header("Content-Length", response.body.len().to_string());
+        }
+    } else {
+        response.set_header("Content-Length", response.body.len().to_string());
+    }
 
     if let Some(set_cookie) = session.set_cookie_value() {
         response.append_header(session::SET_COOKIE_HEADER_NAME, set_cookie);
@@ -4471,7 +4882,7 @@ fn trusted_ingress_soften_match(
         path_prefixes: trust.path_prefixes.clone(),
         request_path_softened: bait_soften_path_prefixes
             .iter()
-            .any(|prefix| request_path.starts_with(prefix)),
+            .any(|prefix| ingress_identity::path_matches_segment_prefix(request_path, prefix)),
         bait_soften_path_prefixes,
         user_agent_substrings: trust.user_agent_substrings.clone().unwrap_or_default(),
         hosts: trust.hosts.clone().unwrap_or_default(),
@@ -4499,15 +4910,14 @@ fn maybe_soften_surface_action_for_trusted_ingress(
     }
     if !trusted_bait_soften_path_prefixes
         .iter()
-        .any(|prefix| surface_request.path.starts_with(prefix))
+        .any(|prefix| ingress_identity::path_matches_segment_prefix(&surface_request.path, prefix))
     {
         return (surface_action, None);
     }
     if let Some(local_soften_path_prefixes) = &session.trusted_bait_soften_path_prefixes {
-        if !local_soften_path_prefixes
-            .iter()
-            .any(|prefix| surface_request.path.starts_with(prefix))
-        {
+        if !local_soften_path_prefixes.iter().any(|prefix| {
+            ingress_identity::path_matches_segment_prefix(&surface_request.path, prefix)
+        }) {
             return (surface_action, None);
         }
     }
@@ -4580,36 +4990,14 @@ fn redacted_event_target(target: &str) -> String {
         });
 
     let mut redacted = path.to_string();
-    if let Some(query) = query {
-        redacted.push('?');
-        redacted.push_str(&redacted_event_query(query));
+    if query.is_some() {
+        redacted.push_str("?<redacted>");
     }
     if fragment_present {
         redacted.push_str("#<redacted>");
     }
 
     redacted
-}
-
-fn redacted_event_query(query: &str) -> String {
-    let redacted_pairs: Vec<String> = query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let key = pair.split_once('=').map_or(pair, |(key, _)| key);
-            if key.is_empty() {
-                "<redacted>".to_string()
-            } else {
-                format!("{key}=<redacted>")
-            }
-        })
-        .collect();
-
-    if redacted_pairs.is_empty() {
-        "<redacted>".to_string()
-    } else {
-        redacted_pairs.join("&")
-    }
 }
 
 fn debug_query_present(target: &str) -> bool {
@@ -4764,7 +5152,12 @@ struct HttpResponse {
 
 impl HttpRequest {
     fn to_upstream_bytes(&self, upstream: &UpstreamTarget) -> io::Result<Vec<u8>> {
-        let target = normalize_request_target(&self.target)?;
+        if self.target == "*" && !self.method.eq_ignore_ascii_case("OPTIONS") {
+            return Err(invalid_data(
+                "HTTP asterisk-form request target is only valid for OPTIONS",
+            ));
+        }
+        let target = canonicalize_request_target(&self.target)?;
         let connection_nominated_headers = connection_nominated_headers(&self.headers);
         let should_emit_content_length = !self.body.is_empty()
             || self
@@ -4798,7 +5191,12 @@ impl HttpRequest {
 }
 
 impl HttpResponse {
+    #[cfg(test)]
     fn to_http_bytes(&self) -> Vec<u8> {
+        self.to_http_bytes_for_method("GET")
+    }
+
+    fn to_http_bytes_for_method(&self, request_method: &str) -> Vec<u8> {
         let mut bytes = Vec::new();
         write!(
             bytes,
@@ -4813,7 +5211,9 @@ impl HttpResponse {
         }
 
         bytes.extend_from_slice(b"\r\n");
-        bytes.extend_from_slice(&self.body);
+        if !response_has_no_message_body(request_method, self.status) {
+            bytes.extend_from_slice(&self.body);
+        }
         bytes
     }
 
@@ -4891,38 +5291,76 @@ where
     Ok(Some(request))
 }
 
+#[cfg(test)]
 fn read_http_response<R>(reader: &mut R) -> io::Result<HttpResponse>
+where
+    R: Read,
+{
+    read_http_response_for_method(reader, "GET")
+}
+
+fn read_http_response_for_method<R>(
+    reader: &mut R,
+    request_method: &str,
+) -> io::Result<HttpResponse>
 where
     R: Read,
 {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
-    let header_end = loop {
-        let bytes_read = reader.read(&mut chunk)?;
-        if bytes_read == 0 {
+    let mut informational_count = 0;
+    let (mut response, transfer_coding, content_length) = loop {
+        let header_end = loop {
+            if let Some(header_end) = find_header_end(&buffer) {
+                break header_end;
+            }
+            let bytes_read = reader.read(&mut chunk)?;
+            if bytes_read == 0 {
+                return Err(invalid_data(
+                    "connection closed before HTTP response headers completed",
+                ));
+            }
+
+            buffer.extend_from_slice(&chunk[..bytes_read]);
+            if buffer.len() > MAX_HEADER_BYTES {
+                return Err(invalid_data("HTTP response headers exceed size limit"));
+            }
+        };
+
+        let head = buffer[..header_end - 4].to_vec();
+        buffer.drain(..header_end);
+        let response = parse_http_response_head(&head)?;
+        let transfer_coding = response_transfer_coding(&response)?;
+        let content_length = response_content_length(&response)?;
+        if transfer_coding != ResponseTransferCoding::Identity && content_length.is_some() {
             return Err(invalid_data(
-                "connection closed before HTTP response headers completed",
+                "upstream response must not combine Transfer-Encoding and Content-Length",
             ));
         }
-
-        buffer.extend_from_slice(&chunk[..bytes_read]);
-        if buffer.len() > MAX_HEADER_BYTES {
-            return Err(invalid_data("HTTP response headers exceed size limit"));
+        if !(100..200).contains(&response.status) {
+            break (response, transfer_coding, content_length);
         }
-
-        if let Some(header_end) = find_header_end(&buffer) {
-            break header_end;
+        if response.status == 101 {
+            return Err(invalid_data(
+                "upstream protocol switching is not supported by the v0 proxy",
+            ));
+        }
+        informational_count += 1;
+        if informational_count > MAX_INFORMATIONAL_RESPONSES {
+            return Err(invalid_data(
+                "upstream sent too many informational responses",
+            ));
         }
     };
 
-    let head = &buffer[..header_end - 4];
-    let mut response = parse_http_response_head(head)?;
-    let body_start = header_end;
-    response.body.extend_from_slice(&buffer[body_start..]);
+    if response_has_no_message_body(request_method, response.status) {
+        return Ok(response);
+    }
+    response.body = buffer;
 
-    match response_transfer_coding(&response)? {
+    match transfer_coding {
         ResponseTransferCoding::Identity => {
-            if let Some(content_length) = response_content_length(&response)? {
+            if let Some(content_length) = content_length {
                 if content_length > MAX_BODY_BYTES {
                     return Err(invalid_data("HTTP response body exceeds size limit"));
                 }
@@ -4964,13 +5402,50 @@ where
     Ok(response)
 }
 
+fn response_has_no_message_body(request_method: &str, status: u16) -> bool {
+    request_method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn is_valid_http_field_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte))
+}
+
 fn parse_http_request_head(head: &[u8]) -> io::Result<HttpRequest> {
     let head = std::str::from_utf8(head).map_err(|_| invalid_data("HTTP headers are not UTF-8"))?;
     let mut lines = head.split("\r\n");
     let request_line = lines
         .next()
         .ok_or_else(|| invalid_data("missing HTTP request line"))?;
-    let mut request_parts = request_line.split_whitespace();
+    let mut request_parts = request_line.split(' ');
     let method = request_parts
         .next()
         .ok_or_else(|| invalid_data("missing HTTP method"))?;
@@ -4981,12 +5456,23 @@ fn parse_http_request_head(head: &[u8]) -> io::Result<HttpRequest> {
         .next()
         .ok_or_else(|| invalid_data("missing HTTP version"))?;
 
-    if request_parts.next().is_some() {
-        return Err(invalid_data("HTTP request line has too many fields"));
+    if method.is_empty()
+        || target.is_empty()
+        || version.is_empty()
+        || request_parts.next().is_some()
+    {
+        return Err(invalid_data(
+            "HTTP request line must contain exactly three fields separated by one space",
+        ));
     }
 
-    if !version.starts_with("HTTP/") {
-        return Err(invalid_data("HTTP version must start with HTTP/"));
+    if !is_http_token(method) {
+        return Err(invalid_data("HTTP method is not a valid token"));
+    }
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(invalid_data(
+            "HTTP request version must be HTTP/1.0 or HTTP/1.1",
+        ));
     }
 
     let mut headers = Vec::new();
@@ -4999,9 +5485,11 @@ fn parse_http_request_head(head: &[u8]) -> io::Result<HttpRequest> {
             return Err(invalid_data("HTTP header is missing `:`"));
         };
 
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(invalid_data("HTTP header name cannot be empty"));
+        if !is_http_token(name) {
+            return Err(invalid_data("HTTP header name is not a valid token"));
+        }
+        if !is_valid_http_field_value(value) {
+            return Err(invalid_data("HTTP header value contains invalid bytes"));
         }
 
         headers.push(HttpHeader {
@@ -5033,15 +5521,34 @@ fn parse_http_response_head(head: &[u8]) -> io::Result<HttpResponse> {
     let status = status_parts
         .next()
         .ok_or_else(|| invalid_data("missing HTTP response status"))?;
-    let reason = status_parts.next().unwrap_or_default();
+    let reason = status_parts
+        .next()
+        .ok_or_else(|| invalid_data("missing HTTP response reason separator"))?;
 
-    if !version.starts_with("HTTP/") {
-        return Err(invalid_data("HTTP response version must start with HTTP/"));
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(invalid_data(
+            "HTTP response version must be HTTP/1.0 or HTTP/1.1",
+        ));
+    }
+    if status.len() != 3 || !status.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_data(
+            "HTTP response status must contain exactly three digits",
+        ));
+    }
+    if !is_valid_http_field_value(reason) {
+        return Err(invalid_data(
+            "HTTP response reason phrase contains invalid bytes",
+        ));
     }
 
     let status = status
         .parse::<u16>()
         .map_err(|error| invalid_data(format!("invalid HTTP response status: {error}")))?;
+    if !(100..=599).contains(&status) {
+        return Err(invalid_data(
+            "HTTP response status must be between 100 and 599",
+        ));
+    }
 
     let mut headers = Vec::new();
     for line in lines {
@@ -5053,9 +5560,15 @@ fn parse_http_response_head(head: &[u8]) -> io::Result<HttpResponse> {
             return Err(invalid_data("HTTP response header is missing `:`"));
         };
 
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(invalid_data("HTTP response header name cannot be empty"));
+        if !is_http_token(name) {
+            return Err(invalid_data(
+                "HTTP response header name is not a valid token",
+            ));
+        }
+        if !is_valid_http_field_value(value) {
+            return Err(invalid_data(
+                "HTTP response header value contains invalid bytes",
+            ));
         }
 
         headers.push(HttpHeader {
@@ -5074,12 +5587,13 @@ fn parse_http_response_head(head: &[u8]) -> io::Result<HttpResponse> {
 }
 
 fn request_content_length(request: &HttpRequest) -> io::Result<usize> {
-    if request.headers.iter().any(|header| {
-        header.name.eq_ignore_ascii_case("transfer-encoding")
-            && header.value.to_ascii_lowercase().contains("chunked")
-    }) {
+    if request
+        .headers
+        .iter()
+        .any(|header| header.name.eq_ignore_ascii_case("transfer-encoding"))
+    {
         return Err(invalid_data(
-            "chunked request bodies are not supported by the v0 proxy",
+            "request Transfer-Encoding is not supported by the v0 proxy",
         ));
     }
 
@@ -5255,49 +5769,24 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
         .map(|index| index + 4)
 }
 
-fn normalize_request_target(target: &str) -> io::Result<&str> {
-    if target.is_empty() {
-        return Err(invalid_data("HTTP request target cannot be empty"));
-    }
-
-    if target.starts_with('/') {
-        return Ok(target);
-    }
-
-    if let Some(rest) = target.strip_prefix("http://") {
-        return Ok(match rest.find('/') {
-            Some(index) => &rest[index..],
-            None => "/",
-        });
-    }
-
-    if target == "*" {
-        return Ok(target);
-    }
-
-    Err(invalid_data(
-        "HTTP request target must be origin-form or http absolute-form",
-    ))
-}
-
 fn effective_request_host(request: &HttpRequest) -> Option<String> {
-    request_host_from_target(&request.target)
-        .or_else(|| {
-            request
-                .headers
-                .iter()
-                .find(|header| header.name.eq_ignore_ascii_case("host"))
-                .map(|header| header.value.as_str())
-        })
+    validated_request_host_header(request)
+        .ok()
         .and_then(normalize_request_host)
 }
 
 fn request_host_from_target(target: &str) -> Option<&str> {
     let rest = target.strip_prefix("http://")?;
-    Some(match rest.split_once('/') {
-        Some((authority, _)) => authority,
-        None => rest,
-    })
+    let end = rest
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '/' | '?').then_some(index))
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+fn normalized_request_authority(value: &str) -> io::Result<(String, u16)> {
+    let (host, port) = parse_authority(value).map_err(|error| invalid_data(error.to_string()))?;
+    Ok((host.to_ascii_lowercase(), port.unwrap_or(DEFAULT_HTTP_PORT)))
 }
 
 fn normalize_request_host(value: &str) -> Option<String> {
@@ -5552,6 +6041,7 @@ mod tests {
         let bait_registry = Arc::new(BaitRegistry::m3_catalog());
         ProxyRuntime {
             upstream,
+            client_request_deadline: CLIENT_REQUEST_DEADLINE,
             event_log: Arc::new(Mutex::new(
                 FileEventLogWriter::open(event_log_path).expect("event log should open"),
             )),
@@ -5595,6 +6085,7 @@ mod tests {
         let bait_registry = Arc::new(BaitRegistry::m3_catalog());
         ProxyRuntime {
             upstream,
+            client_request_deadline: CLIENT_REQUEST_DEADLINE,
             event_log: Arc::new(Mutex::new(must_ok(
                 FileEventLogWriter::open(event_log_path),
                 "event log should open",
@@ -5633,6 +6124,7 @@ mod tests {
         let bait_registry = Arc::new(BaitRegistry::m3_catalog());
         ProxyRuntime {
             upstream,
+            client_request_deadline: CLIENT_REQUEST_DEADLINE,
             event_log: Arc::new(Mutex::new(
                 FileEventLogWriter::open(event_log_path).expect("event log should open"),
             )),
@@ -5669,6 +6161,7 @@ mod tests {
         let bait_content = loaded_profile.content;
         ProxyRuntime {
             upstream,
+            client_request_deadline: CLIENT_REQUEST_DEADLINE,
             event_log: Arc::new(Mutex::new(
                 FileEventLogWriter::open(event_log_path).expect("event log should open"),
             )),
@@ -6040,7 +6533,10 @@ mod tests {
         let addr = listener.local_addr().expect("proxy should have address");
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("proxy should accept");
-            handle_connection(stream, &runtime).expect("runtime should handle request");
+            let permit = ConnectionLimiter::new(1)
+                .try_acquire()
+                .expect("test connection permit should acquire");
+            handle_connection(stream, &runtime, permit).expect("runtime should handle request");
         });
 
         let mut client = TcpStream::connect(addr).expect("client should connect");
@@ -6066,7 +6562,10 @@ mod tests {
         let addr = listener.local_addr().expect("proxy should have address");
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("proxy should accept");
-            handle_connection(stream, &runtime)
+            let permit = ConnectionLimiter::new(1)
+                .try_acquire()
+                .expect("test connection permit should acquire");
+            handle_connection(stream, &runtime, permit)
         });
 
         let mut client = TcpStream::connect(addr).expect("client should connect");
@@ -6520,6 +7019,57 @@ mod tests {
     }
 
     #[test]
+    fn byte_drip_client_hits_total_deadline_and_releases_connection_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let event_log_path = unique_temp_path("slow-client-events.jsonl");
+        let mut runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("slow-client-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.client_request_deadline = Duration::from_millis(80);
+        let limiter = ConnectionLimiter::new(1);
+        let worker_limiter = limiter.clone();
+        let handle = thread::spawn(move || {
+            let permit = worker_limiter
+                .try_acquire()
+                .expect("worker permit should acquire");
+            let (server, _) = listener.accept().expect("listener should accept");
+            let started = Instant::now();
+
+            let error = handle_connection(server, &runtime, permit)
+                .expect_err("production request handling must enforce the total deadline");
+            assert!(
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ),
+                "unexpected timeout error: {error}"
+            );
+            started.elapsed()
+        });
+
+        let mut client = TcpStream::connect(addr).expect("client should connect");
+        for byte in b"GET /docs HTTP/1.1\r\nHost: proxy.local\r\n"
+            .iter()
+            .cycle()
+            .take(100)
+        {
+            if client.write_all(&[*byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let elapsed = handle.join().expect("slow-client worker should join");
+
+        assert!(elapsed < Duration::from_millis(300));
+        assert_eq!(limiter.active_for_test(), 0);
+        assert!(limiter.try_acquire().is_some());
+    }
+
+    #[test]
     #[should_panic(expected = "connection limit must be positive")]
     fn connection_limiter_rejects_zero_limit() {
         let _ = ConnectionLimiter::new(0);
@@ -6689,6 +7239,34 @@ mod tests {
             config.intervention_control_path,
             PathBuf::from("/tmp/eidolon-control.txt")
         );
+    }
+
+    #[test]
+    fn surface_content_overrides_reject_informational_statuses() {
+        for status in 100..200 {
+            let override_config = SurfaceContentOverride {
+                status: Some(status),
+                content_type: Some("text/plain".to_string()),
+                body: "hint".to_string(),
+            };
+
+            let error = override_config
+                .validate("test-bait")
+                .expect_err("direct surfaces must emit a final response");
+            assert!(error
+                .to_string()
+                .contains("must be a final HTTP status code (200-599)"));
+        }
+
+        for status in [200, 204, 304, 599] {
+            SurfaceContentOverride {
+                status: Some(status),
+                content_type: Some("text/plain".to_string()),
+                body: "final".to_string(),
+            }
+            .validate("test-bait")
+            .expect("representative final statuses should be accepted");
+        }
     }
 
     #[test]
@@ -7775,6 +8353,28 @@ mod tests {
     }
 
     #[test]
+    fn upstream_forwarding_uses_the_canonical_request_target() {
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9001", false),
+            "upstream should parse",
+        );
+        let mut request_bytes =
+            &b"GET http://proxy.local/do%63s?x=%7e&slash=%2f HTTP/1.1\r\nHost: proxy.local\r\n\r\n"
+                [..];
+        let request = read_http_request(&mut request_bytes)
+            .expect("request should parse")
+            .expect("request should be present");
+
+        assert_eq!(
+            normalized_event_path(&request).expect("target should canonicalize"),
+            "/docs?x=~&slash=%2F"
+        );
+        let forwarded = String::from_utf8(request.to_upstream_bytes(&upstream).unwrap())
+            .expect("forwarded request should be utf8");
+        assert!(forwarded.starts_with("GET /docs?x=~&slash=%2F HTTP/1.1\r\n"));
+    }
+
+    #[test]
     fn upstream_request_strips_hop_by_hop_and_connection_nominated_headers() {
         let upstream = must_ok(
             parse_upstream("http://127.0.0.1:9001", false),
@@ -7868,22 +8468,25 @@ mod tests {
     #[test]
     fn normalizes_absolute_form_request_targets() {
         assert_eq!(
-            normalize_request_target("http://127.0.0.1:8080/openapi.json?x=1").unwrap(),
+            canonicalize_request_target("http://127.0.0.1:8080/openapi.json?x=1").unwrap(),
             "/openapi.json?x=1"
         );
         assert_eq!(
-            normalize_request_target("http://127.0.0.1:8080").unwrap(),
+            canonicalize_request_target("http://127.0.0.1:8080").unwrap(),
             "/"
         );
     }
 
     #[test]
-    fn rejects_chunked_request_bodies_for_v0() {
-        let mut request_bytes =
-            &b"POST /api/v1/imports HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"[..];
-        let error = read_http_request(&mut request_bytes).expect_err("chunked should fail");
+    fn rejects_all_request_transfer_codings_for_v0() {
+        for coding in ["chunked", "gzip", "identity"] {
+            let request =
+                format!("POST /api/v1/imports HTTP/1.1\r\nTransfer-Encoding: {coding}\r\n\r\n");
+            let error = read_http_request(&mut request.as_bytes())
+                .expect_err("unsupported transfer coding should fail");
 
-        assert!(error.to_string().contains("chunked"));
+            assert!(error.to_string().contains("Transfer-Encoding"));
+        }
     }
 
     #[test]
@@ -7895,6 +8498,53 @@ mod tests {
             read_http_request(&mut request_bytes).expect_err("conflicting lengths should fail");
 
         assert!(error.to_string().contains("conflicting request"));
+    }
+
+    #[test]
+    fn rejects_whitespace_before_header_colon() {
+        let mut request_bytes = &b"GET /docs HTTP/1.1\r\nHost : trusted.example\r\n\r\n"[..];
+        let error = read_http_request(&mut request_bytes)
+            .expect_err("whitespace before the header colon must be rejected");
+
+        assert!(error.to_string().contains("valid token"));
+    }
+
+    #[test]
+    fn rejects_control_bytes_in_header_values() {
+        let mut request_bytes =
+            &b"GET /docs HTTP/1.1\r\nHost: proxy.local\r\nX-Test: safe\0smuggled\r\n\r\n"[..];
+        let error = read_http_request(&mut request_bytes)
+            .expect_err("control bytes in header values must be rejected");
+
+        assert!(error.to_string().contains("invalid bytes"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_unsupported_http_start_lines() {
+        for raw in [
+            "GET  /docs HTTP/1.1\r\nHost: proxy.local\r\n\r\n",
+            "GET\t/docs\tHTTP/1.1\r\nHost: proxy.local\r\n\r\n",
+            "GET /docs HTTP/2.0\r\nHost: proxy.local\r\n\r\n",
+        ] {
+            assert!(
+                read_http_request(&mut raw.as_bytes()).is_err(),
+                "request start line should be rejected: {raw:?}"
+            );
+        }
+
+        for raw in [
+            "HTTP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 20 OK\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 600 Unknown\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\nInjected: yes\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\0Injected\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            assert!(
+                read_http_response(&mut raw.as_bytes()).is_err(),
+                "response start line should be rejected: {raw:?}"
+            );
+        }
     }
 
     #[test]
@@ -7946,6 +8596,337 @@ mod tests {
             read_http_response(&mut response_bytes).expect_err("transfer encoding should fail");
 
         assert!(error.to_string().contains("Transfer-Encoding"));
+    }
+
+    #[test]
+    fn skips_bounded_informational_responses_before_the_final_response() {
+        let mut response_bytes = &b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"[..];
+        let response =
+            read_http_response(&mut response_bytes).expect("final response should parse");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+    }
+
+    #[test]
+    fn rejects_upstream_protocol_switching() {
+        let mut response_bytes =
+            &b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"[..];
+        let error = read_http_response(&mut response_bytes).expect_err("101 should fail");
+
+        assert!(error.to_string().contains("protocol switching"));
+    }
+
+    #[test]
+    fn head_and_no_content_statuses_never_read_or_emit_a_message_body() {
+        let mut head_bytes = &b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n"[..];
+        let head = read_http_response_for_method(&mut head_bytes, "HEAD")
+            .expect("HEAD response should not wait for a body");
+        assert!(head.body.is_empty());
+
+        for status_line in ["204 No Content", "304 Not Modified"] {
+            let raw = format!("HTTP/1.1 {status_line}\r\nContent-Length: 7\r\n\r\nignored");
+            let response = read_http_response(&mut raw.as_bytes())
+                .expect("no-body status should not consume a body");
+            assert!(response.body.is_empty());
+            assert!(!String::from_utf8(response.to_http_bytes_for_method("GET"))
+                .expect("response should be utf8")
+                .ends_with("ignored"));
+        }
+    }
+
+    #[test]
+    fn no_body_responses_still_validate_framing_headers() {
+        for (method, raw) in [
+            (
+                "HEAD",
+                "HTTP/1.1 200 OK\r\nContent-Length: invalid\r\n\r\n",
+            ),
+            (
+                "HEAD",
+                "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+            ),
+            (
+                "GET",
+                "HTTP/1.1 304 Not Modified\r\nContent-Length: invalid\r\n\r\n",
+            ),
+            (
+                "GET",
+                "HTTP/1.1 204 No Content\r\nTransfer-Encoding: gzip\r\n\r\n",
+            ),
+            (
+                "GET",
+                "HTTP/1.1 100 Continue\r\nContent-Length: invalid\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            ),
+        ] {
+            assert!(
+                read_http_response_for_method(&mut raw.as_bytes(), method).is_err(),
+                "{method} response framing should be rejected: {raw:?}"
+            );
+        }
+
+        let both =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n";
+        let error = read_http_response(&mut both.as_bytes())
+            .expect_err("Transfer-Encoding plus Content-Length must be rejected");
+        assert!(error.to_string().contains("must not combine"));
+    }
+
+    #[test]
+    fn canonicalizes_plain_and_absolute_form_targets() {
+        assert_eq!(
+            canonicalize_request_target("/docs/legacy-import").expect("plain path"),
+            "/docs/legacy-import"
+        );
+        assert_eq!(
+            canonicalize_request_target("http://proxy.local/docs/legacy-import")
+                .expect("absolute form"),
+            "/docs/legacy-import"
+        );
+        assert_eq!(
+            canonicalize_request_target("/docs?topic=imports&x=1").expect("query preserved"),
+            "/docs?topic=imports&x=1"
+        );
+        assert_eq!(
+            canonicalize_request_target("http://proxy.local?topic=%7e&slash=%2f")
+                .expect("absolute form without a path"),
+            "/?topic=~&slash=%2F"
+        );
+        assert_eq!(
+            canonicalize_request_target("*").expect("asterisk form"),
+            "*"
+        );
+    }
+
+    #[test]
+    fn canonicalizes_unreserved_percent_encodings_once() {
+        assert_eq!(
+            canonicalize_request_target("/api/v2/import/recon%63ile").expect("unreserved encoding"),
+            "/api/v2/import/reconcile"
+        );
+        assert_eq!(
+            canonicalize_request_target("/d%6Fcs/a%7Eb%2Dc_d.e").expect("mixed unreserved"),
+            "/docs/a~b-c_d.e"
+        );
+        // Idempotent: the canonical form re-canonicalizes to itself.
+        assert_eq!(
+            canonicalize_request_target("/api/v2/import/reconcile").expect("canonical form again"),
+            "/api/v2/import/reconcile"
+        );
+    }
+
+    #[test]
+    fn rejects_reserved_and_invalid_percent_encodings() {
+        for target in [
+            "/api%2Fops",
+            "/api%2fops",
+            "/a%25b",
+            "/%2e%2e/etc",
+            "/a%00b",
+            "/a%3Fb",
+            "/a%23b",
+            "/a%4",
+            "/a%zzb",
+            "/%80%80/a",
+        ] {
+            assert!(
+                canonicalize_request_target(target).is_err(),
+                "{target} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_dot_segments_backslashes_empty_segments_and_fragments() {
+        for target in [
+            "/a/./b",
+            "/a/../b",
+            "/./x",
+            "/../x",
+            "/a/b/../../x",
+            "/a\\b",
+            "/a//b",
+            "//a/b",
+            "/docs#fragment",
+        ] {
+            assert!(
+                canonicalize_request_target(target).is_err(),
+                "{target} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_absolute_form_authority() {
+        for target in [
+            "http:///docs",
+            "http://?x=1",
+            "http://",
+            "http://user@proxy.local/docs",
+            "http://proxy.local:/docs",
+            "http://proxy.local:0/docs",
+            "http://bad..host/docs",
+            "http://-bad.host/docs",
+            "http://[not-an-ip]/docs",
+            "http://proxy%2Elocal/docs",
+        ] {
+            assert!(
+                canonicalize_request_target(target).is_err(),
+                "{target} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_form_authority_must_agree_with_host_header() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "http://proxy.local/docs".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![HttpHeader {
+                name: "Host".to_string(),
+                value: "other.local".to_string(),
+            }],
+            body: Vec::new(),
+        };
+        assert!(normalized_event_path(&request).is_err());
+
+        let matching = HttpRequest {
+            headers: vec![HttpHeader {
+                name: "Host".to_string(),
+                value: "proxy.local:80".to_string(),
+            }],
+            ..request
+        };
+        assert_eq!(
+            normalized_event_path(&matching).expect("default ports should agree"),
+            "/docs"
+        );
+    }
+
+    #[test]
+    fn origin_form_requires_exactly_one_valid_host_header() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/docs".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert!(normalized_event_path(&request).is_err());
+
+        let malformed = HttpRequest {
+            headers: vec![HttpHeader {
+                name: "Host".to_string(),
+                value: "bad..host".to_string(),
+            }],
+            ..request.clone()
+        };
+        assert!(normalized_event_path(&malformed).is_err());
+
+        let duplicate = HttpRequest {
+            headers: vec![
+                HttpHeader {
+                    name: "Host".to_string(),
+                    value: "proxy.local".to_string(),
+                },
+                HttpHeader {
+                    name: "host".to_string(),
+                    value: "trusted.local".to_string(),
+                },
+            ],
+            ..request.clone()
+        };
+        assert!(normalized_event_path(&duplicate).is_err());
+
+        let valid = HttpRequest {
+            headers: vec![HttpHeader {
+                name: "Host".to_string(),
+                value: "proxy.local:8080".to_string(),
+            }],
+            ..request
+        };
+        assert_eq!(
+            normalized_event_path(&valid).expect("valid Host should pass"),
+            "/docs"
+        );
+    }
+
+    #[test]
+    fn percent_encoding_canonicalization_is_exhaustive_and_idempotent_for_ascii() {
+        for byte in 0_u8..=127 {
+            let target = format!("/a%{byte:02X}b");
+            let result = canonicalize_request_target(&target);
+            if is_unreserved_path_byte(byte) {
+                let expected = format!("/a{}b", byte as char);
+                let canonical = result.unwrap_or_else(|error| {
+                    panic!("unreserved byte {byte:#04x} should canonicalize: {error}")
+                });
+                assert_eq!(canonical, expected);
+                assert_eq!(
+                    canonicalize_request_target(&canonical)
+                        .expect("canonical target should remain valid"),
+                    canonical
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "reserved byte {byte:#04x} must be rejected in a path"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_query_percent_encodings_are_rejected() {
+        for target in ["/docs?x=%", "/docs?x=%2", "/docs?x=%GG"] {
+            assert!(
+                canonicalize_request_target(target).is_err(),
+                "{target} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_target_characters_follow_the_conservative_uri_grammar() {
+        for byte in 0x21_u8..=0x7e {
+            if matches!(byte, b'%' | b'?' | b'#') {
+                continue;
+            }
+            let target = format!("/a{}b", byte as char);
+            assert_eq!(
+                canonicalize_request_target(&target).is_ok(),
+                is_raw_path_byte(byte),
+                "unexpected raw path treatment for byte {byte:#04x}"
+            );
+        }
+
+        for byte in 0x21_u8..=0x7e {
+            if matches!(byte, b'%' | b'#') {
+                continue;
+            }
+            let target = format!("/docs?x={}y", byte as char);
+            assert_eq!(
+                canonicalize_request_target(&target).is_ok(),
+                is_raw_query_byte(byte),
+                "unexpected raw query treatment for byte {byte:#04x}"
+            );
+        }
+
+        assert!(canonicalize_request_target("/docs;ignored").is_err());
+    }
+
+    #[test]
+    fn ambiguous_targets_reject_deterministically() {
+        for target in ["/a/../b", "/api%2Fops", "/docs#x", "/a//b"] {
+            let first = canonicalize_request_target(target);
+            let second = canonicalize_request_target(target);
+            assert!(first.is_err() && second.is_err());
+            assert_eq!(
+                first.expect_err("first").to_string(),
+                second.expect_err("second").to_string()
+            );
+        }
     }
 
     #[test]
@@ -8002,7 +8983,7 @@ mod tests {
             body: b"ok".to_vec(),
         };
 
-        apply_response_headers(&mut response, &session);
+        apply_response_headers(&mut response, &session, "GET");
 
         assert!(header_values(&response, "transfer-encoding").is_empty());
         assert!(header_values(&response, "keep-alive").is_empty());
@@ -8011,6 +8992,50 @@ mod tests {
         assert!(header_values(&response, "x-hop-by-hop").is_empty());
         assert_eq!(header_values(&response, "content-length"), vec!["2"]);
         assert_eq!(header_values(&response, "connection"), vec!["close"]);
+    }
+
+    #[test]
+    fn downstream_head_and_no_content_headers_match_body_semantics() {
+        let mut authority = test_session_authority();
+        let session = session::derive_session_from_headers(
+            &mut authority,
+            [("Cookie", cookie_header())],
+            None,
+            now_unix_secs(),
+        );
+        let mut head = HttpResponse {
+            version: "HTTP/1.1".to_string(),
+            status: 200,
+            reason: "OK".to_string(),
+            headers: vec![HttpHeader {
+                name: "Content-Length".to_string(),
+                value: "99".to_string(),
+            }],
+            body: Vec::new(),
+        };
+        apply_response_headers(&mut head, &session, "HEAD");
+        assert_eq!(header_values(&head, "content-length"), vec!["99"]);
+        assert!(String::from_utf8(head.to_http_bytes_for_method("HEAD"))
+            .expect("HEAD response should be utf8")
+            .ends_with("\r\n\r\n"));
+
+        let mut no_content = HttpResponse {
+            version: "HTTP/1.1".to_string(),
+            status: 204,
+            reason: "No Content".to_string(),
+            headers: vec![HttpHeader {
+                name: "Content-Length".to_string(),
+                value: "7".to_string(),
+            }],
+            body: b"ignored".to_vec(),
+        };
+        apply_response_headers(&mut no_content, &session, "GET");
+        assert!(header_values(&no_content, "content-length").is_empty());
+        assert!(
+            String::from_utf8(no_content.to_http_bytes_for_method("GET"))
+                .expect("204 response should be utf8")
+                .ends_with("\r\n\r\n")
+        );
     }
 
     #[test]
@@ -8477,7 +9502,7 @@ mod tests {
         assert!(!raw_event_log.contains("secret-value"));
         assert_eq!(
             first_event_of_type(&event_log_path, "request_seen")["kind"]["path"],
-            "/docs/legacy-import?token=<redacted>"
+            "/docs/legacy-import?<redacted>"
         );
 
         let request_debug = first_debug_event(&debug_log_path, "request_received");
@@ -13965,10 +14990,7 @@ mod tests {
 
         let exposure = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(exposure["kind"]["bait_id"], "openapi_reconcile_trace");
-        assert_eq!(
-            exposure["kind"]["surface"],
-            "/openapi.json?eidolon_surface=<redacted>"
-        );
+        assert_eq!(exposure["kind"]["surface"], "/openapi.json?<redacted>");
     }
 
     #[test]
@@ -15116,6 +16138,99 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_host_authority_never_reaches_policy_or_upstream() {
+        let cases = [
+            ("missing", "GET /docs HTTP/1.1\r\n\r\n"),
+            ("malformed", "GET /docs HTTP/1.1\r\nHost: bad..host\r\n\r\n"),
+            (
+                "duplicate",
+                "GET /docs HTTP/1.1\r\nHost: proxy.local\r\nHost: trusted.local\r\n\r\n",
+            ),
+            (
+                "absolute-conflict",
+                "GET http://proxy.local/docs HTTP/1.1\r\nHost: trusted.local\r\n\r\n",
+            ),
+        ];
+
+        for (case, request) in cases {
+            let event_log_path = unique_temp_path(&format!("ambiguous-host-{case}.jsonl"));
+            let (upstream, upstream_recorder) =
+                spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+            let runtime = test_runtime(
+                upstream,
+                &event_log_path,
+                unique_temp_path(&format!("ambiguous-host-{case}-control.txt")),
+                SurfaceAction::ProtectedUpstream,
+            );
+
+            let response =
+                parse_downstream_response(&run_runtime_request(runtime, request.as_bytes()));
+            let upstream_requests = upstream_recorder.finish();
+
+            assert_eq!(response.status, 400, "{case} Host case should fail");
+            assert!(
+                upstream_requests.is_empty(),
+                "{case} Host case reached protected upstream"
+            );
+            assert!(events_of_type(&event_log_path, "request_seen")
+                .iter()
+                .all(|event| event["kind"]["routing_decision"] == "eidolon_owned"));
+        }
+    }
+
+    #[test]
+    fn malformed_host_header_syntax_never_reaches_upstream() {
+        let event_log_path = unique_temp_path("malformed-host-syntax-events.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            unique_temp_path("malformed-host-syntax-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+
+        let (result, response) = run_runtime_request_result(
+            runtime,
+            b"GET /docs HTTP/1.1\r\nHost : trusted.example\r\n\r\n",
+        );
+        let upstream_requests = upstream_recorder.finish();
+
+        assert!(result.is_err());
+        assert!(response.is_empty());
+        assert!(upstream_requests.is_empty());
+        assert!(events_of_type(&event_log_path, "request_seen").is_empty());
+    }
+
+    #[test]
+    fn rejected_target_audit_uses_a_fixed_non_secret_placeholder() {
+        let event_log_path = unique_temp_path("rejected-target-redaction-events.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            unique_temp_path("rejected-target-redaction-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            b"GET /docs;token=secret-value HTTP/1.1\r\nHost: proxy.local\r\n\r\n",
+        ));
+        let upstream_requests = upstream_recorder.finish();
+        let raw_events = fs::read_to_string(&event_log_path).expect("event log should read");
+
+        assert_eq!(response.status, 400);
+        assert!(upstream_requests.is_empty());
+        assert!(!raw_events.contains("secret-value"));
+        assert_eq!(
+            first_event_of_type(&event_log_path, "request_seen")["kind"]["path"],
+            REJECTED_REQUEST_TARGET
+        );
+    }
+
+    #[test]
     fn ambiguous_custom_action_targets_never_connect_to_upstream_in_any_mode() {
         let cases = [
             (
@@ -15123,30 +16238,35 @@ mod tests {
                 "/eidolon-lab/route-c",
                 "/eidolon-lab/route-c#fragment",
                 false,
+                400_u16,
             ),
             (
                 "encoded-incoming-alias",
                 "/eidolon-lab/route-c",
                 "/eidolon-lab/route-%63",
                 false,
+                403_u16,
             ),
             (
                 "encoded-config-alias",
                 "/eidolon-lab/route-%63",
                 "/eidolon-lab/route-c",
                 true,
+                403_u16,
             ),
             (
                 "encoded-reserved-alias",
                 "/eidolon-lab/route/c",
                 "/eidolon-lab/route%2Fc",
                 false,
+                400_u16,
             ),
             (
                 "absolute-form",
                 "/eidolon-lab/route-c",
                 "http://proxy.local/eidolon-lab/route-c",
                 false,
+                403_u16,
             ),
         ];
 
@@ -15156,7 +16276,9 @@ mod tests {
             } else {
                 "enabled"
             };
-            for (case, configured_path, incoming_target, bypass_validation) in cases {
+            for (case, configured_path, incoming_target, bypass_validation, expected_status) in
+                cases
+            {
                 let loaded = if bypass_validation {
                     // Loader rejection is primary; this exercises runtime defense in depth.
                     unchecked_custom_unsafe_action_profile(configured_path)
@@ -15203,8 +16325,14 @@ mod tests {
                 ));
                 let upstream_connections = upstream_recorder.finish();
 
-                assert_eq!(missing_response.status, 403, "missing proof: {case} {mode}");
-                assert_eq!(wrong_response.status, 403, "wrong proof: {case} {mode}");
+                assert_eq!(
+                    missing_response.status, expected_status,
+                    "missing proof: {case} {mode}"
+                );
+                assert_eq!(
+                    wrong_response.status, expected_status,
+                    "wrong proof: {case} {mode}"
+                );
                 assert!(
                     upstream_connections.is_empty(),
                     "{case} target connected to protected upstream in {mode} mode"
@@ -15373,8 +16501,8 @@ mod tests {
             ));
             let upstream_requests = upstream_recorder.finish();
 
-            assert_eq!(missing_response.status, 403);
-            assert_eq!(wrong_response.status, 403);
+            assert_eq!(missing_response.status, 400);
+            assert_eq!(wrong_response.status, 400);
             assert!(
                 upstream_requests.is_empty(),
                 "encoded configured action reached protected upstream"
@@ -16243,11 +17371,19 @@ mod tests {
     fn event_target_redacts_query_values_and_fragments() {
         assert_eq!(
             redacted_event_target("/docs?token=secret&mode=debug#secret-fragment"),
-            "/docs?token=<redacted>&mode=<redacted>#<redacted>"
+            "/docs?<redacted>#<redacted>"
         );
         assert_eq!(
             redacted_event_target("/docs?flag&=secret"),
-            "/docs?flag=<redacted>&<redacted>"
+            "/docs?<redacted>"
+        );
+        assert_eq!(
+            redacted_event_target("/docs?sk_live_secret"),
+            "/docs?<redacted>"
+        );
+        assert_eq!(
+            redacted_event_target("/docs?sk_live_secret=x"),
+            "/docs?<redacted>"
         );
         assert_eq!(redacted_event_target("/docs?"), "/docs?<redacted>");
         assert_eq!(redacted_event_target("/docs"), "/docs");
