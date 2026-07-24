@@ -3,7 +3,7 @@ use std::{
     env, fmt, fs,
     io::{self, BufRead, BufReader, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::ExitCode,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -22,8 +22,13 @@ use eidolon_core::{
 use eidolon_proxy::{
     controlled_reality::{
         is_controlled_follow_up_path, rate_limited_response, ControlledRealityConfig,
+        ControlledRealityRenderedResponse, ControlledRealityResourceDescriptor,
         ControlledRealityResponder, DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY,
         MAX_CONTROLLED_REALITY_ACTION_DEPTH, MAX_TARPIT_DELAY,
+    },
+    controlled_reality_backend::{
+        ControlledRealityBackendAuthSecret, ControlledRealityBackendClient,
+        ControlledRealityBackendError,
     },
     debug_log::FileDebugLogWriter,
     event_log::{
@@ -70,6 +75,10 @@ const MAX_BAIT_PROOF_TTL_SECS: u64 = 24 * 60 * 60;
 const BAIT_EXPOSURE_STATE_SCHEMA_VERSION: u16 = 1;
 const CONSUMED_PROOF_STATE_SCHEMA_VERSION: u16 = 1;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+const CONTROLLED_REALITY_WORKFLOW_LOCK_SHARDS: usize = 64;
+const CONTROLLED_REALITY_BACKEND_ENCODED_SECRET_BYTES: usize = 64;
+const CONTROLLED_REALITY_BACKEND_MAX_SECRET_FILE_BYTES: usize =
+    CONTROLLED_REALITY_BACKEND_ENCODED_SECRET_BYTES + 1;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -143,6 +152,12 @@ fn main() -> ExitCode {
                 config.controlled_reality_config.tarpit_delay.as_millis(),
                 config.controlled_reality_config.retry_after_seconds
             );
+            match &config.controlled_reality_backend {
+                Some(backend) => {
+                    println!("controlled_reality_renderer: remote ({})", backend.address)
+                }
+                None => println!("controlled_reality_renderer: in_process"),
+            }
             println!(
                 "owned_cluster_lab: {}",
                 if config.owned_cluster_lab {
@@ -182,7 +197,14 @@ struct ProxyConfig {
     intervention_control_path: PathBuf,
     policy_state_path: PathBuf,
     controlled_reality_config: ControlledRealityConfig,
+    controlled_reality_backend: Option<ControlledRealityBackendConfig>,
     owned_cluster_lab: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlledRealityBackendConfig {
+    address: SocketAddr,
+    auth_secret_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +354,18 @@ impl CliAction {
                         parse_u64_option(&value, "controlled reality retry-after seconds")?,
                     )?;
                 }
+                "--controlled-reality-backend-addr" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(&mut builder.controlled_reality_backend_addr, flag, value)?;
+                }
+                "--controlled-reality-backend-auth-secret-file" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.controlled_reality_backend_auth_secret_path,
+                        flag,
+                        parse_controlled_reality_backend_auth_secret_path(&value)?,
+                    )?;
+                }
                 "--owned-cluster-lab" => {
                     if builder.owned_cluster_lab {
                         return Err(ConfigError::new(format!("duplicate option `{flag}`")));
@@ -370,11 +404,28 @@ struct ConfigBuilder {
     controlled_reality_max_depth: Option<u32>,
     controlled_reality_tarpit_delay: Option<Duration>,
     controlled_reality_retry_after_seconds: Option<u64>,
+    controlled_reality_backend_addr: Option<String>,
+    controlled_reality_backend_auth_secret_path: Option<PathBuf>,
     owned_cluster_lab: bool,
 }
 
 impl ConfigBuilder {
     fn build(self) -> Result<ProxyConfig, ConfigError> {
+        let controlled_reality_backend = match (
+            self.controlled_reality_backend_addr,
+            self.controlled_reality_backend_auth_secret_path,
+        ) {
+            (Some(address), Some(auth_secret_path)) => Some(ControlledRealityBackendConfig {
+                address: parse_controlled_reality_backend_addr(&address, self.owned_cluster_lab)?,
+                auth_secret_path,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(ConfigError::new(
+                    "controlled-reality backend address and auth secret file must be configured together",
+                ));
+            }
+        };
         Ok(ProxyConfig {
             listen_addr: match self.listen_addr {
                 Some(value) => parse_listen_addr(&value, self.owned_cluster_lab)?,
@@ -419,6 +470,7 @@ impl ConfigBuilder {
                     .controlled_reality_retry_after_seconds
                     .unwrap_or(DEFAULT_RETRY_AFTER_SECONDS),
             },
+            controlled_reality_backend,
             owned_cluster_lab: self.owned_cluster_lab,
         })
     }
@@ -648,6 +700,28 @@ fn parse_tarpit_delay(raw: &str, label: &str) -> Result<Duration, ConfigError> {
     Ok(delay)
 }
 
+fn parse_controlled_reality_backend_addr(
+    raw: &str,
+    owned_cluster_lab: bool,
+) -> Result<SocketAddr, ConfigError> {
+    let address = raw.parse::<SocketAddr>().map_err(|error| {
+        ConfigError::new(format!(
+            "controlled reality backend address must be an IP socket address: {error}"
+        ))
+    })?;
+    if address.port() == 0 {
+        return Err(ConfigError::new(
+            "controlled reality backend port must not be 0",
+        ));
+    }
+    if address.ip().is_unspecified() || (!address.ip().is_loopback() && !owned_cluster_lab) {
+        return Err(ConfigError::new(
+            "controlled reality backend must be loopback unless `--owned-cluster-lab` is set",
+        ));
+    }
+    Ok(address)
+}
+
 fn ensure_allowed_upstream_host(host: &str, owned_cluster_lab: bool) -> Result<(), ConfigError> {
     if host.eq_ignore_ascii_case("localhost") {
         return Ok(());
@@ -734,12 +808,86 @@ fn parse_ingress_transport_auth_secret_path(raw: &str) -> Result<PathBuf, Config
     Ok(path)
 }
 
+fn parse_controlled_reality_backend_auth_secret_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = parse_file_path(raw, "controlled reality backend auth secret")?;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(ConfigError::new(
+            "controlled reality backend auth secret path must be absolute and contain no `..` components",
+        ));
+    }
+    if !path.is_file() {
+        return Err(ConfigError::new(format!(
+            "controlled reality backend auth secret path must be an existing file: `{}`",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
 fn load_ingress_transport_auth_secret(path: &Path) -> io::Result<Arc<str>> {
     load_non_empty_secret(path, "ingress transport auth secret")
 }
 
 fn load_bait_signing_secret(path: &Path) -> io::Result<Arc<str>> {
     load_non_empty_secret(path, "bait signing secret")
+}
+
+fn load_controlled_reality_backend_auth_secret(
+    path: &Path,
+) -> io::Result<ControlledRealityBackendAuthSecret> {
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid_data(
+            "controlled reality backend auth secret must be a regular file",
+        ));
+    }
+    let mut encoded = Vec::with_capacity(CONTROLLED_REALITY_BACKEND_MAX_SECRET_FILE_BYTES + 1);
+    file.take((CONTROLLED_REALITY_BACKEND_MAX_SECRET_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut encoded)?;
+    let decoded = decode_controlled_reality_backend_auth_secret(&encoded);
+    encoded.fill(0);
+    ControlledRealityBackendAuthSecret::new(decoded?).map_err(|_| {
+        invalid_data("controlled reality backend auth secret must decode to 32 nontrivial bytes")
+    })
+}
+
+fn decode_controlled_reality_backend_auth_secret(encoded: &[u8]) -> io::Result<Vec<u8>> {
+    let encoded = match encoded {
+        bytes if bytes.len() == CONTROLLED_REALITY_BACKEND_ENCODED_SECRET_BYTES => bytes,
+        bytes
+            if bytes.len() == CONTROLLED_REALITY_BACKEND_MAX_SECRET_FILE_BYTES
+                && bytes.last().is_some_and(|byte| *byte == b'\n') =>
+        {
+            &bytes[..CONTROLLED_REALITY_BACKEND_ENCODED_SECRET_BYTES]
+        }
+        _ => {
+            return Err(invalid_data(
+                "controlled reality backend auth secret must contain exactly 64 hexadecimal characters and an optional newline",
+            ));
+        }
+    };
+    let mut decoded = Vec::with_capacity(CONTROLLED_REALITY_BACKEND_ENCODED_SECRET_BYTES / 2);
+    for pair in encoded.chunks_exact(2) {
+        let high = decode_controlled_reality_backend_hex_nibble(pair[0])
+            .ok_or_else(|| invalid_data("controlled reality backend auth secret is not hex"))?;
+        let low = decode_controlled_reality_backend_hex_nibble(pair[1])
+            .ok_or_else(|| invalid_data("controlled reality backend auth secret is not hex"))?;
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+fn decode_controlled_reality_backend_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn load_non_empty_secret(path: &Path, label: &str) -> io::Result<Arc<str>> {
@@ -1042,6 +1190,13 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         policy_store.fail_closed_for_unknown_sessions();
     let event_log_writer = FileEventLogWriter::open(&config.event_log_path)?;
     let event_log_tail_repair = event_log_writer.startup_tail_repair();
+    let controlled_reality_backend = match &config.controlled_reality_backend {
+        Some(backend) => Some(Arc::new(ControlledRealityBackendClient::new(
+            backend.address,
+            load_controlled_reality_backend_auth_secret(&backend.auth_secret_path)?,
+        ))),
+        None => None,
+    };
     let runtime = ProxyRuntime {
         upstream: config.upstream,
         client_request_deadline: CLIENT_REQUEST_DEADLINE,
@@ -1052,7 +1207,8 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         session_authority: Arc::new(Mutex::new(session_authority)),
         controlled_reality_config: config.controlled_reality_config,
         controlled_reality: Arc::new(ControlledRealityResponder),
-        controlled_reality_workflow_lock: Arc::new(Mutex::new(())),
+        controlled_reality_backend,
+        controlled_reality_workflow_locks: Arc::new(ControlledRealityWorkflowLocks::new()),
         surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
             Arc::clone(&bait_registry),
             bait_content.clone(),
@@ -1079,6 +1235,11 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 "max_depth": runtime.controlled_reality_config.max_action_depth,
                 "tarpit_ms": runtime.controlled_reality_config.tarpit_delay.as_millis(),
                 "retry_after_seconds": runtime.controlled_reality_config.retry_after_seconds,
+                "renderer": if runtime.controlled_reality_backend.is_some() {
+                    "remote"
+                } else {
+                    "in_process"
+                },
             },
             "bait_profile": bait_profile_debug,
             "bait_signing_enabled": bait_signing_secret.is_some(),
@@ -1173,7 +1334,8 @@ struct ProxyRuntime {
     session_authority: Arc<Mutex<SessionAuthority>>,
     controlled_reality_config: ControlledRealityConfig,
     controlled_reality: Arc<ControlledRealityResponder>,
-    controlled_reality_workflow_lock: Arc<Mutex<()>>,
+    controlled_reality_backend: Option<Arc<ControlledRealityBackendClient>>,
+    controlled_reality_workflow_locks: Arc<ControlledRealityWorkflowLocks>,
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
     ingress_identity_resolver: Arc<IngressIdentityResolver>,
     ingress_transport_auth_secret: Option<Arc<str>>,
@@ -1183,6 +1345,26 @@ struct ProxyRuntime {
     bait_content: BaitContentOverrides,
     bait_exposures: Arc<Mutex<BaitExposureStore>>,
     consumed_bait_proofs: Arc<Mutex<ConsumedBaitProofStore>>,
+}
+
+struct ControlledRealityWorkflowLocks {
+    shards: [Mutex<()>; CONTROLLED_REALITY_WORKFLOW_LOCK_SHARDS],
+}
+
+impl ControlledRealityWorkflowLocks {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(())),
+        }
+    }
+
+    fn lock(&self, session_id: SessionId) -> io::Result<std::sync::MutexGuard<'_, ()>> {
+        let index =
+            (session_id.0.as_u128() % CONTROLLED_REALITY_WORKFLOW_LOCK_SHARDS as u128) as usize;
+        self.shards[index]
+            .lock()
+            .map_err(|_| io::Error::other("controlled-reality workflow lock poisoned"))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3106,9 +3288,8 @@ fn handle_connection(
         request_evaluation::InitialRoutePlan::ControlledReality => {
             _controlled_reality_workflow_guard = Some(
                 runtime
-                    .controlled_reality_workflow_lock
-                    .lock()
-                    .map_err(|_| io::Error::other("controlled-reality workflow lock poisoned"))?,
+                    .controlled_reality_workflow_locks
+                    .lock(session.session_id)?,
             );
             let (action, transition, interaction, pending_commit) = controlled_reality_action(
                 runtime,
@@ -3409,11 +3590,8 @@ fn handle_connection(
                 apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
                 _response_workflow_guard = Some(
                     runtime
-                        .controlled_reality_workflow_lock
-                        .lock()
-                        .map_err(|_| {
-                            io::Error::other("controlled-reality workflow lock poisoned")
-                        })?,
+                        .controlled_reality_workflow_locks
+                        .lock(session.session_id)?,
                 );
                 let (action, controlled_transition, interaction, pending_commit) =
                     controlled_reality_action(
@@ -4457,10 +4635,62 @@ fn controlled_reality_action(
         return Ok((action, transition, None, true));
     }
 
-    let controlled_decision =
+    let controlled_decision = if let Some(backend) = &runtime.controlled_reality_backend {
+        let rendered = progress
+            .origin_request_id
+            .map(|origin_request_id| {
+                ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id)
+                    .map_err(|_| ControlledRealityBackendError::InvalidResourceDescriptor)
+            })
+            .transpose()
+            .and_then(|resources| backend.render(request_id, request_kind, progress, resources));
+        match rendered {
+            Ok(rendered) => runtime.controlled_reality.decide_from_rendered(
+                session_id,
+                request_kind,
+                progress,
+                ControlledRealityRenderedResponse {
+                    status: rendered.status,
+                    body: rendered.body,
+                },
+            ),
+            Err(error) => {
+                let rolled_back = runtime
+                    .policy_store
+                    .lock()
+                    .map_err(|_| io::Error::other("policy state store lock poisoned"))?
+                    .reconcile_pending_controlled_reality(session_id, request_id, false)?;
+                if !rolled_back {
+                    return Err(invalid_data(
+                        "controlled-reality renderer failure had no pending workflow state",
+                    ));
+                }
+                write_debug(
+                    runtime,
+                    "controlled_reality_backend_failed",
+                    Some(session_id),
+                    json!({
+                        "request_id": request_id.0,
+                        "reason": error.audit_code(),
+                        "response_status": 503,
+                        "local_fallback": false,
+                    }),
+                )?;
+                return Ok((
+                    SurfaceAction::EidolonOwned {
+                        response: runtime.controlled_reality.backend_unavailable_response(),
+                    },
+                    None,
+                    None,
+                    false,
+                ));
+            }
+        }
+    } else {
         runtime
             .controlled_reality
-            .decide(session_id, request, request_kind, progress);
+            .decide(session_id, request, request_kind, progress)
+    };
     let mut action = controlled_decision.action;
     if let SurfaceAction::ControlledReality { reason, .. } = &mut action {
         if depth == 1 {
@@ -4617,10 +4847,6 @@ fn reconcile_pending_controlled_reality_interaction(
 }
 
 fn reconcile_all_pending_controlled_reality_interactions(runtime: &ProxyRuntime) -> io::Result<()> {
-    let _guard = runtime
-        .controlled_reality_workflow_lock
-        .lock()
-        .map_err(|_| io::Error::other("controlled-reality workflow lock poisoned"))?;
     let sessions = runtime
         .policy_store
         .lock()
@@ -4630,6 +4856,7 @@ fn reconcile_all_pending_controlled_reality_interactions(runtime: &ProxyRuntime)
         return Ok(());
     }
     for session_id in sessions {
+        let _guard = runtime.controlled_reality_workflow_locks.lock(session_id)?;
         reconcile_pending_controlled_reality_interaction(runtime, session_id)?;
     }
     runtime
@@ -6764,6 +6991,10 @@ Options:
   --controlled-reality-retry-after-seconds <SECONDS>
                          Retry-After value for controlled-reality rate limits
                          [default: {DEFAULT_RETRY_AFTER_SECONDS}]
+  --controlled-reality-backend-addr <ADDR>
+                         Optional signed renderer IP socket address
+  --controlled-reality-backend-auth-secret-file <PATH>
+                         Required 64-hex HMAC secret when a remote renderer is configured
   --owned-cluster-lab   Allow non-loopback listen and upstream addresses for an
                          owned Kubernetes or cluster lab
   -h, --help            Show this help text
@@ -6794,7 +7025,13 @@ mod tests {
     use eidolon_core::{
         ControlledRealityWorkflowState, ExpectedAction, PersistenceMetadata, SessionId, SurfaceKind,
     };
-    use eidolon_proxy::surface::{HtmlInsertion, RewritePlan};
+    use eidolon_proxy::{
+        controlled_reality_backend::{
+            serve_render_connection, ControlledRealityBackendConnectionOutcome,
+            ControlledRealityBackendReplayCache,
+        },
+        surface::{HtmlInsertion, RewritePlan},
+    };
     use serde_json::Value;
 
     #[derive(Clone)]
@@ -6902,6 +7139,49 @@ mod tests {
         path
     }
 
+    fn write_controlled_reality_backend_secret() -> PathBuf {
+        let path = unique_temp_path("controlled-reality-backend-secret.txt");
+        must_ok(
+            fs::write(
+                &path,
+                concat!(
+                    "30313233", "34353637", "38396162", "63646566", "30313233", "34353637",
+                    "38396162", "63646566",
+                ),
+            ),
+            "controlled reality backend secret should write",
+        );
+        path
+    }
+
+    fn test_controlled_reality_backend_secret() -> ControlledRealityBackendAuthSecret {
+        ControlledRealityBackendAuthSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
+            .expect("test backend secret should be accepted")
+    }
+
+    fn start_controlled_reality_backend_once() -> (
+        Arc<ControlledRealityBackendClient>,
+        JoinHandle<ControlledRealityBackendConnectionOutcome>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("backend should bind");
+        let address = listener.local_addr().expect("backend address should exist");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("backend should accept");
+            serve_render_connection(
+                stream,
+                &test_controlled_reality_backend_secret(),
+                &ControlledRealityBackendReplayCache::new(),
+            )
+        });
+        (
+            Arc::new(ControlledRealityBackendClient::new(
+                address,
+                test_controlled_reality_backend_secret(),
+            )),
+            server,
+        )
+    }
+
     fn test_runtime(
         upstream: UpstreamTarget,
         event_log_path: &Path,
@@ -6935,7 +7215,8 @@ mod tests {
             session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
-            controlled_reality_workflow_lock: Arc::new(Mutex::new(())),
+            controlled_reality_backend: None,
+            controlled_reality_workflow_locks: Arc::new(ControlledRealityWorkflowLocks::new()),
             surface_controller,
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
@@ -6984,7 +7265,8 @@ mod tests {
             session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
-            controlled_reality_workflow_lock: Arc::new(Mutex::new(())),
+            controlled_reality_backend: None,
+            controlled_reality_workflow_locks: Arc::new(ControlledRealityWorkflowLocks::new()),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
                 Arc::clone(&bait_registry),
                 BaitContentOverrides::default(),
@@ -7020,7 +7302,8 @@ mod tests {
             session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
-            controlled_reality_workflow_lock: Arc::new(Mutex::new(())),
+            controlled_reality_backend: None,
+            controlled_reality_workflow_locks: Arc::new(ControlledRealityWorkflowLocks::new()),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
                 Arc::clone(&bait_registry),
                 BaitContentOverrides::default(),
@@ -7058,7 +7341,8 @@ mod tests {
             session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
-            controlled_reality_workflow_lock: Arc::new(Mutex::new(())),
+            controlled_reality_backend: None,
+            controlled_reality_workflow_locks: Arc::new(ControlledRealityWorkflowLocks::new()),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
                 Arc::clone(&bait_registry),
                 bait_content.clone(),
@@ -7766,7 +8050,32 @@ mod tests {
             config.controlled_reality_config,
             ControlledRealityConfig::default()
         );
+        assert_eq!(config.controlled_reality_backend, None);
         assert!(!config.owned_cluster_lab);
+    }
+
+    #[test]
+    fn remote_renderer_config_requires_a_complete_loopback_pair() {
+        let secret_path = write_controlled_reality_backend_secret();
+        let config = run_config(&[
+            "--controlled-reality-backend-addr",
+            "127.0.0.1:9103",
+            "--controlled-reality-backend-auth-secret-file",
+            path_str(&secret_path, "backend secret path should be utf8"),
+        ])
+        .expect("complete remote renderer config should parse");
+
+        assert_eq!(
+            config.controlled_reality_backend,
+            Some(ControlledRealityBackendConfig {
+                address: "127.0.0.1:9103".parse().expect("address should parse"),
+                auth_secret_path: secret_path,
+            })
+        );
+        assert_error_contains(
+            &["--controlled-reality-backend-addr", "127.0.0.1:9103"],
+            "configured together",
+        );
     }
 
     #[test]
@@ -17732,6 +18041,105 @@ mod tests {
         assert_eq!(action_debugs.len(), 2);
         assert_eq!(action_debugs[1]["fields"]["matched_prior_exposure"], false);
         assert_eq!(action_debugs[1]["fields"]["prior_same_bait_exposure"], true);
+    }
+
+    #[test]
+    fn remote_renderer_success_uses_the_verified_response() {
+        let event_log_path = unique_temp_path("remote-renderer-success-events.jsonl");
+        let mut runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("remote-renderer-success-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let (backend, server) = start_controlled_reality_backend_once();
+        runtime.controlled_reality_backend = Some(backend);
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let request = SurfaceRequestMeta::new(
+            "POST",
+            eidolon_proxy::controlled_reality::DECOY_RECONCILE_PATH,
+            Vec::new(),
+            0,
+        );
+
+        let (action, transition, interaction, pending_commit) = controlled_reality_action(
+            &runtime,
+            session_id,
+            request_id,
+            &request,
+            "test transition".to_string(),
+        )
+        .expect("remote renderer should serve the action");
+
+        let SurfaceAction::ControlledReality { response, .. } = action else {
+            panic!("successful remote render should remain controlled reality");
+        };
+        assert_eq!(response.status, 202);
+        assert!(transition.is_none());
+        assert!(interaction.is_some());
+        assert!(pending_commit);
+        assert_eq!(
+            server.join().expect("renderer should finish"),
+            ControlledRealityBackendConnectionOutcome::Served {
+                request_id,
+                status: 202,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_renderer_failure_returns_503_and_rolls_back_progress() {
+        let event_log_path = unique_temp_path("remote-renderer-failure-events.jsonl");
+        let mut runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("remote-renderer-failure-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("address should bind");
+        let address = listener.local_addr().expect("address should exist");
+        drop(listener);
+        runtime.controlled_reality_backend = Some(Arc::new(ControlledRealityBackendClient::new(
+            address,
+            test_controlled_reality_backend_secret(),
+        )));
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let request = SurfaceRequestMeta::new(
+            "POST",
+            eidolon_proxy::controlled_reality::DECOY_RECONCILE_PATH,
+            Vec::new(),
+            0,
+        );
+
+        let (action, transition, interaction, pending_commit) = controlled_reality_action(
+            &runtime,
+            session_id,
+            request_id,
+            &request,
+            "test transition".to_string(),
+        )
+        .expect("backend failure should become a direct response");
+
+        let SurfaceAction::EidolonOwned { response } = action else {
+            panic!("backend failure must not fall back to local controlled reality");
+        };
+        assert_eq!(response.status, 503);
+        assert!(transition.is_none());
+        assert!(interaction.is_none());
+        assert!(!pending_commit);
+        let record = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(record.controlled_reality_depth, 0);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Ready
+        );
+        assert!(record.controlled_reality_pending_update.is_none());
     }
 
     #[test]
