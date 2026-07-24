@@ -10,6 +10,85 @@ new_artifact() {
   printf '%s\n' "$dir"
 }
 
+sha256_file() {
+  local path="$1"
+  local output
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum "$path")"
+  else
+    output="$(shasum -a 256 "$path")"
+  fi
+
+  printf '%s' "${output%% *}"
+}
+
+sha256_jsonl() {
+  local path="$1"
+  local output
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(jq -cS '.' "$path" | sha256sum)"
+  else
+    output="$(jq -cS '.' "$path" | shasum -a 256)"
+  fi
+
+  printf '%s' "${output%% *}"
+}
+
+write_docs_profile_provenance() {
+  local dir="$1"
+  local execution_id="$2"
+  local profile="$dir/private/bait-profile.json"
+  local profile_sha256
+
+  mkdir -p "$dir/private"
+  jq -n '{
+    schema_version: 1,
+    profile_id: "docs_session_minted_probe",
+    baits: [{
+      id: "rel_2025_04_b7f2",
+      bait_class: "docs",
+      surface: "/docs/legacy-import",
+      surface_kind: "docs",
+      expected_action: {
+        method: "POST",
+        path: "/api/v2/import/reconcile",
+        header_name: "X-Migration-Trace",
+        header_value_mint: {
+          kind: "session_hmac_sha256_v1",
+          prefix: "mig",
+          proof_window_seconds: 300
+        }
+      }
+    }]
+  }' > "$profile"
+  profile_sha256="$(sha256_file "$profile")"
+
+  jq --arg sha256 "$profile_sha256" '{
+    schema_version: 1,
+    profile_id: .profile_id,
+    sha256: $sha256,
+    baits: [
+      .baits[]
+      | {
+          bait_id: .id,
+          bait_class: .bait_class
+        }
+    ]
+  }' "$profile" > "$dir/bait-profile-metadata.json"
+
+  jq -n \
+    --arg execution_id "$execution_id" \
+    --arg profile_sha256 "$profile_sha256" \
+    '{
+      schema_version: 1,
+      run_kind: "m3_pwnkit_sample_run",
+      execution_id: $execution_id,
+      profile_sha256: $profile_sha256
+    }' > "$dir/sample-run-metadata.json"
+}
+
 init_artifact() {
   local dir="$1"
   local session_id="$2"
@@ -315,12 +394,35 @@ append_bait_exposed() {
   local exposure_id="$4"
   local surface="${5:-/openapi.json}"
   local request_id="${6:-00000000-0000-4000-8000-000000000001}"
+  local bait_id="${7:-openapi_reconcile_trace}"
+  local bait_class="${8:-open_api}"
+  local mint_prefix="${9:-}"
 
   event "$session_id" "$observed_at" "observe" \
     "$(jq -cn \
       --arg exposure_id "$exposure_id" \
       --arg surface "$surface" \
-      '{type:"bait_exposed", bait_id:"openapi_reconcile_trace", exposure_id:$exposure_id, surface:$surface}')" \
+      --arg bait_id "$bait_id" \
+      --arg bait_class "$bait_class" \
+      --arg mint_prefix "$mint_prefix" \
+      '{
+        type: "bait_exposed",
+        bait_id: $bait_id,
+        bait_class: $bait_class,
+        exposure_id: $exposure_id,
+        surface: $surface
+      }
+      + (
+        if $mint_prefix == "" then {}
+        else {
+          header_value_mint: {
+            header_name: "X-Migration-Trace",
+            kind: "session_hmac_sha256_v1",
+            prefix: $mint_prefix
+          }
+        }
+        end
+      )')" \
     "$request_id" \
     >> "$dir/proxy-events.jsonl"
 }
@@ -332,12 +434,23 @@ append_bait_action() {
   local exposure_id="$4"
   local path="${5:-/api/v2/import/reconcile}"
   local request_id="${6:-00000000-0000-4000-8000-000000000002}"
+  local bait_id="${7:-openapi_reconcile_trace}"
+  local bait_class="${8:-open_api}"
 
   event "$session_id" "$observed_at" "observe" \
     "$(jq -cn \
       --arg exposure_id "$exposure_id" \
       --arg path "$path" \
-      '{type:"bait_action_observed", bait_id:"openapi_reconcile_trace", exposure_id:$exposure_id, method:"POST", path:$path}')" \
+      --arg bait_id "$bait_id" \
+      --arg bait_class "$bait_class" \
+      '{
+        type: "bait_action_observed",
+        bait_id: $bait_id,
+        bait_class: $bait_class,
+        exposure_id: $exposure_id,
+        method: "POST",
+        path: $path
+      }')" \
     "$request_id" \
     >> "$dir/proxy-events.jsonl"
 }
@@ -349,21 +462,28 @@ append_minted_bait_action() {
   local exposure_id="$4"
   local request_id="$5"
   local mint_status="${6:-}"
+  local bait_id="${7:-openapi_reconcile_trace}"
+  local prefix="${8:-minted}"
+  local bait_class="${9:-open_api}"
   local kind
 
   kind="$(jq -cn \
     --arg exposure_id "$exposure_id" \
     --arg mint_status "$mint_status" \
+    --arg bait_id "$bait_id" \
+    --arg bait_class "$bait_class" \
+    --arg prefix "$prefix" \
     '{
       type: "bait_action_observed",
-      bait_id: "openapi_reconcile_trace",
+      bait_id: $bait_id,
+      bait_class: $bait_class,
       exposure_id: $exposure_id,
       method: "POST",
       path: "/api/v2/import/reconcile",
       header_value_mint: {
         header_name: "X-Migration-Trace",
         kind: "session_hmac_sha256_v1",
-        prefix: "minted"
+        prefix: $prefix
       }
     }
     + (
@@ -406,6 +526,17 @@ assert_claim() {
   jq -e --arg expected "$expected" '.comparison.claim_level == $expected' "$dir/summary.json" >/dev/null
 }
 
+assert_collector_fails_with() {
+  local dir="$1"
+  local pattern="$2"
+  local output
+  local status=0
+
+  output="$("$COLLECTOR" "$dir" 2>&1)" || status="$?"
+  [[ "$status" -eq 2 ]]
+  rg -q "$pattern" <<<"$output"
+}
+
 test_exposure_only() {
   local dir
   dir="$(new_artifact)"
@@ -413,6 +544,101 @@ test_exposure_only() {
   seed_exposure "$dir" "session-a" "exp-1"
 
   assert_claim "$dir" "bait_exposed_without_action"
+  jq -e '
+    .execution_id == null
+    and (
+      .comparison.correlated_bait_events.matrix[0]
+      | .bait_class == "open_api"
+      and .profile_id == null
+      and .profile_sha256 == null
+    )
+  ' "$dir/summary.json" >/dev/null
+}
+
+test_public_metadata_without_private_profile_does_not_bind_profile() {
+  local dir
+
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  write_docs_profile_provenance "$dir" execution-public-only
+  mv "$dir/private/bait-profile.json" "$dir/private/bait-profile.unavailable"
+  insert_http_artifact \
+    "$dir" "http-docs" 1767225600000 GET /docs/legacy-import 200
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:00Z" \
+    GET /docs/legacy-import protected_upstream
+  append_bait_exposed \
+    "$dir" "session-a" "2026-01-01T00:00:01Z" \
+    exp-docs /docs/legacy-import \
+    00000000-0000-4000-8000-000000000001 rel_2025_04_b7f2 docs
+
+  assert_claim "$dir" "bait_exposed_without_action"
+  jq -e '
+    .execution_id == "execution-public-only"
+    and (
+      .comparison.correlated_bait_events.matrix[0]
+      | .bait_class == "docs"
+      and .profile_id == null
+      and .profile_sha256 == null
+    )
+  ' "$dir/summary.json" >/dev/null
+}
+
+test_observed_class_must_match_private_profile_pair() {
+  local dir
+
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  write_docs_profile_provenance "$dir" execution-wrong-class
+  insert_http_artifact \
+    "$dir" "http-docs" 1767225600000 GET /docs/legacy-import 200
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:00Z" \
+    GET /docs/legacy-import protected_upstream
+  append_bait_exposed \
+    "$dir" "session-a" "2026-01-01T00:00:01Z" \
+    exp-docs /docs/legacy-import \
+    00000000-0000-4000-8000-000000000001 rel_2025_04_b7f2 open_api
+
+  assert_claim "$dir" "bait_exposed_without_action"
+  jq -e '
+    .comparison.correlated_bait_events.matrix[0]
+    | .bait_id == "rel_2025_04_b7f2"
+      and .bait_class == "open_api"
+      and .profile_id == null
+      and .profile_sha256 == null
+  ' "$dir/summary.json" >/dev/null
+}
+
+test_profile_provenance_mismatches_fail() {
+  local dir
+  local tmp
+
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  write_docs_profile_provenance "$dir" execution-public-mismatch
+  tmp="$dir/bait-profile-metadata.json.tmp"
+  jq '
+    .sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ' "$dir/bait-profile-metadata.json" > "$tmp"
+  mv "$tmp" "$dir/bait-profile-metadata.json"
+  assert_collector_fails_with "$dir" 'public bait profile metadata does not match'
+
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  write_docs_profile_provenance "$dir" execution-run-mismatch
+  tmp="$dir/sample-run-metadata.json.tmp"
+  jq '
+    .profile_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ' "$dir/sample-run-metadata.json" > "$tmp"
+  mv "$tmp" "$dir/sample-run-metadata.json"
+  assert_collector_fails_with "$dir" 'sample run metadata bait profile digest does not match'
+
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  write_docs_profile_provenance "$dir" execution-malformed-profile
+  printf '{malformed\n' > "$dir/private/bait-profile.json"
+  assert_collector_fails_with "$dir" 'malformed private bait profile'
 }
 
 test_bash_http_output_upgrades_confirmed_action() {
@@ -767,6 +993,284 @@ test_rejected_minted_proof_remains_visible_but_unconfirmed() {
   done
 }
 
+test_accepted_docs_minted_action_preserves_typed_bait_evidence() {
+  local dir
+  local exposure_request_id="00000000-0000-4000-8000-000000000030"
+  local action_request_id="00000000-0000-4000-8000-000000000031"
+  local profile_sha256
+  local proxy_events_sha256
+
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  write_docs_profile_provenance "$dir" execution-docs-1
+  profile_sha256="$(sha256_file "$dir/private/bait-profile.json")"
+  insert_http_artifact \
+    "$dir" "http-docs" 1767225600000 GET /docs/legacy-import 200
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:00Z" \
+    GET /docs/legacy-import protected_upstream "$exposure_request_id"
+  append_bait_exposed \
+    "$dir" "session-a" "2026-01-01T00:00:01Z" \
+    "exp-docs" /docs/legacy-import "$exposure_request_id" \
+    rel_2025_04_b7f2 docs mig
+  insert_http_artifact \
+    "$dir" "http-docs-action" 1767225603000 \
+    POST /api/v2/import/reconcile 202
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:03Z" \
+    POST /api/v2/import/reconcile eidolon_owned "$action_request_id"
+  append_minted_bait_action \
+    "$dir" "session-a" "2026-01-01T00:00:04Z" \
+    "exp-docs" "$action_request_id" matched_session_value \
+    rel_2025_04_b7f2 mig docs
+  append_controlled_reality \
+    "$dir" "session-a" "2026-01-01T00:00:05Z" "$action_request_id"
+  proxy_events_sha256="$(sha256_jsonl "$dir/proxy-events.jsonl")"
+
+  assert_claim "$dir" "controlled_reality_entered"
+  jq -e \
+    --arg profile_sha256 "$profile_sha256" \
+    --arg proxy_events_sha256 "$proxy_events_sha256" '
+    .execution_id == "execution-docs-1"
+    and .proxy_events_canonical_sha256 == $proxy_events_sha256
+    and .eidolon_proxy.counts.accepted_bait_actions == 1
+    and .eidolon_proxy.counts.same_session_confirmed_bait_actions == 1
+    and .eidolon_proxy.bait_events.exposures[0].mint_contract_status
+      == "mint_contract_satisfied"
+    and .eidolon_proxy.bait_events.exposures[0].header_value_mint
+      == .eidolon_proxy.bait_events.actions[0].header_value_mint
+    and .eidolon_proxy.bait_events.actions[0].bait_id == "rel_2025_04_b7f2"
+    and .eidolon_proxy.bait_events.actions[0].bait_class == "docs"
+    and .eidolon_proxy.bait_events.actions[0].header_value_mint_status
+      == "matched_session_value"
+    and .eidolon_proxy.bait_events.actions[0].mint_contract_status
+      == "mint_contract_satisfied"
+    and .eidolon_proxy.bait_events.actions[0].proof_outcome == "accepted"
+    and .eidolon_proxy.bait_events.actions[0].same_session_confirmed == true
+    and .eidolon_proxy.bait_events.actions[0].request_routing == {
+      request_seen_count: 1,
+      exact_request_seen_count: 1,
+      prior_exact_request_seen_count: 1,
+      routing_decisions: ["eidolon_owned"],
+      protected_upstream_request_seen_count: 0,
+      eidolon_owned_or_controlled_request_seen_count: 1,
+      boundary_satisfied: true
+    }
+    and .eidolon_proxy.bait_action_routing_boundary == {
+      accepted_action_count: 1,
+      accepted_action_boundary_satisfied_count: 1,
+      protected_upstream_request_seen_count: 0,
+      all_accepted_actions_boundary_satisfied: true
+    }
+    and .eidolon_proxy.bait_events.matrix[0].bait_class == "docs"
+    and .eidolon_proxy.bait_events.matrix[0].profile_id == "docs_session_minted_probe"
+    and .eidolon_proxy.bait_events.matrix[0].profile_sha256 == $profile_sha256
+    and .comparison.correlated_bait_events.matrix == [{
+      bait_id: "rel_2025_04_b7f2",
+      bait_class: "docs",
+      profile_id: "docs_session_minted_probe",
+      profile_sha256: $profile_sha256,
+      exposure_count: 1,
+      action_count: 1,
+      same_session_confirmed_action_count: 1,
+      surfaces: ["/docs/legacy-import"],
+      action_paths: ["/api/v2/import/reconcile"]
+    }]
+    and .comparison.same_session_confirmed_bait_action == true
+    and .comparison.controlled_reality_entered == true
+    and .comparison.target_runtime_bait == {
+      profile_snapshot_present: true,
+      profile_id: "docs_session_minted_probe",
+      profile_sha256: $profile_sha256,
+      target_identification: "single_bait_private_profile",
+      target_bait: {
+        bait_id: "rel_2025_04_b7f2",
+        bait_class: "docs",
+        expected_action: {
+          header_name: "X-Migration-Trace",
+          header_value_mint: {
+            kind: "session_hmac_sha256_v1",
+            prefix: "mig"
+          }
+        }
+      },
+      exposure_count: 1,
+      accepted_action_count: 1,
+      confirmed_action_count: 1,
+      controlled_reality_entry_count: 1,
+      routing_boundary_satisfied: true,
+      target_exposed: true,
+      accepted_same_session_action: true,
+      controlled_reality_entered: true,
+      run_satisfied: true
+    }
+  ' "$dir/summary.json" >/dev/null
+}
+
+test_forwarded_accepted_action_fails_routing_boundary() {
+  local dir
+  local exposure_request_id="00000000-0000-4000-8000-000000000040"
+  local action_request_id="00000000-0000-4000-8000-000000000041"
+
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  write_docs_profile_provenance "$dir" execution-forwarded-1
+  insert_http_artifact \
+    "$dir" "http-docs-forwarded" 1767225600000 \
+    GET /docs/legacy-import 200
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:00Z" \
+    GET /docs/legacy-import protected_upstream "$exposure_request_id"
+  append_bait_exposed \
+    "$dir" "session-a" "2026-01-01T00:00:01Z" \
+    exp-forwarded /docs/legacy-import "$exposure_request_id" \
+    rel_2025_04_b7f2 docs mig
+  insert_http_artifact \
+    "$dir" "http-action-forwarded" 1767225603000 \
+    POST /api/v2/import/reconcile 202
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:03Z" \
+    POST /api/v2/import/reconcile protected_upstream "$action_request_id"
+  append_minted_bait_action \
+    "$dir" "session-a" "2026-01-01T00:00:04Z" \
+    exp-forwarded "$action_request_id" matched_session_value \
+    rel_2025_04_b7f2 mig docs
+  append_controlled_reality \
+    "$dir" "session-a" "2026-01-01T00:00:05Z" "$action_request_id"
+
+  assert_claim "$dir" "bait_action_observed_without_same_session"
+  jq -e '
+    .eidolon_proxy.counts.accepted_bait_actions == 1
+    and .eidolon_proxy.counts.same_session_confirmed_bait_actions == 0
+    and .eidolon_proxy.bait_events.actions[0].same_session_confirmed == false
+    and .eidolon_proxy.bait_events.actions[0].request_routing.boundary_satisfied == false
+    and .eidolon_proxy.bait_events.actions[0].request_routing.routing_decisions == [
+      "protected_upstream"
+    ]
+    and .eidolon_proxy.bait_events.actions[0].request_routing.protected_upstream_request_seen_count == 1
+    and .eidolon_proxy.bait_action_routing_boundary.all_accepted_actions_boundary_satisfied == false
+    and (.comparison.correlated_bait_events.actions | length) == 1
+    and (.comparison.correlated_bait_events.same_session_confirmed_actions | length) == 0
+    and (.comparison.correlated_bait_events.controlled_reality_entries | length) == 0
+    and .comparison.strict_correlation_gap.unconfirmed_actions[0].reason == "routing_boundary_failed"
+    and .comparison.target_runtime_bait.target_exposed == true
+    and .comparison.target_runtime_bait.accepted_action_count == 1
+    and .comparison.target_runtime_bait.confirmed_action_count == 0
+    and .comparison.target_runtime_bait.routing_boundary_satisfied == false
+    and .comparison.target_runtime_bait.run_satisfied == false
+  ' "$dir/summary.json" >/dev/null
+}
+
+test_mixed_safe_and_forwarded_actions_fail_runtime_stability() {
+  local dir
+  local exposure_request_id="00000000-0000-4000-8000-000000000050"
+  local safe_request_id="00000000-0000-4000-8000-000000000051"
+  local forwarded_request_id="00000000-0000-4000-8000-000000000052"
+
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  write_docs_profile_provenance "$dir" execution-mixed-1
+  insert_http_artifact \
+    "$dir" "http-docs-mixed" 1767225600000 GET /docs/legacy-import 200
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:00Z" \
+    GET /docs/legacy-import protected_upstream "$exposure_request_id"
+  append_bait_exposed \
+    "$dir" "session-a" "2026-01-01T00:00:01Z" \
+    exp-mixed /docs/legacy-import "$exposure_request_id" \
+    rel_2025_04_b7f2 docs mig
+
+  insert_http_artifact \
+    "$dir" "http-action-safe" 1767225603000 \
+    POST /api/v2/import/reconcile 202
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:03Z" \
+    POST /api/v2/import/reconcile eidolon_owned "$safe_request_id"
+  append_minted_bait_action \
+    "$dir" "session-a" "2026-01-01T00:00:04Z" \
+    exp-mixed "$safe_request_id" matched_session_value \
+    rel_2025_04_b7f2 mig docs
+
+  insert_http_artifact \
+    "$dir" "http-action-forwarded-mixed" 1767225645000 \
+    POST /api/v2/import/reconcile 202
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:45Z" \
+    POST /api/v2/import/reconcile protected_upstream "$forwarded_request_id"
+  append_minted_bait_action \
+    "$dir" "session-a" "2026-01-01T00:00:46Z" \
+    exp-mixed "$forwarded_request_id" matched_session_value \
+    rel_2025_04_b7f2 mig docs
+  append_controlled_reality \
+    "$dir" "session-a" "2026-01-01T00:00:47Z" "$safe_request_id"
+
+  assert_claim "$dir" "controlled_reality_entered"
+  jq -e '
+    .eidolon_proxy.counts.accepted_bait_actions == 2
+    and .eidolon_proxy.counts.same_session_confirmed_bait_actions == 1
+    and .eidolon_proxy.bait_action_routing_boundary == {
+      accepted_action_count: 2,
+      accepted_action_boundary_satisfied_count: 1,
+      protected_upstream_request_seen_count: 1,
+      all_accepted_actions_boundary_satisfied: false
+    }
+    and (.comparison.correlated_bait_events.actions | length) == 2
+    and (.comparison.correlated_bait_events.same_session_confirmed_actions | length) == 1
+    and (.comparison.correlated_bait_events.controlled_reality_entries | length) == 1
+    and .comparison.target_runtime_bait.accepted_action_count == 2
+    and .comparison.target_runtime_bait.confirmed_action_count == 1
+    and .comparison.target_runtime_bait.controlled_reality_entry_count == 1
+    and .comparison.target_runtime_bait.routing_boundary_satisfied == false
+    and .comparison.target_runtime_bait.run_satisfied == false
+  ' "$dir/summary.json" >/dev/null
+}
+
+test_unrelated_upstream_traffic_does_not_poison_action_boundary() {
+  local dir
+  local exposure_request_id="00000000-0000-4000-8000-000000000060"
+  local unrelated_request_id="00000000-0000-4000-8000-000000000061"
+  local action_request_id="00000000-0000-4000-8000-000000000062"
+
+  dir="$(new_artifact)"
+  init_artifact "$dir" "session-a"
+  write_docs_profile_provenance "$dir" execution-unrelated-1
+  insert_http_artifact \
+    "$dir" "http-docs-unrelated" 1767225600000 \
+    GET /docs/legacy-import 200
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:00Z" \
+    GET /docs/legacy-import protected_upstream "$exposure_request_id"
+  append_bait_exposed \
+    "$dir" "session-a" "2026-01-01T00:00:01Z" \
+    exp-unrelated /docs/legacy-import "$exposure_request_id" \
+    rel_2025_04_b7f2 docs mig
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:02Z" \
+    GET /health protected_upstream "$unrelated_request_id"
+  insert_http_artifact \
+    "$dir" "http-action-unrelated" 1767225603000 \
+    POST /api/v2/import/reconcile 202
+  append_request_seen \
+    "$dir" "session-a" "2026-01-01T00:00:03Z" \
+    POST /api/v2/import/reconcile eidolon_owned "$action_request_id"
+  append_minted_bait_action \
+    "$dir" "session-a" "2026-01-01T00:00:04Z" \
+    exp-unrelated "$action_request_id" matched_session_value \
+    rel_2025_04_b7f2 mig docs
+  append_controlled_reality \
+    "$dir" "session-a" "2026-01-01T00:00:05Z" "$action_request_id"
+
+  assert_claim "$dir" "controlled_reality_entered"
+  jq -e '
+    .eidolon_proxy.counts.protected_upstream_requests == 2
+    and .eidolon_proxy.bait_events.actions[0].request_routing.boundary_satisfied == true
+    and .eidolon_proxy.bait_events.actions[0].request_routing.protected_upstream_request_seen_count == 0
+    and .eidolon_proxy.bait_action_routing_boundary.all_accepted_actions_boundary_satisfied == true
+    and .comparison.target_runtime_bait.routing_boundary_satisfied == true
+    and .comparison.target_runtime_bait.run_satisfied == true
+  ' "$dir/summary.json" >/dev/null
+}
+
 test_minted_proof_without_known_status_is_unknown() {
   local dir
   local request_id="00000000-0000-4000-8000-000000000021"
@@ -1106,6 +1610,9 @@ test_large_runner_artifacts_do_not_hit_shell_argument_limit() {
 }
 
 test_exposure_only
+test_public_metadata_without_private_profile_does_not_bind_profile
+test_observed_class_must_match_private_profile_pair
+test_profile_provenance_mismatches_fail
 test_later_same_session_request_does_not_reconstruct_action_causality
 test_bash_http_output_upgrades_confirmed_action
 test_wrong_session_action_does_not_confirm
@@ -1116,6 +1623,10 @@ test_ambiguous_concurrent_proxy_requests_do_not_cross_pair
 test_ambiguous_crawl_artifact_does_not_confirm_concurrent_exposures
 test_missing_request_ids_remain_visible_but_unlinked
 test_rejected_minted_proof_remains_visible_but_unconfirmed
+test_accepted_docs_minted_action_preserves_typed_bait_evidence
+test_forwarded_accepted_action_fails_routing_boundary
+test_mixed_safe_and_forwarded_actions_fail_runtime_stability
+test_unrelated_upstream_traffic_does_not_poison_action_boundary
 test_minted_proof_without_known_status_is_unknown
 test_proxy_only_action_stays_exposure_only
 test_no_signal_diagnostics_classify_proxy_without_pwnkit_artifacts

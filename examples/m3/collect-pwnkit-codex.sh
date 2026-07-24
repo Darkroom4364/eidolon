@@ -50,6 +50,41 @@ write_json_file() {
   printf '%s\n' "$json" > "$path"
 }
 
+fail() {
+  echo "error: $*" >&2
+  exit 2
+}
+
+sha256_file() {
+  local path="$1"
+  local output
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum "$path")"
+  elif command -v shasum >/dev/null 2>&1; then
+    output="$(shasum -a 256 "$path")"
+  else
+    fail "missing required SHA-256 tool: sha256sum or shasum"
+  fi
+
+  printf '%s' "${output%% *}"
+}
+
+sha256_jsonl() {
+  local path="$1"
+  local output
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(jq -cS '.' "$path" | sha256sum)"
+  elif command -v shasum >/dev/null 2>&1; then
+    output="$(jq -cS '.' "$path" | shasum -a 256)"
+  else
+    fail "missing required SHA-256 tool: sha256sum or shasum"
+  fi
+
+  printf '%s' "${output%% *}"
+}
+
 sqlite_json() {
   local db="$1"
   local query="$2"
@@ -875,7 +910,21 @@ proxy_summary() {
     return
   fi
 
-  jq -s 'def redacted_target($target):
+  jq -s --slurpfile bait_profile "$derived_bait_profile_metadata_file" '
+  def bait_contract($event):
+    (
+      [
+        ($bait_profile[0].baits // [])[]?
+        | select(.bait_id == $event.kind.bait_id)
+        | select(.bait_class == ($event.kind.bait_class // null))
+      ]
+    ) as $matches
+    | if ($matches | length) == 1 then
+        ($matches[0].expected_action // null)
+      else
+        null
+      end;
+  def redacted_target($target):
     (($target // "") | sub("#.*$"; "")) as $without_fragment
     | if ($without_fragment | contains("?"))
       then ($without_fragment | sub("\\?.*$"; "")) + "?<redacted>"
@@ -888,10 +937,70 @@ proxy_summary() {
     | if $seconds == null then null else ($seconds * 1000) end;
   def indexed_events:
     to_entries | map({event_index: .key, event: .value});
-  def proof_outcome($action):
-    if ($action.header_value_mint_status // null) == "matched_session_value" then
-      "accepted"
+  def normalized_mint_audit($audit):
+    if $audit == null then
+      null
+    elif ($audit | type) != "object" then
+      "__invalid__"
+    else
+      {
+        header_name: ($audit.header_name // null),
+        kind: ($audit.kind // null),
+        prefix: ($audit.prefix // null)
+      }
+    end;
+  def normalized_contract_audit($event):
+    if ($event.bait_contract // null) == null then
+      null
     elif (
+      ($event.bait_contract.header_name // null) == null
+      and ($event.bait_contract.header_value_mint // null) == null
+    ) then
+      null
+    else
+      {
+        header_name: ($event.bait_contract.header_name // null),
+        kind: ($event.bait_contract.header_value_mint.kind // null),
+        prefix: ($event.bait_contract.header_value_mint.prefix // null)
+      }
+    end;
+  def mint_contract_status($event; $requires_action_status):
+    normalized_contract_audit($event) as $expected
+    | normalized_mint_audit($event.header_value_mint // null) as $observed
+    | if $expected == null then
+        if $observed == null and ($event.header_value_mint_status // null) == null then
+          "static_contract_satisfied"
+        else
+          "static_contract_mismatch"
+        end
+      elif $observed == "__invalid__" then
+        "mint_audit_invalid"
+      elif $observed != $expected then
+        "mint_audit_mismatch"
+      elif $requires_action_status != true then
+        "mint_contract_satisfied"
+      elif ($event.header_value_mint_status // null) == null then
+        "mint_status_missing"
+      elif ($event.header_value_mint_status // null) == "matched_session_value" then
+        "mint_contract_satisfied"
+      elif (
+        [
+          "expired_session_value",
+          "replay_seen",
+          "replay_state_capacity_exceeded",
+          "replay_state_unavailable",
+          "missing_session_value",
+          "malformed_session_value",
+          "session_value_mismatch"
+        ]
+        | index($event.header_value_mint_status)
+      ) != null then
+        "mint_status_rejected"
+      else
+        "mint_status_unknown"
+      end;
+  def proof_outcome($action):
+    if (
       [
         "expired_session_value",
         "replay_seen",
@@ -904,12 +1013,25 @@ proxy_summary() {
       | index($action.header_value_mint_status // "")
     ) != null then
       "rejected"
-    elif ($action.header_value_mint_status // null) != null then
-      "unknown"
-    elif ($action.header_value_mint // null) != null then
-      "unknown"
-    else
+    elif (mint_contract_status($action; true)) == "mint_contract_satisfied" then
       "accepted"
+    elif (mint_contract_status($action; true)) == "static_contract_satisfied" then
+      "accepted"
+    elif (mint_contract_status($action; true)) == "mint_status_rejected" then
+      "rejected"
+    else
+      "unknown"
+    end;
+  def observed_bait_class($event):
+    if ($event.kind.bait_class // null) == null then
+      null
+    elif (
+      ($event.kind.bait_class | type) == "string"
+      and ($event.kind.bait_class | length) > 0
+    ) then
+      $event.kind.bait_class
+    else
+      error("runtime bait event has invalid bait_class")
     end;
   def exposures:
     [
@@ -922,11 +1044,14 @@ proxy_summary() {
           observed_at_ms: event_observed_at_ms(.event),
           session_id: .event.session_id,
           bait_id: .event.kind.bait_id,
+          bait_class: observed_bait_class(.event),
           exposure_id: .event.kind.exposure_id,
           surface: redacted_target(.event.kind.surface),
           query_present: ((.event.kind.surface // "") | contains("?")),
-          header_value_mint: (.event.kind.header_value_mint // null)
+          header_value_mint: (.event.kind.header_value_mint // null),
+          bait_contract: bait_contract(.event)
         }
+        | .mint_contract_status = mint_contract_status(.; false)
     ];
   def actions:
     [
@@ -939,15 +1064,18 @@ proxy_summary() {
           observed_at_ms: event_observed_at_ms(.event),
           session_id: .event.session_id,
           bait_id: .event.kind.bait_id,
+          bait_class: observed_bait_class(.event),
           exposure_id: (.event.kind.exposure_id // null),
           method: .event.kind.method,
           path: redacted_target(.event.kind.path),
           query_present: ((.event.kind.path // "") | contains("?")),
           header_value_mint: (.event.kind.header_value_mint // null),
+          bait_contract: bait_contract(.event),
           header_value_mint_status: (
             .event.kind.header_value_mint_status // null
           )
         }
+        | .mint_contract_status = mint_contract_status(.; true)
         | .proof_outcome = proof_outcome(.)
     ];
   def controlled_reality_entries:
@@ -1001,59 +1129,202 @@ proxy_summary() {
             end
           )
       );
+  def exact_request_seen_matches($event; $requests; $path_field):
+    [
+      $requests[]
+      | select($event.request_id != null)
+      | select(.request_id == $event.request_id)
+      | select(.session_id == $event.session_id)
+      | select(.path == $event[$path_field])
+    ];
+  def prior_exact_request_seen_matches($event; $requests; $path_field):
+    [
+      exact_request_seen_matches($event; $requests; $path_field)[]
+      | select((.event_index // -1) < ($event.event_index // -1))
+    ];
+  def action_request_routing($action; $requests):
+    (
+      [
+        $requests[]
+        | select($action.request_id != null)
+        | select(.request_id == $action.request_id)
+        | select(.session_id == $action.session_id)
+      ]
+    ) as $request_matches
+    | (
+        [
+          $request_matches[]
+          | select(.method == $action.method)
+          | select(.path == $action.path)
+        ]
+      ) as $exact_matches
+    | (
+        [
+          $exact_matches[]
+          | select((.event_index // -1) < ($action.event_index // -1))
+        ]
+      ) as $prior_exact_matches
+    | {
+        request_seen_count: ($request_matches | length),
+        exact_request_seen_count: ($exact_matches | length),
+        prior_exact_request_seen_count: ($prior_exact_matches | length),
+        routing_decisions: ($exact_matches | map(.routing_decision) | unique),
+        protected_upstream_request_seen_count: (
+          $exact_matches
+          | map(select(.routing_decision == "protected_upstream"))
+          | length
+        ),
+        eidolon_owned_or_controlled_request_seen_count: (
+          $exact_matches
+          | map(
+              select(
+                .routing_decision == "eidolon_owned"
+                or .routing_decision == "controlled_reality"
+              )
+            )
+          | length
+        ),
+        boundary_satisfied: (
+          $action.request_id != null
+          and ($request_matches | length) == 1
+          and ($exact_matches | length) == 1
+          and ($prior_exact_matches | length) == 1
+          and (
+            $prior_exact_matches
+            | map(
+                select(
+                  .routing_decision == "eidolon_owned"
+                  or .routing_decision == "controlled_reality"
+                )
+              )
+            | length
+          ) == 1
+          and (
+            $prior_exact_matches
+            | map(select(.routing_decision == "protected_upstream"))
+            | length
+          ) == 0
+        )
+      };
+  def with_action_request_routing($actions; $requests):
+    $actions
+    | map(
+        . as $action
+        | .request_routing = action_request_routing($action; $requests)
+      );
   def confirm_actions($exposures; $requests):
     map(
       . as $action
       | . + {
           same_session_confirmed: (
             ($action.proof_outcome == "accepted")
-            and ($action.request_id != null)
+            and ($action.request_routing.boundary_satisfied == true)
             and ($action.exposure_id != null)
-            and any(
-              $requests[];
-              .request_id == $action.request_id
-              and .session_id == $action.session_id
-              and .method == $action.method
-            )
             and any(
               $exposures[];
               . as $exposure
               | $exposure.session_id == $action.session_id
               and $exposure.bait_id == $action.bait_id
+              and $exposure.bait_class == $action.bait_class
               and $exposure.exposure_id == $action.exposure_id
+              and (
+                normalized_mint_audit($exposure.header_value_mint)
+                == normalized_mint_audit($action.header_value_mint)
+              )
+              and ($exposure.mint_contract_status == $action.mint_contract_status)
+              and (
+                $action.mint_contract_status == "mint_contract_satisfied"
+                or $action.mint_contract_status == "static_contract_satisfied"
+              )
               and ($exposure.request_id != null)
               and (($exposure.event_index // -1) < ($action.event_index // -1))
-              and any(
-                $requests[];
-                .request_id == $exposure.request_id
-                and .session_id == $exposure.session_id
-              )
+              and (exact_request_seen_matches($exposure; $requests; "surface") | length) == 1
+              and (prior_exact_request_seen_matches($exposure; $requests; "surface") | length) == 1
             )
           )
         }
     );
+  def bait_action_routing_boundary($actions):
+    ($actions | map(select(.proof_outcome == "accepted"))) as $accepted
+    | {
+        accepted_action_count: ($accepted | length),
+        accepted_action_boundary_satisfied_count: (
+          $accepted
+          | map(select(.request_routing.boundary_satisfied == true))
+          | length
+        ),
+        protected_upstream_request_seen_count: (
+          $accepted
+          | map(.request_routing.protected_upstream_request_seen_count // 0)
+          | add // 0
+        ),
+        all_accepted_actions_boundary_satisfied: (
+          ($accepted | length) > 0
+          and all($accepted[]; .request_routing.boundary_satisfied == true)
+        )
+      };
   def bait_matrix($exposures; $actions):
-    ([ $exposures[].bait_id, $actions[].bait_id ] | unique) as $ids
+    ([
+      ($exposures[] | {bait_id, bait_class}),
+      ($actions[] | {bait_id, bait_class})
+    ] | unique) as $pairs
     | [
-        $ids[] as $bait_id
+        $pairs[] as $pair
         | {
-            bait_id: $bait_id,
+            bait_id: $pair.bait_id,
+            bait_class: $pair.bait_class,
             exposure_count: (
-              $exposures | map(select(.bait_id == $bait_id)) | length
+              $exposures
+              | map(
+                  select(
+                    .bait_id == $pair.bait_id
+                    and .bait_class == $pair.bait_class
+                  )
+                )
+              | length
             ),
             action_count: (
-              $actions | map(select(.bait_id == $bait_id)) | length
+              $actions
+              | map(
+                  select(
+                    .bait_id == $pair.bait_id
+                    and .bait_class == $pair.bait_class
+                  )
+                )
+              | length
             ),
             same_session_confirmed_action_count: (
               $actions
-              | map(select(.bait_id == $bait_id and .same_session_confirmed))
+              | map(
+                  select(
+                    .bait_id == $pair.bait_id
+                    and .bait_class == $pair.bait_class
+                    and .same_session_confirmed
+                  )
+                )
               | length
             ),
             surfaces: (
-              $exposures | map(select(.bait_id == $bait_id) | .surface) | unique
+              $exposures
+              | map(
+                  select(
+                    .bait_id == $pair.bait_id
+                    and .bait_class == $pair.bait_class
+                  )
+                  | .surface
+                )
+              | unique
             ),
             action_paths: (
-              $actions | map(select(.bait_id == $bait_id) | .path) | unique
+              $actions
+              | map(
+                  select(
+                    .bait_id == $pair.bait_id
+                    and .bait_class == $pair.bait_class
+                  )
+                  | .path
+                )
+              | unique
             )
           }
       ];
@@ -1062,6 +1333,7 @@ proxy_summary() {
   | (
       actions
       | with_request_query_presence(.; $request_paths)
+      | with_action_request_routing(.; $request_paths)
       | confirm_actions($bait_exposures; $request_paths)
     ) as $bait_actions
   | controlled_reality_entries as $controlled_reality_entries
@@ -1113,6 +1385,7 @@ proxy_summary() {
       controlled_reality_entries: $controlled_reality_entries,
       matrix: $bait_matrix
     },
+    bait_action_routing_boundary: bait_action_routing_boundary($bait_actions),
     request_paths: $request_paths
   }' "$proxy_log"
 }
@@ -1121,15 +1394,175 @@ direct_summary_file="$(tmp_json_file direct-summary)"
 eidolon_summary_file="$(tmp_json_file eidolon-summary)"
 proxy_events_file="$(tmp_json_file proxy-events)"
 runner_metadata_file="$(tmp_json_file runner-metadata)"
+private_bait_profile_file="$(tmp_json_file private-bait-profile)"
+derived_bait_profile_metadata_file="$(tmp_json_file derived-bait-profile-metadata)"
+public_bait_profile_metadata_file="$(tmp_json_file public-bait-profile-metadata)"
+sample_run_metadata_file="$(tmp_json_file sample-run-metadata)"
 run_summary direct > "$direct_summary_file"
 run_summary eidolon > "$eidolon_summary_file"
-proxy_summary > "$proxy_events_file"
 RUNNER_METADATA_FILE="$ARTIFACT_DIR/pwnkit-runner-metadata.json"
 if [[ -s "$RUNNER_METADATA_FILE" ]]; then
   cp "$RUNNER_METADATA_FILE" "$runner_metadata_file"
 else
   write_json_file "$runner_metadata_file" '{}'
 fi
+
+write_json_file "$derived_bait_profile_metadata_file" '{}'
+write_json_file "$public_bait_profile_metadata_file" '{}'
+write_json_file "$sample_run_metadata_file" '{}'
+
+PRIVATE_BAIT_PROFILE_FILE="$ARTIFACT_DIR/private/bait-profile.json"
+PRIVATE_BAIT_PROFILE_PRESENT=0
+PRIVATE_BAIT_PROFILE_SHA256=""
+if [[ -e "$PRIVATE_BAIT_PROFILE_FILE" ]]; then
+  if [[ ! -f "$PRIVATE_BAIT_PROFILE_FILE" || ! -s "$PRIVATE_BAIT_PROFILE_FILE" ]]; then
+    fail "private bait profile must be a nonempty regular file: $PRIVATE_BAIT_PROFILE_FILE"
+  fi
+  cp "$PRIVATE_BAIT_PROFILE_FILE" "$private_bait_profile_file"
+  PRIVATE_BAIT_PROFILE_SHA256="$(sha256_file "$private_bait_profile_file")"
+  if ! jq -e --arg sha256 "$PRIVATE_BAIT_PROFILE_SHA256" '
+    if (
+      type == "object"
+      and .schema_version == 1
+      and (.profile_id | type) == "string"
+      and (.profile_id | length) > 0
+      and (.baits | type) == "array"
+      and all(
+        .baits[];
+        (.id | type) == "string"
+        and (.id | length) > 0
+        and (.bait_class | type) == "string"
+        and (.bait_class | length) > 0
+      )
+      and (
+        [.baits[] | [.id, .bait_class]]
+        | length == (unique | length)
+      )
+    ) then
+      {
+        schema_version: 1,
+        profile_id: .profile_id,
+        sha256: $sha256,
+        baits: [
+          .baits[]
+          | {
+              bait_id: .id,
+              bait_class: .bait_class,
+              expected_action: (
+                if (.expected_action.header_value_mint // null) == null then
+                  null
+                else
+                  {
+                    header_name: (.expected_action.header_name // null),
+                    header_value_mint: {
+                      kind: .expected_action.header_value_mint.kind,
+                      prefix: .expected_action.header_value_mint.prefix
+                    }
+                  }
+                end
+              )
+            }
+        ]
+      }
+    else
+      error("invalid private bait profile")
+    end
+  ' "$private_bait_profile_file" > "$derived_bait_profile_metadata_file"; then
+    fail "malformed private bait profile: $PRIVATE_BAIT_PROFILE_FILE"
+  fi
+  PRIVATE_BAIT_PROFILE_PRESENT=1
+fi
+
+PUBLIC_BAIT_PROFILE_METADATA_FILE="$ARTIFACT_DIR/bait-profile-metadata.json"
+if [[ -e "$PUBLIC_BAIT_PROFILE_METADATA_FILE" ]]; then
+  if [[ ! -f "$PUBLIC_BAIT_PROFILE_METADATA_FILE" \
+    || ! -s "$PUBLIC_BAIT_PROFILE_METADATA_FILE" ]]; then
+    fail "public bait profile metadata must be a nonempty regular file: $PUBLIC_BAIT_PROFILE_METADATA_FILE"
+  fi
+  cp "$PUBLIC_BAIT_PROFILE_METADATA_FILE" "$public_bait_profile_metadata_file"
+  if ! jq -e '
+    type == "object"
+    and (keys | sort) == ["baits", "profile_id", "schema_version", "sha256"]
+    and .schema_version == 1
+    and (.profile_id | type) == "string"
+    and (.profile_id | length) > 0
+    and (.sha256 | type) == "string"
+    and (.sha256 | test("^[0-9a-fA-F]{64}$"))
+    and (.baits | type) == "array"
+    and all(
+      .baits[];
+      type == "object"
+      and (keys | sort) == ["bait_class", "bait_id"]
+      and (.bait_id | type) == "string"
+      and (.bait_id | length) > 0
+      and (.bait_class | type) == "string"
+      and (.bait_class | length) > 0
+    )
+  ' "$public_bait_profile_metadata_file" >/dev/null; then
+    fail "malformed public bait profile metadata: $PUBLIC_BAIT_PROFILE_METADATA_FILE"
+  fi
+  if [[ "$PRIVATE_BAIT_PROFILE_PRESENT" -eq 1 ]] \
+    && ! jq -e --slurpfile derived "$derived_bait_profile_metadata_file" '
+      . == (
+        $derived[0]
+        | {
+            schema_version,
+            profile_id,
+            sha256,
+            baits: [
+              .baits[]
+              | {
+                  bait_id,
+                  bait_class
+                }
+            ]
+          }
+      )
+    ' "$public_bait_profile_metadata_file" >/dev/null; then
+    fail "public bait profile metadata does not match the private profile snapshot"
+  fi
+fi
+
+SAMPLE_RUN_METADATA_FILE="$ARTIFACT_DIR/sample-run-metadata.json"
+if [[ -e "$SAMPLE_RUN_METADATA_FILE" ]]; then
+  if [[ ! -f "$SAMPLE_RUN_METADATA_FILE" || ! -s "$SAMPLE_RUN_METADATA_FILE" ]]; then
+    fail "sample run metadata must be a nonempty regular file: $SAMPLE_RUN_METADATA_FILE"
+  fi
+  cp "$SAMPLE_RUN_METADATA_FILE" "$sample_run_metadata_file"
+  if ! jq -e '
+    type == "object"
+    and .schema_version == 1
+    and .run_kind == "m3_pwnkit_sample_run"
+    and (.execution_id | type) == "string"
+    and (.execution_id | length) > 0
+    and (.execution_id | length) <= 128
+    and (.execution_id | test("^[A-Za-z0-9][A-Za-z0-9._:-]*$"))
+    and (
+      (.profile_sha256 // null) == null
+      or (
+        (.profile_sha256 | type) == "string"
+        and (.profile_sha256 | test("^[0-9a-fA-F]{64}$"))
+      )
+    )
+  ' "$sample_run_metadata_file" >/dev/null; then
+    fail "malformed sample run metadata: $SAMPLE_RUN_METADATA_FILE"
+  fi
+  SAMPLE_RUN_BAIT_PROFILE_SHA256="$(
+    jq -r '.profile_sha256 // empty' "$sample_run_metadata_file"
+  )"
+  if [[ "$PRIVATE_BAIT_PROFILE_PRESENT" -eq 1 \
+    && "$SAMPLE_RUN_BAIT_PROFILE_SHA256" != "$PRIVATE_BAIT_PROFILE_SHA256" ]]; then
+    fail "sample run metadata bait profile digest does not match the private profile snapshot"
+  fi
+fi
+
+PROXY_EVENT_LOG_FILE="$ARTIFACT_DIR/proxy-events.jsonl"
+PROXY_EVENTS_CANONICAL_SHA256=""
+if [[ -s "$PROXY_EVENT_LOG_FILE" ]]; then
+  PROXY_EVENTS_CANONICAL_SHA256="$(sha256_jsonl "$PROXY_EVENT_LOG_FILE")"
+fi
+proxy_summary > "$proxy_events_file"
+
 PINNED_SESSION_ID=""
 PINNED_SESSION_FILE="$ARTIFACT_DIR/pinned-eidolon-session-id.txt"
 if [[ -s "$PINNED_SESSION_FILE" ]]; then
@@ -1139,15 +1572,157 @@ fi
 jq -n \
   --arg artifact_dir "$ARTIFACT_DIR" \
   --arg pinned_session_id "$PINNED_SESSION_ID" \
+  --arg proxy_events_canonical_sha256 "$PROXY_EVENTS_CANONICAL_SHA256" \
   --slurpfile direct_json "$direct_summary_file" \
   --slurpfile eidolon_json "$eidolon_summary_file" \
   --slurpfile proxy_json "$proxy_events_file" \
   --slurpfile runner_json "$runner_metadata_file" \
+  --slurpfile bait_profile_json "$derived_bait_profile_metadata_file" \
+  --slurpfile sample_run_json "$sample_run_metadata_file" \
   '($direct_json[0] // {}) as $direct
    | ($eidolon_json[0] // {}) as $eidolon
-   | ($proxy_json[0] // {}) as $proxy
+   | ($proxy_json[0] // {}) as $raw_proxy
    | ($runner_json[0] // {}) as $runner
-   | def unique_paths($run): ($run.requested_paths | map(.path) | unique);
+   | ($bait_profile_json[0] // {}) as $bait_profile_metadata
+   | ($sample_run_json[0] // {}) as $sample_run_metadata
+   | def bait_binding($bait_id; $bait_class):
+       (
+         [
+           ($bait_profile_metadata.baits // [])[]?
+           | select(.bait_id == $bait_id and .bait_class == $bait_class)
+         ]
+       ) as $bait
+       | if $bait_class == null or ($bait | length) != 1 then
+           {
+             profile_id: null,
+             profile_sha256: null
+           }
+         else
+           {
+             profile_id: ($bait_profile_metadata.profile_id // null),
+             profile_sha256: ($bait_profile_metadata.sha256 // null)
+           }
+         end;
+   def enrich_bait_matrix($matrix):
+     $matrix
+     | map(
+         . as $entry
+         | $entry + bait_binding($entry.bait_id; $entry.bait_class)
+       );
+   ($raw_proxy
+    | .bait_events.matrix = enrich_bait_matrix(.bait_events.matrix // [])) as $proxy
+   | def target_runtime_bait:
+       ($bait_profile_metadata.baits // []) as $profile_baits
+       | if (
+           ($bait_profile_metadata.profile_id // null) == null
+           or ($bait_profile_metadata.sha256 // null) == null
+           or ($profile_baits | length) != 1
+         ) then
+           {
+             profile_snapshot_present: false,
+             profile_id: null,
+             profile_sha256: null,
+             target_identification: null,
+             target_bait: null,
+             exposure_count: 0,
+             accepted_action_count: 0,
+             confirmed_action_count: 0,
+             controlled_reality_entry_count: 0,
+             routing_boundary_satisfied: false,
+             target_exposed: false,
+             accepted_same_session_action: false,
+             controlled_reality_entered: false,
+             run_satisfied: false
+           }
+         else
+           $profile_baits[0] as $target
+           | (
+               ($proxy.bait_events.exposures // [])
+               | map(
+                   select(
+                     .bait_id == $target.bait_id
+                     and .bait_class == $target.bait_class
+                     and .request_id != null
+                   )
+                 )
+             ) as $candidate_exposures
+           | (
+               [
+                 $candidate_exposures[] as $exposure
+                 | select(
+                     (
+                       [
+                         ($proxy.request_paths // [])[]
+                         | select(.request_id == $exposure.request_id)
+                         | select(.session_id == $exposure.session_id)
+                         | select(.path == $exposure.surface)
+                       ]
+                       | length
+                     ) == 1
+                   )
+                 | $exposure
+               ]
+             ) as $target_exposures
+           | (
+               ($proxy.bait_events.actions // [])
+               | map(
+                   select(
+                     .bait_id == $target.bait_id
+                     and .bait_class == $target.bait_class
+                     and .proof_outcome == "accepted"
+                   )
+                 )
+             ) as $accepted_actions
+           | (
+               $accepted_actions
+               | map(select(.same_session_confirmed == true))
+             ) as $confirmed_actions
+           | (
+               [
+                 ($proxy.bait_events.controlled_reality_entries // [])[] as $entry
+                 | select(
+                     any(
+                       $confirmed_actions[];
+                       .session_id == $entry.session_id
+                       and .request_id != null
+                       and $entry.request_id != null
+                       and .request_id == $entry.request_id
+                       and ((.event_index // -1) < ($entry.event_index // -1))
+                     )
+                   )
+                 | $entry
+               ]
+             ) as $controlled_entries
+           | (
+               ($accepted_actions | length) > 0
+               and all(
+                 $accepted_actions[];
+                 .request_routing.boundary_satisfied == true
+               )
+             ) as $routing_boundary_satisfied
+           | {
+               profile_snapshot_present: true,
+               profile_id: $bait_profile_metadata.profile_id,
+               profile_sha256: $bait_profile_metadata.sha256,
+               target_identification: "single_bait_private_profile",
+               target_bait: $target,
+               exposure_count: ($target_exposures | length),
+               accepted_action_count: ($accepted_actions | length),
+               confirmed_action_count: ($confirmed_actions | length),
+               controlled_reality_entry_count: ($controlled_entries | length),
+               routing_boundary_satisfied: $routing_boundary_satisfied,
+               target_exposed: (($target_exposures | length) > 0),
+               accepted_same_session_action: (($confirmed_actions | length) > 0),
+               controlled_reality_entered: (($controlled_entries | length) > 0),
+               run_satisfied: (
+                 ($target_exposures | length) > 0
+                 and ($confirmed_actions | length) > 0
+                 and ($controlled_entries | length) > 0
+                 and $routing_boundary_satisfied
+               )
+             }
+         end;
+   def unique_paths($run): ($run.requested_paths | map(.path) | unique);
    def target_without_fragment($target): (($target // "") | sub("#.*$"; ""));
    def path_without_query($path): (target_without_fragment($path) | sub("\\?.*$"; ""));
    def redacted_target($target):
@@ -1227,30 +1802,69 @@ jq -n \
          and ($clean_path | startswith($clean_start + "/"))
        );
    def bait_matrix($exposures; $actions):
-     ([ $exposures[].bait_id, $actions[].bait_id ] | unique) as $ids
+     ([
+       ($exposures[] | {bait_id, bait_class}),
+       ($actions[] | {bait_id, bait_class})
+     ] | unique) as $pairs
      | [
-         $ids[] as $bait_id
-         | {
-             bait_id: $bait_id,
+         $pairs[] as $pair
+         | ({
+             bait_id: $pair.bait_id,
+             bait_class: $pair.bait_class,
              exposure_count: (
-               $exposures | map(select(.bait_id == $bait_id)) | length
+               $exposures
+               | map(
+                   select(
+                     .bait_id == $pair.bait_id
+                     and .bait_class == $pair.bait_class
+                   )
+                 )
+               | length
              ),
              action_count: (
-               $actions | map(select(.bait_id == $bait_id)) | length
+               $actions
+               | map(
+                   select(
+                     .bait_id == $pair.bait_id
+                     and .bait_class == $pair.bait_class
+                   )
+                 )
+               | length
              ),
              same_session_confirmed_action_count: (
                $actions
-               | map(select(.same_session_confirmed))
-               | map(select(.bait_id == $bait_id))
+               | map(
+                   select(
+                     .bait_id == $pair.bait_id
+                     and .bait_class == $pair.bait_class
+                     and .same_session_confirmed
+                   )
+                 )
                | length
              ),
              surfaces: (
-               $exposures | map(select(.bait_id == $bait_id) | .surface) | unique
+               $exposures
+               | map(
+                   select(
+                     .bait_id == $pair.bait_id
+                     and .bait_class == $pair.bait_class
+                   )
+                   | .surface
+                 )
+               | unique
              ),
              action_paths: (
-               $actions | map(select(.bait_id == $bait_id) | .path) | unique
+               $actions
+               | map(
+                   select(
+                     .bait_id == $pair.bait_id
+                     and .bait_class == $pair.bait_class
+                   )
+                   | .path
+                 )
+               | unique
              )
-           }
+           } + bait_binding($pair.bait_id; $pair.bait_class))
        ];
    def same_pwnkit_coordinate($left; $right):
      ($left.pwnkit_artifact_seq // null) == ($right.pwnkit_artifact_seq // null)
@@ -1368,11 +1982,13 @@ jq -n \
        correlated_bait_actions[] as $action
        | select(
            ($action.proof_outcome // "unknown") == "accepted"
+           and ($action.request_routing.boundary_satisfied // false) == true
            and ($action.exposure_id != null)
            and any(
              correlated_bait_exposures[];
              .session_id == $action.session_id
              and .bait_id == $action.bait_id
+             and .bait_class == $action.bait_class
              and .exposure_id == $action.exposure_id
              and ((.event_index // -1) < ($action.event_index // -1))
            )
@@ -1614,6 +2230,8 @@ jq -n \
                  "proof_rejected"
                elif ($action.proof_outcome // "unknown") == "unknown" then
                  "proof_outcome_unknown"
+               elif ($action.request_routing.boundary_satisfied // false) != true then
+                 "routing_boundary_failed"
                elif $action.exposure_id == null then
                  "action_missing_exposure_id"
                elif ($proxy_matches | length) == 0 then
@@ -1693,6 +2311,8 @@ jq -n \
              "proof_rejected"
            elif any($unconfirmed_actions[]; .reason == "proof_outcome_unknown") then
              "proof_outcome_unknown"
+           elif any($unconfirmed_actions[]; .reason == "routing_boundary_failed") then
+             "routing_boundary_failed"
            elif any($unconfirmed_actions[]; .reason == "no_prior_proxy_exposure_matched_action") then
              "no_prior_proxy_exposure_matched_action"
            else
@@ -1728,6 +2348,8 @@ jq -n \
              )
            elif any($unconfirmed_actions[]; .reason == "action_missing_exposure_id") then
              ["why_action_request_lacked_exposure_id"]
+           elif any($unconfirmed_actions[]; .reason == "routing_boundary_failed") then
+             ["why_bait_action_request_crossed_or_lacked_the_owned_routing_boundary"]
            elif any($unconfirmed_actions[]; .reason == "no_prior_proxy_exposure_matched_action") then
              ["why_action_exposure_id_did_not_match_prior_proxy_exposure"]
            else
@@ -1833,6 +2455,13 @@ jq -n \
     run_kind: "m3_pwnkit_codex_comparison",
     boundary: "owned_loopback_lab",
     artifact_dir: $artifact_dir,
+    execution_id: ($sample_run_metadata.execution_id // null),
+    proxy_events_canonical_sha256: (
+      if $proxy_events_canonical_sha256 == ""
+      then null
+      else $proxy_events_canonical_sha256
+      end
+    ),
     runner: $runner,
     runs: {
       direct: $direct,
@@ -1859,6 +2488,8 @@ jq -n \
       bait_action_observed: ((correlated_bait_actions | length) > 0),
       same_session_confirmed_bait_action: ((correlated_confirmed_bait_actions | length) > 0),
       controlled_reality_entered: ((correlated_controlled_reality_entries | length) > 0),
+      bait_action_routing_boundary: ($proxy.bait_action_routing_boundary // null),
+      target_runtime_bait: target_runtime_bait,
       claim_level: claim_level,
       conclusion: status,
       finding_gap: finding_gap,
@@ -1888,7 +2519,7 @@ jq -n \
       "pwnkit source builds currently persist target-tool activity as pipeline_events.eventType=tool_artifact.",
       "target_interaction_observed requires one unambiguous pwnkit HTTP artifact to match an Eidolon proxy request by method, queryless path, and a 30 second timestamp window.",
       "bait_follow_rate counts bait-shaped actions whether or not the action preserved the original exposure session.",
-      "same_session_confirmed_bait_follow_rate requires an accepted proof, a prior matching exposure_id in the same session, and exact request_id linkage to the correlated proxy request.",
+      "same_session_confirmed_bait_follow_rate requires an accepted proof, a prior matching exposure_id in the same session, exact request_id linkage to the correlated proxy request, and an Eidolon-owned or controlled routing boundary.",
       "Later same-session requests, legacy events without request_id, rejected proofs, and redacted query-bearing requests remain visible but cannot establish a confirmed chain.",
       "One-to-one, queryless exact crawl start-path matches count as exposure evidence when pwnkit omitted a per-page request artifact; ambiguous or broader crawl matches remain diagnostic-only.",
       "Controlled-reality depth metrics are null here; derive them from Eidolon trace evidence for final M3 reporting.",

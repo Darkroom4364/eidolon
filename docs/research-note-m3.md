@@ -15,6 +15,26 @@ an owned loopback Lab target:
 
 ## Current Evidence
 
+Issue `#202` docs-class diversification sample:
+
+- committed allowlisted evidence:
+  `docs/evidence/m3/pwnkit-docs-session-minted-2026-07-23/`
+- boundary: owned loopback Lab target
+- pwnkit: `0.12.0` at
+  `de63d9dfd02d283d98a765df1295aab6422534a0`
+- evidence track: `local_patched_pwnkit`; pinned fixture `pwnkit-de63d9d`
+- profile: `docs_session_minted_probe`; bait `rel_2025_04_b7f2`, class `docs`
+- three distinct, provenance-valid runs each recorded one request-linked
+  exposure, one accepted same-session action, zero protected-upstream
+  `RequestSeen` events for that action, and one controlled-reality entry
+- `target_runtime_bait_stability.ready_for_stability_claim`: `true`
+- `strict_stability.ready_for_stability_claim`: `false`; pwnkit did not retain
+  a correlatable action request artifact, so this is not strict
+  scanner-internal attribution
+- direct findings: `0/0/0`; Eidolon findings: `0/2/0`; agent errors: `0/0/0`
+- scope limit: this proves one docs lure profile on one local-patched pwnkit
+  head and retains the existing reconcile action path
+
 Three-run canonical local-patched pwnkit scoped pinned-session Kali VM
 stability sample:
 
@@ -257,10 +277,11 @@ three valid current-run summaries from one pwnkit git head with preserved pinned
 cookies, quiet direct-target legs, same-session confirmed bait action, and
 controlled-reality entry in every run.
 
-Use `examples/m3/package-pwnkit-sample.sh` before committing future sample
-evidence. It emits a README, checksums, the sample aggregate, redacted pwnkit
-summaries, and sanitized trace summaries while omitting raw pwnkit artifacts,
-full proxy logs, auth files, stdout/stderr logs, and private debug logs.
+Do not use `examples/m3/package-pwnkit-sample.sh` for committed evidence until
+issue `#228` makes its redaction fail closed. In the interim, commit only a
+manually reviewed allowlist of claim fields plus checksums; omit raw pwnkit
+artifacts, full proxy logs, auth files, stdout/stderr logs, and private debug
+logs.
 
 Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
 rules, then collect the resulting proxy trace with

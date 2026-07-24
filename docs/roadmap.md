@@ -211,6 +211,10 @@ Current status:
   `strict_stability.ready_for_stability_claim: true`
 - the current canonical evidence track is `local_patched_pwnkit`; the May 31
   upstream-current sample remains the historical unpatched baseline
+- issue `#202` adds a separate `3/3` target-runtime proof for one session-minted
+  `docs` profile at
+  `docs/evidence/m3/pwnkit-docs-session-minted-2026-07-23/`; strict
+  pwnkit-internal attribution remains false for that sample
 
 Issues:
 
@@ -218,7 +222,10 @@ Issues:
 2. Produce internal uniqueness report with metrics table - initial report exists in `docs/research-report-m3.md`
 3. Identify bait classes that actually influence agent plans - initial class decisions are in the internal report
 4. Keep upstream-current drift checks separate from the canonical local-patched M3 fixture, and decide whether further parity work is worth the churn
-5. Decide go/no-go criteria for adaptive bait policy - current posture is no-go for automation until broader samples show stable class signal beyond the current `open_api` action path
+5. Decide go/no-go criteria for adaptive bait policy - current posture remains
+   no-go for automation; issue `#202` broadens stable target-runtime action
+   proof from `open_api` to one `docs` lure profile, but one profile using the
+   existing reconcile action path does not establish general class stability
 
 ## M4 Edge/CDN Integration
 

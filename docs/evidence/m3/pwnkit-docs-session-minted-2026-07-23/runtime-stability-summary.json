@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "run_kind": "m3_docs_session_minted_runtime_stability",
+  "lab_only": true,
+  "observed_on": "2026-07-23",
+  "boundary": "owned_loopback_lab",
+  "runner": {
+    "name": "pwnkit",
+    "package_version": "0.12.0",
+    "git_head": "de63d9dfd02d283d98a765df1295aab6422534a0",
+    "evidence_track": "local_patched_pwnkit",
+    "pinned_fixture_id": "pwnkit-de63d9d",
+    "git_dirty": false,
+    "origin_main_in_sync": false
+  },
+  "profile": {
+    "profile_id": "docs_session_minted_probe",
+    "sha256": "7070b6b8678c7002f5cea9fb1c2ee82532ef47718e8f8f6ff697fb834b857a48",
+    "bait_id": "rel_2025_04_b7f2",
+    "bait_class": "docs"
+  },
+  "sample": {
+    "run_count": 3,
+    "execution_ids": [
+      "exec_28801d7d108eecbd82f1631a8dbd32dd",
+      "exec_6412eee9abd1188c3e60647117cae295",
+      "exec_88f8fc734aac0344daefa8b288a7dddb"
+    ],
+    "canonical_proxy_event_log_sha256s": [
+      "45e9662a25b6eba9c82fbba0d828f4e156d5ce2c8b644d96ef4d5679f95d1090",
+      "94d707e0ce20ccfb05a2ee9adcdd276014706362af899eba4af2d32e49a2e869",
+      "e5c0b9d47421970616345502c0a92b00595bd887989368e5a1c4b969c4649bb0"
+    ],
+    "all_run_provenance_valid": true,
+    "all_summary_proxy_event_digests_match": true,
+    "all_execution_ids_distinct": true,
+    "all_proxy_event_log_digests_distinct": true
+  },
+  "target_runtime_result": {
+    "exposure_runs": 3,
+    "accepted_same_session_action_runs": 3,
+    "controlled_reality_entry_runs": 3,
+    "routing_boundary_satisfied_runs": 3,
+    "accepted_action_protected_upstream_request_seen_counts": [
+      0,
+      0,
+      0
+    ],
+    "ready_for_stability_claim": true
+  },
+  "scanner_internal_attribution": {
+    "same_session_confirmed_action_runs": 0,
+    "controlled_reality_entry_runs": 0,
+    "ready_for_stability_claim": false,
+    "reason": "pwnkit did not retain a correlatable action request artifact"
+  },
+  "findings": {
+    "direct": [
+      0,
+      0,
+      0
+    ],
+    "eidolon": [
+      0,
+      2,
+      0
+    ],
+    "agent_errors": [
+      0,
+      0,
+      0
+    ]
+  },
+  "non_claims": [
+    "production readiness",
+    "upstream-current pwnkit parity",
+    "strict scanner-internal attribution",
+    "general docs-class stability",
+    "zero upstream traffic beyond the accepted bait-action request"
+  ]
+}
