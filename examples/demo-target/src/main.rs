@@ -142,14 +142,16 @@ fn audit_protected_upstream_probe(request: &Request) -> io::Result<()> {
 }
 
 fn protected_upstream_probe_audit_event(request: &Request) -> Option<Value> {
-    if request.method != "POST" || request.path != "/api/v2/import/reconcile" {
-        return None;
-    }
+    let route = match (request.method.as_str(), request.path.as_str()) {
+        ("POST", "/api/v2/import/reconcile") => "api_v2_import_reconcile",
+        ("POST", "/api/v1/imports") => "api_v1_imports",
+        _ => return None,
+    };
 
     let mut event = serde_json::json!({
         "event": "protected_upstream_probe_observed",
         "method": "POST",
-        "route": "api_v2_import_reconcile",
+        "route": route,
     });
     if let Some(probe_id) = protected_upstream_probe_id(request) {
         event["probe_id"] = Value::String(probe_id.to_string());
@@ -839,6 +841,22 @@ mod tests {
     }
 
     #[test]
+    fn shield_lab_probe_audits_the_protected_import_write_route() {
+        let request = Request::for_test("POST", "/api/v1/imports")
+            .with_header("x-shield-lab-probe", "shield-probe-escape-a1b2c3d4");
+
+        assert_eq!(
+            protected_upstream_probe_audit_event(&request),
+            Some(serde_json::json!({
+                "event": "protected_upstream_probe_observed",
+                "method": "POST",
+                "probe_id": "shield-probe-escape-a1b2c3d4",
+                "route": "api_v1_imports",
+            }))
+        );
+    }
+
+    #[test]
     fn shield_lab_probe_audit_rejects_untrusted_header_values() {
         let invalid_values = [
             "",
@@ -872,7 +890,7 @@ mod tests {
         let valid_probe_id = "shield-probe-20260724-a1b2c3d4";
         let wrong_method = Request::for_test("GET", "/api/v2/import/reconcile")
             .with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id);
-        let wrong_path = Request::for_test("POST", "/api/v1/imports")
+        let wrong_path = Request::for_test("POST", "/api/v1/projects")
             .with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id);
 
         for request in [wrong_method, wrong_path] {

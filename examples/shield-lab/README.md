@@ -64,6 +64,7 @@ Keep out of the private repo:
   controlled-reality-kill-switch-kind.sh
   smoke-controlled-reality-isolation-kind.sh
   smoke-controlled-reality-outage-kind.sh
+  smoke-controlled-reality-escape-kind.sh
   status-orbstack.sh
   metrics-orbstack.sh
   logs-orbstack.sh
@@ -247,6 +248,13 @@ unavailable and sends no protected write-shaped request to the owned target:
 
 ```sh
 examples/shield-lab/smoke-controlled-reality-outage-kind.sh
+```
+
+Prove repeated POST requests outside the controlled branch stay synthetic,
+become blocked, and send zero writes to either owned-target replica:
+
+```sh
+examples/shield-lab/smoke-controlled-reality-escape-kind.sh
 ```
 
 Inspect, disable, or restore every kind renderer replica through the

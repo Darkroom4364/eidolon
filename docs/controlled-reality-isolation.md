@@ -59,6 +59,14 @@ the drained state. A fresh same-session minted action then returned the fixed
 Eidolon-owned `503` with no local fallback and produced zero protected-target
 reconcile requests. Enable restored one available renderer replica and endpoint.
 
+On 2026-07-24,
+`examples/shield-lab/smoke-controlled-reality-escape-kind.sh` also passed. It
+baselined a direct protected `POST /api/v1/imports`, entered controlled reality,
+then repeated that POST through the contained session. The first attempt was a
+renderer-audited synthetic `404`; the second moved the session to blocked and
+returned an Eidolon-owned `403`. The audit covered both owned-target replicas
+and observed zero escape requests after a quiet period.
+
 The owned demo target is stateless. This proves zero protected write-shaped
 request arrival, not the absence of a storage mutation in a stateful target.
 The backend failure reason currently remains in the debug audit rather than a
@@ -134,9 +142,7 @@ The enforced kind network boundary is now proven. Issue `#176` still requires:
 1. Live-test worker, audit, and replay-cache saturation; expose drop and
    saturation counters to operators.
 2. Define restart and multi-replica replay behavior before allowing stateful
-    rendering.
-3. Live-test controlled-branch escape attempts and prove they produce zero
-   protected write-shaped requests.
+   rendering.
 
 ## Proxy integration contract
 
@@ -161,7 +167,6 @@ Issue `#176` stays open until:
   state
 - quotas are live-tested
 - boundary violations are auditable
-- escape tests prove zero protected writes
 
 The standalone renderer is a prerequisite for that work, not proof that the
 work is complete.
