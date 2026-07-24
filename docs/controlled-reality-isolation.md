@@ -149,7 +149,8 @@ supplied request ID.
 
 ## Deployment status
 
-The local profiles still cannot support an honest hard-isolation claim:
+Deployment claims differ by profile. OrbStack remains a behavioral harness;
+the pinned kind/Calico path carries the local hard-isolation proof:
 
 - the OrbStack deploy and status paths do not verify NetworkPolicy
   enforcement; the local validation node inspected on 2026-07-24 was started
@@ -160,17 +161,16 @@ The local profiles still cannot support an honest hard-isolation claim:
   deploys the remote renderer without NodePorts
 - the checked-in kind smoke now proves the active renderer path, paired
   allow/deny behavior, and request/pod-correlated denied-flow evidence
-- this proof does not cover managed-cluster networking, host compromise,
-  saturation, restart, or multi-replica behavior
+- the capacity smoke proves bounded single-replica overload behavior
+- these proofs do not cover managed-cluster networking, host compromise,
+  restart continuity, or multi-replica aggregation
 
-## Remaining deployment slice
+## Stateful renderer guardrail
 
-The enforced kind network boundary is now proven. Issue `#176` still requires:
-
-1. Live-test worker, audit, and replay-cache saturation; expose drop and
-   saturation counters to operators.
-2. Define restart and multi-replica replay behavior before allowing stateful
-   rendering.
+The renderer is deliberately stateless. Restart and multi-replica replay
+semantics must be defined and live-tested before synthetic application state
+or more than one renderer replica is allowed. That future work is not required
+for the current stateless, single-replica isolation claim.
 
 ## Proxy integration contract
 
@@ -186,15 +186,13 @@ Remote proxy integration preserves these failure rules:
 - policy, evidence interaction, durable response expectations, headers, cache
   policy, and artifact digest remain proxy-owned
 
-## Remaining acceptance work
+## Acceptance status
 
-Issue `#176` stays open until:
-
-- the active controlled-reality response path crosses the enforced boundary
-- synthetic application state is isolated from protected and proxy enforcement
-  state
-- quotas are live-tested
-- boundary violations are auditable
-
-The standalone renderer is a prerequisite for that work, not proof that the
-work is complete.
+The checked-in kind path now covers issue `#176`'s isolation acceptance
+criteria: the active response path crosses the authenticated process boundary,
+the stateless renderer has no protected state or upstream connector, Calico
+enforces default-deny egress, quotas are live-tested, the operator kill switch
+is explicit, and escape attempts and saturation are auditable. Managed-cluster
+portability, host isolation, stateful restart semantics, and multi-replica
+aggregation remain separate hardening work rather than claims of this lab
+proof.
