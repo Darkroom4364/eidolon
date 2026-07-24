@@ -277,11 +277,12 @@ three valid current-run summaries from one pwnkit git head with preserved pinned
 cookies, quiet direct-target legs, same-session confirmed bait action, and
 controlled-reality entry in every run.
 
-Do not use `examples/m3/package-pwnkit-sample.sh` for committed evidence until
-issue `#228` makes its redaction fail closed. In the interim, commit only a
-manually reviewed allowlist of claim fields plus checksums; omit raw pwnkit
-artifacts, full proxy logs, auth files, stdout/stderr logs, and private debug
-logs.
+Use `examples/m3/package-pwnkit-sample.sh` for committed evidence. It
+reconstructs public output from typed allowlists, omits unknown fields, and
+fails before creating a bundle when a retained value is malformed. Continue
+to review the result before committing it: the packager and its checksums
+protect disclosure boundaries and byte integrity, not the semantic truth of
+the retained claims.
 
 Use `examples/m3/agent-replay-probe.md` for the blind prompt and contamination
 rules, then collect the resulting proxy trace with

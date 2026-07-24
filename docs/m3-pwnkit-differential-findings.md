@@ -222,10 +222,12 @@ examples/m3/package-pwnkit-sample.sh \
   docs/evidence/m3/pwnkit-sample-YYYY-MM-DD
 ```
 
-Review the generated README and redacted JSON before committing the bundle.
-Committed bundles must not contain local source artifact directories, pwnkit
-runner command paths, generated scope-file paths, raw pwnkit artifacts, or
-private debug logs.
+The packager reconstructs public JSON from typed allowlists and fails before
+creating the bundle when a retained field has an invalid type. Review the
+generated README and JSON before committing it. Committed bundles must not
+contain local source artifact directories, pwnkit runner command paths,
+generated scope-file paths, raw pwnkit artifacts, or private debug logs.
+Checksums prove byte integrity, not semantic truth.
 
 For the promotion investigation, run the seed bait-profile matrix after the
 standard sample path is healthy:
@@ -251,8 +253,10 @@ examples/m3/package-pwnkit-promotion-matrix.sh \
   docs/evidence/m3/pwnkit-promotion-matrix-YYYY-MM-DD
 ```
 
-Review the generated README, redacted matrix summary, per-variant redacted
-sample bundles, and checksums before committing the bundle.
+Review the generated README, allowlisted matrix summary, per-variant sample
+bundles, and checksums before committing the bundle. Matrix metadata is
+validated before export, and invalid retained values fail before the output is
+created. Checksums prove byte integrity, not semantic truth.
 
 ## Collector Diagnostics
 
