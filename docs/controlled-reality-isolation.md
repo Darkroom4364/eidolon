@@ -65,7 +65,9 @@ baselined a direct protected `POST /api/v1/imports`, entered controlled reality,
 then repeated that POST through the contained session. The first attempt was a
 renderer-audited synthetic `404`; the second moved the session to blocked and
 returned an Eidolon-owned `403`. The audit covered both owned-target replicas
-and observed zero escape requests after a quiet period.
+after verifying they were the proxy upstream, baselined each replica directly,
+and observed zero escape requests after a quiet period. The target audit
+classifies all standard HTTP write methods without recording arbitrary paths.
 
 The owned demo target is stateless. This proves zero protected write-shaped
 request arrival, not the absence of a storage mutation in a stateful target.
