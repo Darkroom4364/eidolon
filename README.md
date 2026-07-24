@@ -166,6 +166,9 @@ The repository already includes:
   softening
 - an OrbStack shield-lab deployment with live status, evidence export,
   edge-decision export, trusted-ingress smoke checks, and Kali VM validation
+- an authenticated standalone controlled-reality renderer foundation that is
+  intentionally not wired into the active proxy or unverified cluster
+  profiles yet
 
 The `#213` review strengthened the merged baseline through fail-closed
 bait-action routing, correct evidence classification, protected session
@@ -175,6 +178,10 @@ claim.
 
 For the recommended work order and review standards, see
 [docs/engineering-operating-policy.md](docs/engineering-operating-policy.md).
+
+For the controlled-reality process boundary, known cluster isolation blockers,
+and remaining `#176` work, see
+[docs/controlled-reality-isolation.md](docs/controlled-reality-isolation.md).
 
 For the end-state definition, see [docs/completed-project.md](docs/completed-project.md).
 
