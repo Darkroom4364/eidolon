@@ -8,6 +8,113 @@ new_temp_dir() {
   mktemp -d "${TMPDIR:-/tmp}/eidolon-m3-pwnkit-package-test.XXXXXX"
 }
 
+rewrite_json() {
+  local path="$1"
+  local filter="$2"
+  local temp_file="${path}.tmp"
+
+  jq "$filter" "$path" > "$temp_file"
+  mv "$temp_file" "$path"
+}
+
+inject_nested_sentinels() {
+  local sample_dir="$1"
+  local path
+  local filter='
+    walk(
+      if type == "object" then
+        . + {
+          unexpected_nested_secret: "EIDOLON_SENTINEL_SECRET_228",
+          headers: {authorization: "EIDOLON_SENTINEL_SECRET_228"},
+          cookies: {session: "EIDOLON_SENTINEL_SECRET_228"},
+          body: "EIDOLON_SENTINEL_SECRET_228",
+          authorization: "EIDOLON_SENTINEL_SECRET_228",
+          token: "EIDOLON_SENTINEL_SECRET_228",
+          url: "https://sentinel.invalid/?token=EIDOLON_SENTINEL_SECRET_228"
+        }
+      else
+        .
+      end
+    )
+  '
+
+  for path in \
+    "$sample_dir/pwnkit-stability-sample.json" \
+    "$sample_dir/run-1/pwnkit-summary.json" \
+    "$sample_dir/run-1/agent-replay-trace-summary.json"; do
+    rewrite_json "$path" "$filter"
+  done
+}
+
+add_query_fragment_sentinels() {
+  local sample_dir="$1"
+
+  rewrite_json "$sample_dir/pwnkit-stability-sample.json" '
+    .no_signal_diagnostics.proxy_path_counts[0].path = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .artifacts[0].eidolon_proxy.request_path_counts[0].value = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .artifacts[0].pwnkit_events.eidolon.crawl_artifacts[0].start_path = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .artifacts[0].target_evidence_diagnostics.eidolon.crawl_start_paths[0] = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .artifacts[0].strict_correlation_gap.unconfirmed_actions[0].action_path = "/api/v2/import/reconcile?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .artifacts[0].strict_correlation_gap.unconfirmed_actions[0].matching_proxy_exposure_surfaces[0] = "/docs/legacy-import?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .artifacts[0].strict_correlation_gap.unconfirmed_actions[0].matching_proxy_exposure_crawl_start_paths[0] = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .artifacts[0].strict_correlation_gap.crawl_artifact_start_paths[0] = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .artifacts[0].strict_correlation_gap.matching_proxy_exposure_crawl_start_paths[0] = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+  '
+  rewrite_json "$sample_dir/run-1/pwnkit-summary.json" '
+    .runs.eidolon.pwnkit_events.crawl_artifacts[0].start_path = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .runs.eidolon.target_evidence_diagnostics.crawl_start_paths[0] = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .comparison.correlated_bait_events.matrix[0].surfaces[0] = "/openapi.json?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .comparison.correlated_bait_events.matrix[0].action_paths[0] = "/api/v2/import/reconcile?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .comparison.strict_correlation_gap.unconfirmed_actions[0].action_path = "/api/v2/import/reconcile?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .comparison.strict_correlation_gap.unconfirmed_actions[0].matching_proxy_exposure_surfaces[0] = "/docs/legacy-import?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .comparison.strict_correlation_gap.unconfirmed_actions[0].matching_proxy_exposure_crawl_start_paths[0] = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .comparison.strict_correlation_gap.crawl_artifact_start_paths[0] = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .comparison.strict_correlation_gap.matching_proxy_exposure_crawl_start_paths[0] = "/docs?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+  '
+  rewrite_json "$sample_dir/run-1/agent-replay-trace-summary.json" '
+    .bait_events.exposures[0].surface = "/openapi.json?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .bait_events.actions[0].path = "/api/v2/import/reconcile?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+    | .bait_events.same_session_confirmed_actions[0].path = "/api/v2/import/reconcile?QUERY_VALUE_SENTINEL#FRAGMENT_VALUE_SENTINEL"
+  '
+}
+
+schema_digest() {
+  local path="$1"
+  local schema
+
+  schema="$(jq -cS '
+    [
+      paths as $value_path
+      | (getpath($value_path)) as $value
+      | if ($value | type) == "object" then
+          {
+            path: $value_path,
+            type: "object",
+            keys: ($value | keys)
+          }
+        elif ($value | type) == "array" then
+          {
+            path: $value_path,
+            type: "array",
+            length: ($value | length),
+            item_types: ($value | map(type))
+          }
+        else
+          {
+            path: $value_path,
+            type: ($value | type)
+          }
+        end
+    ]
+  ' "$path")"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s\n' "$schema" | sha256sum | awk '{print $1}'
+  else
+    printf '%s\n' "$schema" | shasum -a 256 | awk '{print $1}'
+  fi
+}
+
 write_fixture_sample() {
   local sample_dir="$1"
   local run_dir="$sample_dir/run-1"
@@ -50,7 +157,7 @@ write_fixture_sample() {
   "weakest_claim_level": "controlled_reality_entered",
   "strongest_claim_level": "controlled_reality_entered",
   "runner_git_heads": ["abc123"],
-  "runner_package_versions": ["v0.test"],
+  "runner_package_versions": ["0.0.0-test"],
   "runner_pwnkit_fixture_ids": ["pwnkit-v0.12.0-private"],
   "evidence_track_counts": [
     {"evidence_track": "upstream_current", "count": 1}
@@ -133,7 +240,7 @@ write_fixture_sample() {
       "present": true,
       "evidence_track": "upstream_current",
       "runner_git_head": "abc123",
-      "runner_package_version": "v0.test",
+      "runner_package_version": "0.0.0-test",
       "runner_git_dirty": false,
       "runner_origin_main_in_sync": true,
       "runner_pwnkit_fixture": {
@@ -358,7 +465,7 @@ JSON
       "entry_path": "/tmp/pwnkit/dist/pwnkit.js",
       "source_dir": "/tmp/pwnkit",
       "command_source": "fixture",
-      "package_version": "v0.test",
+      "package_version": "0.0.0-test",
       "evidence_track": "upstream_current",
       "git_head": "abc123",
       "git_head_short": "abc123",
@@ -662,20 +769,31 @@ test_packager_redacts_raw_artifacts_and_query_values() {
   sample_dir="$(new_temp_dir)"
   bundle_dir="$(new_temp_dir)/bundle"
   write_fixture_sample "$sample_dir"
+  add_query_fragment_sentinels "$sample_dir"
+  inject_nested_sentinels "$sample_dir"
 
   EIDOLON_M3_ALLOW_AGENT_ERRORS=1 "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null
 
-  [[ -f "$bundle_dir/README.md" ]]
-  [[ -f "$bundle_dir/SHA256SUMS" ]]
-  [[ -f "$bundle_dir/pwnkit-stability-sample.json" ]]
-  [[ -f "$bundle_dir/run-1/pwnkit-summary.redacted.json" ]]
-  [[ -f "$bundle_dir/run-1/agent-replay-trace-summary.json" ]]
+  [[ -f "$bundle_dir/README.md" ]] || return 1
+  [[ -f "$bundle_dir/SHA256SUMS" ]] || return 1
+  [[ -f "$bundle_dir/pwnkit-stability-sample.json" ]] || return 1
+  [[ -f "$bundle_dir/run-1/pwnkit-summary.redacted.json" ]] || return 1
+  [[ -f "$bundle_dir/run-1/agent-replay-trace-summary.json" ]] || return 1
 
-  ! find "$bundle_dir" -type f -name '*.db' | rg -q .
-  ! find "$bundle_dir" -type f -name '*.log' | rg -q .
-  ! find "$bundle_dir" -type f -path '*/private/*' | rg -q .
-  ! rg -q 'secret-token|direct-secret|secret-label|debug-secret|must-not-survive|raw warning' "$bundle_dir"
-  ! rg -q '/private/tmp|/tmp/pwnkit|node /tmp|eidolon-fixture' "$bundle_dir"
+  ! find "$bundle_dir" -type f -name '*.db' | rg -q . || return 1
+  ! find "$bundle_dir" -type f -name '*.log' | rg -q . || return 1
+  ! find "$bundle_dir" -type f -path '*/private/*' | rg -q . || return 1
+  ! rg -q 'secret-token|direct-secret|secret-label|debug-secret|must-not-survive|raw warning' "$bundle_dir" || return 1
+  ! rg -q 'EIDOLON_SENTINEL_SECRET_228' "$bundle_dir" || return 1
+  ! rg -q 'QUERY_VALUE_SENTINEL|FRAGMENT_VALUE_SENTINEL' "$bundle_dir" || return 1
+  ! rg -q '/private/tmp|/tmp/pwnkit|node /tmp|eidolon-fixture' "$bundle_dir" || return 1
+
+  [[ "$(schema_digest "$bundle_dir/pwnkit-stability-sample.json")" \
+    == "031dd74e3213a6c1f0720a52eb3494f5add32524a7964ee5d288ae2240eed7cf" ]] || return 1
+  [[ "$(schema_digest "$bundle_dir/run-1/pwnkit-summary.redacted.json")" \
+    == "fca23483971b0b85748078cee657370d998c16e6c2b342e5e5abb076ff341373" ]] || return 1
+  [[ "$(schema_digest "$bundle_dir/run-1/agent-replay-trace-summary.json")" \
+    == "f2c2cbd4de67018d4d122dc80fcd64892b432a4a6e5443a42200ca8302d8e5d7" ]] || return 1
 
   jq -e '
     .source_artifact_dir == "<source-artifact-path-omitted>"
@@ -687,7 +805,7 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .comparison.strict_correlation_gap.likely_cause == "matching_proxy_exposure_not_pwnkit_correlated"
     and .comparison.strict_correlation_gap.likely_missing_artifact_class == "crawl_page_request_artifact"
     and .comparison.strict_correlation_gap.matching_proxy_exposure_crawl_start_paths == ["/docs"]
-    and .comparison.strict_correlation_gap.unconfirmed_actions[0].action_path == "/api/v2/import/reconcile?token=<redacted>"
+    and .comparison.strict_correlation_gap.unconfirmed_actions[0].action_path == "/api/v2/import/reconcile"
     and .runs.eidolon.warning_count == 1
     and .runs.eidolon.final_json_finding_count == 0
     and .runs.eidolon.db_saved_finding_count == 1
@@ -711,11 +829,10 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and (.runner.pwnkit | has("command") | not)
     and (.runner.pwnkit | has("entry_path") | not)
     and (.runner.pwnkit | has("source_dir") | not)
-    and (.runner.pwnkit.scopes.eidolon | has("path") | not)
-    and (.runner.pwnkit.scopes.direct | has("path") | not)
+    and (.runner.pwnkit | has("scopes") | not)
     and .redaction.source_artifact_path_omitted == true
     and .redaction.runner_command_paths_omitted == true
-    and .redaction.pwnkit_scope_paths_omitted == true
+    and .redaction.pwnkit_scopes_omitted == true
     and .redaction.raw_requested_paths_omitted == true
   ' "$bundle_dir/run-1/pwnkit-summary.redacted.json" >/dev/null
 
@@ -723,6 +840,13 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     .artifact_dir == "<source-artifact-path-omitted>"
     and .bait_events.exposures[0].surface == "/openapi.json"
     and .bait_events.actions[0].path == "/api/v2/import/reconcile"
+    and (. | has("sessions") | not)
+    and (. | has("notes") | not)
+    and (.pinned_session | has("session_id") | not)
+    and (.bait_events.exposures[0] | has("session_id") | not)
+    and (.bait_events.exposures[0] | has("exposure_id") | not)
+    and (.bait_events.actions[0] | has("session_id") | not)
+    and (.bait_events.actions[0] | has("exposure_id") | not)
     and .redaction.private_debug_logs_omitted == true
     and .redaction.source_artifact_path_omitted == true
   ' "$bundle_dir/run-1/agent-replay-trace-summary.json" >/dev/null
@@ -767,7 +891,7 @@ test_packager_redacts_raw_artifacts_and_query_values() {
     and .artifacts[0].strict_correlation_gap.likely_cause == "matching_proxy_exposure_not_pwnkit_correlated"
     and .artifacts[0].strict_correlation_gap.likely_missing_artifact_class == "crawl_page_request_artifact"
     and .artifacts[0].strict_correlation_gap.matching_proxy_exposure_crawl_start_paths == ["/docs"]
-    and .artifacts[0].strict_correlation_gap.unconfirmed_actions[0].action_path == "/api/v2/import/reconcile?token=<redacted>"
+    and .artifacts[0].strict_correlation_gap.unconfirmed_actions[0].action_path == "/api/v2/import/reconcile"
     and .artifacts[0].pwnkit_events.eidolon.crawl_artifacts[0].start_path == "/docs"
     and .artifacts[0].target_evidence_diagnostics.eidolon.crawl_start_paths == ["/docs"]
     and .artifacts[0].trace_gap.strict_controlled_reality_without_eidolon_finding == true
@@ -797,7 +921,7 @@ test_packager_refuses_non_empty_bundle_dir() {
 
   output="$("$PACKAGER" "$sample_dir" "$bundle_dir" 2>&1)" || status="$?"
 
-  [[ "$status" -eq 2 ]]
+  [[ "$status" -eq 2 ]] || return 1
   rg -q 'bundle directory must be empty' <<<"$output"
 }
 
@@ -812,14 +936,351 @@ test_packager_rejects_agent_error_sample_by_default() {
 
   output="$("$PACKAGER" "$sample_dir" "$bundle_dir" 2>&1)" || status="$?"
 
-  [[ "$status" -eq 1 ]]
+  [[ "$status" -eq 1 ]] || return 1
   rg -q 'pwnkit agent errors detected in sample' <<<"$output"
   rg -q 'eidolon classes=codex_backend_api_error=1' <<<"$output"
-  ! rg -q 'secret-token|debug-secret|raw warning' <<<"$output"
+  ! rg -q 'secret-token|debug-secret|raw warning' <<<"$output" || return 1
+}
+
+test_packager_rejects_non_string_paths_atomically() {
+  local test_case
+  local cases=(
+    'sample|.no_signal_diagnostics.proxy_path_counts[0].path = {}'
+    'sample|.no_signal_diagnostics.proxy_path_counts[0].path = "//user:secret@internal.invalid/path?token=secret"'
+    'sample|.no_signal_diagnostics.proxy_path_counts[0].path = false | .no_signal_diagnostics.proxy_path_counts[0].value = "/docs"'
+    'sample|.artifacts[0].eidolon_proxy.request_path_counts[0].value = []'
+    'sample|.artifacts[0].pwnkit_events.eidolon.crawl_artifacts[0].start_path = 7'
+    'sample|.artifacts[0].target_evidence_diagnostics.eidolon.crawl_start_paths[0] = false'
+    'sample|.artifacts[0].strict_correlation_gap.unconfirmed_actions[0].action_path = {}'
+    'run|.runs.eidolon.pwnkit_events.crawl_artifacts[0].start_path = {}'
+    'run|.runs.eidolon.target_evidence_diagnostics.crawl_start_paths[0] = []'
+    'run|.comparison.correlated_bait_events.matrix[0].surfaces[0] = {}'
+    'run|.comparison.correlated_bait_events.matrix[0].action_paths[0] = 7'
+    'run|.comparison.strict_correlation_gap.unconfirmed_actions[0].action_path = false'
+    'trace|.bait_events.exposures[0].surface = {}'
+    'trace|.bait_events.actions[0].path = []'
+    'trace|.bait_events.same_session_confirmed_actions[0].path = 7'
+  )
+
+  for test_case in "${cases[@]}"; do
+    local sample_dir
+    local bundle_parent
+    local bundle_dir
+    local file_kind
+    local filter
+    local input_file
+    local status=0
+
+    sample_dir="$(new_temp_dir)"
+    bundle_parent="$(new_temp_dir)"
+    bundle_dir="$bundle_parent/bundle"
+    write_fixture_sample "$sample_dir"
+    IFS='|' read -r file_kind filter <<<"$test_case"
+    case "$file_kind" in
+      sample)
+        input_file="$sample_dir/pwnkit-stability-sample.json"
+        ;;
+      run)
+        input_file="$sample_dir/run-1/pwnkit-summary.json"
+        ;;
+      trace)
+        input_file="$sample_dir/run-1/agent-replay-trace-summary.json"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    rewrite_json "$input_file" "$filter"
+
+    EIDOLON_M3_ALLOW_AGENT_ERRORS=1 \
+      "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null 2>&1 \
+      || status="$?"
+
+    [[ "$status" -ne 0 ]] || return 1
+    [[ ! -e "$bundle_dir" ]] || return 1
+    ! find "$bundle_parent" -maxdepth 1 \
+      -name '.eidolon-pwnkit-bundle.*' | rg -q . || return 1
+  done
+}
+
+test_packager_rejects_invalid_json_streams_atomically() {
+  local test_case
+
+  for test_case in empty whitespace multiple malformed array wrong_type; do
+    local sample_dir
+    local bundle_parent
+    local bundle_dir
+    local trace_file
+    local status=0
+
+    sample_dir="$(new_temp_dir)"
+    bundle_parent="$(new_temp_dir)"
+    bundle_dir="$bundle_parent/bundle"
+    write_fixture_sample "$sample_dir"
+    trace_file="$sample_dir/run-1/agent-replay-trace-summary.json"
+
+    case "$test_case" in
+      empty)
+        : > "$trace_file"
+        ;;
+      whitespace)
+        printf '   \n' > "$trace_file"
+        ;;
+      multiple)
+        printf '{}\n{}\n' > "$trace_file"
+        ;;
+      malformed)
+        printf '{"schema_version":\n' > "$trace_file"
+        ;;
+      array)
+        printf '[]\n' > "$trace_file"
+        ;;
+      wrong_type)
+        rewrite_json \
+          "$sample_dir/pwnkit-stability-sample.json" \
+          '.counts = "not-an-object"'
+        ;;
+    esac
+
+    EIDOLON_M3_ALLOW_AGENT_ERRORS=1 \
+      "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null 2>&1 \
+      || status="$?"
+
+    [[ "$status" -ne 0 ]] || return 1
+    [[ ! -e "$bundle_dir" ]] || return 1
+    ! find "$bundle_parent" -maxdepth 1 \
+      -name '.eidolon-pwnkit-bundle.*' | rg -q . || return 1
+  done
+}
+
+test_packager_rejects_invalid_contract_constants_atomically() {
+  local test_case
+  local cases=(
+    'sample|.schema_version = 999'
+    'sample|.run_kind = "future_sample"'
+    'sample|.generated_at = "/private/tmp/secret"'
+    'sample|.runner_package_versions[0] = "/private/tmp/secret"'
+    'sample|.runner_package_versions[0] = "EIDOLON_PUBLIC_SECRET_228"'
+    'sample|.artifacts[0].runner_package_version = "EIDOLON_PUBLIC_SECRET_228"'
+    'sample|.artifacts[0].runner_pwnkit_fixture.id = "/private/tmp/secret"'
+    'sample|.artifacts[0].runner_pwnkit_fixture.id = "EIDOLON_PUBLIC_SECRET_228"'
+    'sample|.no_signal_diagnostics.eidolon_agent_error_class_counts[0].error_class = "EIDOLON_PUBLIC_SECRET_228"'
+    'run|.schema_version = 999'
+    'run|.runner.schema_version = 999'
+    'run|.runner.run_kind = "future_runner"'
+    'run|.runner.pwnkit.package_version = "/private/tmp/secret"'
+    'run|.runner.pwnkit.package_version = "EIDOLON_PUBLIC_SECRET_228"'
+    'trace|.schema_version = 999'
+    'trace|.boundary = "other_boundary"'
+  )
+
+  for test_case in "${cases[@]}"; do
+    local sample_dir
+    local bundle_parent
+    local bundle_dir
+    local file_kind
+    local filter
+    local input_file
+    local status=0
+
+    sample_dir="$(new_temp_dir)"
+    bundle_parent="$(new_temp_dir)"
+    bundle_dir="$bundle_parent/bundle"
+    write_fixture_sample "$sample_dir"
+    IFS='|' read -r file_kind filter <<<"$test_case"
+    case "$file_kind" in
+      sample)
+        input_file="$sample_dir/pwnkit-stability-sample.json"
+        ;;
+      run)
+        input_file="$sample_dir/run-1/pwnkit-summary.json"
+        ;;
+      trace)
+        input_file="$sample_dir/run-1/agent-replay-trace-summary.json"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+    rewrite_json "$input_file" "$filter"
+
+    EIDOLON_M3_ALLOW_AGENT_ERRORS=1 \
+      "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null 2>&1 \
+      || status="$?"
+
+    [[ "$status" -ne 0 ]] || return 1
+    [[ ! -e "$bundle_dir" ]] || return 1
+    ! find "$bundle_parent" -maxdepth 1 \
+      -name '.eidolon-pwnkit-bundle.*' | rg -q . || return 1
+  done
+}
+
+test_packager_rejects_unknown_health_error_class_without_leak() {
+  local sample_dir
+  local bundle_parent
+  local bundle_dir
+  local output
+  local status=0
+
+  sample_dir="$(new_temp_dir)"
+  bundle_parent="$(new_temp_dir)"
+  bundle_dir="$bundle_parent/bundle"
+  write_fixture_sample "$sample_dir"
+  rewrite_json \
+    "$sample_dir/pwnkit-stability-sample.json" \
+    '.no_signal_diagnostics.eidolon_agent_error_class_counts[0].error_class = "EIDOLON_HEALTH_SECRET_228"'
+
+  output="$("$PACKAGER" "$sample_dir" "$bundle_dir" 2>&1)" \
+    || status="$?"
+
+  [[ "$status" -eq 2 ]] || return 1
+  ! rg -q 'EIDOLON_HEALTH_SECRET_228' <<<"$output" || return 1
+  [[ ! -e "$bundle_dir" ]] || return 1
+  ! find "$bundle_parent" -maxdepth 1 \
+    -name '.eidolon-pwnkit-bundle.*' | rg -q . || return 1
+}
+
+test_packager_validates_before_health_output() {
+  local sample_dir
+  local bundle_parent
+  local bundle_dir
+  local output
+  local status=0
+
+  sample_dir="$(new_temp_dir)"
+  bundle_parent="$(new_temp_dir)"
+  bundle_dir="$bundle_parent/bundle"
+  write_fixture_sample "$sample_dir"
+  rewrite_json \
+    "$sample_dir/pwnkit-stability-sample.json" \
+    '.finding_reconciliation.final_json_counts_still_drive_finding_claims = false
+    | .finding_reconciliation.direct_final_json_finding_total = "EIDOLON_STDERR_SECRET_228"'
+
+  output="$("$PACKAGER" "$sample_dir" "$bundle_dir" 2>&1)" \
+    || status="$?"
+
+  [[ "$status" -eq 2 ]] || return 1
+  ! rg -q 'EIDOLON_STDERR_SECRET_228' <<<"$output" || return 1
+  [[ ! -e "$bundle_dir" ]] || return 1
+  ! find "$bundle_parent" -maxdepth 1 \
+    -name '.eidolon-pwnkit-bundle.*' | rg -q . || return 1
+}
+
+test_packager_uses_one_input_snapshot() {
+  local sample_dir
+  local bundle_dir
+  local fake_bin
+  local real_cp
+
+  sample_dir="$(new_temp_dir)"
+  bundle_dir="$(new_temp_dir)/bundle"
+  fake_bin="$(new_temp_dir)"
+  real_cp="$(command -v cp)"
+  write_fixture_sample "$sample_dir"
+
+  cat > "$fake_bin/cp" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+"$REAL_CP" "$@"
+source_path="${@: -2:1}"
+destination_path="${@: -1}"
+if [[ "$(basename "$source_path")" == "pwnkit-stability-sample.json" \
+  && "$destination_path" == *"/.source/pwnkit-stability-sample.json" ]]; then
+  jq '.schema_version = 999' "$source_path" > "$source_path.tmp"
+  mv "$source_path.tmp" "$source_path"
+fi
+SH
+  chmod +x "$fake_bin/cp"
+
+  EIDOLON_M3_ALLOW_AGENT_ERRORS=1 \
+    REAL_CP="$real_cp" \
+    PATH="$fake_bin:$PATH" \
+    "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null
+
+  jq -e '.schema_version == 999' \
+    "$sample_dir/pwnkit-stability-sample.json" >/dev/null
+  jq -e '.schema_version == 1' \
+    "$bundle_dir/pwnkit-stability-sample.json" >/dev/null
+}
+
+test_packager_rejects_noncanonical_run_names() {
+  local sample_dir
+  local bundle_dir
+  local status=0
+
+  sample_dir="$(new_temp_dir)"
+  bundle_dir="$(new_temp_dir)/bundle"
+  write_fixture_sample "$sample_dir"
+  mv "$sample_dir/run-1" "$sample_dir/run-DIRNAME-SECRET"
+
+  EIDOLON_M3_ALLOW_AGENT_ERRORS=1 \
+    "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null 2>&1 \
+    || status="$?"
+
+  [[ "$status" -eq 2 ]] || return 1
+  [[ ! -e "$bundle_dir" ]] || return 1
+}
+
+test_packager_rejects_unapproved_missing_reason_atomically() {
+  local sample_dir
+  local bundle_parent
+  local bundle_dir
+  local status=0
+
+  sample_dir="$(new_temp_dir)"
+  bundle_parent="$(new_temp_dir)"
+  bundle_dir="$bundle_parent/bundle"
+  write_fixture_sample "$sample_dir"
+  rewrite_json \
+    "$sample_dir/pwnkit-stability-sample.json" \
+    '.artifacts[0].missing_reason = "missing at /private/tmp/secret"'
+
+  EIDOLON_M3_ALLOW_AGENT_ERRORS=1 \
+    "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null 2>&1 \
+    || status="$?"
+
+  [[ "$status" -ne 0 ]] || return 1
+  [[ ! -e "$bundle_dir" ]] || return 1
+  ! find "$bundle_parent" -maxdepth 1 \
+    -name '.eidolon-pwnkit-bundle.*' | rg -q . || return 1
+}
+
+test_packager_discards_late_partial_bundle() {
+  local sample_dir
+  local bundle_parent
+  local bundle_dir
+  local status=0
+
+  sample_dir="$(new_temp_dir)"
+  bundle_parent="$(new_temp_dir)"
+  bundle_dir="$bundle_parent/bundle"
+  write_fixture_sample "$sample_dir"
+  cp -R "$sample_dir/run-1" "$sample_dir/run-2"
+  printf '{"schema_version":\n' \
+    > "$sample_dir/run-2/agent-replay-trace-summary.json"
+
+  EIDOLON_M3_ALLOW_AGENT_ERRORS=1 \
+    "$PACKAGER" "$sample_dir" "$bundle_dir" >/dev/null 2>&1 \
+    || status="$?"
+
+  [[ "$status" -ne 0 ]] || return 1
+  [[ ! -e "$bundle_dir" ]] || return 1
+  ! find "$bundle_parent" -maxdepth 1 \
+    -name '.eidolon-pwnkit-bundle.*' | rg -q . || return 1
 }
 
 test_packager_redacts_raw_artifacts_and_query_values
 test_packager_refuses_non_empty_bundle_dir
 test_packager_rejects_agent_error_sample_by_default
+test_packager_rejects_non_string_paths_atomically
+test_packager_rejects_invalid_json_streams_atomically
+test_packager_rejects_invalid_contract_constants_atomically
+test_packager_rejects_unknown_health_error_class_without_leak
+test_packager_validates_before_health_output
+test_packager_uses_one_input_snapshot
+test_packager_rejects_noncanonical_run_names
+test_packager_rejects_unapproved_missing_reason_atomically
+test_packager_discards_late_partial_bundle
 
 printf 'package-pwnkit-sample fixture tests passed\n'

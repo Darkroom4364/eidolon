@@ -192,9 +192,26 @@ echo "error: pwnkit agent errors detected in sample $SAMPLE_FILE" >&2
 echo "       clear pwnkit runtime/auth failures before collecting M3 evidence," >&2
 echo "       or set EIDOLON_M3_ALLOW_AGENT_ERRORS=1 for diagnostic no-signal artifacts." >&2
 jq -r '
+  def public_error_class:
+    if . == "codex_token_refresh_failed"
+      or . == "codex_authentication_failed"
+      or . == "codex_backend_timeout"
+      or . == "codex_backend_api_error"
+      or . == "agent_api_timeout"
+      or . == "agent_api_error"
+      or . == "pwnkit_agent_error"
+    then
+      .
+    else
+      "redacted_unknown"
+    end;
   def class_counts:
     .no_signal_diagnostics.eidolon_agent_error_class_counts // []
-    | map((.error_class // "unknown") + "=" + ((.count // 0) | tostring))
+    | map(
+        ((.error_class // null) | public_error_class)
+        + "="
+        + ((.count // 0) | tostring)
+      )
     | join(",");
   .no_signal_diagnostics.totals as $totals
   | "       totals: direct=\($totals.direct_pwnkit_agent_errors // 0) eidolon=\($totals.eidolon_pwnkit_agent_errors // 0)",
