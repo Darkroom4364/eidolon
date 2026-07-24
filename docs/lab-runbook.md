@@ -269,6 +269,17 @@ Run negative controls:
 - Send ordinary `/api/v1/*` traffic after controlled-reality entry. It should produce a `reality_escape_attempt` event and stay inside controlled reality while interventions are enabled.
 - Trigger the configured emergency disable. The next request must stop controlled-reality intervention and record the disable behavior; known decoy write paths should fail closed locally instead of forwarding to the protected upstream.
 
+The kind deployment has an executable write-escape proof for this boundary:
+
+```sh
+examples/shield-lab/smoke-controlled-reality-escape-kind.sh
+```
+
+It baselines the target-side detector directly, enters controlled reality,
+repeats `POST /api/v1/imports`, and requires synthetic `404`, blocked `403`,
+request-linked renderer evidence, and zero matching requests across every
+owned-target replica.
+
 M2.5 does not prove broad containment, attribution, adaptive bait policy, public-v1 readiness, production readiness, or safe deployment outside the Lab. It proves only that one qualifying Lab session can be routed into one synthetic no-write branch and audited.
 
 ## M3 Bait Catalog Smoke
