@@ -11,6 +11,7 @@ use eidolon_core::{
     ControlledRealityBranch, ControlledRealityInteraction, ControlledRealityInteractionAction,
     ControlledRealityJobId, ControlledRealityWorkflowState, RequestId, RoutingDecision, SessionId,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -55,7 +56,8 @@ pub struct ControlledRealityExpectedResponse {
     pub interaction: Option<ControlledRealityInteraction>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ControlledRealityRequestKind {
     BranchRead,
     JobSubmitted,
@@ -63,6 +65,77 @@ pub enum ControlledRealityRequestKind {
     ArtifactRead,
     MethodRejected,
     UnknownResource,
+}
+
+/// Closed synthetic resource data that can cross a renderer boundary.
+///
+/// The descriptor intentionally contains no session identity, HTTP request
+/// data, bait proof, credentials, upstream target, or routing authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlledRealityResourceDescriptor {
+    pub job_id: ControlledRealityJobId,
+    pub artifact: ControlledRealityArtifactRef,
+}
+
+impl ControlledRealityResourceDescriptor {
+    pub fn for_session(session_id: SessionId, origin_request_id: RequestId) -> Self {
+        let job_id = ControlledRealityJobId::new(synthetic_id(
+            "job",
+            "eidolon:import-reconcile:job:v1",
+            session_id,
+            origin_request_id,
+        ))
+        .expect("generated job id should satisfy the typed contract");
+        let artifact_id = ControlledRealityArtifactId::new(synthetic_id(
+            "artifact",
+            "eidolon:import-reconcile:artifact:v1",
+            session_id,
+            origin_request_id,
+        ))
+        .expect("generated artifact id should satisfy the typed contract");
+        let artifact_body = synthetic_artifact_body(&job_id, &artifact_id);
+        let artifact_bytes =
+            serde_json::to_vec(&artifact_body).expect("static synthetic artifact should serialize");
+        let artifact = ControlledRealityArtifactRef {
+            artifact_id,
+            sha256: ControlledRealityArtifactSha256::new(digest_hex(&Sha256::digest(
+                &artifact_bytes,
+            )))
+            .expect("generated artifact digest should satisfy the typed contract"),
+        };
+
+        Self { job_id, artifact }
+    }
+
+    pub fn status_path(&self) -> String {
+        format!("{DECOY_RECONCILE_JOBS_PREFIX}{}", self.job_id.as_str())
+    }
+
+    pub fn artifact_path(&self) -> String {
+        format!("{}/result", self.status_path())
+    }
+
+    pub fn has_valid_artifact_digest(&self) -> bool {
+        let body = synthetic_artifact_body(&self.job_id, &self.artifact.artifact_id);
+        let bytes = serde_json::to_vec(&body).expect("static synthetic artifact should serialize");
+        self.artifact.sha256.as_str() == digest_hex(&Sha256::digest(&bytes))
+    }
+
+    fn artifact_body(&self) -> serde_json::Value {
+        synthetic_artifact_body(&self.job_id, &self.artifact.artifact_id)
+    }
+}
+
+/// Status and body are the only values a separate renderer can propose.
+///
+/// A remote response must match the deterministic local rendering before it
+/// can be accepted. Headers, cache policy, artifact digests, evidence, and
+/// routing remain local to the proxy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledRealityRenderedResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
 }
 
 impl ControlledRealityRequestKind {
@@ -96,15 +169,16 @@ impl ControlledRealityResponder {
         let Some(origin_request_id) = origin_request_id else {
             return ControlledRealityRequestKind::UnknownResource;
         };
-        let resources = synthetic_resources(session_id, origin_request_id);
-        if request.path == resources.status_path {
+        let resources =
+            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id);
+        if request.path == resources.status_path() {
             return if request.method == "GET" {
                 ControlledRealityRequestKind::StatusRead
             } else {
                 ControlledRealityRequestKind::MethodRejected
             };
         }
-        if request.path == resources.artifact_path {
+        if request.path == resources.artifact_path() {
             return if request.method == "GET" {
                 ControlledRealityRequestKind::ArtifactRead
             } else {
@@ -122,9 +196,9 @@ impl ControlledRealityResponder {
         kind: ControlledRealityRequestKind,
         progress: ControlledRealityProgress,
     ) -> ControlledRealityDecision {
-        let resources = progress
-            .origin_request_id
-            .map(|origin_request_id| synthetic_resources(session_id, origin_request_id));
+        let resources = progress.origin_request_id.map(|origin_request_id| {
+            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id)
+        });
         let interaction = resources
             .as_ref()
             .and_then(|resources| interaction_for(kind, progress, resources));
@@ -171,9 +245,9 @@ impl ControlledRealityResponder {
                 ControlledRealityRequestKind::UnknownResource
             }
         };
-        let resources = progress
-            .origin_request_id
-            .map(|origin_request_id| synthetic_resources(session_id, origin_request_id));
+        let resources = progress.origin_request_id.map(|origin_request_id| {
+            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id)
+        });
         ControlledRealityExpectedResponse {
             status: response_for(request_kind, progress, resources.as_ref()).status,
             routing_decision: RoutingDecision::ControlledReality,
@@ -181,6 +255,15 @@ impl ControlledRealityResponder {
                 .as_ref()
                 .and_then(|resources| interaction_for(request_kind, progress, resources)),
         }
+    }
+
+    pub fn render(
+        &self,
+        kind: ControlledRealityRequestKind,
+        progress: ControlledRealityProgress,
+        resources: Option<&ControlledRealityResourceDescriptor>,
+    ) -> ControlledRealityRenderedResponse {
+        rendered_response_for(kind, progress, resources)
     }
 
     pub fn fail_closed_bait_action_response(
@@ -240,33 +323,11 @@ pub fn is_controlled_follow_up_path(path: &str) -> bool {
     path == DECOY_RECONCILE_JOBS_PATH || path.starts_with(DECOY_RECONCILE_JOBS_PREFIX)
 }
 
-#[derive(Debug, Clone)]
-struct SyntheticResources {
-    job_id: ControlledRealityJobId,
-    status_path: String,
-    artifact_path: String,
-    artifact: ControlledRealityArtifactRef,
-    artifact_body: serde_json::Value,
-}
-
-fn synthetic_resources(session_id: SessionId, origin_request_id: RequestId) -> SyntheticResources {
-    let job_id = ControlledRealityJobId::new(synthetic_id(
-        "job",
-        "eidolon:import-reconcile:job:v1",
-        session_id,
-        origin_request_id,
-    ))
-    .expect("generated job id should satisfy the typed contract");
-    let artifact_id = ControlledRealityArtifactId::new(synthetic_id(
-        "artifact",
-        "eidolon:import-reconcile:artifact:v1",
-        session_id,
-        origin_request_id,
-    ))
-    .expect("generated artifact id should satisfy the typed contract");
-    let status_path = format!("{DECOY_RECONCILE_JOBS_PREFIX}{}", job_id.as_str());
-    let artifact_path = format!("{status_path}/result");
-    let artifact_body = json!({
+fn synthetic_artifact_body(
+    job_id: &ControlledRealityJobId,
+    artifact_id: &ControlledRealityArtifactId,
+) -> serde_json::Value {
+    json!({
         "schema_version": 1,
         "artifact_id": artifact_id.as_str(),
         "job_id": job_id.as_str(),
@@ -280,22 +341,7 @@ fn synthetic_resources(session_id: SessionId, origin_request_id: RequestId) -> S
             "tenant_ownership_checked": false,
             "source_url_verified": false
         }
-    });
-    let artifact_bytes =
-        serde_json::to_vec(&artifact_body).expect("static synthetic artifact should serialize");
-    let artifact = ControlledRealityArtifactRef {
-        artifact_id,
-        sha256: ControlledRealityArtifactSha256::new(digest_hex(&Sha256::digest(&artifact_bytes)))
-            .expect("generated artifact digest should satisfy the typed contract"),
-    };
-
-    SyntheticResources {
-        job_id,
-        status_path,
-        artifact_path,
-        artifact,
-        artifact_body,
-    }
+    })
 }
 
 fn synthetic_id(
@@ -319,7 +365,7 @@ fn digest_hex(bytes: &[u8]) -> String {
 fn interaction_for(
     kind: ControlledRealityRequestKind,
     progress: ControlledRealityProgress,
-    resources: &SyntheticResources,
+    resources: &ControlledRealityResourceDescriptor,
 ) -> Option<ControlledRealityInteraction> {
     let origin_request_id = progress.origin_request_id?;
     let action = match kind {
@@ -361,43 +407,58 @@ fn interaction_for(
 fn response_for(
     kind: ControlledRealityRequestKind,
     progress: ControlledRealityProgress,
-    resources: Option<&SyntheticResources>,
+    resources: Option<&ControlledRealityResourceDescriptor>,
 ) -> SurfaceResponse {
+    let rendered = rendered_response_for(kind, progress, resources);
+    let mut response = surface_response(rendered);
+    if kind == ControlledRealityRequestKind::ArtifactRead
+        && progress.to_state == ControlledRealityWorkflowState::Completed
+    {
+        if let Some(resources) = resources {
+            response.headers.push(SurfaceHeader::new(
+                "X-Eidolon-Artifact-Sha256",
+                resources.artifact.sha256.as_str(),
+            ));
+        }
+    }
+    response
+}
+
+fn rendered_response_for(
+    kind: ControlledRealityRequestKind,
+    progress: ControlledRealityProgress,
+    resources: Option<&ControlledRealityResourceDescriptor>,
+) -> ControlledRealityRenderedResponse {
     match kind {
         ControlledRealityRequestKind::BranchRead => {
-            workflow_status_response(200, progress.to_state, progress.depth, resources)
+            workflow_status_rendered_response(200, progress.to_state, progress.depth, resources)
         }
         ControlledRealityRequestKind::JobSubmitted => match progress.to_state {
             ControlledRealityWorkflowState::Ready => {
-                workflow_status_response(409, progress.to_state, progress.depth, resources)
+                workflow_status_rendered_response(409, progress.to_state, progress.depth, resources)
             }
             ControlledRealityWorkflowState::Queued => {
-                workflow_status_response(202, progress.to_state, progress.depth, resources)
+                workflow_status_rendered_response(202, progress.to_state, progress.depth, resources)
             }
             ControlledRealityWorkflowState::Completed => {
-                workflow_status_response(200, progress.to_state, progress.depth, resources)
+                workflow_status_rendered_response(200, progress.to_state, progress.depth, resources)
             }
         },
         ControlledRealityRequestKind::StatusRead => {
             if progress.from_state == ControlledRealityWorkflowState::Ready {
-                unknown_resource_response(progress.depth)
+                unknown_resource_rendered_response(progress.depth)
             } else {
-                workflow_status_response(200, progress.to_state, progress.depth, resources)
+                workflow_status_rendered_response(200, progress.to_state, progress.depth, resources)
             }
         }
         ControlledRealityRequestKind::ArtifactRead => match progress.to_state {
             ControlledRealityWorkflowState::Completed => {
                 let Some(resources) = resources else {
-                    return unknown_resource_response(progress.depth);
+                    return unknown_resource_rendered_response(progress.depth);
                 };
-                let mut response = json_response(200, resources.artifact_body.clone());
-                response.headers.push(SurfaceHeader::new(
-                    "X-Eidolon-Artifact-Sha256",
-                    resources.artifact.sha256.as_str(),
-                ));
-                response
+                rendered_json_response(200, resources.artifact_body())
             }
-            ControlledRealityWorkflowState::Queued => json_response(
+            ControlledRealityWorkflowState::Queued => rendered_json_response(
                 409,
                 json!({
                     "status": workflow_state_name(progress.to_state),
@@ -406,9 +467,11 @@ fn response_for(
                     "action_depth": progress.depth,
                 }),
             ),
-            ControlledRealityWorkflowState::Ready => unknown_resource_response(progress.depth),
+            ControlledRealityWorkflowState::Ready => {
+                unknown_resource_rendered_response(progress.depth)
+            }
         },
-        ControlledRealityRequestKind::MethodRejected => json_response(
+        ControlledRealityRequestKind::MethodRejected => rendered_json_response(
             405,
             json!({
                 "status": "method_not_allowed",
@@ -417,16 +480,18 @@ fn response_for(
                 "action_depth": progress.depth,
             }),
         ),
-        ControlledRealityRequestKind::UnknownResource => unknown_resource_response(progress.depth),
+        ControlledRealityRequestKind::UnknownResource => {
+            unknown_resource_rendered_response(progress.depth)
+        }
     }
 }
 
-fn workflow_status_response(
+fn workflow_status_rendered_response(
     status: u16,
     state: ControlledRealityWorkflowState,
     depth: u32,
-    resources: Option<&SyntheticResources>,
-) -> SurfaceResponse {
+    resources: Option<&ControlledRealityResourceDescriptor>,
+) -> ControlledRealityRenderedResponse {
     let mut body = json!({
         "status": workflow_state_name(state),
         "synthetic": true,
@@ -437,11 +502,11 @@ fn workflow_status_response(
 
     if let Some(resources) = resources.filter(|_| state != ControlledRealityWorkflowState::Ready) {
         body["job_id"] = json!(resources.job_id.as_str());
-        body["status_path"] = json!(resources.status_path);
+        body["status_path"] = json!(resources.status_path());
         if state == ControlledRealityWorkflowState::Completed {
             body["artifact"] = json!({
                 "artifact_id": resources.artifact.artifact_id.as_str(),
-                "path": resources.artifact_path,
+                "path": resources.artifact_path(),
                 "sha256": resources.artifact.sha256.as_str(),
             });
         }
@@ -455,11 +520,11 @@ fn workflow_status_response(
         });
     }
 
-    json_response(status, body)
+    rendered_json_response(status, body)
 }
 
-fn unknown_resource_response(depth: u32) -> SurfaceResponse {
-    json_response(
+fn unknown_resource_rendered_response(depth: u32) -> ControlledRealityRenderedResponse {
+    rendered_json_response(
         404,
         json!({
             "status": "not_found",
@@ -480,13 +545,27 @@ fn workflow_state_name(state: ControlledRealityWorkflowState) -> &'static str {
 }
 
 fn json_response(status: u16, body: serde_json::Value) -> SurfaceResponse {
-    SurfaceResponse::new(
+    surface_response(rendered_json_response(status, body))
+}
+
+fn rendered_json_response(
+    status: u16,
+    body: serde_json::Value,
+) -> ControlledRealityRenderedResponse {
+    ControlledRealityRenderedResponse {
         status,
+        body: serde_json::to_vec(&body).expect("controlled-reality JSON should serialize"),
+    }
+}
+
+fn surface_response(rendered: ControlledRealityRenderedResponse) -> SurfaceResponse {
+    SurfaceResponse::new(
+        rendered.status,
         vec![
             SurfaceHeader::new("Content-Type", "application/json; charset=utf-8"),
             SurfaceHeader::new("X-Eidolon-Synthetic", "true"),
         ],
-        serde_json::to_vec(&body).expect("controlled-reality JSON should serialize"),
+        rendered.body,
     )
     .with_cache_policy(ResponseCachePolicy::PrivateNoStore)
 }
@@ -504,8 +583,97 @@ mod tests {
 
     use super::*;
 
+    const GOLDEN_SESSION_UUID: u128 = 0x11111111_1111_4111_8111_111111111111;
+    const GOLDEN_REQUEST_UUID: u128 = 0x22222222_2222_4222_8222_222222222222;
+    const GOLDEN_JOB_ID: &str = "job_36bed8d5c23ffe08";
+    const GOLDEN_ARTIFACT_ID: &str = "artifact_a26855bf1cbc8ca5";
+    const GOLDEN_ARTIFACT_SHA256: &str =
+        "727da12d0f4d542328f32e7de7189bb582ae39bb59c0633e20bd1e71869071e9";
+    const GOLDEN_READY_BODY: &str = concat!(
+        r#"{"action_depth":3,"path":"/api/v2/import/reconcile","status":"ready","#,
+        r#""synthetic":true,"write_committed":false}"#,
+    );
+    const GOLDEN_QUEUED_BODY: &str = concat!(
+        r#"{"accepted_untrusted_fields":["source","source_url","tenant_id","reconcile_mode"],"#,
+        r#""action_depth":3,"job_id":"job_36bed8d5c23ffe08","path":"/api/v2/import/reconcile","#,
+        r#""status":"queued","status_path":"/api/v2/import/reconcile/jobs/job_36bed8d5c23ffe08","#,
+        r#""synthetic":true,"validation":{"source_url_verified":false,"tenant_ownership_checked":false},"#,
+        r#""write_committed":false}"#,
+    );
+    const GOLDEN_COMPLETED_BODY: &str = concat!(
+        r#"{"action_depth":3,"artifact":{"artifact_id":"artifact_a26855bf1cbc8ca5","#,
+        r#""path":"/api/v2/import/reconcile/jobs/job_36bed8d5c23ffe08/result","#,
+        r#""sha256":"727da12d0f4d542328f32e7de7189bb582ae39bb59c0633e20bd1e71869071e9"},"#,
+        r#""job_id":"job_36bed8d5c23ffe08","path":"/api/v2/import/reconcile","#,
+        r#""status":"completed","status_path":"/api/v2/import/reconcile/jobs/job_36bed8d5c23ffe08","#,
+        r#""synthetic":true,"write_committed":false}"#,
+    );
+    const GOLDEN_ARTIFACT_BODY: &str = concat!(
+        r#"{"artifact_id":"artifact_a26855bf1cbc8ca5","job_id":"job_36bed8d5c23ffe08","#,
+        r#""kind":"reconciliation_summary","schema_version":1,"summary":{"changes_committed":0,"#,
+        r#""changes_planned":2,"records_examined":7,"source_url_verified":false,"#,
+        r#""tenant_ownership_checked":false},"synthetic":true,"write_committed":false}"#,
+    );
+    const GOLDEN_ARTIFACT_QUEUED_BODY: &str =
+        r#"{"action_depth":3,"status":"queued","synthetic":true,"write_committed":false}"#;
+    const GOLDEN_METHOD_REJECTED_BODY: &str = concat!(
+        r#"{"action_depth":3,"status":"method_not_allowed","#,
+        r#""synthetic":true,"write_committed":false}"#,
+    );
+    const GOLDEN_UNKNOWN_RESOURCE_BODY: &str = concat!(
+        r#"{"action_depth":3,"message":"controlled reality has no matching synthetic resource","#,
+        r#""status":"not_found","synthetic":true,"write_committed":false}"#,
+    );
+
+    #[derive(Clone, Copy)]
+    struct GoldenResponseCase {
+        name: &'static str,
+        kind: ControlledRealityRequestKind,
+        from_state: ControlledRealityWorkflowState,
+        to_state: ControlledRealityWorkflowState,
+        include_resources: bool,
+        expected_status: u16,
+        expected_body: &'static str,
+        expected_artifact_header: bool,
+    }
+
     fn request(method: &str, path: &str) -> SurfaceRequestMeta {
         SurfaceRequestMeta::new(method, path, Vec::new(), 0)
+    }
+
+    fn golden_session_id() -> SessionId {
+        SessionId(uuid::Uuid::from_u128(GOLDEN_SESSION_UUID))
+    }
+
+    fn golden_request_id() -> RequestId {
+        RequestId(uuid::Uuid::from_u128(GOLDEN_REQUEST_UUID))
+    }
+
+    fn golden_resources() -> ControlledRealityResourceDescriptor {
+        ControlledRealityResourceDescriptor {
+            job_id: ControlledRealityJobId::new(GOLDEN_JOB_ID)
+                .expect("golden job id should satisfy the typed contract"),
+            artifact: ControlledRealityArtifactRef {
+                artifact_id: ControlledRealityArtifactId::new(GOLDEN_ARTIFACT_ID)
+                    .expect("golden artifact id should satisfy the typed contract"),
+                sha256: ControlledRealityArtifactSha256::new(GOLDEN_ARTIFACT_SHA256)
+                    .expect("golden artifact digest should satisfy the typed contract"),
+            },
+        }
+    }
+
+    fn golden_headers(include_artifact_digest: bool) -> Vec<SurfaceHeader> {
+        let mut headers = vec![
+            SurfaceHeader::new("Content-Type", "application/json; charset=utf-8"),
+            SurfaceHeader::new("X-Eidolon-Synthetic", "true"),
+        ];
+        if include_artifact_digest {
+            headers.push(SurfaceHeader::new(
+                "X-Eidolon-Artifact-Sha256",
+                GOLDEN_ARTIFACT_SHA256,
+            ));
+        }
+        headers
     }
 
     fn progress(
@@ -531,6 +699,228 @@ mod tests {
 
     fn json_body(response: &SurfaceResponse) -> Value {
         serde_json::from_slice(&response.body).expect("body should be json")
+    }
+
+    #[test]
+    fn fixed_session_resources_match_legacy_identifiers_and_artifact_digest() {
+        let resources = ControlledRealityResourceDescriptor::for_session(
+            golden_session_id(),
+            golden_request_id(),
+        );
+
+        assert_eq!(resources, golden_resources());
+        assert_eq!(
+            resources.status_path(),
+            "/api/v2/import/reconcile/jobs/job_36bed8d5c23ffe08"
+        );
+        assert_eq!(
+            resources.artifact_path(),
+            "/api/v2/import/reconcile/jobs/job_36bed8d5c23ffe08/result"
+        );
+        assert_eq!(
+            digest_hex(&Sha256::digest(GOLDEN_ARTIFACT_BODY.as_bytes())),
+            GOLDEN_ARTIFACT_SHA256
+        );
+    }
+
+    #[test]
+    fn controlled_reality_responses_match_legacy_golden_contract() {
+        let cases = [
+            GoldenResponseCase {
+                name: "branch_ready",
+                kind: ControlledRealityRequestKind::BranchRead,
+                from_state: ControlledRealityWorkflowState::Ready,
+                to_state: ControlledRealityWorkflowState::Ready,
+                include_resources: false,
+                expected_status: 200,
+                expected_body: GOLDEN_READY_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "branch_queued",
+                kind: ControlledRealityRequestKind::BranchRead,
+                from_state: ControlledRealityWorkflowState::Queued,
+                to_state: ControlledRealityWorkflowState::Queued,
+                include_resources: true,
+                expected_status: 200,
+                expected_body: GOLDEN_QUEUED_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "branch_completed",
+                kind: ControlledRealityRequestKind::BranchRead,
+                from_state: ControlledRealityWorkflowState::Completed,
+                to_state: ControlledRealityWorkflowState::Completed,
+                include_resources: true,
+                expected_status: 200,
+                expected_body: GOLDEN_COMPLETED_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "job_ready",
+                kind: ControlledRealityRequestKind::JobSubmitted,
+                from_state: ControlledRealityWorkflowState::Ready,
+                to_state: ControlledRealityWorkflowState::Ready,
+                include_resources: false,
+                expected_status: 409,
+                expected_body: GOLDEN_READY_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "job_queued",
+                kind: ControlledRealityRequestKind::JobSubmitted,
+                from_state: ControlledRealityWorkflowState::Ready,
+                to_state: ControlledRealityWorkflowState::Queued,
+                include_resources: true,
+                expected_status: 202,
+                expected_body: GOLDEN_QUEUED_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "job_completed",
+                kind: ControlledRealityRequestKind::JobSubmitted,
+                from_state: ControlledRealityWorkflowState::Completed,
+                to_state: ControlledRealityWorkflowState::Completed,
+                include_resources: true,
+                expected_status: 200,
+                expected_body: GOLDEN_COMPLETED_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "status_before_submission",
+                kind: ControlledRealityRequestKind::StatusRead,
+                from_state: ControlledRealityWorkflowState::Ready,
+                to_state: ControlledRealityWorkflowState::Ready,
+                include_resources: false,
+                expected_status: 404,
+                expected_body: GOLDEN_UNKNOWN_RESOURCE_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "status_ready_rendering",
+                kind: ControlledRealityRequestKind::StatusRead,
+                from_state: ControlledRealityWorkflowState::Queued,
+                to_state: ControlledRealityWorkflowState::Ready,
+                include_resources: true,
+                expected_status: 200,
+                expected_body: GOLDEN_READY_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "status_queued",
+                kind: ControlledRealityRequestKind::StatusRead,
+                from_state: ControlledRealityWorkflowState::Queued,
+                to_state: ControlledRealityWorkflowState::Queued,
+                include_resources: true,
+                expected_status: 200,
+                expected_body: GOLDEN_QUEUED_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "status_completed",
+                kind: ControlledRealityRequestKind::StatusRead,
+                from_state: ControlledRealityWorkflowState::Queued,
+                to_state: ControlledRealityWorkflowState::Completed,
+                include_resources: true,
+                expected_status: 200,
+                expected_body: GOLDEN_COMPLETED_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "artifact_ready",
+                kind: ControlledRealityRequestKind::ArtifactRead,
+                from_state: ControlledRealityWorkflowState::Ready,
+                to_state: ControlledRealityWorkflowState::Ready,
+                include_resources: false,
+                expected_status: 404,
+                expected_body: GOLDEN_UNKNOWN_RESOURCE_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "artifact_queued",
+                kind: ControlledRealityRequestKind::ArtifactRead,
+                from_state: ControlledRealityWorkflowState::Queued,
+                to_state: ControlledRealityWorkflowState::Queued,
+                include_resources: true,
+                expected_status: 409,
+                expected_body: GOLDEN_ARTIFACT_QUEUED_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "artifact_completed",
+                kind: ControlledRealityRequestKind::ArtifactRead,
+                from_state: ControlledRealityWorkflowState::Completed,
+                to_state: ControlledRealityWorkflowState::Completed,
+                include_resources: true,
+                expected_status: 200,
+                expected_body: GOLDEN_ARTIFACT_BODY,
+                expected_artifact_header: true,
+            },
+            GoldenResponseCase {
+                name: "artifact_completed_without_resources",
+                kind: ControlledRealityRequestKind::ArtifactRead,
+                from_state: ControlledRealityWorkflowState::Completed,
+                to_state: ControlledRealityWorkflowState::Completed,
+                include_resources: false,
+                expected_status: 404,
+                expected_body: GOLDEN_UNKNOWN_RESOURCE_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "method_rejected",
+                kind: ControlledRealityRequestKind::MethodRejected,
+                from_state: ControlledRealityWorkflowState::Ready,
+                to_state: ControlledRealityWorkflowState::Ready,
+                include_resources: false,
+                expected_status: 405,
+                expected_body: GOLDEN_METHOD_REJECTED_BODY,
+                expected_artifact_header: false,
+            },
+            GoldenResponseCase {
+                name: "unknown_resource",
+                kind: ControlledRealityRequestKind::UnknownResource,
+                from_state: ControlledRealityWorkflowState::Ready,
+                to_state: ControlledRealityWorkflowState::Ready,
+                include_resources: false,
+                expected_status: 404,
+                expected_body: GOLDEN_UNKNOWN_RESOURCE_BODY,
+                expected_artifact_header: false,
+            },
+        ];
+        let resources = golden_resources();
+
+        for case in cases {
+            let response = response_for(
+                case.kind,
+                progress(
+                    3,
+                    case.from_state,
+                    case.to_state,
+                    case.include_resources.then_some(golden_request_id()),
+                ),
+                case.include_resources.then_some(&resources),
+            );
+
+            assert_eq!(response.status, case.expected_status, "{}", case.name);
+            assert_eq!(
+                response.body,
+                case.expected_body.as_bytes(),
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                response.headers,
+                golden_headers(case.expected_artifact_header),
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                response.cache_policy,
+                ResponseCachePolicy::PrivateNoStore,
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -592,9 +982,10 @@ mod tests {
         let responder = ControlledRealityResponder;
         let session_id = SessionId::new();
         let origin_request_id = RequestId::new();
-        let resources = synthetic_resources(session_id, origin_request_id);
+        let resources =
+            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id);
 
-        let status_request = request("GET", &resources.status_path);
+        let status_request = request("GET", &resources.status_path());
         assert_eq!(
             responder.classify(session_id, Some(origin_request_id), &status_request),
             ControlledRealityRequestKind::StatusRead
@@ -629,7 +1020,7 @@ mod tests {
             ControlledRealityInteractionAction::StatusRead
         );
 
-        let artifact_request = request("GET", &resources.artifact_path);
+        let artifact_request = request("GET", &resources.artifact_path());
         assert_eq!(
             responder.classify(session_id, Some(origin_request_id), &artifact_request),
             ControlledRealityRequestKind::ArtifactRead
@@ -683,10 +1074,12 @@ mod tests {
     fn identifiers_are_bound_to_session_and_origin_request() {
         let session = SessionId::new();
         let origin = RequestId::new();
-        let same = synthetic_resources(session, origin);
-        let repeated = synthetic_resources(session, origin);
-        let other_session = synthetic_resources(SessionId::new(), origin);
-        let other_origin = synthetic_resources(session, RequestId::new());
+        let same = ControlledRealityResourceDescriptor::for_session(session, origin);
+        let repeated = ControlledRealityResourceDescriptor::for_session(session, origin);
+        let other_session =
+            ControlledRealityResourceDescriptor::for_session(SessionId::new(), origin);
+        let other_origin =
+            ControlledRealityResourceDescriptor::for_session(session, RequestId::new());
 
         assert_eq!(same.job_id, repeated.job_id);
         assert_eq!(same.artifact, repeated.artifact);
@@ -697,10 +1090,11 @@ mod tests {
     #[test]
     fn wrong_session_resource_is_unknown_and_never_reflected() {
         let responder = ControlledRealityResponder;
-        let owner = synthetic_resources(SessionId::new(), RequestId::new());
+        let owner =
+            ControlledRealityResourceDescriptor::for_session(SessionId::new(), RequestId::new());
         let other_session = SessionId::new();
         let other_origin = RequestId::new();
-        let request = request("GET", &owner.status_path);
+        let request = request("GET", &owner.status_path());
         let kind = responder.classify(other_session, Some(other_origin), &request);
         let decision = responder.decide(
             other_session,

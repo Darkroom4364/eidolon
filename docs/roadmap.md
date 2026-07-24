@@ -185,6 +185,12 @@ Acceptance criteria:
 - Reality escape attempts and operator emergency-disable behavior are observable in the event log.
 - The M2.5 research note and checklist are explicitly Lab-only v1-candidate artifacts and make no public-v1 or production-ready claim.
 
+Isolation hardening remains tracked by `#176`. The first separate-process
+renderer foundation does not change the active in-process proxy path and does
+not close that issue. Cluster deployment waits for an enforcing CNI,
+elimination of the direct-target NodePort bypass, live negative egress proof,
+and fail-closed proxy integration.
+
 ## M3 Uniqueness Bakeoff
 
 Goal:

@@ -88,7 +88,8 @@ pub struct EvictionStats {
     pub fail_closed_activated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlledRealityProgress {
     pub depth: u32,
     pub from_state: ControlledRealityWorkflowState,
