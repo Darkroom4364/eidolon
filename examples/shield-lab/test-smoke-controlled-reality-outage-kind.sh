@@ -31,6 +31,12 @@ JSONL
   printf '%s\n' \
     '{"event":"controlled_reality_backend_failed","fields":{"request_id":"request-action","reason":"connect_failed","response_status":503,"local_fallback":false}}' \
     >"$dir/proxy-debug.jsonl"
+  printf '%s\n' \
+    '{"state":"disabled","desired_replicas":0,"available_replicas":0,"pod_count":0,"endpoint_address_count":0,"restore_replicas":1,"proxy_drained":true}' \
+    >"$dir/kill-switch-disabled.json"
+  printf '%s\n' \
+    '{"state":"enabled","desired_replicas":1,"available_replicas":1,"pod_count":1,"endpoint_address_count":1,"restore_replicas":null}' \
+    >"$dir/kill-switch-enabled.json"
   cat >"$dir/target-probes.meta" <<'META'
 baseline_probe_id=shield-probe-baseline-fixture
 outage_probe_id=shield-probe-outage-fixture
@@ -56,7 +62,11 @@ write_valid_fixture "$valid"
 
 "$SMOKE_SCRIPT" --help | grep -Fq 'fails closed'
 "$SMOKE_SCRIPT" --validate-fixture "$valid" \
-  | jq -e '.result == "passed" and .protected_upstream.outage_requests_observed == 0' \
+  | jq -e '
+      .result == "passed"
+      and .operator_kill_switch.activation_acknowledged == true
+      and .protected_upstream.outage_requests_observed == 0
+    ' \
     >/dev/null
 
 bad_status="$(new_fixture)"
@@ -81,6 +91,22 @@ sed -i.bak 's/controlled reality renderer unavailable/temporary outage/' \
   "$bad_body/action.body"
 rm "$bad_body/action.body.bak"
 expect_failure "$bad_body"
+
+stale_renderer_endpoint="$(new_fixture)"
+bad_dirs+=("$stale_renderer_endpoint")
+cp -R "$valid/." "$stale_renderer_endpoint/"
+sed -i.bak 's/"endpoint_address_count":0/"endpoint_address_count":1/' \
+  "$stale_renderer_endpoint/kill-switch-disabled.json"
+rm "$stale_renderer_endpoint/kill-switch-disabled.json.bak"
+expect_failure "$stale_renderer_endpoint"
+
+renderer_not_restored="$(new_fixture)"
+bad_dirs+=("$renderer_not_restored")
+cp -R "$valid/." "$renderer_not_restored/"
+sed -i.bak 's/"available_replicas":1/"available_replicas":0/' \
+  "$renderer_not_restored/kill-switch-enabled.json"
+rm "$renderer_not_restored/kill-switch-enabled.json.bak"
+expect_failure "$renderer_not_restored"
 
 target_reached="$(new_fixture)"
 bad_dirs+=("$target_reached")

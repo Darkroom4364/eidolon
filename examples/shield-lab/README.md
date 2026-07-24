@@ -61,6 +61,9 @@ Keep out of the private repo:
   shield-lab/
   kind-config.yaml
   deploy-kind.sh
+  controlled-reality-kill-switch-kind.sh
+  smoke-controlled-reality-isolation-kind.sh
+  smoke-controlled-reality-outage-kind.sh
   status-orbstack.sh
   metrics-orbstack.sh
   logs-orbstack.sh
@@ -143,6 +146,8 @@ Namespaces:
 - persists proxy event, debug, intervention, and policy state on a PVC
 - deploys the renderer only in kind with a dedicated secret, hardened container,
   proxy-only ingress, and namespace-wide default-deny egress
+- includes an acknowledged kind renderer kill switch that drains all renderer
+  Pods/endpoints and restarts the single remote-mode proxy before returning
 - pins a kind node image and installs pinned Calico manifests before deployment
 - includes local image build and OrbStack deploy scripts
 - includes operator scripts for status, logs, and redacted evidence export
@@ -181,7 +186,7 @@ local files first.
 
 - deploy ingress controllers
 - provision SIEM or webhook exporters
-- live-test renderer outage, saturation, and operator kill-switch behavior
+- live-test renderer saturation and state/restart behavior
 - run workload generators
 - integrate an external production secret manager
 
@@ -242,6 +247,15 @@ unavailable and sends no protected write-shaped request to the owned target:
 
 ```sh
 examples/shield-lab/smoke-controlled-reality-outage-kind.sh
+```
+
+Inspect, disable, or restore every kind renderer replica through the
+acknowledged operator kill switch:
+
+```sh
+examples/shield-lab/controlled-reality-kill-switch-kind.sh status
+examples/shield-lab/controlled-reality-kill-switch-kind.sh disable
+examples/shield-lab/controlled-reality-kill-switch-kind.sh enable
 ```
 
 The kind path has no NodePort. Reach the proxy with the port-forward command

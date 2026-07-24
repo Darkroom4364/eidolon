@@ -7019,7 +7019,9 @@ Options:
                          Repeatable path prefix where strong trusted identities may
                          skip bait exposure surfaces [default: /docs, /openapi.json]
   --intervention-control <PATH>
-                         Optional control file; write `disabled` to force protected forwarding
+                         Optional control file; write `disabled` to bypass ordinary
+                         surface interventions. Recognized unsafe bait actions and
+                         synthetic follow-ups still fail closed
                          [default: {DEFAULT_INTERVENTION_CONTROL}]
   --policy-state <PATH> Per-session policy state JSON file path [default: {DEFAULT_POLICY_STATE}]
   --controlled-reality-max-depth <N>

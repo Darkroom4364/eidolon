@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
 KIND_BIN="${KIND_BIN:-kind}"
 DOCKER_BIN="${DOCKER_BIN:-docker}"
+KILL_SWITCH_SCRIPT="${EIDOLON_SHIELD_KIND_KILL_SWITCH_SCRIPT:-$SCRIPT_DIR/controlled-reality-kill-switch-kind.sh}"
 EXPECTED_CONTEXT="${EIDOLON_SHIELD_KIND_CONTEXT:-kind-eidolon-shield}"
 KIND_CLUSTER_NAME="${EIDOLON_SHIELD_KIND_CLUSTER_NAME:-eidolon-shield}"
 PROBE_IMAGE="${EIDOLON_SHIELD_KIND_PROBE_IMAGE:-busybox:1.37.0-musl}"
@@ -15,8 +17,7 @@ tmp_dir=""
 target_probe_pod=""
 outage_probe_pod=""
 renderer_node=""
-renderer_original_replicas=""
-renderer_scaled_down=0
+renderer_disabled=0
 target_logs_first_line=1
 target_pod=""
 
@@ -109,6 +110,8 @@ validate_evidence() {
     action.body \
     proxy-events.jsonl \
     proxy-debug.jsonl \
+    kill-switch-disabled.json \
+    kill-switch-enabled.json \
     target-audit.log \
     target-probes.meta
   do
@@ -120,6 +123,25 @@ validate_evidence() {
   require_result "$dir/action.meta" cache_private true
   require_result "$dir/action.meta" cache_no_store true
   require_result "$dir/action.meta" eidolon_synthetic true
+  jq -e '
+    .state == "disabled"
+    and .desired_replicas == 0
+    and .available_replicas == 0
+    and .pod_count == 0
+    and .endpoint_address_count == 0
+    and .proxy_drained == true
+    and (.restore_replicas | type == "number")
+    and .restore_replicas > 0
+  ' "$dir/kill-switch-disabled.json" >/dev/null \
+    || fail "operator kill switch did not acknowledge a drained disabled state"
+  jq -e '
+    .state == "enabled"
+    and .desired_replicas > 0
+    and .available_replicas == .desired_replicas
+    and .pod_count >= .desired_replicas
+    and .endpoint_address_count >= .desired_replicas
+  ' "$dir/kill-switch-enabled.json" >/dev/null \
+    || fail "operator kill switch did not restore an available renderer"
   jq -e '
     . == {
       status: "unavailable",
@@ -245,6 +267,12 @@ validate_evidence() {
         cache_policy: "private_no_store",
         write_committed: false
       },
+      operator_kill_switch: {
+        activation_acknowledged: true,
+        renderer_drained: true,
+        proxy_drained: true,
+        restored: true
+      },
       protected_upstream: {
         audit_detector_baselined: true,
         baseline_probe_id: $baseline_probe_id,
@@ -256,16 +284,14 @@ validate_evidence() {
 }
 
 restore_renderer() {
-  if [[ "$renderer_scaled_down" != "1" ]]; then
+  local output_file="${1:-/dev/null}"
+
+  if [[ "$renderer_disabled" != "1" ]]; then
     return
   fi
 
-  "$KUBECTL_BIN" -n shield-controlled-reality scale \
-    deployment/eidolon-controlled-reality \
-    --replicas="$renderer_original_replicas" >/dev/null
-  "$KUBECTL_BIN" -n shield-controlled-reality rollout status \
-    deployment/eidolon-controlled-reality --timeout=120s >/dev/null
-  renderer_scaled_down=0
+  "$KILL_SWITCH_SCRIPT" enable >"$output_file"
+  renderer_disabled=0
 }
 
 cleanup() {
@@ -605,15 +631,10 @@ debug_before="$(
 events_first_line=$((events_before + 1))
 debug_first_line=$((debug_before + 1))
 
-renderer_original_replicas="$(
-  "$KUBECTL_BIN" -n shield-controlled-reality get \
-    deployment/eidolon-controlled-reality -o jsonpath='{.spec.replicas}'
-)"
-[[ "$renderer_original_replicas" =~ ^[1-9][0-9]*$ ]] \
-  || fail "renderer deployment must start with at least one replica"
-"$KUBECTL_BIN" -n shield-controlled-reality scale \
-  deployment/eidolon-controlled-reality --replicas=0 >/dev/null
-renderer_scaled_down=1
+[[ -x "$KILL_SWITCH_SCRIPT" ]] \
+  || fail "renderer kill-switch helper is not executable: $KILL_SWITCH_SCRIPT"
+renderer_disabled=1
+"$KILL_SWITCH_SCRIPT" disable >"$tmp_dir/kill-switch-disabled.json"
 wait_for_renderer_unavailable
 
 create_outage_probe "$proxy_ip" "$outage_probe_id"
@@ -660,7 +681,7 @@ for _ in $(seq 1 "$OUTAGE_QUIET_SECONDS"); do
 done
 capture_target_audit "$tmp_dir/target-audit.log"
 
-restore_renderer
+restore_renderer "$tmp_dir/kill-switch-enabled.json"
 
 validate_evidence "$tmp_dir" >"$tmp_dir/validation.json"
 mkdir -p "$(dirname "$EVIDENCE_PATH")"

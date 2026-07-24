@@ -36,6 +36,29 @@ proves the target-side detector works. Any later protected reconcile audit,
 even if an intermediary strips that marker, fails the smoke. A target Pod
 replacement or container restart also invalidates the proof.
 
+`examples/shield-lab/controlled-reality-kill-switch-kind.sh` is the kind
+operator control for that outage boundary. It first verifies the proxy uses
+the remote backend, stores the positive renderer replica count, scales every
+renderer replica to zero, and acknowledges `disabled` only after both Pods
+and all Service endpoint addresses are gone. It then restarts and waits for
+the single remote-mode proxy replica before rechecking the empty renderer
+boundary, which drains any response already buffered in that process.
+`enable` restores the stored replica count and acknowledges only after rollout
+and endpoints recover.
+Manual scale-to-zero without that metadata is reported as an unmanaged outage,
+not a successful kill-switch activation.
+
+The older intervention control file is not this kill switch. Disabled
+interventions forward ordinary traffic to the protected upstream, intentionally
+retain fail-closed ownership only for recognized unsafe actions and synthetic
+follow-ups, and do not drain in-flight renderer work.
+
+On 2026-07-24, the outage smoke passed through this operator path. Disable
+reached zero renderer Pods and endpoints, restarted the proxy, and acknowledged
+the drained state. A fresh same-session minted action then returned the fixed
+Eidolon-owned `503` with no local fallback and produced zero protected-target
+reconcile requests. Enable restored one available renderer replica and endpoint.
+
 The owned demo target is stateless. This proves zero protected write-shaped
 request arrival, not the absence of a storage mutation in a stateful target.
 The backend failure reason currently remains in the debug audit rather than a
@@ -112,8 +135,8 @@ The enforced kind network boundary is now proven. Issue `#176` still requires:
    saturation counters to operators.
 2. Define restart and multi-replica replay behavior before allowing stateful
     rendering.
-3. Keep the renderer-outage smoke green in a live gate and prove the operator
-   kill switch preserves zero protected writes.
+3. Live-test controlled-branch escape attempts and prove they produce zero
+   protected write-shaped requests.
 
 ## Proxy integration contract
 
@@ -136,9 +159,9 @@ Issue `#176` stays open until:
 - the active controlled-reality response path crosses the enforced boundary
 - synthetic application state is isolated from protected and proxy enforcement
   state
-- quotas and an operator kill switch are live-tested
+- quotas are live-tested
 - boundary violations are auditable
-- outage and escape tests prove zero protected writes
+- escape tests prove zero protected writes
 
 The standalone renderer is a prerequisite for that work, not proof that the
 work is complete.
