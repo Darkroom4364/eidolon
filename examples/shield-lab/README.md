@@ -237,6 +237,13 @@ proxy-only renderer ingress, and matching Calico denied-flow records:
 examples/shield-lab/smoke-controlled-reality-isolation-kind.sh
 ```
 
+Prove a valid same-session minted action fails closed when the renderer is
+unavailable and sends no protected write-shaped request to the owned target:
+
+```sh
+examples/shield-lab/smoke-controlled-reality-outage-kind.sh
+```
+
 The kind path has no NodePort. Reach the proxy with the port-forward command
 printed by the deploy script.
 
