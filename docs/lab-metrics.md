@@ -485,11 +485,15 @@ examples/m3/package-pwnkit-sample.sh \
   docs/evidence/m3/pwnkit-sample-YYYY-MM-DD
 ```
 
-The packager writes redacted per-run summaries, sanitized trace summaries, a
-sample aggregate, a README, and `SHA256SUMS`. It intentionally omits raw pwnkit
-databases, auth files, stdout/stderr logs, full proxy event logs, and private
-Eidolon debug logs. It also omits local source artifact paths, pwnkit runner
-command paths, and generated scope-file paths from committed bundles.
+The packager reconstructs the sample aggregate, per-run summaries, and trace
+events from typed allowlists, then writes a README and `SHA256SUMS`. Validation
+and export use one private snapshot of the selected source JSON. Unknown fields
+are omitted; malformed retained fields fail packaging before the output bundle
+is created. Raw pwnkit databases, auth files, stdout/stderr logs, full proxy
+event logs, private Eidolon debug logs, local source artifact paths, runner
+command paths, and generated scope-file paths are not exported. Checksums
+protect the packaged bytes; they do not prove that the retained claims are
+semantically true.
 
 For the finding-promotion investigation, keep the runner shape identical and
 vary only owned bait surfaces with a lab-only profile:
@@ -558,12 +562,16 @@ examples/m3/package-pwnkit-promotion-matrix.sh \
   docs/evidence/m3/pwnkit-promotion-matrix-YYYY-MM-DD
 ```
 
-The packager reuses the sample packager for each observed variant, writes a
-redacted matrix aggregate, copies the manifest, and emits `SHA256SUMS`. It
-omits raw pwnkit databases, auth files, stdout/stderr logs, full proxy events,
-private Eidolon debug logs, local artifact paths, runner command paths, and
-scope-file paths from every variant. By default, it fails before writing the
-bundle unless `matrix_health.ready_for_matrix_interpretation` is `true`; the
+The packager reuses the sample packager for each observed variant and
+reconstructs the matrix aggregate and manifest from typed allowlists before
+emitting `SHA256SUMS`. Matrix metadata and each selected variant are copied to
+one private input snapshot before validation and export. Invalid hypotheses,
+observations, knobs, profiles, IDs, or retained field types fail before the
+output bundle is created. Raw pwnkit databases, auth files, stdout/stderr logs,
+full proxy events, private Eidolon debug logs, local artifact paths, runner
+command paths, and scope-file paths are not exported. Checksums protect the
+packaged bytes, not the truth of the claims. By default, packaging also fails
+unless `matrix_health.ready_for_matrix_interpretation` is `true`; the
 `EIDOLON_M3_ALLOW_UNHEALTHY_PROMOTION_MATRIX=1` bypass is for diagnostic
 packaging only and must not be used to support promotion-matrix conclusions.
 

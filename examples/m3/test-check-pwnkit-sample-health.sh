@@ -90,11 +90,25 @@ test_rejects_agent_error_sample_with_sanitized_output() {
 
   output="$("$CHECKER" "$dir/pwnkit-stability-sample.json" 2>&1)" || status="$?"
 
-  [[ "$status" -eq 1 ]]
+  [[ "$status" -eq 1 ]] || return 1
   rg -q 'pwnkit agent errors detected in sample' <<<"$output"
   rg -q 'totals: direct=0 eidolon=2' <<<"$output"
   rg -q 'eidolon classes=codex_token_refresh_failed=2' <<<"$output"
-  ! rg -q 'sensitive-refresh-detail' <<<"$output"
+  ! rg -q 'sensitive-refresh-detail' <<<"$output" || return 1
+}
+
+test_redacts_unknown_agent_error_class() {
+  local dir
+  local output
+  local status=0
+  dir="$(new_temp_dir)"
+  write_sample "$dir/pwnkit-stability-sample.json" 0 2 EIDOLON_HEALTH_SECRET_228
+
+  output="$("$CHECKER" "$dir/pwnkit-stability-sample.json" 2>&1)" || status="$?"
+
+  [[ "$status" -eq 1 ]] || return 1
+  rg -q 'eidolon classes=redacted_unknown=2' <<<"$output"
+  ! rg -q 'EIDOLON_HEALTH_SECRET_228' <<<"$output" || return 1
 }
 
 test_allows_agent_errors_when_explicitly_requested() {
@@ -136,7 +150,7 @@ test_rejects_mixed_evidence_tracks_even_when_agent_errors_allowed() {
       "$CHECKER" "$dir/pwnkit-stability-sample.json" 2>&1
   )" || status="$?"
 
-  [[ "$status" -eq 1 ]]
+  [[ "$status" -eq 1 ]] || return 1
   rg -q 'evidence tracks are not claim-safe' <<<"$output"
   rg -q 'mixed_upstream_and_patched=true' <<<"$output"
 }
@@ -160,7 +174,7 @@ test_rejects_db_only_positive_finding_claim() {
 
   output="$("$CHECKER" "$dir/pwnkit-stability-sample.json" 2>&1)" || status="$?"
 
-  [[ "$status" -eq 1 ]]
+  [[ "$status" -eq 1 ]] || return 1
   rg -q 'infers finding claims without final JSON support' <<<"$output"
   rg -q 'positive_differential_count_without_final_json_delta' <<<"$output"
 }
@@ -171,12 +185,13 @@ test_rejects_missing_sample() {
 
   output="$("$CHECKER" "$(new_temp_dir)/missing.json" 2>&1)" || status="$?"
 
-  [[ "$status" -eq 2 ]]
+  [[ "$status" -eq 2 ]] || return 1
   rg -q 'pwnkit sample summary not found' <<<"$output"
 }
 
 test_accepts_clean_sample
 test_rejects_agent_error_sample_with_sanitized_output
+test_redacts_unknown_agent_error_class
 test_allows_agent_errors_when_explicitly_requested
 test_rejects_mixed_evidence_tracks_even_when_agent_errors_allowed
 test_rejects_db_only_positive_finding_claim
