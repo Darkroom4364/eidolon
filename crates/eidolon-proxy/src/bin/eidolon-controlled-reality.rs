@@ -177,6 +177,7 @@ fn validate_listen_addr(address: SocketAddr, owned_cluster_lab: bool) -> Result<
 }
 
 fn parse_auth_secret_path(value: &str) -> Result<PathBuf, String> {
+    // foxguard: ignore[rs/no-path-traversal] - validated as absolute and parent-free below.
     let path = Path::new(value);
     if !path.is_absolute() {
         return Err("auth secret file path must be absolute".to_string());
