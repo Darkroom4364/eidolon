@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     fmt,
     io::{Read, Write},
-    net::{Shutdown, TcpStream},
-    sync::Mutex,
+    net::{Shutdown, SocketAddr, TcpStream},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -62,6 +62,51 @@ impl fmt::Debug for ControlledRealityBackendAuthSecret {
 impl Drop for ControlledRealityBackendAuthSecret {
     fn drop(&mut self) {
         self.0.fill(0);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlledRealityBackendClient {
+    address: SocketAddr,
+    secret: Arc<ControlledRealityBackendAuthSecret>,
+}
+
+impl ControlledRealityBackendClient {
+    pub fn new(address: SocketAddr, secret: ControlledRealityBackendAuthSecret) -> Self {
+        Self {
+            address,
+            secret: Arc::new(secret),
+        }
+    }
+
+    pub fn render(
+        &self,
+        request_id: RequestId,
+        request_kind: ControlledRealityRequestKind,
+        progress: ControlledRealityProgress,
+        resources: Option<ControlledRealityResourceDescriptor>,
+    ) -> Result<VerifiedControlledRealityRenderResponse, ControlledRealityBackendError> {
+        let request = SignedControlledRealityRenderRequest::new(
+            &self.secret,
+            request_id,
+            current_unix_secs()?,
+            request_kind,
+            progress,
+            resources,
+        )?;
+        let mut stream =
+            TcpStream::connect_timeout(&self.address, CONTROLLED_REALITY_BACKEND_IO_TIMEOUT)
+                .map_err(|_| ControlledRealityBackendError::ConnectFailed)?;
+        stream
+            .set_read_timeout(Some(CONTROLLED_REALITY_BACKEND_IO_TIMEOUT))
+            .and_then(|_| stream.set_write_timeout(Some(CONTROLLED_REALITY_BACKEND_IO_TIMEOUT)))
+            .map_err(|_| ControlledRealityBackendError::ConnectFailed)?;
+        write_render_request(&mut stream, &request)?;
+        stream
+            .shutdown(Shutdown::Write)
+            .map_err(|_| ControlledRealityBackendError::WriteFailed)?;
+        let response = read_render_response(&mut stream)?;
+        verify_render_response(&self.secret, &response, &request, current_unix_secs()?)
     }
 }
 
@@ -196,6 +241,7 @@ pub struct VerifiedControlledRealityRenderResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlledRealityBackendError {
     WeakSecret,
+    ConnectFailed,
     SchemaMismatch,
     AuthenticationFailed,
     StaleMessage,
@@ -225,6 +271,7 @@ impl ControlledRealityBackendError {
     pub fn audit_code(self) -> &'static str {
         match self {
             Self::WeakSecret => "weak_secret",
+            Self::ConnectFailed => "connect_failed",
             Self::SchemaMismatch => "schema_mismatch",
             Self::AuthenticationFailed => "authentication_failed",
             Self::StaleMessage => "stale_message",
@@ -809,6 +856,61 @@ mod tests {
                 request_id,
                 status: 200,
             }
+        );
+    }
+
+    #[test]
+    fn client_returns_only_a_verified_renderer_response() {
+        let now = current_unix_secs().expect("clock should be available");
+        let (request, resources) = fixture(now);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener address should exist");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("connection should arrive");
+            serve_render_connection(stream, &secret(), &replay_cache())
+        });
+        let client = ControlledRealityBackendClient::new(address, secret());
+
+        let rendered = client
+            .render(
+                request.request_id,
+                request.request_kind,
+                request.progress,
+                Some(resources),
+            )
+            .expect("client should verify the renderer response");
+
+        assert_eq!(rendered.request_id, request.request_id);
+        assert_eq!(rendered.status, 200);
+        assert_eq!(
+            server.join().expect("server should finish"),
+            ControlledRealityBackendConnectionOutcome::Served {
+                request_id: request.request_id,
+                status: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn client_reports_connection_failure_without_retrying() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener address should exist");
+        drop(listener);
+        let client = ControlledRealityBackendClient::new(address, secret());
+        let (request, resources) = fixture(current_unix_secs().expect("clock should be available"));
+
+        assert_eq!(
+            client.render(
+                request.request_id,
+                request.request_kind,
+                request.progress,
+                Some(resources),
+            ),
+            Err(ControlledRealityBackendError::ConnectFailed)
         );
     }
 

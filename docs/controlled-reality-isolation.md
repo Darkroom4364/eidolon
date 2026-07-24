@@ -4,13 +4,16 @@ Status: issue `#176` foundation; not an isolation or production-readiness claim
 
 ## Current boundary
 
-The active proxy still renders controlled-reality responses in process. Its
-policy state, request correlation, durable workflow state, evidence, depth
-limits, and protected-upstream routing remain authoritative.
+The proxy defaults to in-process rendering. Operators can instead configure
+the standalone `eidolon-controlled-reality` process with
+`--controlled-reality-backend-addr` and
+`--controlled-reality-backend-auth-secret-file`. Remote mode has no local
+rendering fallback.
 
-The standalone `eidolon-controlled-reality` binary establishes a future
-separate-process rendering boundary. It is not selected by the proxy or
-deployed by the Shield Lab overlays yet.
+Policy state, request correlation, durable workflow state, evidence, depth
+limits, response headers, and protected-upstream routing remain proxy-owned.
+No Shield Lab overlay deploys the renderer yet, so this is process separation,
+not a hard network-isolation claim.
 
 The renderer protocol is deliberately closed:
 
@@ -101,17 +104,17 @@ Before the proxy can use the separate renderer in Kubernetes:
 10. Define restart and multi-replica replay behavior before allowing stateful
     rendering.
 
-## Required proxy integration slice
+## Proxy integration contract
 
-Proxy integration must preserve these failure rules:
+Remote proxy integration preserves these failure rules:
 
 - no fallback to the in-process renderer after remote mode is selected
 - timeout, disconnect, invalid authentication, stale frame, wrong request ID,
   malformed body, or oversized output rolls back the pending workflow step
-- every backend failure returns a bounded local response and makes zero
-  protected-upstream requests
-- backend network I/O must not run under the current global workflow mutex;
-  concurrency must be isolated per session or by bounded lock sharding
+- every backend failure returns a fixed private/no-store `503` and remains on
+  an Eidolon-owned route
+- backend network I/O is isolated by 64 bounded session-keyed lock shards
+  rather than one global workflow mutex
 - policy, evidence interaction, durable response expectations, headers, cache
   policy, and artifact digest remain proxy-owned
 
