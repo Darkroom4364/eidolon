@@ -218,6 +218,15 @@ validated interaction linked to the exported request. The artifact SHA-256
 identifies the synthetic bytes and does not prove that the decoy narrative is
 true.
 
+Issue `#176` is moving response rendering toward a separate process. The first
+foundation is a closed, authenticated renderer protocol and standalone binary;
+the active proxy path remains in process. The renderer cannot choose routing,
+policy, evidence, headers, cache policy, or artifact identity, and it receives
+no raw request or session identity. It is not deployed by the current
+OrbStack or kind overlays because those profiles do not presently provide an
+enforced, live-tested network boundary. See
+[`controlled-reality-isolation.md`](controlled-reality-isolation.md).
+
 ## 3. Bait/Canary Engine
 
 The bait engine creates traceable false evidence.

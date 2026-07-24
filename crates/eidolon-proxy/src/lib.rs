@@ -1,4 +1,5 @@
 pub mod controlled_reality;
+pub mod controlled_reality_backend;
 pub mod debug_log;
 pub mod event_log;
 pub mod ingress_identity;
