@@ -74,6 +74,22 @@ request arrival, not the absence of a storage mutation in a stateful target.
 The backend failure reason currently remains in the debug audit rather than a
 first-class durable event/export field.
 
+On 2026-07-24,
+`examples/shield-lab/smoke-controlled-reality-capacity-kind.sh` passed with all
+four renderer bounds temporarily reduced to one. It forced connection-queue
+saturation and audit drops, then filled the replay cache with one valid action.
+A second request failed closed with a synthetic `503` and no local fallback.
+Renderer audit counters proved all three saturation paths and remained
+monotonic. The target-side detector was baselined on both protected replicas
+and observed zero capacity-test writes. The smoke restored the exact original
+renderer arguments and waited for the default deployment to become ready.
+
+The renderer can name `replay_cache_saturated` because it authenticates and
+rejects the request. The current closed protocol does not return typed error
+frames, so the proxy records the empty error response as `malformed_frame`.
+The live proof requires both request-linked records rather than claiming the
+proxy received a reason the protocol does not transmit.
+
 The renderer protocol is deliberately closed:
 
 - requests contain only a request ID, a classified action kind, workflow
