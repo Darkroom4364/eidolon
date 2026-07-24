@@ -13,6 +13,9 @@ const OWNED_CLUSTER_LAB_ENV: &str = "EIDOLON_OWNED_CLUSTER_LAB";
 const PROFILE_ENV: &str = "EIDOLON_LAB_TARGET_PROFILE";
 const DEFAULT_PROFILE: &str = "default";
 const NEGATIVE_CONTROL_PROFILE: &str = "qualification_negative_control";
+const SHIELD_LAB_PROBE_HEADER: &str = "X-Shield-Lab-Probe";
+const SHIELD_LAB_PROBE_ID_PREFIX: &str = "shield-probe-";
+const MAX_SHIELD_LAB_PROBE_ID_LEN: usize = 64;
 const SECURITY_HEADERS: &[(&str, &str)] = &[
     (
         "Content-Security-Policy",
@@ -122,9 +125,67 @@ fn handle_connection(mut stream: TcpStream, profile: TargetProfile) -> io::Resul
     }
 
     let request = Request::parse(&buffer[..bytes_read]);
+    audit_protected_upstream_probe(&request)?;
     let response = route_request(profile, &request);
     stream.write_all(&response.to_http_bytes())?;
     stream.flush()
+}
+
+fn audit_protected_upstream_probe(request: &Request) -> io::Result<()> {
+    let Some(event) = protected_upstream_probe_audit_event(request) else {
+        return Ok(());
+    };
+
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{event}")?;
+    stdout.flush()
+}
+
+fn protected_upstream_probe_audit_event(request: &Request) -> Option<Value> {
+    let probe_id = protected_upstream_probe_id(request)?;
+    Some(serde_json::json!({
+        "event": "protected_upstream_probe_observed",
+        "probe_id": probe_id,
+    }))
+}
+
+fn protected_upstream_probe_id(request: &Request) -> Option<&str> {
+    if request.method != "POST" || request.path != "/api/v2/import/reconcile" {
+        return None;
+    }
+
+    let mut probe_headers = request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(SHIELD_LAB_PROBE_HEADER))
+        .map(|(_, value)| value.as_str());
+    let probe_id = probe_headers.next()?;
+    if probe_headers.next().is_some() || !is_safe_shield_lab_probe_id(probe_id) {
+        return None;
+    }
+
+    Some(probe_id)
+}
+
+fn is_safe_shield_lab_probe_id(value: &str) -> bool {
+    if value.len() > MAX_SHIELD_LAB_PROBE_ID_LEN {
+        return false;
+    }
+
+    let Some(suffix) = value.strip_prefix(SHIELD_LAB_PROBE_ID_PREFIX) else {
+        return false;
+    };
+    let bytes = suffix.as_bytes();
+    !bytes.is_empty()
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -755,6 +816,62 @@ mod tests {
             &Request::for_test("POST", "/api/v2/import/reconcile"),
         );
         assert_eq!(response.status, 404);
+    }
+
+    #[test]
+    fn valid_shield_lab_probe_emits_only_the_safe_probe_id() {
+        let request = Request::for_test("POST", "/api/v2/import/reconcile")
+            .with_header("x-shield-lab-probe", "shield-probe-20260724-a1b2c3d4");
+
+        assert_eq!(
+            protected_upstream_probe_audit_event(&request),
+            Some(serde_json::json!({
+                "event": "protected_upstream_probe_observed",
+                "probe_id": "shield-probe-20260724-a1b2c3d4",
+            }))
+        );
+    }
+
+    #[test]
+    fn shield_lab_probe_audit_rejects_untrusted_header_values() {
+        let invalid_values = [
+            "",
+            "arbitrary",
+            "shield-probe-",
+            "shield-probe-UPPERCASE",
+            "shield-probe-leading space",
+            "shield-probe-json\"escape",
+            "shield-probe-unicode-\u{e9}",
+            "shield-probe-trailing-",
+            "shield-probe-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+
+        for value in invalid_values {
+            let request = Request::for_test("POST", "/api/v2/import/reconcile")
+                .with_header(SHIELD_LAB_PROBE_HEADER, value);
+            assert_eq!(
+                protected_upstream_probe_audit_event(&request),
+                None,
+                "unexpectedly accepted probe header: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shield_lab_probe_audit_requires_the_exact_route_and_one_header() {
+        let valid_probe_id = "shield-probe-20260724-a1b2c3d4";
+        let wrong_method = Request::for_test("GET", "/api/v2/import/reconcile")
+            .with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id);
+        let wrong_path = Request::for_test("POST", "/api/v1/imports")
+            .with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id);
+        let missing_header = Request::for_test("POST", "/api/v2/import/reconcile");
+        let duplicate_header = Request::for_test("POST", "/api/v2/import/reconcile")
+            .with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id)
+            .with_header(SHIELD_LAB_PROBE_HEADER, "shield-probe-other");
+
+        for request in [wrong_method, wrong_path, missing_header, duplicate_header] {
+            assert_eq!(protected_upstream_probe_audit_event(&request), None);
+        }
     }
 
     #[test]
