@@ -24,6 +24,11 @@ The next gap is deployment-grade validation:
 - event export and observability
 - scale and failure testing against owned targets
 
+The standalone controlled-reality renderer is an isolation foundation only.
+It is not used by the active proxy or deployed by the current overlays. See
+[`docs/controlled-reality-isolation.md`](../../docs/controlled-reality-isolation.md)
+for the exact boundary and remaining work.
+
 ## Private repo boundary
 
 Recommended private repo contents:
@@ -131,6 +136,8 @@ Namespaces:
 - wires the proxy to the target with a config map
 - persists proxy event, debug, intervention, and policy state on a PVC
 - reserves a default-deny policy for the controlled-reality namespace
+- includes a dedicated non-root controlled-reality renderer image definition
+  without deploying it into a cluster that cannot enforce its boundary
 - includes local image build and OrbStack deploy scripts
 - includes operator scripts for status, logs, and redacted evidence export
 - includes live edge-decision export for webhook/SIEM handoff
@@ -169,6 +176,8 @@ local files first.
 - deploy ingress controllers
 - provision SIEM or webhook exporters
 - isolate controlled reality beyond namespace and network-policy reservation
+- install and live-test a NetworkPolicy-enforcing cluster profile before
+  deploying the standalone renderer
 - run workload generators
 - manage secrets
 
@@ -180,6 +189,7 @@ Those should live in the private repo as the next hardening steps.
 2. Add image build automation for:
    - `eidolon-shield-proxy:local`
    - `eidolon-owned-demo-target:local`
+   - `eidolon-controlled-reality:local`
 3. Add environment overlays for:
    - `kind`
    - `orbstack`
@@ -203,6 +213,17 @@ Build local images for OrbStack Kubernetes:
 ```sh
 examples/shield-lab/build-orbstack-images.sh
 ```
+
+Build the standalone renderer foundation separately:
+
+```sh
+docker build \
+  -f examples/shield-lab/Dockerfile.controlled-reality-backend \
+  -t eidolon-controlled-reality:local \
+  .
+```
+
+That image is not deployed by the current overlays.
 
 Deploy to the active OrbStack Kubernetes context:
 
