@@ -24,8 +24,9 @@ The next gap is deployment-grade validation:
 - event export and observability
 - scale and failure testing against owned targets
 
-The standalone controlled-reality renderer is an isolation foundation only.
-It is not used by the active proxy or deployed by the current overlays. See
+The kind overlay deploys the standalone controlled-reality renderer and makes
+the proxy use it without an in-process fallback. OrbStack remains unchanged
+and continues to use in-process rendering. See
 [`docs/controlled-reality-isolation.md`](../../docs/controlled-reality-isolation.md)
 for the exact boundary and remaining work.
 
@@ -99,6 +100,11 @@ Keep out of the private repo:
       eidolon-proxy.yaml
       demo-target.yaml
       controlled-reality-networkpolicy.yaml
+    kind/
+      kustomization.yaml
+      controlled-reality-renderer.yaml
+      controlled-reality-renderer-networkpolicy.yaml
+      proxy-controlled-reality-renderer-patch.yaml
     orbstack/
       kustomization.yaml
       shield-edge-service.yaml
@@ -118,14 +124,14 @@ internet / workload generators
         |
         +---- protected upstream target
         |
-        +---- reserved controlled-reality namespace
+        +---- kind-only isolated renderer
 ```
 
 Namespaces:
 
 - `shield-system`: Eidolon runtime
 - `shield-targets`: owned demo or qualification targets
-- `shield-controlled-reality`: future isolated decoy backends
+- `shield-controlled-reality`: kind-only isolated renderer
 - `shield-observability`: logs, metrics, dashboards
 
 ## What this template does now
@@ -135,9 +141,9 @@ Namespaces:
 - deploys a simple Eidolon proxy service and owned demo target
 - wires the proxy to the target with a config map
 - persists proxy event, debug, intervention, and policy state on a PVC
-- reserves a default-deny policy for the controlled-reality namespace
-- includes a dedicated non-root controlled-reality renderer image definition
-  without deploying it into a cluster that cannot enforce its boundary
+- deploys the renderer only in kind with a dedicated secret, hardened container,
+  proxy-only ingress, and namespace-wide default-deny egress
+- pins a kind node image and installs pinned Calico manifests before deployment
 - includes local image build and OrbStack deploy scripts
 - includes operator scripts for status, logs, and redacted evidence export
 - includes live edge-decision export for webhook/SIEM handoff
@@ -175,11 +181,9 @@ local files first.
 
 - deploy ingress controllers
 - provision SIEM or webhook exporters
-- isolate controlled reality beyond namespace and network-policy reservation
-- install and live-test a NetworkPolicy-enforcing cluster profile before
-  deploying the standalone renderer
+- prove the kind boundary with live allow/deny and denied-flow evidence
 - run workload generators
-- manage secrets
+- integrate an external production secret manager
 
 Those should live in the private repo as the next hardening steps.
 
@@ -214,16 +218,20 @@ Build local images for OrbStack Kubernetes:
 examples/shield-lab/build-orbstack-images.sh
 ```
 
-Build the standalone renderer foundation separately:
+Build all three kind images:
 
 ```sh
-docker build \
-  -f examples/shield-lab/Dockerfile.controlled-reality-backend \
-  -t eidolon-controlled-reality:local \
-  .
+examples/shield-lab/build-kind-images.sh
 ```
 
-That image is not deployed by the current overlays.
+Create the pinned kind cluster, install Calico, load the images, and deploy:
+
+```sh
+examples/shield-lab/deploy-kind.sh
+```
+
+The kind path has no NodePort. Reach the proxy with the port-forward command
+printed by the deploy script.
 
 Deploy to the active OrbStack Kubernetes context:
 

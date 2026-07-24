@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eidolon-controlled-reality
+  namespace: shield-controlled-reality
+  labels:
+    app.kubernetes.io/name: eidolon-controlled-reality
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: eidolon-controlled-reality
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: eidolon-controlled-reality
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controlled-reality
+          image: eidolon-controlled-reality
+          imagePullPolicy: IfNotPresent
+          args:
+            - --owned-cluster-lab
+            - --listen-addr
+            - 0.0.0.0:9103
+            - --auth-secret-file
+            - /var/run/secrets/eidolon-controlled-reality/auth-secret.txt
+          ports:
+            - containerPort: 9103
+              name: renderer
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+              ephemeral-storage: 16Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+          volumeMounts:
+            - name: renderer-auth
+              mountPath: /var/run/secrets/eidolon-controlled-reality
+              readOnly: true
+      volumes:
+        - name: renderer-auth
+          secret:
+            secretName: eidolon-controlled-reality-auth
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: eidolon-controlled-reality
+  namespace: shield-controlled-reality
+spec:
+  selector:
+    app.kubernetes.io/name: eidolon-controlled-reality
+  ports:
+    - name: renderer
+      port: 9103
+      targetPort: renderer
