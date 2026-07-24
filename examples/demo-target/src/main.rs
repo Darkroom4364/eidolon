@@ -148,6 +148,8 @@ fn protected_upstream_probe_audit_event(request: &Request) -> Option<Value> {
 
     let mut event = serde_json::json!({
         "event": "protected_upstream_probe_observed",
+        "method": "POST",
+        "route": "api_v2_import_reconcile",
     });
     if let Some(probe_id) = protected_upstream_probe_id(request) {
         event["probe_id"] = Value::String(probe_id.to_string());
@@ -829,7 +831,9 @@ mod tests {
             protected_upstream_probe_audit_event(&request),
             Some(serde_json::json!({
                 "event": "protected_upstream_probe_observed",
+                "method": "POST",
                 "probe_id": "shield-probe-20260724-a1b2c3d4",
+                "route": "api_v2_import_reconcile",
             }))
         );
     }
@@ -855,6 +859,8 @@ mod tests {
                 protected_upstream_probe_audit_event(&request),
                 Some(serde_json::json!({
                     "event": "protected_upstream_probe_observed",
+                    "method": "POST",
+                    "route": "api_v2_import_reconcile",
                 })),
                 "unsafe probe header leaked into the audit: {value:?}"
             );
@@ -886,6 +892,8 @@ mod tests {
                 protected_upstream_probe_audit_event(&request),
                 Some(serde_json::json!({
                     "event": "protected_upstream_probe_observed",
+                    "method": "POST",
+                    "route": "api_v2_import_reconcile",
                 }))
             );
         }

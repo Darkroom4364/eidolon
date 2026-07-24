@@ -27,6 +27,20 @@ canary, and internet from `shield-system` while all four destinations were
 denied from `shield-controlled-reality`. It also proved a non-proxy pod could
 not reach the renderer and matched all five denials to Calico flow records.
 
+`examples/shield-lab/smoke-controlled-reality-outage-kind.sh` adds the outage
+contract. It removes every renderer Pod and Service endpoint, performs a valid
+same-session minted action, and requires the fixed private/no-store synthetic
+`503`, an Eidolon-owned request-linked response event, and one request-linked
+`connect_failed` debug audit with no local fallback. A unique safe marker first
+proves the target-side detector works. Any later protected reconcile audit,
+even if an intermediary strips that marker, fails the smoke. A target Pod
+replacement or container restart also invalidates the proof.
+
+The owned demo target is stateless. This proves zero protected write-shaped
+request arrival, not the absence of a storage mutation in a stateful target.
+The backend failure reason currently remains in the debug audit rather than a
+first-class durable event/export field.
+
 The renderer protocol is deliberately closed:
 
 - requests contain only a request ID, a classified action kind, workflow
@@ -88,7 +102,7 @@ The local profiles still cannot support an honest hard-isolation claim:
 - the checked-in kind smoke now proves the active renderer path, paired
   allow/deny behavior, and request/pod-correlated denied-flow evidence
 - this proof does not cover managed-cluster networking, host compromise,
-  renderer outage, saturation, restart, or multi-replica behavior
+  saturation, restart, or multi-replica behavior
 
 ## Remaining deployment slice
 
@@ -98,8 +112,8 @@ The enforced kind network boundary is now proven. Issue `#176` still requires:
    saturation counters to operators.
 2. Define restart and multi-replica replay behavior before allowing stateful
     rendering.
-3. Prove renderer outage and the operator kill switch preserve zero protected
-   writes.
+3. Keep the renderer-outage smoke green in a live gate and prove the operator
+   kill switch preserves zero protected writes.
 
 ## Proxy integration contract
 
