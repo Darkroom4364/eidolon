@@ -79,33 +79,33 @@ pub struct ControlledRealityResourceDescriptor {
 }
 
 impl ControlledRealityResourceDescriptor {
-    pub fn for_session(session_id: SessionId, origin_request_id: RequestId) -> Self {
+    pub fn for_session(
+        session_id: SessionId,
+        origin_request_id: RequestId,
+    ) -> Result<Self, String> {
         let job_id = ControlledRealityJobId::new(synthetic_id(
             "job",
             "eidolon:import-reconcile:job:v1",
             session_id,
             origin_request_id,
-        ))
-        .expect("generated job id should satisfy the typed contract");
+        ))?;
         let artifact_id = ControlledRealityArtifactId::new(synthetic_id(
             "artifact",
             "eidolon:import-reconcile:artifact:v1",
             session_id,
             origin_request_id,
-        ))
-        .expect("generated artifact id should satisfy the typed contract");
+        ))?;
         let artifact_body = synthetic_artifact_body(&job_id, &artifact_id);
         let artifact_bytes =
-            serde_json::to_vec(&artifact_body).expect("static synthetic artifact should serialize");
+            serde_json::to_vec(&artifact_body).map_err(|error| error.to_string())?;
         let artifact = ControlledRealityArtifactRef {
             artifact_id,
             sha256: ControlledRealityArtifactSha256::new(digest_hex(&Sha256::digest(
                 &artifact_bytes,
-            )))
-            .expect("generated artifact digest should satisfy the typed contract"),
+            )))?,
         };
 
-        Self { job_id, artifact }
+        Ok(Self { job_id, artifact })
     }
 
     pub fn status_path(&self) -> String {
@@ -118,7 +118,9 @@ impl ControlledRealityResourceDescriptor {
 
     pub fn has_valid_artifact_digest(&self) -> bool {
         let body = synthetic_artifact_body(&self.job_id, &self.artifact.artifact_id);
-        let bytes = serde_json::to_vec(&body).expect("static synthetic artifact should serialize");
+        let Ok(bytes) = serde_json::to_vec(&body) else {
+            return false;
+        };
         self.artifact.sha256.as_str() == digest_hex(&Sha256::digest(&bytes))
     }
 
@@ -169,8 +171,11 @@ impl ControlledRealityResponder {
         let Some(origin_request_id) = origin_request_id else {
             return ControlledRealityRequestKind::UnknownResource;
         };
-        let resources =
-            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id);
+        let Ok(resources) =
+            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id)
+        else {
+            return ControlledRealityRequestKind::UnknownResource;
+        };
         if request.path == resources.status_path() {
             return if request.method == "GET" {
                 ControlledRealityRequestKind::StatusRead
@@ -196,8 +201,8 @@ impl ControlledRealityResponder {
         kind: ControlledRealityRequestKind,
         progress: ControlledRealityProgress,
     ) -> ControlledRealityDecision {
-        let resources = progress.origin_request_id.map(|origin_request_id| {
-            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id)
+        let resources = progress.origin_request_id.and_then(|origin_request_id| {
+            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id).ok()
         });
         let interaction = resources
             .as_ref()
@@ -245,8 +250,8 @@ impl ControlledRealityResponder {
                 ControlledRealityRequestKind::UnknownResource
             }
         };
-        let resources = progress.origin_request_id.map(|origin_request_id| {
-            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id)
+        let resources = progress.origin_request_id.and_then(|origin_request_id| {
+            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id).ok()
         });
         ControlledRealityExpectedResponse {
             status: response_for(request_kind, progress, resources.as_ref()).status,
@@ -554,7 +559,7 @@ fn rendered_json_response(
 ) -> ControlledRealityRenderedResponse {
     ControlledRealityRenderedResponse {
         status,
-        body: serde_json::to_vec(&body).expect("controlled-reality JSON should serialize"),
+        body: body.to_string().into_bytes(),
     }
 }
 
@@ -649,6 +654,14 @@ mod tests {
         RequestId(uuid::Uuid::from_u128(GOLDEN_REQUEST_UUID))
     }
 
+    fn generated_resources(
+        session_id: SessionId,
+        request_id: RequestId,
+    ) -> ControlledRealityResourceDescriptor {
+        ControlledRealityResourceDescriptor::for_session(session_id, request_id)
+            .expect("fixed digest-derived resources should satisfy the typed contract")
+    }
+
     fn golden_resources() -> ControlledRealityResourceDescriptor {
         ControlledRealityResourceDescriptor {
             job_id: ControlledRealityJobId::new(GOLDEN_JOB_ID)
@@ -703,10 +716,7 @@ mod tests {
 
     #[test]
     fn fixed_session_resources_match_legacy_identifiers_and_artifact_digest() {
-        let resources = ControlledRealityResourceDescriptor::for_session(
-            golden_session_id(),
-            golden_request_id(),
-        );
+        let resources = generated_resources(golden_session_id(), golden_request_id());
 
         assert_eq!(resources, golden_resources());
         assert_eq!(
@@ -982,8 +992,7 @@ mod tests {
         let responder = ControlledRealityResponder;
         let session_id = SessionId::new();
         let origin_request_id = RequestId::new();
-        let resources =
-            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id);
+        let resources = generated_resources(session_id, origin_request_id);
 
         let status_request = request("GET", &resources.status_path());
         assert_eq!(
@@ -1074,12 +1083,10 @@ mod tests {
     fn identifiers_are_bound_to_session_and_origin_request() {
         let session = SessionId::new();
         let origin = RequestId::new();
-        let same = ControlledRealityResourceDescriptor::for_session(session, origin);
-        let repeated = ControlledRealityResourceDescriptor::for_session(session, origin);
-        let other_session =
-            ControlledRealityResourceDescriptor::for_session(SessionId::new(), origin);
-        let other_origin =
-            ControlledRealityResourceDescriptor::for_session(session, RequestId::new());
+        let same = generated_resources(session, origin);
+        let repeated = generated_resources(session, origin);
+        let other_session = generated_resources(SessionId::new(), origin);
+        let other_origin = generated_resources(session, RequestId::new());
 
         assert_eq!(same.job_id, repeated.job_id);
         assert_eq!(same.artifact, repeated.artifact);
@@ -1090,8 +1097,7 @@ mod tests {
     #[test]
     fn wrong_session_resource_is_unknown_and_never_reflected() {
         let responder = ControlledRealityResponder;
-        let owner =
-            ControlledRealityResourceDescriptor::for_session(SessionId::new(), RequestId::new());
+        let owner = generated_resources(SessionId::new(), RequestId::new());
         let other_session = SessionId::new();
         let other_origin = RequestId::new();
         let request = request("GET", &owner.status_path());

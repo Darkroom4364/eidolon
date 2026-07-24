@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::ExitCode,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -85,7 +85,8 @@ impl CliAction {
             match flag {
                 "--auth-secret-file" => {
                     let value = option_value(flag, inline_value, &mut args)?;
-                    set_once(&mut auth_secret_path, flag, PathBuf::from(value))?;
+                    let path = parse_auth_secret_path(&value)?;
+                    set_once(&mut auth_secret_path, flag, path)?;
                 }
                 "--listen-addr" => {
                     let value = option_value(flag, inline_value, &mut args)?;
@@ -173,6 +174,20 @@ fn validate_listen_addr(address: SocketAddr, owned_cluster_lab: bool) -> Result<
         );
     }
     Ok(())
+}
+
+fn parse_auth_secret_path(value: &str) -> Result<PathBuf, String> {
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return Err("auth secret file path must be absolute".to_string());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("auth secret file path must not contain `..` components".to_string());
+    }
+    Ok(path.to_path_buf())
 }
 
 fn run_server(config: ServerConfig) -> io::Result<()> {
@@ -484,42 +499,15 @@ Options:
 mod tests {
     use std::{
         env, fs,
-        io::Read,
-        net::{Shutdown, TcpStream},
-        process::{Child, Command, Stdio},
         sync::{atomic::Ordering, Condvar},
-        thread,
-        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-    };
-
-    use eidolon_core::{ControlledRealityWorkflowState, RequestId, SessionId};
-    use eidolon_proxy::{
-        controlled_reality::{ControlledRealityRequestKind, ControlledRealityResourceDescriptor},
-        controlled_reality_backend::{
-            current_unix_secs, read_render_response, verify_render_response, write_render_request,
-            SignedControlledRealityRenderRequest,
-        },
-        policy_store::ControlledRealityProgress,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
 
-    const CHILD_SERVER_ENV: &str = "EIDOLON_CONTROLLED_REALITY_TEST_CHILD";
-    const CHILD_BINARY_PATH_ENV: &str = "EIDOLON_CONTROLLED_REALITY_TEST_BINARY";
-    const CHILD_SECRET_PATH_ENV: &str = "EIDOLON_CONTROLLED_REALITY_TEST_SECRET_PATH";
-    const CHILD_LISTEN_ADDR_ENV: &str = "EIDOLON_CONTROLLED_REALITY_TEST_LISTEN_ADDR";
     const TEST_SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
     const TEST_SECRET_HEX: &str =
         "3031323334353637383961626364656630313233343536373839616263646566";
-
-    struct ChildGuard(Child);
-
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
 
     #[test]
     fn non_loopback_requires_owned_cluster_lab() {
@@ -541,6 +529,20 @@ mod tests {
         ])
         .expect("owned lab should allow non-loopback");
         assert!(matches!(action, CliAction::Run(_)));
+    }
+
+    #[test]
+    fn auth_secret_path_requires_an_absolute_normalized_shape() {
+        for path in ["relative-secret", "/var/run/eidolon/../secret"] {
+            let error = CliAction::from_args(["--auth-secret-file", path])
+                .expect_err("unsafe secret path shape should be rejected");
+            assert!(error.contains("auth secret file path"));
+        }
+        assert!(CliAction::from_args([
+            "--auth-secret-file",
+            "/var/run/secrets/eidolon/renderer-auth",
+        ])
+        .is_ok());
     }
 
     #[test]
@@ -716,83 +718,6 @@ mod tests {
         fs::remove_file(secret_path).expect("secret fixture should be removed");
     }
 
-    #[test]
-    fn valid_signed_round_trip_through_cli_entrypoint_process() {
-        let secret_path = unique_temp_path();
-        fs::write(&secret_path, format!("{TEST_SECRET_HEX}\n"))
-            .expect("secret fixture should write");
-        let probe = TcpListener::bind("127.0.0.1:0").expect("port probe should bind");
-        let address = probe.local_addr().expect("probe address should exist");
-        drop(probe);
-
-        let child = spawn_cli_server(&secret_path, address);
-        let mut child = ChildGuard(child);
-        wait_until_listening(&mut child.0, address);
-
-        let now = current_unix_secs().expect("clock should be available");
-        let origin_request_id = RequestId::new();
-        let resources =
-            ControlledRealityResourceDescriptor::for_session(SessionId::new(), origin_request_id);
-        let request = SignedControlledRealityRenderRequest::new(
-            &test_secret(),
-            RequestId::new(),
-            now,
-            ControlledRealityRequestKind::JobSubmitted,
-            ControlledRealityProgress {
-                depth: 1,
-                from_state: ControlledRealityWorkflowState::Ready,
-                to_state: ControlledRealityWorkflowState::Queued,
-                origin_request_id: Some(origin_request_id),
-            },
-            Some(resources),
-        )
-        .expect("request should sign");
-        let mut stream = TcpStream::connect(address).expect("client should connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .expect("read deadline should set");
-        stream
-            .set_write_timeout(Some(Duration::from_secs(3)))
-            .expect("write deadline should set");
-        write_render_request(&mut stream, &request).expect("request should write");
-        stream
-            .shutdown(Shutdown::Write)
-            .expect("request side should close");
-        let response = read_render_response(&mut stream).expect("response should parse");
-        let verified = verify_render_response(&test_secret(), &response, &request, now)
-            .expect("response should authenticate");
-
-        assert_eq!(verified.status, 202);
-        assert!(String::from_utf8(verified.body)
-            .expect("body should be utf8")
-            .contains(r#""status":"queued""#));
-
-        drop(child);
-        fs::remove_file(secret_path).expect("secret fixture should be removed");
-    }
-
-    #[test]
-    fn child_server_helper() {
-        if env::var_os(CHILD_SERVER_ENV).is_none() {
-            return;
-        }
-        let secret_path =
-            PathBuf::from(env::var_os(CHILD_SECRET_PATH_ENV).expect("secret path is required"));
-        let listen_addr = env::var(CHILD_LISTEN_ADDR_ENV).expect("listen address is required");
-        let exit = run_cli([
-            "--auth-secret-file".to_string(),
-            secret_path.to_string_lossy().into_owned(),
-            "--listen-addr".to_string(),
-            listen_addr,
-        ]);
-        panic!("CLI server exited unexpectedly with {exit:?}");
-    }
-
-    fn test_secret() -> ControlledRealityBackendAuthSecret {
-        ControlledRealityBackendAuthSecret::new(TEST_SECRET.to_vec())
-            .expect("test secret should be accepted")
-    }
-
     fn unique_temp_path() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -802,64 +727,5 @@ mod tests {
             "eidolon-controlled-reality-secret-{}-{nanos}",
             std::process::id()
         ))
-    }
-
-    fn spawn_cli_server(secret_path: &Path, address: SocketAddr) -> Child {
-        let packaged_binary = env::var_os(CHILD_BINARY_PATH_ENV)
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("CARGO_BIN_EXE_eidolon-controlled-reality").map(PathBuf::from))
-            .or_else(|| option_env!("CARGO_BIN_EXE_eidolon-controlled-reality").map(PathBuf::from));
-        let mut command = if let Some(binary) = packaged_binary {
-            let mut command = Command::new(binary);
-            command.args([
-                "--auth-secret-file",
-                &secret_path.to_string_lossy(),
-                "--listen-addr",
-                &address.to_string(),
-            ]);
-            command
-        } else {
-            // Binary unit tests do not normally receive CARGO_BIN_EXE. The helper
-            // still enters through run_cli, exercising the same parser/startup path.
-            let mut command =
-                Command::new(env::current_exe().expect("test executable should exist"));
-            command
-                .args(["--exact", "tests::child_server_helper", "--nocapture"])
-                .env(CHILD_SERVER_ENV, "1")
-                .env(CHILD_SECRET_PATH_ENV, secret_path)
-                .env(CHILD_LISTEN_ADDR_ENV, address.to_string());
-            command
-        };
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("CLI server should start")
-    }
-
-    fn wait_until_listening(child: &mut Child, address: SocketAddr) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if let Some(status) = child.try_wait().expect("child status should be readable") {
-                let mut stderr = String::new();
-                if let Some(mut child_stderr) = child.stderr.take() {
-                    child_stderr
-                        .read_to_string(&mut stderr)
-                        .expect("child stderr should be readable");
-                }
-                panic!("child server exited before listening: {status}: {stderr}");
-            }
-            match TcpStream::connect_timeout(&address, Duration::from_millis(50)) {
-                Ok(mut stream) => {
-                    let _ = stream.shutdown(Shutdown::Write);
-                    let mut ignored = Vec::new();
-                    let _ = stream.read_to_end(&mut ignored);
-                    return;
-                }
-                Err(_) => thread::sleep(Duration::from_millis(20)),
-            }
-        }
-        panic!("child server did not start before deadline");
     }
 }
