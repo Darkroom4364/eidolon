@@ -8,19 +8,6 @@ new_temp_dir() {
   mktemp -d "${TMPDIR:-/tmp}/eidolon-m3-pwnkit-promotion-runner-test.XXXXXX"
 }
 
-canonical_file_path() {
-  local path="$1"
-  local dir
-  local base
-
-  dir="$(dirname "$path")"
-  base="$(basename "$path")"
-  (
-    cd "$dir"
-    printf '%s/%s' "$(pwd -P)" "$base"
-  )
-}
-
 write_manifest() {
   local manifest="$1"
   local profile="$2"
@@ -83,16 +70,16 @@ test_dry_run_creates_variant_sample_plans() {
   local temp_dir
   local manifest
   local profile
-  local canonical_profile
   local matrix_dir
+  local configured_dir
 
   temp_dir="$(new_temp_dir)"
   manifest="$temp_dir/manifest.json"
   profile="$temp_dir/profile.json"
   matrix_dir="$temp_dir/matrix"
+  configured_dir="$matrix_dir/openapi_promotion_probe"
   printf '{"schema_version":1,"profile_id":"fixture"}\n' > "$profile"
   write_manifest "$manifest" "$profile"
-  canonical_profile="$(canonical_file_path "$profile")"
 
   EIDOLON_M3_PROMOTION_DRY_RUN=1 \
     EIDOLON_M3_PROMOTION_RUNS=2 \
@@ -111,8 +98,25 @@ test_dry_run_creates_variant_sample_plans() {
   ' "$matrix_dir/matrix-plan.json" >/dev/null
   rg -q '^run_count=2$' "$matrix_dir/default_m3_catalog/sample-plan.txt"
   rg -q '^bait_profile=default$' "$matrix_dir/default_m3_catalog/sample-plan.txt"
-  rg -q "^bait_profile=$canonical_profile$" \
-    "$matrix_dir/openapi_promotion_probe/sample-plan.txt"
+  rg -q '^bait_profile_sha256=none$' \
+    "$matrix_dir/default_m3_catalog/sample-plan.txt"
+  rg -q '^bait_profile=configured$' "$configured_dir/sample-plan.txt"
+  rg -q '^bait_profile_sha256=[0-9a-f]{64}$' "$configured_dir/sample-plan.txt"
+  rg -q '^bait_profile_snapshot=run-\*/private/bait-profile.json$' \
+    "$configured_dir/sample-plan.txt"
+  ! rg -F -q "$profile" "$configured_dir/sample-plan.txt"
+
+  for run_index in 1 2; do
+    cmp -s \
+      "$profile" \
+      "$configured_dir/run-$run_index/private/bait-profile.json"
+    jq -e --slurpfile run_metadata \
+      "$configured_dir/run-$run_index/sample-run-metadata.json" '
+        .profile_id == "fixture"
+        and (.sha256 | test("^[0-9a-f]{64}$"))
+        and $run_metadata[0].profile_sha256 == .sha256
+      ' "$configured_dir/run-$run_index/bait-profile-metadata.json" >/dev/null
+  done
 }
 
 test_rejects_invalid_variant_id() {

@@ -10,6 +10,108 @@ new_artifact() {
   printf '%s\n' "$dir"
 }
 
+sha256_file() {
+  local path="$1"
+  local output
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum "$path")"
+  else
+    output="$(shasum -a 256 "$path")"
+  fi
+
+  printf '%s' "${output%% *}"
+}
+
+sha256_jsonl() {
+  local path="$1"
+  local output
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(jq -cS '.' "$path" | sha256sum)"
+  else
+    output="$(jq -cS '.' "$path" | shasum -a 256)"
+  fi
+
+  printf '%s' "${output%% *}"
+}
+
+write_run_provenance() {
+  local dir="$1"
+  local summary="$dir/pwnkit-summary.json"
+  local profile="$dir/private/bait-profile.json"
+  local execution_id
+  local profile_sha256=""
+  local proxy_events_sha256
+  local summary_tmp="$summary.tmp"
+
+  [[ -f "$summary" ]] || return 0
+  execution_id="$(jq -er '.execution_id' "$summary")"
+  if [[ -f "$profile" ]]; then
+    profile_sha256="$(sha256_file "$profile")"
+  fi
+
+  jq -n \
+    --arg execution_id "$execution_id" \
+    --arg profile_sha256 "$profile_sha256" \
+    '{
+      schema_version: 1,
+      run_kind: "m3_pwnkit_sample_run",
+      execution_id: $execution_id,
+      profile_sha256: (
+        if $profile_sha256 == "" then null else $profile_sha256 end
+      )
+    }' > "$dir/sample-run-metadata.json"
+
+  jq -nc \
+    --arg execution_id "$execution_id" \
+    '{
+      schema_version: 2,
+      id: ("fixture-event-" + $execution_id),
+      kind: {
+        type: "fixture",
+        execution_id: $execution_id
+      }
+    }' > "$dir/proxy-events.jsonl"
+
+  proxy_events_sha256="$(sha256_jsonl "$dir/proxy-events.jsonl")"
+  jq --arg proxy_events_sha256 "$proxy_events_sha256" '
+    .proxy_events_canonical_sha256 = $proxy_events_sha256
+  ' "$summary" > "$summary_tmp"
+  mv "$summary_tmp" "$summary"
+}
+
+write_bait_profile_snapshot() {
+  local dir="$1"
+  local profile_id="$2"
+  local bait_id="$3"
+  local bait_class="$4"
+
+  mkdir -p "$dir/private"
+  jq -n \
+    --arg profile_id "$profile_id" \
+    --arg bait_id "$bait_id" \
+    --arg bait_class "$bait_class" \
+    '{
+      schema_version: 1,
+      profile_id: $profile_id,
+      baits: [{
+        id: $bait_id,
+        bait_class: $bait_class,
+        surface: "/fixture",
+        surface_kind: "docs",
+        expected_action: {
+          method: "POST",
+          path: "/api/fixture",
+          header_name: "X-Fixture",
+          header_value: "fixture"
+        }
+      }]
+    }' > "$dir/private/bait-profile.json"
+
+  write_run_provenance "$dir"
+}
+
 write_summary() {
   local dir="$1"
   local claim_level="$2"
@@ -18,6 +120,7 @@ write_summary() {
   local pinned_cookie_preserved="$5"
   local controlled_entries="$6"
   local eidolon_findings="${7:-0}"
+  local execution_id="${8:-$(basename "$dir")}"
 
   local bait_reached=false
   local bait_action=false
@@ -54,6 +157,7 @@ write_summary() {
   jq -n \
     --arg claim_level "$claim_level" \
     --arg git_head "$git_head" \
+    --arg execution_id "$execution_id" \
     --argjson direct_findings "$direct_findings" \
     --argjson eidolon_findings "$eidolon_findings" \
     --argjson bait_reached "$bait_reached" \
@@ -65,6 +169,7 @@ write_summary() {
     '{
       schema_version: 1,
       run_kind: "m3_pwnkit_codex_comparison",
+      execution_id: $execution_id,
       runner: {
         environment: {
           runner_environment: "host_mac",
@@ -224,6 +329,8 @@ write_summary() {
         )
       }
     }' > "$dir/pwnkit-summary.json"
+
+  write_run_provenance "$dir"
 }
 
 write_agent_trace_summary() {
@@ -256,6 +363,194 @@ mutate_summary() {
 
   jq "$filter" "$dir/pwnkit-summary.json" > "$tmp"
   mv "$tmp" "$dir/pwnkit-summary.json"
+  write_run_provenance "$dir"
+}
+
+set_bait_matrix() {
+  local dir="$1"
+  local bait_id="$2"
+  local exposure_count="$3"
+  local action_count="$4"
+  local confirmed_action_count="$5"
+  local surface="$6"
+  local action_path="$7"
+  local bait_class="${8:-}"
+  local profile_id="${9:-}"
+  local profile_sha256="${10:-}"
+  local tmp="$dir/pwnkit-summary.json.tmp"
+
+  jq \
+    --arg bait_id "$bait_id" \
+    --arg bait_class "$bait_class" \
+    --arg profile_id "$profile_id" \
+    --arg profile_sha256 "$profile_sha256" \
+    --argjson exposure_count "$exposure_count" \
+    --argjson action_count "$action_count" \
+    --argjson confirmed_action_count "$confirmed_action_count" \
+    --arg surface "$surface" \
+    --arg action_path "$action_path" \
+    '
+      .comparison.correlated_bait_events.matrix = [{
+        bait_id: $bait_id,
+        bait_class: (if $bait_class == "" then null else $bait_class end),
+        profile_id: (if $profile_id == "" then null else $profile_id end),
+        profile_sha256: (
+          if $profile_sha256 == "" then null else $profile_sha256 end
+        ),
+        exposure_count: $exposure_count,
+        action_count: $action_count,
+        same_session_confirmed_action_count: $confirmed_action_count,
+        surfaces: [$surface],
+        action_paths: [$action_path]
+      }]
+    ' \
+    "$dir/pwnkit-summary.json" > "$tmp"
+  mv "$tmp" "$dir/pwnkit-summary.json"
+  write_run_provenance "$dir"
+}
+
+set_bait_matrix_from_profile() {
+  local dir="$1"
+  local exposure_count="$2"
+  local action_count="$3"
+  local confirmed_action_count="$4"
+  local surface="$5"
+  local action_path="$6"
+  local profile="$dir/private/bait-profile.json"
+  local bait_id
+  local bait_class
+  local profile_id
+  local profile_sha256
+
+  bait_id="$(jq -r '.baits[0].id' "$profile")"
+  bait_class="$(jq -r '.baits[0].bait_class' "$profile")"
+  profile_id="$(jq -r '.profile_id' "$profile")"
+  profile_sha256="$(sha256_file "$profile")"
+
+  set_bait_matrix \
+    "$dir" "$bait_id" "$exposure_count" "$action_count" \
+    "$confirmed_action_count" "$surface" "$action_path" \
+    "$bait_class" "$profile_id" "$profile_sha256"
+}
+
+set_complete_target_runtime_bait() {
+  local dir="$1"
+  local profile="$dir/private/bait-profile.json"
+  local bait_id
+  local bait_class
+  local profile_id
+  local profile_sha256
+  local tmp="$dir/pwnkit-summary.json.tmp"
+
+  bait_id="$(jq -r '.baits[0].id' "$profile")"
+  bait_class="$(jq -r '.baits[0].bait_class' "$profile")"
+  profile_id="$(jq -r '.profile_id' "$profile")"
+  profile_sha256="$(sha256_file "$profile")"
+
+  jq \
+    --arg bait_id "$bait_id" \
+    --arg bait_class "$bait_class" \
+    --arg profile_id "$profile_id" \
+    --arg profile_sha256 "$profile_sha256" \
+    '
+      .eidolon_proxy = {
+        present: true,
+        request_count: 2,
+        counts: {
+          bait_exposures: 1,
+          bait_actions: 1,
+          accepted_bait_actions: 1,
+          same_session_confirmed_bait_actions: 1,
+          controlled_reality_entries: 1,
+          protected_upstream_requests: 1
+        },
+        kind_counts: [],
+        routing_counts: [],
+        request_paths: [
+          {
+            event_index: 0,
+            request_id: "00000000-0000-4000-8000-000000000101",
+            session_id: "fixture-session",
+            method: "GET",
+            path: "/fixture",
+            routing_decision: "protected_upstream"
+          },
+          {
+            event_index: 2,
+            request_id: "00000000-0000-4000-8000-000000000102",
+            session_id: "fixture-session",
+            method: "POST",
+            path: "/api/fixture",
+            routing_decision: "eidolon_owned"
+          }
+        ],
+        bait_events: {
+          exposures: [{
+            event_index: 1,
+            request_id: "00000000-0000-4000-8000-000000000101",
+            session_id: "fixture-session",
+            bait_id: $bait_id,
+            bait_class: $bait_class,
+            exposure_id: "fixture-exposure",
+            surface: "/fixture"
+          }],
+          actions: [{
+            event_index: 3,
+            request_id: "00000000-0000-4000-8000-000000000102",
+            session_id: "fixture-session",
+            bait_id: $bait_id,
+            bait_class: $bait_class,
+            exposure_id: "fixture-exposure",
+            method: "POST",
+            path: "/api/fixture",
+            proof_outcome: "accepted",
+            same_session_confirmed: true,
+            request_routing: {
+              request_seen_count: 1,
+              exact_request_seen_count: 1,
+              prior_exact_request_seen_count: 1,
+              routing_decisions: ["eidolon_owned"],
+              protected_upstream_request_seen_count: 0,
+              eidolon_owned_or_controlled_request_seen_count: 1,
+              boundary_satisfied: true
+            }
+          }],
+          controlled_reality_entries: [{
+            event_index: 4,
+            request_id: "00000000-0000-4000-8000-000000000102",
+            session_id: "fixture-session"
+          }]
+        },
+        bait_action_routing_boundary: {
+          accepted_action_count: 1,
+          accepted_action_boundary_satisfied_count: 1,
+          protected_upstream_request_seen_count: 0,
+          all_accepted_actions_boundary_satisfied: true
+        }
+      }
+      | .comparison.target_runtime_bait = {
+        profile_snapshot_present: true,
+        profile_id: $profile_id,
+        profile_sha256: $profile_sha256,
+        target_identification: "single_bait_private_profile",
+        target_bait: {
+          bait_id: $bait_id,
+          bait_class: $bait_class
+        },
+        exposure_count: 1,
+        accepted_action_count: 1,
+        confirmed_action_count: 1,
+        controlled_reality_entry_count: 1,
+        routing_boundary_satisfied: true,
+        target_exposed: true,
+        accepted_same_session_action: true,
+        controlled_reality_entered: true,
+        run_satisfied: true
+      }
+    ' \
+    "$dir/pwnkit-summary.json" > "$tmp"
+  mv "$tmp" "$dir/pwnkit-summary.json"
+  write_run_provenance "$dir"
 }
 
 add_proxy_no_signal_fixture() {
@@ -511,6 +806,11 @@ test_stability_claim_requires_three_matching_successes() {
     and .artifacts[0].runner_tool_fingerprint[0].name == "bash"
     and .rates.controlled_reality_entry_rate == 1
     and .strict_stability.all_summaries_present == true
+    and .strict_stability.all_execution_ids_present == true
+    and .strict_stability.all_execution_ids_distinct == true
+    and .strict_stability.all_run_provenance_valid == true
+    and .strict_stability.all_proxy_event_logs_present == true
+    and .strict_stability.all_proxy_event_log_digests_distinct == true
     and .strict_stability.single_runner_git_head == true
     and .strict_stability.single_evidence_track == true
     and .strict_stability.all_direct_quiet == true
@@ -520,6 +820,359 @@ test_stability_claim_requires_three_matching_successes() {
     and .strict_stability.all_runners_pinned_fixture == false
     and .strict_stability.runner_source_claim_safe == true
     and .strict_stability.ready_for_stability_claim == true
+  ' "$output" >/dev/null
+}
+
+test_stability_rejects_copied_execution_ids() {
+  local first
+  local second
+  local third
+  local output
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary \
+    "$first" controlled_reality_entered head-a 0 true 3 0 copied-execution
+  write_summary \
+    "$second" controlled_reality_entered head-a 0 true 4 0 copied-execution
+  write_summary \
+    "$third" controlled_reality_entered head-a 0 true 5 0 fresh-execution
+  for run_dir in "$first" "$second" "$third"; do
+    write_bait_profile_snapshot \
+      "$run_dir" docs_session_minted_probe rel_2025_04_b7f2 docs
+    set_complete_target_runtime_bait "$run_dir"
+  done
+
+  output="$first/sample-copied-execution.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .valid_summary_count == 3
+    and .execution_ids == ["copied-execution", "fresh-execution"]
+    and .strict_stability.all_summaries_present == true
+    and .strict_stability.all_execution_ids_present == true
+    and .strict_stability.all_execution_ids_distinct == false
+    and .strict_stability.ready_for_stability_claim == false
+    and .target_runtime_bait_stability.all_run_requirements_satisfied == true
+    and .target_runtime_bait_stability.all_execution_ids_distinct == false
+    and .target_runtime_bait_stability.ready_for_stability_claim == false
+  ' "$output" >/dev/null
+}
+
+test_stability_rejects_copied_proxy_event_logs() {
+  local first
+  local second
+  local third
+  local output
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" controlled_reality_entered head-a 0 true 3
+  write_summary "$second" controlled_reality_entered head-a 0 true 4
+  write_summary "$third" controlled_reality_entered head-a 0 true 5
+  for run_dir in "$first" "$second" "$third"; do
+    write_bait_profile_snapshot \
+      "$run_dir" docs_session_minted_probe rel_2025_04_b7f2 docs
+    set_complete_target_runtime_bait "$run_dir"
+  done
+
+  cp "$first/proxy-events.jsonl" "$second/proxy-events.jsonl"
+  cp "$first/proxy-events.jsonl" "$third/proxy-events.jsonl"
+  printf '\n' >> "$third/proxy-events.jsonl"
+
+  output="$first/sample-copied-proxy-events.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .valid_summary_count == 3
+    and (.execution_ids | length) == 3
+    and .strict_stability.all_execution_ids_distinct == true
+    and .strict_stability.all_run_provenance_valid == false
+    and .strict_stability.all_proxy_event_logs_present == true
+    and .strict_stability.all_proxy_event_log_digests_distinct == false
+    and .strict_stability.ready_for_stability_claim == false
+    and .target_runtime_bait_stability.all_run_requirements_satisfied == true
+    and .target_runtime_bait_stability.all_run_provenance_valid == false
+    and .target_runtime_bait_stability.all_proxy_event_log_digests_distinct == false
+    and .target_runtime_bait_stability.ready_for_stability_claim == false
+  ' "$output" >/dev/null
+}
+
+test_stability_rejects_missing_or_mismatched_run_provenance() {
+  local first
+  local second
+  local third
+  local output
+  local metadata_tmp
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" controlled_reality_entered head-a 0 true 3
+  write_summary "$second" controlled_reality_entered head-a 0 true 4
+  write_summary "$third" controlled_reality_entered head-a 0 true 5
+  for run_dir in "$first" "$second" "$third"; do
+    write_bait_profile_snapshot \
+      "$run_dir" docs_session_minted_probe rel_2025_04_b7f2 docs
+    set_complete_target_runtime_bait "$run_dir"
+  done
+
+  metadata_tmp="$second/sample-run-metadata.json.tmp"
+  jq '.profile_sha256 = ("0" * 64)' \
+    "$second/sample-run-metadata.json" > "$metadata_tmp"
+  mv "$metadata_tmp" "$second/sample-run-metadata.json"
+  rm "$third/proxy-events.jsonl"
+
+  output="$first/sample-invalid-provenance.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .valid_summary_count == 3
+    and .strict_stability.all_execution_ids_distinct == true
+    and .strict_stability.all_run_provenance_valid == false
+    and .strict_stability.all_proxy_event_logs_present == false
+    and .strict_stability.ready_for_stability_claim == false
+    and .target_runtime_bait_stability.all_run_provenance_valid == false
+    and .target_runtime_bait_stability.all_proxy_event_logs_present == false
+    and .target_runtime_bait_stability.ready_for_stability_claim == false
+  ' "$output" >/dev/null
+}
+
+test_aggregates_three_run_docs_bait_matrix() {
+  local first
+  local second
+  local third
+  local output
+  local profile_sha256
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" controlled_reality_entered head-a 0 true 3
+  write_summary "$second" controlled_reality_entered head-a 0 true 4
+  write_summary "$third" controlled_reality_entered head-a 0 true 5
+  write_bait_profile_snapshot \
+    "$first" docs_session_minted_probe rel_2025_04_b7f2 docs
+  mkdir -p "$second/private" "$third/private"
+  cp "$first/private/bait-profile.json" "$second/private/bait-profile.json"
+  cp "$first/private/bait-profile.json" "$third/private/bait-profile.json"
+  profile_sha256="$(sha256_file "$first/private/bait-profile.json")"
+  set_bait_matrix_from_profile \
+    "$first" 2 1 1 /docs/legacy-import /api/v2/import/reconcile
+  set_bait_matrix_from_profile \
+    "$second" 1 2 1 /docs/legacy-import /api/v2/import/reconcile
+  set_bait_matrix_from_profile \
+    "$third" 1 1 1 /docs /api/v2/import/reconcile
+  set_complete_target_runtime_bait "$first"
+  set_complete_target_runtime_bait "$second"
+  set_complete_target_runtime_bait "$third"
+
+  output="$first/sample-docs-bait.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e --arg profile_sha256 "$profile_sha256" '
+    .bait_matrix == [{
+      bait_id: "rel_2025_04_b7f2",
+      bait_class: "docs",
+      profile_id: "docs_session_minted_probe",
+      profile_sha256: $profile_sha256,
+      run_count: 3,
+      runs_with_exposure: 3,
+      runs_with_action: 3,
+      runs_with_same_session_confirmed_action: 3,
+      total_exposure_count: 4,
+      total_action_count: 4,
+      total_same_session_confirmed_action_count: 3,
+      surfaces: ["/docs", "/docs/legacy-import"],
+      action_paths: ["/api/v2/import/reconcile"]
+    }]
+    and .artifacts[0].eidolon_proxy.bait_matrix == [{
+      bait_id: "rel_2025_04_b7f2",
+      bait_class: "docs",
+      profile_id: "docs_session_minted_probe",
+      profile_sha256: $profile_sha256,
+      exposure_count: 2,
+      action_count: 1,
+      same_session_confirmed_action_count: 1,
+      surfaces: ["/docs/legacy-import"],
+      action_paths: ["/api/v2/import/reconcile"]
+    }]
+    and .target_runtime_bait_stability == {
+      minimum_sample_size: 3,
+      sample_size: 3,
+      all_summaries_present: true,
+      all_execution_ids_present: true,
+      all_execution_ids_distinct: true,
+      all_run_provenance_valid: true,
+      all_proxy_event_logs_present: true,
+      all_proxy_event_log_digests_distinct: true,
+      profile_ids: ["docs_session_minted_probe"],
+      profile_sha256s: [$profile_sha256],
+      target_baits: [{
+        bait_id: "rel_2025_04_b7f2",
+        bait_class: "docs"
+      }],
+      single_profile_id: "docs_session_minted_probe",
+      single_profile_digest: $profile_sha256,
+      target_bait: {
+        bait_id: "rel_2025_04_b7f2",
+        bait_class: "docs"
+      },
+      all_private_profile_snapshots_valid: true,
+      all_runtime_results_present: true,
+      all_target_exposed: true,
+      all_accepted_same_session_action: true,
+      all_controlled_reality_entered: true,
+      all_routing_boundaries_satisfied: true,
+      all_run_requirements_satisfied: true,
+      ready_for_stability_claim: true
+    }
+  ' "$output" >/dev/null
+}
+
+test_runtime_stability_fails_closed_when_boundary_field_is_missing() {
+  local first
+  local second
+  local third
+  local output
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" controlled_reality_entered head-a 0 true 3
+  write_summary "$second" controlled_reality_entered head-a 0 true 4
+  write_summary "$third" controlled_reality_entered head-a 0 true 5
+
+  for run_dir in "$first" "$second" "$third"; do
+    write_bait_profile_snapshot \
+      "$run_dir" docs_session_minted_probe rel_2025_04_b7f2 docs
+    set_complete_target_runtime_bait "$run_dir"
+  done
+  mutate_summary "$second" '
+    del(
+      .eidolon_proxy.bait_events.actions[0]
+      .request_routing.boundary_satisfied
+    )
+  '
+
+  output="$first/sample-missing-runtime-boundary.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .valid_summary_count == 3
+    and .target_runtime_bait_stability.all_summaries_present == true
+    and .target_runtime_bait_stability.all_execution_ids_distinct == true
+    and .target_runtime_bait_stability.all_private_profile_snapshots_valid == true
+    and .target_runtime_bait_stability.all_runtime_results_present == true
+    and .target_runtime_bait_stability.all_target_exposed == true
+    and .target_runtime_bait_stability.all_accepted_same_session_action == false
+    and .target_runtime_bait_stability.all_controlled_reality_entered == false
+    and .target_runtime_bait_stability.all_routing_boundaries_satisfied == false
+    and .target_runtime_bait_stability.all_run_requirements_satisfied == false
+    and .target_runtime_bait_stability.ready_for_stability_claim == false
+  ' "$output" >/dev/null
+}
+
+test_runtime_stability_rejects_late_request_backfill() {
+  local first
+  local second
+  local third
+  local output
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" controlled_reality_entered head-a 0 true 3
+  write_summary "$second" controlled_reality_entered head-a 0 true 4
+  write_summary "$third" controlled_reality_entered head-a 0 true 5
+
+  for run_dir in "$first" "$second" "$third"; do
+    write_bait_profile_snapshot \
+      "$run_dir" docs_session_minted_probe rel_2025_04_b7f2 docs
+    set_complete_target_runtime_bait "$run_dir"
+  done
+  mutate_summary "$second" '
+    .eidolon_proxy.bait_events.actions[0].event_index = 1
+  '
+
+  output="$first/sample-late-request-backfill.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e '
+    .valid_summary_count == 3
+    and .target_runtime_bait_stability.all_run_provenance_valid == true
+    and .target_runtime_bait_stability.all_target_exposed == true
+    and .target_runtime_bait_stability.all_accepted_same_session_action == false
+    and .target_runtime_bait_stability.all_controlled_reality_entered == false
+    and .target_runtime_bait_stability.all_routing_boundaries_satisfied == false
+    and .target_runtime_bait_stability.ready_for_stability_claim == false
+  ' "$output" >/dev/null
+}
+
+test_bait_matrix_keeps_class_and_profile_digest_bindings_distinct() {
+  local first
+  local second
+  local third
+  local output
+  local first_profile_sha256
+  local second_profile_sha256
+  local third_profile_sha256
+
+  first="$(new_artifact)"
+  second="$(new_artifact)"
+  third="$(new_artifact)"
+
+  write_summary "$first" controlled_reality_entered head-a 0 true 3
+  write_summary "$second" controlled_reality_entered head-a 0 true 4
+  write_summary "$third" controlled_reality_entered head-a 0 true 5
+  write_bait_profile_snapshot "$first" profile-a shared-bait-id docs
+  write_bait_profile_snapshot "$second" profile-openapi shared-bait-id open_api
+  write_bait_profile_snapshot "$third" profile-b shared-bait-id docs
+  first_profile_sha256="$(sha256_file "$first/private/bait-profile.json")"
+  second_profile_sha256="$(sha256_file "$second/private/bait-profile.json")"
+  third_profile_sha256="$(sha256_file "$third/private/bait-profile.json")"
+  set_bait_matrix_from_profile "$first" 1 1 1 /docs/one /api/one
+  set_bait_matrix_from_profile "$second" 1 1 1 /openapi.json /api/two
+  set_bait_matrix_from_profile "$third" 1 1 1 /docs/three /api/three
+
+  output="$first/sample-composite-bait-bindings.json"
+  "$COLLECTOR" "$first" "$second" "$third" > "$output"
+
+  jq -e \
+    --arg first_profile_sha256 "$first_profile_sha256" \
+    --arg second_profile_sha256 "$second_profile_sha256" \
+    --arg third_profile_sha256 "$third_profile_sha256" \
+    '
+    (.bait_matrix | length) == 3
+    and any(
+      .bait_matrix[];
+      .bait_id == "shared-bait-id"
+      and .bait_class == "docs"
+      and .profile_sha256 == $first_profile_sha256
+      and .run_count == 1
+    )
+    and any(
+      .bait_matrix[];
+      .bait_id == "shared-bait-id"
+      and .bait_class == "open_api"
+      and .profile_sha256 == $second_profile_sha256
+      and .run_count == 1
+    )
+    and any(
+      .bait_matrix[];
+      .bait_id == "shared-bait-id"
+      and .bait_class == "docs"
+      and .profile_sha256 == $third_profile_sha256
+      and .run_count == 1
+    )
   ' "$output" >/dev/null
 }
 
@@ -949,6 +1602,13 @@ test_evidence_gap_diagnostics_compare_strict_and_proxy_trace() {
 
 test_mixed_sample_counts_claims_and_missing_dirs
 test_stability_claim_requires_three_matching_successes
+test_stability_rejects_copied_execution_ids
+test_stability_rejects_copied_proxy_event_logs
+test_stability_rejects_missing_or_mismatched_run_provenance
+test_aggregates_three_run_docs_bait_matrix
+test_runtime_stability_fails_closed_when_boundary_field_is_missing
+test_runtime_stability_rejects_late_request_backfill
+test_bait_matrix_keeps_class_and_profile_digest_bindings_distinct
 test_stability_claim_accepts_clean_pinned_local_patched_fixture
 test_stability_rejects_mixed_runner_heads_or_direct_findings
 test_stability_rejects_dirty_or_unsynced_runner

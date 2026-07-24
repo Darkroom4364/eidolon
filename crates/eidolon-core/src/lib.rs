@@ -601,6 +601,8 @@ pub enum EventKind {
     },
     BaitExposed {
         bait_id: BaitId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bait_class: Option<BaitClass>,
         exposure_id: ExposureId,
         surface: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -608,6 +610,8 @@ pub enum EventKind {
     },
     BaitActionObserved {
         bait_id: BaitId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bait_class: Option<BaitClass>,
         exposure_id: Option<ExposureId>,
         method: String,
         path: String,
@@ -784,6 +788,8 @@ pub struct EdgeEvidenceRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeBaitHeaderValueMintAudit {
     pub bait_id: BaitId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bait_class: Option<BaitClass>,
     pub header_name: String,
     pub kind: HeaderValueMintKind,
     pub prefix: String,
@@ -792,6 +798,8 @@ pub struct EdgeBaitHeaderValueMintAudit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeObservedBaitHeaderValueMint {
     pub bait_id: BaitId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bait_class: Option<BaitClass>,
     pub header_name: String,
     pub kind: HeaderValueMintKind,
     pub prefix: String,
@@ -1547,9 +1555,45 @@ mod tests {
 
         match parsed.kind {
             EventKind::BaitExposed {
-                header_value_mint, ..
-            } => assert_eq!(header_value_mint, None),
+                bait_class,
+                header_value_mint,
+                ..
+            } => {
+                assert_eq!(bait_class, None);
+                assert_eq!(header_value_mint, None);
+            }
             other => panic!("expected bait_exposed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_bait_action_event_deserializes_with_unknown_class() {
+        let event = json!({
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "id": Uuid::new_v4(),
+            "session_id": SessionId::new(),
+            "observed_at": Utc::now(),
+            "source": "bait_engine",
+            "policy_state": "observe",
+            "kind": {
+                "type": "bait_action_observed",
+                "bait_id": "older-bait",
+                "exposure_id": "exp-older",
+                "method": "POST",
+                "path": "/api/v2/import/reconcile"
+            }
+        });
+
+        let parsed: Event = must_ok(
+            serde_json::from_value(event),
+            "legacy bait action event should parse",
+        );
+
+        match parsed.kind {
+            EventKind::BaitActionObserved { bait_class, .. } => {
+                assert_eq!(bait_class, None);
+            }
+            other => panic!("expected bait_action_observed, got {other:?}"),
         }
     }
 
@@ -1562,6 +1606,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitActionObserved {
                 bait_id: BaitId("minted-trace".to_string()),
+                bait_class: Some(BaitClass::Docs),
                 exposure_id: Some(ExposureId("exp-minted".to_string())),
                 method: "POST".to_string(),
                 path: "/api/v2/import/reconcile".to_string(),
@@ -1592,6 +1637,7 @@ mod tests {
             serialized["kind"]["header_value_mint_status"],
             json!("matched_session_value")
         );
+        assert_eq!(serialized["kind"]["bait_class"], json!("docs"));
     }
 
     #[test]
@@ -1712,12 +1758,14 @@ mod tests {
                 }],
                 bait_header_value_mints: vec![EdgeBaitHeaderValueMintAudit {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     header_name: "X-Minted-Trace".to_string(),
                     kind: HeaderValueMintKind::SessionHmacSha256V1,
                     prefix: "minted".to_string(),
                 }],
                 latest_bait_header_value_mint: Some(EdgeObservedBaitHeaderValueMint {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     header_name: "X-Minted-Trace".to_string(),
                     kind: HeaderValueMintKind::SessionHmacSha256V1,
                     prefix: "minted".to_string(),
@@ -1844,8 +1892,16 @@ mod tests {
             json!("session_hmac_sha256_v1")
         );
         assert_eq!(
+            serialized["evidence"]["bait_header_value_mints"][0]["bait_class"],
+            json!("docs")
+        );
+        assert_eq!(
             serialized["evidence"]["latest_bait_header_value_mint"]["status"],
             json!("session_value_mismatch")
+        );
+        assert_eq!(
+            serialized["evidence"]["latest_bait_header_value_mint"]["bait_class"],
+            json!("docs")
         );
         assert_eq!(
             serialized["deployment_context"]["bait_profile_id"],

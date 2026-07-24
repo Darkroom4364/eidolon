@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "profile_id": "docs_session_minted_probe",
+  "hypothesis": "A session-minted docs lure can produce stable same-session action evidence without relying on the OpenAPI bait class.",
+  "baits": [
+    {
+      "id": "rel_2025_04_b7f2",
+      "bait_class": "docs",
+      "surface": "/docs/legacy-import",
+      "surface_kind": "docs",
+      "expected_action": {
+        "method": "POST",
+        "path": "/api/v2/import/reconcile",
+        "header_name": "X-Migration-Trace",
+        "header_value_mint": {
+          "kind": "session_hmac_sha256_v1",
+          "prefix": "mig",
+          "proof_window_seconds": 300
+        }
+      }
+    }
+  ]
+}
