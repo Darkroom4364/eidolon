@@ -203,7 +203,7 @@ struct ProxyConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ControlledRealityBackendConfig {
-    address: SocketAddr,
+    address: String,
     auth_secret_path: PathBuf,
 }
 
@@ -703,23 +703,54 @@ fn parse_tarpit_delay(raw: &str, label: &str) -> Result<Duration, ConfigError> {
 fn parse_controlled_reality_backend_addr(
     raw: &str,
     owned_cluster_lab: bool,
-) -> Result<SocketAddr, ConfigError> {
-    let address = raw.parse::<SocketAddr>().map_err(|error| {
-        ConfigError::new(format!(
-            "controlled reality backend address must be an IP socket address: {error}"
-        ))
-    })?;
-    if address.port() == 0 {
+) -> Result<String, ConfigError> {
+    if let Ok(address) = raw.parse::<SocketAddr>() {
+        if address.port() == 0 {
+            return Err(ConfigError::new(
+                "controlled reality backend port must not be 0",
+            ));
+        }
+        if address.ip().is_unspecified() || (!address.ip().is_loopback() && !owned_cluster_lab) {
+            return Err(ConfigError::new(
+                "controlled reality backend must be loopback unless `--owned-cluster-lab` is set",
+            ));
+        }
+        return Ok(address.to_string());
+    }
+
+    if !owned_cluster_lab {
+        return Err(ConfigError::new(
+            "controlled reality backend DNS names require `--owned-cluster-lab`",
+        ));
+    }
+    if raw.contains(['/', '?', '#', '@']) || raw.chars().any(char::is_whitespace) {
+        return Err(ConfigError::new(
+            "controlled reality backend must be a host and explicit TCP port",
+        ));
+    }
+    let Some((host, raw_port)) = raw.rsplit_once(':') else {
+        return Err(ConfigError::new(
+            "controlled reality backend DNS name requires an explicit TCP port",
+        ));
+    };
+    if host.is_empty()
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+    {
+        return Err(ConfigError::new(
+            "controlled reality backend DNS name is invalid",
+        ));
+    }
+    let port = parse_port(raw_port, "controlled reality backend port")?;
+    if port == 0 {
         return Err(ConfigError::new(
             "controlled reality backend port must not be 0",
         ));
     }
-    if address.ip().is_unspecified() || (!address.ip().is_loopback() && !owned_cluster_lab) {
-        return Err(ConfigError::new(
-            "controlled reality backend must be loopback unless `--owned-cluster-lab` is set",
-        ));
-    }
-    Ok(address)
+    Ok(raw.to_string())
 }
 
 fn ensure_allowed_upstream_host(host: &str, owned_cluster_lab: bool) -> Result<(), ConfigError> {
@@ -1191,10 +1222,18 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     let event_log_writer = FileEventLogWriter::open(&config.event_log_path)?;
     let event_log_tail_repair = event_log_writer.startup_tail_repair();
     let controlled_reality_backend = match &config.controlled_reality_backend {
-        Some(backend) => Some(Arc::new(ControlledRealityBackendClient::new(
-            backend.address,
-            load_controlled_reality_backend_auth_secret(&backend.auth_secret_path)?,
-        ))),
+        Some(backend) => Some(Arc::new(
+            ControlledRealityBackendClient::from_target(
+                &backend.address,
+                load_controlled_reality_backend_auth_secret(&backend.auth_secret_path)?,
+            )
+            .map_err(|error| {
+                invalid_data(format!(
+                    "could not resolve controlled reality backend: {}",
+                    error.audit_code()
+                ))
+            })?,
+        )),
         None => None,
     };
     let runtime = ProxyRuntime {
@@ -6992,7 +7031,7 @@ Options:
                          Retry-After value for controlled-reality rate limits
                          [default: {DEFAULT_RETRY_AFTER_SECONDS}]
   --controlled-reality-backend-addr <ADDR>
-                         Optional signed renderer IP socket address
+                         Optional signed renderer host and TCP port
   --controlled-reality-backend-auth-secret-file <PATH>
                          Required 64-hex HMAC secret when a remote renderer is configured
   --owned-cluster-lab   Allow non-loopback listen and upstream addresses for an
@@ -8068,13 +8107,44 @@ mod tests {
         assert_eq!(
             config.controlled_reality_backend,
             Some(ControlledRealityBackendConfig {
-                address: "127.0.0.1:9103".parse().expect("address should parse"),
+                address: "127.0.0.1:9103".to_string(),
                 auth_secret_path: secret_path,
             })
         );
         assert_error_contains(
             &["--controlled-reality-backend-addr", "127.0.0.1:9103"],
             "configured together",
+        );
+    }
+
+    #[test]
+    fn remote_renderer_dns_requires_owned_cluster_lab() {
+        let secret_path = write_controlled_reality_backend_secret();
+        let target = "eidolon-controlled-reality.shield-controlled-reality.svc.cluster.local:9103";
+        let config = run_config(&[
+            "--owned-cluster-lab",
+            "--controlled-reality-backend-addr",
+            target,
+            "--controlled-reality-backend-auth-secret-file",
+            path_str(&secret_path, "backend secret path should be utf8"),
+        ])
+        .expect("owned cluster renderer DNS should parse");
+
+        assert_eq!(
+            config
+                .controlled_reality_backend
+                .expect("renderer config should exist")
+                .address,
+            target
+        );
+        assert_error_contains(
+            &[
+                "--controlled-reality-backend-addr",
+                target,
+                "--controlled-reality-backend-auth-secret-file",
+                path_str(&secret_path, "backend secret path should be utf8"),
+            ],
+            "--owned-cluster-lab",
         );
     }
 

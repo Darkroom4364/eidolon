@@ -2,8 +2,20 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../base
+  - controlled-reality-renderer.yaml
+  - controlled-reality-renderer-networkpolicy.yaml
+patches:
+  - path: proxy-controlled-reality-renderer-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: eidolon-shield-proxy
+      namespace: shield-system
 images:
   - name: eidolon-shield-proxy
     newTag: local
   - name: eidolon-owned-demo-target
+    newTag: local
+  - name: eidolon-controlled-reality
     newTag: local

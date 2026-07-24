@@ -1,0 +1,24 @@
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --controlled-reality-backend-addr
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: eidolon-controlled-reality.shield-controlled-reality.svc.cluster.local:9103
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: --controlled-reality-backend-auth-secret-file
+- op: add
+  path: /spec/template/spec/containers/0/args/-
+  value: /var/run/secrets/eidolon-controlled-reality/auth-secret.txt
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts/-
+  value:
+    name: controlled-reality-auth
+    mountPath: /var/run/secrets/eidolon-controlled-reality
+    readOnly: true
+- op: add
+  path: /spec/template/spec/volumes/-
+  value:
+    name: controlled-reality-auth
+    secret:
+      secretName: eidolon-controlled-reality-auth

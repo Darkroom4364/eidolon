@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt,
     io::{Read, Write},
-    net::{Shutdown, SocketAddr, TcpStream},
+    net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -77,6 +77,18 @@ impl ControlledRealityBackendClient {
             address,
             secret: Arc::new(secret),
         }
+    }
+
+    pub fn from_target(
+        target: &str,
+        secret: ControlledRealityBackendAuthSecret,
+    ) -> Result<Self, ControlledRealityBackendError> {
+        let address = target
+            .to_socket_addrs()
+            .map_err(|_| ControlledRealityBackendError::ResolutionFailed)?
+            .next()
+            .ok_or(ControlledRealityBackendError::ResolutionFailed)?;
+        Ok(Self::new(address, secret))
     }
 
     pub fn render(
@@ -241,6 +253,7 @@ pub struct VerifiedControlledRealityRenderResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlledRealityBackendError {
     WeakSecret,
+    ResolutionFailed,
     ConnectFailed,
     SchemaMismatch,
     AuthenticationFailed,
@@ -271,6 +284,7 @@ impl ControlledRealityBackendError {
     pub fn audit_code(self) -> &'static str {
         match self {
             Self::WeakSecret => "weak_secret",
+            Self::ResolutionFailed => "resolution_failed",
             Self::ConnectFailed => "connect_failed",
             Self::SchemaMismatch => "schema_mismatch",
             Self::AuthenticationFailed => "authentication_failed",
