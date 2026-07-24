@@ -142,18 +142,20 @@ fn audit_protected_upstream_probe(request: &Request) -> io::Result<()> {
 }
 
 fn protected_upstream_probe_audit_event(request: &Request) -> Option<Value> {
-    let probe_id = protected_upstream_probe_id(request)?;
-    Some(serde_json::json!({
-        "event": "protected_upstream_probe_observed",
-        "probe_id": probe_id,
-    }))
-}
-
-fn protected_upstream_probe_id(request: &Request) -> Option<&str> {
     if request.method != "POST" || request.path != "/api/v2/import/reconcile" {
         return None;
     }
 
+    let mut event = serde_json::json!({
+        "event": "protected_upstream_probe_observed",
+    });
+    if let Some(probe_id) = protected_upstream_probe_id(request) {
+        event["probe_id"] = Value::String(probe_id.to_string());
+    }
+    Some(event)
+}
+
+fn protected_upstream_probe_id(request: &Request) -> Option<&str> {
     let mut probe_headers = request
         .headers
         .iter()
@@ -851,26 +853,41 @@ mod tests {
                 .with_header(SHIELD_LAB_PROBE_HEADER, value);
             assert_eq!(
                 protected_upstream_probe_audit_event(&request),
-                None,
-                "unexpectedly accepted probe header: {value:?}"
+                Some(serde_json::json!({
+                    "event": "protected_upstream_probe_observed",
+                })),
+                "unsafe probe header leaked into the audit: {value:?}"
             );
         }
     }
 
     #[test]
-    fn shield_lab_probe_audit_requires_the_exact_route_and_one_header() {
+    fn shield_lab_probe_audit_requires_the_exact_route() {
         let valid_probe_id = "shield-probe-20260724-a1b2c3d4";
         let wrong_method = Request::for_test("GET", "/api/v2/import/reconcile")
             .with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id);
         let wrong_path = Request::for_test("POST", "/api/v1/imports")
             .with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id);
+
+        for request in [wrong_method, wrong_path] {
+            assert_eq!(protected_upstream_probe_audit_event(&request), None);
+        }
+    }
+
+    #[test]
+    fn reconcile_probe_audit_survives_missing_or_duplicate_markers() {
         let missing_header = Request::for_test("POST", "/api/v2/import/reconcile");
         let duplicate_header = Request::for_test("POST", "/api/v2/import/reconcile")
-            .with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id)
+            .with_header(SHIELD_LAB_PROBE_HEADER, "shield-probe-20260724-a1b2c3d4")
             .with_header(SHIELD_LAB_PROBE_HEADER, "shield-probe-other");
 
-        for request in [wrong_method, wrong_path, missing_header, duplicate_header] {
-            assert_eq!(protected_upstream_probe_audit_event(&request), None);
+        for request in [missing_header, duplicate_header] {
+            assert_eq!(
+                protected_upstream_probe_audit_event(&request),
+                Some(serde_json::json!({
+                    "event": "protected_upstream_probe_observed",
+                }))
+            );
         }
     }
 
