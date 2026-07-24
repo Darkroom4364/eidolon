@@ -12,8 +12,11 @@ rendering fallback.
 
 Policy state, request correlation, durable workflow state, evidence, depth
 limits, response headers, and protected-upstream routing remain proxy-owned.
-No Shield Lab overlay deploys the renderer yet, so this is process separation,
-not a hard network-isolation claim.
+The kind Shield Lab overlay deploys the renderer in
+`shield-controlled-reality`, routes the proxy through Service DNS, and gives
+the renderer default-deny egress. OrbStack does not deploy it. This remains a
+manifested isolation boundary, not a hard-isolation claim, until live deny
+tests and denied-flow evidence pass.
 
 The renderer protocol is deliberately closed:
 
@@ -40,10 +43,10 @@ occupying connection workers, and a later record reports the number dropped.
 
 The implementation currently contains no outbound connector and writes no
 persistent filesystem state after loading its dedicated secret. The ordinary
-Debian image does not enforce either property: it has no network sandbox,
-read-only root filesystem, or syscall policy beyond its non-root user. Those
-restrictions remain deployment requirements, not properties proved by this
-image.
+Debian image does not enforce either property by itself. The kind Deployment
+adds a read-only root filesystem, dropped capabilities, `RuntimeDefault`
+seccomp, no service-account token, resource limits, and a dedicated secret
+mount. NetworkPolicy supplies the no-egress boundary.
 
 Within one backend process, the first authenticated request ID is retained
 through its 30-second freshness window and a duplicate is rejected. Saturation
@@ -62,46 +65,32 @@ correlation, not raw frames or secrets. Authenticated rejections retain their
 request ID. Malformed or unauthenticated frames intentionally do not trust a
 supplied request ID.
 
-## Why it is not deployed yet
+## Deployment status
 
-The existing local cluster profiles cannot support an honest hard-isolation
-claim:
+The local profiles still cannot support an honest hard-isolation claim:
 
 - the OrbStack deploy and status paths do not verify NetworkPolicy
   enforcement; the local validation node inspected on 2026-07-24 was started
   with `--disable-network-policy`
 - the OrbStack overlay exposes the owned target through NodePort `31081`,
   which creates a host-level bypass around a pod-only policy boundary
-- kind supports NetworkPolicy in current releases, but this repo does not pin
-  the kind/node versions or run live allow/deny checks
-- neither profile captures denied-flow evidence
-- NetworkPolicy objects alone do not prove that denied traffic is enforced or
-  audited
-
-Adding a backend Deployment to those overlays would look isolated in YAML
-while remaining able to reach protected destinations in practice.
+- kind pins its node image, disables kindnet, installs Calico `v3.32.1`, and
+  deploys the remote renderer without NodePorts
+- kind still lacks a checked-in live allow/deny smoke and denied-flow capture
+- the kind path was not run locally for this slice because `kind` was not
+  installed
+- NetworkPolicy objects and cluster-free rendering do not prove enforcement
 
 ## Required deployment slice
 
-Before the proxy can use the separate renderer in Kubernetes:
+Before issue `#176` can claim the enforced boundary:
 
-1. Pin a NetworkPolicy-capable cluster version and verify enforcement before
-   deployment.
-2. Remove or isolate the direct-target NodePort from that profile.
-3. Run the backend in its own namespace and dedicated non-root image.
-4. Disable its service-account token, use a read-only root filesystem, drop all
-   capabilities, apply `RuntimeDefault` seccomp, and set CPU, memory, and
-   ephemeral-storage limits.
-5. Mount only a dedicated renderer authentication secret. Do not mount proxy,
-   ingress, bait-signing, protected-target, or customer credentials.
-6. Permit ingress only from the proxy on the renderer port and permit no
-   backend egress.
-7. Prove live negative access to the protected target ClusterIP, node
+1. Prove live negative access to the protected target ClusterIP, node
    NodePorts, Kubernetes API, metadata destinations, and internet.
-8. Capture denied-flow evidence from the enforcing CNI.
-9. Live-test worker, audit, and replay-cache saturation; expose drop and
+2. Capture denied-flow evidence from the enforcing CNI.
+3. Live-test worker, audit, and replay-cache saturation; expose drop and
    saturation counters to operators.
-10. Define restart and multi-replica replay behavior before allowing stateful
+4. Define restart and multi-replica replay behavior before allowing stateful
     rendering.
 
 ## Proxy integration contract
