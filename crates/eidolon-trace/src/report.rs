@@ -2,7 +2,8 @@ use std::fmt::Write;
 
 use eidolon_core::{
     BaitClass, BaitHeaderValueMintAudit, BaitHeaderValueMintStatus,
-    EdgeAuthenticatedIngressRuleRejectionHistory, EdgeBaitHeaderValueMintAudit, EdgeEvidenceRef,
+    ControlledRealityInteractionAction, EdgeAuthenticatedIngressRuleRejectionHistory,
+    EdgeBaitHeaderValueMintAudit, EdgeControlledRealityInteraction, EdgeEvidenceRef,
     EdgeLocalIngressTrustScopeRejectionHistory, EdgeObservedBaitHeaderValueMint,
     EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestLinkage,
     EdgeRequestRef, EdgeTrustedIngressSoftenHistory, EidolonEdgeDecisionExport, EventKind,
@@ -175,9 +176,63 @@ fn render_evidence_markdown_from_timeline(
         }
     }
 
+    render_controlled_reality_workflow(bundle, &mut report);
     report.push_str(&render_replay_view_from_timeline(timeline, bundle));
 
     report
+}
+
+fn render_controlled_reality_workflow(bundle: &EvidenceBundle, report: &mut String) {
+    if bundle.controlled_reality_interactions.is_empty() {
+        return;
+    }
+
+    push_line(report, format_args!("\n## Controlled Reality Workflow"));
+    push_line(
+        report,
+        format_args!("| Line | Request | Origin | Step | State | Job | Artifact | SHA-256 |"),
+    );
+    push_line(
+        report,
+        format_args!("| --- | --- | --- | --- | --- | --- | --- | --- |"),
+    );
+    for evidence in &bundle.controlled_reality_interactions {
+        let (step, artifact_id, artifact_sha256) =
+            controlled_reality_action_fields(&evidence.interaction.action);
+        push_line(
+            report,
+            format_args!(
+                "| {} | `{}` | `{}` | `{}` | `{} -> {}` | `{}` | {} | {} |",
+                evidence.event_ref.line_number,
+                evidence.request_id.0,
+                evidence.interaction.origin_request_id.0,
+                step,
+                snake_case_debug(&evidence.interaction.from_state),
+                snake_case_debug(&evidence.interaction.to_state),
+                inline_code(evidence.interaction.job_id.as_str()),
+                artifact_id
+                    .map(|value| format!("`{}`", inline_code(value)))
+                    .unwrap_or_else(|| "-".to_string()),
+                artifact_sha256
+                    .map(|value| format!("`{}`", inline_code(value)))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+        );
+    }
+}
+
+fn controlled_reality_action_fields(
+    action: &ControlledRealityInteractionAction,
+) -> (&'static str, Option<&str>, Option<&str>) {
+    match action {
+        ControlledRealityInteractionAction::JobSubmitted => ("job_submitted", None, None),
+        ControlledRealityInteractionAction::StatusRead => ("status_read", None, None),
+        ControlledRealityInteractionAction::ArtifactRead { artifact } => (
+            "artifact_read",
+            Some(artifact.artifact_id.as_str()),
+            Some(artifact.sha256.as_str()),
+        ),
+    }
 }
 
 fn render_metric_summary(timeline: &SessionTimeline, bundle: &EvidenceBundle, report: &mut String) {
@@ -390,6 +445,13 @@ pub fn edge_decision_export_for_evidence(
         .map(|event| event.persistence)
         .unwrap_or_default();
     let latest_request_bait_action = latest_request_bait_action_event(timeline, request_event);
+    let latest_request_controlled_reality = bundle
+        .controlled_reality_interactions
+        .iter()
+        .rev()
+        .find(|interaction| event_belongs_to_linked_request(&interaction.event_ref));
+    let latest_request_controlled_reality_event = latest_request_controlled_reality
+        .and_then(|interaction| timeline_event_by_ref(timeline, interaction.event_ref));
     let edge_recommendation = edge_recommendation_for(
         policy_state,
         routing_decision,
@@ -426,6 +488,7 @@ pub fn edge_decision_export_for_evidence(
                 timeline,
                 request_event,
                 latest_request_bait_action,
+                latest_request_controlled_reality_event,
                 [latest_policy_reason_event, latest_policy_routing_event],
             ),
             bundle_ref: format!("session:{}", bundle.session_id.0),
@@ -438,6 +501,13 @@ pub fn edge_decision_export_for_evidence(
             bait_header_value_mints: edge_bait_header_value_mints(bundle),
             latest_bait_header_value_mint: latest_request_bait_action
                 .and_then(edge_observed_bait_header_value_mint),
+            latest_controlled_reality_interaction: latest_request_controlled_reality.map(
+                |interaction| EdgeControlledRealityInteraction {
+                    event_id: interaction.event_ref.event_id,
+                    request_id: interaction.request_id,
+                    interaction: interaction.interaction.clone(),
+                },
+            ),
         },
         edge_recommendation,
         deployment_context: None,
@@ -654,6 +724,7 @@ fn edge_export_event_ids(
     timeline: &SessionTimeline,
     request_event: &TimelineEvent,
     bait_action_event: Option<&TimelineEvent>,
+    controlled_reality_event: Option<&TimelineEvent>,
     policy_events: [Option<&crate::PolicyEventEvidence>; 2],
 ) -> Vec<uuid::Uuid> {
     let mut event_ids = vec![request_event.event.id];
@@ -661,6 +732,14 @@ fn edge_export_event_ids(
     if let Some(bait_action_event) = bait_action_event {
         if bait_action_event.event.id != request_event.event.id {
             event_ids.push(bait_action_event.event.id);
+        }
+    }
+
+    if let Some(controlled_reality_event) = controlled_reality_event {
+        if controlled_reality_event.event.id != request_event.event.id
+            && !event_ids.contains(&controlled_reality_event.event.id)
+        {
+            event_ids.push(controlled_reality_event.event.id);
         }
     }
 
@@ -927,10 +1006,29 @@ fn replay_summary(event: &TimelineEvent, bundle: &EvidenceBundle) -> String {
         EventKind::ResponseServed {
             status,
             routing_decision,
-        } => format!(
-            "served status `{status}` with routing `{}`",
-            snake_case_debug(routing_decision)
-        ),
+            controlled_reality,
+        } => {
+            let workflow = controlled_reality
+                .as_ref()
+                .map_or_else(String::new, |interaction| {
+                    let (step, artifact_id, _) =
+                        controlled_reality_action_fields(&interaction.action);
+                    format!(
+                        "; controlled branch `{}` step `{step}` state `{} -> {}` job `{}`{}",
+                        snake_case_debug(&interaction.branch),
+                        snake_case_debug(&interaction.from_state),
+                        snake_case_debug(&interaction.to_state),
+                        inline_code(interaction.job_id.as_str()),
+                        artifact_id
+                            .map(|value| format!(" artifact `{}`", inline_code(value)))
+                            .unwrap_or_default(),
+                    )
+                });
+            format!(
+                "served status `{status}` with routing `{}`{workflow}",
+                snake_case_debug(routing_decision)
+            )
+        }
         EventKind::BaitExposed {
             bait_id,
             bait_class,
@@ -1236,11 +1334,13 @@ fn markdown_text(value: &str) -> String {
 mod tests {
     use chrono::{TimeDelta, TimeZone, Utc};
     use eidolon_core::{
-        BaitId, DiscoveryReconScore, EdgeRecommendedAction, Event, EventKind, EventSource,
-        ExposureId, IngressActorKind, IngressAdvisorySignals, IngressIdentity,
-        IngressIdentitySource, IngressTrustTier, IngressVerificationStrength, PolicyState,
-        RequestId, RoutingDecision, SafeHeaderObservation, SessionId,
-        TRUSTED_INGRESS_CONTRACT_VERSION,
+        BaitId, ControlledRealityArtifactId, ControlledRealityArtifactRef,
+        ControlledRealityArtifactSha256, ControlledRealityBranch, ControlledRealityInteraction,
+        ControlledRealityInteractionAction, ControlledRealityJobId, ControlledRealityWorkflowState,
+        DiscoveryReconScore, EdgeRecommendedAction, Event, EventKind, EventSource, ExposureId,
+        IngressActorKind, IngressAdvisorySignals, IngressIdentity, IngressIdentitySource,
+        IngressTrustTier, IngressVerificationStrength, PolicyState, RequestId, RoutingDecision,
+        SafeHeaderObservation, SessionId, TRUSTED_INGRESS_CONTRACT_VERSION,
     };
 
     use crate::{evidence_bundle_for_timeline, TimelineEvent};
@@ -1630,6 +1730,7 @@ mod tests {
             EventKind::ResponseServed {
                 status: 200,
                 routing_decision,
+                controlled_reality: None,
             },
         )
     }
@@ -2248,6 +2349,7 @@ mod tests {
                 EventKind::ResponseServed {
                     status: 202,
                     routing_decision: RoutingDecision::ControlledReality,
+                    controlled_reality: None,
                 },
             )
             .with_request_id(action_rid),
@@ -2609,6 +2711,7 @@ mod tests {
                 EventKind::ResponseServed {
                     status: 429,
                     routing_decision: RoutingDecision::RateLimited,
+                    controlled_reality: None,
                 },
             )
             .with_request_id(rid_a),
@@ -3363,6 +3466,7 @@ mod tests {
                 EventKind::ResponseServed {
                     status: 429,
                     routing_decision: RoutingDecision::RateLimited,
+                    controlled_reality: None,
                 },
             )
             .with_request_id(rid),
@@ -3439,6 +3543,7 @@ mod tests {
                 EventKind::ResponseServed {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
+                    controlled_reality: None,
                 },
             )
             .with_persistence(PersistenceMetadata::post_containment(
@@ -3518,6 +3623,7 @@ mod tests {
                 EventKind::ResponseServed {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
+                    controlled_reality: None,
                 },
             )
             .with_persistence(PersistenceMetadata::pre_containment_retry(
@@ -3613,6 +3719,7 @@ mod tests {
                 EventKind::ResponseServed {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
+                    controlled_reality: None,
                 },
             )
             .with_persistence(PersistenceMetadata::pre_containment_retry(
@@ -3707,6 +3814,7 @@ mod tests {
                 EventKind::ResponseServed {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
+                    controlled_reality: None,
                 },
             )
             .with_persistence(PersistenceMetadata::pre_containment_retry(
@@ -3790,6 +3898,7 @@ mod tests {
                 EventKind::ResponseServed {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
+                    controlled_reality: None,
                 },
             )
             .with_persistence(PersistenceMetadata::post_containment(
@@ -3974,6 +4083,7 @@ mod tests {
                 EventKind::ResponseServed {
                     status: 429,
                     routing_decision: RoutingDecision::RateLimited,
+                    controlled_reality: None,
                 },
             )
             .with_request_id(rid),
@@ -4017,6 +4127,138 @@ mod tests {
                 "eidolon_owned".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn controlled_reality_workflow_survives_report_and_strict_latest_request_export() {
+        let session_id = SessionId::new();
+        let origin_request_id = RequestId::new();
+        let status_request_id = RequestId::new();
+        let artifact_request_id = RequestId::new();
+        let job_id =
+            ControlledRealityJobId::new("job_0123456789abcdef").expect("job id should be valid");
+        let artifact = ControlledRealityArtifactRef {
+            artifact_id: ControlledRealityArtifactId::new("artifact_0123456789abcdef")
+                .expect("artifact id should be valid"),
+            sha256: ControlledRealityArtifactSha256::new("a".repeat(64))
+                .expect("artifact digest should be valid"),
+        };
+        let request_event = |request_id: RequestId, path: &str| {
+            Event::new(
+                session_id,
+                EventSource::Proxy,
+                PolicyState::ControlledReality,
+                EventKind::RequestSeen {
+                    method: if request_id == origin_request_id {
+                        "POST".to_string()
+                    } else {
+                        "GET".to_string()
+                    },
+                    path: path.to_string(),
+                    safe_headers: Vec::new(),
+                    ingress_identity: IngressIdentity::default(),
+                    authenticated_ingress_rule_rejection: None,
+                    local_ingress_trust_scope_rejection: None,
+                    trusted_ingress_soften_match: None,
+                    ingress_signals: Default::default(),
+                    discovery_recon_score: Default::default(),
+                    routing_decision: RoutingDecision::ControlledReality,
+                },
+            )
+            .with_request_id(request_id)
+        };
+        let response_event =
+            |request_id: RequestId,
+             from_state: ControlledRealityWorkflowState,
+             to_state: ControlledRealityWorkflowState,
+             action: ControlledRealityInteractionAction| {
+                Event::new(
+                    session_id,
+                    EventSource::Proxy,
+                    PolicyState::ControlledReality,
+                    EventKind::ResponseServed {
+                        status: if matches!(
+                            &action,
+                            ControlledRealityInteractionAction::JobSubmitted
+                        ) {
+                            202
+                        } else {
+                            200
+                        },
+                        routing_decision: RoutingDecision::ControlledReality,
+                        controlled_reality: Some(ControlledRealityInteraction {
+                            branch: ControlledRealityBranch::ImportReconcile,
+                            origin_request_id,
+                            from_state,
+                            to_state,
+                            job_id: job_id.clone(),
+                            action,
+                        }),
+                    },
+                )
+                .with_request_id(request_id)
+            };
+        let timeline = timeline(vec![
+            request_event(origin_request_id, "/api/v2/import/reconcile"),
+            response_event(
+                origin_request_id,
+                ControlledRealityWorkflowState::Ready,
+                ControlledRealityWorkflowState::Queued,
+                ControlledRealityInteractionAction::JobSubmitted,
+            ),
+            request_event(
+                status_request_id,
+                "/api/v2/import/reconcile/jobs/job_0123456789abcdef",
+            ),
+            response_event(
+                status_request_id,
+                ControlledRealityWorkflowState::Queued,
+                ControlledRealityWorkflowState::Completed,
+                ControlledRealityInteractionAction::StatusRead,
+            ),
+            request_event(
+                artifact_request_id,
+                "/api/v2/import/reconcile/jobs/job_0123456789abcdef/result",
+            ),
+            response_event(
+                artifact_request_id,
+                ControlledRealityWorkflowState::Completed,
+                ControlledRealityWorkflowState::Completed,
+                ControlledRealityInteractionAction::ArtifactRead {
+                    artifact: artifact.clone(),
+                },
+            ),
+        ]);
+
+        let bundle = evidence_bundle_for_timeline(&timeline);
+        assert_eq!(bundle.controlled_reality_interactions.len(), 3);
+        assert!(bundle
+            .controlled_reality_interactions
+            .iter()
+            .all(|interaction| interaction.interaction.origin_request_id == origin_request_id));
+
+        let report = render_markdown_report(&timeline);
+        assert!(report.contains("## Controlled Reality Workflow"));
+        assert!(report.contains("`job_0123456789abcdef`"));
+        assert!(report.contains("`artifact_0123456789abcdef`"));
+        assert!(report.contains("| `controlled_reality_branch_count` | `1` |"));
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+        let latest = must_some(
+            export.evidence.latest_controlled_reality_interaction,
+            "latest interaction should be exported",
+        );
+        assert_eq!(latest.request_id, artifact_request_id);
+        assert_eq!(latest.interaction.origin_request_id, origin_request_id);
+        assert_eq!(latest.interaction.job_id, job_id);
+        assert_eq!(
+            latest.interaction.action,
+            ControlledRealityInteractionAction::ArtifactRead { artifact }
+        );
+        assert_eq!(export.evidence.event_ids.len(), 2);
     }
 
     #[test]

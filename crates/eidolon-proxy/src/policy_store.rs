@@ -5,10 +5,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use eidolon_core::{PolicyState, SessionId};
+use eidolon_core::{
+    ControlledRealityWorkflowState, Event, EventKind, EventSource, PolicyState, RequestId,
+    RoutingDecision, SessionId,
+};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-pub const POLICY_STORE_SCHEMA_VERSION: u16 = 2;
+pub const POLICY_STORE_SCHEMA_VERSION: u16 = 3;
 const MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION: u16 = 1;
 
 /// Maximum retained session policy records. If enforcement-only churn reaches
@@ -45,10 +49,16 @@ pub struct PolicyStateStore {
     last_eviction: EvictionStats,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPolicyRecord {
     pub policy_state: PolicyState,
     pub controlled_reality_depth: u32,
+    #[serde(default)]
+    pub controlled_reality_workflow_state: ControlledRealityWorkflowState,
+    #[serde(default)]
+    pub controlled_reality_origin_request_id: Option<RequestId>,
+    #[serde(default)]
+    pub controlled_reality_pending_update: Option<ControlledRealityPendingUpdate>,
     #[serde(default)]
     pub last_seen_unix_secs: u64,
     #[serde(default)]
@@ -78,6 +88,60 @@ pub struct EvictionStats {
     pub fail_closed_activated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlledRealityProgress {
+    pub depth: u32,
+    pub from_state: ControlledRealityWorkflowState,
+    pub to_state: ControlledRealityWorkflowState,
+    pub origin_request_id: Option<RequestId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlledRealityPendingUpdate {
+    pub request_id: RequestId,
+    #[serde(default)]
+    pub request_action: ControlledRealityRequestAction,
+    pub previous_depth: u32,
+    pub previous_state: ControlledRealityWorkflowState,
+    pub previous_origin_request_id: Option<RequestId>,
+    #[serde(default)]
+    pub commit_policy_state: Option<PolicyState>,
+    #[serde(default)]
+    pub expected_policy_changed: Option<Event>,
+    #[serde(default)]
+    pub expected_response: Option<ControlledRealityPendingResponse>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlledRealityPendingResponse {
+    pub event_id: Uuid,
+    pub policy_state: PolicyState,
+    pub status: u16,
+    pub routing_decision: RoutingDecision,
+    pub interaction_kind: Option<ControlledRealityPendingInteractionKind>,
+    pub controlled_reality_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlledRealityPendingInteractionKind {
+    JobSubmitted,
+    StatusRead,
+    ArtifactRead,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlledRealityRequestAction {
+    BranchRead,
+    JobSubmitted,
+    StatusRead,
+    ArtifactRead,
+    MethodRejected,
+    #[default]
+    UnknownResource,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PolicyPersistOutcome {
     Durable,
@@ -98,6 +162,9 @@ impl SessionPolicyRecord {
         Self {
             policy_state,
             controlled_reality_depth: 0,
+            controlled_reality_workflow_state: ControlledRealityWorkflowState::Ready,
+            controlled_reality_origin_request_id: None,
+            controlled_reality_pending_update: None,
             last_seen_unix_secs: 0,
             reality_escape_attempt_count: 0,
             discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout::default(),
@@ -131,6 +198,12 @@ struct StoredSessionPolicy {
     policy_state: PolicyState,
     #[serde(default)]
     controlled_reality_depth: u32,
+    #[serde(default)]
+    controlled_reality_workflow_state: ControlledRealityWorkflowState,
+    #[serde(default)]
+    controlled_reality_origin_request_id: Option<RequestId>,
+    #[serde(default)]
+    controlled_reality_pending_update: Option<ControlledRealityPendingUpdate>,
     #[serde(default)]
     last_seen_unix_secs: u64,
     #[serde(default)]
@@ -292,13 +365,28 @@ impl PolicyStateStore {
     }
 
     pub fn record(&self, session_id: SessionId) -> SessionPolicyRecord {
-        self.records.get(&session_id).copied().unwrap_or_else(|| {
+        self.records.get(&session_id).cloned().unwrap_or_else(|| {
             if self.fail_closed_for_unknown_sessions() {
                 SessionPolicyRecord::new(PolicyState::Blocked)
             } else {
                 SessionPolicyRecord::default()
             }
         })
+    }
+
+    pub fn pending_controlled_reality_sessions(&self) -> Vec<SessionId> {
+        let mut sessions = self
+            .records
+            .iter()
+            .filter_map(|(session_id, record)| {
+                record
+                    .controlled_reality_pending_update
+                    .is_some()
+                    .then_some(*session_id)
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session_id| session_id.0);
+        sessions
     }
 
     /// Expire stale lower-rung sessions before refreshing the current session.
@@ -431,12 +519,26 @@ impl PolicyStateStore {
         session_id: SessionId,
         policy_state: PolicyState,
     ) -> io::Result<()> {
+        let current = self.record(session_id);
+        if current.controlled_reality_pending_update.is_some()
+            && current.policy_state != policy_state
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "policy state cannot change while a controlled-reality response is pending",
+            ));
+        }
+
         self.mutate_and_persist(|store| {
             let mut record = store.record(session_id);
             if record.policy_state != policy_state {
                 record.policy_state = policy_state;
                 if policy_state != PolicyState::ControlledReality {
                     record.controlled_reality_depth = 0;
+                    record.controlled_reality_workflow_state =
+                        ControlledRealityWorkflowState::Ready;
+                    record.controlled_reality_origin_request_id = None;
+                    record.controlled_reality_pending_update = None;
                     record.reality_escape_attempt_count = 0;
                 }
             }
@@ -448,8 +550,309 @@ impl PolicyStateStore {
         self.mutate_and_persist(|store| {
             let mut record = store.record(session_id);
             record.controlled_reality_depth = record.controlled_reality_depth.saturating_add(1);
+            let depth = record.controlled_reality_depth;
             store.insert_record(session_id, record);
-            record.controlled_reality_depth
+            depth
+        })
+    }
+
+    pub fn note_controlled_reality_interaction(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        action: ControlledRealityRequestAction,
+        depth_limit: u32,
+    ) -> io::Result<ControlledRealityProgress> {
+        if self
+            .record(session_id)
+            .controlled_reality_pending_update
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "controlled-reality workflow has an uncommitted evidence record",
+            ));
+        }
+
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            let pending_update = ControlledRealityPendingUpdate {
+                request_id,
+                request_action: action,
+                previous_depth: record.controlled_reality_depth,
+                previous_state: record.controlled_reality_workflow_state,
+                previous_origin_request_id: record.controlled_reality_origin_request_id,
+                commit_policy_state: None,
+                expected_policy_changed: None,
+                expected_response: None,
+            };
+            record.controlled_reality_depth = record.controlled_reality_depth.saturating_add(1);
+            let from_state = record.controlled_reality_workflow_state;
+            let to_state = if record.controlled_reality_depth > depth_limit {
+                from_state
+            } else {
+                match (from_state, action) {
+                    (
+                        ControlledRealityWorkflowState::Ready,
+                        ControlledRealityRequestAction::JobSubmitted,
+                    ) => {
+                        record.controlled_reality_origin_request_id = Some(request_id);
+                        ControlledRealityWorkflowState::Queued
+                    }
+                    (
+                        ControlledRealityWorkflowState::Queued,
+                        ControlledRealityRequestAction::StatusRead,
+                    ) if record.controlled_reality_origin_request_id.is_some() => {
+                        ControlledRealityWorkflowState::Completed
+                    }
+                    _ => from_state,
+                }
+            };
+            record.controlled_reality_workflow_state = to_state;
+            record.controlled_reality_pending_update = Some(pending_update);
+            let depth = record.controlled_reality_depth;
+            let origin_request_id = record.controlled_reality_origin_request_id;
+            store.insert_record(session_id, record);
+            ControlledRealityProgress {
+                depth,
+                from_state,
+                to_state,
+                origin_request_id,
+            }
+        })
+    }
+
+    pub fn commit_controlled_reality_interaction(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+    ) -> io::Result<bool> {
+        let pending_update = match self.record(session_id).controlled_reality_pending_update {
+            None => return Ok(false),
+            Some(pending_update) if pending_update.request_id != request_id => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "controlled-reality workflow commit request id did not match pending state",
+                ));
+            }
+            Some(pending_update) if pending_update.expected_response.is_none() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "controlled-reality workflow cannot commit without a response contract",
+                ));
+            }
+            Some(pending_update) => pending_update,
+        };
+        if pending_update.commit_policy_state.is_some()
+            != pending_update.expected_policy_changed.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "controlled-reality policy transition contract was incomplete",
+            ));
+        }
+
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            if let Some(policy_state) = pending_update.commit_policy_state {
+                record.policy_state = policy_state;
+                if policy_state != PolicyState::ControlledReality {
+                    record.controlled_reality_depth = 0;
+                    record.controlled_reality_workflow_state =
+                        ControlledRealityWorkflowState::Ready;
+                    record.controlled_reality_origin_request_id = None;
+                    record.reality_escape_attempt_count = 0;
+                }
+            }
+            record.controlled_reality_pending_update = None;
+            store.insert_record(session_id, record);
+            true
+        })
+    }
+
+    pub fn stage_controlled_reality_policy_state(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        policy_state: PolicyState,
+        expected_policy_changed: Event,
+    ) -> io::Result<bool> {
+        let record = self.record(session_id);
+        match record.controlled_reality_pending_update.as_ref() {
+            None => return Ok(false),
+            Some(pending_update) if pending_update.request_id != request_id => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "controlled-reality policy transition request id did not match pending state",
+                ));
+            }
+            Some(_) if record.policy_state != PolicyState::ControlledReality => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "controlled-reality policy transition did not start from containment",
+                ));
+            }
+            Some(_) if policy_state != PolicyState::Blocked => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "controlled-reality pending policy transition must fail closed to blocked",
+                ));
+            }
+            Some(pending_update)
+                if pending_update.commit_policy_state.is_some()
+                    || pending_update.expected_policy_changed.is_some() =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "controlled-reality policy transition was already staged",
+                ));
+            }
+            Some(_) => {}
+        }
+        if expected_policy_changed.session_id != session_id
+            || expected_policy_changed.request_id != Some(request_id)
+            || expected_policy_changed.source != EventSource::PolicyRouter
+            || expected_policy_changed.policy_state != policy_state
+            || !matches!(
+                &expected_policy_changed.kind,
+                EventKind::PolicyChanged {
+                    from: PolicyState::ControlledReality,
+                    to: PolicyState::Blocked,
+                    ..
+                }
+            )
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "controlled-reality staged policy event did not match the blocked transition",
+            ));
+        }
+
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            let mut pending_update = record
+                .controlled_reality_pending_update
+                .expect("pending update was checked before mutation");
+            pending_update.commit_policy_state = Some(policy_state);
+            pending_update.expected_policy_changed = Some(expected_policy_changed);
+            record.controlled_reality_pending_update = Some(pending_update);
+            store.insert_record(session_id, record);
+            true
+        })
+    }
+
+    pub fn set_pending_controlled_reality_response(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        expected_response: ControlledRealityPendingResponse,
+    ) -> io::Result<bool> {
+        let record = self.record(session_id);
+        match record.controlled_reality_pending_update.as_ref() {
+            None => return Ok(false),
+            Some(pending_update) if pending_update.request_id != request_id => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "controlled-reality response request id did not match pending state",
+                ));
+            }
+            Some(pending_update) if pending_update.expected_response == Some(expected_response) => {
+                return Ok(true);
+            }
+            Some(pending_update) if pending_update.expected_response.is_some() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "controlled-reality response contract was already registered",
+                ));
+            }
+            Some(_) => {}
+        }
+        let expected_policy_state = record
+            .controlled_reality_pending_update
+            .as_ref()
+            .and_then(|pending| pending.commit_policy_state)
+            .unwrap_or(record.policy_state);
+        if expected_response.policy_state != expected_policy_state {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "controlled-reality response policy state did not match pending state",
+            ));
+        }
+
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            let mut pending_update = record
+                .controlled_reality_pending_update
+                .expect("pending update was checked before mutation");
+            pending_update.expected_response = Some(expected_response);
+            record.controlled_reality_pending_update = Some(pending_update);
+            store.insert_record(session_id, record);
+            true
+        })
+    }
+
+    pub fn recover_pending_controlled_reality(
+        &mut self,
+        session_id: SessionId,
+    ) -> io::Result<bool> {
+        let Some(pending_update) = self.record(session_id).controlled_reality_pending_update else {
+            return Ok(false);
+        };
+
+        self.reconcile_pending_controlled_reality(session_id, pending_update.request_id, false)
+    }
+
+    pub fn reconcile_pending_controlled_reality(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        durable_response_seen: bool,
+    ) -> io::Result<bool> {
+        let Some(pending_update) = self.record(session_id).controlled_reality_pending_update else {
+            return Ok(false);
+        };
+        if pending_update.request_id != request_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "controlled-reality workflow recovery request id did not match pending state",
+            ));
+        }
+        if durable_response_seen && pending_update.expected_response.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "controlled-reality workflow cannot roll forward without a response contract",
+            ));
+        }
+        if durable_response_seen
+            && pending_update.commit_policy_state.is_some()
+                != pending_update.expected_policy_changed.is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "controlled-reality policy transition contract was incomplete",
+            ));
+        }
+
+        self.mutate_and_persist(|store| {
+            let mut record = store.record(session_id);
+            if !durable_response_seen {
+                record.controlled_reality_depth = pending_update.previous_depth;
+                record.controlled_reality_workflow_state = pending_update.previous_state;
+                record.controlled_reality_origin_request_id =
+                    pending_update.previous_origin_request_id;
+            } else if let Some(policy_state) = pending_update.commit_policy_state {
+                record.policy_state = policy_state;
+                if policy_state != PolicyState::ControlledReality {
+                    record.controlled_reality_depth = 0;
+                    record.controlled_reality_workflow_state =
+                        ControlledRealityWorkflowState::Ready;
+                    record.controlled_reality_origin_request_id = None;
+                    record.reality_escape_attempt_count = 0;
+                }
+            }
+            record.controlled_reality_pending_update = None;
+            store.insert_record(session_id, record);
+            true
         })
     }
 
@@ -458,8 +861,9 @@ impl PolicyStateStore {
             let mut record = store.record(session_id);
             record.reality_escape_attempt_count =
                 record.reality_escape_attempt_count.saturating_add(1);
+            let attempt_count = record.reality_escape_attempt_count;
             store.insert_record(session_id, record);
-            record.reality_escape_attempt_count
+            attempt_count
         })
     }
 
@@ -487,8 +891,9 @@ impl PolicyStateStore {
             record.discovery_request_count = record.discovery_request_count.saturating_add(1);
             record.discovery_query_seen |= query_present;
             record.discovery_legacy_openapi_query_seen |= legacy_openapi_query_seen;
+            let state = discovery_recon_state(&record);
             store.insert_record(session_id, record);
-            discovery_recon_state(record)
+            state
         })
     }
 
@@ -501,8 +906,9 @@ impl PolicyStateStore {
             let mut record = store.record(session_id);
             record.discovery_linked_bait_surface_fanout =
                 record.discovery_linked_bait_surface_fanout.mark(kind);
+            let state = discovery_recon_state(&record);
             store.insert_record(session_id, record);
-            discovery_recon_state(record)
+            state
         })
     }
 
@@ -519,8 +925,9 @@ impl PolicyStateStore {
                 .min(crate::policy::discovery_recon_decoy_write_probe_count_cap());
             record.discovery_decoy_write_probe_fanout =
                 record.discovery_decoy_write_probe_fanout.mark(kind);
+            let state = discovery_recon_state(&record);
             store.insert_record(session_id, record);
-            discovery_recon_state(record)
+            state
         })
     }
 
@@ -543,6 +950,9 @@ impl PolicyStateStore {
                 session_id: *session_id,
                 policy_state: record.policy_state,
                 controlled_reality_depth: record.controlled_reality_depth,
+                controlled_reality_workflow_state: record.controlled_reality_workflow_state,
+                controlled_reality_origin_request_id: record.controlled_reality_origin_request_id,
+                controlled_reality_pending_update: record.controlled_reality_pending_update.clone(),
                 last_seen_unix_secs: record.last_seen_unix_secs,
                 reality_escape_attempt_count: record.reality_escape_attempt_count,
                 discovery_surface_fanout: record.discovery_surface_fanout,
@@ -613,7 +1023,7 @@ fn sync_parent_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn discovery_recon_state(record: SessionPolicyRecord) -> crate::policy::DiscoveryReconState {
+fn discovery_recon_state(record: &SessionPolicyRecord) -> crate::policy::DiscoveryReconState {
     crate::policy::DiscoveryReconState {
         fanout: record.discovery_surface_fanout,
         request_count: record.discovery_request_count,
@@ -701,6 +1111,10 @@ fn deserialize_records(
                 SessionPolicyRecord {
                     policy_state: session.policy_state,
                     controlled_reality_depth: session.controlled_reality_depth,
+                    controlled_reality_workflow_state: session.controlled_reality_workflow_state,
+                    controlled_reality_origin_request_id: session
+                        .controlled_reality_origin_request_id,
+                    controlled_reality_pending_update: session.controlled_reality_pending_update,
                     last_seen_unix_secs: session.last_seen_unix_secs,
                     reality_escape_attempt_count: session.reality_escape_attempt_count,
                     discovery_surface_fanout: session.discovery_surface_fanout,
@@ -754,9 +1168,46 @@ mod tests {
         ))
     }
 
+    fn set_test_response_contract(
+        store: &mut PolicyStateStore,
+        session_id: SessionId,
+        request_id: RequestId,
+        status: u16,
+        interaction_kind: ControlledRealityPendingInteractionKind,
+    ) {
+        store
+            .set_pending_controlled_reality_response(
+                session_id,
+                request_id,
+                ControlledRealityPendingResponse {
+                    event_id: Uuid::new_v4(),
+                    policy_state: PolicyState::ControlledReality,
+                    status,
+                    routing_decision: RoutingDecision::ControlledReality,
+                    interaction_kind: Some(interaction_kind),
+                    controlled_reality_sha256: [0; 32],
+                },
+            )
+            .expect("response contract should persist");
+    }
+
+    fn test_blocked_policy_event(session_id: SessionId, request_id: RequestId) -> Event {
+        Event::new(
+            session_id,
+            EventSource::PolicyRouter,
+            PolicyState::Blocked,
+            EventKind::PolicyChanged {
+                from: PolicyState::ControlledReality,
+                to: PolicyState::Blocked,
+                reason: "test controlled-reality block".to_string(),
+            },
+        )
+        .with_request_id(request_id)
+    }
+
     #[test]
     fn policy_store_schema_version_matches_current_contract() {
-        assert_eq!(POLICY_STORE_SCHEMA_VERSION, 2);
+        assert_eq!(POLICY_STORE_SCHEMA_VERSION, 3);
     }
 
     fn store_with(records: Vec<(SessionId, PolicyState, u64)>) -> PolicyStateStore {
@@ -1222,6 +1673,392 @@ mod tests {
     }
 
     #[test]
+    fn controlled_reality_workflow_is_bounded_and_survives_reopen() {
+        let path = unique_temp_path("controlled-workflow");
+        let session_id = SessionId::new();
+        let origin_request_id = RequestId::new();
+        let status_request_id = RequestId::new();
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("state should persist");
+
+        let submitted = store
+            .note_controlled_reality_interaction(
+                session_id,
+                origin_request_id,
+                ControlledRealityRequestAction::JobSubmitted,
+                4,
+            )
+            .expect("submission should persist");
+        assert_eq!(submitted.depth, 1);
+        assert_eq!(submitted.from_state, ControlledRealityWorkflowState::Ready);
+        assert_eq!(submitted.to_state, ControlledRealityWorkflowState::Queued);
+        assert_eq!(submitted.origin_request_id, Some(origin_request_id));
+        assert_eq!(
+            store
+                .record(session_id)
+                .controlled_reality_pending_update
+                .map(|pending| pending.request_id),
+            Some(origin_request_id)
+        );
+        set_test_response_contract(
+            &mut store,
+            session_id,
+            origin_request_id,
+            202,
+            ControlledRealityPendingInteractionKind::JobSubmitted,
+        );
+        assert!(store
+            .commit_controlled_reality_interaction(session_id, origin_request_id)
+            .expect("submission evidence should commit"));
+
+        let mut reopened = PolicyStateStore::open(&path).expect("store should reopen");
+        let status = reopened
+            .note_controlled_reality_interaction(
+                session_id,
+                status_request_id,
+                ControlledRealityRequestAction::StatusRead,
+                4,
+            )
+            .expect("status should persist");
+        assert_eq!(status.depth, 2);
+        assert_eq!(status.from_state, ControlledRealityWorkflowState::Queued);
+        assert_eq!(status.to_state, ControlledRealityWorkflowState::Completed);
+        assert_eq!(status.origin_request_id, Some(origin_request_id));
+        set_test_response_contract(
+            &mut reopened,
+            session_id,
+            status_request_id,
+            200,
+            ControlledRealityPendingInteractionKind::StatusRead,
+        );
+        assert!(reopened
+            .commit_controlled_reality_interaction(session_id, status_request_id)
+            .expect("status evidence should commit"));
+
+        let completed = PolicyStateStore::open(&path).expect("store should reopen");
+        let record = completed.record(session_id);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Completed
+        );
+        assert_eq!(
+            record.controlled_reality_origin_request_id,
+            Some(origin_request_id)
+        );
+        assert_eq!(record.controlled_reality_pending_update, None);
+        fs::remove_file(path).expect("store should remove");
+    }
+
+    #[test]
+    fn pending_workflow_stages_block_state_until_response_commit() {
+        let mut store = PolicyStateStore::in_memory();
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("controlled state should persist");
+        store
+            .note_controlled_reality_interaction(
+                session_id,
+                request_id,
+                ControlledRealityRequestAction::BranchRead,
+                4,
+            )
+            .expect("pending interaction should persist");
+
+        let error = store
+            .set_policy_state(session_id, PolicyState::Blocked)
+            .expect_err("ordinary policy updates must not clear pending workflow state");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            store.record(session_id).policy_state,
+            PolicyState::ControlledReality
+        );
+
+        assert!(store
+            .stage_controlled_reality_policy_state(
+                session_id,
+                request_id,
+                PolicyState::Blocked,
+                test_blocked_policy_event(session_id, request_id),
+            )
+            .expect("block state should stage"));
+        store
+            .set_pending_controlled_reality_response(
+                session_id,
+                request_id,
+                ControlledRealityPendingResponse {
+                    event_id: Uuid::new_v4(),
+                    policy_state: PolicyState::Blocked,
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                    interaction_kind: None,
+                    controlled_reality_sha256: [0; 32],
+                },
+            )
+            .expect("blocked response contract should persist");
+        assert!(store
+            .commit_controlled_reality_interaction(session_id, request_id)
+            .expect("durable response should commit the staged block"));
+
+        let record = store.record(session_id);
+        assert_eq!(record.policy_state, PolicyState::Blocked);
+        assert_eq!(record.controlled_reality_depth, 0);
+        assert_eq!(record.controlled_reality_pending_update, None);
+    }
+
+    #[test]
+    fn staged_block_rolls_back_when_no_durable_response_exists() {
+        let mut store = PolicyStateStore::in_memory();
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("controlled state should persist");
+        store
+            .note_controlled_reality_interaction(
+                session_id,
+                request_id,
+                ControlledRealityRequestAction::BranchRead,
+                4,
+            )
+            .expect("pending interaction should persist");
+        store
+            .stage_controlled_reality_policy_state(
+                session_id,
+                request_id,
+                PolicyState::Blocked,
+                test_blocked_policy_event(session_id, request_id),
+            )
+            .expect("block state should stage");
+
+        assert!(store
+            .reconcile_pending_controlled_reality(session_id, request_id, false)
+            .expect("missing response should roll back"));
+
+        let record = store.record(session_id);
+        assert_eq!(record.policy_state, PolicyState::ControlledReality);
+        assert_eq!(record.controlled_reality_depth, 0);
+        assert_eq!(record.controlled_reality_pending_update, None);
+    }
+
+    #[test]
+    fn uncommitted_workflow_state_recovers_to_ready_after_reopen() {
+        let path = unique_temp_path("controlled-workflow-pending");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("state should persist");
+        store
+            .note_controlled_reality_interaction(
+                session_id,
+                request_id,
+                ControlledRealityRequestAction::JobSubmitted,
+                4,
+            )
+            .expect("pending submission should persist");
+        store
+            .set_pending_controlled_reality_response(
+                session_id,
+                request_id,
+                ControlledRealityPendingResponse {
+                    event_id: Uuid::new_v4(),
+                    policy_state: PolicyState::ControlledReality,
+                    status: 202,
+                    routing_decision: RoutingDecision::ControlledReality,
+                    interaction_kind: Some(ControlledRealityPendingInteractionKind::JobSubmitted),
+                    controlled_reality_sha256: [0; 32],
+                },
+            )
+            .expect("response contract should persist");
+
+        let mut reopened = PolicyStateStore::open(&path).expect("store should reopen");
+        assert_eq!(
+            reopened
+                .record(session_id)
+                .controlled_reality_pending_update
+                .map(|pending| pending.request_id),
+            Some(request_id)
+        );
+        assert!(reopened
+            .recover_pending_controlled_reality(session_id)
+            .expect("pending workflow should recover"));
+
+        let record = reopened.record(session_id);
+        assert_eq!(record.controlled_reality_depth, 0);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Ready
+        );
+        assert_eq!(record.controlled_reality_origin_request_id, None);
+        assert_eq!(record.controlled_reality_pending_update, None);
+        fs::remove_file(path).expect("store should remove");
+    }
+
+    #[test]
+    fn durable_response_recovery_preserves_the_pending_transition() {
+        let path = unique_temp_path("controlled-workflow-durable-response");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("state should persist");
+        store
+            .note_controlled_reality_interaction(
+                session_id,
+                request_id,
+                ControlledRealityRequestAction::JobSubmitted,
+                4,
+            )
+            .expect("pending submission should persist");
+        store
+            .set_pending_controlled_reality_response(
+                session_id,
+                request_id,
+                ControlledRealityPendingResponse {
+                    event_id: Uuid::new_v4(),
+                    policy_state: PolicyState::ControlledReality,
+                    status: 202,
+                    routing_decision: RoutingDecision::ControlledReality,
+                    interaction_kind: Some(ControlledRealityPendingInteractionKind::JobSubmitted),
+                    controlled_reality_sha256: [0; 32],
+                },
+            )
+            .expect("response contract should persist");
+
+        let mut reopened = PolicyStateStore::open(&path).expect("store should reopen");
+        assert!(reopened
+            .reconcile_pending_controlled_reality(session_id, request_id, true)
+            .expect("durable response should roll the transition forward"));
+
+        let record = reopened.record(session_id);
+        assert_eq!(record.controlled_reality_depth, 1);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Queued
+        );
+        assert_eq!(
+            record.controlled_reality_origin_request_id,
+            Some(request_id)
+        );
+        assert_eq!(record.controlled_reality_pending_update, None);
+        fs::remove_file(path).expect("store should remove");
+    }
+
+    #[test]
+    fn uncommitted_status_restores_the_last_proven_queued_state() {
+        let path = unique_temp_path("controlled-workflow-pending-status");
+        let session_id = SessionId::new();
+        let origin_request_id = RequestId::new();
+        let status_request_id = RequestId::new();
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("state should persist");
+        store
+            .note_controlled_reality_interaction(
+                session_id,
+                origin_request_id,
+                ControlledRealityRequestAction::JobSubmitted,
+                4,
+            )
+            .expect("submission should persist");
+        set_test_response_contract(
+            &mut store,
+            session_id,
+            origin_request_id,
+            202,
+            ControlledRealityPendingInteractionKind::JobSubmitted,
+        );
+        store
+            .commit_controlled_reality_interaction(session_id, origin_request_id)
+            .expect("submission evidence should commit");
+        store
+            .note_controlled_reality_interaction(
+                session_id,
+                status_request_id,
+                ControlledRealityRequestAction::StatusRead,
+                4,
+            )
+            .expect("pending status should persist");
+
+        let mut reopened = PolicyStateStore::open(&path).expect("store should reopen");
+        assert!(reopened
+            .recover_pending_controlled_reality(session_id)
+            .expect("pending status should recover"));
+
+        let record = reopened.record(session_id);
+        assert_eq!(record.controlled_reality_depth, 1);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Queued
+        );
+        assert_eq!(
+            record.controlled_reality_origin_request_id,
+            Some(origin_request_id)
+        );
+        assert_eq!(record.controlled_reality_pending_update, None);
+        fs::remove_file(path).expect("store should remove");
+    }
+
+    #[test]
+    fn depth_limit_does_not_advance_controlled_reality_workflow() {
+        let mut store = PolicyStateStore::in_memory();
+        let session_id = SessionId::new();
+
+        let progress = store
+            .note_controlled_reality_interaction(
+                session_id,
+                RequestId::new(),
+                ControlledRealityRequestAction::JobSubmitted,
+                0,
+            )
+            .expect("depth should persist");
+
+        assert_eq!(progress.depth, 1);
+        assert_eq!(progress.from_state, ControlledRealityWorkflowState::Ready);
+        assert_eq!(progress.to_state, ControlledRealityWorkflowState::Ready);
+        assert_eq!(progress.origin_request_id, None);
+    }
+
+    #[test]
+    fn failed_workflow_persist_rolls_back_phase_origin_and_depth() {
+        let parent = unique_temp_path("workflow-removed-parent");
+        fs::create_dir(&parent).expect("parent should create");
+        let path = parent.join("policy.json");
+        let session_id = SessionId::new();
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("state should persist");
+        fs::remove_file(&path).expect("store file should remove");
+        fs::remove_dir(&parent).expect("parent should remove");
+
+        store
+            .note_controlled_reality_interaction(
+                session_id,
+                RequestId::new(),
+                ControlledRealityRequestAction::JobSubmitted,
+                4,
+            )
+            .expect_err("workflow persistence should fail");
+
+        let record = store.record(session_id);
+        assert_eq!(record.controlled_reality_depth, 0);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Ready
+        );
+        assert_eq!(record.controlled_reality_origin_request_id, None);
+        assert_eq!(record.controlled_reality_pending_update, None);
+    }
+
+    #[test]
     fn leaving_controlled_reality_resets_depth() {
         let mut store = PolicyStateStore::in_memory();
         let session_id = SessionId::new();
@@ -1248,6 +2085,12 @@ mod tests {
         let record = store.record(session_id);
         assert_eq!(record.policy_state, PolicyState::Observe);
         assert_eq!(record.controlled_reality_depth, 0);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Ready
+        );
+        assert_eq!(record.controlled_reality_origin_request_id, None);
+        assert_eq!(record.controlled_reality_pending_update, None);
         assert_eq!(record.reality_escape_attempt_count, 0);
     }
 

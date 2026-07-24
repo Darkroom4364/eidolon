@@ -24,6 +24,10 @@ write_fixture_state() {
 {"schema_version":2,"id":"aaaaaaaa-9999-9999-9999-999999999999","session_id":"eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee","observed_at":"2026-06-05T00:00:51Z","source":"policy_router","policy_state":"observe","kind":{"type":"policy_decision","routing_decision":"rewritten_upstream","reason":"signed agent claim stayed baited after authenticated explicit rule category mismatch"}}
 JSONL
 
+  cat > "$dir/events.jsonl.000000000000000000000000000000000000001" <<'JSONL'
+{"schema_version":2,"id":"00000000-0000-0000-0000-000000000001","session_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","observed_at":"2026-06-04T23:59:59Z","source":"policy_router","policy_state":"observe","kind":{"type":"policy_decision","routing_decision":"protected_upstream","reason":"retained archive marker"}}
+JSONL
+
   cat > "$dir/cluster-status.json" <<'JSON'
 {"bait_profile":{"profile_id":"orbstack_default_m3_catalog","polymorphic_baits":[{"bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","surface_kind":"docs","header_name":"X-Migration-Trace","kind":"session_hmac_sha256_v1","prefix":"mig"},{"bait_id":"openapi_reconcile_trace","surface":"/openapi.json","surface_kind":"open_api","header_name":"X-OpenAPI-Trace","kind":"session_hmac_sha256_v1","prefix":"oapi"},{"bait_id":"fake_service_token","surface":"/docs/service-token","surface_kind":"token","header_name":"X-Api-Key","kind":"session_hmac_sha256_v1","prefix":"svc"}]},"ingress_trust":{"authenticated_trusted_ingress_rules":[{"label":"signed-agent-docs","source":"signed_agent","trust_tier":"signed_attested","path_prefixes":["/docs"],"bait_soften_path_prefixes":["/docs"],"verified_categories":["AI Assistant"],"methods":["GET"]}],"trusted_soften_scopes":[{"label":"docs-crawler","source":"local_allowlist","trust_tier":"allowlisted","expires_at":"2999-06-05T12:00:00Z","path_prefixes":["/docs","/openapi.json"],"bait_soften_path_prefixes":["/docs"],"user_agent_substrings":["eidolon-docs-crawler"],"hosts":["127.0.0.1","localhost"],"source_cidrs":["192.168.194.1/32"],"required_header_names":["X-Eidolon-Trusted-Actor"]}]}}
 JSON
@@ -54,8 +58,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "${EDGE_EXPORT_CALL_LOG:-}" ]]; then
+  printf '%s\n' "$session" >> "$EDGE_EXPORT_CALL_LOG"
+fi
 if [[ ! -f "$events" ]]; then
   echo "missing events file" >&2
+  exit 1
+fi
+if ! grep -q '"id":"00000000-0000-0000-0000-000000000001"' "$events"; then
+  echo "retained event archive was not included" >&2
+  exit 1
+fi
+if [[ -n "${EDGE_EXPECT_EVENT_ID:-}" ]] \
+  && [[ "$(grep -F -c "\"id\":\"$EDGE_EXPECT_EVENT_ID\"" "$events")" -ne 1 ]]; then
+  echo "snapshot retry did not include the expected event exactly once" >&2
   exit 1
 fi
 
@@ -83,6 +99,40 @@ exit 0
 SH
 
   chmod +x "$dir/edge-export" "$dir/curl"
+}
+
+make_snapshot_race_cat() {
+  local dir="$1"
+
+  cat > "$dir/cat" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+active="${EIDOLON_SNAPSHOT_RACE_ACTIVE:?}"
+mode="${EIDOLON_SNAPSHOT_RACE_MODE:?}"
+count_file="${EIDOLON_SNAPSHOT_RACE_COUNT:?}"
+if [[ "$#" -eq 1 && "$1" == "$active" ]]; then
+  count=0
+  if [[ -f "$count_file" ]]; then
+    count="$(/bin/cat "$count_file")"
+  fi
+  if [[ "$mode" == "always" || "$count" -eq 0 ]]; then
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$count_file"
+    suffix="$(printf '%039d' "$((100 + count))")"
+    mv "$active" "$active.$suffix"
+    if [[ "$mode" == "once" ]]; then
+      cat_id="f0000000-0000-0000-0000-000000000001"
+      printf '%s\n' "{\"schema_version\":2,\"id\":\"$cat_id\",\"session_id\":\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\",\"observed_at\":\"2026-06-05T00:02:00Z\",\"source\":\"proxy\",\"policy_state\":\"observe\",\"kind\":{\"type\":\"request_seen\",\"method\":\"GET\",\"path\":\"/snapshot-retry\",\"safe_headers\":[],\"ingress_identity\":{\"source\":\"none\",\"trust_tier\":\"none\"},\"routing_decision\":\"protected_upstream\"}}" > "$active"
+    else
+      : > "$active"
+    fi
+  fi
+fi
+
+exec /bin/cat "$@"
+SH
+  chmod +x "$dir/cat"
 }
 
 test_exports_all_sessions_as_json_array() {
@@ -823,6 +873,60 @@ JSONL
   rg -q 'contains no request_seen sessions to export' <<<"$output"
 }
 
+test_retries_a_rotation_and_exports_each_segment_once() {
+  local temp_dir state_dir output count_file expected_event_id
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  count_file="$temp_dir/race-count"
+  expected_event_id="f0000000-0000-0000-0000-000000000001"
+  mkdir -p "$state_dir"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+  make_snapshot_race_cat "$temp_dir"
+
+  output="$(
+    PATH="$temp_dir:$PATH" \
+      EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      EIDOLON_SNAPSHOT_RACE_ACTIVE="$state_dir/events.jsonl" \
+      EIDOLON_SNAPSHOT_RACE_MODE=once \
+      EIDOLON_SNAPSHOT_RACE_COUNT="$count_file" \
+      EDGE_EXPECT_EVENT_ID="$expected_event_id" \
+      "$EXPORT_SCRIPT"
+  )"
+
+  jq -e 'length == 5' <<<"$output" >/dev/null
+  [[ "$(/bin/cat "$count_file")" -eq 1 ]]
+}
+
+test_fails_closed_when_the_log_never_stabilizes() {
+  local temp_dir state_dir output status=0 count_file call_log
+  temp_dir="$(new_temp_dir)"
+  state_dir="$temp_dir/state"
+  count_file="$temp_dir/race-count"
+  call_log="$temp_dir/edge-export-calls"
+  mkdir -p "$state_dir"
+  : > "$call_log"
+  write_fixture_state "$state_dir"
+  make_stub_bins "$temp_dir"
+  make_snapshot_race_cat "$temp_dir"
+
+  output="$(
+    PATH="$temp_dir:$PATH" \
+      EIDOLON_SHIELD_LOCAL_STATE_DIR="$state_dir" \
+      EIDOLON_EDGE_EXPORT_BIN="$temp_dir/edge-export" \
+      EIDOLON_SNAPSHOT_RACE_ACTIVE="$state_dir/events.jsonl" \
+      EIDOLON_SNAPSHOT_RACE_MODE=always \
+      EIDOLON_SNAPSHOT_RACE_COUNT="$count_file" \
+      EDGE_EXPORT_CALL_LOG="$call_log" \
+      "$EXPORT_SCRIPT" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 2 ]]
+  rg -q 'changed during all snapshot attempts' <<<"$output"
+  [[ ! -s "$call_log" ]]
+}
+
 test_exports_all_sessions_as_json_array
 test_exports_one_session_as_ndjson
 test_posts_each_export_to_webhook_and_writes_output_file
@@ -848,5 +952,7 @@ test_top_rejects_invalid_combinations
 test_fails_when_no_sessions_match_min_polymorphic_coverage
 test_fails_when_no_sessions_match_trusted_soften_filters
 test_fails_when_no_request_seen_sessions_exist
+test_retries_a_rotation_and_exports_each_segment_once
+test_fails_closed_when_the_log_never_stabilizes
 
 printf 'shield-lab edge export checks passed\n'

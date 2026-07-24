@@ -15,21 +15,26 @@ use std::{
 
 use eidolon_bait::{docs_for_bait, render_bait_for_session, BaitRegistry};
 use eidolon_core::{
-    Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, DiscoveryReconScore, Event, EventKind,
-    EventSource, ExposureId, HeaderValueMint, PolicyState, RequestId, RoutingDecision,
-    SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
+    Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, ControlledRealityInteraction,
+    DiscoveryReconScore, Event, EventKind, EventSource, ExposureId, HeaderValueMint, PolicyState,
+    RequestId, RoutingDecision, SafeHeaderObservation, SessionId, EVENT_SCHEMA_VERSION,
 };
 use eidolon_proxy::{
     controlled_reality::{
-        rate_limited_response, ControlledRealityConfig, ControlledRealityResponder,
-        DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY, MAX_CONTROLLED_REALITY_ACTION_DEPTH,
-        MAX_TARPIT_DELAY,
+        is_controlled_follow_up_path, rate_limited_response, ControlledRealityConfig,
+        ControlledRealityResponder, DEFAULT_RETRY_AFTER_SECONDS, DEFAULT_TARPIT_DELAY,
+        MAX_CONTROLLED_REALITY_ACTION_DEPTH, MAX_TARPIT_DELAY,
     },
     debug_log::FileDebugLogWriter,
-    event_log::{read_jsonl_reconstruction, FileEventLogWriter, JsonlTailRepairOutcome},
+    event_log::{
+        read_jsonl_reconstruction, DurableResponseMatch, FileEventLogWriter, JsonlTailRepairOutcome,
+    },
     ingress_identity::{self, IngressIdentityResolver},
     policy::{self, InterventionMode},
-    policy_store::PolicyStateStore,
+    policy_store::{
+        ControlledRealityPendingInteractionKind, ControlledRealityPendingResponse,
+        ControlledRealityProgress, PolicyStateStore,
+    },
     request_evaluation::{self, RequestEvaluationInput, RequestPolicyFacts},
     session::{self, SessionContext},
     session_auth::{enforcement_rank, SessionAuthority},
@@ -1047,6 +1052,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         session_authority: Arc::new(Mutex::new(session_authority)),
         controlled_reality_config: config.controlled_reality_config,
         controlled_reality: Arc::new(ControlledRealityResponder),
+        controlled_reality_workflow_lock: Arc::new(Mutex::new(())),
         surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
             Arc::clone(&bait_registry),
             bait_content.clone(),
@@ -1061,6 +1067,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         bait_exposures: Arc::new(Mutex::new(bait_exposures)),
         consumed_bait_proofs: Arc::new(Mutex::new(consumed_bait_proofs)),
     };
+    reconcile_all_pending_controlled_reality_interactions(&runtime)?;
     write_debug(
         &runtime,
         "proxy_started",
@@ -1166,6 +1173,7 @@ struct ProxyRuntime {
     session_authority: Arc<Mutex<SessionAuthority>>,
     controlled_reality_config: ControlledRealityConfig,
     controlled_reality: Arc<ControlledRealityResponder>,
+    controlled_reality_workflow_lock: Arc<Mutex<()>>,
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
     ingress_identity_resolver: Arc<IngressIdentityResolver>,
     ingress_transport_auth_secret: Option<Arc<str>>,
@@ -2810,6 +2818,7 @@ fn handle_connection(
         )?;
         return Ok(());
     };
+    reconcile_all_pending_controlled_reality_interactions(runtime)?;
 
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
     let path = match normalized_event_path(&request) {
@@ -2854,6 +2863,8 @@ fn handle_connection(
                 discovery_recon_score: policy::DiscoveryReconAggregationScore::default(),
                 discovery_recon_threshold: policy::discovery_recon_aggregation_score_threshold(),
                 response: surface_text_response(400, "ambiguous request target\n"),
+                controlled_reality_interaction: None,
+                controlled_reality_pending_commit: false,
                 intervention_mode,
                 surface_requested_intervention: true,
             });
@@ -2897,6 +2908,8 @@ fn handle_connection(
             discovery_recon_score: policy::DiscoveryReconAggregationScore::default(),
             discovery_recon_threshold: policy::discovery_recon_aggregation_score_threshold(),
             response: surface_text_response(503, "service temporarily unavailable\n"),
+            controlled_reality_interaction: None,
+            controlled_reality_pending_commit: false,
             intervention_mode,
             surface_requested_intervention: true,
         });
@@ -3012,6 +3025,34 @@ fn handle_connection(
         }),
     )?;
 
+    if is_controlled_follow_up_path(&surface_request.path)
+        && (!intervention_mode.interventions_enabled()
+            || decision.routing_decision == RoutingDecision::ProtectedUpstream)
+    {
+        let response = runtime.controlled_reality.fail_closed_follow_up_response();
+        let follow_up_decision = policy::PolicyDecision::new(
+            decision.policy_state,
+            RoutingDecision::EidolonOwned,
+            "synthetic controlled-reality follow-up namespace failed closed",
+        );
+        return write_direct_response(DirectResponseContext {
+            client_stream,
+            runtime,
+            session: &session,
+            request: &request,
+            path: &path,
+            request_id,
+            decision: &follow_up_decision,
+            discovery_recon_score,
+            discovery_recon_threshold,
+            response,
+            controlled_reality_interaction: None,
+            controlled_reality_pending_commit: false,
+            intervention_mode,
+            surface_requested_intervention: true,
+        });
+    }
+
     if !intervention_mode.interventions_enabled()
         && request_facts.owns_configured_unsafe_bait_action
     {
@@ -3044,11 +3085,16 @@ fn handle_connection(
             discovery_recon_score,
             discovery_recon_threshold,
             response,
+            controlled_reality_interaction: None,
+            controlled_reality_pending_commit: false,
             intervention_mode,
             surface_requested_intervention: true,
         });
     }
 
+    let mut controlled_reality_interaction = None;
+    let mut controlled_reality_pending_commit = false;
+    let mut _controlled_reality_workflow_guard = None;
     let controller_surface_action = match request_evaluation::initial_route_plan(
         &decision,
         intervention_mode,
@@ -3058,14 +3104,27 @@ fn handle_connection(
             .surface_controller
             .decide(&surface_request, session.session_id)?,
         request_evaluation::InitialRoutePlan::ControlledReality => {
-            let (action, transition) = controlled_reality_action(
+            _controlled_reality_workflow_guard = Some(
+                runtime
+                    .controlled_reality_workflow_lock
+                    .lock()
+                    .map_err(|_| io::Error::other("controlled-reality workflow lock poisoned"))?,
+            );
+            let (action, transition, interaction, pending_commit) = controlled_reality_action(
                 runtime,
                 session.session_id,
+                request_id,
                 &surface_request,
                 decision.reason.clone(),
             )?;
+            controlled_reality_pending_commit = pending_commit;
             if let Some(transition) = transition {
-                apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
+                stage_controlled_reality_policy_transition(
+                    runtime,
+                    session.session_id,
+                    request_id,
+                    &transition,
+                )?;
                 let blocked_decision = transition.decision(action.routing_decision());
                 write_debug(
                     runtime,
@@ -3100,10 +3159,13 @@ fn handle_connection(
                     discovery_recon_score,
                     discovery_recon_threshold,
                     response,
+                    controlled_reality_interaction: None,
+                    controlled_reality_pending_commit,
                     intervention_mode,
                     surface_requested_intervention: true,
                 });
             }
+            controlled_reality_interaction = interaction;
             action
         }
         request_evaluation::InitialRoutePlan::RateLimited => SurfaceAction::RateLimited {
@@ -3173,7 +3235,12 @@ fn handle_connection(
         request_id,
         &effective_decision,
     )? {
-        apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
+        stage_controlled_reality_policy_transition(
+            runtime,
+            session.session_id,
+            request_id,
+            &transition,
+        )?;
         let blocked_decision = transition.decision(RoutingDecision::EidolonOwned);
         let blocked_response = surface_text_response(403, "blocked by eidolon policy\n");
         let blocked_surface_action = SurfaceAction::EidolonOwned {
@@ -3209,6 +3276,8 @@ fn handle_connection(
             discovery_recon_score,
             discovery_recon_threshold,
             response: blocked_response,
+            controlled_reality_interaction: None,
+            controlled_reality_pending_commit,
             intervention_mode,
             surface_requested_intervention: true,
         });
@@ -3315,6 +3384,9 @@ fn handle_connection(
                 }),
             )?;
 
+            let mut response_interaction = None;
+            let mut response_pending_commit = false;
+            let mut _response_workflow_guard = None;
             let mut response = if !proof_accepted {
                 write_event(
                     &runtime.event_log,
@@ -3335,14 +3407,26 @@ fn handle_connection(
                 action_exposure_id.is_some(),
             ) {
                 apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
-                let (action, controlled_transition) = controlled_reality_action(
-                    runtime,
-                    session.session_id,
-                    &surface_request,
-                    transition.reason.clone(),
-                )?;
+                _response_workflow_guard = Some(
+                    runtime
+                        .controlled_reality_workflow_lock
+                        .lock()
+                        .map_err(|_| {
+                            io::Error::other("controlled-reality workflow lock poisoned")
+                        })?,
+                );
+                let (action, controlled_transition, interaction, pending_commit) =
+                    controlled_reality_action(
+                        runtime,
+                        session.session_id,
+                        request_id,
+                        &surface_request,
+                        transition.reason.clone(),
+                    )?;
+                response_interaction = interaction;
+                response_pending_commit = pending_commit;
                 effective_decision = if let Some(controlled_transition) = controlled_transition {
-                    apply_policy_transition(
+                    stage_controlled_reality_policy_transition(
                         runtime,
                         session.session_id,
                         request_id,
@@ -3379,14 +3463,22 @@ fn handle_connection(
                 bait_action_synthetic_response()
             };
             apply_response_headers(&mut response, &session, &request.method);
-            write_event(
-                &runtime.event_log,
-                &policy::response_audit_event(
+            write_controlled_reality_response_event(
+                runtime,
+                &policy::response_audit_event_with_controlled_reality(
                     session.session_id,
                     request_id,
                     &effective_decision,
                     response.status,
+                    response_interaction,
                 ),
+                response_pending_commit,
+            )?;
+            commit_controlled_reality_interaction(
+                runtime,
+                session.session_id,
+                request_id,
+                response_pending_commit,
             )?;
             write_debug(
                 runtime,
@@ -3468,6 +3560,8 @@ fn handle_connection(
                     discovery_recon_score,
                     discovery_recon_threshold,
                     response,
+                    controlled_reality_interaction: None,
+                    controlled_reality_pending_commit,
                     intervention_mode,
                     surface_requested_intervention: true,
                 });
@@ -3536,6 +3630,8 @@ fn handle_connection(
                     discovery_recon_score,
                     discovery_recon_threshold,
                     response: surface_text_response(403, "blocked by eidolon policy\n"),
+                    controlled_reality_interaction: None,
+                    controlled_reality_pending_commit,
                     intervention_mode,
                     surface_requested_intervention: true,
                 });
@@ -3572,6 +3668,8 @@ fn handle_connection(
             response: runtime
                 .controlled_reality
                 .fail_closed_bait_action_response(&surface_request),
+            controlled_reality_interaction: None,
+            controlled_reality_pending_commit,
             intervention_mode,
             surface_requested_intervention: true,
         });
@@ -3616,14 +3714,22 @@ fn handle_connection(
                 surface_request.path.clone(),
             )?;
         }
-        write_event(
-            &runtime.event_log,
-            &policy::response_audit_event(
+        write_controlled_reality_response_event(
+            runtime,
+            &policy::response_audit_event_with_controlled_reality(
                 session.session_id,
                 request_id,
                 &effective_decision,
                 response.status,
+                controlled_reality_interaction,
             ),
+            controlled_reality_pending_commit,
+        )?;
+        commit_controlled_reality_interaction(
+            runtime,
+            session.session_id,
+            request_id,
+            controlled_reality_pending_commit,
         )?;
         write_debug(
             runtime,
@@ -3893,6 +3999,8 @@ struct DirectResponseContext<'a> {
     discovery_recon_score: policy::DiscoveryReconAggregationScore,
     discovery_recon_threshold: u8,
     response: SurfaceResponse,
+    controlled_reality_interaction: Option<ControlledRealityInteraction>,
+    controlled_reality_pending_commit: bool,
     intervention_mode: InterventionMode,
     surface_requested_intervention: bool,
 }
@@ -3909,32 +4017,44 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
         discovery_recon_score,
         discovery_recon_threshold,
         response,
+        controlled_reality_interaction,
+        controlled_reality_pending_commit,
         intervention_mode,
         surface_requested_intervention,
     } = context;
 
-    write_request_and_policy_events(
+    write_direct_response_request_audit(
         runtime,
-        &request_seen_event(
-            request,
-            path,
-            session,
-            request_id,
-            decision,
-            discovery_recon_score,
-            discovery_recon_threshold,
-        ),
+        session,
+        request,
+        path,
         request_id,
         decision,
+        discovery_recon_score,
+        discovery_recon_threshold,
+        controlled_reality_pending_commit,
         intervention_mode,
         surface_requested_intervention,
     )?;
 
     let mut response = surface_response_to_http(response);
     apply_response_headers(&mut response, session, &request.method);
-    write_event(
-        &runtime.event_log,
-        &policy::response_audit_event(session.session_id, request_id, decision, response.status),
+    write_controlled_reality_response_event(
+        runtime,
+        &policy::response_audit_event_with_controlled_reality(
+            session.session_id,
+            request_id,
+            decision,
+            response.status,
+            controlled_reality_interaction,
+        ),
+        controlled_reality_pending_commit,
+    )?;
+    commit_controlled_reality_interaction(
+        runtime,
+        session.session_id,
+        request_id,
+        controlled_reality_pending_commit,
     )?;
     write_debug(
         runtime,
@@ -3954,6 +4074,103 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
 
     client_stream.write_all(&response.to_http_bytes_for_method(&request.method))?;
     client_stream.flush()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_direct_response_request_audit(
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    request: &HttpRequest,
+    path: &str,
+    request_id: RequestId,
+    decision: &policy::PolicyDecision,
+    discovery_recon_score: policy::DiscoveryReconAggregationScore,
+    discovery_recon_threshold: u8,
+    controlled_reality_pending_commit: bool,
+    intervention_mode: InterventionMode,
+    surface_requested_intervention: bool,
+) -> io::Result<()> {
+    let precommit_decision = staged_controlled_reality_precommit_decision(
+        runtime,
+        session.session_id,
+        request_id,
+        controlled_reality_pending_commit,
+        intervention_mode,
+    )?;
+    let request_decision = precommit_decision.as_ref().unwrap_or(decision);
+    let request_event = request_seen_event(
+        request,
+        path,
+        session,
+        request_id,
+        request_decision,
+        discovery_recon_score,
+        discovery_recon_threshold,
+    );
+    if precommit_decision.is_some() {
+        // A staged transition is not an observed policy outcome until its
+        // response transaction is durable. A failed response may leave only
+        // this pre-commit request fact in the log.
+        write_event(&runtime.event_log, &request_event)
+    } else {
+        write_request_and_policy_events(
+            runtime,
+            &request_event,
+            request_id,
+            decision,
+            intervention_mode,
+            surface_requested_intervention,
+        )
+    }
+}
+
+fn staged_controlled_reality_precommit_decision(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    request_id: RequestId,
+    pending_commit: bool,
+    intervention_mode: InterventionMode,
+) -> io::Result<Option<policy::PolicyDecision>> {
+    if !pending_commit {
+        return Ok(None);
+    }
+
+    let record = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?
+        .record(session_id);
+    let pending = record
+        .controlled_reality_pending_update
+        .ok_or_else(|| invalid_data("controlled-reality response had no pending state"))?;
+    if pending.request_id != request_id {
+        return Err(invalid_data(
+            "controlled-reality response request id did not match pending state",
+        ));
+    }
+    let Some(commit_policy_state) = pending.commit_policy_state else {
+        return Ok(None);
+    };
+    let Some(expected_policy_changed) = pending.expected_policy_changed else {
+        return Err(invalid_data(
+            "staged controlled-reality policy transition had no event contract",
+        ));
+    };
+    let EventKind::PolicyChanged { from, to, .. } = expected_policy_changed.kind else {
+        return Err(invalid_data(
+            "staged controlled-reality policy event was not policy_changed",
+        ));
+    };
+    if from != record.policy_state || to != commit_policy_state {
+        return Err(invalid_data(
+            "staged controlled-reality policy transition did not match current state",
+        ));
+    }
+
+    Ok(Some(policy::decide_for_state(
+        record.policy_state,
+        intervention_mode,
+    )))
 }
 
 fn policy_state_for_session(
@@ -4050,6 +4267,46 @@ fn apply_policy_transition(
     )
 }
 
+fn stage_controlled_reality_policy_transition(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    request_id: RequestId,
+    transition: &policy::PolicyTransition,
+) -> io::Result<()> {
+    if transition.from != PolicyState::ControlledReality || transition.to != PolicyState::Blocked {
+        return Err(invalid_data(
+            "controlled-reality pending transition must move from containment to blocked",
+        ));
+    }
+    write_debug(
+        runtime,
+        "policy_transition_selected",
+        Some(session_id),
+        json!({
+            "from": transition.from,
+            "to": transition.to,
+            "reason": transition.reason.as_str(),
+            "durable_response_pending": true,
+        }),
+    )?;
+    let staged = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?
+        .stage_controlled_reality_policy_state(
+            session_id,
+            request_id,
+            transition.to,
+            policy::policy_changed_event(session_id, request_id, transition),
+        )?;
+    if !staged {
+        return Err(invalid_data(
+            "controlled-reality policy transition had no pending response",
+        ));
+    }
+    Ok(())
+}
+
 fn note_reality_escape_attempt_for_session(
     runtime: &ProxyRuntime,
     session_id: SessionId,
@@ -4123,16 +4380,36 @@ fn update_discovery_recon_state_for_request(
 fn controlled_reality_action(
     runtime: &ProxyRuntime,
     session_id: SessionId,
+    request_id: RequestId,
     request: &SurfaceRequestMeta,
     default_reason: String,
-) -> io::Result<(SurfaceAction, Option<policy::PolicyTransition>)> {
-    let depth = {
+) -> io::Result<(
+    SurfaceAction,
+    Option<policy::PolicyTransition>,
+    Option<ControlledRealityInteraction>,
+    bool,
+)> {
+    reconcile_pending_controlled_reality_interaction(runtime, session_id)?;
+    let (request_kind, progress) = {
         let mut store = runtime
             .policy_store
             .lock()
             .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
-        store.increment_controlled_reality_depth(session_id)?
+        let record = store.record(session_id);
+        let request_kind = runtime.controlled_reality.classify(
+            session_id,
+            record.controlled_reality_origin_request_id,
+            request,
+        );
+        let progress = store.note_controlled_reality_interaction(
+            session_id,
+            request_id,
+            request_kind.store_action(),
+            runtime.controlled_reality_config.max_action_depth,
+        )?;
+        (request_kind, progress)
     };
+    let depth = progress.depth;
 
     let depth_limit = runtime.controlled_reality_config.max_action_depth;
     if depth > depth_limit {
@@ -4177,10 +4454,14 @@ fn controlled_reality_action(
                 "action": debug_surface_action(&action),
             }),
         )?;
-        return Ok((action, transition));
+        return Ok((action, transition, None, true));
     }
 
-    let mut action = runtime.controlled_reality.decide(request, depth);
+    let controlled_decision =
+        runtime
+            .controlled_reality
+            .decide(session_id, request, request_kind, progress);
+    let mut action = controlled_decision.action;
     if let SurfaceAction::ControlledReality { reason, .. } = &mut action {
         if depth == 1 {
             *reason = default_reason;
@@ -4193,11 +4474,198 @@ fn controlled_reality_action(
         json!({
             "depth": depth,
             "depth_limit": depth_limit,
+            "workflow": &controlled_decision.interaction,
             "action": debug_surface_action(&action),
         }),
     )?;
 
-    Ok((action, None))
+    Ok((action, None, controlled_decision.interaction, true))
+}
+
+fn reconcile_pending_controlled_reality_interaction(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+) -> io::Result<()> {
+    let record = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?
+        .record(session_id);
+    let Some(pending) = record.controlled_reality_pending_update else {
+        return Ok(());
+    };
+    let request_id = pending.request_id;
+    if pending.commit_policy_state.is_some() != pending.expected_policy_changed.is_some() {
+        return Err(invalid_data(
+            "pending controlled-reality policy transition contract was incomplete",
+        ));
+    }
+
+    let durable_response = runtime
+        .event_log
+        .lock()
+        .map_err(|_| io::Error::other("event log lock poisoned"))?
+        .durable_response(session_id, request_id)?;
+    let durable_response_seen = match (pending.expected_response, durable_response) {
+        (_, DurableResponseMatch::Missing) => {
+            if let Some(expected_policy_changed) = pending.expected_policy_changed.as_ref() {
+                let mut log = runtime
+                    .event_log
+                    .lock()
+                    .map_err(|_| io::Error::other("event log lock poisoned"))?;
+                log.pin_durable_response(session_id, request_id);
+                match log.durable_event_by_id(session_id, request_id, expected_policy_changed.id) {
+                    Ok(None) => {
+                        log.resolve_durable_response(session_id, request_id);
+                    }
+                    Ok(Some(_)) => {
+                        return Err(invalid_data(
+                            "durable policy transition existed without its workflow response",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            false
+        }
+        (
+            None,
+            DurableResponseMatch::Unique {
+                event_id: _,
+                policy_state: _,
+                status: _,
+                routing_decision: _,
+                controlled_reality: _,
+            },
+        ) => {
+            return Err(invalid_data(
+                "durable response existed without a pending response contract",
+            ));
+        }
+        (
+            Some(expected),
+            DurableResponseMatch::Unique {
+                event_id,
+                policy_state,
+                status,
+                routing_decision,
+                controlled_reality,
+            },
+        ) => {
+            let interaction_kind =
+                controlled_reality
+                    .as_ref()
+                    .map(|interaction| match &interaction.action {
+                        eidolon_core::ControlledRealityInteractionAction::JobSubmitted => {
+                            ControlledRealityPendingInteractionKind::JobSubmitted
+                        }
+                        eidolon_core::ControlledRealityInteractionAction::StatusRead => {
+                            ControlledRealityPendingInteractionKind::StatusRead
+                        }
+                        eidolon_core::ControlledRealityInteractionAction::ArtifactRead {
+                            ..
+                        } => ControlledRealityPendingInteractionKind::ArtifactRead,
+                    });
+            if event_id != expected.event_id
+                || policy_state != expected.policy_state
+                || status != expected.status
+                || routing_decision != expected.routing_decision
+                || expected.interaction_kind != interaction_kind
+            {
+                return Err(invalid_data(
+                    "durable response conflicted with its pending response contract",
+                ));
+            }
+            if controlled_reality_semantics_sha256(&controlled_reality)?
+                != expected.controlled_reality_sha256
+            {
+                return Err(invalid_data(
+                    "durable controlled-reality interaction conflicted with pending state",
+                ));
+            }
+            if let Some(expected_policy_changed) = pending.expected_policy_changed.as_ref() {
+                let mut log = runtime
+                    .event_log
+                    .lock()
+                    .map_err(|_| io::Error::other("event log lock poisoned"))?;
+                match log.durable_event_by_id(session_id, request_id, expected_policy_changed.id)? {
+                    Some(actual) if actual == *expected_policy_changed => {}
+                    Some(_) => {
+                        return Err(invalid_data(
+                            "durable policy transition conflicted with its pending contract",
+                        ));
+                    }
+                    None => {
+                        log.write_recovered_policy_event(expected_policy_changed)?;
+                    }
+                }
+            }
+            true
+        }
+    };
+    runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?
+        .reconcile_pending_controlled_reality(session_id, request_id, durable_response_seen)?;
+    runtime
+        .event_log
+        .lock()
+        .map_err(|_| io::Error::other("event log lock poisoned"))?
+        .resolve_durable_response(session_id, request_id);
+    Ok(())
+}
+
+fn reconcile_all_pending_controlled_reality_interactions(runtime: &ProxyRuntime) -> io::Result<()> {
+    let _guard = runtime
+        .controlled_reality_workflow_lock
+        .lock()
+        .map_err(|_| io::Error::other("controlled-reality workflow lock poisoned"))?;
+    let sessions = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?
+        .pending_controlled_reality_sessions();
+    if sessions.is_empty() {
+        return Ok(());
+    }
+    for session_id in sessions {
+        reconcile_pending_controlled_reality_interaction(runtime, session_id)?;
+    }
+    runtime
+        .event_log
+        .lock()
+        .map_err(|_| io::Error::other("event log lock poisoned"))?
+        .resolve_all_durable_responses();
+    Ok(())
+}
+
+fn commit_controlled_reality_interaction(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    request_id: RequestId,
+    pending_commit: bool,
+) -> io::Result<()> {
+    if !pending_commit {
+        return Ok(());
+    }
+
+    let committed = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?
+        .commit_controlled_reality_interaction(session_id, request_id)?;
+    if !committed {
+        return Err(invalid_data(
+            "controlled-reality response had no pending state to commit",
+        ));
+    }
+    runtime
+        .event_log
+        .lock()
+        .map_err(|_| io::Error::other("event log lock poisoned"))?
+        .resolve_durable_response(session_id, request_id);
+    Ok(())
 }
 
 fn bait_exposure_for_direct_surface<'a>(
@@ -5087,6 +5555,133 @@ fn write_event(log: &Arc<Mutex<FileEventLogWriter>>, event: &Event) -> io::Resul
         eprintln!("eidolon persistence failure: event log: {error}");
     }
     result
+}
+
+fn write_controlled_reality_response_event(
+    runtime: &ProxyRuntime,
+    event: &Event,
+    pending_commit: bool,
+) -> io::Result<()> {
+    if !pending_commit {
+        return write_event(&runtime.event_log, event);
+    }
+
+    let EventKind::ResponseServed {
+        status,
+        routing_decision,
+        controlled_reality,
+    } = &event.kind
+    else {
+        return Err(invalid_data(
+            "controlled-reality durable event was not response_served",
+        ));
+    };
+    let request_id = event
+        .request_id
+        .ok_or_else(|| invalid_data("controlled-reality durable response had no request id"))?;
+    let record = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?
+        .record(event.session_id);
+    let Some(pending) = record.controlled_reality_pending_update else {
+        return Err(invalid_data(
+            "controlled-reality durable response had no pending state",
+        ));
+    };
+    if pending.request_id != request_id {
+        return Err(invalid_data(
+            "controlled-reality durable response request id did not match pending state",
+        ));
+    }
+    let (expected_status, expected_routing_decision, expected_interaction) =
+        if pending.commit_policy_state == Some(PolicyState::Blocked) {
+            (403, RoutingDecision::EidolonOwned, None)
+        } else {
+            let expected = runtime.controlled_reality.expected_response(
+                event.session_id,
+                ControlledRealityProgress {
+                    depth: record.controlled_reality_depth,
+                    from_state: pending.previous_state,
+                    to_state: record.controlled_reality_workflow_state,
+                    origin_request_id: record.controlled_reality_origin_request_id,
+                },
+                pending.request_action,
+                runtime.controlled_reality_config.max_action_depth,
+            );
+            (
+                expected.status,
+                expected.routing_decision,
+                expected.interaction,
+            )
+        };
+    if *status != expected_status
+        || *routing_decision != expected_routing_decision
+        || *controlled_reality != expected_interaction
+        || event.policy_state != pending.commit_policy_state.unwrap_or(record.policy_state)
+    {
+        return Err(invalid_data(
+            "controlled-reality response conflicted with pending request semantics",
+        ));
+    }
+    let interaction_kind =
+        expected_interaction
+            .as_ref()
+            .map(|interaction| match &interaction.action {
+                eidolon_core::ControlledRealityInteractionAction::JobSubmitted => {
+                    ControlledRealityPendingInteractionKind::JobSubmitted
+                }
+                eidolon_core::ControlledRealityInteractionAction::StatusRead => {
+                    ControlledRealityPendingInteractionKind::StatusRead
+                }
+                eidolon_core::ControlledRealityInteractionAction::ArtifactRead { .. } => {
+                    ControlledRealityPendingInteractionKind::ArtifactRead
+                }
+            });
+    let pending_registered = runtime
+        .policy_store
+        .lock()
+        .map_err(|_| io::Error::other("policy state store lock poisoned"))?
+        .set_pending_controlled_reality_response(
+            event.session_id,
+            request_id,
+            ControlledRealityPendingResponse {
+                event_id: event.id,
+                policy_state: event.policy_state,
+                status: *status,
+                routing_decision: *routing_decision,
+                interaction_kind,
+                controlled_reality_sha256: controlled_reality_semantics_sha256(controlled_reality)?,
+            },
+        )?;
+    if !pending_registered {
+        return Err(invalid_data(
+            "controlled-reality durable response contract was not registered",
+        ));
+    }
+
+    let result = runtime
+        .event_log
+        .lock()
+        .map_err(|_| io::Error::other("event log lock poisoned"))
+        .and_then(|mut log| {
+            log.write_durable_response_transaction(event, pending.expected_policy_changed.as_ref())
+        });
+    if let Err(error) = &result {
+        eprintln!("eidolon persistence failure: durable workflow event log: {error}");
+    }
+    result
+}
+
+fn controlled_reality_semantics_sha256(
+    interaction: &Option<ControlledRealityInteraction>,
+) -> io::Result<[u8; 32]> {
+    let serialized = serde_json::to_vec(interaction).map_err(|error| {
+        invalid_data(format!(
+            "failed to serialize controlled-reality response semantics: {error}"
+        ))
+    })?;
+    Ok(Sha256::digest(serialized).into())
 }
 
 fn effective_session_context(
@@ -6196,7 +6791,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use eidolon_core::{ExpectedAction, PersistenceMetadata, SessionId, SurfaceKind};
+    use eidolon_core::{
+        ControlledRealityWorkflowState, ExpectedAction, PersistenceMetadata, SessionId, SurfaceKind,
+    };
     use eidolon_proxy::surface::{HtmlInsertion, RewritePlan};
     use serde_json::Value;
 
@@ -6338,6 +6935,7 @@ mod tests {
             session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
+            controlled_reality_workflow_lock: Arc::new(Mutex::new(())),
             surface_controller,
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
@@ -6386,6 +6984,7 @@ mod tests {
             session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
+            controlled_reality_workflow_lock: Arc::new(Mutex::new(())),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
                 Arc::clone(&bait_registry),
                 BaitContentOverrides::default(),
@@ -6421,6 +7020,7 @@ mod tests {
             session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
+            controlled_reality_workflow_lock: Arc::new(Mutex::new(())),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
                 Arc::clone(&bait_registry),
                 BaitContentOverrides::default(),
@@ -6458,6 +7058,7 @@ mod tests {
             session_authority: Arc::new(Mutex::new(test_session_authority())),
             controlled_reality_config: ControlledRealityConfig::default(),
             controlled_reality: Arc::new(ControlledRealityResponder),
+            controlled_reality_workflow_lock: Arc::new(Mutex::new(())),
             surface_controller: Arc::new(M1DemoSurfaceController::with_content_overrides(
                 Arc::clone(&bait_registry),
                 bait_content.clone(),
@@ -18012,6 +18613,916 @@ mod tests {
     }
 
     #[test]
+    fn runtime_controlled_reality_job_lifecycle_is_durable_and_never_reaches_upstream() {
+        let event_log_path = unique_temp_path("controlled-workflow-events.jsonl");
+        let control_path = unique_temp_path("controlled-workflow-control.txt");
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"upstream"}"#)]);
+        let runtime =
+            test_runtime_with_m1_controller(upstream, &event_log_path, control_path.clone());
+        let owner_cookie = cookie_header();
+        let other_cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &owner_cookie, PolicyState::ControlledReality);
+
+        let submitted = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie(
+                "POST",
+                "/api/v2/import/reconcile?source=SENSITIVE_SENTINEL",
+                &owner_cookie,
+                &[("X-Untrusted-Value", "SENSITIVE_SENTINEL")],
+            ),
+        ));
+        let submitted_json: Value =
+            serde_json::from_slice(&submitted.body).expect("submission should be json");
+        let job_id = submitted_json["job_id"]
+            .as_str()
+            .expect("submission should return job id")
+            .to_string();
+        let status_path = submitted_json["status_path"]
+            .as_str()
+            .expect("submission should return status path")
+            .to_string();
+
+        let status = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie(&status_path, &owner_cookie),
+        ));
+        let status_json: Value =
+            serde_json::from_slice(&status.body).expect("status should be json");
+        let artifact_path = status_json["artifact"]["path"]
+            .as_str()
+            .expect("completed job should return artifact path")
+            .to_string();
+        let artifact_sha256 = status_json["artifact"]["sha256"]
+            .as_str()
+            .expect("completed job should return artifact digest")
+            .to_string();
+
+        let artifact = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie(&artifact_path, &owner_cookie),
+        ));
+        let cross_session = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie(&status_path, &other_cookie),
+        ));
+        fs::write(&control_path, "disabled").expect("control file should write");
+        let disabled = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie(&artifact_path, &owner_cookie),
+        ));
+        let upstream_requests = recorder.finish();
+
+        assert_eq!(submitted.status, 202);
+        assert_eq!(status.status, 200);
+        assert_eq!(status_json["status"], "completed");
+        assert_eq!(status_json["job_id"], job_id);
+        assert_eq!(artifact.status, 200);
+        assert_eq!(
+            header_values(&artifact, "x-eidolon-artifact-sha256"),
+            vec![artifact_sha256.as_str()]
+        );
+        assert_eq!(cross_session.status, 404);
+        assert_eq!(disabled.status, 404);
+        assert!(
+            upstream_requests.is_empty(),
+            "controlled workflow request reached protected upstream"
+        );
+
+        let interactions: Vec<Value> = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .filter(|event| event["kind"]["controlled_reality"].is_object())
+            .collect();
+        assert_eq!(interactions.len(), 3);
+        assert_eq!(
+            interactions[0]["kind"]["controlled_reality"]["kind"],
+            "job_submitted"
+        );
+        assert_eq!(
+            interactions[1]["kind"]["controlled_reality"]["kind"],
+            "status_read"
+        );
+        assert_eq!(
+            interactions[2]["kind"]["controlled_reality"]["kind"],
+            "artifact_read"
+        );
+        let origin_request_id = interactions[0]["request_id"].clone();
+        assert!(interactions.iter().all(|event| {
+            event["kind"]["controlled_reality"]["origin_request_id"] == origin_request_id
+                && event["kind"]["controlled_reality"]["job_id"] == job_id
+        }));
+        let event_log =
+            fs::read_to_string(&event_log_path).expect("event log should remain readable");
+        assert!(!event_log.contains("SENSITIVE_SENTINEL"));
+    }
+
+    #[test]
+    fn runtime_controlled_follow_up_namespace_never_reaches_upstream() {
+        let event_log_path = unique_temp_path("controlled-follow-up-boundary-events.jsonl");
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let runtime = test_runtime_with_m1_controller(
+            upstream,
+            &event_log_path,
+            unique_temp_path("controlled-follow-up-boundary-control.txt"),
+        );
+        let owner_cookie = cookie_header();
+        let other_cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &owner_cookie, PolicyState::ControlledReality);
+
+        let collection_root = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie("/api/v2/import/reconcile/jobs", &other_cookie),
+        ));
+        let submitted = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("POST", "/api/v2/import/reconcile", &owner_cookie, &[]),
+        ));
+        let submitted_json: Value =
+            serde_json::from_slice(&submitted.body).expect("submission should be json");
+        let status_path = submitted_json["status_path"]
+            .as_str()
+            .expect("submission should return status path");
+        let unsupported_method = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("DELETE", status_path, &owner_cookie, &[]),
+        ));
+        let unknown_job = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie(
+                "/api/v2/import/reconcile/jobs/job_0000000000000000",
+                &owner_cookie,
+            ),
+        ));
+        let cross_session = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &get_request_with_cookie(status_path, &other_cookie),
+        ));
+        let upstream_requests = recorder.finish();
+
+        assert_eq!(collection_root.status, 404);
+        assert_eq!(submitted.status, 202);
+        assert_eq!(unsupported_method.status, 405);
+        assert_eq!(unknown_job.status, 404);
+        assert_eq!(cross_session.status, 404);
+        assert!(
+            upstream_requests.is_empty(),
+            "controlled follow-up namespace reached protected upstream"
+        );
+    }
+
+    #[test]
+    fn event_log_failure_cannot_leave_usable_unproven_workflow_state() {
+        let event_log_path = unique_temp_path("controlled-event-failure-events.jsonl");
+        let recovered_event_log_path =
+            unique_temp_path("controlled-event-failure-recovered-events.jsonl");
+        let mut runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("controlled-event-failure-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let cookie = cookie_header();
+        let session_id = session_id_from_cookie(&cookie).expect("cookie should contain session");
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+        let event_log = Arc::clone(&runtime.event_log);
+        assert!(thread::spawn(move || {
+            let _guard = event_log.lock().expect("event log should lock");
+            panic!("poison event log for failure-path coverage");
+        })
+        .join()
+        .is_err());
+
+        let (failed, failed_response) = run_runtime_request_result(
+            runtime.clone(),
+            &request_with_cookie("POST", "/api/v2/import/reconcile", &cookie, &[]),
+        );
+
+        assert!(failed.is_err());
+        assert!(failed_response.is_empty());
+        let pending = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(
+            pending.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Queued
+        );
+        assert!(pending.controlled_reality_pending_update.is_some());
+
+        runtime.event_log = Arc::new(Mutex::new(
+            FileEventLogWriter::open(&recovered_event_log_path)
+                .expect("replacement event log should open"),
+        ));
+        let retry = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("POST", "/api/v2/import/reconcile", &cookie, &[]),
+        ));
+
+        assert_eq!(retry.status, 202);
+        let recovered = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(
+            recovered.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Queued
+        );
+        assert_eq!(recovered.controlled_reality_depth, 1);
+        assert_eq!(recovered.controlled_reality_pending_update, None);
+        let interactions: Vec<Value> = events_of_type(&recovered_event_log_path, "response_served")
+            .into_iter()
+            .filter(|event| event["kind"]["controlled_reality"].is_object())
+            .collect();
+        assert_eq!(interactions.len(), 1);
+        assert_eq!(
+            interactions[0]["request_id"],
+            interactions[0]["kind"]["controlled_reality"]["origin_request_id"]
+        );
+    }
+
+    #[test]
+    fn missing_block_response_leaves_only_precommit_request_audit() {
+        let event_log_path = unique_temp_path("controlled-missing-block-response-events.jsonl");
+        let runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("controlled-missing-block-response-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let request_id = RequestId::new();
+        let request = parse_http_request_head(
+            b"GET /api/v2/import/reconcile/jobs/job_0123456789abcdef HTTP/1.1\r\nHost: proxy.local\r\n\r\n",
+        )
+        .expect("request should parse");
+        let surface_request = surface_request_meta(&request, &request.target);
+        let session = effective_session_context(
+            &runtime,
+            &request,
+            &surface_request,
+            Some("127.0.0.1".parse().expect("loopback IP should parse")),
+            request_id,
+        )
+        .expect("session should resolve");
+        {
+            let mut store = runtime
+                .policy_store
+                .lock()
+                .expect("policy store should lock");
+            store
+                .set_policy_state(session.session_id, PolicyState::ControlledReality)
+                .expect("controlled state should persist");
+            store
+                .note_controlled_reality_interaction(
+                    session.session_id,
+                    request_id,
+                    eidolon_proxy::policy_store::ControlledRealityRequestAction::BranchRead,
+                    MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+                )
+                .expect("pending request should persist");
+        }
+        let transition = policy::PolicyTransition::new(
+            PolicyState::ControlledReality,
+            PolicyState::Blocked,
+            "test staged block",
+        );
+        stage_controlled_reality_policy_transition(
+            &runtime,
+            session.session_id,
+            request_id,
+            &transition,
+        )
+        .expect("block should stage");
+        let blocked_decision = transition.decision(RoutingDecision::EidolonOwned);
+
+        write_direct_response_request_audit(
+            &runtime,
+            &session,
+            &request,
+            &request.target,
+            request_id,
+            &blocked_decision,
+            policy::DiscoveryReconAggregationScore::default(),
+            policy::discovery_recon_aggregation_score_threshold(),
+            true,
+            InterventionMode::Enabled,
+            true,
+        )
+        .expect("pre-response request audit should write");
+        reconcile_pending_controlled_reality_interaction(&runtime, session.session_id)
+            .expect("missing response should roll back");
+
+        let request_events = events_of_type(&event_log_path, "request_seen");
+        assert_eq!(request_events.len(), 1);
+        assert_eq!(request_events[0]["policy_state"], "controlled_reality");
+        assert_eq!(
+            request_events[0]["kind"]["routing_decision"],
+            "controlled_reality"
+        );
+        assert!(events_of_type(&event_log_path, "policy_decision").is_empty());
+        assert!(events_of_type(&event_log_path, "policy_changed").is_empty());
+        assert!(events_of_type(&event_log_path, "response_served").is_empty());
+        let record = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session.session_id);
+        assert_eq!(record.policy_state, PolicyState::ControlledReality);
+        assert_eq!(record.controlled_reality_pending_update, None);
+    }
+
+    #[test]
+    fn crash_after_response_fsync_rolls_pending_workflow_forward() {
+        let event_log_path = unique_temp_path("controlled-fsync-recovery-events.jsonl");
+        let policy_store_path = unique_temp_path("controlled-fsync-recovery-policy.json");
+        let mut runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("controlled-fsync-recovery-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.policy_store = Arc::new(Mutex::new(
+            PolicyStateStore::open(&policy_store_path).expect("policy store should open"),
+        ));
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let progress = {
+            let mut store = runtime
+                .policy_store
+                .lock()
+                .expect("policy store should lock");
+            store
+                .set_policy_state(session_id, PolicyState::ControlledReality)
+                .expect("controlled state should persist");
+            store
+                .note_controlled_reality_interaction(
+                    session_id,
+                    request_id,
+                    eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+                    MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+                )
+                .expect("pending workflow should persist")
+        };
+        let expected = runtime.controlled_reality.expected_response(
+            session_id,
+            progress,
+            eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+            MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+        );
+        let response_event = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: expected.status,
+                routing_decision: expected.routing_decision,
+                controlled_reality: expected.interaction,
+            },
+        )
+        .with_request_id(request_id);
+        write_controlled_reality_response_event(&runtime, &response_event, true)
+            .expect("response event should fsync");
+
+        runtime.policy_store = Arc::new(Mutex::new(
+            PolicyStateStore::open(&policy_store_path)
+                .expect("pending policy store should reopen after crash"),
+        ));
+        runtime.event_log = Arc::new(Mutex::new(
+            FileEventLogWriter::open(&event_log_path).expect("event log should reopen after crash"),
+        ));
+        reconcile_all_pending_controlled_reality_interactions(&runtime)
+            .expect("startup should reconcile the durable pending transition");
+
+        let record = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(record.controlled_reality_depth, 1);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Queued
+        );
+        assert_eq!(
+            record.controlled_reality_origin_request_id,
+            Some(request_id)
+        );
+        assert_eq!(record.controlled_reality_pending_update, None);
+        drop(runtime);
+        fs::remove_file(event_log_path).expect("event log should remove");
+        fs::remove_file(policy_store_path).expect("policy store should remove");
+    }
+
+    #[test]
+    fn crash_after_block_response_fsync_rolls_staged_policy_state_forward() {
+        let event_log_path = unique_temp_path("controlled-block-fsync-events.jsonl");
+        let policy_store_path = unique_temp_path("controlled-block-fsync-policy.json");
+        let mut runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("controlled-block-fsync-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.policy_store = Arc::new(Mutex::new(
+            PolicyStateStore::open(&policy_store_path).expect("policy store should open"),
+        ));
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        {
+            let mut store = runtime
+                .policy_store
+                .lock()
+                .expect("policy store should lock");
+            store
+                .set_policy_state(session_id, PolicyState::ControlledReality)
+                .expect("controlled state should persist");
+            for _ in 0..=MAX_CONTROLLED_REALITY_ACTION_DEPTH {
+                store
+                    .increment_controlled_reality_depth(session_id)
+                    .expect("depth should persist");
+            }
+            store
+                .note_controlled_reality_interaction(
+                    session_id,
+                    request_id,
+                    eidolon_proxy::policy_store::ControlledRealityRequestAction::BranchRead,
+                    MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+                )
+                .expect("pending over-limit action should persist");
+        }
+        let transition = request_evaluation::controlled_reality_depth_transition(
+            PolicyState::ControlledReality,
+            "/api/v2/import/reconcile",
+            MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+            MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+        )
+        .expect("repeated over-limit action should block");
+        stage_controlled_reality_policy_transition(&runtime, session_id, request_id, &transition)
+            .expect("blocked state should stage");
+        let response_event = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::Blocked,
+            EventKind::ResponseServed {
+                status: 403,
+                routing_decision: RoutingDecision::EidolonOwned,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(request_id);
+        let expected_policy_changed = {
+            let mut store = runtime
+                .policy_store
+                .lock()
+                .expect("policy store should lock");
+            let expected_policy_changed = store
+                .record(session_id)
+                .controlled_reality_pending_update
+                .and_then(|pending| pending.expected_policy_changed)
+                .expect("blocked transition should persist its policy event");
+            store
+                .set_pending_controlled_reality_response(
+                    session_id,
+                    request_id,
+                    ControlledRealityPendingResponse {
+                        event_id: response_event.id,
+                        policy_state: PolicyState::Blocked,
+                        status: 403,
+                        routing_decision: RoutingDecision::EidolonOwned,
+                        interaction_kind: None,
+                        controlled_reality_sha256: controlled_reality_semantics_sha256(&None)
+                            .expect("empty interaction should serialize"),
+                    },
+                )
+                .expect("blocked response contract should persist");
+            expected_policy_changed
+        };
+        runtime
+            .event_log
+            .lock()
+            .expect("event log should lock")
+            .write_durable_response(&response_event)
+            .expect("response should fsync before the simulated crash");
+
+        runtime.policy_store = Arc::new(Mutex::new(
+            PolicyStateStore::open(&policy_store_path)
+                .expect("pending policy store should reopen after crash"),
+        ));
+        runtime.event_log = Arc::new(Mutex::new(
+            FileEventLogWriter::open(&event_log_path).expect("event log should reopen after crash"),
+        ));
+        reconcile_all_pending_controlled_reality_interactions(&runtime)
+            .expect("startup should roll the blocked state forward");
+
+        let record = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(record.policy_state, PolicyState::Blocked);
+        assert_eq!(record.controlled_reality_depth, 0);
+        assert_eq!(record.controlled_reality_pending_update, None);
+        let policy_events = events_of_type(&event_log_path, "policy_changed");
+        assert_eq!(policy_events.len(), 1);
+        assert_eq!(
+            policy_events[0]["id"],
+            expected_policy_changed.id.to_string()
+        );
+        drop(runtime);
+        fs::remove_file(event_log_path).expect("event log should remove");
+        fs::remove_file(policy_store_path).expect("policy store should remove");
+    }
+
+    #[test]
+    fn durable_response_recovery_uses_stored_semantics_after_depth_config_change() {
+        let event_log_path = unique_temp_path("controlled-config-recovery-events.jsonl");
+        let policy_store_path = unique_temp_path("controlled-config-recovery-policy.json");
+        let mut runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("controlled-config-recovery-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.controlled_reality_config.max_action_depth = 1;
+        runtime.policy_store = Arc::new(Mutex::new(
+            PolicyStateStore::open(&policy_store_path).expect("policy store should open"),
+        ));
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let progress = {
+            let mut store = runtime
+                .policy_store
+                .lock()
+                .expect("policy store should lock");
+            store
+                .set_policy_state(session_id, PolicyState::ControlledReality)
+                .expect("controlled state should persist");
+            store
+                .increment_controlled_reality_depth(session_id)
+                .expect("prior depth should persist");
+            store
+                .note_controlled_reality_interaction(
+                    session_id,
+                    request_id,
+                    eidolon_proxy::policy_store::ControlledRealityRequestAction::BranchRead,
+                    1,
+                )
+                .expect("pending over-limit action should persist")
+        };
+        let expected = runtime.controlled_reality.expected_response(
+            session_id,
+            progress,
+            eidolon_proxy::policy_store::ControlledRealityRequestAction::BranchRead,
+            1,
+        );
+        let response_event = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: expected.status,
+                routing_decision: expected.routing_decision,
+                controlled_reality: expected.interaction,
+            },
+        )
+        .with_request_id(request_id);
+        write_controlled_reality_response_event(&runtime, &response_event, true)
+            .expect("rate-limited response should fsync");
+
+        runtime.controlled_reality_config.max_action_depth = 4;
+        runtime.policy_store = Arc::new(Mutex::new(
+            PolicyStateStore::open(&policy_store_path)
+                .expect("pending policy store should reopen after config change"),
+        ));
+        runtime.event_log = Arc::new(Mutex::new(
+            FileEventLogWriter::open(&event_log_path).expect("event log should reopen after crash"),
+        ));
+        reconcile_all_pending_controlled_reality_interactions(&runtime)
+            .expect("stored response semantics should survive config changes");
+
+        let record = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(record.policy_state, PolicyState::ControlledReality);
+        assert_eq!(record.controlled_reality_depth, 2);
+        assert_eq!(record.controlled_reality_pending_update, None);
+        drop(runtime);
+        fs::remove_file(event_log_path).expect("event log should remove");
+        fs::remove_file(policy_store_path).expect("policy store should remove");
+    }
+
+    #[test]
+    fn conflicting_durable_response_keeps_workflow_pending() {
+        let event_log_path = unique_temp_path("controlled-conflicting-response-events.jsonl");
+        let runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("controlled-conflicting-response-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let progress = {
+            let mut store = runtime
+                .policy_store
+                .lock()
+                .expect("policy store should lock");
+            store
+                .set_policy_state(session_id, PolicyState::ControlledReality)
+                .expect("controlled state should persist");
+            store
+                .note_controlled_reality_interaction(
+                    session_id,
+                    request_id,
+                    eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+                    MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+                )
+                .expect("pending workflow should persist")
+        };
+        let expected = runtime.controlled_reality.expected_response(
+            session_id,
+            progress,
+            eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+            MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+        );
+        let response_event = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: expected.status,
+                routing_decision: expected.routing_decision,
+                controlled_reality: Some(ControlledRealityInteraction {
+                    branch: eidolon_core::ControlledRealityBranch::ImportReconcile,
+                    origin_request_id: request_id,
+                    from_state: progress.from_state,
+                    to_state: progress.to_state,
+                    job_id: eidolon_core::ControlledRealityJobId::new("job_ffffffffffffffff")
+                        .expect("wrong job id should still satisfy the type"),
+                    action: eidolon_core::ControlledRealityInteractionAction::JobSubmitted,
+                }),
+            },
+        )
+        .with_request_id(request_id);
+        runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .set_pending_controlled_reality_response(
+                session_id,
+                request_id,
+                ControlledRealityPendingResponse {
+                    event_id: response_event.id,
+                    policy_state: PolicyState::ControlledReality,
+                    status: expected.status,
+                    routing_decision: expected.routing_decision,
+                    interaction_kind: Some(ControlledRealityPendingInteractionKind::JobSubmitted),
+                    controlled_reality_sha256: controlled_reality_semantics_sha256(
+                        &expected.interaction,
+                    )
+                    .expect("expected interaction should serialize"),
+                },
+            )
+            .expect("pending response contract should persist");
+        runtime
+            .event_log
+            .lock()
+            .expect("event log should lock")
+            .write_durable_response(&response_event)
+            .expect("conflicting response should fsync");
+
+        let error = reconcile_pending_controlled_reality_interaction(&runtime, session_id)
+            .expect_err("conflicting durable response must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let record = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Queued
+        );
+        assert!(record.controlled_reality_pending_update.is_some());
+        drop(runtime);
+        fs::remove_file(event_log_path).expect("event log should remove");
+    }
+
+    #[test]
+    fn wrong_response_routing_is_rejected_before_workflow_fsync() {
+        let event_log_path = unique_temp_path("controlled-wrong-routing-events.jsonl");
+        let runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("controlled-wrong-routing-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let progress = {
+            let mut store = runtime
+                .policy_store
+                .lock()
+                .expect("policy store should lock");
+            store
+                .set_policy_state(session_id, PolicyState::ControlledReality)
+                .expect("controlled state should persist");
+            store
+                .note_controlled_reality_interaction(
+                    session_id,
+                    request_id,
+                    eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+                    MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+                )
+                .expect("pending workflow should persist")
+        };
+        let expected = runtime.controlled_reality.expected_response(
+            session_id,
+            progress,
+            eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+            MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+        );
+        let response_event = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: expected.status,
+                routing_decision: RoutingDecision::ProtectedUpstream,
+                controlled_reality: expected.interaction,
+            },
+        )
+        .with_request_id(request_id);
+
+        let error = write_controlled_reality_response_event(&runtime, &response_event, true)
+            .expect_err("wrong response routing must fail before fsync");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(events_of_type(&event_log_path, "response_served").is_empty());
+        let pending = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id)
+            .controlled_reality_pending_update
+            .expect("workflow should remain pending");
+        assert_eq!(pending.expected_response, None);
+        drop(runtime);
+        fs::remove_file(event_log_path).expect("event log should remove");
+    }
+
+    #[test]
+    fn concurrent_controlled_submissions_serialize_one_coherent_job() {
+        let event_log_path = unique_temp_path("controlled-concurrent-events.jsonl");
+        let runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("controlled-concurrent-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let cookie = cookie_header();
+        let session_id = session_id_from_cookie(&cookie).expect("cookie should contain session");
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+        let request = request_with_cookie("POST", "/api/v2/import/reconcile", &cookie, &[]);
+        let first_runtime = runtime.clone();
+        let second_runtime = runtime.clone();
+        let first_request = request.clone();
+        let first = thread::spawn(move || run_runtime_request(first_runtime, &first_request));
+        let second = thread::spawn(move || run_runtime_request(second_runtime, &request));
+        let first =
+            parse_downstream_response(&first.join().expect("first controlled request should join"));
+        let second = parse_downstream_response(
+            &second
+                .join()
+                .expect("second controlled request should join"),
+        );
+        let first_json: Value =
+            serde_json::from_slice(&first.body).expect("first response should be json");
+        let second_json: Value =
+            serde_json::from_slice(&second.body).expect("second response should be json");
+
+        assert_eq!(first.status, 202);
+        assert_eq!(second.status, 202);
+        assert_eq!(first_json["job_id"], second_json["job_id"]);
+        let interactions: Vec<Value> = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .filter(|event| event["kind"]["controlled_reality"].is_object())
+            .collect();
+        assert_eq!(interactions.len(), 2);
+        assert_eq!(
+            interactions[0]["kind"]["controlled_reality"]["origin_request_id"],
+            interactions[1]["kind"]["controlled_reality"]["origin_request_id"]
+        );
+        let record = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Queued
+        );
+        assert_eq!(record.controlled_reality_depth, 2);
+        assert_eq!(record.controlled_reality_pending_update, None);
+    }
+
+    #[test]
+    fn failed_status_audit_restores_queued_state_before_retry() {
+        let event_log_path = unique_temp_path("controlled-status-event-failure.jsonl");
+        let mut runtime = test_runtime(
+            closed_upstream(),
+            &event_log_path,
+            unique_temp_path("controlled-status-event-failure-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let cookie = cookie_header();
+        let session_id = session_id_from_cookie(&cookie).expect("cookie should contain session");
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+        let submitted = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie("POST", "/api/v2/import/reconcile", &cookie, &[]),
+        ));
+        let submitted_json: Value =
+            serde_json::from_slice(&submitted.body).expect("submission should be json");
+        let status_path = submitted_json["status_path"]
+            .as_str()
+            .expect("submission should return status path")
+            .to_string();
+        let event_log = Arc::clone(&runtime.event_log);
+        assert!(thread::spawn(move || {
+            let _guard = event_log.lock().expect("event log should lock");
+            panic!("poison event log before status audit");
+        })
+        .join()
+        .is_err());
+
+        let (failed, failed_response) = run_runtime_request_result(
+            runtime.clone(),
+            &get_request_with_cookie(&status_path, &cookie),
+        );
+
+        assert!(failed.is_err());
+        assert!(failed_response.is_empty());
+        let pending = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(
+            pending.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Completed
+        );
+        let pending_update = pending
+            .controlled_reality_pending_update
+            .expect("failed status should remain pending");
+        assert_eq!(
+            pending_update.previous_state,
+            ControlledRealityWorkflowState::Queued
+        );
+        assert_eq!(pending_update.previous_depth, 1);
+
+        runtime.event_log = Arc::new(Mutex::new(
+            FileEventLogWriter::open(&event_log_path).expect("replacement event log should reopen"),
+        ));
+        let retried = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie(&status_path, &cookie),
+        ));
+
+        assert_eq!(retried.status, 200);
+        let recovered = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(
+            recovered.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Completed
+        );
+        assert_eq!(recovered.controlled_reality_depth, 2);
+        assert_eq!(recovered.controlled_reality_pending_update, None);
+        let interactions: Vec<Value> = events_of_type(&event_log_path, "response_served")
+            .into_iter()
+            .filter(|event| event["kind"]["controlled_reality"].is_object())
+            .collect();
+        assert_eq!(interactions.len(), 2);
+        assert_eq!(
+            interactions[0]["kind"]["controlled_reality"]["kind"],
+            "job_submitted"
+        );
+        assert_eq!(
+            interactions[1]["kind"]["controlled_reality"]["kind"],
+            "status_read"
+        );
+    }
+
+    #[test]
     fn runtime_rate_limits_after_controlled_reality_action_depth_limit() {
         let event_log_path = unique_temp_path("controlled-rate-limit-events.jsonl");
         let runtime = test_runtime(
@@ -18148,12 +19659,15 @@ mod tests {
             "controlled_reality_depth_limit"
         );
 
-        let blocked_request = events_of_type(&event_log_path, "request_seen")
+        let precommit_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()
             .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
-            .unwrap_or_else(|| panic!("blocked request_seen should exist"));
-        assert_eq!(blocked_request["policy_state"], "blocked");
-        assert_eq!(blocked_request["kind"]["routing_decision"], "eidolon_owned");
+            .unwrap_or_else(|| panic!("pre-commit request_seen should exist"));
+        assert_eq!(precommit_request["policy_state"], "controlled_reality");
+        assert_eq!(
+            precommit_request["kind"]["routing_decision"],
+            "controlled_reality"
+        );
 
         let blocked_response = events_of_type(&event_log_path, "response_served")
             .into_iter()
@@ -18164,6 +19678,11 @@ mod tests {
             blocked_response["kind"]["routing_decision"],
             "eidolon_owned"
         );
+        assert_eq!(
+            precommit_request["request_id"],
+            blocked_response["request_id"]
+        );
+        assert_eq!(blocked_change["request_id"], blocked_response["request_id"]);
 
         let controlled_debug = debug_events(&debug_log_path, "controlled_reality_action_selected")
             .into_iter()
@@ -18278,12 +19797,15 @@ mod tests {
             "controlled_reality_branch_escape"
         );
 
-        let blocked_request = events_of_type(&event_log_path, "request_seen")
+        let precommit_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()
             .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v1/projects"))
-            .unwrap_or_else(|| panic!("blocked request_seen should exist"));
-        assert_eq!(blocked_request["policy_state"], "blocked");
-        assert_eq!(blocked_request["kind"]["routing_decision"], "eidolon_owned");
+            .unwrap_or_else(|| panic!("pre-commit request_seen should exist"));
+        assert_eq!(precommit_request["policy_state"], "controlled_reality");
+        assert_eq!(
+            precommit_request["kind"]["routing_decision"],
+            "controlled_reality"
+        );
 
         let blocked_response = events_of_type(&event_log_path, "response_served")
             .into_iter()
@@ -18294,6 +19816,11 @@ mod tests {
             blocked_response["kind"]["routing_decision"],
             "eidolon_owned"
         );
+        assert_eq!(
+            precommit_request["request_id"],
+            blocked_response["request_id"]
+        );
+        assert_eq!(blocked_change["request_id"], blocked_response["request_id"]);
 
         let escape_debug = debug_events(&debug_log_path, "reality_escape_attempt")
             .into_iter()

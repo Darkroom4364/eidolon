@@ -86,6 +86,7 @@ mod tests {
             EventKind::ResponseServed {
                 status: 200,
                 routing_decision: eidolon_core::RoutingDecision::ProtectedUpstream,
+                controlled_reality: None,
             },
         )
     }
