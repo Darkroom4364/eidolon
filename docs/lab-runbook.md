@@ -154,7 +154,13 @@ Every request handled by the proxy is assigned an opaque `request_id` (a random 
 
 Every request handled by the proxy is assigned an opaque `request_id` (a random v4 UUID; it encodes no secrets, client identity, or request data). Every event derived from that request — `request_seen`, bait exposure and action events, policy decisions and changes, responses, rate limits, and reality-escape audits — carries that id, so concurrent requests sharing one session cookie can still be separated causally. Trace and edge-export reducers join events strictly by `request_id`; sessions whose events predate request identifiers are exported with `request_linkage: unknown_legacy` and no cross-event joins are attempted.
 
-The intervention control file is read per request. If it contains `disabled`, `disable`, `off`, or `0`, interventions are disabled without restarting the proxy and traffic is forwarded to protected upstream.
+The intervention control file is read per request. If it contains `disabled`,
+`disable`, `off`, or `0`, ordinary surface interventions are bypassed without
+restarting the proxy and ordinary traffic is forwarded to protected upstream.
+Recognized unsafe bait-action shapes and synthetic controlled-reality
+follow-ups remain Eidolon-owned and fail closed. This control is not an
+authoritative renderer kill switch: it does not drain in-flight renderer work,
+and a missing file enables interventions.
 
 M2.5 controlled-reality tuning is local CLI configuration:
 
