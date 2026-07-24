@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     fmt,
-    fs::File,
+    fs::{self, File},
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
 };
@@ -10,6 +10,8 @@ use eidolon_core::{Event, EVENT_SCHEMA_VERSION};
 use serde_json::Value;
 
 use crate::TimelineEvent;
+
+const EVENT_LOG_SNAPSHOT_ATTEMPTS: usize = 8;
 
 pub fn read_events_jsonl_file(
     path: impl AsRef<Path>,
@@ -21,6 +23,117 @@ pub fn read_events_jsonl_file(
     })?;
 
     read_events_jsonl_with_path(BufReader::new(file), Some(path.to_path_buf()))
+}
+
+pub fn read_events_jsonl_file_with_archives(
+    path: impl AsRef<Path>,
+) -> Result<Vec<TimelineEvent>, TraceReadError> {
+    read_events_jsonl_file_with_archives_and_hook(path.as_ref(), |_| {})
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventLogSegmentSnapshot {
+    path: PathBuf,
+    len: u64,
+}
+
+fn read_events_jsonl_file_with_archives_and_hook(
+    path: &Path,
+    mut after_snapshot: impl FnMut(usize),
+) -> Result<Vec<TimelineEvent>, TraceReadError> {
+    for attempt in 0..EVENT_LOG_SNAPSHOT_ATTEMPTS {
+        let before = match event_log_segment_snapshot(path) {
+            Ok(snapshot) => snapshot,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                std::thread::yield_now();
+                continue;
+            }
+            Err(source) => {
+                return Err(TraceReadError::Open {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        after_snapshot(attempt);
+
+        let read_result = read_event_log_snapshot(&before);
+        let after = match event_log_segment_snapshot(path) {
+            Ok(snapshot) => snapshot,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                std::thread::yield_now();
+                continue;
+            }
+            Err(source) => {
+                return Err(TraceReadError::Open {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        if before == after {
+            return read_result;
+        }
+        std::thread::yield_now();
+    }
+
+    Err(TraceReadError::UnstableEventLogSnapshot {
+        path: path.to_path_buf(),
+        attempts: EVENT_LOG_SNAPSHOT_ATTEMPTS,
+    })
+}
+
+fn read_event_log_snapshot(
+    segments: &[EventLogSegmentSnapshot],
+) -> Result<Vec<TimelineEvent>, TraceReadError> {
+    let mut events = Vec::new();
+    for segment in segments {
+        for mut event in read_events_jsonl_file(&segment.path)? {
+            event.file_order = events.len();
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
+fn event_log_segment_snapshot(path: &Path) -> io::Result<Vec<EventLogSegmentSnapshot>> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let entries = fs::read_dir(parent)?;
+    let mut archives = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = event_log_archive_suffix(base, name) else {
+            continue;
+        };
+        archives.push((entry.path(), suffix.to_string()));
+    }
+    archives.sort_by(|(_, left), (_, right)| {
+        left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+    });
+
+    let mut segments = archives
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+    segments.push(path.to_path_buf());
+    segments
+        .into_iter()
+        .map(|segment| {
+            let len = fs::metadata(&segment)?.len();
+            Ok(EventLogSegmentSnapshot { path: segment, len })
+        })
+        .collect()
 }
 
 pub fn read_events_jsonl<R>(reader: R) -> Result<Vec<TimelineEvent>, TraceReadError>
@@ -110,6 +223,10 @@ pub enum TraceReadError {
         schema_version: u16,
         expected_schema_version: u16,
     },
+    UnstableEventLogSnapshot {
+        path: PathBuf,
+        attempts: usize,
+    },
 }
 
 impl fmt::Display for TraceReadError {
@@ -151,6 +268,11 @@ impl fmt::Display for TraceReadError {
                 "unsupported event schema version {schema_version} on {}; expected {expected_schema_version}",
                 line_location(path.as_deref(), *line_number)
             ),
+            Self::UnstableEventLogSnapshot { path, attempts } => write!(
+                formatter,
+                "event log family `{}` changed during all {attempts} snapshot attempts",
+                path.display()
+            ),
         }
     }
 }
@@ -160,7 +282,9 @@ impl Error for TraceReadError {
         match self {
             Self::Open { source, .. } | Self::ReadLine { source, .. } => Some(source),
             Self::ParseLine { source, .. } => Some(source),
-            Self::MissingSchemaVersion { .. } | Self::UnsupportedSchemaVersion { .. } => None,
+            Self::MissingSchemaVersion { .. }
+            | Self::UnsupportedSchemaVersion { .. }
+            | Self::UnstableEventLogSnapshot { .. } => None,
         }
     }
 }
@@ -179,10 +303,17 @@ fn line_location(path: Option<&Path>, line_number: usize) -> String {
     }
 }
 
+fn event_log_archive_suffix<'a>(base: &str, candidate: &'a str) -> Option<&'a str> {
+    let suffix = candidate.strip_prefix(base)?.strip_prefix('.')?;
+    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(suffix)
+}
+
 #[cfg(test)]
 mod tests {
     use eidolon_core::{
-        EventKind, EventSource, IngressIdentity, PolicyState, RoutingDecision, SessionId,
+        ControlledRealityBranch, ControlledRealityInteraction, ControlledRealityInteractionAction,
+        ControlledRealityJobId, ControlledRealityWorkflowState, EventKind, EventSource,
+        IngressIdentity, PolicyState, RequestId, RoutingDecision, SessionId,
     };
 
     use super::*;
@@ -221,6 +352,216 @@ mod tests {
         assert_eq!(events[0].line_number, 1);
         assert_eq!(events[1].file_order, 1);
         assert_eq!(events[1].line_number, 2);
+    }
+
+    #[test]
+    fn schema_v2_reader_roundtrips_controlled_reality_response_metadata() {
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let origin_request_id = RequestId::new();
+        let event = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: 202,
+                routing_decision: RoutingDecision::ControlledReality,
+                controlled_reality: Some(ControlledRealityInteraction {
+                    branch: ControlledRealityBranch::ImportReconcile,
+                    origin_request_id,
+                    from_state: ControlledRealityWorkflowState::Ready,
+                    to_state: ControlledRealityWorkflowState::Queued,
+                    job_id: ControlledRealityJobId::new("job_0123456789abcdef")
+                        .expect("job id should be valid"),
+                    action: ControlledRealityInteractionAction::JobSubmitted,
+                }),
+            },
+        )
+        .with_request_id(request_id);
+        let input = serde_json::to_string(&event).expect("event should serialize");
+
+        let events = read_events_jsonl(input.as_bytes()).expect("event should parse");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, event);
+    }
+
+    #[test]
+    fn archived_request_and_active_response_remain_one_verifiable_workflow() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "eidolon-trace-rotated-reader-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("temp directory should create");
+        let active = dir.join("events.jsonl");
+        let archive = PathBuf::from(format!("{}.{:039}", active.display(), 1));
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let job_id =
+            ControlledRealityJobId::new("job_0123456789abcdef").expect("job id should be valid");
+        let request = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::RequestSeen {
+                method: "POST".to_string(),
+                path: "/api/v2/import/reconcile".to_string(),
+                safe_headers: Vec::new(),
+                ingress_identity: IngressIdentity::default(),
+                authenticated_ingress_rule_rejection: None,
+                local_ingress_trust_scope_rejection: None,
+                trusted_ingress_soften_match: None,
+                ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
+                routing_decision: RoutingDecision::ControlledReality,
+            },
+        )
+        .with_request_id(request_id);
+        let response = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: 202,
+                routing_decision: RoutingDecision::ControlledReality,
+                controlled_reality: Some(ControlledRealityInteraction {
+                    branch: ControlledRealityBranch::ImportReconcile,
+                    origin_request_id: request_id,
+                    from_state: ControlledRealityWorkflowState::Ready,
+                    to_state: ControlledRealityWorkflowState::Queued,
+                    job_id,
+                    action: ControlledRealityInteractionAction::JobSubmitted,
+                }),
+            },
+        )
+        .with_request_id(request_id);
+        fs::write(
+            &archive,
+            format!(
+                "{}\n",
+                serde_json::to_string(&request).expect("request should serialize")
+            ),
+        )
+        .expect("archive should write");
+        fs::write(
+            &active,
+            format!(
+                "{}\n",
+                serde_json::to_string(&response).expect("response should serialize")
+            ),
+        )
+        .expect("active log should write");
+        fs::write(dir.join("events.jsonl.backup"), "not json\n").expect("lookalike should write");
+
+        let events =
+            read_events_jsonl_file_with_archives(&active).expect("log family should parse");
+        let timelines = crate::build_session_timelines(events);
+        let bundle = crate::evidence_bundle_for_timeline(&timelines[0]);
+
+        assert_eq!(timelines[0].events.len(), 2);
+        assert_eq!(timelines[0].events[0].file_order, 0);
+        assert_eq!(timelines[0].events[1].file_order, 1);
+        assert_eq!(bundle.controlled_reality_interactions.len(), 1);
+        fs::remove_dir_all(dir).expect("temp directory should remove");
+    }
+
+    #[test]
+    fn rotation_during_snapshot_is_retried_without_losing_a_segment() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "eidolon-trace-snapshot-rotation-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("temp directory should create");
+        let active = dir.join("events.jsonl");
+        let archive = PathBuf::from(format!("{}.{:039}", active.display(), 1));
+        let session_id = SessionId::new();
+        let first = event(session_id, "/before-rotation");
+        let second = event(session_id, "/after-rotation");
+        fs::write(
+            &active,
+            format!(
+                "{}\n",
+                serde_json::to_string(&first).expect("first event should serialize")
+            ),
+        )
+        .expect("active log should write");
+        let mut rotated = false;
+
+        let events = read_events_jsonl_file_with_archives_and_hook(&active, |_| {
+            if rotated {
+                return;
+            }
+            rotated = true;
+            fs::rename(&active, &archive).expect("active log should rotate");
+            fs::write(
+                &active,
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&second).expect("second event should serialize")
+                ),
+            )
+            .expect("new active log should write");
+        })
+        .expect("reader should retry the rotated snapshot");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, first);
+        assert_eq!(events[1].event, second);
+        fs::remove_dir_all(dir).expect("temp directory should remove");
+    }
+
+    #[test]
+    fn continuously_changing_log_fails_instead_of_returning_a_partial_snapshot() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "eidolon-trace-unstable-snapshot-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("temp directory should create");
+        let active = dir.join("events.jsonl");
+        let session_id = SessionId::new();
+        fs::write(
+            &active,
+            format!(
+                "{}\n",
+                serde_json::to_string(&event(session_id, "/initial"))
+                    .expect("event should serialize")
+            ),
+        )
+        .expect("active log should write");
+        let mut append_index = 0;
+
+        let error = read_events_jsonl_file_with_archives_and_hook(&active, |_| {
+            append_index += 1;
+            let mut content = fs::read_to_string(&active).expect("active log should read");
+            content.push_str(
+                &serde_json::to_string(&event(session_id, &format!("/append-{append_index}")))
+                    .expect("event should serialize"),
+            );
+            content.push('\n');
+            fs::write(&active, content).expect("active log should change");
+        })
+        .expect_err("unstable log must not produce a partial snapshot");
+
+        assert!(matches!(
+            error,
+            TraceReadError::UnstableEventLogSnapshot {
+                attempts: EVENT_LOG_SNAPSHOT_ATTEMPTS,
+                ..
+            }
+        ));
+        fs::remove_dir_all(dir).expect("temp directory should remove");
     }
 
     #[test]

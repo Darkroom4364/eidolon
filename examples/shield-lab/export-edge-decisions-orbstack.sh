@@ -97,8 +97,9 @@ Environment:
   KUBECTL_BIN                   kubectl command override.
   CURL_BIN                      curl command override.
   EIDOLON_SHIELD_LOCAL_STATE_DIR
-                                Read events.jsonl from a local fixture directory
-                                instead of the live cluster.
+                                Read events.jsonl and retained numeric archives
+                                from a local fixture directory instead of the
+                                live cluster.
   EIDOLON_SHIELD_LOCAL_STATUS_JSON
                                 Read status-orbstack JSON from this file when
                                 enriching exports with deployment context.
@@ -107,7 +108,8 @@ Environment:
                                 present, otherwise cargo run -q -p eidolon-trace
                                 --bin eidolon-edge-export --.
 
-The script reads /var/lib/eidolon/events.jsonl from the live proxy deployment,
+The script reads retained /var/lib/eidolon/events.jsonl.<numeric> archives
+followed by /var/lib/eidolon/events.jsonl from the live proxy deployment,
 generates one EidolonEdgeDecisionExport per session, and optionally POSTs each
 JSON document to a webhook or SIEM receiver.
 USAGE
@@ -133,15 +135,130 @@ curl_cmd() {
   "$CURL_BIN" "$@"
 }
 
-read_proxy_state_file() {
-  local basename="$1"
+list_local_event_basenames() {
+  local candidate
+  local basename
 
+  for candidate in "$LOCAL_STATE_DIR"/events.jsonl.*; do
+    [[ -f "$candidate" ]] || continue
+    basename="${candidate##*/}"
+    if [[ "$basename" =~ ^events\.jsonl\.[0-9]+$ ]]; then
+      printf '%s\n' "$basename"
+    fi
+  done | LC_ALL=C sort
+  [[ -f "$LOCAL_STATE_DIR/events.jsonl" ]] && printf '%s\n' events.jsonl
+}
+
+local_event_log_signature() {
+  local basename
+  local size
+
+  while IFS= read -r basename; do
+    [[ -n "$basename" ]] || continue
+    [[ -f "$LOCAL_STATE_DIR/$basename" ]] || return 1
+    size="$(wc -c < "$LOCAL_STATE_DIR/$basename")" || return 1
+    printf '%s:%s\n' "$basename" "$size"
+  done < <(list_local_event_basenames)
+}
+
+read_local_event_log_snapshot() {
+  local attempt
+  local before
+  local after
+  local basename
+  local snapshot
+  local copy_ok
+
+  for attempt in {1..8}; do
+    before="$(local_event_log_signature 2>/dev/null)" || continue
+    snapshot="$(mktemp "${TMPDIR:-/tmp}/eidolon-events-snapshot.XXXXXX")"
+    copy_ok=true
+    while IFS= read -r basename; do
+      [[ -n "$basename" ]] || continue
+      if ! cat "$LOCAL_STATE_DIR/$basename" >> "$snapshot"; then
+        copy_ok=false
+        break
+      fi
+    done < <(list_local_event_basenames)
+    if [[ "$copy_ok" == true ]] \
+      && after="$(local_event_log_signature 2>/dev/null)" \
+      && [[ "$before" == "$after" ]]; then
+      cat "$snapshot"
+      rm -f "$snapshot"
+      return
+    fi
+    rm -f "$snapshot"
+  done
+
+  fail "proxy event log changed during all snapshot attempts"
+}
+
+read_live_event_log_snapshot() {
+  kubectl_cmd -n shield-system exec deploy/eidolon-shield-proxy -- sh -lc '
+    set -eu
+
+    event_files() {
+      for file in /var/lib/eidolon/events.jsonl.*; do
+        [ -f "$file" ] || continue
+        basename="${file##*/}"
+        suffix="${basename#events.jsonl.}"
+        case "$suffix" in
+          ""|*[!0-9]*) ;;
+          *) printf "%s\n" "$basename" ;;
+        esac
+      done | LC_ALL=C sort
+      [ -f /var/lib/eidolon/events.jsonl ] && printf "%s\n" events.jsonl
+    }
+
+    signature() {
+      event_files | while IFS= read -r basename; do
+        [ -n "$basename" ] || continue
+        [ -f "/var/lib/eidolon/$basename" ] || exit 1
+        size="$(wc -c < "/var/lib/eidolon/$basename")" || exit 1
+        printf "%s:%s\n" "$basename" "$size"
+      done
+    }
+
+    attempt=1
+    while [ "$attempt" -le 8 ]; do
+      before="$(signature)" || {
+        attempt=$((attempt + 1))
+        continue
+      }
+      snapshot="$(mktemp /tmp/eidolon-events-snapshot.XXXXXX)"
+      copy_ok=true
+      while IFS= read -r basename; do
+        [ -n "$basename" ] || continue
+        if ! cat "/var/lib/eidolon/$basename" >> "$snapshot"; then
+          copy_ok=false
+          break
+        fi
+      done <<EOF
+$(event_files)
+EOF
+      if [ "$copy_ok" = true ]; then
+        after="$(signature)" || after="__changed__"
+        if [ "$before" = "$after" ]; then
+          cat "$snapshot"
+          rm -f "$snapshot"
+          exit 0
+        fi
+      fi
+      rm -f "$snapshot"
+      attempt=$((attempt + 1))
+    done
+
+    echo "proxy event log changed during all snapshot attempts" >&2
+    exit 1
+  '
+}
+
+read_proxy_event_log_family() {
   if [[ -n "$LOCAL_STATE_DIR" ]]; then
-    cat "$LOCAL_STATE_DIR/$basename"
-    return
+    read_local_event_log_snapshot
+  else
+    read_live_event_log_snapshot
   fi
-
-  kubectl_cmd -n shield-system exec deploy/eidolon-shield-proxy -- sh -lc "cat /var/lib/eidolon/$basename"
 }
 
 read_status_json() {
@@ -1439,7 +1556,7 @@ tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/eidolon-edge-decisions.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 events_file="$tmp_dir/events.jsonl"
-read_proxy_state_file events.jsonl > "$events_file"
+read_proxy_event_log_family > "$events_file"
 if [[ ! -s "$events_file" ]]; then
   fail "proxy event log is empty"
 fi

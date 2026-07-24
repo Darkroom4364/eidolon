@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use eidolon_core::{
-    BaitClass, BaitHeaderValueMintAudit, BaitHeaderValueMintStatus, BaitId, EventKind, ExposureId,
-    PersistenceMetadata, PolicyState, RequestId, RoutingDecision, Score, SessionId,
+    BaitClass, BaitHeaderValueMintAudit, BaitHeaderValueMintStatus, BaitId,
+    ControlledRealityInteraction, ControlledRealityInteractionAction,
+    ControlledRealityWorkflowState, EventKind, EventSource, ExposureId, PersistenceMetadata,
+    PolicyState, RequestId, RoutingDecision, Score, SessionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +21,8 @@ pub struct EvidenceBundle {
     pub matched_actions: Vec<BaitActionEvidence>,
     pub unmatched_actions: Vec<BaitActionEvidence>,
     pub policy_events: Vec<PolicyEventEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controlled_reality_interactions: Vec<ControlledRealityInteractionEvidence>,
     pub baseline_comparison: BaselineComparison,
     pub score: Score,
     pub source_refs: Vec<TimelineEventRef>,
@@ -31,6 +35,10 @@ pub struct EvidenceBundle {
 pub struct RequestObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<RequestId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<EventSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_state: Option<PolicyState>,
     pub method: String,
     pub path: String,
     pub routing_decision: RoutingDecision,
@@ -283,6 +291,21 @@ pub struct PolicyEventEvidence {
     pub persistence: PersistenceMetadata,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlledRealityInteractionEvidence {
+    pub request_id: RequestId,
+    #[serde(flatten)]
+    pub interaction: ControlledRealityInteraction,
+    pub event_ref: TimelineEventRef,
+}
+
+struct ControlledRealityCandidate {
+    evidence: ControlledRealityInteractionEvidence,
+    source: EventSource,
+    policy_state: PolicyState,
+    status: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyEvidenceKind {
@@ -365,6 +388,8 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
     let mut latest_bait_exposures: HashMap<(BaitId, Option<BaitClass>), TimelineEventRef> =
         HashMap::new();
     let mut actions = Vec::new();
+    let mut controlled_reality_candidates = Vec::new();
+    let mut response_counts = HashMap::new();
     let mut bundle = EvidenceBundle {
         session_id: timeline.session_id,
         policy_state: timeline.events.last().map(|event| event.event.policy_state),
@@ -374,6 +399,7 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
         matched_actions: Vec::new(),
         unmatched_actions: Vec::new(),
         policy_events: Vec::new(),
+        controlled_reality_interactions: Vec::new(),
         baseline_comparison: BaselineComparison::default(),
         score: Score {
             points: 0,
@@ -455,17 +481,39 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
             EventKind::ResponseServed {
                 status,
                 routing_decision,
-            } => bundle.policy_events.push(PolicyEventEvidence {
-                event_ref,
-                policy_state: timeline_event.event.policy_state,
-                kind: PolicyEvidenceKind::ResponseServed,
-                routing_decision: Some(*routing_decision),
-                from_policy_state: None,
-                to_policy_state: None,
-                status: Some(*status),
-                reason: None,
-                persistence: timeline_event.event.persistence,
-            }),
+                controlled_reality,
+            } => {
+                if let Some(request_id) = timeline_event.event.request_id {
+                    *response_counts.entry(request_id).or_insert(0_usize) += 1;
+                }
+                bundle.policy_events.push(PolicyEventEvidence {
+                    event_ref,
+                    policy_state: timeline_event.event.policy_state,
+                    kind: PolicyEvidenceKind::ResponseServed,
+                    routing_decision: Some(*routing_decision),
+                    from_policy_state: None,
+                    to_policy_state: None,
+                    status: Some(*status),
+                    reason: None,
+                    persistence: timeline_event.event.persistence,
+                });
+                if *routing_decision == RoutingDecision::ControlledReality {
+                    if let (Some(request_id), Some(interaction)) =
+                        (timeline_event.event.request_id, controlled_reality)
+                    {
+                        controlled_reality_candidates.push(ControlledRealityCandidate {
+                            evidence: ControlledRealityInteractionEvidence {
+                                request_id,
+                                interaction: interaction.clone(),
+                                event_ref,
+                            },
+                            source: timeline_event.event.source,
+                            policy_state: timeline_event.event.policy_state,
+                            status: *status,
+                        });
+                    }
+                }
+            }
             EventKind::PolicyDecision {
                 routing_decision,
                 reason,
@@ -543,6 +591,8 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
                 ..
             } => bundle.request_observations.push(RequestObservation {
                 request_id: timeline_event.event.request_id,
+                source: Some(timeline_event.event.source),
+                policy_state: Some(timeline_event.event.policy_state),
                 method: method.clone(),
                 path: path.clone(),
                 routing_decision: *routing_decision,
@@ -558,8 +608,211 @@ pub(crate) fn collect_evidence(timeline: &SessionTimeline) -> EvidenceBundle {
             bundle.unmatched_actions.push(action);
         }
     }
+    bundle.controlled_reality_interactions = validated_controlled_reality_interactions(
+        &bundle,
+        controlled_reality_candidates,
+        &response_counts,
+    );
 
     bundle
+}
+
+fn validated_controlled_reality_interactions(
+    bundle: &EvidenceBundle,
+    candidates: Vec<ControlledRealityCandidate>,
+    response_counts: &HashMap<RequestId, usize>,
+) -> Vec<ControlledRealityInteractionEvidence> {
+    let mut validated = Vec::new();
+    let mut seen_request_ids = HashSet::new();
+    let mut workflow_state = ControlledRealityWorkflowState::Ready;
+    let mut workflow_origin = None;
+    let mut workflow_job = None;
+
+    for candidate in candidates {
+        let evidence = &candidate.evidence;
+        let interaction = &evidence.interaction;
+        let Some(request) = unique_request_observation(bundle, evidence.request_id) else {
+            continue;
+        };
+        let Some(origin_request) =
+            unique_request_observation(bundle, interaction.origin_request_id)
+        else {
+            continue;
+        };
+        if candidate.source != EventSource::Proxy
+            || candidate.policy_state != PolicyState::ControlledReality
+            || response_counts.get(&evidence.request_id) != Some(&1)
+            || !controlled_workflow_request_provenance_matches(interaction, request)
+            || !controlled_workflow_origin_provenance_matches(origin_request)
+            || !controlled_workflow_request_routing_matches(interaction, request)
+            || !controlled_workflow_origin_matches(origin_request)
+            || !controlled_reality_status_matches(interaction, candidate.status)
+            || !seen_request_ids.insert(evidence.request_id)
+            || request.event_ref.file_order >= evidence.event_ref.file_order
+            || origin_request.event_ref.file_order >= evidence.event_ref.file_order
+            || interaction.from_state != workflow_state
+        {
+            continue;
+        }
+
+        let valid = match &interaction.action {
+            ControlledRealityInteractionAction::JobSubmitted => {
+                if !is_import_reconcile_submit(request) {
+                    false
+                } else if workflow_state == ControlledRealityWorkflowState::Ready {
+                    if evidence.request_id != interaction.origin_request_id
+                        || interaction.to_state != ControlledRealityWorkflowState::Queued
+                    {
+                        false
+                    } else {
+                        workflow_origin = Some(interaction.origin_request_id);
+                        workflow_job = Some(interaction.job_id.clone());
+                        workflow_state = interaction.to_state;
+                        true
+                    }
+                } else {
+                    workflow_identity_matches(interaction, workflow_origin, workflow_job.as_ref())
+                        && interaction.to_state == workflow_state
+                }
+            }
+            ControlledRealityInteractionAction::StatusRead => {
+                if !workflow_identity_matches(interaction, workflow_origin, workflow_job.as_ref())
+                    || !is_import_reconcile_status(request, interaction.job_id.as_str())
+                {
+                    false
+                } else {
+                    let next_state = match workflow_state {
+                        ControlledRealityWorkflowState::Queued => {
+                            ControlledRealityWorkflowState::Completed
+                        }
+                        ControlledRealityWorkflowState::Completed => {
+                            ControlledRealityWorkflowState::Completed
+                        }
+                        ControlledRealityWorkflowState::Ready => continue,
+                    };
+                    if interaction.to_state != next_state {
+                        false
+                    } else {
+                        workflow_state = next_state;
+                        true
+                    }
+                }
+            }
+            ControlledRealityInteractionAction::ArtifactRead { .. } => {
+                workflow_state == ControlledRealityWorkflowState::Completed
+                    && interaction.to_state == ControlledRealityWorkflowState::Completed
+                    && workflow_identity_matches(
+                        interaction,
+                        workflow_origin,
+                        workflow_job.as_ref(),
+                    )
+                    && is_import_reconcile_artifact(request, interaction.job_id.as_str())
+            }
+        };
+
+        if valid {
+            validated.push(candidate.evidence);
+        }
+    }
+
+    validated
+}
+
+fn controlled_workflow_request_routing_matches(
+    interaction: &ControlledRealityInteraction,
+    request: &RequestObservation,
+) -> bool {
+    match &interaction.action {
+        ControlledRealityInteractionAction::JobSubmitted => matches!(
+            request.routing_decision,
+            RoutingDecision::EidolonOwned | RoutingDecision::ControlledReality
+        ),
+        ControlledRealityInteractionAction::StatusRead
+        | ControlledRealityInteractionAction::ArtifactRead { .. } => {
+            request.routing_decision == RoutingDecision::ControlledReality
+        }
+    }
+}
+
+fn controlled_workflow_request_provenance_matches(
+    interaction: &ControlledRealityInteraction,
+    request: &RequestObservation,
+) -> bool {
+    request.source == Some(EventSource::Proxy)
+        && match &interaction.action {
+            ControlledRealityInteractionAction::JobSubmitted => {
+                controlled_workflow_origin_policy_state(request.policy_state)
+            }
+            ControlledRealityInteractionAction::StatusRead
+            | ControlledRealityInteractionAction::ArtifactRead { .. } => {
+                request.policy_state == Some(PolicyState::ControlledReality)
+            }
+        }
+}
+
+fn controlled_workflow_origin_provenance_matches(request: &RequestObservation) -> bool {
+    request.source == Some(EventSource::Proxy)
+        && controlled_workflow_origin_policy_state(request.policy_state)
+}
+
+fn controlled_workflow_origin_policy_state(policy_state: Option<PolicyState>) -> bool {
+    matches!(
+        policy_state,
+        Some(
+            PolicyState::Observe
+                | PolicyState::Suspicious
+                | PolicyState::RateLimited
+                | PolicyState::ControlledReality
+        )
+    )
+}
+
+fn controlled_workflow_origin_matches(request: &RequestObservation) -> bool {
+    matches!(
+        request.routing_decision,
+        RoutingDecision::EidolonOwned | RoutingDecision::ControlledReality
+    ) && is_import_reconcile_submit(request)
+}
+
+fn controlled_reality_status_matches(
+    interaction: &ControlledRealityInteraction,
+    status: u16,
+) -> bool {
+    match &interaction.action {
+        ControlledRealityInteractionAction::JobSubmitted => match interaction.to_state {
+            ControlledRealityWorkflowState::Queued => status == 202,
+            ControlledRealityWorkflowState::Completed => status == 200,
+            ControlledRealityWorkflowState::Ready => false,
+        },
+        ControlledRealityInteractionAction::StatusRead
+        | ControlledRealityInteractionAction::ArtifactRead { .. } => status == 200,
+    }
+}
+
+fn workflow_identity_matches(
+    interaction: &ControlledRealityInteraction,
+    workflow_origin: Option<RequestId>,
+    workflow_job: Option<&eidolon_core::ControlledRealityJobId>,
+) -> bool {
+    workflow_origin == Some(interaction.origin_request_id)
+        && workflow_job == Some(&interaction.job_id)
+}
+
+fn is_import_reconcile_submit(request: &RequestObservation) -> bool {
+    request.method.eq_ignore_ascii_case("POST")
+        && normalized_branch_path(&request.path) == "/api/v2/import/reconcile"
+}
+
+fn is_import_reconcile_status(request: &RequestObservation, job_id: &str) -> bool {
+    request.method.eq_ignore_ascii_case("GET")
+        && normalized_branch_path(&request.path)
+            == format!("/api/v2/import/reconcile/jobs/{job_id}")
+}
+
+fn is_import_reconcile_artifact(request: &RequestObservation, job_id: &str) -> bool {
+    request.method.eq_ignore_ascii_case("GET")
+        && normalized_branch_path(&request.path)
+            == format!("/api/v2/import/reconcile/jobs/{job_id}/result")
 }
 
 fn time_to_first_bait_action_seconds(
@@ -665,15 +918,21 @@ fn controlled_reality_branch_count(timeline: &SessionTimeline) -> usize {
             } => {
                 let contained = containment_policy_state(event.event.policy_state)
                     || containment_routing_decision(*routing_decision);
+                let branch = controlled_reality_branch_key(path);
                 if contained {
-                    branches.insert(normalized_branch_path(path).to_string());
+                    branches.insert(branch.clone());
                 }
-                pending_request = Some((normalized_branch_path(path).to_string(), contained));
+                pending_request = Some((branch, contained));
             }
             EventKind::ResponseServed {
-                routing_decision, ..
+                routing_decision,
+                controlled_reality,
+                ..
             } if containment_routing_decision(*routing_decision) => {
-                if let Some((path, false)) = pending_request.take() {
+                if let Some(interaction) = controlled_reality {
+                    branches.insert(controlled_reality_interaction_branch_key(interaction));
+                    pending_request = None;
+                } else if let Some((path, _)) = pending_request.take() {
                     branches.insert(path);
                 }
             }
@@ -692,6 +951,30 @@ fn normalized_branch_path(target: &str) -> &str {
     without_fragment
         .split_once('?')
         .map_or(without_fragment, |(path, _)| path)
+}
+
+fn controlled_reality_branch_key(target: &str) -> String {
+    const IMPORT_RECONCILE_PATH: &str = "/api/v2/import/reconcile";
+    const IMPORT_RECONCILE_JOBS_PREFIX: &str = "/api/v2/import/reconcile/jobs/";
+
+    let path = normalized_branch_path(target);
+    if path == IMPORT_RECONCILE_PATH || path.starts_with(IMPORT_RECONCILE_JOBS_PREFIX) {
+        controlled_reality_import_reconcile_branch_key().to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+fn controlled_reality_interaction_branch_key(interaction: &ControlledRealityInteraction) -> String {
+    match interaction.branch {
+        eidolon_core::ControlledRealityBranch::ImportReconcile => {
+            controlled_reality_import_reconcile_branch_key().to_string()
+        }
+    }
+}
+
+fn controlled_reality_import_reconcile_branch_key() -> &'static str {
+    "controlled_reality:import_reconcile"
 }
 
 fn request_or_response_routes_to_containment(kind: &EventKind) -> bool {
@@ -755,8 +1038,8 @@ fn seconds_between(start: &TimelineEvent, end: &TimelineEvent) -> f64 {
 mod tests {
     use chrono::{TimeDelta, TimeZone, Utc};
     use eidolon_core::{
-        Event, EventKind, EventSource, ExposureId, IngressIdentity, PolicyState, RoutingDecision,
-        SessionId,
+        ControlledRealityBranch, ControlledRealityJobId, Event, EventKind, EventSource, ExposureId,
+        IngressIdentity, PolicyState, RoutingDecision, SessionId,
     };
     use serde_json::json;
 
@@ -866,10 +1149,15 @@ mod tests {
         path: &str,
         routing_decision: RoutingDecision,
     ) -> Event {
+        let policy_state = if routing_decision == RoutingDecision::ControlledReality {
+            PolicyState::ControlledReality
+        } else {
+            PolicyState::Observe
+        };
         Event::new(
             session_id,
             EventSource::Proxy,
-            PolicyState::Observe,
+            policy_state,
             EventKind::RequestSeen {
                 method: method.to_string(),
                 path: path.to_string(),
@@ -931,6 +1219,7 @@ mod tests {
             EventKind::ResponseServed {
                 status: 200,
                 routing_decision,
+                controlled_reality: None,
             },
         )
     }
@@ -946,6 +1235,42 @@ mod tests {
         )
     }
 
+    fn controlled_workflow_response(
+        session_id: SessionId,
+        request_id: RequestId,
+        origin_request_id: RequestId,
+        job_id: ControlledRealityJobId,
+        from_state: ControlledRealityWorkflowState,
+        to_state: ControlledRealityWorkflowState,
+        action: ControlledRealityInteractionAction,
+    ) -> Event {
+        let status = match (&action, to_state) {
+            (
+                ControlledRealityInteractionAction::JobSubmitted,
+                ControlledRealityWorkflowState::Queued,
+            ) => 202,
+            _ => 200,
+        };
+        Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status,
+                routing_decision: RoutingDecision::ControlledReality,
+                controlled_reality: Some(ControlledRealityInteraction {
+                    branch: ControlledRealityBranch::ImportReconcile,
+                    origin_request_id,
+                    from_state,
+                    to_state,
+                    job_id,
+                    action,
+                }),
+            },
+        )
+        .with_request_id(request_id)
+    }
+
     fn at(mut event: Event, seconds: i64) -> Event {
         event.observed_at = Utc
             .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
@@ -953,6 +1278,264 @@ mod tests {
             .expect("test timestamp should be valid")
             + TimeDelta::seconds(seconds);
         event
+    }
+
+    #[test]
+    fn controlled_workflow_evidence_requires_unique_linked_legal_steps() {
+        let session_id = SessionId::new();
+        let origin_request_id = RequestId::new();
+        let status_request_id = RequestId::new();
+        let job_id =
+            ControlledRealityJobId::new("job_0123456789abcdef".to_string()).expect("valid job id");
+        let status_path = format!("/api/v2/import/reconcile/jobs/{}", job_id.as_str());
+        let valid = timeline(vec![
+            request_seen_with(
+                session_id,
+                origin_request_id,
+                "POST",
+                "/api/v2/import/reconcile",
+                RoutingDecision::EidolonOwned,
+            ),
+            controlled_workflow_response(
+                session_id,
+                origin_request_id,
+                origin_request_id,
+                job_id.clone(),
+                ControlledRealityWorkflowState::Ready,
+                ControlledRealityWorkflowState::Queued,
+                ControlledRealityInteractionAction::JobSubmitted,
+            ),
+            request_seen_with(
+                session_id,
+                status_request_id,
+                "GET",
+                &status_path,
+                RoutingDecision::ControlledReality,
+            ),
+            controlled_workflow_response(
+                session_id,
+                status_request_id,
+                origin_request_id,
+                job_id,
+                ControlledRealityWorkflowState::Queued,
+                ControlledRealityWorkflowState::Completed,
+                ControlledRealityInteractionAction::StatusRead,
+            ),
+        ]);
+
+        let bundle = collect_evidence(&valid);
+
+        assert_eq!(bundle.controlled_reality_interactions.len(), 2);
+    }
+
+    #[test]
+    fn controlled_workflow_evidence_rejects_wrong_status_source_routing_and_duplicates() {
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let job_id =
+            ControlledRealityJobId::new("job_0123456789abcdef".to_string()).expect("valid job id");
+        let request = request_seen_with(
+            session_id,
+            request_id,
+            "POST",
+            "/api/v2/import/reconcile",
+            RoutingDecision::EidolonOwned,
+        );
+        let wrong_routing_request = request_seen_with(
+            session_id,
+            request_id,
+            "POST",
+            "/api/v2/import/reconcile",
+            RoutingDecision::ProtectedUpstream,
+        );
+        let response = controlled_workflow_response(
+            session_id,
+            request_id,
+            request_id,
+            job_id,
+            ControlledRealityWorkflowState::Ready,
+            ControlledRealityWorkflowState::Queued,
+            ControlledRealityInteractionAction::JobSubmitted,
+        );
+
+        let mut wrong_status = response.clone();
+        let EventKind::ResponseServed { status, .. } = &mut wrong_status.kind else {
+            panic!("workflow helper should return a response event");
+        };
+        *status = 200;
+
+        let mut wrong_source = response.clone();
+        wrong_source.source = EventSource::TraceEngine;
+        let mut wrong_request_source = request.clone();
+        wrong_request_source.source = EventSource::TraceEngine;
+        let mut wrong_request_policy = request.clone();
+        wrong_request_policy.policy_state = PolicyState::Blocked;
+
+        assert!(
+            collect_evidence(&timeline(vec![request.clone(), wrong_status]))
+                .controlled_reality_interactions
+                .is_empty()
+        );
+        assert!(
+            collect_evidence(&timeline(vec![request.clone(), wrong_source]))
+                .controlled_reality_interactions
+                .is_empty()
+        );
+        assert!(
+            collect_evidence(&timeline(vec![wrong_request_source, response.clone()]))
+                .controlled_reality_interactions
+                .is_empty()
+        );
+        assert!(
+            collect_evidence(&timeline(vec![wrong_request_policy, response.clone()]))
+                .controlled_reality_interactions
+                .is_empty()
+        );
+        assert!(
+            collect_evidence(&timeline(vec![wrong_routing_request, response.clone()]))
+                .controlled_reality_interactions
+                .is_empty()
+        );
+        assert!(
+            collect_evidence(&timeline(vec![request, response.clone(), response]))
+                .controlled_reality_interactions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn controlled_workflow_evidence_rejects_orphans_duplicates_and_changed_ids() {
+        let session_id = SessionId::new();
+        let origin_request_id = RequestId::new();
+        let status_request_id = RequestId::new();
+        let job_id =
+            ControlledRealityJobId::new("job_0123456789abcdef".to_string()).expect("valid job id");
+        let changed_job =
+            ControlledRealityJobId::new("job_fedcba9876543210".to_string()).expect("valid job id");
+        let status_path = format!("/api/v2/import/reconcile/jobs/{}", job_id.as_str());
+        let orphan = timeline(vec![controlled_workflow_response(
+            session_id,
+            origin_request_id,
+            origin_request_id,
+            job_id.clone(),
+            ControlledRealityWorkflowState::Ready,
+            ControlledRealityWorkflowState::Queued,
+            ControlledRealityInteractionAction::JobSubmitted,
+        )]);
+        let duplicate_origin = timeline(vec![
+            request_seen_with(
+                session_id,
+                origin_request_id,
+                "POST",
+                "/api/v2/import/reconcile",
+                RoutingDecision::ControlledReality,
+            ),
+            request_seen_with(
+                session_id,
+                origin_request_id,
+                "POST",
+                "/api/v2/import/reconcile",
+                RoutingDecision::ControlledReality,
+            ),
+            controlled_workflow_response(
+                session_id,
+                origin_request_id,
+                origin_request_id,
+                job_id.clone(),
+                ControlledRealityWorkflowState::Ready,
+                ControlledRealityWorkflowState::Queued,
+                ControlledRealityInteractionAction::JobSubmitted,
+            ),
+        ]);
+        let changed_id = timeline(vec![
+            request_seen_with(
+                session_id,
+                origin_request_id,
+                "POST",
+                "/api/v2/import/reconcile",
+                RoutingDecision::ControlledReality,
+            ),
+            controlled_workflow_response(
+                session_id,
+                origin_request_id,
+                origin_request_id,
+                job_id,
+                ControlledRealityWorkflowState::Ready,
+                ControlledRealityWorkflowState::Queued,
+                ControlledRealityInteractionAction::JobSubmitted,
+            ),
+            request_seen_with(
+                session_id,
+                status_request_id,
+                "GET",
+                &status_path,
+                RoutingDecision::ControlledReality,
+            ),
+            controlled_workflow_response(
+                session_id,
+                status_request_id,
+                origin_request_id,
+                changed_job,
+                ControlledRealityWorkflowState::Queued,
+                ControlledRealityWorkflowState::Completed,
+                ControlledRealityInteractionAction::StatusRead,
+            ),
+        ]);
+        let illegal_transition = timeline(vec![
+            request_seen_with(
+                session_id,
+                origin_request_id,
+                "POST",
+                "/api/v2/import/reconcile",
+                RoutingDecision::ControlledReality,
+            ),
+            controlled_workflow_response(
+                session_id,
+                origin_request_id,
+                origin_request_id,
+                ControlledRealityJobId::new("job_0123456789abcdef".to_string())
+                    .expect("valid job id"),
+                ControlledRealityWorkflowState::Ready,
+                ControlledRealityWorkflowState::Queued,
+                ControlledRealityInteractionAction::JobSubmitted,
+            ),
+            request_seen_with(
+                session_id,
+                status_request_id,
+                "GET",
+                &status_path,
+                RoutingDecision::ControlledReality,
+            ),
+            controlled_workflow_response(
+                session_id,
+                status_request_id,
+                origin_request_id,
+                ControlledRealityJobId::new("job_0123456789abcdef".to_string())
+                    .expect("valid job id"),
+                ControlledRealityWorkflowState::Ready,
+                ControlledRealityWorkflowState::Completed,
+                ControlledRealityInteractionAction::StatusRead,
+            ),
+        ]);
+
+        assert!(collect_evidence(&orphan)
+            .controlled_reality_interactions
+            .is_empty());
+        assert!(collect_evidence(&duplicate_origin)
+            .controlled_reality_interactions
+            .is_empty());
+        assert_eq!(
+            collect_evidence(&changed_id)
+                .controlled_reality_interactions
+                .len(),
+            1
+        );
+        assert_eq!(
+            collect_evidence(&illegal_transition)
+                .controlled_reality_interactions
+                .len(),
+            1
+        );
     }
 
     #[test]
