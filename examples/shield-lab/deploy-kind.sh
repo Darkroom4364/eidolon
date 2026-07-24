@@ -24,6 +24,16 @@ ingress_trust_config_key="ingress-trust.json"
 ingress_trust_rollout_annotation="eidolon.dev/ingress-trust-sha256"
 ingress_trust_config_path="${EIDOLON_SHIELD_INGRESS_TRUST_CONFIG_PATH:-${repo_root}/examples/shield-lab/ingress-trust-configs/docs-crawler-soften-docs-only.json}"
 ingress_trust_config_sha256=""
+controlled_reality_auth_secret_name="eidolon-controlled-reality-auth"
+controlled_reality_auth_secret_key="auth-secret.txt"
+controlled_reality_auth_secret_literal="${EIDOLON_SHIELD_CONTROLLED_REALITY_AUTH_SECRET:-}"
+calico_version="v3.32.1"
+calico_base_url="https://raw.githubusercontent.com/projectcalico/calico/${calico_version}/manifests"
+kind_images=(
+  "eidolon-shield-proxy:local"
+  "eidolon-owned-demo-target:local"
+  "eidolon-controlled-reality:local"
+)
 
 require_command() {
   local command_name="$1"
@@ -111,6 +121,62 @@ ensure_secret() {
     --from-literal="${secret_key}=${secret_value}" >/dev/null
 }
 
+validate_controlled_reality_auth_secret() {
+  local value="$1"
+
+  if [[ ! "$value" =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "controlled-reality auth secret must contain exactly 64 hexadecimal characters" >&2
+    exit 1
+  fi
+}
+
+apply_controlled_reality_auth_secret() {
+  local namespace="$1"
+  local value="$2"
+
+  "$kubectl_bin" -n "$namespace" create secret generic "$controlled_reality_auth_secret_name" \
+    --from-literal="${controlled_reality_auth_secret_key}=${value}" \
+    --dry-run=client -o yaml | "$kubectl_bin" apply -f - >/dev/null
+}
+
+ensure_controlled_reality_auth_secrets() {
+  local system_secret_data
+  local renderer_secret_data
+  local secret_value
+
+  if [[ -n "$controlled_reality_auth_secret_literal" ]]; then
+    validate_controlled_reality_auth_secret "$controlled_reality_auth_secret_literal"
+    apply_controlled_reality_auth_secret shield-system "$controlled_reality_auth_secret_literal"
+    apply_controlled_reality_auth_secret \
+      shield-controlled-reality \
+      "$controlled_reality_auth_secret_literal"
+    return
+  fi
+
+  system_secret_data="$(
+    "$kubectl_bin" -n shield-system get secret "$controlled_reality_auth_secret_name" \
+      -o "jsonpath={.data.${controlled_reality_auth_secret_key//./\\.}}" 2>/dev/null || true
+  )"
+  renderer_secret_data="$(
+    "$kubectl_bin" -n shield-controlled-reality get secret "$controlled_reality_auth_secret_name" \
+      -o "jsonpath={.data.${controlled_reality_auth_secret_key//./\\.}}" 2>/dev/null || true
+  )"
+
+  if [[ -n "$system_secret_data" || -n "$renderer_secret_data" ]]; then
+    if [[ -z "$system_secret_data" || "$system_secret_data" != "$renderer_secret_data" ]]; then
+      echo "controlled-reality auth secrets must exist in both namespaces with matching values" >&2
+      exit 1
+    fi
+    return
+  fi
+
+  require_command openssl
+  secret_value="$(openssl rand -hex 32)"
+  validate_controlled_reality_auth_secret "$secret_value"
+  apply_controlled_reality_auth_secret shield-system "$secret_value"
+  apply_controlled_reality_auth_secret shield-controlled-reality "$secret_value"
+}
+
 apply_bait_profile_configmap() {
   "$kubectl_bin" -n shield-system create configmap "$bait_profile_configmap_name" \
     --from-file="${bait_profile_key}=${bait_profile_path}" \
@@ -138,6 +204,29 @@ ensure_kind_cluster() {
   "$kind_bin" create cluster --name "$kind_cluster_name" --config "$kind_config_path"
 }
 
+ensure_calico_network_policy() {
+  if "$kubectl_bin" -n kube-system get daemonset kindnet >/dev/null 2>&1; then
+    echo "existing kind cluster uses kindnet, which does not enforce NetworkPolicy; recreate it with ${kind_config_path}" >&2
+    exit 1
+  fi
+
+  if ! "$kubectl_bin" get tigerastatus calico >/dev/null 2>&1; then
+    "$kubectl_bin" apply --server-side -f "${calico_base_url}/operator-crds.yaml" >/dev/null
+    "$kubectl_bin" apply --server-side -f "${calico_base_url}/tigera-operator.yaml" >/dev/null
+    "$kubectl_bin" apply --server-side -f "${calico_base_url}/custom-resources.yaml" >/dev/null
+  fi
+
+  "$kubectl_bin" wait --for=condition=Available tigerastatus/calico --timeout=300s >/dev/null
+}
+
+load_kind_images() {
+  local image
+
+  for image in "${kind_images[@]}"; do
+    "$kind_bin" load docker-image "$image" --name "$kind_cluster_name"
+  done
+}
+
 require_command "$kubectl_bin"
 require_command "$kind_bin"
 
@@ -152,19 +241,30 @@ if [[ "$context" != "$expected_context" ]]; then
   exit 1
 fi
 
+ensure_calico_network_policy
+
 "$kubectl_bin" apply -f - <<'YAML'
 apiVersion: v1
 kind: Namespace
 metadata:
   name: shield-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shield-controlled-reality
 YAML
 
 ensure_secret "$trusted_ingress_secret_name" "$trusted_ingress_secret_key" "$trusted_ingress_secret_literal"
 ensure_secret "$bait_signing_secret_name" "$bait_signing_secret_key" "$bait_signing_secret_literal"
+ensure_controlled_reality_auth_secrets
 apply_bait_profile_configmap
 apply_ingress_trust_configmap
+load_kind_images
 "$kubectl_bin" apply -k "${repo_root}/examples/shield-lab/k8s/kind"
 rollout_proxy_for_bait_profile
+"$kubectl_bin" -n shield-controlled-reality rollout status \
+  deployment/eidolon-controlled-reality >/dev/null
 
 echo "kind Shield lab deployed."
 echo "Cluster:             ${kind_cluster_name}"
@@ -173,6 +273,8 @@ echo "Proxy service:       kubectl -n shield-system get svc eidolon-shield-proxy
 echo "Demo target service: kubectl -n shield-targets get svc eidolon-owned-demo-target"
 echo "Trusted ingress:     kubectl -n shield-system get secret ${trusted_ingress_secret_name}"
 echo "Bait signing:        kubectl -n shield-system get secret ${bait_signing_secret_name}"
+echo "Renderer auth:       kubectl -n shield-system get secret ${controlled_reality_auth_secret_name}"
+echo "Renderer:            kubectl -n shield-controlled-reality get deployment eidolon-controlled-reality"
 echo "Bait profile:        ${bait_profile_path}"
 echo "Bait profile digest: ${bait_profile_sha256}"
 echo "Bait profile config: kubectl -n shield-system get configmap ${bait_profile_configmap_name}"

@@ -77,6 +77,15 @@ validate_kind_overlay_shape() {
 
     docs = YAML.load_stream(STDIN.read)
     docs.compact!
+    fail_with = ->(message) { abort("error: kind overlay #{message}") }
+    find_doc = lambda do |kind, name, namespace|
+      docs.find do |doc|
+        doc.is_a?(Hash) &&
+          doc["kind"] == kind &&
+          doc.dig("metadata", "name") == name &&
+          doc.dig("metadata", "namespace") == namespace
+      end
+    end
 
     node_port_services = docs.select do |doc|
       doc.is_a?(Hash) &&
@@ -88,6 +97,67 @@ validate_kind_overlay_shape() {
       names = node_port_services.map { |doc| doc.dig("metadata", "name") || "<unnamed>" }
       abort("error: kind overlay must not render NodePort services: #{names.join(", ")}")
     end
+
+    renderer = find_doc.call(
+      "Deployment",
+      "eidolon-controlled-reality",
+      "shield-controlled-reality"
+    )
+    fail_with.call("must deploy the controlled-reality renderer") unless renderer
+
+    pod_spec = renderer.dig("spec", "template", "spec")
+    container = pod_spec&.dig("containers", 0)
+    security = container&.fetch("securityContext", {})
+    pod_security = pod_spec&.fetch("securityContext", {})
+    resources = container&.fetch("resources", {})
+    fail_with.call("renderer must disable service-account token mounting") unless pod_spec&.fetch("automountServiceAccountToken", nil) == false
+    fail_with.call("renderer must run as non-root user 65532") unless pod_security["runAsNonRoot"] == true && pod_security["runAsUser"] == 65_532
+    fail_with.call("renderer must use RuntimeDefault seccomp") unless pod_security.dig("seccompProfile", "type") == "RuntimeDefault"
+    fail_with.call("renderer root filesystem must be read-only") unless security["readOnlyRootFilesystem"] == true
+    fail_with.call("renderer privilege escalation must be disabled") unless security["allowPrivilegeEscalation"] == false
+    fail_with.call("renderer must drop all capabilities") unless security.dig("capabilities", "drop") == ["ALL"]
+    %w[cpu memory ephemeral-storage].each do |resource|
+      fail_with.call("renderer must set #{resource} requests and limits") unless resources.dig("requests", resource) && resources.dig("limits", resource)
+    end
+    volumes = pod_spec.fetch("volumes", [])
+    fail_with.call("renderer must mount only its dedicated secret") unless volumes.length == 1 && volumes[0].dig("secret", "secretName") == "eidolon-controlled-reality-auth"
+
+    service = find_doc.call(
+      "Service",
+      "eidolon-controlled-reality",
+      "shield-controlled-reality"
+    )
+    fail_with.call("must expose the renderer only through ClusterIP port 9103") unless service && service.dig("spec", "type") != "NodePort" && service.dig("spec", "ports", 0, "port") == 9103
+
+    proxy = find_doc.call("Deployment", "eidolon-shield-proxy", "shield-system")
+    proxy_container = proxy&.dig("spec", "template", "spec", "containers", 0)
+    proxy_args = proxy_container&.fetch("args", []) || []
+    renderer_flag = proxy_args.index("--controlled-reality-backend-addr")
+    secret_flag = proxy_args.index("--controlled-reality-backend-auth-secret-file")
+    fail_with.call("proxy must use renderer Service DNS") unless renderer_flag && proxy_args[renderer_flag + 1] == "eidolon-controlled-reality.shield-controlled-reality.svc.cluster.local:9103"
+    fail_with.call("proxy must use the dedicated renderer secret") unless secret_flag && proxy_args[secret_flag + 1] == "/var/run/secrets/eidolon-controlled-reality/auth-secret.txt"
+    proxy_volumes = proxy.dig("spec", "template", "spec", "volumes") || []
+    fail_with.call("proxy must mount the renderer auth Secret") unless proxy_volumes.any? { |volume| volume.dig("secret", "secretName") == "eidolon-controlled-reality-auth" }
+
+    default_deny = find_doc.call(
+      "NetworkPolicy",
+      "controlled-reality-default-deny",
+      "shield-controlled-reality"
+    )
+    fail_with.call("must retain namespace-wide ingress and egress default deny") unless default_deny && default_deny.dig("spec", "podSelector") == {} && default_deny.dig("spec", "policyTypes")&.sort == %w[Egress Ingress]
+
+    ingress = find_doc.call(
+      "NetworkPolicy",
+      "allow-proxy-to-controlled-reality",
+      "shield-controlled-reality"
+    )
+    from = ingress&.dig("spec", "ingress", 0, "from")
+    port = ingress&.dig("spec", "ingress", 0, "ports", 0)
+    allowed_peer = from&.first
+    fail_with.call("renderer ingress must have exactly one combined namespace and pod selector") unless from&.length == 1 &&
+      allowed_peer.dig("namespaceSelector", "matchLabels", "kubernetes.io/metadata.name") == "shield-system" &&
+      allowed_peer.dig("podSelector", "matchLabels", "app.kubernetes.io/name") == "eidolon-shield-proxy"
+    fail_with.call("renderer ingress must allow only TCP port 9103") unless port == { "protocol" => "TCP", "port" => 9103 }
   '
 }
 
