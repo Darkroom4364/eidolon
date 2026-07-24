@@ -1,9 +1,11 @@
 use std::{env, fmt, fs, path::PathBuf, process::ExitCode};
 
 use eidolon_core::SessionId;
+#[cfg(test)]
+use eidolon_trace::read_events_jsonl_file;
 use eidolon_trace::{
-    build_session_timelines, edge_decision_export_for_timeline, read_events_jsonl_file,
-    SessionTimeline,
+    build_session_timelines, edge_decision_export_for_timeline,
+    read_events_jsonl_file_with_archives, SessionTimeline,
 };
 
 fn main() -> ExitCode {
@@ -123,7 +125,7 @@ impl fmt::Display for CliError {
 }
 
 fn run(config: CliConfig) -> Result<(), CliError> {
-    let events = read_events_jsonl_file(&config.events_path)
+    let events = read_events_jsonl_file_with_archives(&config.events_path)
         .map_err(|error| CliError::new(error.to_string()))?;
     let timelines = build_session_timelines(events);
     let timeline = select_timeline(&timelines, config.session_id)?;
@@ -179,7 +181,7 @@ fn usage() -> String {
 Usage: eidolon-edge-export [OPTIONS]
 
 Options:
-  --events <PATH>   Event JSONL file path
+  --events <PATH>   Active event JSONL path; retained numeric archives are included
   --session <UUID>  Optional session ID; required when the file contains multiple sessions
   --pretty          Pretty-print JSON output
   -h, --help        Show this help text

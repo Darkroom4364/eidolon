@@ -6,9 +6,12 @@ mod timeline;
 
 pub use evidence::{
     evidence_bundle_for_timeline, BaitActionEvidence, BaitExposureEvidence, BaselineComparison,
-    EvidenceBundle, ObservedSurface, PolicyEventEvidence, PolicyEvidenceKind, ProofOutcome,
+    ControlledRealityInteractionEvidence, EvidenceBundle, ObservedSurface, PolicyEventEvidence,
+    PolicyEvidenceKind, ProofOutcome,
 };
-pub use reader::{read_events_jsonl, read_events_jsonl_file, TraceReadError};
+pub use reader::{
+    read_events_jsonl, read_events_jsonl_file, read_events_jsonl_file_with_archives, TraceReadError,
+};
 pub use report::{
     edge_decision_export_for_evidence, edge_decision_export_for_timeline, render_evidence_markdown,
     render_markdown_report, render_replay_view,

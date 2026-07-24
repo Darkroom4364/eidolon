@@ -75,7 +75,11 @@ This is `0` until the session enters controlled reality or rate-limited containm
 
 ### `controlled_reality_branch_count`
 
-Number of distinct controlled-reality paths touched by the session. This includes the transition request path when its response is served by controlled reality.
+Number of distinct logical controlled-reality branches touched by the session.
+Typed workflow metadata groups the submit, status, and artifact paths of the
+import-reconciliation lifecycle as one branch. Historical events without that
+metadata fall back to distinct normalized request paths. The transition request
+counts when its response is served by controlled reality.
 
 This is `0` until the session enters controlled reality or rate-limited containment.
 

@@ -1,7 +1,8 @@
 use eidolon_core::{
-    BaitId, Event, EventKind, EventSource, IngressActorKind, IngressAdvisorySignals,
-    IngressIdentity, PersistenceMetadata, PolicyState, PostContainmentPersistenceKind,
-    PreContainmentPersistenceClass, RequestId, RoutingDecision, SessionId,
+    BaitId, ControlledRealityInteraction, Event, EventKind, EventSource, IngressActorKind,
+    IngressAdvisorySignals, IngressIdentity, PersistenceMetadata, PolicyState,
+    PostContainmentPersistenceKind, PreContainmentPersistenceClass, RequestId, RoutingDecision,
+    SessionId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -862,6 +863,16 @@ pub fn response_audit_event(
     decision: &PolicyDecision,
     status: u16,
 ) -> Event {
+    response_audit_event_with_controlled_reality(session_id, request_id, decision, status, None)
+}
+
+pub fn response_audit_event_with_controlled_reality(
+    session_id: SessionId,
+    request_id: RequestId,
+    decision: &PolicyDecision,
+    status: u16,
+    controlled_reality: Option<ControlledRealityInteraction>,
+) -> Event {
     Event::new(
         session_id,
         EventSource::Proxy,
@@ -869,6 +880,7 @@ pub fn response_audit_event(
         EventKind::ResponseServed {
             status,
             routing_decision: decision.routing_decision,
+            controlled_reality,
         },
     )
     .with_persistence(decision.persistence)
@@ -2474,7 +2486,8 @@ mod tests {
             event.kind,
             EventKind::ResponseServed {
                 status: 203,
-                routing_decision: RoutingDecision::RewrittenUpstream
+                routing_decision: RoutingDecision::RewrittenUpstream,
+                controlled_reality: None,
             }
         ));
     }

@@ -1,12 +1,43 @@
 use std::{
+    collections::HashSet,
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
-use eidolon_core::Event;
+use eidolon_core::{
+    ControlledRealityInteraction, Event, EventKind, EventSource, PolicyState, RequestId,
+    RoutingDecision, SessionId,
+};
+use uuid::Uuid;
 
 pub type FileEventLogWriter = EventLogWriter<BufWriter<File>>;
+
+fn open_event_log_sink(path: &Path) -> io::Result<BufWriter<File>> {
+    open_event_log_sink_with_parent_sync(path, sync_parent_directory)
+}
+
+fn open_event_log_sink_with_parent_sync(
+    path: &Path,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<BufWriter<File>> {
+    let existed = path.try_exists()?;
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    #[cfg(unix)]
+    {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+
+    if !existed {
+        file.sync_all()?;
+        sync_parent(path)?;
+    }
+
+    Ok(BufWriter::new(file))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JsonlTailRepairOutcome {
@@ -20,12 +51,25 @@ pub enum JsonlTailRepairOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableResponseMatch {
+    Missing,
+    Unique {
+        event_id: Uuid,
+        policy_state: PolicyState,
+        status: u16,
+        routing_decision: RoutingDecision,
+        controlled_reality: Option<ControlledRealityInteraction>,
+    },
+}
+
 pub struct EventLogWriter<W> {
     sink: W,
     reopen: Option<Box<dyn Fn() -> io::Result<W> + Send + Sync>>,
     path: Option<PathBuf>,
     current_len: u64,
     startup_tail_repair: JsonlTailRepairOutcome,
+    unresolved_durable_responses: HashSet<(SessionId, RequestId)>,
 }
 
 impl FileEventLogWriter {
@@ -40,45 +84,250 @@ impl FileEventLogWriter {
             );
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path.as_ref())?;
-
-        #[cfg(unix)]
-        {
-            use std::{fs, os::unix::fs::PermissionsExt};
-
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-
         let current_len = std::fs::metadata(path.as_ref())
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         let path = path.as_ref().to_path_buf();
         let reopen_path = path.clone();
+        let sink = open_event_log_sink(&path)?;
 
         Ok(Self {
-            sink: BufWriter::new(file),
-            reopen: Some(Box::new(move || {
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&reopen_path)?;
-
-                #[cfg(unix)]
-                {
-                    use std::{fs, os::unix::fs::PermissionsExt};
-
-                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-                }
-
-                Ok(BufWriter::new(file))
-            })),
+            sink,
+            reopen: Some(Box::new(move || open_event_log_sink(&reopen_path))),
             path: Some(path),
             current_len,
             startup_tail_repair,
+            unresolved_durable_responses: HashSet::new(),
         })
+    }
+
+    pub fn sync_all(&mut self) -> io::Result<()> {
+        self.sink.flush()?;
+        self.sink.get_ref().sync_all()
+    }
+
+    /// Check the durable log family while the caller holds the writer lock.
+    ///
+    /// This reconciles the narrow crash window after a workflow response is
+    /// fsynced but before its pending policy-state update is committed.
+    pub fn durable_response(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+    ) -> io::Result<DurableResponseMatch> {
+        self.sync_all()?;
+        let path = self.path.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file event log has no configured path",
+            )
+        })?;
+
+        let mut matched = None;
+        for segment in event_log_family_paths(path)? {
+            let reader = BufReader::new(File::open(&segment)?);
+            for (line_index, line) in reader.lines().enumerate() {
+                let line = line?;
+                let event: Event = serde_json::from_str(&line).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid event JSON at {}:{}: {error}",
+                            segment.display(),
+                            line_index + 1
+                        ),
+                    )
+                })?;
+                if event.session_id != session_id || event.request_id != Some(request_id) {
+                    continue;
+                }
+                let EventKind::ResponseServed {
+                    status,
+                    routing_decision,
+                    controlled_reality,
+                } = event.kind
+                else {
+                    continue;
+                };
+                if event.source != EventSource::Proxy {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "durable response event had a non-proxy source",
+                    ));
+                }
+                if matched.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "multiple durable response events matched one request",
+                    ));
+                }
+                matched = Some((
+                    event.id,
+                    event.policy_state,
+                    status,
+                    routing_decision,
+                    controlled_reality,
+                ));
+            }
+        }
+
+        let result = match matched {
+            Some((event_id, policy_state, status, routing_decision, controlled_reality)) => {
+                self.unresolved_durable_responses
+                    .insert((session_id, request_id));
+                DurableResponseMatch::Unique {
+                    event_id,
+                    policy_state,
+                    status,
+                    routing_decision,
+                    controlled_reality,
+                }
+            }
+            None => DurableResponseMatch::Missing,
+        };
+        Ok(result)
+    }
+
+    pub fn write_durable_response(&mut self, event: &Event) -> io::Result<()> {
+        self.write_durable_response_transaction(event, None)
+    }
+
+    pub fn write_durable_response_transaction(
+        &mut self,
+        event: &Event,
+        policy_changed: Option<&Event>,
+    ) -> io::Result<()> {
+        let request_id = event.request_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable response event must carry a request id",
+            )
+        })?;
+        if !matches!(event.kind, EventKind::ResponseServed { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable workflow event must be a response_served event",
+            ));
+        }
+        if let Some(policy_changed) = policy_changed {
+            if policy_changed.session_id != event.session_id
+                || policy_changed.request_id != Some(request_id)
+                || policy_changed.source != EventSource::PolicyRouter
+                || !matches!(&policy_changed.kind, EventKind::PolicyChanged { .. })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "durable workflow policy event did not match its response",
+                ));
+            }
+        }
+        if !self.unresolved_durable_responses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "event log has an unresolved durable workflow response",
+            ));
+        }
+
+        let result = (|| {
+            let mut events = vec![event];
+            events.extend(policy_changed);
+            self.write_events_unchecked(&events)?;
+            self.sync_all()
+        })();
+        self.unresolved_durable_responses
+            .insert((event.session_id, request_id));
+        result
+    }
+
+    pub fn durable_event_by_id(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        event_id: Uuid,
+    ) -> io::Result<Option<Event>> {
+        self.sync_all()?;
+        let path = self.path.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file event log has no configured path",
+            )
+        })?;
+
+        let mut matched = None;
+        for segment in event_log_family_paths(path)? {
+            let reader = BufReader::new(File::open(&segment)?);
+            for (line_index, line) in reader.lines().enumerate() {
+                let line = line?;
+                let event: Event = serde_json::from_str(&line).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid event JSON at {}:{}: {error}",
+                            segment.display(),
+                            line_index + 1
+                        ),
+                    )
+                })?;
+                if event.id != event_id {
+                    continue;
+                }
+                if event.session_id != session_id || event.request_id != Some(request_id) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "durable event id matched the wrong workflow",
+                    ));
+                }
+                if matched.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "durable workflow event id appeared more than once",
+                    ));
+                }
+                matched = Some(event);
+            }
+        }
+        Ok(matched)
+    }
+
+    pub fn write_recovered_policy_event(&mut self, event: &Event) -> io::Result<()> {
+        let request_id = event.request_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recovered policy event must carry a request id",
+            )
+        })?;
+        if event.source != EventSource::PolicyRouter
+            || !matches!(&event.kind, EventKind::PolicyChanged { .. })
+            || !self
+                .unresolved_durable_responses
+                .contains(&(event.session_id, request_id))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recovered policy event did not match a pinned workflow response",
+            ));
+        }
+        self.write_event_unchecked(event)?;
+        self.sync_all()
+    }
+
+    pub fn pin_durable_response(&mut self, session_id: SessionId, request_id: RequestId) {
+        self.unresolved_durable_responses
+            .insert((session_id, request_id));
+    }
+
+    pub fn resolve_durable_response(&mut self, session_id: SessionId, request_id: RequestId) {
+        self.unresolved_durable_responses
+            .remove(&(session_id, request_id));
+    }
+
+    pub fn resolve_all_durable_responses(&mut self) {
+        self.unresolved_durable_responses.clear();
+    }
+
+    #[cfg(test)]
+    pub fn unresolved_durable_response_count(&self) -> usize {
+        self.unresolved_durable_responses.len()
     }
 }
 
@@ -90,6 +339,7 @@ impl<W: Write> EventLogWriter<W> {
             path: None,
             current_len: 0,
             startup_tail_repair: JsonlTailRepairOutcome::NotNeeded,
+            unresolved_durable_responses: HashSet::new(),
         }
     }
 
@@ -98,17 +348,44 @@ impl<W: Write> EventLogWriter<W> {
     }
 
     pub fn write_event(&mut self, event: &Event) -> io::Result<()> {
-        let serialized = serde_json::to_vec(event).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to serialize event as JSON: {err}"),
-            )
-        })?;
+        if !self.unresolved_durable_responses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "event log has an unresolved durable workflow response",
+            ));
+        }
+        self.write_event_unchecked(event)
+    }
 
-        self.rotate_if_needed(serialized.len() as u64 + 1)?;
-        self.sink.write_all(&serialized)?;
-        self.sink.write_all(b"\n")?;
-        self.current_len += serialized.len() as u64 + 1;
+    fn write_event_unchecked(&mut self, event: &Event) -> io::Result<()> {
+        self.write_events_unchecked(&[event])
+    }
+
+    fn write_events_unchecked(&mut self, events: &[&Event]) -> io::Result<()> {
+        let serialized = events
+            .iter()
+            .map(|event| {
+                serde_json::to_vec(event).map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("failed to serialize event as JSON: {err}"),
+                    )
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let incoming = serialized
+            .iter()
+            .try_fold(0_u64, |total, event| {
+                total.checked_add(event.len() as u64 + 1)
+            })
+            .ok_or_else(|| io::Error::other("event batch length overflow"))?;
+
+        self.rotate_if_needed(incoming)?;
+        for event in serialized {
+            self.sink.write_all(&event)?;
+            self.sink.write_all(b"\n")?;
+        }
+        self.current_len += incoming;
         self.sink.flush()
     }
 
@@ -293,14 +570,47 @@ pub fn rotate_log_if_oversized(path: &Path) -> io::Result<Option<PathBuf>> {
 /// prune archives beyond the retention budget. The caller reopens the
 /// active path afterwards.
 pub fn rotate_log_now(path: &Path) -> io::Result<PathBuf> {
+    rotate_log_now_with_sync(path, sync_log_file, sync_parent_directory)
+}
+
+fn rotate_log_now_with_sync(
+    path: &Path,
+    sync_file: impl FnOnce(&Path) -> io::Result<()>,
+    sync_parent: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    sync_file(path)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     let archive = next_archive_path(path, now);
     std::fs::rename(path, &archive)?;
+    sync_parent(path)?;
     prune_log_archives(path, &archive, LOG_ARCHIVES_KEPT)?;
+    sync_parent(path)?;
     Ok(archive)
+}
+
+fn sync_log_file(path: &Path) -> io::Result<()> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 fn next_archive_path(path: &Path, initial_stamp: u128) -> PathBuf {
@@ -355,17 +665,43 @@ fn archive_suffix<'a>(path: &Path, candidate: &'a Path) -> Option<&'a str> {
     (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(suffix)
 }
 
+fn event_log_family_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut archives = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let candidate = entry?.path();
+        let Some(suffix) = archive_suffix(path, &candidate) else {
+            continue;
+        };
+        let suffix = suffix.to_string();
+        archives.push((candidate, suffix));
+    }
+    archives.sort_by(|(_, left), (_, right)| {
+        left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+    });
+
+    let mut segments = archives
+        .into_iter()
+        .map(|(candidate, _)| candidate)
+        .collect::<Vec<_>>();
+    segments.push(path.to_path_buf());
+    Ok(segments)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{self, Write};
 
     use eidolon_core::{
-        Event, EventKind, EventSource, IngressIdentity, PolicyState, RoutingDecision,
+        Event, EventKind, EventSource, IngressIdentity, PolicyState, RequestId, RoutingDecision,
         SafeHeaderObservation, SessionId,
     };
     use serde_json::Value;
 
-    use super::{EventLogWriter, FileEventLogWriter, JsonlTailRepairOutcome};
+    use super::{DurableResponseMatch, EventLogWriter, FileEventLogWriter, JsonlTailRepairOutcome};
 
     #[cfg(unix)]
     fn unique_temp_path(label: &str) -> std::path::PathBuf {
@@ -837,6 +1173,292 @@ mod tests {
 
         fs::remove_file(&path).expect("active log should remove");
         fs::remove_file(&archives[0]).expect("archive should remove");
+    }
+
+    #[test]
+    fn durable_response_lookup_includes_rotated_archives() {
+        use std::fs;
+
+        let path = unique_temp_path("durable-response-archive.jsonl");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let response = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: 202,
+                routing_decision: RoutingDecision::ControlledReality,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(request_id);
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should open");
+        writer
+            .write_event(&response)
+            .expect("response should write");
+        writer.current_len = super::LOG_ROTATE_BYTES;
+        writer
+            .write_event(&request_event("GET", "/after-rotation"))
+            .expect("next event should rotate the response");
+
+        assert_eq!(
+            writer
+                .durable_response(session_id, request_id)
+                .expect("durable response lookup should succeed"),
+            DurableResponseMatch::Unique {
+                event_id: response.id,
+                policy_state: PolicyState::ControlledReality,
+                status: 202,
+                routing_decision: RoutingDecision::ControlledReality,
+                controlled_reality: None
+            }
+        );
+
+        let archives = super::event_log_family_paths(&path)
+            .expect("event log family should list")
+            .into_iter()
+            .filter(|candidate| candidate != &path)
+            .collect::<Vec<_>>();
+        fs::remove_file(&path).expect("active log should remove");
+        for archive in archives {
+            fs::remove_file(archive).expect("archive should remove");
+        }
+    }
+
+    #[test]
+    fn duplicate_durable_responses_are_rejected() {
+        use std::fs;
+
+        let path = unique_temp_path("duplicate-durable-response.jsonl");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let response = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: 202,
+                routing_decision: RoutingDecision::ControlledReality,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(request_id);
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should open");
+        writer
+            .write_event(&response)
+            .expect("first response should write");
+        writer
+            .write_event(&response)
+            .expect("duplicate response should write");
+
+        let error = writer
+            .durable_response(session_id, request_id)
+            .expect_err("duplicate response must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        drop(writer);
+        fs::remove_file(path).expect("event log should remove");
+    }
+
+    #[test]
+    fn duplicate_durable_policy_event_ids_are_rejected() {
+        use std::fs;
+
+        let path = unique_temp_path("duplicate-durable-policy-event.jsonl");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let policy_event = Event::new(
+            session_id,
+            EventSource::PolicyRouter,
+            PolicyState::Blocked,
+            EventKind::PolicyChanged {
+                from: PolicyState::ControlledReality,
+                to: PolicyState::Blocked,
+                reason: "test block".to_string(),
+            },
+        )
+        .with_request_id(request_id);
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should open");
+        writer
+            .write_event(&policy_event)
+            .expect("first policy event should write");
+        writer
+            .write_event(&policy_event)
+            .expect("duplicate policy event should write");
+
+        let error = writer
+            .durable_event_by_id(session_id, request_id, policy_event.id)
+            .expect_err("duplicate policy event id must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        drop(writer);
+        fs::remove_file(path).expect("event log should remove");
+    }
+
+    #[test]
+    fn durable_response_and_policy_event_rotate_as_one_fsynced_batch() {
+        use std::fs;
+
+        let path = unique_temp_path("durable-batch-rotation.jsonl");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let response = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::Blocked,
+            EventKind::ResponseServed {
+                status: 403,
+                routing_decision: RoutingDecision::EidolonOwned,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(request_id);
+        let policy_event = Event::new(
+            session_id,
+            EventSource::PolicyRouter,
+            PolicyState::Blocked,
+            EventKind::PolicyChanged {
+                from: PolicyState::ControlledReality,
+                to: PolicyState::Blocked,
+                reason: "test block".to_string(),
+            },
+        )
+        .with_request_id(request_id);
+        let response_len = serde_json::to_vec(&response)
+            .expect("response should serialize")
+            .len() as u64
+            + 1;
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should open");
+        writer
+            .write_event(&request_event("GET", "/before-batch"))
+            .expect("seed event should write");
+        writer.current_len = super::LOG_ROTATE_BYTES - response_len;
+
+        writer
+            .write_durable_response_transaction(&response, Some(&policy_event))
+            .expect("durable pair should rotate and fsync together");
+
+        let active = fs::read_to_string(&path).expect("active log should read");
+        assert!(active.contains(&response.id.to_string()));
+        assert!(active.contains(&policy_event.id.to_string()));
+        let archives = super::event_log_family_paths(&path)
+            .expect("event log family should list")
+            .into_iter()
+            .filter(|candidate| candidate != &path)
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        let archive = fs::read_to_string(&archives[0]).expect("archive should read");
+        assert!(!archive.contains(&response.id.to_string()));
+        assert!(!archive.contains(&policy_event.id.to_string()));
+
+        writer.resolve_durable_response(session_id, request_id);
+        drop(writer);
+        fs::remove_file(path).expect("active log should remove");
+        for archive in archives {
+            fs::remove_file(archive).expect("archive should remove");
+        }
+    }
+
+    #[test]
+    fn rotation_syncs_the_old_segment_before_renaming_and_syncs_directory_changes() {
+        use std::{cell::RefCell, fs};
+
+        let path = unique_temp_path("durable-rotation-order.jsonl");
+        fs::write(&path, b"old segment\n").expect("seed segment should write");
+        let stages = RefCell::new(Vec::new());
+
+        let archive = super::rotate_log_now_with_sync(
+            &path,
+            |source| {
+                assert!(source.exists(), "file sync must happen before rename");
+                stages.borrow_mut().push("file");
+                Ok(())
+            },
+            |source| {
+                assert!(
+                    !source.exists(),
+                    "directory sync must happen after the rename"
+                );
+                stages.borrow_mut().push("directory");
+                Ok(())
+            },
+        )
+        .expect("rotation should succeed");
+
+        assert_eq!(stages.into_inner(), vec!["file", "directory", "directory"]);
+        assert_eq!(
+            fs::read(&archive).expect("archive should read"),
+            b"old segment\n"
+        );
+        fs::remove_file(archive).expect("archive should remove");
+    }
+
+    #[test]
+    fn creating_a_new_active_segment_syncs_its_parent_directory() {
+        use std::{cell::Cell, fs};
+
+        let path = unique_temp_path("durable-active-create.jsonl");
+        let sync_calls = Cell::new(0);
+        let sink = super::open_event_log_sink_with_parent_sync(&path, |created| {
+            assert!(
+                created.exists(),
+                "active file must exist before its directory is synced"
+            );
+            sync_calls.set(sync_calls.get() + 1);
+            Ok(())
+        })
+        .expect("active segment should open");
+
+        assert_eq!(sync_calls.get(), 1);
+        drop(sink);
+        fs::remove_file(path).expect("active segment should remove");
+    }
+
+    #[test]
+    fn unresolved_durable_response_blocks_event_churn_until_resolved() {
+        use std::fs;
+
+        let path = unique_temp_path("pinned-durable-response.jsonl");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let response = Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: 202,
+                routing_decision: RoutingDecision::ControlledReality,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(request_id);
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should open");
+        writer
+            .write_durable_response(&response)
+            .expect("durable response should write and pin");
+        writer.current_len = super::LOG_ROTATE_BYTES;
+
+        let error = writer
+            .write_event(&request_event("GET", "/must-not-rotate"))
+            .expect_err("unresolved durable response must block event churn");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(writer.unresolved_durable_response_count(), 1);
+        assert_eq!(
+            super::event_log_family_paths(&path)
+                .expect("event log family should list")
+                .len(),
+            1
+        );
+        writer.resolve_durable_response(session_id, request_id);
+        writer
+            .write_event(&request_event("GET", "/after-resolution"))
+            .expect("event writes should resume after resolution");
+        drop(writer);
+        for segment in super::event_log_family_paths(&path).expect("event log family should list") {
+            fs::remove_file(segment).expect("event log segment should remove");
+        }
     }
 
     struct FailingSink;
