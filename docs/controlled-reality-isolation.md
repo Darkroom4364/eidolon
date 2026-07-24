@@ -1,6 +1,7 @@
 # Controlled-Reality Isolation
 
-Status: issue `#176` foundation; not an isolation or production-readiness claim
+Status: issue `#176` enforced kind boundary; not a hard-isolation or
+production-readiness claim
 
 ## Current boundary
 
@@ -14,9 +15,17 @@ Policy state, request correlation, durable workflow state, evidence, depth
 limits, response headers, and protected-upstream routing remain proxy-owned.
 The kind Shield Lab overlay deploys the renderer in
 `shield-controlled-reality`, routes the proxy through Service DNS, and gives
-the renderer default-deny egress. OrbStack does not deploy it. This remains a
-manifested isolation boundary, not a hard-isolation claim, until live deny
-tests and denied-flow evidence pass.
+the renderer default-deny egress. OrbStack does not deploy it.
+
+On 2026-07-24,
+`examples/shield-lab/smoke-controlled-reality-isolation-kind.sh` passed against
+the pinned local kind/Calico deployment. It correlated one minted bait action
+from the proxy event log to the renderer's `served` audit by request ID,
+required a synthetic `202` response with `write_committed:false`, and proved
+the same probe image could reach the target, Kubernetes API, owned metadata
+canary, and internet from `shield-system` while all four destinations were
+denied from `shield-controlled-reality`. It also proved a non-proxy pod could
+not reach the renderer and matched all five denials to Calico flow records.
 
 The renderer protocol is deliberately closed:
 
@@ -76,22 +85,21 @@ The local profiles still cannot support an honest hard-isolation claim:
   which creates a host-level bypass around a pod-only policy boundary
 - kind pins its node image, disables kindnet, installs Calico `v3.32.1`, and
   deploys the remote renderer without NodePorts
-- kind still lacks a checked-in live allow/deny smoke and denied-flow capture
-- the kind path was not run locally for this slice because `kind` was not
-  installed
-- NetworkPolicy objects and cluster-free rendering do not prove enforcement
+- the checked-in kind smoke now proves the active renderer path, paired
+  allow/deny behavior, and request/pod-correlated denied-flow evidence
+- this proof does not cover managed-cluster networking, host compromise,
+  renderer outage, saturation, restart, or multi-replica behavior
 
-## Required deployment slice
+## Remaining deployment slice
 
-Before issue `#176` can claim the enforced boundary:
+The enforced kind network boundary is now proven. Issue `#176` still requires:
 
-1. Prove live negative access to the protected target ClusterIP, node
-   NodePorts, Kubernetes API, metadata destinations, and internet.
-2. Capture denied-flow evidence from the enforcing CNI.
-3. Live-test worker, audit, and replay-cache saturation; expose drop and
+1. Live-test worker, audit, and replay-cache saturation; expose drop and
    saturation counters to operators.
-4. Define restart and multi-replica replay behavior before allowing stateful
+2. Define restart and multi-replica replay behavior before allowing stateful
     rendering.
+3. Prove renderer outage and the operator kill switch preserve zero protected
+   writes.
 
 ## Proxy integration contract
 

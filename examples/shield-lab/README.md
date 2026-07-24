@@ -181,7 +181,7 @@ local files first.
 
 - deploy ingress controllers
 - provision SIEM or webhook exporters
-- prove the kind boundary with live allow/deny and denied-flow evidence
+- live-test renderer outage, saturation, and operator kill-switch behavior
 - run workload generators
 - integrate an external production secret manager
 
@@ -228,6 +228,13 @@ Create the pinned kind cluster, install Calico, load the images, and deploy:
 
 ```sh
 examples/shield-lab/deploy-kind.sh
+```
+
+Prove the live proxy-to-renderer path, paired unrestricted/isolated egress,
+proxy-only renderer ingress, and matching Calico denied-flow records:
+
+```sh
+examples/shield-lab/smoke-controlled-reality-isolation-kind.sh
 ```
 
 The kind path has no NodePort. Reach the proxy with the port-forward command

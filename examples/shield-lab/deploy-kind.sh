@@ -216,6 +216,7 @@ ensure_calico_network_policy() {
     "$kubectl_bin" apply --server-side -f "${calico_base_url}/custom-resources.yaml" >/dev/null
   fi
 
+  "$kubectl_bin" wait --for=create tigerastatus/calico --timeout=300s >/dev/null
   "$kubectl_bin" wait --for=condition=Available tigerastatus/calico --timeout=300s >/dev/null
 }
 
