@@ -18143,6 +18143,30 @@ mod tests {
     }
 
     #[test]
+    fn controlled_reality_workflow_locks_do_not_block_unrelated_shards() {
+        let locks = Arc::new(ControlledRealityWorkflowLocks::new());
+        let first_session = SessionId(uuid::Uuid::from_u128(1));
+        let second_session = SessionId(uuid::Uuid::from_u128(2));
+        let first_guard = locks
+            .lock(first_session)
+            .expect("first session lock should succeed");
+        let worker_locks = Arc::clone(&locks);
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _guard = worker_locks
+                .lock(second_session)
+                .expect("second session lock should succeed");
+            sender.send(()).expect("worker should report lock");
+        });
+
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("unrelated lock shard must not wait for the first session");
+        drop(first_guard);
+        worker.join().expect("lock worker should finish");
+    }
+
+    #[test]
     fn runtime_rate_limited_exact_bait_action_enters_controlled_reality() {
         let event_log_path = unique_temp_path("rate-limited-exact-action-events.jsonl");
         let debug_log_path = unique_temp_path("rate-limited-exact-action-debug.jsonl");
