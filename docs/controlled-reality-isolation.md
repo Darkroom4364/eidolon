@@ -50,8 +50,9 @@ same otherwise-fresh frame again. Rendering is currently stateless and
 deterministic; restart-safe or replica-coordinated replay semantics must be
 defined before a stateful renderer is deployed.
 
-The secret file contains exactly 64 hexadecimal characters encoding 32 bytes,
-with one optional trailing newline.
+The secret file path must be absolute and contain no `..` component. The file
+contains exactly 64 hexadecimal characters encoding 32 bytes, with one
+optional trailing newline.
 
 JSON audit records contain reason codes, peer addresses, and request
 correlation, not raw frames or secrets. Authenticated rejections retain their
