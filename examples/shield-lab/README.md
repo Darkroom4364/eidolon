@@ -65,6 +65,7 @@ Keep out of the private repo:
   smoke-controlled-reality-isolation-kind.sh
   smoke-controlled-reality-outage-kind.sh
   smoke-controlled-reality-escape-kind.sh
+  smoke-controlled-reality-capacity-kind.sh
   status-orbstack.sh
   metrics-orbstack.sh
   logs-orbstack.sh
@@ -187,7 +188,7 @@ local files first.
 
 - deploy ingress controllers
 - provision SIEM or webhook exporters
-- live-test renderer saturation and state/restart behavior
+- live-test renderer state/restart behavior
 - run workload generators
 - integrate an external production secret manager
 
@@ -255,6 +256,14 @@ become blocked, and send zero writes to every active owned-target replica:
 
 ```sh
 examples/shield-lab/smoke-controlled-reality-escape-kind.sh
+```
+
+Temporarily lower every renderer capacity to one, prove connection, audit, and
+replay saturation are observable, require replay saturation to fail closed,
+and restore the original deployment arguments:
+
+```sh
+examples/shield-lab/smoke-controlled-reality-capacity-kind.sh
 ```
 
 Inspect, disable, or restore every kind renderer replica through the

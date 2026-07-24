@@ -24,12 +24,12 @@ capacity_probe_id=shield-probe-capacity-fixture
 target_replica_count=2
 META
   cat >"$dir/proxy-debug.jsonl" <<'JSONL'
-{"event":"controlled_reality_backend_failed","fields":{"request_id":"request-followup","reason":"replay_cache_saturated","response_status":503,"local_fallback":false}}
+{"event":"controlled_reality_backend_failed","fields":{"request_id":"request-followup","reason":"malformed_frame","response_status":503,"local_fallback":false}}
 JSONL
   cat >"$dir/proxy-events.jsonl" <<'JSONL'
 {"session_id":"session-a","request_id":"request-exposure","policy_state":"observe","kind":{"type":"bait_exposed","bait_id":"rel_2025_04_b7f2","surface":"/docs/legacy-import","exposure_id":"exposure-a"}}
 {"session_id":"session-a","request_id":"request-action","policy_state":"observe","kind":{"type":"bait_action_observed","bait_id":"rel_2025_04_b7f2","path":"/api/v2/import/reconcile","exposure_id":"exposure-a","header_value_mint_status":"matched_session_value"}}
-{"session_id":"session-a","request_id":"request-followup","policy_state":"controlled_reality","kind":{"type":"reality_escape_attempt","method":"POST","path":"/api/v1/imports","routing_decision":"controlled_reality"}}
+{"session_id":"session-a","request_id":"request-followup","policy_state":"controlled_reality","kind":{"type":"request_seen","method":"POST","path":"/api/v1/imports","routing_decision":"eidolon_owned"}}
 {"session_id":"session-a","request_id":"request-followup","policy_state":"controlled_reality","kind":{"type":"response_served","status":503,"routing_decision":"eidolon_owned"}}
 JSONL
   cat >"$dir/renderer-identity.meta" <<'META'
@@ -38,9 +38,9 @@ pod_uid_stable=true
 restart_count_stable=true
 META
   cat >"$dir/renderer.jsonl" <<'JSONL'
-{"schema_version":1,"component":"controlled_reality_renderer","event":"startup","request_id":null,"status":null,"reason":null,"peer":null,"dropped_audits_before":0,"counters":{"connection_queue_saturated_total":0,"audit_events_dropped_total":0,"replay_cache_saturated_total":0},"limits":{"connection_workers":1,"connection_queue_capacity":1,"audit_queue_capacity":1,"replay_cache_capacity":1}}
-{"schema_version":1,"component":"controlled_reality_renderer","event":"served","request_id":"request-action","status":202,"reason":null,"peer":"10.244.1.8:41001","dropped_audits_before":2,"counters":{"connection_queue_saturated_total":3,"audit_events_dropped_total":2,"replay_cache_saturated_total":0},"limits":{"connection_workers":1,"connection_queue_capacity":1,"audit_queue_capacity":1,"replay_cache_capacity":1}}
-{"schema_version":1,"component":"controlled_reality_renderer","event":"rejected","request_id":"request-followup","status":null,"reason":"replay_cache_saturated","peer":"10.244.1.8:41002","dropped_audits_before":0,"counters":{"connection_queue_saturated_total":3,"audit_events_dropped_total":2,"replay_cache_saturated_total":1},"limits":{"connection_workers":1,"connection_queue_capacity":1,"audit_queue_capacity":1,"replay_cache_capacity":1}}
+{"schema_version":1,"component":"eidolon-controlled-reality","event":"startup","request_id":null,"status":null,"reason":null,"peer":null,"dropped_audits_before":0,"counters":{"connection_queue_saturated_total":0,"audit_events_dropped_total":0,"replay_cache_saturated_total":0},"limits":{"connection_workers":1,"connection_queue_capacity":1,"audit_queue_capacity":1,"replay_cache_capacity":1}}
+{"schema_version":1,"component":"eidolon-controlled-reality","event":"served","request_id":"request-action","status":202,"reason":null,"peer":"10.244.1.8:41001","dropped_audits_before":2,"counters":{"connection_queue_saturated_total":3,"audit_events_dropped_total":2,"replay_cache_saturated_total":0},"limits":{"connection_workers":1,"connection_queue_capacity":1,"audit_queue_capacity":1,"replay_cache_capacity":1}}
+{"schema_version":1,"component":"eidolon-controlled-reality","event":"rejected","request_id":"request-followup","status":null,"reason":"replay_cache_saturated","peer":"10.244.1.8:41002","dropped_audits_before":0,"counters":{"connection_queue_saturated_total":3,"audit_events_dropped_total":2,"replay_cache_saturated_total":1},"limits":{"connection_workers":1,"connection_queue_capacity":1,"audit_queue_capacity":1,"replay_cache_capacity":1}}
 JSONL
   cat >"$dir/restoration.meta" <<'META'
 args_restored=true
@@ -51,6 +51,11 @@ META
 {"event":"protected_upstream_probe_observed","method":"POST","probe_id":"shield-probe-baseline-fixture","route":"api_v2_import_reconcile"}
 {"event":"protected_upstream_probe_observed","method":"POST","probe_id":"shield-probe-baseline-fixture","route":"api_v2_import_reconcile"}
 JSONL
+  cat >"$dir/target-identity.meta" <<'META'
+pod_set_stable=true
+restart_count_stable=true
+upstream_verified=true
+META
 }
 
 expect_failure() {
@@ -136,6 +141,8 @@ for mutation in \
   queue_counter_zero \
   audit_counter_zero \
   replay_counter_zero \
+  renderer_component_wrong \
+  upstream_unverified \
   counters_decrease
 do
   dir="$(new_fixture)"
@@ -208,7 +215,7 @@ do
       rm "$dir/proxy-events.jsonl.bak"
       ;;
     missing_followup)
-      sed -i.bak '/"type":"reality_escape_attempt"/d' \
+      sed -i.bak '/"type":"request_seen"/d' \
         "$dir/proxy-events.jsonl"
       rm "$dir/proxy-events.jsonl.bak"
       ;;
@@ -224,7 +231,7 @@ do
       ;;
     debug_reason_wrong)
       sed -i.bak \
-        's/"reason":"replay_cache_saturated"/"reason":"malformed_frame"/' \
+        's/"reason":"malformed_frame"/"reason":"connect_failed"/' \
         "$dir/proxy-debug.jsonl"
       rm "$dir/proxy-debug.jsonl.bak"
       ;;
@@ -295,6 +302,17 @@ do
         's/"replay_cache_saturated_total":1/"replay_cache_saturated_total":0/' \
         "$dir/renderer.jsonl"
       rm "$dir/renderer.jsonl.bak"
+      ;;
+    renderer_component_wrong)
+      sed -i.bak \
+        's/"component":"eidolon-controlled-reality"/"component":"other"/g' \
+        "$dir/renderer.jsonl"
+      rm "$dir/renderer.jsonl.bak"
+      ;;
+    upstream_unverified)
+      sed -i.bak 's/upstream_verified=true/upstream_verified=false/' \
+        "$dir/target-identity.meta"
+      rm "$dir/target-identity.meta.bak"
       ;;
     counters_decrease)
       sed -i.bak \
