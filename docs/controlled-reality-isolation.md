@@ -90,12 +90,22 @@ The renderer protocol is deliberately closed:
 - authenticated request IDs are checked against a process-local replay cache
   capped at 4,096 live entries
 
-The current renderer implementation has I/O deadlines, 32 fixed connection
-workers, and a 32-entry application queue. Connections above that combined
-capacity are dropped with a quota outcome; the operating system's listen
-backlog remains outside the application limit. Audit output uses a separate
-128-entry nonblocking queue. Backpressure drops audit records instead of
-occupying connection workers, and a later record reports the number dropped.
+The current renderer implementation has I/O deadlines and defaults to 32 fixed
+connection workers with a 32-entry application queue. Connections above that
+combined capacity are dropped with a quota outcome; the operating system's
+listen backlog remains outside the application limit. Audit output defaults to
+a separate 128-entry nonblocking queue. Backpressure drops audit records
+instead of occupying connection workers, and a later record reports the number
+dropped.
+Every JSON audit record includes the configured limits and monotonic counters
+for connection-queue saturation, dropped audit events, and replay-cache
+saturation. These counters are process-local, reset when the renderer restarts,
+and are not aggregates across replicas.
+
+The checked-in deployment keeps those defaults. In an explicitly acknowledged
+owned lab, CLI flags may lower the worker, connection-queue, audit-queue, and
+replay-cache bounds to exercise overload behavior. They cannot raise a bound
+above its default maximum.
 
 The implementation currently contains no outbound connector and writes no
 persistent filesystem state after loading its dedicated secret. The ordinary

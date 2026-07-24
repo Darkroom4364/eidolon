@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::ExitCode,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
     },
@@ -15,7 +15,8 @@ use std::{
 
 use eidolon_proxy::controlled_reality_backend::{
     serve_render_connection, ControlledRealityBackendAuthSecret,
-    ControlledRealityBackendConnectionOutcome, ControlledRealityBackendReplayCache,
+    ControlledRealityBackendConnectionOutcome, ControlledRealityBackendError,
+    ControlledRealityBackendReplayCache,
 };
 use serde_json::json;
 
@@ -58,6 +59,10 @@ where
 struct ServerConfig {
     auth_secret_path: PathBuf,
     listen_addr: SocketAddr,
+    connection_worker_count: usize,
+    connection_queue_capacity: usize,
+    audit_queue_capacity: usize,
+    replay_cache_capacity: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +79,10 @@ impl CliAction {
     {
         let mut auth_secret_path = None;
         let mut listen_addr = None;
+        let mut connection_worker_count = None;
+        let mut connection_queue_capacity = None;
+        let mut audit_queue_capacity = None;
+        let mut replay_cache_capacity = None;
         let mut owned_cluster_lab = false;
         let mut args = args.into_iter().map(Into::into).peekable();
 
@@ -91,6 +100,30 @@ impl CliAction {
                 "--listen-addr" => {
                     let value = option_value(flag, inline_value, &mut args)?;
                     set_once(&mut listen_addr, flag, value)?;
+                }
+                "--connection-workers" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    let capacity = parse_capacity(flag, &value, CONNECTION_WORKER_COUNT)?;
+                    set_once(&mut connection_worker_count, flag, capacity)?;
+                }
+                "--connection-queue-capacity" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    let capacity = parse_capacity(flag, &value, CONNECTION_QUEUE_CAPACITY)?;
+                    set_once(&mut connection_queue_capacity, flag, capacity)?;
+                }
+                "--audit-queue-capacity" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    let capacity = parse_capacity(flag, &value, AUDIT_QUEUE_CAPACITY)?;
+                    set_once(&mut audit_queue_capacity, flag, capacity)?;
+                }
+                "--replay-cache-capacity" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    let capacity = parse_capacity(
+                        flag,
+                        &value,
+                        eidolon_proxy::controlled_reality_backend::MAX_CONTROLLED_REALITY_BACKEND_REPLAY_ENTRIES,
+                    )?;
+                    set_once(&mut replay_cache_capacity, flag, capacity)?;
                 }
                 "--owned-cluster-lab" => {
                     if inline_value.is_some() {
@@ -118,10 +151,25 @@ impl CliAction {
             .parse::<SocketAddr>()
             .map_err(|_| format!("invalid listen address `{listen_addr}`"))?;
         validate_listen_addr(listen_addr, owned_cluster_lab)?;
+        if !owned_cluster_lab
+            && (connection_worker_count.is_some()
+                || connection_queue_capacity.is_some()
+                || audit_queue_capacity.is_some()
+                || replay_cache_capacity.is_some())
+        {
+            return Err("capacity overrides require explicit `--owned-cluster-lab`".to_string());
+        }
 
         Ok(Self::Run(ServerConfig {
             auth_secret_path,
             listen_addr,
+            connection_worker_count: connection_worker_count.unwrap_or(CONNECTION_WORKER_COUNT),
+            connection_queue_capacity: connection_queue_capacity
+                .unwrap_or(CONNECTION_QUEUE_CAPACITY),
+            audit_queue_capacity: audit_queue_capacity.unwrap_or(AUDIT_QUEUE_CAPACITY),
+            replay_cache_capacity: replay_cache_capacity.unwrap_or(
+                eidolon_proxy::controlled_reality_backend::MAX_CONTROLLED_REALITY_BACKEND_REPLAY_ENTRIES,
+            ),
         }))
     }
 }
@@ -164,6 +212,18 @@ fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<(), String>
     Ok(())
 }
 
+fn parse_capacity(flag: &str, value: &str, maximum: usize) -> Result<usize, String> {
+    let capacity = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid capacity `{value}` for `{flag}`"))?;
+    if capacity == 0 || capacity > maximum {
+        return Err(format!(
+            "`{flag}` must be between 1 and {maximum}, inclusive"
+        ));
+    }
+    Ok(capacity)
+}
+
 fn validate_listen_addr(address: SocketAddr, owned_cluster_lab: bool) -> Result<(), String> {
     if address.port() == 0 {
         return Err("listen address port must not be 0".to_string());
@@ -194,12 +254,18 @@ fn parse_auth_secret_path(value: &str) -> Result<PathBuf, String> {
 fn run_server(config: ServerConfig) -> io::Result<()> {
     let secret = Arc::new(load_auth_secret(&config.auth_secret_path)?);
     let listener = TcpListener::bind(config.listen_addr)?;
-    let audit = AuditSink::start()?;
+    let counters = Arc::new(RendererCounters::default());
+    let limits = RendererLimits::from(&config);
+    let audit = AuditSink::start(config.audit_queue_capacity, Arc::clone(&counters), limits)?;
     let worker_audit = audit.clone();
-    let replay_cache = Arc::new(ControlledRealityBackendReplayCache::new());
+    let worker_counters = Arc::clone(&counters);
+    let replay_cache = Arc::new(
+        ControlledRealityBackendReplayCache::with_capacity(config.replay_cache_capacity)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+    );
     let workers = BoundedWorkerPool::new(
-        CONNECTION_WORKER_COUNT,
-        CONNECTION_QUEUE_CAPACITY,
+        config.connection_worker_count,
+        config.connection_queue_capacity,
         "controlled-reality-connection",
         move |job: ConnectionJob| {
             let outcome = serve_render_connection(job.stream, &secret, &replay_cache);
@@ -215,6 +281,7 @@ fn run_server(config: ServerConfig) -> io::Result<()> {
                     ));
                 }
                 ControlledRealityBackendConnectionOutcome::Rejected { reason } => {
+                    record_backend_rejection(&worker_counters, reason);
                     worker_audit.try_emit(AuditEvent::new(
                         "rejected",
                         reason
@@ -228,6 +295,7 @@ fn run_server(config: ServerConfig) -> io::Result<()> {
             }
         },
     )?;
+    audit.try_emit(AuditEvent::new("startup", None, None, None, None));
 
     for stream in listener.incoming() {
         let stream = match stream {
@@ -246,10 +314,7 @@ fn run_server(config: ServerConfig) -> io::Result<()> {
         let peer = stream.peer_addr().ok().map(|peer| peer.to_string());
         let job = ConnectionJob { stream, peer };
         if let Err(error) = workers.try_dispatch(job) {
-            let (reason, job) = match error {
-                DispatchError::Full(job) => ("connection_queue_full", job),
-                DispatchError::Disconnected(job) => ("connection_workers_unavailable", job),
-            };
+            let (reason, job) = record_dispatch_error(&counters, error);
             audit.try_emit(AuditEvent::new("quota", None, None, Some(reason), job.peer));
         };
     }
@@ -326,6 +391,28 @@ enum DispatchError<T> {
     Disconnected(T),
 }
 
+fn record_dispatch_error<T>(
+    counters: &RendererCounters,
+    error: DispatchError<T>,
+) -> (&'static str, T) {
+    match error {
+        DispatchError::Full(job) => {
+            increment_counter(&counters.connection_queue_saturated_total);
+            ("connection_queue_full", job)
+        }
+        DispatchError::Disconnected(job) => ("connection_workers_unavailable", job),
+    }
+}
+
+fn record_backend_rejection(counters: &RendererCounters, reason: ControlledRealityBackendError) {
+    if matches!(
+        reason,
+        ControlledRealityBackendError::ReplayCacheSaturated { .. }
+    ) {
+        increment_counter(&counters.replay_cache_saturated_total);
+    }
+}
+
 struct BoundedWorkerPool<T> {
     sender: SyncSender<T>,
     _workers: Vec<JoinHandle<()>>,
@@ -400,6 +487,38 @@ where
     }
 }
 
+#[derive(Debug, Default)]
+struct RendererCounters {
+    connection_queue_saturated_total: AtomicU64,
+    audit_events_dropped_total: AtomicU64,
+    replay_cache_saturated_total: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RendererLimits {
+    connection_workers: usize,
+    connection_queue_capacity: usize,
+    audit_queue_capacity: usize,
+    replay_cache_capacity: usize,
+}
+
+impl From<&ServerConfig> for RendererLimits {
+    fn from(config: &ServerConfig) -> Self {
+        Self {
+            connection_workers: config.connection_worker_count,
+            connection_queue_capacity: config.connection_queue_capacity,
+            audit_queue_capacity: config.audit_queue_capacity,
+            replay_cache_capacity: config.replay_cache_capacity,
+        }
+    }
+}
+
+fn increment_counter(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(1))
+    });
+}
+
 #[derive(Debug)]
 struct AuditEvent {
     event: &'static str,
@@ -431,20 +550,36 @@ impl AuditEvent {
 struct AuditSink {
     sender: SyncSender<AuditEvent>,
     dropped: Arc<AtomicUsize>,
+    counters: Arc<RendererCounters>,
 }
 
 impl AuditSink {
-    fn start() -> io::Result<Self> {
-        let (sender, receiver) = mpsc::sync_channel(AUDIT_QUEUE_CAPACITY);
+    fn start(
+        queue_capacity: usize,
+        counters: Arc<RendererCounters>,
+        limits: RendererLimits,
+    ) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(queue_capacity);
         let dropped = Arc::new(AtomicUsize::new(0));
         let writer_dropped = Arc::clone(&dropped);
+        let writer_counters = Arc::clone(&counters);
         thread::Builder::new()
             .name("controlled-reality-audit".to_string())
             .spawn(move || {
                 let stdout = io::stdout();
-                write_audit_events(receiver, writer_dropped, stdout.lock());
+                write_audit_events(
+                    receiver,
+                    writer_dropped,
+                    writer_counters,
+                    limits,
+                    stdout.lock(),
+                );
             })?;
-        Ok(Self { sender, dropped })
+        Ok(Self {
+            sender,
+            dropped,
+            counters,
+        })
     }
 
     fn try_emit(&self, event: AuditEvent) -> bool {
@@ -452,6 +587,7 @@ impl AuditSink {
             Ok(()) => true,
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
+                increment_counter(&self.counters.audit_events_dropped_total);
                 false
             }
         }
@@ -461,6 +597,8 @@ impl AuditSink {
 fn write_audit_events(
     receiver: Receiver<AuditEvent>,
     dropped: Arc<AtomicUsize>,
+    counters: Arc<RendererCounters>,
+    limits: RendererLimits,
     mut writer: impl Write,
 ) {
     while let Ok(event) = receiver.recv() {
@@ -474,12 +612,24 @@ fn write_audit_events(
             "reason": event.reason,
             "peer": event.peer,
             "dropped_audits_before": dropped_audits_before,
+            "counters": {
+                "connection_queue_saturated_total": counters.connection_queue_saturated_total.load(Ordering::Relaxed),
+                "audit_events_dropped_total": counters.audit_events_dropped_total.load(Ordering::Relaxed),
+                "replay_cache_saturated_total": counters.replay_cache_saturated_total.load(Ordering::Relaxed),
+            },
+            "limits": {
+                "connection_workers": limits.connection_workers,
+                "connection_queue_capacity": limits.connection_queue_capacity,
+                "audit_queue_capacity": limits.audit_queue_capacity,
+                "replay_cache_capacity": limits.replay_cache_capacity,
+            },
         });
         if writeln!(writer, "{record}")
             .and_then(|_| writer.flush())
             .is_err()
         {
             dropped.fetch_add(dropped_audits_before.saturating_add(1), Ordering::Relaxed);
+            increment_counter(&counters.audit_events_dropped_total);
         }
     }
 }
@@ -493,6 +643,14 @@ Options:
                          Dedicated HMAC key: exactly 64 hex characters
   --listen-addr <ADDR>   Listen address [default: 127.0.0.1:9103]
   --owned-cluster-lab    Permit a non-loopback listen address in an owned lab
+  --connection-workers <N>
+                         Lab-only worker count [default/max: 32]
+  --connection-queue-capacity <N>
+                         Lab-only connection queue bound [default/max: 32]
+  --audit-queue-capacity <N>
+                         Lab-only audit queue bound [default/max: 128]
+  --replay-cache-capacity <N>
+                         Lab-only replay cache bound [default/max: 4096]
   -h, --help             Show this help text"
 }
 
@@ -509,6 +667,16 @@ mod tests {
     const TEST_SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
     const TEST_SECRET_HEX: &str =
         "3031323334353637383961626364656630313233343536373839616263646566";
+
+    fn test_limits() -> RendererLimits {
+        RendererLimits {
+            connection_workers: CONNECTION_WORKER_COUNT,
+            connection_queue_capacity: CONNECTION_QUEUE_CAPACITY,
+            audit_queue_capacity: AUDIT_QUEUE_CAPACITY,
+            replay_cache_capacity:
+                eidolon_proxy::controlled_reality_backend::MAX_CONTROLLED_REALITY_BACKEND_REPLAY_ENTRIES,
+        }
+    }
 
     #[test]
     fn non_loopback_requires_owned_cluster_lab() {
@@ -544,6 +712,67 @@ mod tests {
             "/var/run/secrets/eidolon/renderer-auth",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn capacity_overrides_are_bounded_and_lab_only() {
+        let without_lab = CliAction::from_args([
+            "--auth-secret-file",
+            "/tmp/test-secret",
+            "--connection-workers",
+            "1",
+        ])
+        .expect_err("capacity override should be lab-only");
+        assert!(without_lab.contains("--owned-cluster-lab"));
+
+        let action = CliAction::from_args([
+            "--auth-secret-file",
+            "/tmp/test-secret",
+            "--owned-cluster-lab",
+            "--connection-workers",
+            "1",
+            "--connection-queue-capacity=2",
+            "--audit-queue-capacity",
+            "3",
+            "--replay-cache-capacity",
+            "4",
+        ])
+        .expect("bounded lab capacities should be accepted");
+        let CliAction::Run(config) = action else {
+            panic!("capacity arguments should run the server");
+        };
+        assert_eq!(config.connection_worker_count, 1);
+        assert_eq!(config.connection_queue_capacity, 2);
+        assert_eq!(config.audit_queue_capacity, 3);
+        assert_eq!(config.replay_cache_capacity, 4);
+
+        for (flag, value) in [
+            ("--connection-workers", "0"),
+            ("--connection-workers", "33"),
+            ("--connection-queue-capacity", "33"),
+            ("--audit-queue-capacity", "129"),
+            ("--replay-cache-capacity", "4097"),
+        ] {
+            let error = CliAction::from_args([
+                "--auth-secret-file",
+                "/tmp/test-secret",
+                "--owned-cluster-lab",
+                flag,
+                value,
+            ])
+            .expect_err("out-of-range capacity should be rejected");
+            assert!(error.contains("between 1 and"));
+        }
+    }
+
+    #[test]
+    fn default_capacities_remain_at_the_existing_bounds() {
+        let action = CliAction::from_args(["--auth-secret-file", "/tmp/test-secret"])
+            .expect("default configuration should parse");
+        let CliAction::Run(config) = action else {
+            panic!("default arguments should run the server");
+        };
+        assert_eq!(RendererLimits::from(&config), test_limits());
     }
 
     #[test]
@@ -591,21 +820,76 @@ mod tests {
     fn audit_queue_drops_instead_of_blocking_when_full() {
         let (sender, _receiver) = mpsc::sync_channel(1);
         let dropped = Arc::new(AtomicUsize::new(0));
+        let counters = Arc::new(RendererCounters::default());
         let sink = AuditSink {
             sender,
             dropped: Arc::clone(&dropped),
+            counters: Arc::clone(&counters),
         };
         let event = || AuditEvent::new("served", None, Some(200), None, None);
 
         assert!(sink.try_emit(event()));
         assert!(!sink.try_emit(event()));
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            counters.audit_events_dropped_total.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn saturation_counters_track_only_the_matching_failure() {
+        let counters = RendererCounters::default();
+        let (reason, job) = record_dispatch_error(&counters, DispatchError::Full(7));
+        assert_eq!(reason, "connection_queue_full");
+        assert_eq!(job, 7);
+        assert_eq!(
+            counters
+                .connection_queue_saturated_total
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        record_backend_rejection(
+            &counters,
+            ControlledRealityBackendError::ReplayDetected {
+                request_id: eidolon_core::RequestId(uuid::Uuid::nil()),
+            },
+        );
+        assert_eq!(
+            counters
+                .replay_cache_saturated_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        record_backend_rejection(
+            &counters,
+            ControlledRealityBackendError::ReplayCacheSaturated {
+                request_id: eidolon_core::RequestId(uuid::Uuid::nil()),
+            },
+        );
+        assert_eq!(
+            counters
+                .replay_cache_saturated_total
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
     fn audit_writer_reports_prior_drops_without_sensitive_fields() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let dropped = Arc::new(AtomicUsize::new(2));
+        let counters = Arc::new(RendererCounters::default());
+        counters
+            .connection_queue_saturated_total
+            .store(3, Ordering::Relaxed);
+        counters
+            .audit_events_dropped_total
+            .store(2, Ordering::Relaxed);
+        counters
+            .replay_cache_saturated_total
+            .store(1, Ordering::Relaxed);
         sender
             .send(AuditEvent::new(
                 "rejected",
@@ -617,12 +901,23 @@ mod tests {
             .expect("audit fixture should enqueue");
         drop(sender);
         let mut output = Vec::new();
-        write_audit_events(receiver, Arc::clone(&dropped), &mut output);
+        write_audit_events(
+            receiver,
+            Arc::clone(&dropped),
+            Arc::clone(&counters),
+            test_limits(),
+            &mut output,
+        );
 
         let record: serde_json::Value =
             serde_json::from_slice(&output).expect("audit output should be JSON");
         assert_eq!(record["dropped_audits_before"], 2);
         assert_eq!(record["peer"], "127.0.0.1:1234");
+        assert_eq!(record["counters"]["connection_queue_saturated_total"], 3);
+        assert_eq!(record["counters"]["audit_events_dropped_total"], 2);
+        assert_eq!(record["counters"]["replay_cache_saturated_total"], 1);
+        assert_eq!(record["limits"]["connection_workers"], 32);
+        assert_eq!(record["limits"]["replay_cache_capacity"], 4_096);
         assert!(record.get("secret").is_none());
     }
 
@@ -645,14 +940,25 @@ mod tests {
 
         let (sender, receiver) = mpsc::sync_channel(1);
         let dropped = Arc::new(AtomicUsize::new(2));
+        let counters = Arc::new(RendererCounters::default());
         sender
             .send(AuditEvent::new("served", None, Some(200), None, None))
             .expect("audit fixture should enqueue");
         drop(sender);
 
-        write_audit_events(receiver, Arc::clone(&dropped), FailingWriter);
+        write_audit_events(
+            receiver,
+            Arc::clone(&dropped),
+            Arc::clone(&counters),
+            test_limits(),
+            FailingWriter,
+        );
 
         assert_eq!(dropped.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            counters.audit_events_dropped_total.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
