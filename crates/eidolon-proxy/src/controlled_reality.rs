@@ -204,6 +204,20 @@ impl ControlledRealityResponder {
         let resources = progress.origin_request_id.and_then(|origin_request_id| {
             ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id).ok()
         });
+        let rendered = self.render(kind, progress, resources.as_ref());
+        self.decide_from_rendered(session_id, kind, progress, rendered)
+    }
+
+    pub fn decide_from_rendered(
+        &self,
+        session_id: SessionId,
+        kind: ControlledRealityRequestKind,
+        progress: ControlledRealityProgress,
+        rendered: ControlledRealityRenderedResponse,
+    ) -> ControlledRealityDecision {
+        let resources = progress.origin_request_id.and_then(|origin_request_id| {
+            ControlledRealityResourceDescriptor::for_session(session_id, origin_request_id).ok()
+        });
         let interaction = resources
             .as_ref()
             .and_then(|resources| interaction_for(kind, progress, resources));
@@ -213,7 +227,7 @@ impl ControlledRealityResponder {
                     "controlled reality served synthetic response at action depth {}",
                     progress.depth
                 ),
-                response: response_for(kind, progress, resources.as_ref()),
+                response: response_from_rendered(kind, progress, resources.as_ref(), rendered),
             },
             interaction,
         }
@@ -297,6 +311,18 @@ impl ControlledRealityResponder {
                 "status": "not_found",
                 "synthetic": true,
                 "message": "controlled reality has no matching synthetic resource",
+            }),
+        )
+    }
+
+    pub fn backend_unavailable_response(&self) -> SurfaceResponse {
+        json_response(
+            503,
+            json!({
+                "status": "unavailable",
+                "synthetic": true,
+                "write_committed": false,
+                "message": "controlled reality renderer unavailable",
             }),
         )
     }
@@ -415,6 +441,15 @@ fn response_for(
     resources: Option<&ControlledRealityResourceDescriptor>,
 ) -> SurfaceResponse {
     let rendered = rendered_response_for(kind, progress, resources);
+    response_from_rendered(kind, progress, resources, rendered)
+}
+
+fn response_from_rendered(
+    kind: ControlledRealityRequestKind,
+    progress: ControlledRealityProgress,
+    resources: Option<&ControlledRealityResourceDescriptor>,
+    rendered: ControlledRealityRenderedResponse,
+) -> SurfaceResponse {
     let mut response = surface_response(rendered);
     if kind == ControlledRealityRequestKind::ArtifactRead
         && progress.to_state == ControlledRealityWorkflowState::Completed
