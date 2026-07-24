@@ -13,6 +13,7 @@ EDGE_EXPORT_BIN="${EIDOLON_EDGE_EXPORT_BIN:-}"
 SURFACE_PATH="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_SURFACE_PATH:-/docs/legacy-import}"
 ACTION_PATH="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_ACTION_PATH:-/api/v2/import/reconcile}"
 EXPECTED_BAIT_ID="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_BAIT_ID:-rel_2025_04_b7f2}"
+EXPECTED_BAIT_CLASS="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_BAIT_CLASS:-docs}"
 HEADER_NAME="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_HEADER_NAME:-X-Migration-Trace}"
 HEADER_PREFIX="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_HEADER_PREFIX:-mig}"
 MINTED_VALUE_PATTERN="${EIDOLON_SHIELD_SESSION_MINTED_LEGACY_IMPORT_VALUE_PATTERN:-mig_w[0-9a-f]+_[0-9a-f]+}"
@@ -324,14 +325,19 @@ exposure_b_json="$(
 
 exposure_a_id="$(jq -r '.kind.exposure_id // empty' <<<"$exposure_a_json")"
 exposure_b_id="$(jq -r '.kind.exposure_id // empty' <<<"$exposure_b_json")"
+exposure_a_request_id="$(jq -r '.request_id // empty' <<<"$exposure_a_json")"
 [[ -n "$exposure_a_id" ]] || fail "session ${SESSION_A} bait exposure had no exposure id"
 [[ -n "$exposure_b_id" ]] || fail "session ${SESSION_B} bait exposure had no exposure id"
+[[ -n "$exposure_a_request_id" ]] \
+  || fail "session ${SESSION_A} bait exposure had no request id"
 
 jq -e \
   --arg surface "$SURFACE_PATH" \
+  --arg bait_class "$EXPECTED_BAIT_CLASS" \
   --arg header_name "$HEADER_NAME" \
   --arg prefix "$HEADER_PREFIX" '
     .kind.surface == $surface
+    and .kind.bait_class == $bait_class
     and .kind.header_value_mint.header_name == $header_name
     and .kind.header_value_mint.kind == "session_hmac_sha256_v1"
     and .kind.header_value_mint.prefix == $prefix
@@ -340,9 +346,11 @@ jq -e \
 
 jq -e \
   --arg surface "$SURFACE_PATH" \
+  --arg bait_class "$EXPECTED_BAIT_CLASS" \
   --arg header_name "$HEADER_NAME" \
   --arg prefix "$HEADER_PREFIX" '
     .kind.surface == $surface
+    and .kind.bait_class == $bait_class
     and .kind.header_value_mint.header_name == $header_name
     and .kind.header_value_mint.kind == "session_hmac_sha256_v1"
     and .kind.header_value_mint.prefix == $prefix
@@ -367,11 +375,15 @@ replay_action_json="$(
 )" || fail "session ${SESSION_B} had no bait_action_observed event for the cross-session legacy-import replay"
 
 jq -e \
+  --arg bait_class "$EXPECTED_BAIT_CLASS" \
   --arg header_name "$HEADER_NAME" \
   --arg prefix "$HEADER_PREFIX" '
     .policy_state == "observe"
+    and .request_id != null
+    and .kind.bait_class == $bait_class
     and .kind.exposure_id == null
     and .kind.method == "POST"
+    and .kind.header_value_mint_status == "session_value_mismatch"
     and .kind.header_value_mint.header_name == $header_name
     and .kind.header_value_mint.kind == "session_hmac_sha256_v1"
     and .kind.header_value_mint.prefix == $prefix
@@ -393,8 +405,10 @@ replay_request_json="$(
     ' "$events_file"
 )" || fail "session ${SESSION_B} had no request_seen event for the cross-session legacy-import replay"
 
-jq -e '
+jq -e \
+  --arg request_id "$(jq -r '.request_id' <<<"$replay_action_json")" '
     .policy_state == "observe"
+    and .request_id == $request_id
     and .kind.routing_decision == "eidolon_owned"
   ' <<<"$replay_request_json" >/dev/null \
   || fail "session ${SESSION_B} replay request was not held Eidolon-owned (fail closed)"
@@ -431,22 +445,49 @@ action_event_json="$(
 
 jq -e \
   --arg exposure_id "$exposure_a_id" \
+  --arg bait_class "$EXPECTED_BAIT_CLASS" \
   --arg header_name "$HEADER_NAME" \
   --arg prefix "$HEADER_PREFIX" '
-    .kind.exposure_id == $exposure_id
+    .request_id != null
+    and .kind.exposure_id == $exposure_id
+    and .kind.bait_class == $bait_class
     and .kind.method == "POST"
+    and .kind.header_value_mint_status == "matched_session_value"
     and .kind.header_value_mint.header_name == $header_name
     and .kind.header_value_mint.kind == "session_hmac_sha256_v1"
     and .kind.header_value_mint.prefix == $prefix
   ' <<<"$action_event_json" >/dev/null \
   || fail "session ${SESSION_A} bait action did not preserve the expected same-session mint audit metadata"
 
-policy_changed_json="$(
+action_request_id="$(jq -r '.request_id // empty' <<<"$action_event_json")"
+[[ -n "$action_request_id" ]] || fail "session ${SESSION_A} bait action had no request id"
+[[ "$action_request_id" != "$exposure_a_request_id" ]] \
+  || fail "session ${SESSION_A} exposure and action unexpectedly shared one request id"
+
+action_request_json="$(
   jq -c -e -s \
-    --arg session_id "$SESSION_A" '
+    --arg session_id "$SESSION_A" \
+    --arg request_id "$action_request_id" '
       map(
         select(
           .session_id == $session_id
+          and .request_id == $request_id
+          and .kind.type == "request_seen"
+          and .kind.routing_decision == "eidolon_owned"
+        )
+      )
+      | last
+    ' "$events_file"
+)" || fail "session ${SESSION_A} action had no request-linked Eidolon-owned interception event"
+
+policy_changed_json="$(
+  jq -c -e -s \
+    --arg session_id "$SESSION_A" \
+    --arg request_id "$action_request_id" '
+      map(
+        select(
+          .session_id == $session_id
+          and .request_id == $request_id
           and .kind.type == "policy_changed"
           and .kind.from == "observe"
           and .kind.to == "controlled_reality"
@@ -456,11 +497,9 @@ policy_changed_json="$(
     ' "$events_file"
 )" || fail "session ${SESSION_A} had no observe -> controlled_reality transition after the minted bait action"
 
-jq -e \
-  --arg reason_substring "confirmed bait-derived action moved session into controlled reality" '
-    (.kind.reason // "") | contains($reason_substring)
-  ' <<<"$policy_changed_json" >/dev/null \
-  || fail "session ${SESSION_A} controlled-reality transition reason did not match the exact minted bait action path"
+jq -e '.request_id != null and .kind.to == "controlled_reality"' \
+  <<<"$policy_changed_json" >/dev/null \
+  || fail "session ${SESSION_A} controlled-reality transition was not request linked"
 
 EIDOLON_SHIELD_LOCAL_STATE_DIR="$LOCAL_STATE_DIR" \
   EIDOLON_EDGE_EXPORT_BIN="$EDGE_EXPORT_BIN" \
@@ -480,19 +519,24 @@ jq -e \
   --arg session_id "$SESSION_A" \
   --arg path "$ACTION_PATH" \
   --arg bait_id "$EXPECTED_BAIT_ID" \
+  --arg bait_class "$EXPECTED_BAIT_CLASS" \
   --arg header_name "$HEADER_NAME" \
-  --arg prefix "$HEADER_PREFIX" '
+  --arg prefix "$HEADER_PREFIX" \
+  --arg request_id "$action_request_id" '
     length == 1
     and .[0].session_id == $session_id
     and .[0].request.method == "POST"
     and .[0].request.path == $path
+    and .[0].request.request_id == $request_id
     and .[0].policy.state == "controlled_reality"
     and .[0].policy.routing_decision == "controlled_reality"
+    and .[0].evidence.request_linkage == "linked"
     and .[0].edge_recommendation.action == "preserve_eidolon_routing"
     and (.[0].edge_recommendation.reason_codes // []) == ["eidolon_runtime_enforcement", "controlled_reality"]
     and (.[0].evidence.bait_header_value_mints // []) == [
       {
         "bait_id": $bait_id,
+        "bait_class": $bait_class,
         "header_name": $header_name,
         "kind": "session_hmac_sha256_v1",
         "prefix": $prefix
@@ -503,10 +547,12 @@ jq -e \
 
 jq -e \
   --arg bait_id "$EXPECTED_BAIT_ID" \
+  --arg bait_class "$EXPECTED_BAIT_CLASS" \
   --arg header_name "$HEADER_NAME" \
   --arg prefix "$HEADER_PREFIX" '
     .[0].evidence.latest_bait_header_value_mint == {
       "bait_id": $bait_id,
+      "bait_class": $bait_class,
       "header_name": $header_name,
       "kind": "session_hmac_sha256_v1",
       "prefix": $prefix,
@@ -519,16 +565,21 @@ jq -e \
   --arg session_id "$SESSION_B" \
   --arg path "$ACTION_PATH" \
   --arg bait_id "$EXPECTED_BAIT_ID" \
+  --arg bait_class "$EXPECTED_BAIT_CLASS" \
   --arg header_name "$HEADER_NAME" \
-  --arg prefix "$HEADER_PREFIX" '
+  --arg prefix "$HEADER_PREFIX" \
+  --arg request_id "$(jq -r '.request_id' <<<"$replay_action_json")" '
     length == 1
     and .[0].session_id == $session_id
     and .[0].request.method == "POST"
     and .[0].request.path == $path
+    and .[0].request.request_id == $request_id
     and .[0].policy.state == "observe"
     and .[0].policy.routing_decision == "eidolon_owned"
+    and .[0].evidence.request_linkage == "linked"
     and .[0].evidence.latest_bait_header_value_mint == {
       "bait_id": $bait_id,
+      "bait_class": $bait_class,
       "header_name": $header_name,
       "kind": "session_hmac_sha256_v1",
       "prefix": $prefix,

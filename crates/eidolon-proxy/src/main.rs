@@ -4276,6 +4276,7 @@ fn write_bait_exposed_event(
         policy_state,
         EventKind::BaitExposed {
             bait_id: bait.id.clone(),
+            bait_class: Some(bait.bait_class),
             exposure_id: exposure_id.clone(),
             surface: redacted_event_target(&surface),
             header_value_mint: bait.header_value_mint_audit(),
@@ -4360,6 +4361,7 @@ fn write_bait_action_observed_event_with_exposure(
             policy_state,
             EventKind::BaitActionObserved {
                 bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
                 exposure_id: exposure_id.clone(),
                 method: method.to_string(),
                 path: redacted_event_target(path),
@@ -8166,22 +8168,25 @@ mod tests {
     }
 
     #[test]
-    fn runtime_session_minted_bait_surface_is_stable_per_session_and_verifies_action() {
-        let path = write_bait_profile(session_minted_profile_json());
-        let loaded = load_bait_profile(&path).expect("minted profile should load");
+    fn runtime_committed_docs_bait_is_stable_per_session_and_verifies_action() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/m3/bait-profiles/docs-session-minted-probe.json");
+        let loaded = load_bait_profile(&path).expect("committed docs profile should load");
         let bait = loaded
             .registry
-            .bait_for_surface("/docs/minted-trace")
-            .expect("minted bait should exist")
+            .bait_for_surface("/docs/legacy-import")
+            .expect("session-minted docs bait should exist")
             .clone();
+        assert_eq!(bait.id.0, "rel_2025_04_b7f2");
+        assert_eq!(bait.bait_class, BaitClass::Docs);
         let signing_secret: Arc<str> = Arc::from("mint-secret");
-        let event_log_path = unique_temp_path("session-minted-bait-events.jsonl");
+        let event_log_path = unique_temp_path("committed-docs-bait-events.jsonl");
         let (upstream, upstream_recorder) =
             spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
         let runtime = test_runtime_with_bait_profile(
             upstream,
             &event_log_path,
-            unique_temp_path("session-minted-bait-control.txt"),
+            unique_temp_path("committed-docs-bait-control.txt"),
             loaded,
             Some(Arc::clone(&signing_secret)),
         );
@@ -8216,15 +8221,15 @@ mod tests {
 
         let response_a = parse_downstream_response(&run_runtime_request(
             runtime.clone(),
-            &get_request_with_cookie("/docs/minted-trace", &cookie_a),
+            &get_request_with_cookie("/docs/legacy-import", &cookie_a),
         ));
         let response_a_repeat = parse_downstream_response(&run_runtime_request(
             runtime.clone(),
-            &get_request_with_cookie("/docs/minted-trace", &cookie_a),
+            &get_request_with_cookie("/docs/legacy-import", &cookie_a),
         ));
         let response_b = parse_downstream_response(&run_runtime_request(
             runtime.clone(),
-            &get_request_with_cookie("/docs/minted-trace", &cookie_b),
+            &get_request_with_cookie("/docs/legacy-import", &cookie_b),
         ));
 
         assert_eq!(response_a.status, 200);
@@ -8262,7 +8267,12 @@ mod tests {
             "valid minted action reached protected upstream"
         );
         let action = first_event_of_type(&event_log_path, "bait_action_observed");
-        assert_eq!(action["kind"]["bait_id"], "minted_trace");
+        assert_eq!(action["kind"]["bait_id"], "rel_2025_04_b7f2");
+        assert_eq!(action["kind"]["bait_class"], "docs");
+        assert_eq!(
+            action["kind"]["header_value_mint_status"],
+            "matched_session_value"
+        );
         assert_eq!(
             action["kind"]["header_value_mint"]["header_name"],
             header_name
@@ -8271,16 +8281,17 @@ mod tests {
             action["kind"]["header_value_mint"]["kind"],
             "session_hmac_sha256_v1"
         );
-        assert_eq!(action["kind"]["header_value_mint"]["prefix"], "minted");
+        assert_eq!(action["kind"]["header_value_mint"]["prefix"], "mig");
         assert!(!action.to_string().contains(&header_value_a));
         let exposure = events_of_type(&event_log_path, "bait_exposed")
             .into_iter()
             .rev()
             .find(|event| {
-                event["kind"]["bait_id"] == "minted_trace"
+                event["kind"]["bait_id"] == "rel_2025_04_b7f2"
                     && event["session_id"] == action["session_id"]
             })
             .expect("same-session minted exposure should exist");
+        assert_eq!(exposure["kind"]["bait_class"], "docs");
         assert_eq!(
             action["kind"]["exposure_id"],
             exposure["kind"]["exposure_id"]
@@ -8289,7 +8300,33 @@ mod tests {
             exposure["kind"]["header_value_mint"]["header_name"],
             header_name
         );
-        assert_eq!(exposure["kind"]["header_value_mint"]["prefix"], "minted");
+        assert_eq!(exposure["kind"]["header_value_mint"]["prefix"], "mig");
+        assert_ne!(
+            exposure["request_id"], action["request_id"],
+            "surface exposure and follow-through must remain distinct requests"
+        );
+        assert!(events_of_type(&event_log_path, "request_seen")
+            .iter()
+            .any(|event| {
+                event["request_id"] == action["request_id"]
+                    && event["kind"]["path"] == "/api/v2/import/reconcile"
+                    && event["kind"]["routing_decision"] == "eidolon_owned"
+            }));
+        assert!(events_of_type(&event_log_path, "policy_changed")
+            .iter()
+            .any(|event| {
+                event["request_id"] == action["request_id"]
+                    && event["kind"]["from"] == "observe"
+                    && event["kind"]["to"] == "controlled_reality"
+            }));
+        assert!(
+            events_of_type(&event_log_path, "controlled_reality_entered")
+                .iter()
+                .any(|event| {
+                    event["request_id"] == action["request_id"]
+                        && event["policy_state"] == "controlled_reality"
+                })
+        );
         assert!(!exposure.to_string().contains(&header_value_a));
     }
 
@@ -10038,6 +10075,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitActionObserved {
                 bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
                 exposure_id: None,
                 method: "POST".to_string(),
                 path: bait.expected_action.path.clone(),
@@ -10238,6 +10276,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitActionObserved {
                 bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
                 exposure_id: None,
                 method: "POST".to_string(),
                 path: bait.expected_action.path.clone(),
@@ -10308,6 +10347,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitExposed {
                     bait_id: bait_id.clone(),
+                    bait_class: None,
                     exposure_id: old_exposure_id,
                     surface: "/docs".to_string(),
                     header_value_mint: None,
@@ -10319,6 +10359,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitExposed {
                     bait_id: other_bait_id.clone(),
+                    bait_class: None,
                     exposure_id: other_exposure_id.clone(),
                     surface: "/openapi.json".to_string(),
                     header_value_mint: None,
@@ -10330,6 +10371,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitExposed {
                     bait_id: bait_id.clone(),
+                    bait_class: None,
                     exposure_id: new_exposure_id.clone(),
                     surface: "/docs".to_string(),
                     header_value_mint: None,
@@ -10426,6 +10468,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitExposed {
                 bait_id: bait.clone(),
+                bait_class: None,
                 exposure_id: exposure.clone(),
                 surface: "/docs".to_string(),
                 header_value_mint: None,
@@ -10511,6 +10554,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitExposed {
                 bait_id: BaitId("stale".to_string()),
+                bait_class: None,
                 exposure_id: ExposureId("stale-exposure".to_string()),
                 surface: "/docs".to_string(),
                 header_value_mint: None,
@@ -10523,6 +10567,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitExposed {
                 bait_id: BaitId("fresh".to_string()),
+                bait_class: None,
                 exposure_id: ExposureId("fresh-exposure".to_string()),
                 surface: "/docs".to_string(),
                 header_value_mint: None,
@@ -10571,6 +10616,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitExposed {
                 bait_id: BaitId("schema-bait".to_string()),
+                bait_class: None,
                 exposure_id: ExposureId("schema-exposure".to_string()),
                 surface: "/docs".to_string(),
                 header_value_mint: None,
@@ -10597,6 +10643,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitExposed {
                 bait_id: BaitId("torn-bait".to_string()),
+                bait_class: None,
                 exposure_id: ExposureId("torn-exposure".to_string()),
                 surface: "/docs".to_string(),
                 header_value_mint: None,
@@ -16665,6 +16712,7 @@ mod tests {
                     PolicyState::Observe,
                     EventKind::BaitExposed {
                         bait_id: bait.id.clone(),
+                        bait_class: Some(bait.bait_class),
                         exposure_id: restored_exposure_id.clone(),
                         surface: bait.surface.clone(),
                         header_value_mint: None,

@@ -2,7 +2,10 @@ use eidolon_core::{ConfidenceBand, Event, Score};
 
 use crate::{
     build_session_timelines,
-    evidence::{collect_evidence, EvidenceBundle, ProofOutcome},
+    evidence::{
+        bait_action_confirmation_failure, collect_evidence, confirms_bait_action,
+        BaitActionConfirmationFailureReason, EvidenceBundle, ProofOutcome,
+    },
     SessionTimeline, TimelineEvent,
 };
 
@@ -37,7 +40,10 @@ pub fn score_evidence(bundle: &EvidenceBundle) -> Score {
     let mut points = 0;
     let mut reasons = Vec::new();
     let exposed = !bundle.bait_exposures.is_empty();
-    let confirmed = !bundle.matched_actions.is_empty();
+    let confirmed = bundle
+        .matched_actions
+        .iter()
+        .any(|action| confirms_bait_action(bundle, action));
     let rejected = bundle
         .unmatched_actions
         .iter()
@@ -48,6 +54,11 @@ pub fn score_evidence(bundle: &EvidenceBundle) -> Score {
     });
     let unknown_linked = bundle.unmatched_actions.iter().any(|action| {
         action.proof_outcome() == ProofOutcome::Unknown && action.matched_exposure.is_some()
+    });
+    let exact_unconfirmed = bundle.unmatched_actions.iter().find_map(|action| {
+        (action.proof_outcome() == ProofOutcome::Accepted && action.matched_exposure.is_some())
+            .then(|| bait_action_confirmation_failure(bundle, action))
+            .flatten()
     });
     let acted = bundle
         .unmatched_actions
@@ -74,6 +85,9 @@ pub fn score_evidence(bundle: &EvidenceBundle) -> Score {
             "session performed an action matching a recorded exposure, but the proof validity is unverifiable; not counted as confirmed"
                 .to_string(),
         );
+    } else if let Some(failure) = exact_unconfirmed {
+        points += 40;
+        reasons.push(confirmation_failure_score_reason(failure).to_string());
     } else if acted {
         points += 40;
         reasons.push(
@@ -106,6 +120,29 @@ pub fn score_evidence(bundle: &EvidenceBundle) -> Score {
     }
 }
 
+fn confirmation_failure_score_reason(failure: BaitActionConfirmationFailureReason) -> &'static str {
+    match failure {
+        BaitActionConfirmationFailureReason::MissingCorrelationMetadata => {
+            "session performed an action with a matching exposure identifier, but correlation metadata was incomplete; not counted as confirmed"
+        }
+        BaitActionConfirmationFailureReason::MissingOrDuplicateRequestObservation => {
+            "session performed an action with a matching exposure, but request identity was missing or ambiguous; not counted as confirmed"
+        }
+        BaitActionConfirmationFailureReason::RequestShapeMismatch => {
+            "session performed an action with a matching exposure, but request method, path, or identity did not match; not counted as confirmed"
+        }
+        BaitActionConfirmationFailureReason::UnsafeActionRouting => {
+            "session performed an action with a matching exposure, but the action was not held Eidolon-owned; not counted as confirmed"
+        }
+        BaitActionConfirmationFailureReason::InvalidEventOrder => {
+            "session performed an action with a matching exposure, but request and evidence order was invalid; not counted as confirmed"
+        }
+        BaitActionConfirmationFailureReason::ProofAuditMismatch => {
+            "session performed an action with a matching exposure, but its proof audit did not match; not counted as confirmed"
+        }
+    }
+}
+
 fn low_score() -> Score {
     Score {
         points: 0,
@@ -126,8 +163,8 @@ fn confidence_rank(confidence: ConfidenceBand) -> i32 {
 #[cfg(test)]
 mod tests {
     use eidolon_core::{
-        BaitId, Event, EventKind, EventSource, ExposureId, IngressIdentity, PolicyState,
-        RoutingDecision, SessionId,
+        BaitClass, BaitId, Event, EventKind, EventSource, ExposureId, IngressIdentity, PolicyState,
+        RequestId, RoutingDecision, SessionId,
     };
 
     use super::*;
@@ -159,11 +196,13 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitExposed {
                 bait_id: BaitId(bait_id.to_string()),
+                bait_class: Some(BaitClass::Docs),
                 exposure_id: ExposureId(exposure_id.to_string()),
                 surface: "/docs/legacy-import".to_string(),
                 header_value_mint: None,
             },
         )
+        .with_request_id(RequestId::new())
     }
 
     fn bait_action(session_id: SessionId) -> Event {
@@ -177,6 +216,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitActionObserved {
                 bait_id: BaitId(bait_id.to_string()),
+                bait_class: Some(BaitClass::Docs),
                 exposure_id: exposure_id.map(|exposure_id| ExposureId(exposure_id.to_string())),
                 method: "POST".to_string(),
                 path: "/api/v2/import/reconcile".to_string(),
@@ -184,6 +224,71 @@ mod tests {
                 header_value_mint_status: None,
             },
         )
+        .with_request_id(RequestId::new())
+    }
+
+    fn with_bait_class(mut event: Event, bait_class: Option<BaitClass>) -> Event {
+        match &mut event.kind {
+            EventKind::BaitExposed {
+                bait_class: event_class,
+                ..
+            }
+            | EventKind::BaitActionObserved {
+                bait_class: event_class,
+                ..
+            } => *event_class = bait_class,
+            other => panic!("expected bait event, got {other:?}"),
+        }
+        event
+    }
+
+    fn request_for_bait_event(event: &Event, routing_decision: RoutingDecision) -> Event {
+        let request_id = event
+            .request_id
+            .expect("bait test events must carry request ids");
+        let (method, path) = match &event.kind {
+            EventKind::BaitExposed { surface, .. } => ("GET", surface.as_str()),
+            EventKind::BaitActionObserved { method, path, .. } => (method.as_str(), path.as_str()),
+            other => panic!("expected bait event, got {other:?}"),
+        };
+
+        request_seen_with(event.session_id, request_id, method, path, routing_decision)
+    }
+
+    fn confirmed_chain(exposure: Event, action: Event) -> Vec<Event> {
+        vec![
+            request_for_bait_event(&exposure, RoutingDecision::ProtectedUpstream),
+            exposure,
+            request_for_bait_event(&action, RoutingDecision::EidolonOwned),
+            action,
+        ]
+    }
+
+    fn request_seen_with(
+        session_id: SessionId,
+        request_id: RequestId,
+        method: &str,
+        path: &str,
+        routing_decision: RoutingDecision,
+    ) -> Event {
+        Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::RequestSeen {
+                method: method.to_string(),
+                path: path.to_string(),
+                safe_headers: Vec::new(),
+                ingress_identity: IngressIdentity::default(),
+                authenticated_ingress_rule_rejection: None,
+                local_ingress_trust_scope_rejection: None,
+                trusted_ingress_soften_match: None,
+                ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
+                routing_decision,
+            },
+        )
+        .with_request_id(request_id)
     }
 
     fn request_seen(session_id: SessionId, path: &str) -> Event {
@@ -209,15 +314,74 @@ mod tests {
     #[test]
     fn exact_bait_chain_is_confirmed() {
         let session_id = SessionId::new();
-        let score = score_timeline(&timeline(vec![
+        let score = score_timeline(&timeline(confirmed_chain(
             bait_exposed(session_id),
             bait_action(session_id),
-        ]));
+        )));
 
         assert_eq!(score.points, 85);
         assert_eq!(score.confidence, ConfidenceBand::ConfirmedBaitDerivedChain);
         assert_eq!(score.reasons.len(), 2);
         assert!(score.reasons[0].contains("controlled bait was exposed"));
+    }
+
+    #[test]
+    fn exact_exposure_with_upstream_action_routing_explains_boundary_failure() {
+        let session_id = SessionId::new();
+        let exposure = bait_exposed(session_id);
+        let action = bait_action(session_id);
+        let score = score_timeline(&timeline(vec![
+            request_for_bait_event(&exposure, RoutingDecision::ProtectedUpstream),
+            exposure,
+            request_for_bait_event(&action, RoutingDecision::ProtectedUpstream),
+            action,
+        ]));
+
+        assert_eq!(score.points, 55);
+        assert_eq!(score.confidence, ConfidenceBand::Medium);
+        assert!(score
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("not held Eidolon-owned")));
+        assert!(!score
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("without a matching recorded exposure")));
+    }
+
+    #[test]
+    fn legacy_requestless_classless_events_remain_visible_but_unconfirmed() {
+        let session_id = SessionId::new();
+        let mut exposure = with_bait_class(bait_exposed(session_id), None);
+        exposure.request_id = None;
+        let mut action = with_bait_class(bait_action(session_id), None);
+        action.request_id = None;
+        let bundle = collect_evidence(&timeline(vec![exposure, action]));
+        let score = score_evidence(&bundle);
+
+        assert_eq!(bundle.bait_exposures.len(), 1);
+        assert!(bundle.matched_actions.is_empty());
+        assert_eq!(bundle.unmatched_actions.len(), 1);
+        assert_eq!(score.points, 55);
+        assert_eq!(score.confidence, ConfidenceBand::Medium);
+        assert_ne!(score.confidence, ConfidenceBand::ConfirmedBaitDerivedChain);
+    }
+
+    #[test]
+    fn exact_ids_with_mismatched_classes_are_not_confirmed() {
+        let session_id = SessionId::new();
+        let score = score_timeline(&timeline(confirmed_chain(
+            with_bait_class(bait_exposed(session_id), Some(BaitClass::Docs)),
+            with_bait_class(bait_action(session_id), Some(BaitClass::HiddenRoute)),
+        )));
+
+        assert_eq!(score.points, 55);
+        assert_eq!(score.confidence, ConfidenceBand::Medium);
+        assert_ne!(score.confidence, ConfidenceBand::ConfirmedBaitDerivedChain);
+        assert!(score
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("without a matching recorded exposure")));
     }
 
     #[test]
@@ -263,30 +427,52 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitActionObserved {
                 bait_id: BaitId("rel_2025_04_b7f2".to_string()),
+                bait_class: Some(BaitClass::Docs),
                 exposure_id: exposure_id.map(|id| ExposureId(id.to_string())),
                 method: "POST".to_string(),
                 path: "/api/v2/import/reconcile".to_string(),
-                header_value_mint: Some(eidolon_core::BaitHeaderValueMintAudit {
-                    header_name: "X-Trace".to_string(),
-                    kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
-                    prefix: "test".to_string(),
-                }),
+                header_value_mint: Some(mint_audit()),
                 header_value_mint_status: status,
             },
         )
+        .with_request_id(RequestId::new())
+    }
+
+    fn mint_audit() -> eidolon_core::BaitHeaderValueMintAudit {
+        eidolon_core::BaitHeaderValueMintAudit {
+            header_name: "X-Trace".to_string(),
+            kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+            prefix: "test".to_string(),
+        }
+    }
+
+    fn minted_exposure(session_id: SessionId, bait_id: &str, exposure_id: &str) -> Event {
+        Event::new(
+            session_id,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId(bait_id.to_string()),
+                bait_class: Some(BaitClass::Docs),
+                exposure_id: ExposureId(exposure_id.to_string()),
+                surface: "/docs/legacy-import".to_string(),
+                header_value_mint: Some(mint_audit()),
+            },
+        )
+        .with_request_id(RequestId::new())
     }
 
     #[test]
     fn replayed_proof_after_exposure_scores_no_confirmed_chain() {
         let session_id = SessionId::new();
-        let score = score_timeline(&timeline(vec![
-            bait_exposed(session_id),
+        let score = score_timeline(&timeline(confirmed_chain(
+            minted_exposure(session_id, "rel_2025_04_b7f2", "exp-1"),
             minted_action_with(
                 session_id,
                 Some("exp-1"),
                 Some(eidolon_core::BaitHeaderValueMintStatus::ReplaySeen),
             ),
-        ]));
+        )));
 
         assert_eq!(score.points, 15);
         assert_eq!(score.confidence, ConfidenceBand::Low);
@@ -299,14 +485,14 @@ mod tests {
     #[test]
     fn expired_proof_after_exposure_scores_no_confirmed_chain() {
         let session_id = SessionId::new();
-        let score = score_timeline(&timeline(vec![
-            bait_exposed(session_id),
+        let score = score_timeline(&timeline(confirmed_chain(
+            minted_exposure(session_id, "rel_2025_04_b7f2", "exp-1"),
             minted_action_with(
                 session_id,
                 Some("exp-1"),
                 Some(eidolon_core::BaitHeaderValueMintStatus::ExpiredSessionValue),
             ),
-        ]));
+        )));
 
         assert_eq!(score.points, 15);
         assert_eq!(score.confidence, ConfidenceBand::Low);
@@ -319,14 +505,14 @@ mod tests {
     #[test]
     fn mismatched_proof_after_exposure_scores_no_confirmed_chain() {
         let session_id = SessionId::new();
-        let score = score_timeline(&timeline(vec![
-            bait_exposed(session_id),
+        let score = score_timeline(&timeline(confirmed_chain(
+            minted_exposure(session_id, "rel_2025_04_b7f2", "exp-1"),
             minted_action_with(
                 session_id,
                 Some("exp-1"),
                 Some(eidolon_core::BaitHeaderValueMintStatus::SessionValueMismatch),
             ),
-        ]));
+        )));
 
         assert_eq!(score.points, 15);
         assert_eq!(score.confidence, ConfidenceBand::Low);
@@ -339,10 +525,10 @@ mod tests {
     #[test]
     fn unknown_mint_status_after_exposure_is_medium_not_confirmed() {
         let session_id = SessionId::new();
-        let score = score_timeline(&timeline(vec![
-            bait_exposed(session_id),
+        let score = score_timeline(&timeline(confirmed_chain(
+            minted_exposure(session_id, "rel_2025_04_b7f2", "exp-1"),
             minted_action_with(session_id, Some("exp-1"), None),
-        ]));
+        )));
 
         assert_eq!(score.points, 55);
         assert_eq!(score.confidence, ConfidenceBand::Medium);
@@ -356,44 +542,32 @@ mod tests {
     #[test]
     fn mixed_session_confirms_from_accepted_proof_and_flags_rejected() {
         let session_id = SessionId::new();
-        let minted_exposure = Event::new(
-            session_id,
-            EventSource::SurfaceController,
-            PolicyState::Observe,
-            EventKind::BaitExposed {
-                bait_id: BaitId("minted-trace".to_string()),
-                exposure_id: ExposureId("exp-minted".to_string()),
-                surface: "/docs/minted-trace".to_string(),
-                header_value_mint: Some(eidolon_core::BaitHeaderValueMintAudit {
-                    header_name: "X-Trace".to_string(),
-                    kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
-                    prefix: "test".to_string(),
-                }),
-            },
-        );
+        let mut minted_exposure = minted_exposure(session_id, "minted-trace", "exp-minted");
+        let EventKind::BaitExposed { surface, .. } = &mut minted_exposure.kind else {
+            panic!("expected bait exposure");
+        };
+        *surface = "/docs/minted-trace".to_string();
         let replayed_action = Event::new(
             session_id,
             EventSource::BaitEngine,
             PolicyState::Observe,
             EventKind::BaitActionObserved {
                 bait_id: BaitId("minted-trace".to_string()),
+                bait_class: Some(BaitClass::Docs),
                 exposure_id: Some(ExposureId("exp-minted".to_string())),
                 method: "POST".to_string(),
                 path: "/api/v2/import/reconcile".to_string(),
-                header_value_mint: Some(eidolon_core::BaitHeaderValueMintAudit {
-                    header_name: "X-Trace".to_string(),
-                    kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
-                    prefix: "test".to_string(),
-                }),
+                header_value_mint: Some(mint_audit()),
                 header_value_mint_status: Some(eidolon_core::BaitHeaderValueMintStatus::ReplaySeen),
             },
-        );
-        let score = score_timeline(&timeline(vec![
-            minted_exposure,
-            replayed_action,
+        )
+        .with_request_id(RequestId::new());
+        let mut events = confirmed_chain(minted_exposure, replayed_action);
+        events.extend(confirmed_chain(
             bait_exposed(session_id),
             bait_action(session_id),
-        ]));
+        ));
+        let score = score_timeline(&timeline(events));
 
         assert_eq!(score.points, 85);
         assert_eq!(score.confidence, ConfidenceBand::ConfirmedBaitDerivedChain);
@@ -486,10 +660,10 @@ mod tests {
         let confirmed_session = SessionId::new();
         let timelines = vec![
             timeline(vec![bait_exposed(exposed_session)]),
-            timeline(vec![
+            timeline(confirmed_chain(
                 bait_exposed(confirmed_session),
                 bait_action(confirmed_session),
-            ]),
+            )),
         ];
 
         let score = score_timelines(&timelines);
