@@ -12,6 +12,7 @@ PROXY_URL="${EIDOLON_LAB_PROXY_URL:-http://127.0.0.1:8080}"
 EIDOLON_M3_PIN_SESSION="${EIDOLON_M3_PIN_SESSION:-1}"
 EIDOLON_M3_SAMPLE_DRY_RUN="${EIDOLON_M3_SAMPLE_DRY_RUN:-0}"
 EIDOLON_M3_BAIT_PROFILE="${EIDOLON_M3_BAIT_PROFILE:-}"
+EIDOLON_M3_BAIT_SIGNING_SECRET_FILE="${EIDOLON_M3_BAIT_SIGNING_SECRET_FILE:-}"
 EIDOLON_M3_ALLOW_AGENT_ERRORS="${EIDOLON_M3_ALLOW_AGENT_ERRORS:-0}"
 EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE="${EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE:-0}"
 EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="${EIDOLON_M3_PWNKIT_MAX_ATTEMPTS:-2}"
@@ -27,6 +28,10 @@ TARGET_PID=""
 PROXY_PID=""
 TARGET_BIN="$REPO_ROOT/target/debug/eidolon-demo-target"
 PROXY_BIN="$REPO_ROOT/target/debug/eidolon-proxy"
+FROZEN_BAIT_PROFILE=""
+FROZEN_BAIT_PROFILE_SHA256=""
+RUN_BAIT_PROFILE=""
+RUN_BAIT_PROFILE_SHA256=""
 
 usage() {
   cat <<'USAGE'
@@ -44,6 +49,12 @@ Environment:
   EIDOLON_M3_SAMPLE_DIR        Sample root if [sample-dir] is omitted.
   EIDOLON_M3_PIN_SESSION       Pin one Eidolon session cookie. Defaults to 1.
   EIDOLON_M3_BAIT_PROFILE      Optional lab-only proxy bait profile JSON.
+  EIDOLON_M3_BAIT_SIGNING_SECRET_FILE
+                                Proxy bait-signing secret file. Required when
+                                the configured profile uses minted values.
+                                Its path and value are never written to plans
+                                or bait-profile metadata.
+                                Each run uses a private frozen profile snapshot.
   EIDOLON_M3_ALLOW_AGENT_ERRORS
                                 If true, continue when pwnkit emits agent_error
                                 events. Defaults to 0.
@@ -120,6 +131,224 @@ require_positive_integer() {
   fi
 }
 
+bait_profile_requires_signing_secret() {
+  local profile_path="$1"
+
+  jq -e '
+    any(
+      .baits[]?;
+      (.expected_action.header_value_mint // null) != null
+    )
+  ' "$profile_path" >/dev/null
+}
+
+sha256_file() {
+  local path="$1"
+  local output
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum "$path")"
+  elif command -v shasum >/dev/null 2>&1; then
+    output="$(shasum -a 256 "$path")"
+  else
+    fail "missing required SHA-256 tool: sha256sum or shasum"
+  fi
+
+  printf '%s' "${output%% *}"
+}
+
+validate_bait_profile_file() {
+  local profile_path="$1"
+  local label="$2"
+
+  if ! jq empty "$profile_path" >/dev/null 2>&1; then
+    fail "$label must contain valid JSON"
+  fi
+  if ! jq -s -e '
+    length == 1
+    and (
+      .[0]
+      | type == "object"
+      and .schema_version == 1
+      and (.profile_id | type == "string" and length > 0)
+      and ((.baits // []) | type == "array")
+      and all(
+        (.baits // [])[];
+        (.id | type == "string" and length > 0)
+        and (.bait_class | type == "string" and length > 0)
+      )
+    )
+  ' "$profile_path" >/dev/null; then
+    fail "$label has invalid metadata fields"
+  fi
+}
+
+validate_bait_configuration() {
+  if [[ -n "$EIDOLON_M3_BAIT_PROFILE" && ! -f "$EIDOLON_M3_BAIT_PROFILE" ]]; then
+    fail "EIDOLON_M3_BAIT_PROFILE must point to an existing file"
+  fi
+
+  if [[ -n "$EIDOLON_M3_BAIT_PROFILE" ]]; then
+    validate_bait_profile_file \
+      "$EIDOLON_M3_BAIT_PROFILE" \
+      "EIDOLON_M3_BAIT_PROFILE"
+  fi
+
+  if [[ -n "$EIDOLON_M3_BAIT_SIGNING_SECRET_FILE" \
+    && ! -f "$EIDOLON_M3_BAIT_SIGNING_SECRET_FILE" ]]; then
+    fail "EIDOLON_M3_BAIT_SIGNING_SECRET_FILE must point to an existing file"
+  fi
+
+  if [[ -n "$EIDOLON_M3_BAIT_PROFILE" ]] \
+    && bait_profile_requires_signing_secret "$EIDOLON_M3_BAIT_PROFILE" \
+    && [[ -z "$EIDOLON_M3_BAIT_SIGNING_SECRET_FILE" ]]; then
+    fail "EIDOLON_M3_BAIT_SIGNING_SECRET_FILE is required by the configured mint-enabled bait profile"
+  fi
+}
+
+verify_bait_profile_snapshot() {
+  local profile_path="$1"
+  local expected_sha256="$2"
+  local current_sha256
+
+  [[ -n "$profile_path" ]] || return 0
+  current_sha256="$(sha256_file "$profile_path")"
+  if [[ "$current_sha256" != "$expected_sha256" ]]; then
+    fail "run-owned bait profile snapshot digest changed"
+  fi
+}
+
+write_bait_profile_metadata() {
+  local profile_path="$1"
+  local profile_sha256="$2"
+  local output_file="$3"
+  local temp_file="${output_file}.tmp"
+
+  jq --arg sha256 "$profile_sha256" '
+    {
+      schema_version: 1,
+      profile_id: .profile_id,
+      sha256: $sha256,
+      baits: [
+        (.baits // [])[]
+        | {
+            bait_id: .id,
+            bait_class: .bait_class
+          }
+      ]
+    }
+  ' "$profile_path" > "$temp_file"
+  mv "$temp_file" "$output_file"
+}
+
+generate_execution_id() {
+  local random_hex
+
+  if [[ -r /dev/urandom ]] && command -v od >/dev/null 2>&1; then
+    random_hex="$(
+      od -An -N16 -tx1 /dev/urandom \
+        | tr -d '[:space:]'
+    )"
+  elif command -v uuidgen >/dev/null 2>&1; then
+    random_hex="$(uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-')"
+  else
+    fail "unable to generate a non-secret execution ID"
+  fi
+
+  if [[ ! "$random_hex" =~ ^[0-9a-f]{32}$ ]]; then
+    fail "unable to generate a valid execution ID"
+  fi
+  printf 'exec_%s' "$random_hex"
+}
+
+write_sample_run_metadata() {
+  local output_file="$1"
+  local execution_id="$2"
+  local profile_sha256="$3"
+  local temp_file="${output_file}.tmp"
+
+  jq -n \
+    --arg execution_id "$execution_id" \
+    --arg profile_sha256 "$profile_sha256" \
+    '{
+      schema_version: 1,
+      run_kind: "m3_pwnkit_sample_run",
+      execution_id: $execution_id,
+      profile_sha256: (
+        if $profile_sha256 == "" then null else $profile_sha256 end
+      )
+    }' > "$temp_file"
+  mv "$temp_file" "$output_file"
+}
+
+freeze_configured_bait_profile() {
+  local snapshot_file="$SAMPLE_DIR/private/bait-profile.json"
+  local temp_file="${snapshot_file}.tmp"
+
+  [[ -n "$EIDOLON_M3_BAIT_PROFILE" ]] || return 0
+  (
+    umask 077
+    cp "$EIDOLON_M3_BAIT_PROFILE" "$temp_file"
+  )
+  validate_bait_profile_file "$temp_file" "frozen bait profile"
+  if bait_profile_requires_signing_secret "$temp_file" \
+    && [[ -z "$EIDOLON_M3_BAIT_SIGNING_SECRET_FILE" ]]; then
+    fail "EIDOLON_M3_BAIT_SIGNING_SECRET_FILE is required by the frozen mint-enabled bait profile"
+  fi
+  chmod 400 "$temp_file"
+  mv "$temp_file" "$snapshot_file"
+
+  FROZEN_BAIT_PROFILE="$snapshot_file"
+  FROZEN_BAIT_PROFILE_SHA256="$(sha256_file "$snapshot_file")"
+  verify_bait_profile_snapshot \
+    "$FROZEN_BAIT_PROFILE" \
+    "$FROZEN_BAIT_PROFILE_SHA256"
+}
+
+prepare_run_artifacts() {
+  local run_dir="$1"
+  local profile_snapshot="$run_dir/private/bait-profile.json"
+  local profile_temp="${profile_snapshot}.tmp"
+  local execution_id
+
+  mkdir -p "$run_dir/private"
+  RUN_BAIT_PROFILE=""
+  RUN_BAIT_PROFILE_SHA256=""
+
+  if [[ -e "$run_dir/sample-run-metadata.json" \
+    || -e "$run_dir/bait-profile-metadata.json" \
+    || -e "$profile_snapshot" ]]; then
+    fail "run directory contains stale provenance artifacts"
+  fi
+
+  if [[ -n "$FROZEN_BAIT_PROFILE" ]]; then
+    (
+      umask 077
+      cp "$FROZEN_BAIT_PROFILE" "$profile_temp"
+    )
+    chmod 400 "$profile_temp"
+    mv "$profile_temp" "$profile_snapshot"
+    RUN_BAIT_PROFILE="$profile_snapshot"
+    RUN_BAIT_PROFILE_SHA256="$(sha256_file "$profile_snapshot")"
+    if [[ "$RUN_BAIT_PROFILE_SHA256" != "$FROZEN_BAIT_PROFILE_SHA256" ]]; then
+      fail "run-owned bait profile snapshot does not match the frozen profile"
+    fi
+    verify_bait_profile_snapshot \
+      "$RUN_BAIT_PROFILE" \
+      "$RUN_BAIT_PROFILE_SHA256"
+    write_bait_profile_metadata \
+      "$RUN_BAIT_PROFILE" \
+      "$RUN_BAIT_PROFILE_SHA256" \
+      "$run_dir/bait-profile-metadata.json"
+  fi
+
+  execution_id="$(generate_execution_id)"
+  write_sample_run_metadata \
+    "$run_dir/sample-run-metadata.json" \
+    "$execution_id" \
+    "$RUN_BAIT_PROFILE_SHA256"
+}
+
 stop_pid() {
   local pid="$1"
   if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
@@ -172,9 +401,8 @@ write_dry_run_plan() {
   local proxy_addr="$2"
   local plan_file="$SAMPLE_DIR/sample-plan.txt"
 
-  mkdir -p "$SAMPLE_DIR"
   for ((run_index = 1; run_index <= RUN_COUNT; run_index++)); do
-    mkdir -p "$SAMPLE_DIR/run-$run_index/private"
+    prepare_run_artifacts "$SAMPLE_DIR/run-$run_index"
   done
 
   {
@@ -185,7 +413,23 @@ write_dry_run_plan() {
     printf 'target_addr=%s\n' "$target_addr"
     printf 'proxy_addr=%s\n' "$proxy_addr"
     printf 'pin_session=%s\n' "$EIDOLON_M3_PIN_SESSION"
-    printf 'bait_profile=%s\n' "${EIDOLON_M3_BAIT_PROFILE:-default}"
+    if [[ -n "$FROZEN_BAIT_PROFILE" ]]; then
+      printf 'bait_profile=configured\n'
+      printf 'bait_profile_sha256=%s\n' "$FROZEN_BAIT_PROFILE_SHA256"
+      printf 'bait_profile_snapshot=run-*/private/bait-profile.json\n'
+      printf 'bait_profile_metadata=run-*/bait-profile-metadata.json\n'
+    else
+      printf 'bait_profile=default\n'
+      printf 'bait_profile_sha256=none\n'
+      printf 'bait_profile_snapshot=none\n'
+      printf 'bait_profile_metadata=none\n'
+    fi
+    printf 'sample_run_metadata=run-*/sample-run-metadata.json\n'
+    if [[ -n "$EIDOLON_M3_BAIT_SIGNING_SECRET_FILE" ]]; then
+      printf 'bait_signing_secret=configured\n'
+    else
+      printf 'bait_signing_secret=default\n'
+    fi
     printf 'allow_agent_errors=%s\n' "$EIDOLON_M3_ALLOW_AGENT_ERRORS"
     printf 'allow_unfresh_pwnkit_source=%s\n' "$EIDOLON_M3_ALLOW_UNFRESH_PWNKIT_SOURCE"
     printf 'pwnkit_max_attempts=%s\n' "$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS"
@@ -223,6 +467,7 @@ start_target() {
 start_proxy() {
   local proxy_addr="$1"
   local run_dir="$2"
+  local bait_profile_snapshot="$3"
   local log_file="$run_dir/private/eidolon-proxy.log"
   local proxy_args=(
     --listen-addr "$proxy_addr"
@@ -231,8 +476,11 @@ start_proxy() {
     --debug-log "$run_dir/private/eidolon-debug.jsonl"
   )
 
-  if [[ -n "$EIDOLON_M3_BAIT_PROFILE" ]]; then
-    proxy_args+=(--bait-profile "$EIDOLON_M3_BAIT_PROFILE")
+  if [[ -n "$bait_profile_snapshot" ]]; then
+    proxy_args+=(--bait-profile "$bait_profile_snapshot")
+  fi
+  if [[ -n "$EIDOLON_M3_BAIT_SIGNING_SECRET_FILE" ]]; then
+    proxy_args+=(--bait-signing-secret-file "$EIDOLON_M3_BAIT_SIGNING_SECRET_FILE")
   fi
 
   proxy_args+=(
@@ -252,7 +500,7 @@ run_pwnkit_preflight() {
   mkdir -p "$preflight_dir"
   EIDOLON_LAB_TARGET_URL="$TARGET_URL" \
     EIDOLON_LAB_PROXY_URL="$PROXY_URL" \
-    EIDOLON_M3_PIN_SESSION="$EIDOLON_M3_PIN_SESSION" \
+    EIDOLON_M3_PIN_SESSION=0 \
     EIDOLON_M3_PWNKIT_MAX_ATTEMPTS="$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS" \
     EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS="$EIDOLON_M3_PWNKIT_TIMEOUT_SECONDS" \
     EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS="$EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS" \
@@ -304,10 +552,13 @@ run_one_sample() {
   local attempt=1
 
   while :; do
-    mkdir -p "$run_dir/private"
+    prepare_run_artifacts "$run_dir"
     echo "m3 pwnkit sample run $run_index/$RUN_COUNT attempt $attempt/$EIDOLON_M3_PWNKIT_MAX_ATTEMPTS -> $run_dir" >&2
 
-    start_proxy "$proxy_addr" "$run_dir"
+    start_proxy "$proxy_addr" "$run_dir" "$RUN_BAIT_PROFILE"
+    verify_bait_profile_snapshot \
+      "$RUN_BAIT_PROFILE" \
+      "$RUN_BAIT_PROFILE_SHA256"
     local runner_status=0
     set +e
     EIDOLON_LAB_TARGET_URL="$TARGET_URL" \
@@ -324,6 +575,9 @@ run_one_sample() {
       "$SCRIPT_DIR/pwnkit-codex.sh" all "$run_dir"
     runner_status="$?"
     set -e
+    verify_bait_profile_snapshot \
+      "$RUN_BAIT_PROFILE" \
+      "$RUN_BAIT_PROFILE_SHA256"
     "$SCRIPT_DIR/collect-pwnkit-codex.sh" "$run_dir" > "$run_dir/pwnkit-summary.json"
     "$SCRIPT_DIR/collect-agent-replay-trace.sh" "$run_dir" \
       > "$run_dir/agent-replay-trace-summary.json"
@@ -370,17 +624,18 @@ main() {
   require_positive_integer \
     "EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS" \
     "$EIDOLON_M3_PWNKIT_HEARTBEAT_SECONDS"
+  require_command jq
   eidolon_lab_require_loopback_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL"
   eidolon_lab_require_loopback_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL"
-  if [[ -n "$EIDOLON_M3_BAIT_PROFILE" && ! -f "$EIDOLON_M3_BAIT_PROFILE" ]]; then
-    echo "error: EIDOLON_M3_BAIT_PROFILE must point to an existing file: $EIDOLON_M3_BAIT_PROFILE" >&2
-    exit 2
-  fi
+  validate_bait_configuration
 
   local target_addr
   local proxy_addr
   target_addr="$(eidolon_lab_listen_addr_for_url "EIDOLON_LAB_TARGET_URL" "$TARGET_URL")"
   proxy_addr="$(eidolon_lab_listen_addr_for_url "EIDOLON_LAB_PROXY_URL" "$PROXY_URL")"
+
+  mkdir -p "$SAMPLE_DIR/private"
+  freeze_configured_bait_profile
 
   if truthy "$EIDOLON_M3_SAMPLE_DRY_RUN"; then
     write_dry_run_plan "$target_addr" "$proxy_addr"
@@ -389,9 +644,7 @@ main() {
 
   require_command cargo
   require_command curl
-  require_command jq
 
-  mkdir -p "$SAMPLE_DIR/private"
   trap cleanup EXIT INT TERM
 
   run_pwnkit_preflight

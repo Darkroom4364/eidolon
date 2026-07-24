@@ -7,7 +7,8 @@ Usage: examples/m3/collect-pwnkit-sample.sh <artifact-dir>...
 
 Aggregates multiple examples/m3/collect-pwnkit-codex.sh summaries into one
 sample-level stability report. Each artifact directory should contain
-pwnkit-summary.json and may contain agent-replay-trace-summary.json.
+pwnkit-summary.json, sample-run-metadata.json, and proxy-events.jsonl. It may
+also contain agent-replay-trace-summary.json.
 
 Requires jq.
 USAGE
@@ -28,11 +29,59 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
+sha256_file() {
+  local path="$1"
+  local output
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum "$path")"
+  else
+    output="$(shasum -a 256 "$path")"
+  fi
+
+  printf '%s' "${output%% *}"
+}
+
+sha256_jsonl() {
+  local path="$1"
+  local output
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(jq -cS '.' "$path" | sha256sum)"
+  else
+    output="$(jq -cS '.' "$path" | shasum -a 256)"
+  fi
+
+  printf '%s' "${output%% *}"
+}
+
 emit_artifact_summary() {
   local artifact_dir="$1"
   local summary_file="$artifact_dir/pwnkit-summary.json"
   local trace_file="$artifact_dir/agent-replay-trace-summary.json"
+  local profile_file="$artifact_dir/private/bait-profile.json"
+  local metadata_file="$artifact_dir/sample-run-metadata.json"
+  local proxy_events_file="$artifact_dir/proxy-events.jsonl"
   local trace_json="null"
+  local metadata_json="null"
+  local metadata_present=false
+  local metadata_valid=false
+  local proxy_events_present=false
+  local proxy_events_valid=false
+  local proxy_events_sha256=""
+  local profile_snapshot_json
+  local profile_sha256
+  local run_provenance_json
+
+  profile_snapshot_json="$(
+    jq -cn '{
+      present: false,
+      valid: false,
+      profile_id: null,
+      sha256: null,
+      baits: []
+    }'
+  )"
 
   if [[ ! -f "$summary_file" ]]; then
     jq -cn \
@@ -49,14 +98,193 @@ emit_artifact_summary() {
     trace_json="$(jq -c '.' "$trace_file")"
   fi
 
+  if [[ -f "$profile_file" && -s "$profile_file" ]]; then
+    profile_sha256="$(sha256_file "$profile_file")"
+    if ! profile_snapshot_json="$(
+      jq -ce --arg sha256 "$profile_sha256" '
+        if (
+          type == "object"
+          and .schema_version == 1
+          and (.profile_id | type) == "string"
+          and (.profile_id | length) > 0
+          and (.baits | type) == "array"
+          and (.baits | length) > 0
+          and all(
+            .baits[];
+            type == "object"
+            and (.id | type) == "string"
+            and (.id | length) > 0
+            and (.bait_class | type) == "string"
+            and (.bait_class | length) > 0
+          )
+          and (
+            [.baits[] | [.id, .bait_class]]
+            | length == (unique | length)
+          )
+        ) then
+          {
+            present: true,
+            valid: true,
+            profile_id: .profile_id,
+            sha256: $sha256,
+            baits: [
+              .baits[]
+              | {
+                  bait_id: .id,
+                  bait_class: .bait_class
+                }
+            ]
+          }
+        else
+          error("invalid private bait profile")
+        end
+      ' "$profile_file" 2>/dev/null
+    )"; then
+      profile_snapshot_json="$(
+        jq -cn '{
+          present: true,
+          valid: false,
+          profile_id: null,
+          sha256: null,
+          baits: []
+        }'
+      )"
+    fi
+  elif [[ -e "$profile_file" ]]; then
+    profile_snapshot_json="$(
+      jq -cn '{
+        present: true,
+        valid: false,
+        profile_id: null,
+        sha256: null,
+        baits: []
+      }'
+    )"
+  fi
+
+  if [[ -f "$metadata_file" && -s "$metadata_file" ]]; then
+    metadata_present=true
+    if metadata_json="$(
+      jq -ce '
+        select(
+          type == "object"
+          and .schema_version == 1
+          and .run_kind == "m3_pwnkit_sample_run"
+          and (.execution_id | type) == "string"
+          and (.execution_id | test("^[A-Za-z0-9._:-]{1,128}$"))
+          and (
+            .profile_sha256 == null
+            or (
+              (.profile_sha256 | type) == "string"
+              and (.profile_sha256 | test("^[0-9a-f]{64}$"))
+            )
+          )
+        )
+      ' "$metadata_file" 2>/dev/null
+    )"; then
+      metadata_valid=true
+    else
+      metadata_json="null"
+    fi
+  elif [[ -e "$metadata_file" ]]; then
+    metadata_present=true
+  fi
+
+  if [[ -f "$proxy_events_file" && -s "$proxy_events_file" ]]; then
+    proxy_events_present=true
+    if jq -e -s '
+      length > 0
+      and all(.[]; type == "object")
+    ' "$proxy_events_file" >/dev/null 2>&1; then
+      proxy_events_valid=true
+      proxy_events_sha256="$(sha256_jsonl "$proxy_events_file")"
+    fi
+  elif [[ -e "$proxy_events_file" ]]; then
+    proxy_events_present=true
+  fi
+
+  run_provenance_json="$(
+    jq -cn \
+      --argjson metadata "$metadata_json" \
+      --argjson metadata_present "$metadata_present" \
+      --argjson metadata_valid "$metadata_valid" \
+      --argjson proxy_events_present "$proxy_events_present" \
+      --argjson proxy_events_valid "$proxy_events_valid" \
+      --arg proxy_events_sha256 "$proxy_events_sha256" \
+      --argjson profile_snapshot "$profile_snapshot_json" \
+      '
+        (
+          if $profile_snapshot.present then
+            (
+              $profile_snapshot.valid
+              and $metadata.profile_sha256 == $profile_snapshot.sha256
+            )
+          else
+            $metadata.profile_sha256 == null
+          end
+        ) as $profile_binding_valid
+        | {
+            present: (
+              $metadata_present
+              and $proxy_events_present
+            ),
+            valid: (
+              $metadata_valid
+              and $proxy_events_valid
+              and $profile_binding_valid
+            ),
+            metadata_present: $metadata_present,
+            metadata_valid: $metadata_valid,
+            proxy_events_present: $proxy_events_present,
+            proxy_events_valid: $proxy_events_valid,
+            profile_binding_valid: $profile_binding_valid,
+            execution_id: ($metadata.execution_id // null),
+            profile_sha256: ($metadata.profile_sha256 // null),
+            proxy_events_sha256: (
+              if $proxy_events_sha256 == ""
+              then null
+              else $proxy_events_sha256
+              end
+            )
+          }
+      '
+  )"
+
   jq -c \
     --arg artifact_dir "$artifact_dir" \
     --argjson trace "$trace_json" \
-    '. + {
-      artifact_dir: $artifact_dir,
-      missing: false,
-      agent_trace_summary: $trace
-    }' \
+    --argjson profile_snapshot "$profile_snapshot_json" \
+    --argjson run_provenance "$run_provenance_json" \
+    '
+      (.execution_id // null) as $summary_execution_id
+      | (.proxy_events_canonical_sha256 // null) as $summary_proxy_events_sha256
+      | (
+          $run_provenance.execution_id == $summary_execution_id
+          and $summary_execution_id != null
+        ) as $summary_execution_id_matches
+      | (
+          $run_provenance.proxy_events_sha256 == $summary_proxy_events_sha256
+          and $summary_proxy_events_sha256 != null
+        ) as $summary_proxy_events_sha256_matches
+      | . + {
+          artifact_dir: $artifact_dir,
+          missing: false,
+          agent_trace_summary: $trace,
+          private_bait_profile_snapshot: $profile_snapshot,
+          run_provenance: (
+            $run_provenance + {
+              summary_execution_id_matches: $summary_execution_id_matches,
+              summary_proxy_events_sha256_matches:
+                $summary_proxy_events_sha256_matches,
+              valid: (
+                $run_provenance.valid
+                and $summary_execution_id_matches
+                and $summary_proxy_events_sha256_matches
+              )
+            }
+          )
+        }
+    ' \
     "$summary_file"
 }
 
@@ -89,6 +317,87 @@ done | jq -s '
     | sort_by(.value)
     | group_by(.value)
     | map({($key_name): .[0].value, count: (map(.count) | add)});
+
+  def aggregate_bait_matrix($runs):
+    [
+      $runs[] as $run
+      | ($run.eidolon_proxy.bait_matrix // [])[]?
+      | . + {
+          artifact_dir: $run.artifact_dir,
+          bait_class: (.bait_class // null),
+          profile_id: (.profile_id // null),
+          profile_sha256: (.profile_sha256 // null)
+        }
+    ]
+    | sort_by([.bait_id, .bait_class, .profile_sha256])
+    | group_by([.bait_id, .bait_class, .profile_sha256])
+    | map({
+        bait_id: .[0].bait_id,
+        bait_class: .[0].bait_class,
+        profile_id: (
+          map(.profile_id)
+          | unique
+          | if length == 1 then .[0] else null end
+        ),
+        profile_sha256: .[0].profile_sha256,
+        run_count: (map(.artifact_dir) | unique | length),
+        runs_with_exposure: (
+          map(select((.exposure_count // 0) > 0) | .artifact_dir)
+          | unique
+          | length
+        ),
+        runs_with_action: (
+          map(select((.action_count // 0) > 0) | .artifact_dir)
+          | unique
+          | length
+        ),
+        runs_with_same_session_confirmed_action: (
+          map(
+            select((.same_session_confirmed_action_count // 0) > 0)
+            | .artifact_dir
+          )
+          | unique
+          | length
+        ),
+        total_exposure_count: (map(.exposure_count // 0) | add),
+        total_action_count: (map(.action_count // 0) | add),
+        total_same_session_confirmed_action_count: (
+          map(.same_session_confirmed_action_count // 0) | add
+        ),
+        surfaces: (map(.surfaces[]?) | unique),
+        action_paths: (map(.action_paths[]?) | unique)
+      });
+
+  def runtime_target_result_matches_snapshot($run):
+    ($run.private_bait_profile_snapshot // {}) as $profile
+    | ($run.target_runtime_bait // {}) as $runtime
+    | (
+        $profile.present == true
+        and $profile.valid == true
+        and ($profile.profile_id | type) == "string"
+        and ($profile.sha256 | type) == "string"
+        and ($profile.sha256 | test("^[0-9a-f]{64}$"))
+        and ($profile.baits | type) == "array"
+        and ($profile.baits | length) == 1
+        and $runtime.profile_snapshot_present == true
+        and $runtime.profile_id == $profile.profile_id
+        and $runtime.profile_sha256 == $profile.sha256
+        and $runtime.target_identification == "single_bait_private_profile"
+        and $runtime.target_bait == $profile.baits[0]
+        and ($runtime.exposure_count | type) == "number"
+        and $runtime.exposure_count >= 1
+        and ($runtime.accepted_action_count | type) == "number"
+        and $runtime.accepted_action_count >= 1
+        and ($runtime.confirmed_action_count | type) == "number"
+        and $runtime.confirmed_action_count >= 1
+        and ($runtime.controlled_reality_entry_count | type) == "number"
+        and $runtime.controlled_reality_entry_count >= 1
+        and $runtime.target_exposed == true
+        and $runtime.accepted_same_session_action == true
+        and $runtime.controlled_reality_entered == true
+        and $runtime.routing_boundary_satisfied == true
+        and $runtime.run_satisfied == true
+      );
 
   def valid_evidence_track:
     . == "upstream_current"
@@ -198,12 +507,221 @@ done | jq -s '
       ]
     end;
 
+  def expected_action_request_routing($action; $requests):
+    (
+      [
+        $requests[]
+        | select($action.request_id != null)
+        | select(.request_id == $action.request_id)
+        | select(.session_id == $action.session_id)
+      ]
+    ) as $request_matches
+    | (
+      [
+        $request_matches[]
+        | select(.method == $action.method)
+        | select(.path == $action.path)
+      ]
+    ) as $exact_matches
+    | (
+        [
+          $exact_matches[]
+          | select((.event_index // -1) < ($action.event_index // -1))
+        ]
+      ) as $prior_exact_matches
+    | {
+        request_seen_count: ($request_matches | length),
+        exact_request_seen_count: ($exact_matches | length),
+        prior_exact_request_seen_count: ($prior_exact_matches | length),
+        routing_decisions: ($exact_matches | map(.routing_decision) | unique),
+        protected_upstream_request_seen_count: (
+          $exact_matches
+          | map(select(.routing_decision == "protected_upstream"))
+          | length
+        ),
+        eidolon_owned_or_controlled_request_seen_count: (
+          $exact_matches
+          | map(
+              select(
+                .routing_decision == "eidolon_owned"
+                or .routing_decision == "controlled_reality"
+              )
+            )
+          | length
+        ),
+        boundary_satisfied: (
+          $action.request_id != null
+          and ($request_matches | length) == 1
+          and ($exact_matches | length) == 1
+          and ($prior_exact_matches | length) == 1
+          and (
+            $prior_exact_matches
+            | map(
+                select(
+                  .routing_decision == "eidolon_owned"
+                  or .routing_decision == "controlled_reality"
+                )
+              )
+            | length
+          ) == 1
+          and (
+            $prior_exact_matches
+            | map(select(.routing_decision == "protected_upstream"))
+            | length
+          ) == 0
+        )
+      };
+
+  def derive_target_runtime_bait:
+    . as $run
+    | ($run.private_bait_profile_snapshot // {}) as $profile
+    | ($run.eidolon_proxy.request_paths // []) as $requests
+    | if (
+        $profile.present != true
+        or $profile.valid != true
+        or ($profile.profile_id // null) == null
+        or ($profile.sha256 // null) == null
+        or (($profile.baits // []) | length) != 1
+      ) then
+        {
+          profile_snapshot_present: false,
+          profile_id: null,
+          profile_sha256: null,
+          target_identification: null,
+          target_bait: null,
+          exposure_count: 0,
+          accepted_action_count: 0,
+          confirmed_action_count: 0,
+          controlled_reality_entry_count: 0,
+          routing_boundary_satisfied: false,
+          target_exposed: false,
+          accepted_same_session_action: false,
+          controlled_reality_entered: false,
+          run_satisfied: false
+        }
+      else
+        $profile.baits[0] as $target
+        | (
+            [
+              ($run.eidolon_proxy.bait_events.exposures // [])[] as $exposure
+              | select(
+                  $exposure.bait_id == $target.bait_id
+                  and $exposure.bait_class == $target.bait_class
+                  and $exposure.request_id != null
+                )
+              | select(
+                  (
+                    [
+                      $requests[]
+                      | select(.request_id == $exposure.request_id)
+                      | select(.session_id == $exposure.session_id)
+                      | select(.path == $exposure.surface)
+                    ]
+                    | length
+                  ) == 1
+                )
+              | $exposure
+            ]
+          ) as $target_exposures
+        | (
+            ($run.eidolon_proxy.bait_events.actions // [])
+            | map(
+                select(
+                  .bait_id == $target.bait_id
+                  and .bait_class == $target.bait_class
+                  and .proof_outcome == "accepted"
+                )
+              )
+          ) as $accepted_actions
+        | (
+            [
+              $accepted_actions[] as $action
+              | (expected_action_request_routing($action; $requests)) as $expected_routing
+              | select($expected_routing.boundary_satisfied == true)
+              | select($action.request_routing == $expected_routing)
+              | select($action.same_session_confirmed == true)
+              | select(
+                  any(
+                    $target_exposures[];
+                    .session_id == $action.session_id
+                    and .bait_id == $action.bait_id
+                    and .bait_class == $action.bait_class
+                    and .exposure_id == $action.exposure_id
+                    and ((.event_index // -1) < ($action.event_index // -1))
+                  )
+                )
+              | $action
+            ]
+          ) as $confirmed_actions
+        | (
+            [
+              ($run.eidolon_proxy.bait_events.controlled_reality_entries // [])[] as $entry
+              | select(
+                  any(
+                    $confirmed_actions[];
+                    .session_id == $entry.session_id
+                    and .request_id != null
+                    and $entry.request_id != null
+                    and .request_id == $entry.request_id
+                    and ((.event_index // -1) < ($entry.event_index // -1))
+                  )
+                )
+              | $entry
+            ]
+          ) as $controlled_entries
+        | (
+            ($accepted_actions | length) > 0
+            and all(
+              $accepted_actions[];
+              (expected_action_request_routing(.; $requests)) as $expected_routing
+              | $expected_routing.boundary_satisfied == true
+              and .request_routing == $expected_routing
+            )
+          ) as $routing_boundary_satisfied
+        | {
+            profile_snapshot_present: true,
+            profile_id: $profile.profile_id,
+            profile_sha256: $profile.sha256,
+            target_identification: "single_bait_private_profile",
+            target_bait: $target,
+            exposure_count: ($target_exposures | length),
+            accepted_action_count: ($accepted_actions | length),
+            confirmed_action_count: ($confirmed_actions | length),
+            controlled_reality_entry_count: ($controlled_entries | length),
+            routing_boundary_satisfied: $routing_boundary_satisfied,
+            target_exposed: (($target_exposures | length) > 0),
+            accepted_same_session_action: (($confirmed_actions | length) > 0),
+            controlled_reality_entered: (($controlled_entries | length) > 0),
+            run_satisfied: (
+              ($target_exposures | length) > 0
+              and ($confirmed_actions | length) > 0
+              and ($controlled_entries | length) > 0
+              and $routing_boundary_satisfied
+            )
+          }
+      end;
+
   def summarize_run:
     if .missing then
       {
         artifact_dir,
         present: false,
         missing_reason,
+        execution_id: null,
+        run_provenance: {
+          present: false,
+          valid: false,
+          metadata_present: false,
+          metadata_valid: false,
+          proxy_events_present: false,
+          proxy_events_valid: false,
+          profile_binding_valid: false,
+          summary_execution_id_matches: false,
+          summary_proxy_events_sha256_matches: false,
+          execution_id: null,
+          profile_sha256: null,
+          proxy_events_sha256: null
+        },
         evidence_track: "missing",
         claim_level: "missing"
       }
@@ -211,6 +729,33 @@ done | jq -s '
       {
         artifact_dir,
         present: true,
+        execution_id: (.run_provenance.execution_id // null),
+        run_provenance: (
+          .run_provenance // {
+            present: false,
+            valid: false,
+            metadata_present: false,
+            metadata_valid: false,
+            proxy_events_present: false,
+            proxy_events_valid: false,
+            profile_binding_valid: false,
+            summary_execution_id_matches: false,
+            summary_proxy_events_sha256_matches: false,
+            execution_id: null,
+            profile_sha256: null,
+            proxy_events_sha256: null
+          }
+        ),
+        private_bait_profile_snapshot: (
+          .private_bait_profile_snapshot // {
+            present: false,
+            valid: false,
+            profile_id: null,
+            sha256: null,
+            baits: []
+          }
+        ),
+        target_runtime_bait: derive_target_runtime_bait,
         evidence_track: inferred_evidence_track,
         runner_git_head: (.runner.pwnkit.git_head // null),
         runner_package_version: (.runner.pwnkit.package_version // null),
@@ -315,7 +860,8 @@ done | jq -s '
           routing_counts: (.eidolon_proxy.routing_counts // []),
           request_path_counts: count_values(
             (.eidolon_proxy.request_paths // []) | map(.path // null)
-          )
+          ),
+          bait_matrix: (.comparison.correlated_bait_events.matrix // [])
         },
         target_correlation_diagnostics: (
           .comparison.target_correlation_diagnostics // (
@@ -579,6 +1125,97 @@ done | jq -s '
   | ($runs | map(select(.present))) as $present
   | ($runs | length) as $artifact_count
   | ($present | length) as $valid_count
+  | (
+      $present
+      | map(.execution_id // null)
+      | map(select(type == "string" and length > 0))
+    ) as $execution_ids_observed
+  | ($execution_ids_observed | unique) as $execution_ids
+  | (
+      $valid_count > 0
+      and ($execution_ids_observed | length) == $valid_count
+    ) as $all_execution_ids_present
+  | (
+      $all_execution_ids_present
+      and ($execution_ids | length) == $valid_count
+    ) as $all_execution_ids_distinct
+  | (
+      $valid_count > 0
+      and all($present[]; .run_provenance.valid == true)
+    ) as $all_run_provenance_valid
+  | (
+      $present
+      | map(.run_provenance.proxy_events_sha256 // null)
+      | map(select(type == "string" and test("^[0-9a-f]{64}$")))
+    ) as $proxy_event_log_sha256s_observed
+  | (
+      $proxy_event_log_sha256s_observed
+      | unique
+    ) as $proxy_event_log_sha256s
+  | (
+      $valid_count > 0
+      and ($proxy_event_log_sha256s_observed | length) == $valid_count
+    ) as $all_proxy_event_logs_present
+  | (
+      $all_proxy_event_logs_present
+      and ($proxy_event_log_sha256s | length) == $valid_count
+    ) as $all_proxy_event_log_digests_distinct
+  | (
+      $present
+      | map(.private_bait_profile_snapshot.profile_id // null)
+      | map(select(type == "string" and length > 0))
+      | unique
+    ) as $runtime_profile_ids
+  | (
+      $present
+      | map(.private_bait_profile_snapshot.sha256 // null)
+      | map(select(type == "string" and test("^[0-9a-f]{64}$")))
+      | unique
+    ) as $runtime_profile_sha256s
+  | (
+      $present
+      | map(.private_bait_profile_snapshot.baits // [])
+      | map(select(length == 1) | .[0])
+      | unique
+    ) as $runtime_target_baits
+  | (
+      $valid_count > 0
+      and all(
+        $present[];
+        .private_bait_profile_snapshot.present == true
+        and .private_bait_profile_snapshot.valid == true
+      )
+    ) as $all_private_profile_snapshots_valid
+  | (
+      $present
+      | map(select((.target_runtime_bait | type) == "object"))
+      | length
+    ) as $runtime_target_result_count
+  | (
+      $present
+      | map(select(.target_runtime_bait.target_exposed == true))
+      | length
+    ) as $runtime_target_exposed_count
+  | (
+      $present
+      | map(select(.target_runtime_bait.accepted_same_session_action == true))
+      | length
+    ) as $runtime_target_confirmed_count
+  | (
+      $present
+      | map(select(.target_runtime_bait.controlled_reality_entered == true))
+      | length
+    ) as $runtime_target_controlled_count
+  | (
+      $present
+      | map(select(.target_runtime_bait.routing_boundary_satisfied == true))
+      | length
+    ) as $runtime_target_boundary_count
+  | (
+      $present
+      | map(select(runtime_target_result_matches_snapshot(.)))
+      | length
+    ) as $runtime_target_satisfied_count
   | ($present | map(select(.target_interaction_observed)) | length) as $target_count
   | ($present | map(select(.bait_reached)) | length) as $bait_reached_count
   | ($present | map(select(.bait_action_observed)) | length) as $bait_action_count
@@ -911,6 +1548,9 @@ done | jq -s '
       generated_at: (now | todateiso8601),
       artifact_count: $artifact_count,
       valid_summary_count: $valid_count,
+      execution_ids: $execution_ids,
+      proxy_event_log_sha256s: $proxy_event_log_sha256s,
+      bait_matrix: aggregate_bait_matrix($present),
       counts: {
         missing_summary: ($artifact_count - $valid_count),
         target_interaction_observed: $target_count,
@@ -1185,10 +1825,82 @@ done | jq -s '
           | unique
         )
       },
+      target_runtime_bait_stability: {
+        minimum_sample_size: 3,
+        sample_size: $valid_count,
+        all_summaries_present: (
+          $artifact_count > 0 and $valid_count == $artifact_count
+        ),
+        all_execution_ids_present: $all_execution_ids_present,
+        all_execution_ids_distinct: $all_execution_ids_distinct,
+        all_run_provenance_valid: $all_run_provenance_valid,
+        all_proxy_event_logs_present: $all_proxy_event_logs_present,
+        all_proxy_event_log_digests_distinct: $all_proxy_event_log_digests_distinct,
+        profile_ids: $runtime_profile_ids,
+        profile_sha256s: $runtime_profile_sha256s,
+        target_baits: $runtime_target_baits,
+        single_profile_id: (
+          if ($runtime_profile_ids | length) == 1
+          then $runtime_profile_ids[0]
+          else null
+          end
+        ),
+        single_profile_digest: (
+          if ($runtime_profile_sha256s | length) == 1
+          then $runtime_profile_sha256s[0]
+          else null
+          end
+        ),
+        target_bait: (
+          if ($runtime_target_baits | length) == 1
+          then $runtime_target_baits[0]
+          else null
+          end
+        ),
+        all_private_profile_snapshots_valid: $all_private_profile_snapshots_valid,
+        all_runtime_results_present: (
+          $valid_count > 0 and $runtime_target_result_count == $valid_count
+        ),
+        all_target_exposed: (
+          $valid_count > 0 and $runtime_target_exposed_count == $valid_count
+        ),
+        all_accepted_same_session_action: (
+          $valid_count > 0 and $runtime_target_confirmed_count == $valid_count
+        ),
+        all_controlled_reality_entered: (
+          $valid_count > 0 and $runtime_target_controlled_count == $valid_count
+        ),
+        all_routing_boundaries_satisfied: (
+          $valid_count > 0 and $runtime_target_boundary_count == $valid_count
+        ),
+        all_run_requirements_satisfied: (
+          $valid_count > 0 and $runtime_target_satisfied_count == $valid_count
+        ),
+        ready_for_stability_claim: (
+          $valid_count >= 3
+          and $valid_count == $artifact_count
+          and $all_execution_ids_present
+          and $all_execution_ids_distinct
+          and $all_run_provenance_valid
+          and $all_proxy_event_logs_present
+          and $all_proxy_event_log_digests_distinct
+          and $all_private_profile_snapshots_valid
+          and $runtime_target_result_count == $valid_count
+          and ($runtime_profile_ids | length) == 1
+          and ($runtime_profile_sha256s | length) == 1
+          and ($runtime_target_baits | length) == 1
+          and $runtime_target_satisfied_count == $valid_count
+        )
+      },
       strict_stability: {
         minimum_sample_size: 3,
         sample_size: $valid_count,
         all_summaries_present: ($artifact_count > 0 and $valid_count == $artifact_count),
+        all_execution_ids_present: $all_execution_ids_present,
+        all_execution_ids_distinct: $all_execution_ids_distinct,
+        all_run_provenance_valid: $all_run_provenance_valid,
+        all_proxy_event_logs_present: $all_proxy_event_logs_present,
+        all_proxy_event_log_digests_distinct: $all_proxy_event_log_digests_distinct,
         single_runner_git_head: ($valid_count > 0 and ($runner_heads | length) == 1),
         single_evidence_track: (
           $valid_count > 0
@@ -1225,6 +1937,11 @@ done | jq -s '
         ready_for_stability_claim: (
           $valid_count >= 3
           and $valid_count == $artifact_count
+          and $all_execution_ids_present
+          and $all_execution_ids_distinct
+          and $all_run_provenance_valid
+          and $all_proxy_event_logs_present
+          and $all_proxy_event_log_digests_distinct
           and ($runner_heads | length) == 1
           and ($evidence_tracks | length) == 1
           and $unknown_evidence_track_count == 0

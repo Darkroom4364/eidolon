@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use eidolon_core::{
-    BaitHeaderValueMintAudit, BaitHeaderValueMintStatus,
+    BaitClass, BaitHeaderValueMintAudit, BaitHeaderValueMintStatus,
     EdgeAuthenticatedIngressRuleRejectionHistory, EdgeBaitHeaderValueMintAudit, EdgeEvidenceRef,
     EdgeLocalIngressTrustScopeRejectionHistory, EdgeObservedBaitHeaderValueMint,
     EdgePolicySnapshot, EdgeRecommendation, EdgeRecommendedAction, EdgeRequestLinkage,
@@ -15,7 +15,10 @@ use eidolon_core::{
     PostContainmentPersistenceKind, PreContainmentPersistenceClass, PreContainmentPersistenceKind,
 };
 
-use crate::evidence::{trace_metric_summary_for_timeline, ProofOutcome};
+use crate::evidence::{
+    bait_action_confirmation_failure, trace_metric_summary_for_timeline,
+    BaitActionConfirmationFailureReason, ProofOutcome,
+};
 use crate::{
     evidence_bundle_for_timeline, BaitActionEvidence, BaitExposureEvidence, EvidenceBundle,
     SessionTimeline, TimelineEvent, TimelineEventRef,
@@ -26,7 +29,18 @@ pub fn render_markdown_report(timeline: &SessionTimeline) -> String {
     render_evidence_markdown(timeline, &bundle)
 }
 
-pub fn render_evidence_markdown(timeline: &SessionTimeline, bundle: &EvidenceBundle) -> String {
+pub fn render_evidence_markdown(
+    timeline: &SessionTimeline,
+    _supplied_bundle: &EvidenceBundle,
+) -> String {
+    let bundle = evidence_bundle_for_timeline(timeline);
+    render_evidence_markdown_from_timeline(timeline, &bundle)
+}
+
+fn render_evidence_markdown_from_timeline(
+    timeline: &SessionTimeline,
+    bundle: &EvidenceBundle,
+) -> String {
     let mut report = String::new();
 
     push_line(&mut report, format_args!("# Eidolon Trace Report"));
@@ -94,12 +108,14 @@ pub fn render_evidence_markdown(timeline: &SessionTimeline, bundle: &EvidenceBun
                 push_line(
                     &mut report,
                     format_args!(
-                        "- Exposure `{}` on `{}` at line `{}` matched action `{}` `{}` at line `{}`.",
+                        "- Exposure `{}` (class `{}`) on `{}` at line `{}` matched action `{}` `{}` (class `{}`) at line `{}`.",
                         inline_code(&exposure.exposure_id.0),
+                        bait_class_name(exposure.bait_class),
                         inline_code(&report_target(&exposure.surface)),
                         exposure.event_ref.line_number,
                         inline_code(&action.method),
                         inline_code(&report_target(&action.path)),
+                        bait_class_name(action.bait_class),
                         action.event_ref.line_number
                     ),
                 );
@@ -116,12 +132,13 @@ pub fn render_evidence_markdown(timeline: &SessionTimeline, bundle: &EvidenceBun
             push_line(
                 &mut report,
                 format_args!(
-                    "- `{}` `{}` for bait `{}` at line `{}`: {}.",
+                    "- `{}` `{}` for bait `{}` (class `{}`) at line `{}`: {}.",
                     inline_code(&action.method),
                     inline_code(&report_target(&action.path)),
                     inline_code(&action.bait_id.0),
+                    bait_class_name(action.bait_class),
                     action.event_ref.line_number,
-                    unconfirmed_action_reason(action)
+                    unconfirmed_action_reason(bundle, action)
                 ),
             );
         }
@@ -158,7 +175,7 @@ pub fn render_evidence_markdown(timeline: &SessionTimeline, bundle: &EvidenceBun
         }
     }
 
-    report.push_str(&render_replay_view(timeline, bundle));
+    report.push_str(&render_replay_view_from_timeline(timeline, bundle));
 
     report
 }
@@ -217,7 +234,12 @@ fn render_metric_summary(timeline: &SessionTimeline, bundle: &EvidenceBundle, re
     );
 }
 
-pub fn render_replay_view(timeline: &SessionTimeline, bundle: &EvidenceBundle) -> String {
+pub fn render_replay_view(timeline: &SessionTimeline, _supplied_bundle: &EvidenceBundle) -> String {
+    let bundle = evidence_bundle_for_timeline(timeline);
+    render_replay_view_from_timeline(timeline, &bundle)
+}
+
+fn render_replay_view_from_timeline(timeline: &SessionTimeline, bundle: &EvidenceBundle) -> String {
     let mut replay = String::new();
 
     push_line(&mut replay, format_args!("\n## Replay"));
@@ -263,8 +285,10 @@ pub fn edge_decision_export_for_timeline(
 
 pub fn edge_decision_export_for_evidence(
     timeline: &SessionTimeline,
-    bundle: &EvidenceBundle,
+    _supplied_bundle: &EvidenceBundle,
 ) -> Option<EidolonEdgeDecisionExport> {
+    let rebuilt_bundle = evidence_bundle_for_timeline(timeline);
+    let bundle = &rebuilt_bundle;
     let latest_request = timeline.events.iter().rev().find_map(|event| {
         let EventKind::RequestSeen {
             method,
@@ -309,12 +333,27 @@ pub fn edge_decision_export_for_evidence(
         request_routing_decision,
     ) = latest_request;
     let linked_request_id = request_event.event.request_id;
+    if linked_request_id.is_some_and(|request_id| {
+        timeline
+            .events
+            .iter()
+            .filter(|event| {
+                event.event.request_id == Some(request_id)
+                    && matches!(event.event.kind, EventKind::RequestSeen { .. })
+            })
+            .count()
+            != 1
+    }) {
+        return None;
+    }
     let event_belongs_to_linked_request = |event_ref: &TimelineEventRef| -> bool {
         let Some(linked_request_id) = linked_request_id else {
             return false;
         };
-        timeline_event_by_ref(timeline, *event_ref)
-            .is_some_and(|event| event.event.request_id == Some(linked_request_id))
+        timeline_event_by_ref(timeline, *event_ref).is_some_and(|event| {
+            event.file_order > request_event.file_order
+                && event.event.request_id == Some(linked_request_id)
+        })
     };
     let request_linkage = if linked_request_id.is_some() {
         EdgeRequestLinkage::Linked
@@ -460,6 +499,7 @@ fn edge_bait_header_value_mints(bundle: &EvidenceBundle) -> Vec<EdgeBaitHeaderVa
         push_edge_bait_header_value_mint(
             &mut audits,
             &exposure.bait_id,
+            exposure.bait_class,
             exposure.header_value_mint.as_ref(),
         );
     }
@@ -471,6 +511,7 @@ fn edge_bait_header_value_mints(bundle: &EvidenceBundle) -> Vec<EdgeBaitHeaderVa
         push_edge_bait_header_value_mint(
             &mut audits,
             &action.bait_id,
+            action.bait_class,
             action.header_value_mint.as_ref(),
         );
     }
@@ -590,6 +631,7 @@ fn edge_local_ingress_trust_scope_rejection_histories(
 fn push_edge_bait_header_value_mint(
     audits: &mut Vec<EdgeBaitHeaderValueMintAudit>,
     bait_id: &eidolon_core::BaitId,
+    bait_class: Option<BaitClass>,
     mint: Option<&BaitHeaderValueMintAudit>,
 ) {
     let Some(mint) = mint else {
@@ -598,6 +640,7 @@ fn push_edge_bait_header_value_mint(
 
     let audit = EdgeBaitHeaderValueMintAudit {
         bait_id: bait_id.clone(),
+        bait_class,
         header_name: mint.header_name.clone(),
         kind: mint.kind,
         prefix: mint.prefix.clone(),
@@ -645,7 +688,8 @@ fn latest_request_bait_action_event<'a>(
     let linked_request_id = request_event.event.request_id?;
 
     timeline.events.iter().rev().find(|event| {
-        event.event.request_id == Some(linked_request_id)
+        event.file_order > request_event.file_order
+            && event.event.request_id == Some(linked_request_id)
             && matches!(event.event.kind, EventKind::BaitActionObserved { .. })
     })
 }
@@ -655,6 +699,7 @@ fn edge_observed_bait_header_value_mint(
 ) -> Option<EdgeObservedBaitHeaderValueMint> {
     let EventKind::BaitActionObserved {
         bait_id,
+        bait_class,
         header_value_mint,
         header_value_mint_status,
         ..
@@ -667,6 +712,7 @@ fn edge_observed_bait_header_value_mint(
 
     Some(EdgeObservedBaitHeaderValueMint {
         bait_id: bait_id.clone(),
+        bait_class: *bait_class,
         header_name: mint.header_name.clone(),
         kind: mint.kind,
         prefix: mint.prefix.clone(),
@@ -679,7 +725,9 @@ fn timeline_event_by_ref(
     event_ref: TimelineEventRef,
 ) -> Option<&TimelineEvent> {
     timeline.events.iter().find(|event| {
-        event.file_order == event_ref.file_order && event.line_number == event_ref.line_number
+        event.event.id == event_ref.event_id
+            && event.file_order == event_ref.file_order
+            && event.line_number == event_ref.line_number
     })
 }
 
@@ -885,18 +933,21 @@ fn replay_summary(event: &TimelineEvent, bundle: &EvidenceBundle) -> String {
         ),
         EventKind::BaitExposed {
             bait_id,
+            bait_class,
             exposure_id,
             surface,
             header_value_mint,
         } => format!(
-            "exposed bait `{}` as exposure `{}` on surface `{}`{}",
+            "exposed bait `{}` (class `{}`) as exposure `{}` on surface `{}`{}",
             inline_code(&bait_id.0),
+            bait_class_name(*bait_class),
             inline_code(&exposure_id.0),
             inline_code(&report_target(surface)),
             bait_header_value_mint_summary(header_value_mint.as_ref(), None)
         ),
         EventKind::BaitActionObserved {
             bait_id,
+            bait_class,
             exposure_id,
             method,
             path,
@@ -914,11 +965,12 @@ fn replay_summary(event: &TimelineEvent, bundle: &EvidenceBundle) -> String {
                 "unconfirmed bait-shaped action"
             };
             format!(
-                "{}: `{}` `{}` for bait `{}` with exposure `{}`{}",
+                "{}: `{}` `{}` for bait `{}` (class `{}`) with exposure `{}`{}",
                 status,
                 inline_code(method),
                 inline_code(&report_target(path)),
                 inline_code(&bait_id.0),
+                bait_class_name(*bait_class),
                 inline_code(exposure_id.as_ref().map_or("none", |id| id.0.as_str())),
                 bait_header_value_mint_summary(
                     header_value_mint.as_ref(),
@@ -997,7 +1049,7 @@ fn exposure_by_ref(
         .find(|exposure| exposure.event_ref == event_ref)
 }
 
-fn unconfirmed_action_reason(action: &BaitActionEvidence) -> &'static str {
+fn unconfirmed_action_reason(bundle: &EvidenceBundle, action: &BaitActionEvidence) -> &'static str {
     match action.proof_outcome() {
         ProofOutcome::Rejected => match action.header_value_mint_status {
             Some(BaitHeaderValueMintStatus::ReplaySeen) => {
@@ -1033,7 +1085,31 @@ fn unconfirmed_action_reason(action: &BaitActionEvidence) -> &'static str {
             }
         }
         ProofOutcome::Accepted => {
-            if action.prior_same_bait_exposure.is_some() {
+            if action.matched_exposure.is_some() {
+                match bait_action_confirmation_failure(bundle, action) {
+                    Some(
+                        BaitActionConfirmationFailureReason::MissingOrDuplicateRequestObservation,
+                    ) => {
+                        "the exposure matched, but request identity was missing or ambiguous; not counted as confirmed"
+                    }
+                    Some(BaitActionConfirmationFailureReason::RequestShapeMismatch) => {
+                        "the exposure matched, but request method, path, or identity did not; not counted as confirmed"
+                    }
+                    Some(BaitActionConfirmationFailureReason::UnsafeActionRouting) => {
+                        "the exposure matched, but the action was not held Eidolon-owned; not counted as confirmed"
+                    }
+                    Some(BaitActionConfirmationFailureReason::InvalidEventOrder) => {
+                        "the exposure matched, but request and evidence order was invalid; not counted as confirmed"
+                    }
+                    Some(BaitActionConfirmationFailureReason::ProofAuditMismatch) => {
+                        "the exposure matched, but its proof audit did not; not counted as confirmed"
+                    }
+                    Some(BaitActionConfirmationFailureReason::MissingCorrelationMetadata)
+                    | None => {
+                        "the exposure identifier matched, but correlation metadata did not; not counted as confirmed"
+                    }
+                }
+            } else if action.prior_same_bait_exposure.is_some() {
                 "same bait was exposed earlier, but the action did not carry the matching exposure identifier"
             } else {
                 "no prior matching exposure was recorded for this session"
@@ -1142,6 +1218,12 @@ fn snake_case_debug(value: &impl std::fmt::Debug) -> String {
     output
 }
 
+fn bait_class_name(bait_class: Option<BaitClass>) -> String {
+    bait_class
+        .map(|bait_class| snake_case_debug(&bait_class))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn inline_code(value: &str) -> String {
     markdown_text(&value.replace('`', "'"))
 }
@@ -1217,6 +1299,31 @@ mod tests {
         )
     }
 
+    fn bait_request(
+        session_id: SessionId,
+        method: &str,
+        path: &str,
+        routing_decision: RoutingDecision,
+    ) -> Event {
+        Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::RequestSeen {
+                method: method.to_string(),
+                path: path.to_string(),
+                safe_headers: Vec::new(),
+                ingress_identity: IngressIdentity::default(),
+                authenticated_ingress_rule_rejection: None,
+                local_ingress_trust_scope_rejection: None,
+                trusted_ingress_soften_match: None,
+                ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
+                routing_decision,
+            },
+        )
+    }
+
     fn request_with_ingress_signals(session_id: SessionId) -> Event {
         Event::new(
             session_id,
@@ -1260,6 +1367,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitExposed {
                 bait_id: BaitId("rel_2025_04_b7f2".to_string()),
+                bait_class: Some(BaitClass::Docs),
                 exposure_id: ExposureId("exp-1".to_string()),
                 surface: "/docs/legacy-import".to_string(),
                 header_value_mint: None,
@@ -1274,6 +1382,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitActionObserved {
                 bait_id: BaitId("rel_2025_04_b7f2".to_string()),
+                bait_class: Some(BaitClass::Docs),
                 exposure_id: exposure_id.map(|id| ExposureId(id.to_string())),
                 method: "POST".to_string(),
                 path: "/api/v2/import/reconcile".to_string(),
@@ -1297,6 +1406,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitExposed {
                 bait_id: BaitId("minted-trace".to_string()),
+                bait_class: Some(BaitClass::Docs),
                 exposure_id: ExposureId("exp-1".to_string()),
                 surface: "/docs/minted-trace".to_string(),
                 header_value_mint: Some(mint_audit.clone()),
@@ -1308,6 +1418,7 @@ mod tests {
             PolicyState::Observe,
             EventKind::BaitActionObserved {
                 bait_id: BaitId("minted-trace".to_string()),
+                bait_class: Some(BaitClass::Docs),
                 exposure_id: Some(ExposureId("exp-1".to_string())),
                 method: "POST".to_string(),
                 path: "/api/v2/import/reconcile".to_string(),
@@ -1321,6 +1432,142 @@ mod tests {
         assert!(report.contains("- No confirmed bait exposure to action chain."));
         assert!(report.contains("proof rejected as a replay; excluded from confirmed evidence"));
         assert!(report.contains("unconfirmed bait-shaped action"));
+        assert!(!report.contains("confirmed match"));
+    }
+
+    #[test]
+    fn report_confirms_accepted_session_minted_docs_action() {
+        let session_id = SessionId::new();
+        let surface_request_id = RequestId::new();
+        let action_request_id = RequestId::new();
+        let mint_audit = BaitHeaderValueMintAudit {
+            header_name: "X-Migration-Trace".to_string(),
+            kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+            prefix: "mig".to_string(),
+        };
+        let minted_exposure = Event::new(
+            session_id,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId("rel_2025_04_b7f2".to_string()),
+                bait_class: Some(BaitClass::Docs),
+                exposure_id: ExposureId("exp-docs".to_string()),
+                surface: "/docs/legacy-import".to_string(),
+                header_value_mint: Some(mint_audit.clone()),
+            },
+        )
+        .with_request_id(surface_request_id);
+        let accepted_action = Event::new(
+            session_id,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: BaitId("rel_2025_04_b7f2".to_string()),
+                bait_class: Some(BaitClass::Docs),
+                exposure_id: Some(ExposureId("exp-docs".to_string())),
+                method: "POST".to_string(),
+                path: "/api/v2/import/reconcile".to_string(),
+                header_value_mint: Some(mint_audit),
+                header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            },
+        )
+        .with_request_id(action_request_id);
+
+        let report = render_markdown_report(&timeline(vec![
+            bait_request(
+                session_id,
+                "GET",
+                "/docs/legacy-import",
+                RoutingDecision::ProtectedUpstream,
+            )
+            .with_request_id(surface_request_id),
+            minted_exposure,
+            bait_request(
+                session_id,
+                "POST",
+                "/api/v2/import/reconcile",
+                RoutingDecision::EidolonOwned,
+            )
+            .with_request_id(action_request_id),
+            accepted_action,
+        ]));
+
+        assert!(report.contains("Confidence: `confirmed_bait_derived_chain`"));
+        assert!(report.contains("Exposure `exp-docs` (class `docs`)"));
+        assert!(report.contains("confirmed match: `POST` `/api/v2/import/reconcile`"));
+        assert!(report.contains("for bait `rel_2025_04_b7f2`"));
+        assert!(report.contains("class `docs`"));
+        assert!(report.contains("status `matched_session_value`"));
+        assert!(!report.contains("No confirmed bait exposure to action chain"));
+    }
+
+    #[test]
+    fn report_explains_exact_exposure_rejected_by_routing_boundary() {
+        let session_id = SessionId::new();
+        let exposure_request_id = RequestId::new();
+        let action_request_id = RequestId::new();
+        let exposure = exposure(session_id).with_request_id(exposure_request_id);
+        let action = action(session_id, Some("exp-1")).with_request_id(action_request_id);
+        let report = render_markdown_report(&timeline(vec![
+            bait_request(
+                session_id,
+                "GET",
+                "/docs/legacy-import",
+                RoutingDecision::ProtectedUpstream,
+            )
+            .with_request_id(exposure_request_id),
+            exposure,
+            bait_request(
+                session_id,
+                "POST",
+                "/api/v2/import/reconcile",
+                RoutingDecision::ProtectedUpstream,
+            )
+            .with_request_id(action_request_id),
+            action,
+        ]));
+
+        assert!(report.contains("the action was not held Eidolon-owned"));
+        assert!(!report.contains("no prior matching exposure"));
+    }
+
+    #[test]
+    fn report_does_not_confirm_exact_ids_with_mismatched_classes() {
+        let session_id = SessionId::new();
+        let exposure = Event::new(
+            session_id,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: BaitId("shared-id".to_string()),
+                bait_class: Some(BaitClass::Docs),
+                exposure_id: ExposureId("shared-exposure".to_string()),
+                surface: "/docs/legacy-import".to_string(),
+                header_value_mint: None,
+            },
+        );
+        let action = Event::new(
+            session_id,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: BaitId("shared-id".to_string()),
+                bait_class: Some(BaitClass::HiddenRoute),
+                exposure_id: Some(ExposureId("shared-exposure".to_string())),
+                method: "POST".to_string(),
+                path: "/api/v2/import/reconcile".to_string(),
+                header_value_mint: None,
+                header_value_mint_status: None,
+            },
+        );
+
+        let report = render_markdown_report(&timeline(vec![exposure, action]));
+
+        assert!(report.contains("Confidence: `medium`"));
+        assert!(report.contains("- No confirmed bait exposure to action chain."));
+        assert!(report.contains("exposed bait `shared-id` (class `docs`)"));
+        assert!(report.contains("for bait `shared-id` (class `hidden_route`)"));
         assert!(!report.contains("confirmed match"));
     }
 
@@ -1399,11 +1646,26 @@ mod tests {
     #[test]
     fn report_contains_score_bait_chain_policy_and_safety_note() {
         let session_id = SessionId::new();
+        let exposure_request_id = RequestId::new();
+        let action_request_id = RequestId::new();
         let timeline = timeline(vec![
-            request(session_id),
-            exposure(session_id),
-            action(session_id, Some("exp-1")),
-            policy(session_id),
+            bait_request(
+                session_id,
+                "GET",
+                "/docs/legacy-import",
+                RoutingDecision::ProtectedUpstream,
+            )
+            .with_request_id(exposure_request_id),
+            exposure(session_id).with_request_id(exposure_request_id),
+            bait_request(
+                session_id,
+                "POST",
+                "/api/v2/import/reconcile",
+                RoutingDecision::EidolonOwned,
+            )
+            .with_request_id(action_request_id),
+            action(session_id, Some("exp-1")).with_request_id(action_request_id),
+            policy(session_id).with_request_id(action_request_id),
         ]);
 
         let report = render_markdown_report(&timeline);
@@ -1434,9 +1696,25 @@ mod tests {
     #[test]
     fn replay_labels_only_exactly_matched_bait_actions_as_confirmed() {
         let session_id = SessionId::new();
+        let exposure_request_id = RequestId::new();
+        let action_request_id = RequestId::new();
         let timeline = timeline(vec![
-            exposure(session_id),
-            action(session_id, Some("exp-1")),
+            bait_request(
+                session_id,
+                "GET",
+                "/docs/legacy-import",
+                RoutingDecision::ProtectedUpstream,
+            )
+            .with_request_id(exposure_request_id),
+            exposure(session_id).with_request_id(exposure_request_id),
+            bait_request(
+                session_id,
+                "POST",
+                "/api/v2/import/reconcile",
+                RoutingDecision::EidolonOwned,
+            )
+            .with_request_id(action_request_id),
+            action(session_id, Some("exp-1")).with_request_id(action_request_id),
             action(session_id, None),
         ]);
 
@@ -1451,9 +1729,34 @@ mod tests {
     #[test]
     fn report_contains_metric_summary_for_controlled_reality() {
         let session_id = SessionId::new();
+        let exposure_request_id = RequestId::new();
+        let action_request_id = RequestId::new();
         let timeline = timeline(vec![
-            at(exposure(session_id), 0),
-            at(action(session_id, Some("exp-1")), 3),
+            at(
+                bait_request(
+                    session_id,
+                    "GET",
+                    "/docs/legacy-import",
+                    RoutingDecision::ProtectedUpstream,
+                )
+                .with_request_id(exposure_request_id),
+                -1,
+            ),
+            at(exposure(session_id).with_request_id(exposure_request_id), 0),
+            at(
+                bait_request(
+                    session_id,
+                    "POST",
+                    "/api/v2/import/reconcile",
+                    RoutingDecision::EidolonOwned,
+                )
+                .with_request_id(action_request_id),
+                2,
+            ),
+            at(
+                action(session_id, Some("exp-1")).with_request_id(action_request_id),
+                3,
+            ),
             at(controlled_reality_entered(session_id), 10),
             at(
                 routed_request(
@@ -1544,6 +1847,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitExposed {
                     bait_id: BaitId("rel_2025_04_b7f2".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: ExposureId("exp-1".to_string()),
                     surface: "/docs/legacy-import?download_token=surface-secret".to_string(),
                     header_value_mint: None,
@@ -1572,6 +1876,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitActionObserved {
                     bait_id: BaitId("rel_2025_04_b7f2".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: Some(ExposureId("exp-1".to_string())),
                     method: "POST".to_string(),
                     path: "/api/v2/import/reconcile?api_key=action-secret".to_string(),
@@ -1799,7 +2104,9 @@ mod tests {
     #[test]
     fn edge_decision_export_preserves_trusted_soften_history_after_containment() {
         let session_id = SessionId::new();
-        let rid = RequestId::new();
+        let docs_rid = RequestId::new();
+        let openapi_rid = RequestId::new();
+        let action_rid = RequestId::new();
         let timeline = timeline(vec![
             Event::new(
                 session_id,
@@ -1842,7 +2149,7 @@ mod tests {
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             )
-            .with_request_id(rid),
+            .with_request_id(docs_rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -1885,7 +2192,7 @@ mod tests {
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             )
-            .with_request_id(rid),
+            .with_request_id(openapi_rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -1897,7 +2204,7 @@ mod tests {
                         .to_string(),
                 },
             )
-            .with_request_id(rid),
+            .with_request_id(openapi_rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -1921,7 +2228,7 @@ mod tests {
                     routing_decision: RoutingDecision::EidolonOwned,
                 },
             )
-            .with_request_id(rid),
+            .with_request_id(action_rid),
             Event::new(
                 session_id,
                 EventSource::PolicyRouter,
@@ -1933,7 +2240,7 @@ mod tests {
                         .to_string(),
                 },
             )
-            .with_request_id(rid),
+            .with_request_id(action_rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -1943,7 +2250,7 @@ mod tests {
                     routing_decision: RoutingDecision::ControlledReality,
                 },
             )
-            .with_request_id(rid),
+            .with_request_id(action_rid),
         ]);
 
         let export = must_some(
@@ -2124,7 +2431,8 @@ mod tests {
     #[test]
     fn edge_decision_export_includes_deduped_bait_header_value_mint_audits() {
         let session_id = SessionId::new();
-        let rid = RequestId::new();
+        let surface_request_id = RequestId::new();
+        let action_request_id = RequestId::new();
         let mint = BaitHeaderValueMintAudit {
             header_name: "X-Minted-Trace".to_string(),
             kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
@@ -2148,19 +2456,20 @@ mod tests {
                     routing_decision: RoutingDecision::ProtectedUpstream,
                 },
             )
-            .with_request_id(rid),
+            .with_request_id(surface_request_id),
             Event::new(
                 session_id,
                 EventSource::SurfaceController,
                 PolicyState::Observe,
                 EventKind::BaitExposed {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: ExposureId("exp-minted".to_string()),
                     surface: "/docs/minted-trace".to_string(),
                     header_value_mint: Some(mint.clone()),
                 },
             )
-            .with_request_id(rid),
+            .with_request_id(surface_request_id),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2175,16 +2484,17 @@ mod tests {
                     trusted_ingress_soften_match: None,
                     ingress_signals: Default::default(),
                     discovery_recon_score: Default::default(),
-                    routing_decision: RoutingDecision::ControlledReality,
+                    routing_decision: RoutingDecision::EidolonOwned,
                 },
             )
-            .with_request_id(rid),
+            .with_request_id(action_request_id),
             Event::new(
                 session_id,
                 EventSource::BaitEngine,
                 PolicyState::Observe,
                 EventKind::BaitActionObserved {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: Some(ExposureId("exp-minted".to_string())),
                     method: "POST".to_string(),
                     path: "/api/v2/import/reconcile".to_string(),
@@ -2192,8 +2502,8 @@ mod tests {
                     header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
                 },
             )
-            .with_request_id(rid),
-            policy(session_id).with_request_id(rid),
+            .with_request_id(action_request_id),
+            policy(session_id).with_request_id(action_request_id),
         ]);
 
         let export = must_some(
@@ -2201,10 +2511,16 @@ mod tests {
             "edge decision export should exist",
         );
 
+        assert_eq!(export.request.request_id, Some(action_request_id));
+        assert_eq!(export.evidence.request_linkage, EdgeRequestLinkage::Linked);
         assert_eq!(export.evidence.bait_header_value_mints.len(), 1);
         assert_eq!(
             export.evidence.bait_header_value_mints[0].bait_id,
             BaitId("minted_trace".to_string())
+        );
+        assert_eq!(
+            export.evidence.bait_header_value_mints[0].bait_class,
+            Some(BaitClass::Docs)
         );
         assert_eq!(
             export.evidence.bait_header_value_mints[0].header_name,
@@ -2215,6 +2531,7 @@ mod tests {
             export.evidence.latest_bait_header_value_mint,
             Some(EdgeObservedBaitHeaderValueMint {
                 bait_id: BaitId("minted_trace".to_string()),
+                bait_class: Some(BaitClass::Docs),
                 header_name: "X-Minted-Trace".to_string(),
                 kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
                 prefix: "minted".to_string(),
@@ -2322,6 +2639,80 @@ mod tests {
     }
 
     #[test]
+    fn edge_decision_export_rebuilds_an_untrusted_supplied_bundle() {
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let timeline = timeline(vec![
+            request(session_id).with_request_id(request_id),
+            policy(session_id).with_request_id(request_id),
+        ]);
+        let mut supplied_bundle = evidence_bundle_for_timeline(&timeline);
+        supplied_bundle.session_id = SessionId::new();
+        supplied_bundle.policy_state = Some(PolicyState::Blocked);
+        supplied_bundle.policy_events[0].policy_state = PolicyState::Blocked;
+        supplied_bundle.policy_events[0].routing_decision =
+            Some(RoutingDecision::ProtectedUpstream);
+        supplied_bundle.policy_events[0].reason = Some("forged bundle reason".to_string());
+
+        let export = must_some(
+            edge_decision_export_for_evidence(&timeline, &supplied_bundle),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(export.session_id, session_id);
+        assert_eq!(export.policy.state, PolicyState::Observe);
+        assert_eq!(
+            export.policy.routing_decision,
+            RoutingDecision::EidolonOwned
+        );
+        assert_eq!(export.policy.reason, "bait-derived action intercepted");
+    }
+
+    #[test]
+    fn edge_decision_export_rejects_duplicate_latest_request_id() {
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let timeline = timeline(vec![
+            request(session_id).with_request_id(request_id),
+            request(session_id).with_request_id(request_id),
+        ]);
+
+        assert_eq!(edge_decision_export_for_timeline(&timeline), None);
+    }
+
+    #[test]
+    fn edge_decision_export_ignores_events_before_the_linked_request() {
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::PolicyRouter,
+                PolicyState::RateLimited,
+                EventKind::PolicyDecision {
+                    routing_decision: RoutingDecision::RateLimited,
+                    reason: "stale pre-request rate limit".to_string(),
+                },
+            )
+            .with_request_id(request_id),
+            request(session_id).with_request_id(request_id),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(export.policy.state, PolicyState::Observe);
+        assert_eq!(
+            export.policy.routing_decision,
+            RoutingDecision::EidolonOwned
+        );
+        assert_eq!(export.policy.reason, "latest request routing decision");
+        assert_eq!(export.evidence.event_ids, vec![timeline.events[1].event.id]);
+    }
+
+    #[test]
     fn edge_decision_export_marks_legacy_unlinked_sessions_unknown() {
         let session_id = SessionId::new();
         let mint = BaitHeaderValueMintAudit {
@@ -2353,6 +2744,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitExposed {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: ExposureId("exp-minted".to_string()),
                     surface: "/docs/minted-trace".to_string(),
                     header_value_mint: Some(mint.clone()),
@@ -2364,6 +2756,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitActionObserved {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: Some(ExposureId("exp-minted".to_string())),
                     method: "POST".to_string(),
                     path: "/api/v2/import/reconcile".to_string(),
@@ -2437,26 +2830,13 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitExposed {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: ExposureId("exp-minted".to_string()),
                     surface: "/docs/minted-trace".to_string(),
                     header_value_mint: Some(mint.clone()),
                 },
             )
             .with_request_id(surface_rid),
-            Event::new(
-                session_id,
-                EventSource::BaitEngine,
-                PolicyState::Observe,
-                EventKind::BaitActionObserved {
-                    bait_id: BaitId("minted_trace".to_string()),
-                    exposure_id: None,
-                    method: "POST".to_string(),
-                    path: "/api/v2/import/reconcile".to_string(),
-                    header_value_mint: Some(mint),
-                    header_value_mint_status: Some(BaitHeaderValueMintStatus::SessionValueMismatch),
-                },
-            )
-            .with_request_id(rid),
             Event::new(
                 session_id,
                 EventSource::Proxy,
@@ -2475,6 +2855,21 @@ mod tests {
                 },
             )
             .with_request_id(rid),
+            Event::new(
+                session_id,
+                EventSource::BaitEngine,
+                PolicyState::Observe,
+                EventKind::BaitActionObserved {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
+                    exposure_id: None,
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    header_value_mint: Some(mint),
+                    header_value_mint_status: Some(BaitHeaderValueMintStatus::SessionValueMismatch),
+                },
+            )
+            .with_request_id(rid),
         ]);
 
         let export = must_some(
@@ -2490,6 +2885,7 @@ mod tests {
             export.evidence.latest_bait_header_value_mint,
             Some(EdgeObservedBaitHeaderValueMint {
                 bait_id: BaitId("minted_trace".to_string()),
+                bait_class: Some(BaitClass::Docs),
                 header_name: "X-Minted-Trace".to_string(),
                 kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
                 prefix: "minted".to_string(),
@@ -2497,6 +2893,49 @@ mod tests {
             })
         );
         assert_eq!(export.evidence.event_ids.len(), 2);
+    }
+
+    #[test]
+    fn edge_decision_export_does_not_backfill_pre_request_bait_action() {
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let mint = BaitHeaderValueMintAudit {
+            header_name: "X-Minted-Trace".to_string(),
+            kind: eidolon_core::HeaderValueMintKind::SessionHmacSha256V1,
+            prefix: "minted".to_string(),
+        };
+        let timeline = timeline(vec![
+            Event::new(
+                session_id,
+                EventSource::BaitEngine,
+                PolicyState::Observe,
+                EventKind::BaitActionObserved {
+                    bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
+                    exposure_id: None,
+                    method: "POST".to_string(),
+                    path: "/api/v2/import/reconcile".to_string(),
+                    header_value_mint: Some(mint),
+                    header_value_mint_status: Some(BaitHeaderValueMintStatus::SessionValueMismatch),
+                },
+            )
+            .with_request_id(request_id),
+            bait_request(
+                session_id,
+                "POST",
+                "/api/v2/import/reconcile",
+                RoutingDecision::EidolonOwned,
+            )
+            .with_request_id(request_id),
+        ]);
+
+        let export = must_some(
+            edge_decision_export_for_timeline(&timeline),
+            "edge decision export should exist",
+        );
+
+        assert_eq!(export.evidence.latest_bait_header_value_mint, None);
+        assert_eq!(export.evidence.event_ids, vec![timeline.events[1].event.id]);
     }
 
     #[test]
@@ -2536,6 +2975,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitActionObserved {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: Some(ExposureId("exp-minted".to_string())),
                     method: "POST".to_string(),
                     path: "/api/v2/import/reconcile".to_string(),
@@ -2552,6 +2992,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitExposed {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: ExposureId("exp-minted".to_string()),
                     surface: "/docs/minted-trace".to_string(),
                     header_value_mint: Some(mint.clone()),
@@ -2635,6 +3076,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitExposed {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: ExposureId("exp-minted".to_string()),
                     surface: "/docs/minted-trace".to_string(),
                     header_value_mint: Some(mint.clone()),
@@ -2647,6 +3089,7 @@ mod tests {
                 PolicyState::Observe,
                 EventKind::BaitActionObserved {
                     bait_id: BaitId("minted_trace".to_string()),
+                    bait_class: Some(BaitClass::Docs),
                     exposure_id: None,
                     method: "POST".to_string(),
                     path: "/api/v2/import/reconcile".to_string(),
