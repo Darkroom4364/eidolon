@@ -5,6 +5,7 @@ KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
 KIND_BIN="${KIND_BIN:-kind}"
 DOCKER_BIN="${DOCKER_BIN:-docker}"
 EXPECTED_CONTEXT="${EIDOLON_SHIELD_KIND_CONTEXT:-kind-eidolon-shield}"
+EXPECTED_UPSTREAM_URL="${EIDOLON_SHIELD_KIND_EXPECTED_UPSTREAM_URL:-http://eidolon-owned-demo-target.shield-targets.svc.cluster.local:9101}"
 KIND_CLUSTER_NAME="${EIDOLON_SHIELD_KIND_CLUSTER_NAME:-eidolon-shield}"
 PROBE_IMAGE="${EIDOLON_SHIELD_KIND_PROBE_IMAGE:-busybox:1.37.0-musl}"
 PROBE_IMAGE_DIGEST="${EIDOLON_SHIELD_KIND_PROBE_IMAGE_DIGEST:-sha256:222ad6d973c0d198014546a65cd02c5fdedcc172123c5b4c2bf0af636550bd94}"
@@ -62,8 +63,6 @@ target_probe_count_in_file() {
       | fromjson?
       | select(
           .event == "protected_upstream_probe_observed"
-          and .method == "POST"
-          and .route == "api_v1_imports"
           and .probe_id == $probe_id
         )
     ]
@@ -71,35 +70,14 @@ target_probe_count_in_file() {
   ' "$file"
 }
 
-target_import_count_in_file() {
+target_write_count_in_file() {
   local file="$1"
 
   jq -R -s '
     [
       split("\n")[]
       | fromjson?
-      | select(
-          .event == "protected_upstream_probe_observed"
-          and .method == "POST"
-          and .route == "api_v1_imports"
-        )
-    ]
-    | length
-  ' "$file"
-}
-
-target_reconcile_count_in_file() {
-  local file="$1"
-
-  jq -R -s '
-    [
-      split("\n")[]
-      | fromjson?
-      | select(
-          .event == "protected_upstream_probe_observed"
-          and .method == "POST"
-          and .route == "api_v2_import_reconcile"
-        )
+      | select(.event == "protected_upstream_probe_observed")
     ]
     | length
   ' "$file"
@@ -110,9 +88,10 @@ validate_evidence() {
   local baseline_probe_id
   local escape_probe_id
   local baseline_probe_count
+  local baseline_status_count
   local escape_probe_count
-  local target_import_count
-  local target_reconcile_count
+  local target_replica_count
+  local target_write_count
   local action_link
   local escape_link
   local first_escape_request_id
@@ -121,6 +100,7 @@ validate_evidence() {
   for file in \
     probe-ids.meta \
     target-identity.meta \
+    renderer-identity.meta \
     baseline.log \
     escape.log \
     target-audit.log \
@@ -132,7 +112,10 @@ validate_evidence() {
 
   require_result "$dir/target-identity.meta" pod_uid_stable true
   require_result "$dir/target-identity.meta" restart_count_stable true
-  require_result "$dir/baseline.log" target_status 202
+  require_result "$dir/target-identity.meta" upstream_verified true
+  require_result "$dir/renderer-identity.meta" single_replica true
+  require_result "$dir/renderer-identity.meta" pod_uid_stable true
+  require_result "$dir/renderer-identity.meta" restart_count_stable true
   require_result "$dir/escape.log" entry_status 202
   require_result "$dir/escape.log" entry_write_committed false
   require_result "$dir/escape.log" first_escape_status 404
@@ -141,6 +124,11 @@ validate_evidence() {
 
   baseline_probe_id="$(result_value "$dir/probe-ids.meta" baseline_probe_id)"
   escape_probe_id="$(result_value "$dir/probe-ids.meta" escape_probe_id)"
+  target_replica_count="$(
+    result_value "$dir/probe-ids.meta" target_replica_count
+  )"
+  [[ "$target_replica_count" =~ ^[1-9][0-9]*$ ]] \
+    || fail "target replica count was missing or invalid"
   for probe_id in "$baseline_probe_id" "$escape_probe_id"; do
     [[ ${#probe_id} -le 64 \
       && "$probe_id" =~ ^shield-probe-[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
@@ -155,18 +143,18 @@ validate_evidence() {
   escape_probe_count="$(
     target_probe_count_in_file "$dir/target-audit.log" "$escape_probe_id"
   )"
-  target_import_count="$(target_import_count_in_file "$dir/target-audit.log")"
-  target_reconcile_count="$(
-    target_reconcile_count_in_file "$dir/target-audit.log"
+  target_write_count="$(target_write_count_in_file "$dir/target-audit.log")"
+  baseline_status_count="$(
+    grep -Fxc 'target_status=202' "$dir/baseline.log" || true
   )"
-  [[ "$baseline_probe_count" == "1" ]] \
-    || fail "direct protected-write baseline was not observed exactly once"
+  [[ "$baseline_status_count" == "$target_replica_count" ]] \
+    || fail "not every target replica returned the expected baseline status"
+  [[ "$baseline_probe_count" == "$target_replica_count" ]] \
+    || fail "not every target replica emitted the protected-write baseline"
   [[ "$escape_probe_count" == "0" ]] \
-    || fail "controlled-session escape reached the protected import route"
-  [[ "$target_import_count" == "1" ]] \
-    || fail "an unexpected protected import request reached the target"
-  [[ "$target_reconcile_count" == "0" ]] \
-    || fail "the controlled-reality entry action reached the protected target"
+    || fail "controlled-session escape reached a protected write route"
+  [[ "$target_write_count" == "$target_replica_count" ]] \
+    || fail "an unexpected write-shaped request reached the protected target"
 
   action_link="$(
     jq -c -e -s '
@@ -270,6 +258,7 @@ validate_evidence() {
     --arg session_id "$session_id" \
     --arg baseline_probe_id "$baseline_probe_id" \
     --arg escape_probe_id "$escape_probe_id" \
+    --argjson target_replica_count "$target_replica_count" \
     '{
       schema_version: 1,
       result: "passed",
@@ -285,8 +274,9 @@ validate_evidence() {
       },
       protected_upstream: {
         audit_detector_baselined: true,
+        replicas_audited: $target_replica_count,
         baseline_probe_id: $baseline_probe_id,
-        baseline_requests_observed: 1,
+        baseline_requests_observed: $target_replica_count,
         escape_probe_id: $escape_probe_id,
         escape_requests_observed: 0
       }
@@ -338,6 +328,7 @@ capture_target_audit() {
   local expected_uid
   local expected_restarts
   local first_line
+  local pod_ip
   local current_uid
   local current_restarts
   local current_pods
@@ -351,7 +342,9 @@ capture_target_audit() {
   )"
   [[ "$current_pods" == "$(<"$tmp_dir/target-pods.txt")" ]] \
     || fail "owned target pod set changed during the escape proof"
-  while IFS=$'\t' read -r pod expected_uid expected_restarts first_line; do
+  while IFS=$'\t' read -r \
+    pod expected_uid expected_restarts first_line pod_ip
+  do
     [[ -n "$pod" ]] || continue
     current_uid="$(
       "$KUBECTL_BIN" -n shield-targets get pod "$pod" -o jsonpath='{.metadata.uid}'
@@ -372,31 +365,35 @@ capture_target_audit() {
 
 create_baseline_probe() {
   local node="$1"
-  local target_ip="$2"
+  local target_ips="$2"
   local probe_id="$3"
   local probe_script
 
   probe_script='
     set -eu
     body="{\"source\":\"escape-baseline\",\"mode\":\"synthetic\"}"
-    {
-      printf "POST /api/v1/imports HTTP/1.1\r\n"
-      printf "Host: eidolon-owned-demo-target\r\n"
-      printf "X-Shield-Lab-Probe: %s\r\n" "$PROBE_ID"
-      printf "Content-Type: application/json\r\n"
-      printf "Content-Length: %s\r\n" "${#body}"
-      printf "Connection: close\r\n\r\n"
-      printf "%s" "$body"
-    } | nc -n -w 5 "$TARGET_IP" 9101 > /tmp/response.raw
-    tr -d "\r" < /tmp/response.raw > /tmp/response
-    awk "NR == 1 { print \"target_status=\" \$2 }" /tmp/response
+    index=0
+    for target_ip in $TARGET_IPS; do
+      index=$((index + 1))
+      {
+        printf "POST /api/v1/imports HTTP/1.1\r\n"
+        printf "Host: eidolon-owned-demo-target\r\n"
+        printf "X-Shield-Lab-Probe: %s\r\n" "$PROBE_ID"
+        printf "Content-Type: application/json\r\n"
+        printf "Content-Length: %s\r\n" "${#body}"
+        printf "Connection: close\r\n\r\n"
+        printf "%s" "$body"
+      } | nc -n -w 5 "$target_ip" 9101 > "/tmp/response-${index}.raw"
+      tr -d "\r" < "/tmp/response-${index}.raw" > "/tmp/response-${index}"
+      awk "NR == 1 { print \"target_status=\" \$2 }" "/tmp/response-${index}"
+    done
   '
 
   jq -n \
     --arg name "$baseline_pod" \
     --arg node "$node" \
     --arg image "$PROBE_IMAGE" \
-    --arg target_ip "$target_ip" \
+    --arg target_ips "$target_ips" \
     --arg probe_id "$probe_id" \
     --arg probe_script "$probe_script" \
     '{
@@ -417,7 +414,7 @@ create_baseline_probe() {
           imagePullPolicy: "Never",
           command: ["sh", "-c", $probe_script],
           env: [
-            {name: "TARGET_IP", value: $target_ip},
+            {name: "TARGET_IPS", value: $target_ips},
             {name: "PROBE_ID", value: $probe_id}
           ]
         }]
@@ -541,7 +538,8 @@ fi
   || fail "quiet period must be a positive integer"
 
 for command_name in \
-  "$KUBECTL_BIN" "$KIND_BIN" "$DOCKER_BIN" jq grep sed seq date mktemp sort tail wc
+  "$KUBECTL_BIN" "$KIND_BIN" "$DOCKER_BIN" \
+  cut date grep jq mktemp sed seq sort tail tr wc
 do
   require_command "$command_name"
 done
@@ -573,24 +571,71 @@ baseline_pod="eidolon-escape-baseline-${suffix}"
 escape_pod="eidolon-escape-${suffix}"
 baseline_probe_id="shield-probe-baseline-${suffix}"
 escape_probe_id="shield-probe-escape-${suffix}"
-printf 'baseline_probe_id=%s\nescape_probe_id=%s\n' \
-  "$baseline_probe_id" "$escape_probe_id" >"$tmp_dir/probe-ids.meta"
 
-node="$(
-  "$KUBECTL_BIN" -n shield-controlled-reality get pod \
-    -l app.kubernetes.io/name=eidolon-controlled-reality \
-    -o jsonpath='{.items[0].spec.nodeName}'
+renderer_replicas="$(
+  "$KUBECTL_BIN" -n shield-controlled-reality get deployment \
+    eidolon-controlled-reality -o json \
+    | jq -r '
+        [
+          .spec.replicas,
+          .status.replicas,
+          .status.availableReplicas
+        ]
+        | @tsv
+      '
 )"
-target_ip="$(
-  "$KUBECTL_BIN" -n shield-targets get svc eidolon-owned-demo-target \
-    -o jsonpath='{.spec.clusterIP}'
+[[ "$renderer_replicas" == $'1\t1\t1' ]] \
+  || fail "escape proof requires one available renderer replica"
+"$KUBECTL_BIN" -n shield-controlled-reality get pods \
+  -l app.kubernetes.io/name=eidolon-controlled-reality \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+  | sort >"$tmp_dir/renderer-pods.txt"
+[[ "$(wc -l <"$tmp_dir/renderer-pods.txt" | tr -d ' ')" == "1" ]] \
+  || fail "escape proof requires exactly one renderer pod"
+renderer_pod="$(<"$tmp_dir/renderer-pods.txt")"
+node="$(
+  "$KUBECTL_BIN" -n shield-controlled-reality get pod "$renderer_pod" \
+    -o jsonpath='{.spec.nodeName}'
+)"
+renderer_uid="$(
+  "$KUBECTL_BIN" -n shield-controlled-reality get pod "$renderer_pod" \
+    -o jsonpath='{.metadata.uid}'
+)"
+renderer_restarts="$(
+  "$KUBECTL_BIN" -n shield-controlled-reality get pod "$renderer_pod" \
+    -o jsonpath='{.status.containerStatuses[0].restartCount}'
 )"
 proxy_ip="$(
   "$KUBECTL_BIN" -n shield-system get svc eidolon-shield-proxy \
     -o jsonpath='{.spec.clusterIP}'
 )"
-[[ -n "$node" && -n "$target_ip" && -n "$proxy_ip" ]] \
+[[ -n "$node" && -n "$renderer_uid" && -n "$renderer_restarts" \
+  && -n "$proxy_ip" ]] \
   || fail "could not resolve live kind probe inputs"
+
+"$KUBECTL_BIN" -n shield-system get deployment eidolon-shield-proxy -o json \
+  | jq -e '
+      .spec.template.spec.containers[]
+      | select(.name == "shield-proxy")
+      | .args as $args
+      | [
+          range(0; $args | length) as $index
+          | select($args[$index] == "--upstream")
+          | $args[$index + 1]
+        ] == ["$(EIDOLON_UPSTREAM_TARGET)"]
+        and any(.env[];
+          .name == "EIDOLON_UPSTREAM_TARGET"
+          and .valueFrom.configMapKeyRef.name == "eidolon-shield-proxy-config"
+          and .valueFrom.configMapKeyRef.key == "EIDOLON_UPSTREAM_TARGET"
+        )
+    ' >/dev/null \
+  || fail "proxy upstream argument is not sourced from the expected config"
+actual_upstream_url="$(
+  "$KUBECTL_BIN" -n shield-system get configmap eidolon-shield-proxy-config \
+    -o jsonpath='{.data.EIDOLON_UPSTREAM_TARGET}'
+)"
+[[ "$actual_upstream_url" == "$EXPECTED_UPSTREAM_URL" ]] \
+  || fail "proxy upstream config does not match the owned target Service"
 
 : >"$tmp_dir/target-snapshot.tsv"
 "$KUBECTL_BIN" -n shield-targets get pods \
@@ -610,21 +655,42 @@ while IFS= read -r pod; do
     "$KUBECTL_BIN" -n shield-targets logs "$pod" \
       --all-containers=true --tail=-1 | wc -l
   )"
-  printf '%s\t%s\t%s\t%s\n' "$pod" "$uid" "$restarts" "$((lines + 1))" \
+  pod_ip="$(
+    "$KUBECTL_BIN" -n shield-targets get pod "$pod" \
+      -o jsonpath='{.status.podIP}'
+  )"
+  [[ -n "$uid" && -n "$restarts" && -n "$pod_ip" ]] \
+    || fail "target pod snapshot was incomplete: $pod"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$pod" "$uid" "$restarts" "$((lines + 1))" "$pod_ip" \
     >>"$tmp_dir/target-snapshot.tsv"
 done <"$tmp_dir/target-pods.txt"
+target_replica_count="$(wc -l <"$tmp_dir/target-snapshot.tsv" | tr -d ' ')"
+target_ips="$(cut -f 5 "$tmp_dir/target-snapshot.tsv" | tr '\n' ' ')"
+target_pod_ips_sorted="$(cut -f 5 "$tmp_dir/target-snapshot.tsv" | sort)"
+target_endpoint_ips_sorted="$(
+  "$KUBECTL_BIN" -n shield-targets get endpointslice \
+    -l kubernetes.io/service-name=eidolon-owned-demo-target -o json \
+    | jq -r '.items[].endpoints[]?.addresses[]?' \
+    | sort
+)"
+[[ "$target_endpoint_ips_sorted" == "$target_pod_ips_sorted" ]] \
+  || fail "owned target Service endpoints do not match the audited target pods"
+printf 'baseline_probe_id=%s\nescape_probe_id=%s\ntarget_replica_count=%s\n' \
+  "$baseline_probe_id" "$escape_probe_id" "$target_replica_count" \
+  >"$tmp_dir/probe-ids.meta"
 events_before="$(
   "$KUBECTL_BIN" -n shield-system exec deploy/eidolon-shield-proxy -- \
     sh -c 'wc -l < /var/lib/eidolon/events.jsonl'
 )"
 events_first_line=$((events_before + 1))
 renderer_logs_before="$(
-  "$KUBECTL_BIN" -n shield-controlled-reality logs \
-    deployment/eidolon-controlled-reality | wc -l | tr -d ' '
+  "$KUBECTL_BIN" -n shield-controlled-reality logs "$renderer_pod" \
+    | wc -l | tr -d ' '
 )"
 renderer_first_line=$((renderer_logs_before + 1))
 
-create_baseline_probe "$node" "$target_ip" "$baseline_probe_id"
+create_baseline_probe "$node" "$target_ips" "$baseline_probe_id"
 wait_for_pod_completion shield-system "$baseline_pod"
 "$KUBECTL_BIN" -n shield-system logs "$baseline_pod" >"$tmp_dir/baseline.log"
 
@@ -634,10 +700,10 @@ for _ in $(seq 1 20); do
   baseline_count="$(
     target_probe_count_in_file "$tmp_dir/target-audit.log" "$baseline_probe_id"
   )"
-  [[ "$baseline_count" == "1" ]] && break
+  [[ "$baseline_count" == "$target_replica_count" ]] && break
   sleep 1
 done
-[[ "$baseline_count" == "1" ]] \
+[[ "$baseline_count" == "$target_replica_count" ]] \
   || fail "protected-write audit baseline was not observed"
 
 create_escape_probe "$node" "$proxy_ip" "$escape_probe_id"
@@ -649,13 +715,29 @@ capture_target_audit "$tmp_dir/target-audit.log"
 "$KUBECTL_BIN" -n shield-system exec deploy/eidolon-shield-proxy -- \
   tail -n "+${events_first_line}" /var/lib/eidolon/events.jsonl \
   >"$tmp_dir/proxy-events.jsonl"
-"$KUBECTL_BIN" -n shield-controlled-reality logs \
-  deployment/eidolon-controlled-reality \
+"$KUBECTL_BIN" -n shield-controlled-reality logs "$renderer_pod" \
   | tail -n "+${renderer_first_line}" \
   >"$tmp_dir/renderer.jsonl"
 
-printf 'pod_uid_stable=true\nrestart_count_stable=true\n' \
+"$KUBECTL_BIN" -n shield-controlled-reality get pods \
+  -l app.kubernetes.io/name=eidolon-controlled-reality \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' \
+  | sort >"$tmp_dir/renderer-pods-after.txt"
+[[ "$(<"$tmp_dir/renderer-pods-after.txt")" == "$(<"$tmp_dir/renderer-pods.txt")" ]] \
+  || fail "renderer pod set changed during the escape proof"
+[[ "$(
+  "$KUBECTL_BIN" -n shield-controlled-reality get pod "$renderer_pod" \
+    -o jsonpath='{.metadata.uid}'
+)" == "$renderer_uid" ]] || fail "renderer pod changed during the escape proof"
+[[ "$(
+  "$KUBECTL_BIN" -n shield-controlled-reality get pod "$renderer_pod" \
+    -o jsonpath='{.status.containerStatuses[0].restartCount}'
+)" == "$renderer_restarts" ]] || fail "renderer restarted during the escape proof"
+
+printf 'pod_uid_stable=true\nrestart_count_stable=true\nupstream_verified=true\n' \
   >"$tmp_dir/target-identity.meta"
+printf 'single_replica=true\npod_uid_stable=true\nrestart_count_stable=true\n' \
+  >"$tmp_dir/renderer-identity.meta"
 
 validate_evidence "$tmp_dir" >"$tmp_dir/validation.json"
 mkdir -p "$(dirname "$EVIDENCE_PATH")"

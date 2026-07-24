@@ -145,18 +145,23 @@ fn protected_upstream_probe_audit_event(request: &Request) -> Option<Value> {
     let route = match (request.method.as_str(), request.path.as_str()) {
         ("POST", "/api/v2/import/reconcile") => "api_v2_import_reconcile",
         ("POST", "/api/v1/imports") => "api_v1_imports",
+        (method, _) if is_write_method(method) => "other_write",
         _ => return None,
     };
 
     let mut event = serde_json::json!({
         "event": "protected_upstream_probe_observed",
-        "method": "POST",
+        "method": request.method.as_str(),
         "route": route,
     });
     if let Some(probe_id) = protected_upstream_probe_id(request) {
         event["probe_id"] = Value::String(probe_id.to_string());
     }
     Some(event)
+}
+
+fn is_write_method(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
 }
 
 fn protected_upstream_probe_id(request: &Request) -> Option<&str> {
@@ -886,15 +891,31 @@ mod tests {
     }
 
     #[test]
-    fn shield_lab_probe_audit_requires_the_exact_route() {
+    fn shield_lab_probe_audit_ignores_read_requests() {
         let valid_probe_id = "shield-probe-20260724-a1b2c3d4";
-        let wrong_method = Request::for_test("GET", "/api/v2/import/reconcile")
-            .with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id);
-        let wrong_path = Request::for_test("POST", "/api/v1/projects")
-            .with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id);
-
-        for request in [wrong_method, wrong_path] {
+        for path in [
+            "/api/v2/import/reconcile",
+            "/api/v1/imports",
+            "/api/v1/projects",
+        ] {
+            let request =
+                Request::for_test("GET", path).with_header(SHIELD_LAB_PROBE_HEADER, valid_probe_id);
             assert_eq!(protected_upstream_probe_audit_event(&request), None);
+        }
+    }
+
+    #[test]
+    fn shield_lab_probe_audits_other_write_shapes_without_logging_the_path() {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let request = Request::for_test(method, "/private/untrusted-path")
+                .with_header(SHIELD_LAB_PROBE_HEADER, "shield-probe-write-a1b2c3d4");
+            let event = protected_upstream_probe_audit_event(&request)
+                .expect("write-shaped request should be audited");
+
+            assert_eq!(event["method"], method);
+            assert_eq!(event["route"], "other_write");
+            assert_eq!(event["probe_id"], "shield-probe-write-a1b2c3d4");
+            assert!(event.get("path").is_none());
         }
     }
 

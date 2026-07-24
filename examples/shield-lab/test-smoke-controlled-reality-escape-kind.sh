@@ -14,12 +14,19 @@ write_valid_fixture() {
   cat >"$dir/probe-ids.meta" <<'META'
 baseline_probe_id=shield-probe-baseline-fixture
 escape_probe_id=shield-probe-escape-fixture
+target_replica_count=2
 META
   cat >"$dir/target-identity.meta" <<'META'
 pod_uid_stable=true
 restart_count_stable=true
+upstream_verified=true
 META
-  printf '%s\n' 'target_status=202' >"$dir/baseline.log"
+  cat >"$dir/renderer-identity.meta" <<'META'
+single_replica=true
+pod_uid_stable=true
+restart_count_stable=true
+META
+  printf '%s\n' 'target_status=202' 'target_status=202' >"$dir/baseline.log"
   cat >"$dir/escape.log" <<'LOG'
 entry_status=202
 entry_write_committed=false
@@ -29,6 +36,7 @@ second_escape_status=403
 LOG
   cat >"$dir/target-audit.log" <<'LOG'
 eidolon-demo-target listening on http://0.0.0.0:9101
+{"event":"protected_upstream_probe_observed","method":"POST","probe_id":"shield-probe-baseline-fixture","route":"api_v1_imports"}
 {"event":"protected_upstream_probe_observed","method":"POST","probe_id":"shield-probe-baseline-fixture","route":"api_v1_imports"}
 LOG
   cat >"$dir/proxy-events.jsonl" <<'JSONL'
@@ -63,11 +71,13 @@ write_valid_fixture "$valid"
   | jq -e '
       .result == "passed"
       and .escape.attempts == 2
+      and .protected_upstream.replicas_audited == 2
       and .protected_upstream.escape_requests_observed == 0
     ' >/dev/null
 
 for mutation in target_leak stripped_marker missing_baseline wrong_routing \
-  missing_escape duplicate_request restarted_target
+  missing_escape duplicate_request restarted_target renderer_restarted \
+  upstream_unverified
 do
   dir="$(new_fixture)"
   bad_dirs+=("$dir")
@@ -75,12 +85,12 @@ do
   case "$mutation" in
     target_leak)
       printf '%s\n' \
-        '{"event":"protected_upstream_probe_observed","method":"POST","probe_id":"shield-probe-escape-fixture","route":"api_v1_imports"}' \
+        '{"event":"protected_upstream_probe_observed","method":"PUT","probe_id":"shield-probe-escape-fixture","route":"other_write"}' \
         >>"$dir/target-audit.log"
       ;;
     stripped_marker)
       printf '%s\n' \
-        '{"event":"protected_upstream_probe_observed","method":"POST","route":"api_v1_imports"}' \
+        '{"event":"protected_upstream_probe_observed","method":"DELETE","route":"other_write"}' \
         >>"$dir/target-audit.log"
       ;;
     missing_baseline)
@@ -103,6 +113,16 @@ do
       ;;
     restarted_target)
       sed -i.bak 's/restart_count_stable=true/restart_count_stable=false/' \
+        "$dir/target-identity.meta"
+      rm "$dir/target-identity.meta.bak"
+      ;;
+    renderer_restarted)
+      sed -i.bak 's/restart_count_stable=true/restart_count_stable=false/' \
+        "$dir/renderer-identity.meta"
+      rm "$dir/renderer-identity.meta.bak"
+      ;;
+    upstream_unverified)
+      sed -i.bak 's/upstream_verified=true/upstream_verified=false/' \
         "$dir/target-identity.meta"
       rm "$dir/target-identity.meta.bak"
       ;;

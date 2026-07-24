@@ -251,7 +251,7 @@ examples/shield-lab/smoke-controlled-reality-outage-kind.sh
 ```
 
 Prove repeated POST requests outside the controlled branch stay synthetic,
-become blocked, and send zero writes to either owned-target replica:
+become blocked, and send zero writes to every active owned-target replica:
 
 ```sh
 examples/shield-lab/smoke-controlled-reality-escape-kind.sh
