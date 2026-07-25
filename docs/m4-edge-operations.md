@@ -98,8 +98,10 @@ Important trust boundary:
   proxy is configured with the shared transport-auth secret
 - the Cloudflare Worker or Transform Rules adapter is the intended trusted edge
   boundary for explicit ingress identity
-- the OrbStack overlay now mounts a cluster-local transport-auth secret so the
-  accepted trusted-ingress path can be smoke-tested live on the deployment too
+- the OrbStack and kind deployments mount a cluster-local trusted-ingress
+  Secret containing separate `transport-auth.txt` and `continuity-key.txt`
+  files; the proxy receives the latter through
+  `--ingress-continuity-key-file`
 
 Session identity on this deployment:
 
@@ -118,11 +120,25 @@ Session identity on this deployment:
   identities and Lab peer keys are never written there; the sidecar is
   HMAC-authenticated and admits at most 64 new durable mappings per rolling
   60-second window
+- a newly created trusted-ingress Secret initializes `continuity-key.txt` with
+  the same bytes as `transport-auth.txt`, preserving compatibility with state
+  created before the keys were separated
+- when an existing Secret lacks `continuity-key.txt`, the deployment scripts
+  add it from the existing base64 transport value without changing
+  `transport-auth.txt`; an existing continuity key is never overwritten
+- `continuity-key.txt` is backup-critical state and must be backed up and
+  restored with the PVC; losing or replacing it makes persisted continuity
+  records unverifiable
+- the compatibility bootstrap means rotating transport auth does not remediate
+  compromise of the old key bytes now retained as the continuity key
 - if that sidecar is missing while prior state exists, unknown authenticated
   identities fail closed for a bounded migration quarantine; corrupt or
-  transport-key-mismatched sidecar state prevents startup
-- live transport-key rotation remains tracked by issue `#254`; old-key state
-  is never trusted merely because its unverified timestamps appear expired
+  continuity-key-mismatched sidecar state prevents startup
+- planned `Recreate` transport-auth rotation preserves continuity when
+  `continuity-key.txt` stays fixed; overlap-window automation,
+  continuity-key rotation, and live lifecycle proof remain tracked by issue
+  `#254`; old-key state is never trusted merely because its unverified
+  timestamps appear expired
 - for restart-stable cookies, mount a JSON key ring (same
   secret pattern as the transport-auth secret) and pass
   `--session-signing-key-file`; rotate by adding the new version as active and

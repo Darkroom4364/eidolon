@@ -54,6 +54,8 @@ spec:
             - $(EIDOLON_POLICY_STATE_PATH)
             - --ingress-transport-auth-secret-file
             - /var/run/secrets/eidolon-trusted-ingress/transport-auth.txt
+            - --ingress-continuity-key-file
+            - /var/run/secrets/eidolon-trusted-ingress/continuity-key.txt
             - --ingress-trust-config
             - /etc/eidolon-ingress-trust/ingress-trust.json
           ports:
@@ -131,6 +133,11 @@ spec:
         - name: eidolon-trusted-ingress
           secret:
             secretName: eidolon-trusted-ingress
+            items:
+              - key: transport-auth.txt
+                path: transport-auth.txt
+              - key: continuity-key.txt
+                path: continuity-key.txt
         - name: eidolon-ingress-trust
           configMap:
             name: eidolon-shield-ingress-trust-config

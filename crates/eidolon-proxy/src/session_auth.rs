@@ -78,7 +78,7 @@ const MAC_HEX_CHARS: usize = 64;
 const SESSION_KEY_BYTES: usize = 32;
 const CONTINUITY_HASH_DOMAIN_INGRESS: &[u8] = b"eidolon-continuity:trusted-ingress:v1\0";
 const CONTINUITY_HASH_DOMAIN_LAB_PEER: &[u8] = b"eidolon-continuity:lab-peer:v1\0";
-const CONTINUITY_TRANSPORT_KEY_ID_DOMAIN: &[u8] = b"eidolon-continuity:transport-key-id:v1\0";
+const CONTINUITY_STATE_KEY_ID_DOMAIN: &[u8] = b"eidolon-continuity:transport-key-id:v1\0";
 
 /// Authenticated source used to derive a minimized continuity key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -100,7 +100,7 @@ impl ContinuitySource {
 
 /// Domain-separated minimized key used for bounded continuity storage.
 ///
-/// Trusted-ingress identities use HMAC-SHA256 under the transport secret.
+/// Trusted-ingress identities use HMAC-SHA256 under the continuity key.
 /// Raw ingress identities and peer addresses never enter the continuity map.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContinuityKey {
@@ -109,9 +109,9 @@ pub struct ContinuityKey {
 }
 
 impl ContinuityKey {
-    pub(crate) fn authenticated_ingress(raw: &str, transport_secret: &str) -> Self {
-        let mut mac = <SessionMac as Mac>::new_from_slice(transport_secret.as_bytes())
-            .expect("HMAC-SHA256 accepts any transport secret length");
+    pub(crate) fn authenticated_ingress(raw: &str, continuity_key: &str) -> Self {
+        let mut mac = <SessionMac as Mac>::new_from_slice(continuity_key.as_bytes())
+            .expect("HMAC-SHA256 accepts any continuity key length");
         mac.update(CONTINUITY_HASH_DOMAIN_INGRESS);
         mac.update(raw.as_bytes());
         Self {
@@ -368,7 +368,7 @@ pub struct SessionAuthority {
     continuity: HashMap<ContinuityKey, ContinuityRecord>,
     continuity_order: VecDeque<ContinuityKey>,
     continuity_state_path: Option<PathBuf>,
-    continuity_transport_key_id_hex: Option<String>,
+    continuity_state_key_id_hex: Option<String>,
     continuity_integrity_key: Option<IntegrityKey>,
     continuity_migration_quarantine_until: Option<u64>,
     continuity_last_checkpoint_at: u64,
@@ -415,7 +415,7 @@ impl SessionAuthority {
             continuity: HashMap::new(),
             continuity_order: VecDeque::new(),
             continuity_state_path: None,
-            continuity_transport_key_id_hex: None,
+            continuity_state_key_id_hex: None,
             continuity_integrity_key: None,
             continuity_migration_quarantine_until: None,
             continuity_last_checkpoint_at: 0,
@@ -498,7 +498,7 @@ impl SessionAuthority {
     pub fn enable_durable_continuity(
         &mut self,
         path: &Path,
-        transport_secret: &str,
+        continuity_key: &str,
         history_exists: bool,
         now: u64,
     ) -> io::Result<DurableContinuityStartup> {
@@ -511,16 +511,16 @@ impl SessionAuthority {
                 "durable continuity must be enabled before continuity records exist",
             ));
         }
-        let transport_secret = transport_secret.trim();
-        if transport_secret.is_empty() {
+        let continuity_key = continuity_key.trim();
+        if continuity_key.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "durable continuity requires a non-empty transport secret",
+                "durable continuity requires a non-empty continuity key",
             ));
         }
 
-        let expected_key_id = continuity_transport_key_id_hex(transport_secret);
-        let integrity_key = IntegrityKey::derive(transport_secret)?;
+        let expected_key_id = continuity_state_key_id_hex(continuity_key);
+        let integrity_key = IntegrityKey::derive(continuity_key)?;
         let loaded = session_continuity_store::load_state(path, &integrity_key, &expected_key_id)?;
         let mut ttl_evicted_record_count = 0;
         let mut restored_record_count = 0;
@@ -582,7 +582,7 @@ impl SessionAuthority {
         }
 
         self.continuity_state_path = Some(path.to_path_buf());
-        self.continuity_transport_key_id_hex = Some(expected_key_id);
+        self.continuity_state_key_id_hex = Some(expected_key_id);
         self.continuity_integrity_key = Some(integrity_key);
         self.continuity_migration_quarantine_until = migration_quarantine_until;
         self.continuity_last_checkpoint_at = now;
@@ -1405,12 +1405,10 @@ impl SessionAuthority {
     }
 
     fn stored_continuity_state(&self) -> io::Result<StoredContinuityState> {
-        let transport_key_id_hex =
-            self.continuity_transport_key_id_hex
-                .clone()
-                .ok_or_else(|| {
-                    invalid_data("durable continuity transport key identifier is missing")
-                })?;
+        let transport_key_id_hex = self
+            .continuity_state_key_id_hex
+            .clone()
+            .ok_or_else(|| invalid_data("durable continuity state key identifier is missing"))?;
         let mut records = Vec::new();
         for key in &self.continuity_order {
             if key.source() != ContinuitySource::AuthenticatedIngress {
@@ -1531,10 +1529,10 @@ pub fn enforcement_rank(state: PolicyState) -> u8 {
     }
 }
 
-fn continuity_transport_key_id_hex(transport_secret: &str) -> String {
-    let mut mac = <SessionMac as Mac>::new_from_slice(transport_secret.as_bytes())
-        .expect("HMAC-SHA256 accepts any transport secret length");
-    mac.update(CONTINUITY_TRANSPORT_KEY_ID_DOMAIN);
+fn continuity_state_key_id_hex(continuity_key: &str) -> String {
+    let mut mac = <SessionMac as Mac>::new_from_slice(continuity_key.as_bytes())
+        .expect("HMAC-SHA256 accepts any continuity key length");
+    mac.update(CONTINUITY_STATE_KEY_ID_DOMAIN);
     encode_hex(&mac.finalize().into_bytes())
 }
 
@@ -2820,7 +2818,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_continuity_rejects_transport_secret_mismatch() {
+    fn durable_continuity_rejects_continuity_key_mismatch() {
         let dir = TestDir::new();
         let state_path = dir.path("continuity.json");
         let mut authority = test_authority();
@@ -2836,7 +2834,7 @@ mod tests {
         let mut mismatched = test_authority();
         let error = mismatched
             .enable_durable_continuity(&state_path, "rotated-edge-secret", true, NOW + 2)
-            .expect_err("active continuity cannot silently change transport keys");
+            .expect_err("active continuity cannot silently change continuity keys");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("does not match"));
     }

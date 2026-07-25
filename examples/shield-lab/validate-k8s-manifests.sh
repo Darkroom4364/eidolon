@@ -19,7 +19,8 @@ Builds the shield-lab base and overlay kustomizations and performs a cluster-fre
 structural validation pass over the rendered YAML. This validates that each
 rendered document parses as Kubernetes-style YAML and includes apiVersion,
 kind, and metadata.name. It also enforces the proxy's single-writer deployment
-and PVC-backed policy-state invariants.
+and PVC-backed policy-state invariants, plus the trusted-ingress continuity-key
+mount required for restart-safe identity.
 USAGE
 }
 
@@ -105,6 +106,11 @@ validate_proxy_single_writer() {
     policy_flag = args.index("--policy-state")
     fail_with.call("must use EIDOLON_POLICY_STATE_PATH") unless
       policy_flag && args[policy_flag + 1] == "$(EIDOLON_POLICY_STATE_PATH)"
+    continuity_key_flag = args.index("--ingress-continuity-key-file")
+    fail_with.call("must use the mounted ingress continuity key") unless
+      continuity_key_flag &&
+      args[continuity_key_flag + 1] ==
+        "/var/run/secrets/eidolon-trusted-ingress/continuity-key.txt"
 
     env = container.fetch("env", [])
     policy_env = env.find { |item| item["name"] == "EIDOLON_POLICY_STATE_PATH" }
@@ -115,10 +121,29 @@ validate_proxy_single_writer() {
     state_mount = container.fetch("volumeMounts", []).find { |item| item["name"] == "eidolon-state" }
     fail_with.call("state volume must mount at /var/lib/eidolon") unless
       state_mount&.fetch("mountPath", nil) == "/var/lib/eidolon"
+    trusted_ingress_mount = container.fetch("volumeMounts", []).find do |item|
+      item["name"] == "eidolon-trusted-ingress"
+    end
+    fail_with.call("trusted-ingress Secret must use its read-only mount") unless
+      trusted_ingress_mount&.fetch("mountPath", nil) ==
+        "/var/run/secrets/eidolon-trusted-ingress" &&
+      trusted_ingress_mount&.fetch("readOnly", nil) == true
 
     state_volume = pod_spec.fetch("volumes", []).find { |item| item["name"] == "eidolon-state" }
     fail_with.call("state volume must use the supported PVC") unless
       state_volume&.dig("persistentVolumeClaim", "claimName") == "eidolon-shield-proxy-state"
+    trusted_ingress_volume = pod_spec.fetch("volumes", []).find do |item|
+      item["name"] == "eidolon-trusted-ingress"
+    end
+    fail_with.call("trusted-ingress volume must use the supported Secret") unless
+      trusted_ingress_volume&.dig("secret", "secretName") == "eidolon-trusted-ingress"
+    trusted_ingress_items = trusted_ingress_volume&.dig("secret", "items")
+    expected_trusted_ingress_items = [
+      { "key" => "transport-auth.txt", "path" => "transport-auth.txt" },
+      { "key" => "continuity-key.txt", "path" => "continuity-key.txt" }
+    ]
+    fail_with.call("trusted-ingress Secret must project transport and continuity keys") unless
+      trusted_ingress_items == expected_trusted_ingress_items
 
     config = find_doc.call("ConfigMap", "eidolon-shield-proxy-config", "shield-system")
     expected_state_paths = {
