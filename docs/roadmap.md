@@ -2,6 +2,10 @@
 
 This roadmap turns the Eidolon vision into GitHub milestones and issue-sized chunks.
 
+The M0-M5 milestones below record the research and prototype lineage. They are
+not the full-release gate. The governing production release track is
+[Eidolon v1.0 Full Release Definition](v1-release-definition.md).
+
 The intended order was revised after the 2026-05-03 landscape validation.
 
 The main change:
@@ -23,6 +27,24 @@ M3 Uniqueness Bakeoff
 M4 Edge/CDN Integration
 M5 Adaptive Bait Policy and Shield Hardening
 ```
+
+## v1.0 Full Release Track
+
+Full release means a supported production Eidolon Shield inside a bounded
+deployment envelope, not completion of every M5 or research feature.
+
+The release work is bundled into five streams:
+
+1. production Hyper/Tower HTTP boundary
+2. restart-safe identity, durable state, and replay correctness
+3. production Kubernetes isolation, upgrade, rollback, and recovery
+4. stable contracts, operator evidence, privacy, and observability
+5. reliability, supply-chain, and final release qualification
+
+New policy ladders, benchmark breadth, microVMs, behavior telemetry, broad
+controlled reality, and cryptographic export are post-v1 unless needed to fix
+a release invariant. Exact acceptance criteria and no-go conditions live in
+[v1-release-definition.md](v1-release-definition.md).
 
 ## North Star
 
@@ -185,11 +207,12 @@ Acceptance criteria:
 - Reality escape attempts and operator emergency-disable behavior are observable in the event log.
 - The M2.5 research note and checklist are explicitly Lab-only v1-candidate artifacts and make no public-v1 or production-ready claim.
 
-Isolation hardening remains tracked by `#176`. The first separate-process
-renderer foundation does not change the active in-process proxy path and does
-not close that issue. Cluster deployment waits for an enforcing CNI,
-elimination of the direct-target NodePort bypass, live negative egress proof,
-and fail-closed proxy integration.
+Issue `#176` moved response rendering across the separate authenticated
+process boundary and closed the local kind/Calico isolation slice. OrbStack
+remains an in-process behavioral harness with a direct-target NodePort; the
+pinned kind/Calico path proves remote rendering, default-deny isolation,
+negative egress, bounded capacity, and fail-closed proxy integration. A
+production-cluster proof and lifecycle hardening remain on the v1.0 track.
 
 ## M3 Uniqueness Bakeoff
 
@@ -235,6 +258,9 @@ Issues:
 
 ## M4 Edge/CDN Integration
 
+Status: historical integration milestone. Its remaining optional export work is
+post-v1 unless required by the full-release privacy or operator-evidence gates.
+
 Goal:
 
 Treat WAF/CDN/bot-defense vendors as deployment surfaces rather than pretending they do not exist.
@@ -272,6 +298,10 @@ Acceptance criteria:
   constraints are documented.
 
 ## M5 Adaptive Bait Policy And Shield Hardening
+
+Status: historical prototype milestone. Remaining adaptive-policy, benchmark,
+and adversarial-agent research is post-v1; it is not the production release
+gate.
 
 Goal:
 

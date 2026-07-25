@@ -1,5 +1,12 @@
 # Completed Project Vision
 
+Status: directional product vision
+
+The exact full-release contract is defined in
+[v1-release-definition.md](v1-release-definition.md). Where this historical
+vision uses "v1 candidate," "completed v1," or "v2," the release definition
+governs.
+
 ## Final Shape
 
 The completed project is:
@@ -165,38 +172,16 @@ Eidolon should force agents into a trilemma:
 
 That trilemma is the practical "Blackwall" effect.
 
-## Strong Completed V1
+## Release Contract
 
-A strong completed v1 includes:
+The historical Lab-oriented "completed v1" and later Shield-oriented "v2"
+split is retired. A full `v1.0` now means a supported Eidolon Shield release
+inside a narrow declared deployment envelope.
 
-- open-source Rust proxy
-- local demo target
-- pwnkit-style benchmark harness
-- one or more polymorphic bait chains
-- baseline comparison against no defense, static canary, static honeypot, and WAF-style block
-- trace engine
-- risk scoring
-- HTML/Markdown reports
-- clear safety model
+Lab remains the scientific validation layer. Benchmarks, more bait families,
+microVMs, behavior fingerprinting, and broad deception are optional research,
+not substitutes for production transport, durable state, isolation,
+operations, and security qualification.
 
-The project is credible at v1 when it can show:
-
-```text
-an autonomous pentesting agent interacts with a protected target,
-Eidolon infers its attack loop from black-box behavior,
-and the agent is contained without exposing real assets.
-```
-
-## Strong Completed V2
-
-A strong completed v2 includes:
-
-- deployable Shield mode
-- multiple bait families
-- OpenAPI/docs/repo/CI canaries
-- controlled-reality router
-- SIEM integrations
-- benchmark suite for autonomous pentesting agents
-- published research results
-
-At v2, Eidolon becomes active defense infrastructure for autonomous cyber agents.
+See [v1-release-definition.md](v1-release-definition.md) for the objective
+gates and hard no-go conditions.

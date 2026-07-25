@@ -228,6 +228,10 @@ Known v0.1 limits:
 For the recommended work order and review standards, see
 [docs/engineering-operating-policy.md](docs/engineering-operating-policy.md).
 
+For the exact meaning, supported envelope, objective gates, and no-go
+conditions of a full `v1.0` release, see
+[docs/v1-release-definition.md](docs/v1-release-definition.md).
+
 For the controlled-reality process boundary, verified Lab claims, and residual
 limitations, see
 [docs/controlled-reality-isolation.md](docs/controlled-reality-isolation.md).
