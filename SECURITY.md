@@ -4,13 +4,18 @@ Eidolon is a defensive active-defense project for owned or authorized web, API, 
 
 ## Supported Versions
 
-This project is pre-release. Security reports are accepted for the current `main` branch until versioned releases exist.
+Security reports are accepted for the latest `0.1.x` release and the current
+`main` branch. Older research snapshots are unsupported.
 
 ## Reporting A Vulnerability
 
-Use GitHub private vulnerability reporting for this repository when available.
+Use
+[GitHub private vulnerability reporting](https://github.com/Darkroom4364/eidolon/security/advisories/new).
 
-If private reporting is not available, open a public issue with only a minimal description and request a private disclosure channel. Do not include exploit details, secrets, live target data, or instructions that could enable abuse in a public issue.
+If private reporting is unavailable, open a public issue with only a minimal
+description and request a private disclosure channel. Do not include exploit
+details, secrets, live target data, or instructions that could enable abuse in
+a public issue.
 
 Reports should include:
 

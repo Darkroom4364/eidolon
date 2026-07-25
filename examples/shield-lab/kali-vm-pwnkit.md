@@ -16,7 +16,7 @@ Kali VM -> host.internal -> OrbStack NodePort -> Eidolon / direct target
 - run the scanner inside the Kali VM
 - run the shield and demo target in OrbStack Kubernetes on the macOS host
 - use the dedicated wrapper:
-  [run-pwnkit-kali-vm.sh](/Users/darkroom/Projects/eidolon/examples/shield-lab/run-pwnkit-kali-vm.sh)
+  [run-pwnkit-kali-vm.sh](run-pwnkit-kali-vm.sh)
 - keep artifacts outside the Eidolon repo
 - export cluster evidence from the host after the run
 

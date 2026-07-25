@@ -34,46 +34,46 @@ Runtime support:
 
 Relevant code:
 
-- [crates/eidolon-proxy/src/session.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-proxy/src/session.rs)
-- [crates/eidolon-proxy/src/ingress_identity.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-proxy/src/ingress_identity.rs)
-- [crates/eidolon-proxy/src/main.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-proxy/src/main.rs)
-- [examples/shield-lab/deploy-orbstack.sh](/Users/darkroom/Projects/eidolon/examples/shield-lab/deploy-orbstack.sh)
+- [crates/eidolon-proxy/src/session.rs](../crates/eidolon-proxy/src/session.rs)
+- [crates/eidolon-proxy/src/ingress_identity.rs](../crates/eidolon-proxy/src/ingress_identity.rs)
+- [crates/eidolon-proxy/src/main.rs](../crates/eidolon-proxy/src/main.rs)
+- [examples/shield-lab/deploy-orbstack.sh](../examples/shield-lab/deploy-orbstack.sh)
 
 ### Edge adapters
 
 Cloudflare examples:
 
 - Worker adapter:
-  [examples/edge/cloudflare/eidolon-ingress-worker.mjs](/Users/darkroom/Projects/eidolon/examples/edge/cloudflare/eidolon-ingress-worker.mjs)
+  [examples/edge/cloudflare/eidolon-ingress-worker.mjs](../examples/edge/cloudflare/eidolon-ingress-worker.mjs)
 - Request-header Transform Rules payload:
-  [examples/edge/cloudflare/eidolon-request-header-transform-rules.json](/Users/darkroom/Projects/eidolon/examples/edge/cloudflare/eidolon-request-header-transform-rules.json)
+  [examples/edge/cloudflare/eidolon-request-header-transform-rules.json](../examples/edge/cloudflare/eidolon-request-header-transform-rules.json)
 
 ### Outbound decisions
 
 Contract and export path:
 
 - edge export types:
-  [crates/eidolon-core/src/lib.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-core/src/lib.rs)
+  [crates/eidolon-core/src/lib.rs](../crates/eidolon-core/src/lib.rs)
 - trace builder:
-  [crates/eidolon-trace/src/report.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-trace/src/report.rs)
+  [crates/eidolon-trace/src/report.rs](../crates/eidolon-trace/src/report.rs)
 - file-based exporter:
-  [crates/eidolon-trace/src/bin/eidolon-edge-export.rs](/Users/darkroom/Projects/eidolon/crates/eidolon-trace/src/bin/eidolon-edge-export.rs)
+  [crates/eidolon-trace/src/bin/eidolon-edge-export.rs](../crates/eidolon-trace/src/bin/eidolon-edge-export.rs)
 - live OrbStack wrapper:
-  [examples/shield-lab/export-edge-decisions-orbstack.sh](/Users/darkroom/Projects/eidolon/examples/shield-lab/export-edge-decisions-orbstack.sh)
+  [examples/shield-lab/export-edge-decisions-orbstack.sh](../examples/shield-lab/export-edge-decisions-orbstack.sh)
 
 ### Deployment target
 
 OrbStack Kubernetes shield-lab:
 
 - [examples/shield-lab/README.md](../examples/shield-lab/README.md)
-- [examples/shield-lab/k8s/orbstack/kustomization.yaml](/Users/darkroom/Projects/eidolon/examples/shield-lab/k8s/orbstack/kustomization.yaml)
-- [examples/shield-lab/k8s/orbstack/shield-edge-service.yaml](/Users/darkroom/Projects/eidolon/examples/shield-lab/k8s/orbstack/shield-edge-service.yaml)
-- [examples/shield-lab/k8s/orbstack/target-edge-service.yaml](/Users/darkroom/Projects/eidolon/examples/shield-lab/k8s/orbstack/target-edge-service.yaml)
+- [examples/shield-lab/k8s/orbstack/kustomization.yaml](../examples/shield-lab/k8s/orbstack/kustomization.yaml)
+- [examples/shield-lab/k8s/orbstack/shield-edge-service.yaml](../examples/shield-lab/k8s/orbstack/shield-edge-service.yaml)
+- [examples/shield-lab/k8s/orbstack/target-edge-service.yaml](../examples/shield-lab/k8s/orbstack/target-edge-service.yaml)
 
 ### Kali validation path
 
 - Kali scanner wrapper against OrbStack NodePorts:
-  [examples/shield-lab/run-pwnkit-kali-vm.sh](/Users/darkroom/Projects/eidolon/examples/shield-lab/run-pwnkit-kali-vm.sh)
+  [examples/shield-lab/run-pwnkit-kali-vm.sh](../examples/shield-lab/run-pwnkit-kali-vm.sh)
 - Kali validation runbook:
   [examples/shield-lab/kali-vm-pwnkit.md](../examples/shield-lab/kali-vm-pwnkit.md)
 
