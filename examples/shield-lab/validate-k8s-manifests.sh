@@ -20,7 +20,7 @@ structural validation pass over the rendered YAML. This validates that each
 rendered document parses as Kubernetes-style YAML and includes apiVersion,
 kind, and metadata.name. It also enforces the proxy's single-writer deployment
 and PVC-backed policy-state invariants, plus the trusted-ingress continuity-key
-mount required for restart-safe identity.
+mount and persistent session-signing key required for restart-safe identity.
 USAGE
 }
 
@@ -101,6 +101,96 @@ validate_proxy_single_writer() {
     pod_spec = proxy.dig("spec", "template", "spec")
     container = pod_spec&.fetch("containers", [])&.find { |item| item["name"] == "shield-proxy" }
     fail_with.call("container is missing") unless container
+    fail_with.call("must disable service-account token mounting") unless
+      pod_spec&.fetch("automountServiceAccountToken", nil) == false
+    fail_with.call("must retain fsGroup 65532 for repeat state migration") unless
+      pod_spec&.dig("securityContext", "fsGroup") == 65_532
+
+    state_init_containers = pod_spec.fetch("initContainers", []).select do |item|
+      item["name"] == "normalize-eidolon-state"
+    end
+    state_init = state_init_containers.first
+    fail_with.call("state migration init container is missing or duplicated") unless
+      state_init_containers.length == 1
+    fail_with.call("state migration init container must use the proxy image") unless
+      state_init&.fetch("image", nil) == container["image"] &&
+      state_init&.fetch("imagePullPolicy", nil) == container["imagePullPolicy"]
+
+    expected_state_init_command = [
+      "state_dir=/var/lib/eidolon",
+      "if [ -L \"$state_dir\" ] || [ ! -d \"$state_dir\" ]; then",
+      "  echo \"refusing invalid Eidolon state directory: $state_dir\" >&2",
+      "  exit 1",
+      "fi",
+      "normalize_state_file() {",
+      "  if [ -L \"$1\" ]; then",
+      "    echo \"refusing symlinked Eidolon state path: $1\" >&2",
+      "    exit 1",
+      "  fi",
+      "  if [ -e \"$1\" ]; then",
+      "    [ -f \"$1\" ]",
+      "    chown 0:0 \"$1\"",
+      "    chmod 0600 \"$1\"",
+      "    chown 65532:65532 \"$1\"",
+      "  fi",
+      "}",
+      "for state_path in \\",
+      "  \"$state_dir/events.jsonl\" \\",
+      "  \"$state_dir/events.jsonl.exposures.json\" \\",
+      "  \"$state_dir/events.jsonl.exposures.json.tmp\" \\",
+      "  \"$state_dir/events.jsonl.consumed-proofs.json\" \\",
+      "  \"$state_dir/events.jsonl.consumed-proofs.json.tmp\" \\",
+      "  \"$state_dir/debug.jsonl\" \\",
+      "  \"$state_dir/policy-state.json\" \\",
+      "  \"$state_dir/policy-state.tmp\" \\",
+      "  \"$state_dir/policy-state.json.lock\" \\",
+      "  \"$state_dir/policy-state.json.continuity.json\" \\",
+      "  \"$state_dir/policy-state.json.continuity.json.tmp\" \\",
+      "  \"$state_dir/interventions.txt\"; do",
+      "  normalize_state_file \"$state_path\"",
+      "done",
+      "for archive_path in \"$state_dir\"/events.jsonl.* \"$state_dir\"/debug.jsonl.*; do",
+      "  archive_name=${archive_path##*/}",
+      "  archive_suffix=${archive_name#*.jsonl.}",
+      "  case \"$archive_suffix\" in",
+      "    \"\"|*[!0123456789]*)",
+      "      continue",
+      "      ;;",
+      "  esac",
+      "  normalize_state_file \"$archive_path\"",
+      "done",
+      "chown 0:0 \"$state_dir\"",
+      "chmod 0770 \"$state_dir\"",
+      "chown 65532:65532 \"$state_dir\""
+    ].join("\n") + "\n"
+    fail_with.call("state migration init container must use the exact bounded command") unless
+      state_init&.fetch("command", nil) == ["/bin/sh", "-ec"] &&
+      state_init&.fetch("args", nil) == [expected_state_init_command]
+
+    expected_state_init_security = {
+      "runAsNonRoot" => false,
+      "runAsUser" => 0,
+      "runAsGroup" => 0,
+      "allowPrivilegeEscalation" => false,
+      "readOnlyRootFilesystem" => true,
+      "capabilities" => {
+        "drop" => ["ALL"],
+        "add" => ["CHOWN"]
+      }
+    }
+    fail_with.call("state migration init container must use its exact root exception") unless
+      state_init&.fetch("securityContext", nil) == expected_state_init_security
+    expected_state_init_mounts = [
+      { "name" => "eidolon-state", "mountPath" => "/var/lib/eidolon" }
+    ]
+    fail_with.call("state migration init container must mount only eidolon-state") unless
+      state_init&.fetch("volumeMounts", nil) == expected_state_init_mounts &&
+      state_init&.fetch("volumeDevices", []) == []
+    fail_with.call("state migration init container must not receive environment data") unless
+      state_init&.fetch("env", []) == [] &&
+      state_init&.fetch("envFrom", []) == []
+    fail_with.call("state migration init container must exit before the proxy starts") if
+      state_init&.key?("restartPolicy")
 
     args = container.fetch("args", [])
     policy_flag = args.index("--policy-state")
@@ -111,6 +201,14 @@ validate_proxy_single_writer() {
       continuity_key_flag &&
       args[continuity_key_flag + 1] ==
         "/var/run/secrets/eidolon-trusted-ingress/continuity-key.txt"
+    session_signing_flags = args.each_index.select do |index|
+      args[index] == "--session-signing-key-file"
+    end
+    session_signing_flag = session_signing_flags.first
+    fail_with.call("must use exactly one mounted session-signing key") unless
+      session_signing_flags.length == 1 &&
+      args[session_signing_flag + 1] ==
+        "/var/run/secrets/eidolon-session-signing/key-ring.json"
 
     env = container.fetch("env", [])
     policy_env = env.find { |item| item["name"] == "EIDOLON_POLICY_STATE_PATH" }
@@ -128,6 +226,15 @@ validate_proxy_single_writer() {
       trusted_ingress_mount&.fetch("mountPath", nil) ==
         "/var/run/secrets/eidolon-trusted-ingress" &&
       trusted_ingress_mount&.fetch("readOnly", nil) == true
+    session_signing_mounts = container.fetch("volumeMounts", []).select do |item|
+      item["name"] == "eidolon-session-signing"
+    end
+    session_signing_mount = session_signing_mounts.first
+    fail_with.call("session-signing Secret must use exactly one read-only mount") unless
+      session_signing_mounts.length == 1 &&
+      session_signing_mount&.fetch("mountPath", nil) ==
+        "/var/run/secrets/eidolon-session-signing" &&
+      session_signing_mount&.fetch("readOnly", nil) == true
 
     state_volume = pod_spec.fetch("volumes", []).find { |item| item["name"] == "eidolon-state" }
     fail_with.call("state volume must use the supported PVC") unless
@@ -144,6 +251,20 @@ validate_proxy_single_writer() {
     ]
     fail_with.call("trusted-ingress Secret must project transport and continuity keys") unless
       trusted_ingress_items == expected_trusted_ingress_items
+    session_signing_volumes = pod_spec.fetch("volumes", []).select do |item|
+      item["name"] == "eidolon-session-signing"
+    end
+    session_signing_volume = session_signing_volumes.first
+    session_signing_secret = session_signing_volume&.fetch("secret", nil)
+    fail_with.call("session-signing volume must use exactly one required Secret") unless
+      session_signing_volumes.length == 1 &&
+      session_signing_secret&.fetch("secretName", nil) == "eidolon-session-signing" &&
+      session_signing_secret&.fetch("optional", false) == false
+    expected_session_signing_items = [
+      { "key" => "key-ring.json", "path" => "key-ring.json" }
+    ]
+    fail_with.call("session-signing Secret must project key-ring.json") unless
+      session_signing_secret&.fetch("items", nil) == expected_session_signing_items
 
     config = find_doc.call("ConfigMap", "eidolon-shield-proxy-config", "shield-system")
     expected_state_paths = {
