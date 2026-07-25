@@ -86,6 +86,27 @@ validate_kind_overlay_shape() {
           doc.dig("metadata", "namespace") == namespace
       end
     end
+    validate_non_root = lambda do |deployment, label, needs_state_volume|
+      pod_spec = deployment&.dig("spec", "template", "spec")
+      container = pod_spec&.dig("containers", 0)
+      pod_security = pod_spec&.fetch("securityContext", {})
+      security = container&.fetch("securityContext", {})
+
+      fail_with.call("#{label} must run as non-root user 65532") unless
+        pod_security["runAsNonRoot"] == true &&
+        pod_security["runAsUser"] == 65_532 &&
+        pod_security["runAsGroup"] == 65_532
+      fail_with.call("#{label} must use RuntimeDefault seccomp") unless
+        pod_security.dig("seccompProfile", "type") == "RuntimeDefault"
+      fail_with.call("#{label} state volume must use fsGroup 65532") if
+        needs_state_volume && pod_security["fsGroup"] != 65_532
+      fail_with.call("#{label} root filesystem must be read-only") unless
+        security["readOnlyRootFilesystem"] == true
+      fail_with.call("#{label} privilege escalation must be disabled") unless
+        security["allowPrivilegeEscalation"] == false
+      fail_with.call("#{label} must drop all capabilities") unless
+        security.dig("capabilities", "drop") == ["ALL"]
+    end
 
     node_port_services = docs.select do |doc|
       doc.is_a?(Hash) &&
@@ -131,6 +152,7 @@ validate_kind_overlay_shape() {
 
     proxy = find_doc.call("Deployment", "eidolon-shield-proxy", "shield-system")
     proxy_container = proxy&.dig("spec", "template", "spec", "containers", 0)
+    validate_non_root.call(proxy, "proxy", true)
     proxy_args = proxy_container&.fetch("args", []) || []
     renderer_flag = proxy_args.index("--controlled-reality-backend-addr")
     secret_flag = proxy_args.index("--controlled-reality-backend-auth-secret-file")
@@ -138,6 +160,13 @@ validate_kind_overlay_shape() {
     fail_with.call("proxy must use the dedicated renderer secret") unless secret_flag && proxy_args[secret_flag + 1] == "/var/run/secrets/eidolon-controlled-reality/auth-secret.txt"
     proxy_volumes = proxy.dig("spec", "template", "spec", "volumes") || []
     fail_with.call("proxy must mount the renderer auth Secret") unless proxy_volumes.any? { |volume| volume.dig("secret", "secretName") == "eidolon-controlled-reality-auth" }
+
+    demo_target = find_doc.call(
+      "Deployment",
+      "eidolon-owned-demo-target",
+      "shield-targets"
+    )
+    validate_non_root.call(demo_target, "owned demo target", false)
 
     default_deny = find_doc.call(
       "NetworkPolicy",

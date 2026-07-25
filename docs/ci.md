@@ -8,7 +8,7 @@ check for external security review.
 Protect `main` with these required checks:
 
 - `Rust`
-- `M3 fixtures`
+- `Lab fixtures`
 - `Foxguard`, after the Foxguard GitHub App is confirmed to post checks
 
 The `Foxguard` workflow job does not run a scanner itself. It waits for a check
