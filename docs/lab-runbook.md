@@ -150,6 +150,13 @@ older deployment.
 
 State writes go through a temp file, fsync, and rename, and failed writes roll back the corresponding in-memory mutation or fail the proof unavailable. The JSONL event and debug logs rotate at 32 MiB to collision-safe timestamped archives, keeping exactly 3 archives plus the active segment per log. Together those logs consume at most about 256 MiB before filesystem overhead, below the lab's 1 GiB PVC. Startup restores a missing newline or truncates only an invalid final fragment before appending, while corruption anywhere earlier still fails with the exact line number. The `proxy_started` debug record reports state counts, eviction/fallback outcomes, replay migration quarantine, and tail-repair details. Persistence failures use the exact `eidolon persistence failure:` marker.
 
+Before binding its listener or opening durable stores, the proxy takes an
+exclusive operating-system writer lease at `<policy-state-path>.lock`. A
+second process using the same policy-state path fails startup instead of
+overlapping writes. The operating system releases the lease after normal exit
+or a crash; the bounded lock-file metadata is diagnostic only. The storage
+profile must support advisory file locking.
+
 Every request handled by the proxy is assigned an opaque `request_id` (a random v4 UUID; it encodes no secrets, client identity, or request data). Every event derived from that request — `request_seen`, bait exposure and action events, policy decisions and changes, responses, rate limits, and reality-escape audits — carries that id, so concurrent requests sharing one session cookie can still be separated causally. Trace and edge-export reducers join events strictly by `request_id`; sessions whose events predate request identifiers are exported with `request_linkage: unknown_legacy` and no cross-event joins are attempted.
 
 Every request handled by the proxy is assigned an opaque `request_id` (a random v4 UUID; it encodes no secrets, client identity, or request data). Every event derived from that request — `request_seen`, bait exposure and action events, policy decisions and changes, responses, rate limits, and reality-escape audits — carries that id, so concurrent requests sharing one session cookie can still be separated causally. Trace and edge-export reducers join events strictly by `request_id`; sessions whose events predate request identifiers are exported with `request_linkage: unknown_legacy` and no cross-event joins are attempted.
