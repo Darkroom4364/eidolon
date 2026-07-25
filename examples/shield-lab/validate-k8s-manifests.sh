@@ -18,7 +18,8 @@ Usage: examples/shield-lab/validate-k8s-manifests.sh
 Builds the shield-lab base and overlay kustomizations and performs a cluster-free
 structural validation pass over the rendered YAML. This validates that each
 rendered document parses as Kubernetes-style YAML and includes apiVersion,
-kind, and metadata.name.
+kind, and metadata.name. It also enforces the proxy's single-writer deployment
+and PVC-backed policy-state invariants.
 USAGE
 }
 
@@ -66,6 +67,75 @@ validate_manifest_stream() {
         )
       end
     end
+  ' "$manifest_path"
+}
+
+validate_proxy_single_writer() {
+  local manifest_path="$1"
+  local rendered_yaml="$2"
+
+  printf '%s' "$rendered_yaml" | "$RUBY_BIN" -e '
+    require "yaml"
+
+    manifest_path = ARGV.fetch(0)
+    docs = YAML.load_stream(STDIN.read).compact
+    fail_with = ->(message) { abort("error: #{manifest_path} proxy #{message}") }
+    find_doc = lambda do |kind, name, namespace|
+      docs.find do |doc|
+        doc.is_a?(Hash) &&
+          doc["kind"] == kind &&
+          doc.dig("metadata", "name") == name &&
+          doc.dig("metadata", "namespace") == namespace
+      end
+    end
+
+    proxy = find_doc.call("Deployment", "eidolon-shield-proxy", "shield-system")
+    fail_with.call("deployment is missing") unless proxy
+    fail_with.call("must use exactly one replica") unless proxy.dig("spec", "replicas") == 1
+
+    strategy = proxy.dig("spec", "strategy")
+    fail_with.call("must use Recreate strategy") unless strategy.is_a?(Hash) && strategy["type"] == "Recreate"
+    fail_with.call("must not configure rollingUpdate") if strategy.key?("rollingUpdate")
+
+    pod_spec = proxy.dig("spec", "template", "spec")
+    container = pod_spec&.fetch("containers", [])&.find { |item| item["name"] == "shield-proxy" }
+    fail_with.call("container is missing") unless container
+
+    args = container.fetch("args", [])
+    policy_flag = args.index("--policy-state")
+    fail_with.call("must use EIDOLON_POLICY_STATE_PATH") unless
+      policy_flag && args[policy_flag + 1] == "$(EIDOLON_POLICY_STATE_PATH)"
+
+    env = container.fetch("env", [])
+    policy_env = env.find { |item| item["name"] == "EIDOLON_POLICY_STATE_PATH" }
+    fail_with.call("must load EIDOLON_POLICY_STATE_PATH from the proxy ConfigMap") unless
+      policy_env&.dig("valueFrom", "configMapKeyRef", "name") == "eidolon-shield-proxy-config" &&
+      policy_env&.dig("valueFrom", "configMapKeyRef", "key") == "EIDOLON_POLICY_STATE_PATH"
+
+    state_mount = container.fetch("volumeMounts", []).find { |item| item["name"] == "eidolon-state" }
+    fail_with.call("state volume must mount at /var/lib/eidolon") unless
+      state_mount&.fetch("mountPath", nil) == "/var/lib/eidolon"
+
+    state_volume = pod_spec.fetch("volumes", []).find { |item| item["name"] == "eidolon-state" }
+    fail_with.call("state volume must use the supported PVC") unless
+      state_volume&.dig("persistentVolumeClaim", "claimName") == "eidolon-shield-proxy-state"
+
+    config = find_doc.call("ConfigMap", "eidolon-shield-proxy-config", "shield-system")
+    expected_state_paths = {
+      "EIDOLON_EVENT_LOG_PATH" => "/var/lib/eidolon/events.jsonl",
+      "EIDOLON_DEBUG_LOG_PATH" => "/var/lib/eidolon/debug.jsonl",
+      "EIDOLON_POLICY_STATE_PATH" => "/var/lib/eidolon/policy-state.json",
+      "EIDOLON_INTERVENTION_CONTROL_PATH" => "/var/lib/eidolon/interventions.txt"
+    }
+    expected_state_paths.each do |key, expected|
+      fail_with.call("ConfigMap must keep #{key} on the PVC") unless
+        config&.dig("data", key) == expected
+    end
+
+    pvc = find_doc.call("PersistentVolumeClaim", "eidolon-shield-proxy-state", "shield-system")
+    fail_with.call("state PVC is missing") unless pvc
+    fail_with.call("state PVC must remain single-node ReadWriteOnce") unless
+      pvc.dig("spec", "accessModes") == ["ReadWriteOnce"]
   ' "$manifest_path"
 }
 
@@ -203,6 +273,7 @@ cd "$REPO_ROOT"
 for manifest_path in "${MANIFEST_PATHS[@]}"; do
   rendered_yaml="$("$KUBECTL_BIN" kustomize "$manifest_path")"
   validate_manifest_stream "$manifest_path" "$rendered_yaml"
+  validate_proxy_single_writer "$manifest_path" "$rendered_yaml"
   if [[ "$manifest_path" == "examples/shield-lab/k8s/kind" ]]; then
     validate_kind_overlay_shape "$rendered_yaml"
   fi
