@@ -57,7 +57,20 @@ case "${1:-} ${2:-} ${3:-}" in
     exit 1
     ;;
   "-n shield-system get")
-    exit 1
+    if [[ "$4" != "secret" || "$5" != "eidolon-trusted-ingress" ]]; then
+      exit 1
+    fi
+    if [[ "${TRUSTED_INGRESS_FETCH_FAILURE:-}" == "1" ]]; then
+      exit 1
+    fi
+    if [[ "${TRUSTED_INGRESS_SECRET_EXISTS:-}" != "1" ]]; then
+      exit 0
+    fi
+    printf '%s\n' "${TRUSTED_INGRESS_RESOURCE_VERSION:-7}"
+    printf 'transport-auth.txt\t%s\n' "${TRUSTED_INGRESS_TRANSPORT_DATA:-}"
+    if [[ "${TRUSTED_INGRESS_CONTINUITY_PRESENT:-}" == "1" ]]; then
+      printf 'continuity-key.txt\t%s\n' "${TRUSTED_INGRESS_CONTINUITY_DATA:-}"
+    fi
     ;;
   "-n shield-controlled-reality get")
     exit 1
@@ -150,6 +163,8 @@ test_creates_cluster_when_missing_and_applies_kind_overlay() {
   rg -q 'load docker-image eidolon-controlled-reality:local --name eidolon-shield' "$temp_dir/kind.log"
   rg -q 'apply --server-side -f https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/operator-crds.yaml' "$temp_dir/kubectl.log"
   rg -q 'wait --for=create tigerastatus/calico --timeout=300s' "$temp_dir/kubectl.log"
+  rg -Fq -- '--from-literal=transport-auth.txt=fixture-secret --from-literal=continuity-key.txt=fixture-secret' \
+    "$temp_dir/kubectl.log"
   rg -q -- '-n shield-system create secret generic eidolon-controlled-reality-auth' "$temp_dir/kubectl.log"
   rg -q -- '-n shield-controlled-reality create secret generic eidolon-controlled-reality-auth' "$temp_dir/kubectl.log"
   rg -q 'apply -k .*/examples/shield-lab/k8s/kind' "$temp_dir/kubectl.log"
@@ -157,6 +172,165 @@ test_creates_cluster_when_missing_and_applies_kind_overlay() {
   rg -q 'Context:             kind-eidolon-shield' <<<"$output"
   rg -q 'Renderer:            kubectl -n shield-controlled-reality get deployment eidolon-controlled-reality' <<<"$output"
   rg -q 'Port forward proxy:  kubectl -n shield-system port-forward svc/eidolon-shield-proxy 9102:9102' <<<"$output"
+}
+
+test_bootstraps_missing_continuity_key_from_existing_transport_data() {
+  local temp_dir
+  local bin_dir
+  local profile
+
+  temp_dir="$(new_temp_dir)"
+  bin_dir="$temp_dir/bin"
+  profile="$temp_dir/profile.json"
+  make_stub_bin_dir "$bin_dir"
+  printf '{"schema_version":1,"profile_id":"fixture"}\n' > "$profile"
+
+  PATH="$bin_dir:$PATH" \
+    KUBECTL_LOG="$temp_dir/kubectl.log" \
+    KIND_LOG="$temp_dir/kind.log" \
+    CALICO_PRESENT=1 \
+    TRUSTED_INGRESS_SECRET_EXISTS=1 \
+    TRUSTED_INGRESS_TRANSPORT_DATA=dHJhbnNwb3J0LWtleQ== \
+    EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET=replacement-must-not-be-used \
+    EIDOLON_SHIELD_CONTROLLED_REALITY_AUTH_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+    EIDOLON_SHIELD_BAIT_PROFILE_PATH="$profile" \
+    "$RUNNER" >/dev/null 2>&1
+
+  rg -q 'patch secret eidolon-trusted-ingress --type=json' "$temp_dir/kubectl.log"
+  rg -Fq '"op":"test","path":"/metadata/resourceVersion","value":"7"' \
+    "$temp_dir/kubectl.log"
+  rg -Fq '"op":"test","path":"/data/transport-auth.txt","value":"dHJhbnNwb3J0LWtleQ=="' \
+    "$temp_dir/kubectl.log"
+  rg -Fq '"op":"add","path":"/data/continuity-key.txt","value":"dHJhbnNwb3J0LWtleQ=="' \
+    "$temp_dir/kubectl.log"
+  [[ "$(rg -c '^-n shield-system get secret eidolon-trusted-ingress ' \
+    "$temp_dir/kubectl.log")" -eq 1 ]]
+  rg -q -- '--ignore-not-found -o go-template=' "$temp_dir/kubectl.log"
+  ! rg -q 'create secret generic eidolon-trusted-ingress' "$temp_dir/kubectl.log"
+  ! rg -q 'replacement-must-not-be-used' "$temp_dir/kubectl.log"
+}
+
+test_rejects_trusted_ingress_fetch_failure() {
+  local temp_dir
+  local bin_dir
+  local profile
+  local output
+  local status=0
+
+  temp_dir="$(new_temp_dir)"
+  bin_dir="$temp_dir/bin"
+  profile="$temp_dir/profile.json"
+  make_stub_bin_dir "$bin_dir"
+  printf '{"schema_version":1,"profile_id":"fixture"}\n' > "$profile"
+
+  output="$(
+    PATH="$bin_dir:$PATH" \
+      KUBECTL_LOG="$temp_dir/kubectl.log" \
+      KIND_LOG="$temp_dir/kind.log" \
+      CALICO_PRESENT=1 \
+      TRUSTED_INGRESS_FETCH_FAILURE=1 \
+      EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET=replacement-must-not-be-used \
+      EIDOLON_SHIELD_BAIT_PROFILE_PATH="$profile" \
+      "$RUNNER" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 1 ]]
+  rg -q 'could not read trusted-ingress Secret eidolon-trusted-ingress' <<<"$output"
+  [[ "$(rg -c '^-n shield-system get secret eidolon-trusted-ingress ' \
+    "$temp_dir/kubectl.log")" -eq 1 ]]
+  ! rg -q 'patch secret eidolon-trusted-ingress' "$temp_dir/kubectl.log"
+  ! rg -q 'create secret generic eidolon-trusted-ingress' "$temp_dir/kubectl.log"
+  ! rg -q 'replacement-must-not-be-used' "$temp_dir/kubectl.log"
+}
+
+test_preserves_existing_continuity_key() {
+  local temp_dir
+  local bin_dir
+  local profile
+
+  temp_dir="$(new_temp_dir)"
+  bin_dir="$temp_dir/bin"
+  profile="$temp_dir/profile.json"
+  make_stub_bin_dir "$bin_dir"
+  printf '{"schema_version":1,"profile_id":"fixture"}\n' > "$profile"
+
+  PATH="$bin_dir:$PATH" \
+    KUBECTL_LOG="$temp_dir/kubectl.log" \
+    KIND_LOG="$temp_dir/kind.log" \
+    CALICO_PRESENT=1 \
+    TRUSTED_INGRESS_SECRET_EXISTS=1 \
+    TRUSTED_INGRESS_TRANSPORT_DATA=dHJhbnNwb3J0LWtleQ== \
+    TRUSTED_INGRESS_CONTINUITY_PRESENT=1 \
+    TRUSTED_INGRESS_CONTINUITY_DATA=c3RhYmxlLWNvbnRpbnVpdHkta2V5 \
+    EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET=replacement-must-not-be-used \
+    EIDOLON_SHIELD_CONTROLLED_REALITY_AUTH_SECRET=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+    EIDOLON_SHIELD_BAIT_PROFILE_PATH="$profile" \
+    "$RUNNER" >/dev/null 2>&1
+
+  [[ "$(rg -c '^-n shield-system get secret eidolon-trusted-ingress ' \
+    "$temp_dir/kubectl.log")" -eq 1 ]]
+  ! rg -q 'patch secret eidolon-trusted-ingress' "$temp_dir/kubectl.log"
+  ! rg -q 'create secret generic eidolon-trusted-ingress' "$temp_dir/kubectl.log"
+  ! rg -q 'replacement-must-not-be-used' "$temp_dir/kubectl.log"
+}
+
+test_rejects_empty_existing_continuity_key() {
+  local temp_dir
+  local bin_dir
+  local profile
+  local output
+  local status=0
+
+  temp_dir="$(new_temp_dir)"
+  bin_dir="$temp_dir/bin"
+  profile="$temp_dir/profile.json"
+  make_stub_bin_dir "$bin_dir"
+  printf '{"schema_version":1,"profile_id":"fixture"}\n' > "$profile"
+
+  output="$(
+    PATH="$bin_dir:$PATH" \
+      KUBECTL_LOG="$temp_dir/kubectl.log" \
+      KIND_LOG="$temp_dir/kind.log" \
+      CALICO_PRESENT=1 \
+      TRUSTED_INGRESS_SECRET_EXISTS=1 \
+      TRUSTED_INGRESS_TRANSPORT_DATA=dHJhbnNwb3J0LWtleQ== \
+      TRUSTED_INGRESS_CONTINUITY_PRESENT=1 \
+      EIDOLON_SHIELD_BAIT_PROFILE_PATH="$profile" \
+      "$RUNNER" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 1 ]]
+  rg -q 'trusted-ingress Secret has an empty continuity-key.txt' <<<"$output"
+  ! rg -q 'patch secret eidolon-trusted-ingress' "$temp_dir/kubectl.log"
+}
+
+test_rejects_legacy_secret_without_transport_data() {
+  local temp_dir
+  local bin_dir
+  local profile
+  local output
+  local status=0
+
+  temp_dir="$(new_temp_dir)"
+  bin_dir="$temp_dir/bin"
+  profile="$temp_dir/profile.json"
+  make_stub_bin_dir "$bin_dir"
+  printf '{"schema_version":1,"profile_id":"fixture"}\n' > "$profile"
+
+  output="$(
+    PATH="$bin_dir:$PATH" \
+      KUBECTL_LOG="$temp_dir/kubectl.log" \
+      KIND_LOG="$temp_dir/kind.log" \
+      CALICO_PRESENT=1 \
+      TRUSTED_INGRESS_SECRET_EXISTS=1 \
+      EIDOLON_SHIELD_BAIT_PROFILE_PATH="$profile" \
+      "$RUNNER" 2>&1
+  )" || status="$?"
+
+  [[ "$status" -eq 1 ]]
+  rg -q 'trusted-ingress Secret is missing non-empty transport-auth.txt' <<<"$output"
+  ! rg -q 'patch secret eidolon-trusted-ingress' "$temp_dir/kubectl.log"
+  ! rg -q 'create secret generic eidolon-trusted-ingress' "$temp_dir/kubectl.log"
 }
 
 test_skips_cluster_creation_when_kind_cluster_already_exists() {
@@ -239,6 +413,11 @@ test_rejects_existing_kindnet_cluster() {
 }
 
 test_creates_cluster_when_missing_and_applies_kind_overlay
+test_bootstraps_missing_continuity_key_from_existing_transport_data
+test_preserves_existing_continuity_key
+test_rejects_empty_existing_continuity_key
+test_rejects_legacy_secret_without_transport_data
+test_rejects_trusted_ingress_fetch_failure
 test_skips_cluster_creation_when_kind_cluster_already_exists
 test_rejects_missing_kind_config
 test_rejects_existing_kindnet_cluster

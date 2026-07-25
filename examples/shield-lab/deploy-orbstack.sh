@@ -5,6 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 trusted_ingress_secret_name="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET_NAME:-eidolon-trusted-ingress}"
 trusted_ingress_secret_key="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET_KEY:-transport-auth.txt}"
+trusted_ingress_continuity_key="continuity-key.txt"
 trusted_ingress_secret_literal="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET:-}"
 bait_signing_secret_name="${EIDOLON_SHIELD_BAIT_SIGNING_SECRET_NAME:-eidolon-bait-signing}"
 bait_signing_secret_key="${EIDOLON_SHIELD_BAIT_SIGNING_SECRET_KEY:-signing-secret.txt}"
@@ -97,6 +98,94 @@ ensure_secret() {
     --from-literal="${secret_key}=${secret_value}" >/dev/null
 }
 
+json_pointer_escape() {
+  local value="$1"
+
+  value="${value//\~/~0}"
+  value="${value//\//~1}"
+  printf '%s' "$value"
+}
+
+ensure_trusted_ingress_secret() {
+  local continuity_data=""
+  local continuity_present=0
+  local data_key
+  local data_line
+  local data_value
+  local resource_version
+  local secret_data=""
+  local secret_snapshot
+  local secret_value
+  local transport_data=""
+  local transport_present=0
+  local transport_key_pointer
+
+  if ! secret_snapshot="$(
+    kubectl -n shield-system get secret "$trusted_ingress_secret_name" \
+      --ignore-not-found \
+      -o 'go-template={{.metadata.resourceVersion}}{{"\n"}}{{range $key, $value := .data}}{{printf "%s\t%s\n" $key $value}}{{end}}'
+  )"; then
+    echo "could not read trusted-ingress Secret ${trusted_ingress_secret_name}" >&2
+    exit 1
+  fi
+
+  if [[ -z "$secret_snapshot" ]]; then
+    secret_value="$(generate_secret_value "$trusted_ingress_secret_literal")"
+    kubectl -n shield-system create secret generic "$trusted_ingress_secret_name" \
+      --from-literal="${trusted_ingress_secret_key}=${secret_value}" \
+      --from-literal="${trusted_ingress_continuity_key}=${secret_value}" >/dev/null
+    return
+  fi
+
+  resource_version="${secret_snapshot%%$'\n'*}"
+  if [[ -z "$resource_version" ]]; then
+    echo "trusted-ingress Secret has no resourceVersion" >&2
+    exit 1
+  fi
+
+  if [[ "$secret_snapshot" == *$'\n'* ]]; then
+    secret_data="${secret_snapshot#*$'\n'}"
+  fi
+  while IFS= read -r data_line; do
+    [[ -z "$data_line" ]] && continue
+    if [[ "$data_line" != *$'\t'* ]]; then
+      echo "trusted-ingress Secret returned malformed data" >&2
+      exit 1
+    fi
+    data_key="${data_line%%$'\t'*}"
+    data_value="${data_line#*$'\t'}"
+    case "$data_key" in
+      "$trusted_ingress_secret_key")
+        transport_present=1
+        transport_data="$data_value"
+        ;;
+      "$trusted_ingress_continuity_key")
+        continuity_present=1
+        continuity_data="$data_value"
+        ;;
+    esac
+  done <<<"$secret_data"
+
+  if [[ "$transport_present" != "1" || -z "$transport_data" ]]; then
+    echo "trusted-ingress Secret is missing non-empty ${trusted_ingress_secret_key}" >&2
+    exit 1
+  fi
+
+  if [[ "$continuity_present" == "1" ]]; then
+    if [[ -z "$continuity_data" ]]; then
+      echo "trusted-ingress Secret has an empty ${trusted_ingress_continuity_key}" >&2
+      exit 1
+    fi
+    return
+  fi
+
+  transport_key_pointer="$(json_pointer_escape "$trusted_ingress_secret_key")"
+  kubectl -n shield-system patch secret "$trusted_ingress_secret_name" \
+    --type=json \
+    -p "[{\"op\":\"test\",\"path\":\"/metadata/resourceVersion\",\"value\":\"${resource_version}\"},{\"op\":\"test\",\"path\":\"/data/${transport_key_pointer}\",\"value\":\"${transport_data}\"},{\"op\":\"add\",\"path\":\"/data/${trusted_ingress_continuity_key}\",\"value\":\"${transport_data}\"}]" \
+    >/dev/null
+}
+
 apply_bait_profile_configmap() {
   kubectl -n shield-system create configmap "$bait_profile_configmap_name" \
     --from-file="${bait_profile_key}=${bait_profile_path}" \
@@ -138,7 +227,7 @@ YAML
 
 resolve_bait_profile_path
 resolve_ingress_trust_config_path
-ensure_secret "$trusted_ingress_secret_name" "$trusted_ingress_secret_key" "$trusted_ingress_secret_literal"
+ensure_trusted_ingress_secret
 ensure_secret "$bait_signing_secret_name" "$bait_signing_secret_key" "$bait_signing_secret_literal"
 apply_bait_profile_configmap
 apply_ingress_trust_configmap
