@@ -15,10 +15,22 @@ spec:
       labels:
         app.kubernetes.io/name: eidolon-owned-demo-target
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: owned-demo-target
           image: eidolon-owned-demo-target
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: EIDOLON_LAB_TARGET_ADDR
               value: "0.0.0.0:9101"

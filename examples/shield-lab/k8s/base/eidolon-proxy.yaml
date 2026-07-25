@@ -15,10 +15,23 @@ spec:
       labels:
         app.kubernetes.io/name: eidolon-shield-proxy
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: shield-proxy
           image: eidolon-shield-proxy
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           args:
             - --owned-cluster-lab
             - --listen-addr
