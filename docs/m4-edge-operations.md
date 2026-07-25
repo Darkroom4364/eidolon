@@ -162,12 +162,36 @@ Session identity on this deployment:
 - the explicit-cookie smoke scripts mint their session cookies from the live
   edge instead of generating raw UUIDs; cookie-jar smokes are unaffected
 
+Run the kind state recovery proof with:
+
+```sh
+examples/shield-lab/smoke-state-backup-restore-kind.sh
+```
+
+The script stops the single `Recreate` proxy writer before backup and restores
+into a fresh replacement local-path PVC. Its exact recovery set is PVC
+`shield-system/eidolon-shield-proxy-state` plus:
+
+- Secret `shield-system/eidolon-session-signing`, key `key-ring.json`
+- Secret `shield-system/eidolon-trusted-ingress`, keys
+  `transport-auth.txt` and `continuity-key.txt`
+- Secret `shield-system/eidolon-bait-signing`, key `signing-secret.txt`
+- Secret `shield-system/eidolon-controlled-reality-auth`, key
+  `auth-secret.txt`
+- Secret `shield-controlled-reality/eidolon-controlled-reality-auth`, key
+  `auth-secret.txt`
+
+The live evidence requires the contained workflow to retain its session and
+request links, an old authenticated session cookie to remain valid, a consumed
+proof replay to remain rejected and uncorrelated, and the protected target to
+observe zero matching writes.
+
 This manifest wiring and ownership migration do not complete issue `#254`,
-prove session continuity, or establish production readiness. Upgrade,
-rollback, backup/restore, session-key rotation, and storage-driver portability
-still need live lifecycle proof. Graceful request draining and measured rollout
-downtime remain release qualification work, as does live overlapping-pod lease
-proof on the supported PVC profile.
+or establish production readiness. Backup/restore is live-proven only for the
+owned kind/local-path path above. Upgrade, rollback, session-key rotation,
+storage-driver portability, and HA still need lifecycle proof. Graceful request
+draining and measured rollout downtime remain release qualification work, as
+does live overlapping-pod lease proof on the supported PVC profile.
 
 Recorded labels:
 

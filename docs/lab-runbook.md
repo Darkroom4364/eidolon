@@ -142,10 +142,10 @@ If the authenticated-continuity sidecar is missing while prior state exists,
 unknown authenticated identities fail closed for a bounded migration
 quarantine. Corrupt state or state bound to a different continuity key prevents
 startup. Planned transport-auth rotation can preserve continuity when the
-continuity key stays fixed. The session-signing Secret wiring does not prove
-upgrade, rollback, backup/restore, or key-rotation behavior; those live checks,
+continuity key stays fixed. The session-signing Secret wiring alone does not
+prove upgrade, rollback, or key-rotation behavior; those live checks,
 transport overlap windows, and continuity-key rotation remain tracked by issue
-`#254`. Reusing the old
+`#254`. The kind backup/restore proof is documented below. Reusing the old
 transport-secret bytes for migration compatibility also means transport
 rotation does not remediate compromise of those bytes. Old-key state is never
 trusted based on unverified timestamps. This slice does not complete issue
@@ -177,8 +177,8 @@ then assigned to `65532:65532`; the directory is handled last and left `0770`.
 That ordering lets owner permissions perform `chmod` without `FOWNER` or
 `DAC_OVERRIDE`. Repeat runs rely on the enforced pod `fsGroup: 65532` to
 traverse that directory before ownership is normalized again.
-This repairs the observed legacy ownership blocker, but does not prove live
-upgrade, rollback, backup/restore, or storage-driver portability.
+This repairs the observed legacy ownership blocker, but by itself does not
+prove live upgrade, rollback, or storage-driver portability.
 
 Before binding its listener or opening durable stores, the proxy takes an
 exclusive operating-system writer lease at `<policy-state-path>.lock`. A
@@ -186,6 +186,38 @@ second process using the same policy-state path fails startup instead of
 overlapping writes. The operating system releases the lease after normal exit
 or a crash; the bounded lock-file metadata is diagnostic only. The storage
 profile must support advisory file locking.
+
+### Kind State Backup/Restore Validation
+
+Run the owned kind/local-path recovery smoke:
+
+```sh
+examples/shield-lab/smoke-state-backup-restore-kind.sh
+```
+
+The smoke quiesces the single `Recreate` proxy writer before copying the
+recovery set. It restores into a fresh replacement PVC rather than overwriting
+the source PVC. The exact recovery set is:
+
+- PVC `shield-system/eidolon-shield-proxy-state`
+- Secret `shield-system/eidolon-session-signing`, key `key-ring.json`
+- Secret `shield-system/eidolon-trusted-ingress`, keys
+  `transport-auth.txt` and `continuity-key.txt`
+- Secret `shield-system/eidolon-bait-signing`, key `signing-secret.txt`
+- Secret `shield-system/eidolon-controlled-reality-auth`, key
+  `auth-secret.txt`
+- Secret `shield-controlled-reality/eidolon-controlled-reality-auth`, key
+  `auth-secret.txt`
+
+After restore, the smoke proves that the contained workflow retains its
+session and request links, a previously issued authenticated session cookie
+remains valid, and a consumed-proof replay is rejected without being correlated
+as new causal evidence. Target-side audit must observe zero matching protected
+upstream writes.
+
+This is a live proof only for the owned kind cluster and its local-path storage.
+It does not prove cross-cluster or storage-driver portability, CSI snapshot
+behavior, HA, multi-writer coordination, or a zero-downtime lifecycle.
 
 Every request handled by the proxy is assigned an opaque `request_id` (a random v4 UUID; it encodes no secrets, client identity, or request data). Every event derived from that request — `request_seen`, bait exposure and action events, policy decisions and changes, responses, rate limits, and reality-escape audits — carries that id, so concurrent requests sharing one session cookie can still be separated causally. Trace and edge-export reducers join events strictly by `request_id`; sessions whose events predate request identifiers are exported with `request_linkage: unknown_legacy` and no cross-event joins are attempted.
 
