@@ -162,11 +162,15 @@ The current proxy already consumes this subset through reserved headers:
 - `X-Eidolon-Ingress-Identity-Label`
 - `X-Eidolon-Ingress-Identity-Expires-At`
 - `X-Eidolon-Ingress-Transport-Auth`
+- `X-Eidolon-Ingress-Continuity`
 
 The first four fields map directly to the runtime `IngressIdentity`. The
 transport-auth header is not part of the identity model; it is a transport-only
 attestation check that must match the proxy's configured shared secret before
-the explicit identity is trusted.
+the explicit identity is trusted. The continuity header is an opaque,
+adapter-minted identity used only for session continuity. Eidolon immediately
+reduces it to an HMAC-SHA256 key under the transport secret; the raw value is
+not stored, logged, exported, or forwarded upstream.
 
 Reserved and now captured in authenticated request audit events:
 
@@ -185,6 +189,23 @@ Reserved and now captured in authenticated request audit events:
 - Adapters must remove any client-supplied `X-Eidolon-*` headers first.
 - Adapters must attach `X-Eidolon-Ingress-Transport-Auth` with the shared
   secret expected by the proxy before emitting explicit identity headers.
+- Adapters must attach exactly one `X-Eidolon-Ingress-Continuity` value of
+  16-256 ASCII alphanumeric, `-`, or `_` characters. It must distinguish
+  clients sharing one ingress peer and must not contain an email, account ID,
+  IP address, or other direct identifier.
+- `--require-authenticated-ingress-continuity` makes the pair mandatory on
+  every request; missing, duplicate, malformed, or unauthenticated continuity
+  then returns `400` before protected-upstream access. Merely configuring the
+  transport secret keeps existing Lab peer continuity compatible.
+- Authenticated continuity remains bound to one stable session through cookie
+  loss, malformed cookies, and conflicting valid cookies. One valid cookie
+  cannot bind multiple authenticated continuity identities.
+- Continuity storage is TTL- and capacity-bounded. Suspicious-or-higher records
+  are not evicted; if they saturate capacity, an unknown identity receives a
+  `503` Eidolon-owned response even when interventions are disabled.
+- Continuity records are currently in memory. After restart, a valid signed
+  session cookie is still required until the durable-continuity follow-up in
+  issue `#254` lands.
 - Adapters must only emit normalized values, never secrets or raw signatures.
 - Headers are request-scoped, not session-scoped storage.
 - Large raw payloads belong in sidecar logs or webhooks, not inline request
