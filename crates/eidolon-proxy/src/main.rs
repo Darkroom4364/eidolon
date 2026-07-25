@@ -34,6 +34,11 @@ use eidolon_proxy::{
     event_log::{
         read_jsonl_reconstruction, DurableResponseMatch, FileEventLogWriter, JsonlTailRepairOutcome,
     },
+    http_request::{
+        canonical_request_target, normalized_request_host, HttpHeader, HttpRequest, HttpVersion,
+        RequestTargetMode, MAX_HTTP_BODY_BYTES as MAX_BODY_BYTES,
+        MAX_HTTP_HEADER_BYTES as MAX_HEADER_BYTES,
+    },
     ingress_identity::{self, IngressIdentityResolver},
     policy::{self, InterventionMode},
     policy_store::{
@@ -54,6 +59,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use eidolon_proxy::http_request::canonicalize_request_target;
+
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
 const DEFAULT_EVENT_LOG: &str = "/tmp/eidolon-events.jsonl";
@@ -66,8 +74,6 @@ const OPENAPI_DISCOVERY_TARGET: &str = "/openapi.json";
 const REJECTED_REQUEST_TARGET: &str = "/__eidolon_rejected_target__";
 const LEGACY_IMPORT_OPENAPI_QUERY: &str = "eidolon_surface=legacy-import";
 const DEFAULT_HTTP_PORT: u16 = 80;
-const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 const MAX_BAIT_EXPOSURES: usize = 4096;
 const BAIT_EXPOSURE_TTL_SECS: u64 = 24 * 60 * 60;
@@ -2595,15 +2601,6 @@ fn validate_action_path(label: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
 fn bait_profile_debug_value(metadata: &Option<BaitProfileMetadata>) -> Value {
     match metadata {
         Some(metadata) => json!({
@@ -4013,7 +4010,7 @@ fn handle_connection(
         } else {
             0
         };
-    let upstream_request = upstream_request_source.to_upstream_bytes(&runtime.upstream)?;
+    let upstream_request = request_to_upstream_bytes(&upstream_request_source, &runtime.upstream)?;
     write_debug(
         runtime,
         "upstream_request_forwarding",
@@ -5310,297 +5307,8 @@ fn reason_phrase(status: u16) -> &'static str {
 }
 
 fn normalized_event_path(request: &HttpRequest) -> io::Result<String> {
-    if request.target == "*" && !request.method.eq_ignore_ascii_case("OPTIONS") {
-        return Err(invalid_data(
-            "HTTP asterisk-form request target is only valid for OPTIONS",
-        ));
-    }
-    let target = canonicalize_request_target(&request.target)?;
-    let host_header = validated_request_host_header(request)?;
-    let host_authority = normalized_request_authority(host_header)?;
-    if let Some(target_authority) = request_host_from_target(&request.target) {
-        let target_authority = normalized_request_authority(target_authority)?;
-        if target_authority != host_authority {
-            return Err(invalid_data(
-                "HTTP absolute-form authority conflicts with the Host header",
-            ));
-        }
-    }
-    Ok(target)
-}
-
-fn validated_request_host_header(request: &HttpRequest) -> io::Result<&str> {
-    let mut host_headers = request
-        .headers
-        .iter()
-        .filter(|header| header.name.eq_ignore_ascii_case("host"))
-        .map(|header| header.value.trim());
-    let host = host_headers
-        .next()
-        .ok_or_else(|| invalid_data("HTTP request must contain exactly one Host header"))?;
-    if host_headers.next().is_some() {
-        return Err(invalid_data(
-            "HTTP request must contain exactly one Host header",
-        ));
-    }
-    validate_request_target_authority(host)?;
-    Ok(host)
-}
-
-/// Canonicalize an HTTP request target to the single representation shared by
-/// policy evaluation, bait matching, controlled reality, logging, and export
-/// (#212). The query is validated and normalized without decoding reserved
-/// bytes; the path is percent-decoded for unreserved characters only.
-///
-/// Everything ambiguous fails closed instead of being guessed: malformed
-/// absolute-form authorities, backslashes, fragments, control or non-ASCII
-/// bytes, characters outside the URI grammar, path parameters, interior empty
-/// segments (`//`), dot segments, invalid `%` sequences, and percent-encoded
-/// path bytes outside the unreserved set. Encoded dot segments are rejected
-/// after decoding. Normalization disagreements between upstream servers must
-/// never receive different policy meaning from a different spelling of the
-/// "same" path.
-fn canonicalize_request_target(target: &str) -> io::Result<String> {
-    if target
-        .bytes()
-        .any(|byte| matches!(byte, 0x00..=0x20 | 0x7F..=0xFF))
-    {
-        return Err(invalid_data(
-            "HTTP request target contains whitespace, control, or non-ASCII bytes",
-        ));
-    }
-    if target.contains('\\') {
-        return Err(invalid_data(
-            "HTTP request target must not contain backslashes",
-        ));
-    }
-    if target.contains('#') {
-        return Err(invalid_data(
-            "HTTP request target must not contain a fragment",
-        ));
-    }
-
-    let normalized = request_target_origin_form(target)?;
-    if normalized == "*" {
-        return Ok(normalized);
-    }
-
-    let (raw_path, query) = match normalized.split_once('?') {
-        Some((path, query)) => (path, Some(query)),
-        None => (normalized.as_str(), None),
-    };
-    if raw_path.starts_with("//") {
-        return Err(invalid_data(
-            "HTTP request target path must not start with `//`",
-        ));
-    }
-
-    let mut path = String::with_capacity(raw_path.len());
-    let raw_bytes = raw_path.as_bytes();
-    let mut index = 0;
-    while index < raw_bytes.len() {
-        let byte = raw_bytes[index];
-        match byte {
-            b'%' => {
-                if index + 2 >= raw_bytes.len() {
-                    return Err(invalid_data(
-                        "HTTP request target contains a truncated percent encoding",
-                    ));
-                }
-                let high = hex_value(raw_bytes[index + 1]).ok_or_else(|| {
-                    invalid_data("HTTP request target contains an invalid percent encoding")
-                })?;
-                let low = hex_value(raw_bytes[index + 2]).ok_or_else(|| {
-                    invalid_data("HTTP request target contains an invalid percent encoding")
-                })?;
-                let decoded = (high << 4) | low;
-                if is_unreserved_path_byte(decoded) {
-                    path.push(decoded as char);
-                } else {
-                    return Err(invalid_data(
-                        "HTTP request target contains a percent-encoded byte outside the unreserved set",
-                    ));
-                }
-                index += 3;
-            }
-            _ => {
-                if !is_raw_path_byte(byte) {
-                    return Err(invalid_data(
-                        "HTTP request target path contains a character outside the URI path grammar",
-                    ));
-                }
-                path.push(byte as char);
-                index += 1;
-            }
-        }
-    }
-
-    if path.contains("//") {
-        return Err(invalid_data(
-            "HTTP request target path must not contain empty interior segments (`//`)",
-        ));
-    }
-    if path
-        .split('/')
-        .any(|segment| segment == "." || segment == "..")
-    {
-        return Err(invalid_data(
-            "HTTP request target path must not contain dot segments",
-        ));
-    }
-
-    Ok(match query {
-        Some(query) => format!("{path}?{}", canonicalize_request_query(query)?),
-        None => path,
-    })
-}
-
-fn canonicalize_request_query(query: &str) -> io::Result<String> {
-    let bytes = query.as_bytes();
-    let mut canonical = String::with_capacity(query.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'%' {
-            if !is_raw_query_byte(bytes[index]) {
-                return Err(invalid_data(
-                    "HTTP request query contains a character outside the URI query grammar",
-                ));
-            }
-            canonical.push(bytes[index] as char);
-            index += 1;
-            continue;
-        }
-        if index + 2 >= bytes.len() {
-            return Err(invalid_data(
-                "HTTP request query contains a truncated percent encoding",
-            ));
-        }
-        let high = hex_value(bytes[index + 1]).ok_or_else(|| {
-            invalid_data("HTTP request query contains an invalid percent encoding")
-        })?;
-        let low = hex_value(bytes[index + 2]).ok_or_else(|| {
-            invalid_data("HTTP request query contains an invalid percent encoding")
-        })?;
-        let decoded = (high << 4) | low;
-        if is_unreserved_path_byte(decoded) {
-            canonical.push(decoded as char);
-        } else {
-            const HEX: &[u8; 16] = b"0123456789ABCDEF";
-            canonical.push('%');
-            canonical.push(HEX[(decoded >> 4) as usize] as char);
-            canonical.push(HEX[(decoded & 0x0F) as usize] as char);
-        }
-        index += 3;
-    }
-    Ok(canonical)
-}
-
-fn request_target_origin_form(target: &str) -> io::Result<String> {
-    if target.is_empty() {
-        return Err(invalid_data("HTTP request target cannot be empty"));
-    }
-    if target == "*" {
-        return Ok(target.to_string());
-    }
-    if target.starts_with('/') {
-        return Ok(target.to_string());
-    }
-
-    let Some(rest) = target.strip_prefix("http://") else {
-        return Err(invalid_data(
-            "HTTP request target must be origin-form or http absolute-form",
-        ));
-    };
-    let suffix_index = rest
-        .char_indices()
-        .find_map(|(index, character)| matches!(character, '/' | '?').then_some(index))
-        .unwrap_or(rest.len());
-    let authority = &rest[..suffix_index];
-    validate_request_target_authority(authority)?;
-
-    let suffix = &rest[suffix_index..];
-    if suffix.is_empty() {
-        Ok("/".to_string())
-    } else if suffix.starts_with('?') {
-        Ok(format!("/{suffix}"))
-    } else {
-        Ok(suffix.to_string())
-    }
-}
-
-fn validate_request_target_authority(authority: &str) -> io::Result<()> {
-    if authority.is_empty() {
-        return Err(invalid_data(
-            "HTTP absolute-form request target must name a non-empty authority",
-        ));
-    }
-    if authority.contains('@') || authority.contains('%') {
-        return Err(invalid_data(
-            "HTTP absolute-form request target authority must not contain userinfo or percent encoding",
-        ));
-    }
-
-    let (host, port) =
-        parse_authority(authority).map_err(|error| invalid_data(error.to_string()))?;
-    if port == Some(0) {
-        return Err(invalid_data(
-            "HTTP absolute-form request target port must not be 0",
-        ));
-    }
-
-    if authority.starts_with('[') {
-        host.parse::<std::net::Ipv6Addr>().map_err(|_| {
-            invalid_data("HTTP absolute-form bracketed authority must contain a valid IPv6 address")
-        })?;
-        return Ok(());
-    }
-    if host.parse::<IpAddr>().is_ok() {
-        return Ok(());
-    }
-    if host.split('.').any(|label| {
-        label.is_empty()
-            || !label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-            || !label
-                .as_bytes()
-                .first()
-                .is_some_and(u8::is_ascii_alphanumeric)
-            || !label
-                .as_bytes()
-                .last()
-                .is_some_and(u8::is_ascii_alphanumeric)
-    }) {
-        return Err(invalid_data(
-            "HTTP absolute-form request target authority has an invalid host",
-        ));
-    }
-
-    Ok(())
-}
-
-fn is_unreserved_path_byte(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
-    )
-}
-
-fn is_sub_delimiter(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
-    )
-}
-
-fn is_raw_path_byte(byte: u8) -> bool {
-    is_unreserved_path_byte(byte)
-        || (is_sub_delimiter(byte) && byte != b';')
-        || matches!(byte, b':' | b'@' | b'/')
-}
-
-fn is_raw_query_byte(byte: u8) -> bool {
-    is_raw_path_byte(byte) || byte == b'?'
+    canonical_request_target(request, RequestTargetMode::OriginOrAbsoluteHttp)
+        .map_err(|error| invalid_data(error.to_string()))
 }
 
 fn event_discovery_recon_score(
@@ -6280,21 +5988,6 @@ fn intervention_control_disables(value: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct HttpRequest {
-    method: String,
-    target: String,
-    version: String,
-    headers: Vec<HttpHeader>,
-    body: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HttpHeader {
-    name: String,
-    value: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct HttpResponse {
     version: String,
     status: u16,
@@ -6304,44 +5997,41 @@ struct HttpResponse {
     cache_policy: ResponseCachePolicy,
 }
 
-impl HttpRequest {
-    fn to_upstream_bytes(&self, upstream: &UpstreamTarget) -> io::Result<Vec<u8>> {
-        if self.target == "*" && !self.method.eq_ignore_ascii_case("OPTIONS") {
-            return Err(invalid_data(
-                "HTTP asterisk-form request target is only valid for OPTIONS",
-            ));
-        }
-        let target = canonicalize_request_target(&self.target)?;
-        let connection_nominated_headers = connection_nominated_headers(&self.headers);
-        let should_emit_content_length = !self.body.is_empty()
-            || self
-                .headers
-                .iter()
-                .any(|header| header.name.eq_ignore_ascii_case("content-length"));
-        let mut bytes = Vec::new();
+fn request_to_upstream_bytes(
+    request: &HttpRequest,
+    upstream: &UpstreamTarget,
+) -> io::Result<Vec<u8>> {
+    let target = canonical_request_target(request, RequestTargetMode::OriginOrAbsoluteHttp)
+        .map_err(|error| invalid_data(error.to_string()))?;
+    let connection_nominated_headers = connection_nominated_headers(&request.headers);
+    let should_emit_content_length = !request.body.is_empty()
+        || request
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-length"));
+    let mut bytes = Vec::new();
 
-        write!(
-            bytes,
-            "{} {} {}\r\nHost: {}\r\nConnection: close\r\n",
-            self.method, target, self.version, upstream.authority
-        )?;
+    write!(
+        bytes,
+        "{} {} {}\r\nHost: {}\r\nConnection: close\r\n",
+        request.method, target, request.version, upstream.authority
+    )?;
 
-        if should_emit_content_length {
-            write!(bytes, "Content-Length: {}\r\n", self.body.len())?;
-        }
-
-        for header in &self.headers {
-            if should_skip_forwarded_header(&header.name, &connection_nominated_headers) {
-                continue;
-            }
-
-            write!(bytes, "{}: {}\r\n", header.name, header.value)?;
-        }
-
-        bytes.extend_from_slice(b"\r\n");
-        bytes.extend_from_slice(&self.body);
-        Ok(bytes)
+    if should_emit_content_length {
+        write!(bytes, "Content-Length: {}\r\n", request.body.len())?;
     }
+
+    for header in &request.headers {
+        if should_skip_forwarded_header(&header.name, &connection_nominated_headers) {
+            continue;
+        }
+
+        write!(bytes, "{}: {}\r\n", header.name, header.value)?;
+    }
+
+    bytes.extend_from_slice(b"\r\n");
+    bytes.extend_from_slice(&request.body);
+    Ok(bytes)
 }
 
 impl HttpResponse {
@@ -6623,11 +6313,15 @@ fn parse_http_request_head(head: &[u8]) -> io::Result<HttpRequest> {
     if !is_http_token(method) {
         return Err(invalid_data("HTTP method is not a valid token"));
     }
-    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
-        return Err(invalid_data(
-            "HTTP request version must be HTTP/1.0 or HTTP/1.1",
-        ));
-    }
+    let version = match version {
+        "HTTP/1.0" => HttpVersion::Http10,
+        "HTTP/1.1" => HttpVersion::Http11,
+        _ => {
+            return Err(invalid_data(
+                "HTTP request version must be HTTP/1.0 or HTTP/1.1",
+            ));
+        }
+    };
 
     let mut headers = Vec::new();
     for line in lines {
@@ -6655,7 +6349,7 @@ fn parse_http_request_head(head: &[u8]) -> io::Result<HttpRequest> {
     Ok(HttpRequest {
         method: method.to_string(),
         target: target.to_string(),
-        version: version.to_string(),
+        version,
         headers,
         body: Vec::new(),
     })
@@ -6925,42 +6619,7 @@ fn find_header_end(buffer: &[u8]) -> Option<usize> {
 }
 
 fn effective_request_host(request: &HttpRequest) -> Option<String> {
-    validated_request_host_header(request)
-        .ok()
-        .and_then(normalize_request_host)
-}
-
-fn request_host_from_target(target: &str) -> Option<&str> {
-    let rest = target.strip_prefix("http://")?;
-    let end = rest
-        .char_indices()
-        .find_map(|(index, character)| matches!(character, '/' | '?').then_some(index))
-        .unwrap_or(rest.len());
-    Some(&rest[..end])
-}
-
-fn normalized_request_authority(value: &str) -> io::Result<(String, u16)> {
-    let (host, port) = parse_authority(value).map_err(|error| invalid_data(error.to_string()))?;
-    Ok((host.to_ascii_lowercase(), port.unwrap_or(DEFAULT_HTTP_PORT)))
-}
-
-fn normalize_request_host(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    let bracketless = value
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(value);
-    if bracketless.parse::<IpAddr>().is_ok() {
-        return Some(bracketless.to_ascii_lowercase());
-    }
-
-    parse_authority(value)
-        .ok()
-        .map(|(host, _)| host.to_ascii_lowercase())
+    normalized_request_host(request).ok()
 }
 
 fn connection_nominated_headers(headers: &[HttpHeader]) -> Vec<String> {
@@ -9989,7 +9648,7 @@ mod tests {
 
         assert_eq!(request.method, "POST");
         assert_eq!(request.target, "/api/v1/imports");
-        assert_eq!(request.version, "HTTP/1.1");
+        assert_eq!(request.version, HttpVersion::Http11);
         assert_eq!(request.body, br#"{"source":"lab"}"#);
     }
 
@@ -10004,7 +9663,7 @@ mod tests {
             .expect("request should parse")
             .expect("request should be present");
 
-        let forwarded = String::from_utf8(request.to_upstream_bytes(&upstream).unwrap())
+        let forwarded = String::from_utf8(request_to_upstream_bytes(&request, &upstream).unwrap())
             .expect("forwarded request should be utf8");
 
         assert!(forwarded.starts_with("GET /docs?view=full HTTP/1.1\r\n"));
@@ -10031,7 +9690,7 @@ mod tests {
             normalized_event_path(&request).expect("target should canonicalize"),
             "/docs?x=~&slash=%2F"
         );
-        let forwarded = String::from_utf8(request.to_upstream_bytes(&upstream).unwrap())
+        let forwarded = String::from_utf8(request_to_upstream_bytes(&request, &upstream).unwrap())
             .expect("forwarded request should be utf8");
         assert!(forwarded.starts_with("GET /docs?x=~&slash=%2F HTTP/1.1\r\n"));
     }
@@ -10045,7 +9704,7 @@ mod tests {
         let request = HttpRequest {
             method: "GET".to_string(),
             target: "/docs".to_string(),
-            version: "HTTP/1.1".to_string(),
+            version: HttpVersion::Http11,
             headers: vec![
                 HttpHeader {
                     name: "Host".to_string(),
@@ -10091,7 +9750,7 @@ mod tests {
             body: Vec::new(),
         };
 
-        let forwarded = String::from_utf8(request.to_upstream_bytes(&upstream).unwrap())
+        let forwarded = String::from_utf8(request_to_upstream_bytes(&request, &upstream).unwrap())
             .expect("forwarded request should be utf8");
 
         assert!(forwarded.contains("\r\nHost: 127.0.0.1:9001\r\n"));
@@ -10117,7 +9776,7 @@ mod tests {
             .expect("request should parse")
             .expect("request should be present");
 
-        let forwarded = String::from_utf8(request.to_upstream_bytes(&upstream).unwrap())
+        let forwarded = String::from_utf8(request_to_upstream_bytes(&request, &upstream).unwrap())
             .expect("forwarded request should be utf8");
         let content_length_lines = forwarded
             .lines()
@@ -10444,7 +10103,7 @@ mod tests {
         let request = HttpRequest {
             method: "GET".to_string(),
             target: "http://proxy.local/docs".to_string(),
-            version: "HTTP/1.1".to_string(),
+            version: HttpVersion::Http11,
             headers: vec![HttpHeader {
                 name: "Host".to_string(),
                 value: "other.local".to_string(),
@@ -10471,7 +10130,7 @@ mod tests {
         let request = HttpRequest {
             method: "GET".to_string(),
             target: "/docs".to_string(),
-            version: "HTTP/1.1".to_string(),
+            version: HttpVersion::Http11,
             headers: Vec::new(),
             body: Vec::new(),
         };
@@ -10519,7 +10178,17 @@ mod tests {
         for byte in 0_u8..=127 {
             let target = format!("/a%{byte:02X}b");
             let result = canonicalize_request_target(&target);
-            if is_unreserved_path_byte(byte) {
+            let is_unreserved = matches!(
+                byte,
+                b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'0'..=b'9'
+                    | b'-'
+                    | b'.'
+                    | b'_'
+                    | b'~'
+            );
+            if is_unreserved {
                 let expected = format!("/a{}b", byte as char);
                 let canonical = result.unwrap_or_else(|error| {
                     panic!("unreserved byte {byte:#04x} should canonicalize: {error}")
@@ -10556,9 +10225,29 @@ mod tests {
                 continue;
             }
             let target = format!("/a{}b", byte as char);
+            let expected = byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b'='
+                        | b':'
+                        | b'@'
+                        | b'/'
+                );
             assert_eq!(
                 canonicalize_request_target(&target).is_ok(),
-                is_raw_path_byte(byte),
+                expected,
                 "unexpected raw path treatment for byte {byte:#04x}"
             );
         }
@@ -10568,9 +10257,30 @@ mod tests {
                 continue;
             }
             let target = format!("/docs?x={}y", byte as char);
+            let expected = byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b'='
+                        | b':'
+                        | b'@'
+                        | b'/'
+                        | b'?'
+                );
             assert_eq!(
                 canonicalize_request_target(&target).is_ok(),
-                is_raw_query_byte(byte),
+                expected,
                 "unexpected raw query treatment for byte {byte:#04x}"
             );
         }

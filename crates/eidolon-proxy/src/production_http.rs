@@ -1,74 +1,50 @@
 use std::{error::Error, fmt};
 
-use http::uri::Authority;
 use hyper::{
     header::{CONNECTION, CONTENT_LENGTH, EXPECT, HOST, TRAILER, TRANSFER_ENCODING, UPGRADE},
     Method, Request, Version,
 };
 
+use crate::http_request::{
+    canonical_request_target, HttpHeader, HttpRequest, HttpVersion, RequestTargetMode,
+    RequestTargetRejection, MAX_HTTP_BODY_BYTES, MAX_HTTP_HEADER_BYTES,
+};
+
 pub const MAX_PRODUCTION_HEADER_COUNT: usize = 100;
-pub const MAX_PRODUCTION_HEADER_BYTES: usize = 64 * 1024;
-pub const MAX_PRODUCTION_BODY_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_PRODUCTION_HEADER_BYTES: usize = MAX_HTTP_HEADER_BYTES;
+pub const MAX_PRODUCTION_BODY_BYTES: usize = MAX_HTTP_BODY_BYTES;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProductionHttpVersion {
-    Http10,
-    Http11,
-}
+pub type ProductionHttpVersion = HttpVersion;
+pub type ProductionHttpHeader = HttpHeader;
 
-impl ProductionHttpVersion {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Http10 => "HTTP/1.0",
-            Self::Http11 => "HTTP/1.1",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProductionHttpHeader {
-    name: String,
-    value: String,
-}
-
-impl ProductionHttpHeader {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn value(&self) -> &str {
-        &self.value
-    }
-}
-
+/// Request accepted by the production adapter after all boundary validation.
+///
+/// The inner parsed request stays private so callers cannot construct or
+/// mutate a production request without passing through `adapt_hyper_request`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionHttpRequest {
-    method: String,
-    target: String,
-    version: ProductionHttpVersion,
-    headers: Vec<ProductionHttpHeader>,
-    body: Vec<u8>,
+    request: HttpRequest,
 }
 
 impl ProductionHttpRequest {
     pub fn method(&self) -> &str {
-        &self.method
+        self.request.method()
     }
 
     pub fn target(&self) -> &str {
-        &self.target
+        self.request.target()
     }
 
     pub fn version(&self) -> ProductionHttpVersion {
-        self.version
+        self.request.version()
     }
 
     pub fn headers(&self) -> &[ProductionHttpHeader] {
-        &self.headers
+        self.request.headers()
     }
 
     pub fn body(&self) -> &[u8] {
-        &self.body
+        self.request.body()
     }
 }
 
@@ -157,7 +133,6 @@ where
     }
 
     let target = request.uri().to_string();
-    validate_target_form(request.method(), &target)?;
 
     let header_count = request.headers().iter().count();
     if header_count > MAX_PRODUCTION_HEADER_COUNT {
@@ -168,7 +143,6 @@ where
     }
 
     reject_unsupported_protocol_headers(&request)?;
-    validate_host(&request)?;
 
     let body = request.body().as_ref();
     if body.len() > MAX_PRODUCTION_BODY_BYTES {
@@ -180,9 +154,13 @@ where
         .headers()
         .iter()
         .map(|(name, value)| {
-            let value = value
-                .to_str()
-                .map_err(|_| ProductionRequestRejection::NonAsciiHeaderValue)?;
+            let value = value.to_str().map_err(|_| {
+                if name == HOST {
+                    ProductionRequestRejection::InvalidHost
+                } else {
+                    ProductionRequestRejection::NonAsciiHeaderValue
+                }
+            })?;
             Ok(ProductionHttpHeader {
                 name: name.as_str().to_string(),
                 value: value.to_string(),
@@ -190,27 +168,16 @@ where
         })
         .collect::<Result<Vec<_>, ProductionRequestRejection>>()?;
 
-    Ok(ProductionHttpRequest {
+    let mut adapted = HttpRequest {
         method: request.method().as_str().to_string(),
         target,
         version,
         headers,
         body: body.to_vec(),
-    })
-}
-
-fn validate_target_form(method: &Method, target: &str) -> Result<(), ProductionRequestRejection> {
-    if target == "*" {
-        return if method == Method::OPTIONS {
-            Ok(())
-        } else {
-            Err(ProductionRequestRejection::InvalidTargetForm)
-        };
-    }
-    if target.starts_with('/') && !target.starts_with("//") {
-        return Ok(());
-    }
-    Err(ProductionRequestRejection::InvalidTargetForm)
+    };
+    adapted.target = canonical_request_target(&adapted, RequestTargetMode::OriginOnly)
+        .map_err(map_target_rejection)?;
+    Ok(ProductionHttpRequest { request: adapted })
 }
 
 fn encoded_head_len<B>(
@@ -264,33 +231,17 @@ fn reject_unsupported_protocol_headers<B>(
     Ok(())
 }
 
-fn validate_host<B>(request: &Request<B>) -> Result<(), ProductionRequestRejection> {
-    let hosts = request.headers().get_all(HOST);
-    let mut hosts = hosts.iter();
-    let host = hosts
-        .next()
-        .ok_or(ProductionRequestRejection::MissingHost)?;
-    if hosts.next().is_some() {
-        return Err(ProductionRequestRejection::MultipleHostHeaders);
+fn map_target_rejection(rejection: RequestTargetRejection) -> ProductionRequestRejection {
+    match rejection {
+        RequestTargetRejection::MissingHost => ProductionRequestRejection::MissingHost,
+        RequestTargetRejection::MultipleHostHeaders => {
+            ProductionRequestRejection::MultipleHostHeaders
+        }
+        RequestTargetRejection::InvalidHost(_) | RequestTargetRejection::AuthorityMismatch => {
+            ProductionRequestRejection::InvalidHost
+        }
+        RequestTargetRejection::InvalidTarget(_) => ProductionRequestRejection::InvalidTargetForm,
     }
-    let host = host
-        .to_str()
-        .map_err(|_| ProductionRequestRejection::InvalidHost)?;
-    let authority = host
-        .parse::<Authority>()
-        .map_err(|_| ProductionRequestRejection::InvalidHost)?;
-    let canonical_len = authority.host().len()
-        + authority
-            .port()
-            .map(|port| 1 + port.as_str().len())
-            .unwrap_or(0);
-    if host.contains('@')
-        || authority.port_u16() == Some(0)
-        || canonical_len != authority.as_str().len()
-    {
-        return Err(ProductionRequestRejection::InvalidHost);
-    }
-    Ok(())
 }
 
 fn validate_content_length<B>(
@@ -335,7 +286,7 @@ mod tests {
     };
 
     use super::{
-        adapt_hyper_request, ProductionHttpVersion, ProductionRequestRejection,
+        adapt_hyper_request, encoded_head_len, ProductionHttpVersion, ProductionRequestRejection,
         MAX_PRODUCTION_BODY_BYTES, MAX_PRODUCTION_HEADER_BYTES, MAX_PRODUCTION_HEADER_COUNT,
     };
 
@@ -468,6 +419,33 @@ mod tests {
 
         let options = request(Method::OPTIONS, "*", Vec::new());
         assert!(adapt_hyper_request(options).is_ok());
+
+        for target in [
+            "/a/../b",
+            "/api%2Fops",
+            "/a//b",
+            "/docs;parameter",
+            "/%2e%2e/etc",
+        ] {
+            let request = request(Method::GET, target, Vec::new());
+            assert_rejected_before_dispatch(request, ProductionRequestRejection::InvalidTargetForm);
+        }
+    }
+
+    #[test]
+    fn returns_the_shared_canonical_target() {
+        let request = request(
+            Method::GET,
+            "/api/v2/import/recon%63ile?label=%7e",
+            Vec::new(),
+        );
+        let adapted = adapt_hyper_request(request).expect("canonical target should adapt");
+
+        assert_eq!(
+            adapted.target(),
+            "/api/v2/import/reconcile?label=~",
+            "production dispatch must consume the shared canonical spelling"
+        );
     }
 
     #[test]
@@ -542,6 +520,16 @@ mod tests {
 
     #[test]
     fn enforces_header_count_and_encoded_size_limits() {
+        let mut exact_count = request(Method::GET, "/docs", Vec::new());
+        for index in 0..MAX_PRODUCTION_HEADER_COUNT - 1 {
+            let name = HeaderName::from_bytes(format!("x-exact-{index}").as_bytes())
+                .expect("header name should parse");
+            exact_count
+                .headers_mut()
+                .insert(name, HeaderValue::from_static("1"));
+        }
+        adapt_hyper_request(exact_count).expect("exact header count limit should be accepted");
+
         let mut too_many = request(Method::GET, "/docs", Vec::new());
         for index in 0..MAX_PRODUCTION_HEADER_COUNT {
             let name = HeaderName::from_bytes(format!("x-limit-{index}").as_bytes())
@@ -559,6 +547,25 @@ mod tests {
             HeaderValue::from_str(&value).expect("large header should build"),
         );
         assert_rejected_before_dispatch(too_large, ProductionRequestRejection::HeadersTooLarge);
+
+        let mut exact_size = request(Method::GET, "/docs", Vec::new());
+        let target = exact_size.uri().to_string();
+        let current_size =
+            encoded_head_len(&exact_size, &target).expect("base request size should fit");
+        let padding_name = "x-pad";
+        let padding_len = MAX_PRODUCTION_HEADER_BYTES
+            .checked_sub(current_size + padding_name.len() + 4)
+            .expect("production header budget should fit padding");
+        exact_size.headers_mut().insert(
+            padding_name,
+            HeaderValue::from_str(&"a".repeat(padding_len))
+                .expect("exact-limit header should build"),
+        );
+        assert_eq!(
+            encoded_head_len(&exact_size, &target).expect("exact request size should calculate"),
+            MAX_PRODUCTION_HEADER_BYTES
+        );
+        adapt_hyper_request(exact_size).expect("exact header byte limit should be accepted");
     }
 
     #[test]
@@ -605,6 +612,19 @@ mod tests {
 
     #[test]
     fn rejects_actual_body_above_limit_before_dispatch() {
+        let exact = request(
+            Method::POST,
+            "/api/v1/imports",
+            vec![b'x'; MAX_PRODUCTION_BODY_BYTES],
+        );
+        assert_eq!(
+            adapt_hyper_request(exact)
+                .expect("exact body limit should be accepted")
+                .body()
+                .len(),
+            MAX_PRODUCTION_BODY_BYTES
+        );
+
         let body = vec![b'x'; MAX_PRODUCTION_BODY_BYTES + 1];
         let request = request(Method::POST, "/api/v1/imports", body);
         assert_rejected_before_dispatch(request, ProductionRequestRejection::BodyTooLarge);
