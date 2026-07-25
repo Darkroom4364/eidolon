@@ -1219,7 +1219,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         }
         None => (None, None),
     };
-    let (session_authority, session_signing_mode) = match &config.session_signing_key_path {
+    let (mut session_authority, session_signing_mode) = match &config.session_signing_key_path {
         Some(path) => (
             SessionAuthority::from_key_file_json(&fs::read(path)?)?,
             "configured",
@@ -1247,11 +1247,47 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     let restored_consumed_bait_proof_torn_tail_line = consumed_bait_proofs.torn_tail_line;
     let consumed_proof_state_path = consumed_bait_proofs.path.clone();
     let consumed_proof_migration_quarantine_until = consumed_bait_proofs.migration_quarantine_until;
+    let continuity_history_exists = event_log_history_exists(&config.event_log_path)?
+        || path_has_nonempty_file(&config.policy_state_path)?;
     let policy_store = PolicyStateStore::open(&config.policy_state_path)?;
     let policy_store_eviction = policy_store.last_eviction_stats();
     let policy_store_session_count = policy_store.len();
     let policy_store_fail_closed_for_unknown_sessions =
         policy_store.fail_closed_for_unknown_sessions();
+    let durable_continuity_startup =
+        if let Some(transport_secret) = ingress_transport_auth_secret.as_deref() {
+            let continuity_state_path =
+                sidecar_state_path(&config.policy_state_path, ".continuity.json");
+            let startup = session_authority.enable_durable_continuity(
+                &continuity_state_path,
+                transport_secret,
+                continuity_history_exists,
+                now,
+            )?;
+            let reconciled_floor_count =
+                session_authority.reconcile_durable_continuity_floors(|session_id| {
+                    if policy_store.uses_fail_closed_fallback(session_id) {
+                        PolicyState::Blocked
+                    } else {
+                        policy_store.policy_state(session_id)
+                    }
+                })?;
+            Some((startup, reconciled_floor_count))
+        } else {
+            None
+        };
+    let durable_continuity_debug =
+        durable_continuity_startup
+            .as_ref()
+            .map(|(startup, reconciled_floor_count)| {
+                json!({
+                    "state_path": startup.path,
+                    "restored_record_count": startup.restored_record_count,
+                    "ttl_evicted_record_count": startup.ttl_evicted_record_count,
+                    "migration_quarantine_until": startup.migration_quarantine_until,
+                    "reconciled_floor_count": reconciled_floor_count,
+                })
+            });
     let event_log_writer = FileEventLogWriter::open(&config.event_log_path)?;
     let event_log_tail_repair = event_log_writer.startup_tail_repair();
     let controlled_reality_backend = match &config.controlled_reality_backend {
@@ -1335,6 +1371,11 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 "authenticated_ingress_required"
             } else {
                 "lab_direct_peer_with_optional_authenticated_ingress"
+            },
+            "durable_authenticated_continuity": durable_continuity_debug,
+            "durable_continuity_admission": {
+                "max_new_mappings": eidolon_proxy::session_auth::MAX_DURABLE_CONTINUITY_INSERTS_PER_WINDOW,
+                "window_secs": eidolon_proxy::session_auth::DURABLE_CONTINUITY_INSERT_WINDOW_SECS,
             },
             "trusted_bait_soften_path_prefixes": runtime.trusted_bait_soften_path_prefixes,
             "restored_bait_exposure_count": restored_bait_exposure_count,
@@ -1511,8 +1552,8 @@ struct StoredConsumedProof {
     expires_at_unix_secs: u64,
 }
 
-fn state_path_for_event_log(event_log_path: &Path, suffix: &str) -> PathBuf {
-    let mut path = event_log_path.as_os_str().to_os_string();
+fn sidecar_state_path(base_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = base_path.as_os_str().to_os_string();
     path.push(suffix);
     PathBuf::from(path)
 }
@@ -1605,10 +1646,7 @@ fn parse_digest_hex(value: &str) -> io::Result<[u8; 32]> {
 }
 
 fn event_log_history_exists(path: &Path) -> io::Result<bool> {
-    if fs::metadata(path)
-        .map(|metadata| metadata.len() > 0)
-        .unwrap_or(false)
-    {
+    if path_has_nonempty_file(path)? {
         return Ok(true);
     }
     let parent = path
@@ -1630,6 +1668,14 @@ fn event_log_history_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
+fn path_has_nonempty_file(path: &Path) -> io::Result<bool> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len() > 0),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 impl ConsumedBaitProofStore {
     fn open_or_rebuild(
         event_log_path: &Path,
@@ -1637,7 +1683,7 @@ impl ConsumedBaitProofStore {
         signing_secret: Option<&str>,
         now: u64,
     ) -> io::Result<Self> {
-        let state_path = state_path_for_event_log(event_log_path, ".consumed-proofs.json");
+        let state_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
         match fs::read(&state_path) {
             Ok(bytes) => Self::from_state_bytes(state_path, &bytes, now),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1926,7 +1972,7 @@ fn proof_expiry_epoch_seconds(bait: &Bait, proof_value: &str) -> io::Result<u64>
 
 impl BaitExposureStore {
     fn open_or_rebuild(event_log_path: &Path, now: u64) -> io::Result<Self> {
-        let state_path = state_path_for_event_log(event_log_path, ".exposures.json");
+        let state_path = sidecar_state_path(event_log_path, ".exposures.json");
         match fs::read(&state_path) {
             Ok(bytes) => {
                 let store = Self::from_state_bytes(state_path, &bytes, now)?;
@@ -3099,6 +3145,17 @@ fn handle_connection(
                 }
                 Err(error) => return Err(error),
             };
+            if session.continuity_outcome.is_fail_closed() {
+                return write_session_continuity_fail_closed(
+                    client_stream,
+                    runtime,
+                    &session,
+                    &request,
+                    REJECTED_REQUEST_TARGET,
+                    request_id,
+                    intervention_mode,
+                );
+            }
             write_debug(
                 runtime,
                 "ambiguous_request_target_rejected",
@@ -3147,37 +3204,16 @@ fn handle_connection(
         }
         Err(error) => return Err(error),
     };
-    if session.continuity_outcome == ContinuityOutcome::CapacityFailClosed {
-        write_debug(
-            runtime,
-            "session_continuity_capacity_fail_closed",
-            Some(session.session_id),
-            json!({
-                "request_id": request_id.0,
-                "outcome": session.continuity_outcome.as_str(),
-            }),
-        )?;
-        let decision = policy::PolicyDecision::new(
-            PolicyState::Blocked,
-            RoutingDecision::EidolonOwned,
-            "session continuity capacity saturated; unknown identity failed closed",
-        );
-        return write_direct_response(DirectResponseContext {
+    if session.continuity_outcome.is_fail_closed() {
+        return write_session_continuity_fail_closed(
             client_stream,
             runtime,
-            session: &session,
-            request: &request,
-            path: &path,
+            &session,
+            &request,
+            &path,
             request_id,
-            decision: &decision,
-            discovery_recon_score: policy::DiscoveryReconAggregationScore::default(),
-            discovery_recon_threshold: policy::discovery_recon_aggregation_score_threshold(),
-            response: surface_text_response(503, "service temporarily unavailable\n"),
-            controlled_reality_interaction: None,
-            controlled_reality_pending_commit: false,
             intervention_mode,
-            surface_requested_intervention: true,
-        });
+        );
     }
     let (mut policy_state, capacity_fail_closed) =
         policy_state_resolution_for_session(runtime, session.session_id)?;
@@ -4296,6 +4332,68 @@ fn write_session_continuity_rejection(
     client_stream.flush()
 }
 
+fn write_session_continuity_fail_closed(
+    client_stream: TcpStream,
+    runtime: &ProxyRuntime,
+    session: &SessionContext,
+    request: &HttpRequest,
+    path: &str,
+    request_id: RequestId,
+    intervention_mode: InterventionMode,
+) -> io::Result<()> {
+    let (debug_event, reason) = match session.continuity_outcome {
+        ContinuityOutcome::CapacityFailClosed => (
+            "session_continuity_capacity_fail_closed",
+            "session continuity capacity saturated; unknown identity failed closed",
+        ),
+        ContinuityOutcome::MigrationQuarantineFailClosed => (
+            "session_continuity_migration_quarantine_fail_closed",
+            "historical continuity state is unavailable; unknown identity failed closed",
+        ),
+        ContinuityOutcome::StorageUnavailable => (
+            "session_continuity_storage_unavailable",
+            "session continuity state could not be durably committed",
+        ),
+        ContinuityOutcome::AdmissionRateFailClosed => (
+            "session_continuity_admission_rate_fail_closed",
+            "session continuity durable admission rate exceeded",
+        ),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session continuity outcome is not fail-closed",
+            ));
+        }
+    };
+    write_debug(
+        runtime,
+        debug_event,
+        Some(session.session_id),
+        json!({
+            "request_id": request_id.0,
+            "outcome": session.continuity_outcome.as_str(),
+        }),
+    )?;
+    let decision =
+        policy::PolicyDecision::new(PolicyState::Blocked, RoutingDecision::EidolonOwned, reason);
+    write_direct_response(DirectResponseContext {
+        client_stream,
+        runtime,
+        session,
+        request,
+        path,
+        request_id,
+        decision: &decision,
+        discovery_recon_score: policy::DiscoveryReconAggregationScore::default(),
+        discovery_recon_threshold: policy::discovery_recon_aggregation_score_threshold(),
+        response: surface_text_response(503, "service temporarily unavailable\n"),
+        controlled_reality_interaction: None,
+        controlled_reality_pending_commit: false,
+        intervention_mode,
+        surface_requested_intervention: true,
+    })
+}
+
 struct DirectResponseContext<'a> {
     client_stream: TcpStream,
     runtime: &'a ProxyRuntime,
@@ -4508,9 +4606,9 @@ fn policy_state_resolution_for_session(
     ))
 }
 
-/// Best-effort enforcement-floor feedback for peer continuity. The policy
-/// store remains authoritative; a poisoned authority lock only weakens the
-/// rotation-abuse safety net for later requests, never current routing.
+/// Best-effort enforcement-floor feedback for continuity. The durable policy
+/// store remains authoritative and reconstructs authenticated floors after a
+/// restart; a poisoned authority lock never weakens current routing.
 fn note_session_enforcement(
     runtime: &ProxyRuntime,
     session: &SessionContext,
@@ -10850,7 +10948,7 @@ mod tests {
         let session = SessionId::new();
         let bait = BaitId("durable-proof".to_string());
         let proof = "secret-proof-value".to_string();
-        let state_path = state_path_for_event_log(&event_log, ".consumed-proofs.json");
+        let state_path = sidecar_state_path(&event_log, ".consumed-proofs.json");
 
         let mut store =
             ConsumedBaitProofStore::open_or_rebuild(&event_log, &loaded.registry, None, 1_000)
@@ -11365,7 +11463,7 @@ mod tests {
     #[test]
     fn bait_exposure_state_compacts_over_capacity_on_restart() {
         let event_log = unique_temp_path("over-capacity-exposure-state.jsonl");
-        let state_path = state_path_for_event_log(&event_log, ".exposures.json");
+        let state_path = sidecar_state_path(&event_log, ".exposures.json");
         let exposures = (0..MAX_BAIT_EXPOSURES + 3)
             .map(|index| StoredBaitExposure {
                 session_id: SessionId::new(),
@@ -17773,6 +17871,130 @@ mod tests {
         assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
         assert_eq!(
             debug_events(&debug_log_path, "session_continuity_capacity_fail_closed").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_continuity_migration_quarantine_never_reaches_upstream() {
+        let event_log_path = unique_temp_path("continuity-quarantine-events.jsonl");
+        let debug_log_path = unique_temp_path("continuity-quarantine-debug.jsonl");
+        let intervention_path = unique_temp_path("continuity-quarantine-control.txt");
+        let continuity_path = unique_temp_path("continuity-quarantine-state.json");
+        fs::write(&intervention_path, b"disabled\n").expect("control file should write");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            intervention_path,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::from("edge-secret"));
+        runtime.require_authenticated_ingress_continuity = true;
+        runtime
+            .session_authority
+            .lock()
+            .expect("session authority should lock")
+            .enable_durable_continuity(&continuity_path, "edge-secret", true, now_unix_secs())
+            .expect("historical deployment should enter quarantine");
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie(
+                "GET",
+                "/ordinary",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
+                ],
+            ),
+        ));
+        let ambiguous_request = format!(
+            "GET /docs;secret=value HTTP/1.1\r\nHost: proxy.local\r\nCookie: {}\r\n{}: edge-secret\r\n{}: {}\r\n\r\n",
+            cookie_header(),
+            session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+            session::INGRESS_CONTINUITY_HEADER_NAME,
+            TEST_INGRESS_CONTINUITY_ID,
+        );
+        let ambiguous_response =
+            parse_downstream_response(&run_runtime_request(runtime, ambiguous_request.as_bytes()));
+
+        assert_eq!(response.status, 503);
+        assert_eq!(ambiguous_response.status, 503);
+        assert!(header_values(&response, "set-cookie").is_empty());
+        assert!(header_values(&ambiguous_response, "set-cookie").is_empty());
+        assert!(
+            upstream_recorder.finish().is_empty(),
+            "migration quarantine reached protected upstream"
+        );
+        assert_eq!(
+            debug_events(
+                &debug_log_path,
+                "session_continuity_migration_quarantine_fail_closed"
+            )
+            .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn runtime_continuity_storage_failure_never_reaches_upstream() {
+        let event_log_path = unique_temp_path("continuity-storage-failure-events.jsonl");
+        let debug_log_path = unique_temp_path("continuity-storage-failure-debug.jsonl");
+        let intervention_path = unique_temp_path("continuity-storage-failure-control.txt");
+        let continuity_path = unique_temp_path("continuity-storage-failure-state.json");
+        fs::write(&intervention_path, b"disabled\n").expect("control file should write");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            intervention_path,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::from("edge-secret"));
+        runtime.require_authenticated_ingress_continuity = true;
+        runtime
+            .session_authority
+            .lock()
+            .expect("session authority should lock")
+            .enable_durable_continuity(&continuity_path, "edge-secret", false, now_unix_secs())
+            .expect("durable continuity should initialize");
+        let mut temp_path = continuity_path.as_os_str().to_os_string();
+        temp_path.push(".tmp");
+        let temp_path = PathBuf::from(temp_path);
+        fs::create_dir(&temp_path).expect("blocking temp directory should be created");
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/ordinary",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
+                ],
+            ),
+        ));
+        fs::remove_dir(&temp_path).expect("blocking temp directory should be removed");
+
+        assert_eq!(response.status, 503);
+        assert!(header_values(&response, "set-cookie").is_empty());
+        assert!(
+            upstream_recorder.finish().is_empty(),
+            "continuity storage failure reached protected upstream"
+        );
+        assert_eq!(
+            debug_events(&debug_log_path, "session_continuity_storage_unavailable").len(),
             1
         );
     }

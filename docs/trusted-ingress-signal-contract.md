@@ -203,9 +203,19 @@ Reserved and now captured in authenticated request audit events:
 - Continuity storage is TTL- and capacity-bounded. Suspicious-or-higher records
   are not evicted; if they saturate capacity, an unknown identity receives a
   `503` Eidolon-owned response even when interventions are disabled.
-- Continuity records are currently in memory. After restart, a valid signed
-  session cookie is still required until the durable-continuity follow-up in
-  issue `#254` lands.
+- Authenticated continuity mappings are HMAC-minimized and persisted beside
+  policy state at `<policy-state-path>.continuity.json`. Raw continuity
+  identities and process-local Lab peer keys are excluded. The sidecar is
+  HMAC-authenticated, and new durable mappings are limited to 64 per rolling
+  60-second window so a trusted ingress cannot trigger unbounded synchronous
+  state rewrites.
+- If the sidecar is missing while prior state exists, unknown authenticated
+  identities fail closed for a bounded migration quarantine. Corrupt state or
+  state bound to a different transport key prevents startup.
+- Transport-key rotation for live continuity state remains part of issue
+  `#254`; this slice never trusts old-key timestamps to bypass verification.
+- This persistence slice does not complete issue `#254` or establish
+  production readiness.
 - Adapters must only emit normalized values, never secrets or raw signatures.
 - Headers are request-scoped, not session-scoped storage.
 - Large raw payloads belong in sidecar logs or webhooks, not inline request

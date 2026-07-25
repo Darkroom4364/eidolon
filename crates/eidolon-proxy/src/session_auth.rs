@@ -17,15 +17,16 @@
 //! - key rotation is explicit: cookies signed by retired key versions still
 //!   verify and are transparently re-minted under the active version.
 //!
-//! The continuity map is in-memory, capacity-bounded, and TTL-bounded. It is a
-//! safety net for enforcement state, not a general identity primitive. A
-//! restart still requires a valid signed cookie until continuity persistence
-//! is added.
+//! Continuity is capacity- and TTL-bounded. Authenticated-ingress mappings can
+//! be persisted as HMAC-minimized sidecar records; raw identities and Lab peer
+//! keys are never written. It remains an enforcement safety net, not a general
+//! identity primitive.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 
 use eidolon_core::{PolicyState, SessionId};
 use hmac::{Hmac, Mac};
@@ -33,6 +34,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::session::{SESSION_COOKIE_ATTRIBUTES, SESSION_COOKIE_NAME};
+use crate::session_continuity_store::{
+    self, IntegrityKey, StateCommitOutcome, StoredContinuityRecord, StoredContinuityState,
+};
 
 type SessionMac = Hmac<Sha256>;
 
@@ -58,6 +62,15 @@ pub const CONTINUITY_RECOVERY_COOLDOWN_SECS: u64 = 60;
 /// Default bound on tracked continuity identities.
 pub const DEFAULT_CONTINUITY_CAPACITY: usize = 4096;
 
+/// Maximum delay before last-seen-only continuity changes are checkpointed.
+pub const CONTINUITY_CHECKPOINT_INTERVAL_SECS: u64 = 60;
+
+/// Rolling window used to bound synchronous durable mapping creation.
+pub const DURABLE_CONTINUITY_INSERT_WINDOW_SECS: u64 = 60;
+
+/// Maximum new authenticated mappings durably admitted per rolling window.
+pub const MAX_DURABLE_CONTINUITY_INSERTS_PER_WINDOW: usize = 64;
+
 /// Tolerance for cookies whose issue time is slightly ahead of the proxy clock.
 pub const MAX_FUTURE_SKEW_SECS: u64 = 300;
 
@@ -65,6 +78,7 @@ const MAC_HEX_CHARS: usize = 64;
 const SESSION_KEY_BYTES: usize = 32;
 const CONTINUITY_HASH_DOMAIN_INGRESS: &[u8] = b"eidolon-continuity:trusted-ingress:v1\0";
 const CONTINUITY_HASH_DOMAIN_LAB_PEER: &[u8] = b"eidolon-continuity:lab-peer:v1\0";
+const CONTINUITY_TRANSPORT_KEY_ID_DOMAIN: &[u8] = b"eidolon-continuity:transport-key-id:v1\0";
 
 /// Authenticated source used to derive a minimized continuity key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -116,6 +130,17 @@ impl ContinuityKey {
 
     pub fn source(self) -> ContinuitySource {
         self.source
+    }
+
+    fn authenticated_from_digest(digest: [u8; 32]) -> Self {
+        Self {
+            source: ContinuitySource::AuthenticatedIngress,
+            digest,
+        }
+    }
+
+    fn digest(self) -> [u8; 32] {
+        self.digest
     }
 
     fn derive(source: ContinuitySource, domain: &[u8], value: &[u8]) -> Self {
@@ -215,6 +240,13 @@ pub enum ContinuityOutcome {
     /// Capacity was exhausted by protected records. The unknown identity was
     /// assigned a fresh blocked session without inserting a continuity record.
     CapacityFailClosed,
+    /// Historical state exists but no continuity sidecar was available to
+    /// recover an unauthenticated session binding.
+    MigrationQuarantineFailClosed,
+    /// A continuity mutation could not be durably committed before routing.
+    StorageUnavailable,
+    /// New durable mappings exceeded the bounded synchronous-write budget.
+    AdmissionRateFailClosed,
 }
 
 impl ContinuityOutcome {
@@ -228,7 +260,20 @@ impl ContinuityOutcome {
             Self::CooldownSessionPreserved => "cooldown_session_preserved",
             Self::CooldownLimited => "cooldown_limited",
             Self::CapacityFailClosed => "capacity_fail_closed",
+            Self::MigrationQuarantineFailClosed => "migration_quarantine_fail_closed",
+            Self::StorageUnavailable => "storage_unavailable",
+            Self::AdmissionRateFailClosed => "admission_rate_fail_closed",
         }
+    }
+
+    pub fn is_fail_closed(self) -> bool {
+        matches!(
+            self,
+            Self::CapacityFailClosed
+                | Self::MigrationQuarantineFailClosed
+                | Self::StorageUnavailable
+                | Self::AdmissionRateFailClosed
+        )
     }
 }
 
@@ -296,13 +341,20 @@ pub struct SessionKeyFileEntry {
     pub key_hex: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ContinuityRecord {
     session_id: SessionId,
     floor: Option<PolicyState>,
     last_seen: u64,
     last_recovery_at: Option<u64>,
     recovery_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuityInsertOutcome {
+    Inserted,
+    CapacityFailClosed,
+    AdmissionRateFailClosed,
 }
 
 /// Issues, verifies, and recovers session identities.
@@ -315,6 +367,24 @@ pub struct SessionAuthority {
     continuity_capacity: usize,
     continuity: HashMap<ContinuityKey, ContinuityRecord>,
     continuity_order: VecDeque<ContinuityKey>,
+    continuity_state_path: Option<PathBuf>,
+    continuity_transport_key_id_hex: Option<String>,
+    continuity_integrity_key: Option<IntegrityKey>,
+    continuity_migration_quarantine_until: Option<u64>,
+    continuity_last_checkpoint_at: u64,
+    continuity_dirty: bool,
+    continuity_checkpoint_dirty: bool,
+    continuity_security_revision: u64,
+    continuity_metadata_revision: u64,
+    durable_continuity_insert_times: VecDeque<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableContinuityStartup {
+    pub path: PathBuf,
+    pub restored_record_count: usize,
+    pub ttl_evicted_record_count: usize,
+    pub migration_quarantine_until: Option<u64>,
 }
 
 impl SessionAuthority {
@@ -344,6 +414,16 @@ impl SessionAuthority {
             continuity_capacity: DEFAULT_CONTINUITY_CAPACITY,
             continuity: HashMap::new(),
             continuity_order: VecDeque::new(),
+            continuity_state_path: None,
+            continuity_transport_key_id_hex: None,
+            continuity_integrity_key: None,
+            continuity_migration_quarantine_until: None,
+            continuity_last_checkpoint_at: 0,
+            continuity_dirty: false,
+            continuity_checkpoint_dirty: false,
+            continuity_security_revision: 0,
+            continuity_metadata_revision: 0,
+            durable_continuity_insert_times: VecDeque::new(),
         })
     }
 
@@ -410,6 +490,145 @@ impl SessionAuthority {
         Ok(())
     }
 
+    /// Load and enable restart-safe authenticated-ingress continuity.
+    ///
+    /// A missing sidecar on a deployment with prior state enters a bounded
+    /// migration quarantine because raw continuity identities are
+    /// intentionally unavailable for reconstruction.
+    pub fn enable_durable_continuity(
+        &mut self,
+        path: &Path,
+        transport_secret: &str,
+        history_exists: bool,
+        now: u64,
+    ) -> io::Result<DurableContinuityStartup> {
+        if self.continuity_state_path.is_some()
+            || !self.continuity.is_empty()
+            || !self.continuity_order.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable continuity must be enabled before continuity records exist",
+            ));
+        }
+        let transport_secret = transport_secret.trim();
+        if transport_secret.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable continuity requires a non-empty transport secret",
+            ));
+        }
+
+        let expected_key_id = continuity_transport_key_id_hex(transport_secret);
+        let integrity_key = IntegrityKey::derive(transport_secret)?;
+        let loaded = session_continuity_store::load_state(path, &integrity_key, &expected_key_id)?;
+        let mut ttl_evicted_record_count = 0;
+        let mut restored_record_count = 0;
+        let mut migration_quarantine_until = None;
+
+        if let Some(stored) = loaded {
+            let active_quarantine = stored
+                .migration_quarantine_until
+                .filter(|until| *until > now);
+            if stored
+                .records
+                .iter()
+                .any(|record| record.last_seen > now.saturating_add(MAX_FUTURE_SKEW_SECS))
+            {
+                return Err(invalid_data(
+                    "continuity state contains a future-dated last-seen timestamp",
+                ));
+            }
+            if active_quarantine
+                .is_some_and(|until| until.saturating_sub(now) > self.continuity_ttl_secs)
+            {
+                return Err(invalid_data(
+                    "continuity migration quarantine exceeds the maximum continuity lifetime",
+                ));
+            }
+            migration_quarantine_until = active_quarantine;
+
+            for record in stored.records {
+                if record.last_seen.saturating_add(self.continuity_ttl_secs) <= now {
+                    ttl_evicted_record_count += 1;
+                    continue;
+                }
+                if restored_record_count >= self.continuity_capacity {
+                    return Err(invalid_data(
+                        "active continuity state exceeds configured capacity",
+                    ));
+                }
+                let digest = decode_key_hex(&record.key_digest_hex).ok_or_else(|| {
+                    invalid_data(
+                        "continuity state key digest must contain exactly 64 hexadecimal characters",
+                    )
+                })?;
+                let key = ContinuityKey::authenticated_from_digest(digest);
+                self.continuity.insert(
+                    key,
+                    ContinuityRecord {
+                        session_id: record.session_id,
+                        floor: record.enforcement_floor,
+                        last_seen: record.last_seen,
+                        last_recovery_at: record.last_recovery_at,
+                        recovery_count: record.recovery_count,
+                    },
+                );
+                self.continuity_order.push_back(key);
+                restored_record_count += 1;
+            }
+        } else if history_exists {
+            migration_quarantine_until = Some(now.saturating_add(self.continuity_ttl_secs));
+        }
+
+        self.continuity_state_path = Some(path.to_path_buf());
+        self.continuity_transport_key_id_hex = Some(expected_key_id);
+        self.continuity_integrity_key = Some(integrity_key);
+        self.continuity_migration_quarantine_until = migration_quarantine_until;
+        self.continuity_last_checkpoint_at = now;
+        self.continuity_dirty = true;
+        self.continuity_checkpoint_dirty = true;
+        self.persist_continuity_state_durably()?;
+
+        Ok(DurableContinuityStartup {
+            path: path.to_path_buf(),
+            restored_record_count,
+            ttl_evicted_record_count,
+            migration_quarantine_until,
+        })
+    }
+
+    /// Reconcile restored continuity floors against the authoritative policy
+    /// store, then durably checkpoint the result before serving traffic.
+    pub fn reconcile_durable_continuity_floors(
+        &mut self,
+        mut policy_state_for_session: impl FnMut(SessionId) -> PolicyState,
+    ) -> io::Result<usize> {
+        let mut changed = 0;
+        for (key, record) in &mut self.continuity {
+            if key.source() != ContinuitySource::AuthenticatedIngress {
+                continue;
+            }
+            let policy_state = policy_state_for_session(record.session_id);
+            if record
+                .floor
+                .is_none_or(|floor| enforcement_rank(policy_state) > enforcement_rank(floor))
+            {
+                record.floor = Some(policy_state);
+                changed += 1;
+            }
+        }
+        if changed > 0 {
+            self.mark_authenticated_security_change();
+        }
+        self.persist_continuity_state_durably()?;
+        Ok(changed)
+    }
+
+    pub fn continuity_migration_quarantine_until(&self) -> Option<u64> {
+        self.continuity_migration_quarantine_until
+    }
+
     /// Mint the opaque cookie value (without attributes) for a session.
     pub fn mint_cookie_value(&self, session_id: SessionId, iat: u64) -> String {
         let payload = format!(
@@ -466,7 +685,120 @@ impl SessionAuthority {
     {
         self.evict_expired_continuity(now);
 
+        let previous_quarantine = self.continuity_migration_quarantine_until;
+        let previous_dirty = self.continuity_dirty;
+        let previous_checkpoint_dirty = self.continuity_checkpoint_dirty;
+        let previous_checkpoint = self.continuity_last_checkpoint_at;
+        let previous_security_revision = self.continuity_security_revision;
+        let previous_metadata_revision = self.continuity_metadata_revision;
+        let previous_record = continuity_key.and_then(|key| self.continuity.get(&key).copied());
+        let evicted_candidate = continuity_key
+            .filter(|key| !self.continuity.contains_key(key))
+            .filter(|_| self.continuity.len() >= self.continuity_capacity)
+            .and_then(|key| self.oldest_unprotected_continuity(key.source()));
+
+        if self
+            .continuity_migration_quarantine_until
+            .is_some_and(|until| until <= now)
+        {
+            self.continuity_migration_quarantine_until = None;
+            self.mark_authenticated_security_change();
+        }
+
+        let resolution = self.resolve_with_continuity_in_memory(headers, continuity_key, now);
+        if self.continuity_state_path.is_none() {
+            return resolution;
+        }
+
+        let security_changed = previous_security_revision != self.continuity_security_revision;
+        let metadata_changed = previous_metadata_revision != self.continuity_metadata_revision;
+        let checkpoint_due = now
+            >= self
+                .continuity_last_checkpoint_at
+                .saturating_add(CONTINUITY_CHECKPOINT_INTERVAL_SECS);
+        if !self.continuity_dirty && !(self.continuity_checkpoint_dirty && checkpoint_due) {
+            return resolution;
+        }
+
+        match self.persist_continuity_state() {
+            Ok(StateCommitOutcome::Durable) => {
+                self.continuity_dirty = false;
+                self.continuity_checkpoint_dirty = false;
+                self.continuity_last_checkpoint_at = now;
+                resolution
+            }
+            Ok(StateCommitOutcome::CommittedDurabilityUncertain) => {
+                self.continuity_dirty = true;
+                self.continuity_checkpoint_dirty = true;
+                self.storage_unavailable_resolution(resolution)
+            }
+            Err(error) => {
+                if security_changed || metadata_changed {
+                    if let Some(key) = continuity_key {
+                        match previous_record {
+                            Some(record) => {
+                                self.continuity.insert(key, record);
+                            }
+                            None => {
+                                self.continuity.remove(&key);
+                                self.continuity_order.retain(|candidate| *candidate != key);
+                            }
+                        }
+                    }
+                    if let Some((index, key, record)) = evicted_candidate {
+                        if let std::collections::hash_map::Entry::Vacant(entry) =
+                            self.continuity.entry(key)
+                        {
+                            entry.insert(record);
+                            self.continuity_order
+                                .insert(index.min(self.continuity_order.len()), key);
+                        }
+                    }
+                }
+                self.continuity_migration_quarantine_until = previous_quarantine;
+                self.continuity_dirty = previous_dirty;
+                self.continuity_checkpoint_dirty = previous_checkpoint_dirty;
+                self.continuity_last_checkpoint_at = previous_checkpoint;
+                self.continuity_security_revision = previous_security_revision;
+                self.continuity_metadata_revision = previous_metadata_revision;
+                eprintln!("eidolon persistence failure: session continuity state: {error}");
+                self.storage_unavailable_resolution(resolution)
+            }
+        }
+    }
+
+    fn resolve_with_continuity_in_memory<I, N, V>(
+        &mut self,
+        headers: I,
+        continuity_key: Option<ContinuityKey>,
+        now: u64,
+    ) -> SessionResolution
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: AsRef<str>,
+        V: AsRef<str>,
+    {
         let raw_cookie = session_cookie_value(headers);
+        if let Some(continuity_key) = continuity_key.filter(|key| {
+            key.source() == ContinuitySource::AuthenticatedIngress
+                && !self.continuity.contains_key(key)
+                && self
+                    .continuity_migration_quarantine_until
+                    .is_some_and(|until| until > now)
+        }) {
+            let (cookie_outcome, presented_key_version) = match raw_cookie.as_deref() {
+                Some(raw_cookie) => match self.verify(raw_cookie, now) {
+                    Ok(verified) => (CookieOutcome::Valid, Some(verified.key_version)),
+                    Err(result) => result,
+                },
+                None => (CookieOutcome::Absent, None),
+            };
+            return self.migration_quarantine_fail_closed(
+                continuity_key,
+                cookie_outcome,
+                presented_key_version,
+            );
+        }
         let Some(raw_cookie) = raw_cookie else {
             return self.recover_or_mint(continuity_key, now, CookieOutcome::Absent, None);
         };
@@ -543,7 +875,11 @@ impl SessionAuthority {
             if let Some(current) = self.continuity.get_mut(&continuity_key) {
                 current.last_seen = now;
                 if current.session_id == verified.session_id {
+                    current.last_recovery_at = None;
                     current.recovery_count = 0;
+                }
+                if continuity_key.source() == ContinuitySource::AuthenticatedIngress {
+                    self.mark_authenticated_metadata_change();
                 }
             }
 
@@ -595,14 +931,25 @@ impl SessionAuthority {
             (verified.session_id, ContinuityOutcome::NotApplicable)
         };
 
-        if !self.insert_continuity(continuity_key, session_id, now) {
-            return self.capacity_fail_closed(
-                continuity_key,
-                now,
-                CookieOutcome::Valid,
-                Some(key_status),
-                Some(verified.key_version),
-            );
+        match self.insert_continuity(continuity_key, session_id, now) {
+            ContinuityInsertOutcome::Inserted => {}
+            ContinuityInsertOutcome::CapacityFailClosed => {
+                return self.capacity_fail_closed(
+                    continuity_key,
+                    now,
+                    CookieOutcome::Valid,
+                    Some(key_status),
+                    Some(verified.key_version),
+                );
+            }
+            ContinuityInsertOutcome::AdmissionRateFailClosed => {
+                return self.admission_rate_fail_closed(
+                    continuity_key,
+                    CookieOutcome::Valid,
+                    Some(key_status),
+                    Some(verified.key_version),
+                );
+            }
         }
 
         let replace_cookie = session_id != verified.session_id || key_status == KeyStatus::Previous;
@@ -650,10 +997,12 @@ impl SessionAuthority {
             return;
         };
         self.evict_expired_continuity(now);
-        if !self.continuity.contains_key(&continuity_key)
-            && !self.insert_continuity(continuity_key, session_id, now)
-        {
-            return;
+        if !self.continuity.contains_key(&continuity_key) {
+            match self.insert_continuity(continuity_key, session_id, now) {
+                ContinuityInsertOutcome::Inserted => {}
+                ContinuityInsertOutcome::CapacityFailClosed
+                | ContinuityInsertOutcome::AdmissionRateFailClosed => return,
+            }
         }
         let record = self
             .continuity
@@ -667,6 +1016,12 @@ impl SessionAuthority {
             Some(existing) if enforcement_rank(existing) >= enforcement_rank(state) => existing,
             _ => state,
         });
+        if continuity_key.source() == ContinuitySource::AuthenticatedIngress {
+            // The policy store is authoritative and restores this floor at
+            // startup, so sidecar floor refreshes can use the bounded
+            // metadata checkpoint instead of forcing another fsync.
+            self.mark_authenticated_metadata_change();
+        }
     }
 
     fn recover_or_mint(
@@ -696,6 +1051,9 @@ impl SessionAuthority {
                                 ..record
                             },
                         );
+                        if continuity_key.source() == ContinuitySource::AuthenticatedIngress {
+                            self.mark_authenticated_metadata_change();
+                        }
                         return SessionResolution {
                             session_id: record.session_id,
                             cookie_outcome,
@@ -717,6 +1075,7 @@ impl SessionAuthority {
                             .get_mut(&continuity_key)
                             .expect("fresh continuity record was read above");
                         current.last_seen = now;
+                        self.mark_authenticated_metadata_change();
                         return SessionResolution {
                             session_id: record.session_id,
                             cookie_outcome,
@@ -761,14 +1120,25 @@ impl SessionAuthority {
 
         let session_id = SessionId::new();
         if let Some(continuity_key) = continuity_key {
-            if !self.insert_continuity(continuity_key, session_id, now) {
-                return self.capacity_fail_closed(
-                    continuity_key,
-                    now,
-                    cookie_outcome,
-                    None,
-                    presented_key_version,
-                );
+            match self.insert_continuity(continuity_key, session_id, now) {
+                ContinuityInsertOutcome::Inserted => {}
+                ContinuityInsertOutcome::CapacityFailClosed => {
+                    return self.capacity_fail_closed(
+                        continuity_key,
+                        now,
+                        cookie_outcome,
+                        None,
+                        presented_key_version,
+                    );
+                }
+                ContinuityInsertOutcome::AdmissionRateFailClosed => {
+                    return self.admission_rate_fail_closed(
+                        continuity_key,
+                        cookie_outcome,
+                        None,
+                        presented_key_version,
+                    );
+                }
             }
         }
         SessionResolution {
@@ -862,14 +1232,17 @@ impl SessionAuthority {
         continuity_key: ContinuityKey,
         session_id: SessionId,
         now: u64,
-    ) -> bool {
+    ) -> ContinuityInsertOutcome {
         if self.continuity.contains_key(&continuity_key) {
-            return false;
+            return ContinuityInsertOutcome::CapacityFailClosed;
+        }
+        if !self.durable_authenticated_insert_allowed(continuity_key, now) {
+            return ContinuityInsertOutcome::AdmissionRateFailClosed;
         }
 
         while self.continuity.len() >= self.continuity_capacity {
-            if !self.evict_oldest_unprotected_continuity() {
-                return false;
+            if !self.evict_oldest_unprotected_continuity(continuity_key.source()) {
+                return ContinuityInsertOutcome::CapacityFailClosed;
             }
         }
         self.continuity.insert(
@@ -883,24 +1256,68 @@ impl SessionAuthority {
             },
         );
         self.continuity_order.push_back(continuity_key);
-        true
+        if continuity_key.source() == ContinuitySource::AuthenticatedIngress {
+            if self.continuity_state_path.is_some() {
+                self.durable_continuity_insert_times.push_back(now);
+            }
+            self.mark_authenticated_security_change();
+        }
+        ContinuityInsertOutcome::Inserted
     }
 
-    fn evict_oldest_unprotected_continuity(&mut self) -> bool {
-        let Some(index) = self.continuity_order.iter().position(|key| {
-            self.continuity.get(key).is_some_and(|record| {
-                record.floor.is_none_or(|floor| {
-                    enforcement_rank(floor) < enforcement_rank(PolicyState::Suspicious)
-                })
+    fn durable_authenticated_insert_allowed(
+        &mut self,
+        continuity_key: ContinuityKey,
+        now: u64,
+    ) -> bool {
+        if continuity_key.source() != ContinuitySource::AuthenticatedIngress
+            || self.continuity_state_path.is_none()
+        {
+            return true;
+        }
+        let cutoff = now.saturating_sub(DURABLE_CONTINUITY_INSERT_WINDOW_SECS);
+        self.durable_continuity_insert_times
+            .retain(|timestamp| *timestamp > cutoff);
+        self.durable_continuity_insert_times.len() < MAX_DURABLE_CONTINUITY_INSERTS_PER_WINDOW
+    }
+
+    fn oldest_unprotected_continuity(
+        &self,
+        incoming_source: ContinuitySource,
+    ) -> Option<(usize, ContinuityKey, ContinuityRecord)> {
+        self.continuity_order
+            .iter()
+            .enumerate()
+            .find_map(|(index, key)| {
+                if incoming_source == ContinuitySource::LabPeer
+                    && key.source() != ContinuitySource::LabPeer
+                {
+                    return None;
+                }
+                self.continuity
+                    .get(key)
+                    .copied()
+                    .filter(|record| {
+                        record.floor.is_none_or(|floor| {
+                            enforcement_rank(floor) < enforcement_rank(PolicyState::Suspicious)
+                        })
+                    })
+                    .map(|record| (index, *key, record))
             })
-        }) else {
+    }
+
+    fn evict_oldest_unprotected_continuity(&mut self, incoming_source: ContinuitySource) -> bool {
+        let Some((index, continuity_key, _)) = self.oldest_unprotected_continuity(incoming_source)
+        else {
             return false;
         };
-        let continuity_key = self
-            .continuity_order
+        self.continuity_order
             .remove(index)
             .expect("position came from the continuity order");
         self.continuity.remove(&continuity_key);
+        if continuity_key.source() == ContinuitySource::AuthenticatedIngress {
+            self.mark_authenticated_security_change();
+        }
         true
     }
 
@@ -926,12 +1343,142 @@ impl SessionAuthority {
         }
     }
 
+    fn admission_rate_fail_closed(
+        &self,
+        continuity_key: ContinuityKey,
+        cookie_outcome: CookieOutcome,
+        key_status: Option<KeyStatus>,
+        presented_key_version: Option<u32>,
+    ) -> SessionResolution {
+        SessionResolution {
+            session_id: SessionId::new(),
+            cookie_outcome,
+            key_status,
+            presented_key_version,
+            active_key_version: self.active_key_version,
+            continuity_outcome: ContinuityOutcome::AdmissionRateFailClosed,
+            continuity_source: Some(continuity_key.source()),
+            enforcement_floor: Some(PolicyState::Blocked),
+            set_cookie_value: None,
+        }
+    }
+
+    fn migration_quarantine_fail_closed(
+        &self,
+        continuity_key: ContinuityKey,
+        cookie_outcome: CookieOutcome,
+        presented_key_version: Option<u32>,
+    ) -> SessionResolution {
+        let session_id = SessionId::new();
+        SessionResolution {
+            session_id,
+            cookie_outcome,
+            key_status: None,
+            presented_key_version,
+            active_key_version: self.active_key_version,
+            continuity_outcome: ContinuityOutcome::MigrationQuarantineFailClosed,
+            continuity_source: Some(continuity_key.source()),
+            enforcement_floor: Some(PolicyState::Blocked),
+            set_cookie_value: None,
+        }
+    }
+
+    fn storage_unavailable_resolution(
+        &self,
+        mut resolution: SessionResolution,
+    ) -> SessionResolution {
+        resolution.continuity_outcome = ContinuityOutcome::StorageUnavailable;
+        resolution.enforcement_floor = Some(PolicyState::Blocked);
+        resolution.set_cookie_value = None;
+        resolution
+    }
+
+    fn mark_authenticated_security_change(&mut self) {
+        self.continuity_dirty = true;
+        self.continuity_checkpoint_dirty = true;
+        self.continuity_security_revision = self.continuity_security_revision.wrapping_add(1);
+    }
+
+    fn mark_authenticated_metadata_change(&mut self) {
+        self.continuity_checkpoint_dirty = true;
+        self.continuity_metadata_revision = self.continuity_metadata_revision.wrapping_add(1);
+    }
+
+    fn stored_continuity_state(&self) -> io::Result<StoredContinuityState> {
+        let transport_key_id_hex =
+            self.continuity_transport_key_id_hex
+                .clone()
+                .ok_or_else(|| {
+                    invalid_data("durable continuity transport key identifier is missing")
+                })?;
+        let mut records = Vec::new();
+        for key in &self.continuity_order {
+            if key.source() != ContinuitySource::AuthenticatedIngress {
+                continue;
+            }
+            let Some(record) = self.continuity.get(key) else {
+                continue;
+            };
+            records.push(StoredContinuityRecord {
+                key_digest_hex: encode_hex(&key.digest()),
+                session_id: record.session_id,
+                enforcement_floor: record.floor,
+                last_seen: record.last_seen,
+                last_recovery_at: record.last_recovery_at,
+                recovery_count: record.recovery_count,
+            });
+        }
+        Ok(StoredContinuityState {
+            schema_version: 1,
+            transport_key_id_hex,
+            migration_quarantine_until: self.continuity_migration_quarantine_until,
+            records,
+            integrity_mac_hex: String::new(),
+        })
+    }
+
+    fn persist_continuity_state(&self) -> io::Result<StateCommitOutcome> {
+        let Some(path) = &self.continuity_state_path else {
+            return Ok(StateCommitOutcome::Durable);
+        };
+        let integrity_key = self
+            .continuity_integrity_key
+            .as_ref()
+            .ok_or_else(|| invalid_data("durable continuity integrity key is missing"))?;
+        session_continuity_store::persist_state(
+            path,
+            &self.stored_continuity_state()?,
+            integrity_key,
+        )
+    }
+
+    fn persist_continuity_state_durably(&mut self) -> io::Result<()> {
+        match self.persist_continuity_state()? {
+            StateCommitOutcome::Durable => {
+                self.continuity_dirty = false;
+                self.continuity_checkpoint_dirty = false;
+                Ok(())
+            }
+            StateCommitOutcome::CommittedDurabilityUncertain => Err(io::Error::other(
+                "continuity state was committed but parent-directory durability is uncertain",
+            )),
+        }
+    }
+
     fn evict_expired_continuity(&mut self, now: u64) {
         let ttl = self.continuity_ttl_secs;
-        self.continuity
-            .retain(|_, record| record.last_seen + ttl > now);
+        let mut removed_authenticated = false;
+        self.continuity.retain(|key, record| {
+            let keep = record.last_seen.saturating_add(ttl) > now;
+            removed_authenticated |=
+                !keep && key.source() == ContinuitySource::AuthenticatedIngress;
+            keep
+        });
         self.continuity_order
             .retain(|peer| self.continuity.contains_key(peer));
+        if removed_authenticated {
+            self.mark_authenticated_metadata_change();
+        }
     }
 }
 
@@ -984,6 +1531,13 @@ pub fn enforcement_rank(state: PolicyState) -> u8 {
     }
 }
 
+fn continuity_transport_key_id_hex(transport_secret: &str) -> String {
+    let mut mac = <SessionMac as Mac>::new_from_slice(transport_secret.as_bytes())
+        .expect("HMAC-SHA256 accepts any transport secret length");
+    mac.update(CONTINUITY_TRANSPORT_KEY_ID_DOMAIN);
+    encode_hex(&mac.finalize().into_bytes())
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1033,6 +1587,8 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     const NOW: u64 = 1_750_000_000;
@@ -1066,6 +1622,29 @@ mod tests {
 
     fn cookie_header(value: &str) -> [(&'static str, String); 1] {
         [("Cookie", format!("{}={}", SESSION_COOKIE_NAME, value))]
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "eidolon-session-continuity-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir(&path).expect("test directory should be created");
+            Self(path)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
@@ -1758,6 +2337,9 @@ mod tests {
         assert_eq!(DEFAULT_CONTINUITY_TTL_SECS, 86_400);
         assert_eq!(CONTINUITY_RECOVERY_COOLDOWN_SECS, 60);
         assert_eq!(DEFAULT_CONTINUITY_CAPACITY, 4096);
+        assert_eq!(CONTINUITY_CHECKPOINT_INTERVAL_SECS, 60);
+        assert_eq!(DURABLE_CONTINUITY_INSERT_WINDOW_SECS, 60);
+        assert_eq!(MAX_DURABLE_CONTINUITY_INSERTS_PER_WINDOW, 64);
         assert_eq!(MAX_FUTURE_SKEW_SECS, 300);
     }
 
@@ -2135,6 +2717,208 @@ mod tests {
             after_expiry,
         );
         assert!(!authority.continuity.contains_key(&stale_key));
+    }
+
+    #[test]
+    fn durable_authenticated_continuity_survives_restart_without_raw_identity_storage() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let continuity_key = ingress_key("signed-agent-primary");
+        let mut authority = test_authority();
+        authority
+            .enable_durable_continuity(&state_path, "edge-secret", false, NOW)
+            .expect("durable continuity should initialize");
+
+        let first = authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(continuity_key),
+            NOW + 1,
+        );
+        authority.note_enforcement_with_continuity(
+            Some(continuity_key),
+            first.session_id,
+            PolicyState::ControlledReality,
+            NOW + 2,
+        );
+        let checkpointed = authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(continuity_key),
+            NOW + CONTINUITY_CHECKPOINT_INTERVAL_SECS + 2,
+        );
+        assert_eq!(checkpointed.session_id, first.session_id);
+        assert_eq!(
+            checkpointed.enforcement_floor,
+            Some(PolicyState::ControlledReality)
+        );
+
+        let serialized =
+            fs::read_to_string(&state_path).expect("continuity sidecar should be readable");
+        assert!(!serialized.contains("signed-agent-primary"));
+        assert!(!serialized.contains("edge-secret"));
+
+        let mut restored = test_authority();
+        let startup = restored
+            .enable_durable_continuity(
+                &state_path,
+                "edge-secret",
+                true,
+                NOW + CONTINUITY_CHECKPOINT_INTERVAL_SECS + 3,
+            )
+            .expect("continuity state should restore");
+        assert_eq!(startup.restored_record_count, 1);
+        let after_restart = restored.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(continuity_key),
+            NOW + CONTINUITY_CHECKPOINT_INTERVAL_SECS + 4,
+        );
+        assert_eq!(after_restart.session_id, first.session_id);
+        assert_eq!(
+            after_restart.enforcement_floor,
+            Some(PolicyState::ControlledReality)
+        );
+    }
+
+    #[test]
+    fn migration_quarantine_rejects_unknown_identity_with_or_without_valid_cookie() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let continuity_key = ingress_key("unknown-after-upgrade");
+        let mut authority = test_authority();
+        let startup = authority
+            .enable_durable_continuity(&state_path, "edge-secret", true, NOW)
+            .expect("missing historical sidecar should enter quarantine");
+        assert_eq!(
+            startup.migration_quarantine_until,
+            Some(NOW + DEFAULT_CONTINUITY_TTL_SECS)
+        );
+
+        let valid_cookie = authority.mint_cookie_value(SessionId::new(), NOW);
+        let with_cookie = authority.resolve_with_continuity(
+            cookie_header(&valid_cookie),
+            Some(continuity_key),
+            NOW + 1,
+        );
+        assert_eq!(
+            with_cookie.continuity_outcome,
+            ContinuityOutcome::MigrationQuarantineFailClosed
+        );
+        assert_eq!(with_cookie.cookie_outcome, CookieOutcome::Valid);
+        assert_eq!(with_cookie.set_cookie_value, None);
+        assert!(!authority.continuity.contains_key(&continuity_key));
+
+        let without_cookie = authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(continuity_key),
+            NOW + 2,
+        );
+        assert_eq!(
+            without_cookie.continuity_outcome,
+            ContinuityOutcome::MigrationQuarantineFailClosed
+        );
+        assert_eq!(without_cookie.set_cookie_value, None);
+        assert!(!authority.continuity.contains_key(&continuity_key));
+    }
+
+    #[test]
+    fn durable_continuity_rejects_transport_secret_mismatch() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let mut authority = test_authority();
+        authority
+            .enable_durable_continuity(&state_path, "edge-secret", false, NOW)
+            .expect("durable continuity should initialize");
+        authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(ingress_key("signed-agent-primary")),
+            NOW + 1,
+        );
+
+        let mut mismatched = test_authority();
+        let error = mismatched
+            .enable_durable_continuity(&state_path, "rotated-edge-secret", true, NOW + 2)
+            .expect_err("active continuity cannot silently change transport keys");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn durable_mapping_admission_is_temporally_bounded_and_recovers() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let mut authority = test_authority();
+        authority
+            .enable_durable_continuity(&state_path, "edge-secret", false, NOW)
+            .expect("durable continuity should initialize");
+
+        for index in 0..MAX_DURABLE_CONTINUITY_INSERTS_PER_WINDOW {
+            let resolution = authority.resolve_with_continuity(
+                [("Host", "proxy.local")],
+                Some(ingress_key(&format!("admitted-agent-{index}"))),
+                NOW + 1,
+            );
+            assert_eq!(resolution.continuity_outcome, ContinuityOutcome::NoRecord);
+        }
+
+        let rejected_key = ingress_key("rate-limited-agent");
+        let rejected = authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(rejected_key),
+            NOW + 1,
+        );
+        assert_eq!(
+            rejected.continuity_outcome,
+            ContinuityOutcome::AdmissionRateFailClosed
+        );
+        assert_eq!(rejected.set_cookie_value, None);
+        assert!(!authority.continuity.contains_key(&rejected_key));
+
+        let admitted_after_window = authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(rejected_key),
+            NOW + 1 + DURABLE_CONTINUITY_INSERT_WINDOW_SECS,
+        );
+        assert_eq!(
+            admitted_after_window.continuity_outcome,
+            ContinuityOutcome::NoRecord
+        );
+        assert!(authority.continuity.contains_key(&rejected_key));
+    }
+
+    #[test]
+    fn pre_rename_storage_failure_rolls_back_new_mapping_and_suppresses_cookie() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let mut authority = test_authority();
+        authority
+            .enable_durable_continuity(&state_path, "edge-secret", false, NOW)
+            .expect("durable continuity should initialize");
+
+        let mut temp_path = state_path.as_os_str().to_os_string();
+        temp_path.push(".tmp");
+        let temp_path = PathBuf::from(temp_path);
+        fs::create_dir(&temp_path).expect("blocking temp directory should be created");
+
+        let continuity_key = ingress_key("write-failure-agent");
+        let failed = authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(continuity_key),
+            NOW + 1,
+        );
+        assert_eq!(
+            failed.continuity_outcome,
+            ContinuityOutcome::StorageUnavailable
+        );
+        assert_eq!(failed.set_cookie_value, None);
+        assert!(!authority.continuity.contains_key(&continuity_key));
+
+        fs::remove_dir(&temp_path).expect("blocking temp directory should be removed");
+        let retried = authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(continuity_key),
+            NOW + 2,
+        );
+        assert_eq!(retried.continuity_outcome, ContinuityOutcome::NoRecord);
+        assert!(authority.continuity.contains_key(&continuity_key));
     }
 
     #[test]
