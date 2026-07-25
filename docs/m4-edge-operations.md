@@ -108,14 +108,26 @@ Session identity on this deployment:
   deterministic `session_resolved` audit outcomes
 - the current manifests do not pass `--session-signing-key-file`, so the proxy
   runs with an ephemeral per-process key: a pod restart rejects all
-  outstanding cookies and clears the in-memory peer-continuity map, while the
-  PVC-backed policy store survives
-- for restart-stable sessions and continuity, mount a JSON key ring (same
+  outstanding cookies and clears process-local Lab peer continuity, while the
+  PVC-backed policy store and HMAC-minimized authenticated-ingress continuity
+  records survive in `<policy-state-path>.continuity.json`; raw continuity
+  identities and Lab peer keys are never written there; the sidecar is
+  HMAC-authenticated and admits at most 64 new durable mappings per rolling
+  60-second window
+- if that sidecar is missing while prior state exists, unknown authenticated
+  identities fail closed for a bounded migration quarantine; corrupt or
+  transport-key-mismatched sidecar state prevents startup
+- live transport-key rotation remains tracked by issue `#254`; old-key state
+  is never trusted merely because its unverified timestamps appear expired
+- for restart-stable cookies, mount a JSON key ring (same
   secret pattern as the transport-auth secret) and pass
   `--session-signing-key-file`; rotate by adding the new version as active and
   dropping retired versions after the 7-day cookie lifetime
 - the explicit-cookie smoke scripts mint their session cookies from the live
   edge instead of generating raw UUIDs; cookie-jar smokes are unaffected
+
+This continuity persistence slice does not complete issue `#254` or establish
+production readiness.
 
 Recorded labels:
 
