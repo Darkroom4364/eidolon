@@ -23,7 +23,7 @@ The first target class is web/API/developer-surface reconnaissance:
 - fake internal hostnames
 - cloud/identity canaries
 
-## Out Of Scope For Lab V1 Candidate
+## Out Of Scope For The Historical Lab Candidate
 
 - nation-state operators with strong OPSEC
 - malware delivery
@@ -35,6 +35,38 @@ The first target class is web/API/developer-surface reconnaissance:
 - internal enterprise agent governance
 - generic MCP gateway enforcement
 - public-v1 or production-ready claims
+
+Those limits apply to the historical Lab milestone and its archived evidence.
+The supported Shield target and its additional production requirements are
+defined separately in
+[v1-release-definition.md](v1-release-definition.md).
+
+The v1 Shield release remains limited to owned or authorized HTTP web/API
+surfaces, one declared self-hosted deployment profile, synthetic bait, and one
+isolated controlled-reality workflow. It does not expand the allowed defensive
+boundary below.
+
+## v1 Production Trust Boundary
+
+The supported v1 deployment assumes:
+
+- the named ingress terminates TLS and is the only trusted source of forwarded
+  or trusted-ingress headers
+- clients control all request data, can forge cookies, and can replay observed
+  requests
+- storage can become unavailable, stale, or corrupt; Eidolon must fail closed
+  rather than reset enforcement
+- the renderer can fail or be compromised; its identity, input, output,
+  resources, and network reach are constrained by the proxy and cluster policy
+- direct access to the protected target is a deployment defect, not a supported
+  topology
+- volumetric traffic can exhaust declared capacity; queues and state remain
+  bounded and overload fails closed
+- root compromise of a cluster node or control plane is outside the v1
+  guarantee and requires ordinary platform incident response
+
+Release qualification must test the in-scope failures above and document the
+remaining node, cluster, ingress, and storage assumptions.
 
 ## Defensive Boundary
 

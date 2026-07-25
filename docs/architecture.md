@@ -218,13 +218,16 @@ validated interaction linked to the exported request. The artifact SHA-256
 identifies the synthetic bytes and does not prove that the decoy narrative is
 true.
 
-Issue `#176` is moving response rendering toward a separate process. The first
-foundation is a closed, authenticated renderer protocol and standalone binary;
-the active proxy path remains in process. The renderer cannot choose routing,
-policy, evidence, headers, cache policy, or artifact identity, and it receives
-no raw request or session identity. It is not deployed by the current
-OrbStack or kind overlays because those profiles do not presently provide an
-enforced, live-tested network boundary. See
+Issue `#176` moved response rendering across a closed, authenticated process
+boundary. The renderer cannot choose routing, policy, evidence, headers, cache
+policy, or artifact identity, and it receives no raw request or session
+identity. The pinned kind/Calico Lab profile uses that remote path and proves
+its local network boundary; OrbStack remains an in-process behavioral harness.
+The renderer is still single-replica with process-local replay detection. The
+full release keeps rendering stateless and deterministic, so a replay after a
+restart can only reproduce the same bounded synthetic response; stateful
+rendering is post-v1. One production-cluster proof is still required. High
+availability and multi-replica coordination are also post-v1. See
 [`controlled-reality-isolation.md`](controlled-reality-isolation.md).
 
 ## 3. Bait/Canary Engine
