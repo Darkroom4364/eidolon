@@ -148,6 +148,13 @@ limited to owned Lab traffic with connection caps, I/O deadlines, bounded
 headers and bodies, a fixed total request-read deadline, and fail-closed
 parsing.
 
+The first `#251` slice adds an inactive typed adapter for requests already
+parsed and body-bounded by Hyper. It defines the production HTTP/1 target-form,
+Host, framing, header, and body limits, but does not yet bind a socket or
+dispatch policy. The Lab parser remains the only active transport until a
+later slice connects that adapter to the extracted evaluation path and shared
+canonical request-target validation.
+
 The hard part is not high-performance proxying. The hard part is causal trace reconstruction.
 
 ## 2. Surface Controller

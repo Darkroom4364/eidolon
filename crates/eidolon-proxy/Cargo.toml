@@ -12,6 +12,8 @@ chrono.workspace = true
 eidolon-bait = { path = "../eidolon-bait" }
 eidolon-core = { path = "../eidolon-core" }
 hmac.workspace = true
+http.workspace = true
+hyper.workspace = true
 ipnet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
