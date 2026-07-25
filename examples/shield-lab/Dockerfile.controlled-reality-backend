@@ -2,7 +2,7 @@ FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92e
 WORKDIR /workspace
 
 COPY . .
-RUN cargo build --release -p eidolon-proxy --bin eidolon-controlled-reality
+RUN cargo build --release --locked -p eidolon-proxy --bin eidolon-controlled-reality
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 

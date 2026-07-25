@@ -47,22 +47,29 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.95.0"
           components: rustfmt, clippy
 
       - name: Check formatting
         run: cargo fmt --check
 
       - name: Build
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked
 
-  m3-fixtures:
-    name: M3 fixtures
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Audit dependencies
+        run: cargo audit --file Cargo.lock --deny warnings
+
+  lab-fixtures:
+    name: Lab fixtures
     runs-on: ubuntu-latest
 
     steps:
@@ -86,11 +93,17 @@ jobs:
             examples/m3/bait-profiles/*.json
 
       - name: Check shell syntax
-        run: bash -n scripts/ci/*.sh examples/lib/*.sh examples/m3/*.sh examples/baselines/*.sh examples/metrics/*.sh
+        run: git ls-files -z -- '*.sh' | xargs -0 -n1 bash -n
 
       - name: Run M3 fixture tests
         run: |
           for test_script in examples/m3/test-*.sh; do
+            "$test_script"
+          done
+
+      - name: Run Shield Lab fixture tests
+        run: |
+          for test_script in examples/shield-lab/test-*.sh; do
             "$test_script"
           done
 
