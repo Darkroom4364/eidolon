@@ -149,6 +149,7 @@ test_creates_cluster_when_missing_and_applies_kind_overlay() {
   rg -q 'load docker-image eidolon-owned-demo-target:local --name eidolon-shield' "$temp_dir/kind.log"
   rg -q 'load docker-image eidolon-controlled-reality:local --name eidolon-shield' "$temp_dir/kind.log"
   rg -q 'apply --server-side -f https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/operator-crds.yaml' "$temp_dir/kubectl.log"
+  rg -q 'wait --for=create tigerastatus/calico --timeout=300s' "$temp_dir/kubectl.log"
   rg -q -- '-n shield-system create secret generic eidolon-controlled-reality-auth' "$temp_dir/kubectl.log"
   rg -q -- '-n shield-controlled-reality create secret generic eidolon-controlled-reality-auth' "$temp_dir/kubectl.log"
   rg -q 'apply -k .*/examples/shield-lab/k8s/kind' "$temp_dir/kubectl.log"

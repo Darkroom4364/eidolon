@@ -154,7 +154,13 @@ Every request handled by the proxy is assigned an opaque `request_id` (a random 
 
 Every request handled by the proxy is assigned an opaque `request_id` (a random v4 UUID; it encodes no secrets, client identity, or request data). Every event derived from that request — `request_seen`, bait exposure and action events, policy decisions and changes, responses, rate limits, and reality-escape audits — carries that id, so concurrent requests sharing one session cookie can still be separated causally. Trace and edge-export reducers join events strictly by `request_id`; sessions whose events predate request identifiers are exported with `request_linkage: unknown_legacy` and no cross-event joins are attempted.
 
-The intervention control file is read per request. If it contains `disabled`, `disable`, `off`, or `0`, interventions are disabled without restarting the proxy and traffic is forwarded to protected upstream.
+The intervention control file is read per request. If it contains `disabled`,
+`disable`, `off`, or `0`, ordinary surface interventions are bypassed without
+restarting the proxy and ordinary traffic is forwarded to protected upstream.
+Recognized unsafe bait-action shapes and synthetic controlled-reality
+follow-ups remain Eidolon-owned and fail closed. This control is not an
+authoritative renderer kill switch: it does not drain in-flight renderer work,
+and a missing file enables interventions.
 
 M2.5 controlled-reality tuning is local CLI configuration:
 
@@ -262,6 +268,17 @@ Run negative controls:
 - Send ordinary `/api/v1/*` traffic before controlled-reality entry. It should remain ordinary protected-upstream traffic.
 - Send ordinary `/api/v1/*` traffic after controlled-reality entry. It should produce a `reality_escape_attempt` event and stay inside controlled reality while interventions are enabled.
 - Trigger the configured emergency disable. The next request must stop controlled-reality intervention and record the disable behavior; known decoy write paths should fail closed locally instead of forwarding to the protected upstream.
+
+The kind deployment has an executable write-escape proof for this boundary:
+
+```sh
+examples/shield-lab/smoke-controlled-reality-escape-kind.sh
+```
+
+It baselines the target-side detector directly, enters controlled reality,
+repeats `POST /api/v1/imports`, and requires synthetic `404`, blocked `403`,
+request-linked renderer evidence, and zero matching requests across every
+owned-target replica.
 
 M2.5 does not prove broad containment, attribution, adaptive bait policy, public-v1 readiness, production readiness, or safe deployment outside the Lab. It proves only that one qualifying Lab session can be routed into one synthetic no-write branch and audited.
 
