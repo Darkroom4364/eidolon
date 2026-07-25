@@ -2,6 +2,7 @@ pub mod controlled_reality;
 pub mod controlled_reality_backend;
 pub mod debug_log;
 pub mod event_log;
+pub mod http_request;
 pub mod ingress_identity;
 pub mod policy;
 pub mod policy_store;

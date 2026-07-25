@@ -154,7 +154,6 @@ dependencies = [
  "eidolon-bait",
  "eidolon-core",
  "hmac",
- "http",
  "hyper",
  "ipnet",
  "serde",
