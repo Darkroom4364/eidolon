@@ -136,14 +136,16 @@ The proxy assigns a first-party `eidolon_session` cookie when no valid session c
 
 Session cookies are authenticated. The value has the form `v1.<key-version>.<issued-at>.<session-uuid>.<hmac-sha256-hex>`; the proxy verifies the proof, key version, and server-side age before accepting a cookie. A missing, malformed, forged, unknown-key, or expired cookie never supplies the session identity: the request receives a proxy-minted session instead, and the deterministic outcome (`absent`, `valid`, `malformed`, `unknown_key_version`, `bad_signature`, `expired`) is recorded in the server-side debug log as a `session_resolved` audit event together with the continuity outcome. Cookie discard or rapid rotation from one direct peer is absorbed by a bounded continuity map (24h TTL, 4096 peers, one recovery per 60s cooldown): the peer is re-bound to its existing session with its enforcement floor intact, and excess rotation mints fresh sessions that still inherit that floor, so rotation cannot reset policy or evidence state. The floor ranks `blocked` highest and never downgrades an already-loaded state.
 
-Signing keys come from `--session-signing-key-file <PATH>` with JSON shape `{"active_key_version": 2, "keys": [{"version": 1, "key_hex": "<64 hex>"}, {"version": 2, "key_hex": "<64 hex>"}]}`. Every listed version verifies cookies; only the active version mints. Rotate by adding the new version, marking it active, and dropping retired versions once cookies older than the 7-day server-side lifetime have aged out. Cookies signed by a retired-but-listed version are accepted and transparently re-minted under the active version on the response. Without a key file the proxy generates an ephemeral key at startup: sessions survive within one process lifetime, but a restart rejects outstanding cookies and clears process-local Lab peer continuity. Authenticated-ingress mappings are HMAC-minimized and persisted beside policy state at `<policy-state-path>.continuity.json`; raw continuity identities and Lab peer keys are excluded. The sidecar is HMAC-authenticated, and new durable mappings are limited to 64 per rolling 60-second window. `--ingress-continuity-key-file <PATH>` separates continuity minimization and sidecar integrity from request transport authentication. Existing deployments must initially provision it with the current transport-secret bytes so existing sidecar state remains readable. The continuity key is backup-critical and must remain stable while transport credentials rotate. Deployments that need restart-stable cookies must configure a session signing key file; all key files are secrets and must stay outside the event and debug logs.
+Signing keys come from `--session-signing-key-file <PATH>` with JSON shape `{"active_key_version": 2, "keys": [{"version": 1, "key_hex": "<64 hex>"}, {"version": 2, "key_hex": "<64 hex>"}]}`. Every listed version verifies cookies; only the active version mints. Rotate by adding the new version, marking it active, and dropping retired versions once cookies older than the 7-day server-side lifetime have aged out. Cookies signed by a retired-but-listed version are accepted and transparently re-minted under the active version on the response. The Kubernetes lab manifests require this file from Secret `eidolon-session-signing`, key `key-ring.json`, mounted read-only at `/var/run/secrets/eidolon-session-signing/key-ring.json`. The Secret must exist before the proxy pod starts and must be backed up with the PVC as one recovery set. Update it with overlapping key versions and restart the `Recreate` Deployment to load a new active version; remove a retired version only after its cookie lifetime has elapsed and another controlled restart can load the reduced ring. Losing or replacing the ring invalidates outstanding cookies even if PVC state survives. Outside this manifest path, omitting the flag still creates an ephemeral process key and loses cookie validity at restart. Authenticated-ingress mappings are HMAC-minimized and persisted beside policy state at `<policy-state-path>.continuity.json`; raw continuity identities and Lab peer keys are excluded. The sidecar is HMAC-authenticated, and new durable mappings are limited to 64 per rolling 60-second window. `--ingress-continuity-key-file <PATH>` separates continuity minimization and sidecar integrity from request transport authentication. Existing deployments must initially provision it with the current transport-secret bytes so existing sidecar state remains readable. The continuity key is backup-critical and must remain stable while transport credentials rotate. All key files are secrets and must stay outside the event and debug logs.
 
 If the authenticated-continuity sidecar is missing while prior state exists,
 unknown authenticated identities fail closed for a bounded migration
 quarantine. Corrupt state or state bound to a different continuity key prevents
 startup. Planned transport-auth rotation can preserve continuity when the
-continuity key stays fixed; overlap windows, continuity-key rotation, and live
-Kubernetes lifecycle proof remain tracked by issue `#254`. Reusing the old
+continuity key stays fixed. The session-signing Secret wiring does not prove
+upgrade, rollback, backup/restore, or key-rotation behavior; those live checks,
+transport overlap windows, and continuity-key rotation remain tracked by issue
+`#254`. Reusing the old
 transport-secret bytes for migration compatibility also means transport
 rotation does not remediate compromise of those bytes. Old-key state is never
 trusted based on unverified timestamps. This slice does not complete issue
@@ -160,6 +162,23 @@ by `no-store`, so operators must invalidate any proof-bearing URL cached by an
 older deployment.
 
 State writes go through a temp file, fsync, and rename, and failed writes roll back the corresponding in-memory mutation or fail the proof unavailable. The JSONL event and debug logs rotate at 32 MiB to collision-safe timestamped archives, keeping exactly 3 archives plus the active segment per log. Together those logs consume at most about 256 MiB before filesystem overhead, below the lab's 1 GiB PVC. Startup restores a missing newline or truncates only an invalid final fragment before appending, while corruption anywhere earlier still fails with the exact line number. The `proxy_started` debug record reports state counts, eviction/fallback outcomes, replay migration quarantine, and tail-repair details. Persistence failures use the exact `eidolon persistence failure:` marker.
+
+The Kubernetes manifests include a narrow `normalize-eidolon-state` init
+container for legacy PVCs whose state files were created as `root:root 0600`.
+It uses the proxy image, runs as UID/GID 0 only before the proxy starts, mounts
+only `/var/lib/eidolon`, receives no service-account token or environment
+data, uses a read-only root filesystem, disables privilege escalation, drops
+all capabilities, and adds only `CHOWN`. It handles only the known top-level
+state files, temporary files, and `events.jsonl.*` or `debug.jsonl.*` archives
+whose suffix consists entirely of ASCII digits. Symlinked recognized paths
+fail closed; unknown names such as `events.jsonl.1-secret` and subdirectories
+are untouched. Each candidate is temporarily assigned to root, set to `0600`,
+then assigned to `65532:65532`; the directory is handled last and left `0770`.
+That ordering lets owner permissions perform `chmod` without `FOWNER` or
+`DAC_OVERRIDE`. Repeat runs rely on the enforced pod `fsGroup: 65532` to
+traverse that directory before ownership is normalized again.
+This repairs the observed legacy ownership blocker, but does not prove live
+upgrade, rollback, backup/restore, or storage-driver portability.
 
 Before binding its listener or opening durable stores, the proxy takes an
 exclusive operating-system writer lease at `<policy-state-path>.lock`. A

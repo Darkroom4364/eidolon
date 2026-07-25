@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
+python_bin="${PYTHON_BIN:-python3}"
 trusted_ingress_secret_name="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET_NAME:-eidolon-trusted-ingress}"
 trusted_ingress_secret_key="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET_KEY:-transport-auth.txt}"
 trusted_ingress_continuity_key="continuity-key.txt"
@@ -10,6 +11,10 @@ trusted_ingress_secret_literal="${EIDOLON_SHIELD_TRUSTED_INGRESS_SECRET:-}"
 bait_signing_secret_name="${EIDOLON_SHIELD_BAIT_SIGNING_SECRET_NAME:-eidolon-bait-signing}"
 bait_signing_secret_key="${EIDOLON_SHIELD_BAIT_SIGNING_SECRET_KEY:-signing-secret.txt}"
 bait_signing_secret_literal="${EIDOLON_SHIELD_BAIT_SIGNING_SECRET:-}"
+session_signing_secret_name="eidolon-session-signing"
+session_signing_secret_key="key-ring.json"
+session_signing_key_hex="${EIDOLON_SHIELD_SESSION_SIGNING_KEY_HEX:-}"
+session_signing_validator="${script_dir}/validate-session-key-file.py"
 bait_profile_configmap_name="eidolon-shield-bait-profile"
 bait_profile_key="bait-profile.json"
 bait_profile_rollout_annotation="eidolon.dev/bait-profile-sha256"
@@ -186,6 +191,106 @@ ensure_trusted_ingress_secret() {
     >/dev/null
 }
 
+validate_session_signing_key_hex() {
+  local value="$1"
+
+  if [[ ! "$value" =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "session signing key must contain exactly 64 hexadecimal characters" >&2
+    exit 1
+  fi
+}
+
+generate_session_signing_key_hex() {
+  local value="$session_signing_key_hex"
+
+  if [[ -z "$value" ]]; then
+    require_command openssl
+    value="$(openssl rand -hex 32)"
+  fi
+  validate_session_signing_key_hex "$value"
+  printf '%s' "$value"
+}
+
+validate_existing_session_signing_key_file() {
+  local encoded_key_file="$1"
+
+  require_command "$python_bin"
+  if [[ ! -f "$session_signing_validator" ]]; then
+    echo "session signing key validator not found: ${session_signing_validator}" >&2
+    exit 1
+  fi
+  if ! printf '%s' "$encoded_key_file" |
+    "$python_bin" "$session_signing_validator" >/dev/null 2>&1
+  then
+    echo "session-signing Secret contains an invalid ${session_signing_secret_key}" >&2
+    exit 1
+  fi
+}
+
+ensure_session_signing_secret() {
+  local data_key
+  local data_line
+  local data_value
+  local key_data=""
+  local key_file
+  local key_hex
+  local key_present=0
+  local resource_version
+  local secret_data=""
+  local secret_snapshot
+
+  if ! secret_snapshot="$(
+    kubectl -n shield-system get secret "$session_signing_secret_name" \
+      --ignore-not-found \
+      -o 'go-template={{.metadata.resourceVersion}}{{"\n"}}{{range $key, $value := .data}}{{printf "%s\t%s\n" $key $value}}{{end}}'
+  )"; then
+    echo "could not read session-signing Secret ${session_signing_secret_name}" >&2
+    exit 1
+  fi
+
+  if [[ -z "$secret_snapshot" ]]; then
+    key_hex="$(generate_session_signing_key_hex)"
+    key_file="$(printf '{"active_key_version":1,"keys":[{"version":1,"key_hex":"%s"}]}' "$key_hex")"
+    printf '%s' "$key_file" |
+      kubectl -n shield-system create secret generic "$session_signing_secret_name" \
+        --from-file="${session_signing_secret_key}=/dev/stdin" >/dev/null
+    return
+  fi
+
+  resource_version="${secret_snapshot%%$'\n'*}"
+  if [[ -z "$resource_version" ]]; then
+    echo "session-signing Secret has no resourceVersion" >&2
+    exit 1
+  fi
+
+  if [[ "$secret_snapshot" == *$'\n'* ]]; then
+    secret_data="${secret_snapshot#*$'\n'}"
+  fi
+  while IFS= read -r data_line; do
+    [[ -z "$data_line" ]] && continue
+    if [[ "$data_line" != *$'\t'* ]]; then
+      echo "session-signing Secret returned malformed data" >&2
+      exit 1
+    fi
+    data_key="${data_line%%$'\t'*}"
+    data_value="${data_line#*$'\t'}"
+    if [[ "$data_key" == "$session_signing_secret_key" ]]; then
+      key_present=1
+      key_data="$data_value"
+    fi
+  done <<<"$secret_data"
+
+  if [[ "$key_present" != "1" ]]; then
+    echo "session-signing Secret is missing ${session_signing_secret_key}" >&2
+    exit 1
+  fi
+  if [[ -z "$key_data" ]]; then
+    echo "session-signing Secret has an empty ${session_signing_secret_key}" >&2
+    exit 1
+  fi
+  validate_existing_session_signing_key_file "$key_data"
+}
+
 apply_bait_profile_configmap() {
   kubectl -n shield-system create configmap "$bait_profile_configmap_name" \
     --from-file="${bait_profile_key}=${bait_profile_path}" \
@@ -228,6 +333,7 @@ YAML
 resolve_bait_profile_path
 resolve_ingress_trust_config_path
 ensure_trusted_ingress_secret
+ensure_session_signing_secret
 ensure_secret "$bait_signing_secret_name" "$bait_signing_secret_key" "$bait_signing_secret_literal"
 apply_bait_profile_configmap
 apply_ingress_trust_configmap
@@ -240,6 +346,7 @@ echo "Edge service:        kubectl -n shield-system get svc eidolon-shield-edge"
 echo "Demo target service: kubectl -n shield-targets get svc eidolon-owned-demo-target"
 echo "Direct edge service: kubectl -n shield-targets get svc eidolon-owned-demo-target-edge"
 echo "Trusted ingress:     kubectl -n shield-system get secret ${trusted_ingress_secret_name}"
+echo "Session signing:     kubectl -n shield-system get secret ${session_signing_secret_name}"
 echo "Bait signing:        kubectl -n shield-system get secret ${bait_signing_secret_name}"
 echo "Bait profile:        ${bait_profile_path}"
 echo "Bait profile digest: ${bait_profile_sha256}"

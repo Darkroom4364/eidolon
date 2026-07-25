@@ -17,6 +17,7 @@ spec:
       labels:
         app.kubernetes.io/name: eidolon-shield-proxy
     spec:
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -24,6 +25,74 @@ spec:
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        - name: normalize-eidolon-state
+          image: eidolon-shield-proxy
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+          args:
+            - |
+              state_dir=/var/lib/eidolon
+              if [ -L "$state_dir" ] || [ ! -d "$state_dir" ]; then
+                echo "refusing invalid Eidolon state directory: $state_dir" >&2
+                exit 1
+              fi
+              normalize_state_file() {
+                if [ -L "$1" ]; then
+                  echo "refusing symlinked Eidolon state path: $1" >&2
+                  exit 1
+                fi
+                if [ -e "$1" ]; then
+                  [ -f "$1" ]
+                  chown 0:0 "$1"
+                  chmod 0600 "$1"
+                  chown 65532:65532 "$1"
+                fi
+              }
+              for state_path in \
+                "$state_dir/events.jsonl" \
+                "$state_dir/events.jsonl.exposures.json" \
+                "$state_dir/events.jsonl.exposures.json.tmp" \
+                "$state_dir/events.jsonl.consumed-proofs.json" \
+                "$state_dir/events.jsonl.consumed-proofs.json.tmp" \
+                "$state_dir/debug.jsonl" \
+                "$state_dir/policy-state.json" \
+                "$state_dir/policy-state.tmp" \
+                "$state_dir/policy-state.json.lock" \
+                "$state_dir/policy-state.json.continuity.json" \
+                "$state_dir/policy-state.json.continuity.json.tmp" \
+                "$state_dir/interventions.txt"; do
+                normalize_state_file "$state_path"
+              done
+              for archive_path in "$state_dir"/events.jsonl.* "$state_dir"/debug.jsonl.*; do
+                archive_name=${archive_path##*/}
+                archive_suffix=${archive_name#*.jsonl.}
+                case "$archive_suffix" in
+                  ""|*[!0123456789]*)
+                    continue
+                    ;;
+                esac
+                normalize_state_file "$archive_path"
+              done
+              chown 0:0 "$state_dir"
+              chmod 0770 "$state_dir"
+              chown 65532:65532 "$state_dir"
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+          volumeMounts:
+            - name: eidolon-state
+              mountPath: /var/lib/eidolon
       containers:
         - name: shield-proxy
           image: eidolon-shield-proxy
@@ -52,6 +121,8 @@ spec:
             - $(EIDOLON_INTERVENTION_CONTROL_PATH)
             - --policy-state
             - $(EIDOLON_POLICY_STATE_PATH)
+            - --session-signing-key-file
+            - /var/run/secrets/eidolon-session-signing/key-ring.json
             - --ingress-transport-auth-secret-file
             - /var/run/secrets/eidolon-trusted-ingress/transport-auth.txt
             - --ingress-continuity-key-file
@@ -101,6 +172,9 @@ spec:
             - name: eidolon-bait-signing
               mountPath: /var/run/secrets/eidolon-bait-signing
               readOnly: true
+            - name: eidolon-session-signing
+              mountPath: /var/run/secrets/eidolon-session-signing
+              readOnly: true
             - name: eidolon-trusted-ingress
               mountPath: /var/run/secrets/eidolon-trusted-ingress
               readOnly: true
@@ -130,6 +204,12 @@ spec:
         - name: eidolon-bait-signing
           secret:
             secretName: eidolon-bait-signing
+        - name: eidolon-session-signing
+          secret:
+            secretName: eidolon-session-signing
+            items:
+              - key: key-ring.json
+                path: key-ring.json
         - name: eidolon-trusted-ingress
           secret:
             secretName: eidolon-trusted-ingress
