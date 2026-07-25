@@ -158,6 +158,7 @@ Namespaces:
 - includes operator scripts for status, logs, and redacted evidence export
 - includes live edge-decision export for webhook/SIEM handoff
 - includes a lightweight live metrics surface over cluster status and PVC-backed proxy state
+- includes a live kind state backup/restore smoke against a fresh local-path PVC
 - includes a dedicated Kali VM pwnkit wrapper for the OrbStack NodePort validation topology
 
 ## Explicit cluster-lab mode
@@ -211,13 +212,33 @@ rotation, retain the previous verifying version, select a new active version,
 update the Secret, and restart the `Recreate` Deployment; remove the retired
 version only after the 7-day cookie lifetime has elapsed.
 
+The kind backup set is the PVC
+`shield-system/eidolon-shield-proxy-state` plus these five Secret resources and
+keys:
+
+- `shield-system/eidolon-session-signing`: `key-ring.json`
+- `shield-system/eidolon-trusted-ingress`: `transport-auth.txt` and
+  `continuity-key.txt`
+- `shield-system/eidolon-bait-signing`: `signing-secret.txt`
+- `shield-system/eidolon-controlled-reality-auth`: `auth-secret.txt`
+- `shield-controlled-reality/eidolon-controlled-reality-auth`:
+  `auth-secret.txt`
+
+`smoke-state-backup-restore-kind.sh` scales the single `Recreate` proxy writer
+to zero before copying state, restores the bundle into a fresh replacement
+PVC, and starts the renderer and proxy only after the recovery set is complete.
+The two renderer-auth Secrets are separate resources and must contain the same
+value.
+
 ## What it does not do yet
 
 - deploy ingress controllers
 - provision SIEM or webhook exporters
 - live-test renderer state/restart behavior
-- prove session continuity across upgrade, rollback, backup/restore, or
-  session-signing key rotation
+- prove session continuity across upgrade, rollback, or session-signing key
+  rotation
+- prove backup/restore portability beyond kind local-path storage or any
+  HA/multi-writer behavior
 - run workload generators
 - integrate an external production secret manager
 
@@ -294,6 +315,19 @@ and restore the original deployment arguments:
 ```sh
 examples/shield-lab/smoke-controlled-reality-capacity-kind.sh
 ```
+
+Back up the quiesced proxy PVC and five Secret resources, restore them into a
+fresh local-path PVC, and verify the retained contained workflow:
+
+```sh
+examples/shield-lab/smoke-state-backup-restore-kind.sh
+```
+
+The smoke requires the old authenticated session cookie to remain valid,
+preserves the contained workflow and its session/request links, rejects a
+consumed-proof replay without correlating it as new evidence, and observes zero
+matching writes at the protected upstream. This proves only the owned kind
+local-path recovery path, not storage portability or HA.
 
 Inspect, disable, or restore every kind renderer replica through the
 acknowledged operator kill switch:
