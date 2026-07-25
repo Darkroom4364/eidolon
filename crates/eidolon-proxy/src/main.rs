@@ -47,7 +47,7 @@ use eidolon_proxy::{
     },
     request_evaluation::{self, RequestEvaluationInput, RequestPolicyFacts},
     session::{self, SessionContext},
-    session_auth::{enforcement_rank, SessionAuthority},
+    session_auth::{enforcement_rank, ContinuityOutcome, SessionAuthority},
     state_lease::DurableStateLease,
     surface::{
         rewrite_response_body, HtmlInsertion, OpenApiPathInsertion, ResponseCachePolicy,
@@ -145,6 +145,14 @@ fn main() -> ExitCode {
                 }
             );
             println!(
+                "authenticated_ingress_continuity: {}",
+                if config.require_authenticated_ingress_continuity {
+                    "required"
+                } else {
+                    "optional"
+                }
+            );
+            println!(
                 "trusted_bait_soften_prefixes: {}",
                 config.trusted_bait_soften_path_prefixes.join(", ")
             );
@@ -200,6 +208,7 @@ struct ProxyConfig {
     session_signing_key_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
+    require_authenticated_ingress_continuity: bool,
     trusted_bait_soften_path_prefixes: Vec<String>,
     intervention_control_path: PathBuf,
     policy_state_path: PathBuf,
@@ -313,6 +322,12 @@ impl CliAction {
                         parse_ingress_transport_auth_secret_path(&value)?,
                     )?;
                 }
+                "--require-authenticated-ingress-continuity" => {
+                    if builder.require_authenticated_ingress_continuity {
+                        return Err(ConfigError::new(format!("duplicate option `{flag}`")));
+                    }
+                    builder.require_authenticated_ingress_continuity = true;
+                }
                 "--trusted-bait-soften-prefix" => {
                     let value = option_value(flag, inline_value, &mut args)?;
                     push_unique(
@@ -405,6 +420,7 @@ struct ConfigBuilder {
     session_signing_key_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
+    require_authenticated_ingress_continuity: bool,
     trusted_bait_soften_path_prefixes: Vec<String>,
     intervention_control_path: Option<PathBuf>,
     policy_state_path: Option<PathBuf>,
@@ -418,6 +434,14 @@ struct ConfigBuilder {
 
 impl ConfigBuilder {
     fn build(self) -> Result<ProxyConfig, ConfigError> {
+        if self.require_authenticated_ingress_continuity
+            && self.ingress_transport_auth_secret_path.is_none()
+        {
+            return Err(ConfigError::new(
+                "`--require-authenticated-ingress-continuity` requires \
+                 `--ingress-transport-auth-secret-file`",
+            ));
+        }
         let controlled_reality_backend = match (
             self.controlled_reality_backend_addr,
             self.controlled_reality_backend_auth_secret_path,
@@ -452,6 +476,7 @@ impl ConfigBuilder {
             session_signing_key_path: self.session_signing_key_path,
             ingress_trust_config_path: self.ingress_trust_config_path,
             ingress_transport_auth_secret_path: self.ingress_transport_auth_secret_path,
+            require_authenticated_ingress_continuity: self.require_authenticated_ingress_continuity,
             trusted_bait_soften_path_prefixes: if self.trusted_bait_soften_path_prefixes.is_empty()
             {
                 default_trusted_bait_soften_path_prefixes()
@@ -1263,6 +1288,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         )),
         ingress_identity_resolver: Arc::new(ingress_identity_resolver),
         ingress_transport_auth_secret,
+        require_authenticated_ingress_continuity: config.require_authenticated_ingress_continuity,
         bait_signing_secret: bait_signing_secret.clone(),
         trusted_bait_soften_path_prefixes: config.trusted_bait_soften_path_prefixes,
         bait_registry,
@@ -1305,6 +1331,11 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 .unwrap_or(0),
             "ingress_identity_rule_count": runtime.ingress_identity_resolver.len(),
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
+            "continuity_mode": if runtime.require_authenticated_ingress_continuity {
+                "authenticated_ingress_required"
+            } else {
+                "lab_direct_peer_with_optional_authenticated_ingress"
+            },
             "trusted_bait_soften_path_prefixes": runtime.trusted_bait_soften_path_prefixes,
             "restored_bait_exposure_count": restored_bait_exposure_count,
             "restored_bait_exposure_ttl_evicted": restored_bait_exposure_ttl_evicted,
@@ -1390,6 +1421,7 @@ struct ProxyRuntime {
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
     ingress_identity_resolver: Arc<IngressIdentityResolver>,
     ingress_transport_auth_secret: Option<Arc<str>>,
+    require_authenticated_ingress_continuity: bool,
     bait_signing_secret: Option<Arc<str>>,
     trusted_bait_soften_path_prefixes: Vec<String>,
     bait_registry: Arc<BaitRegistry>,
@@ -3054,13 +3086,19 @@ fn handle_connection(
             // itself from leaking attacker-controlled data into evidence.
             let request_id = RequestId::new();
             let surface_request = surface_request_meta(&request, REJECTED_REQUEST_TARGET);
-            let session = effective_session_context(
+            let session = match effective_session_context(
                 runtime,
                 &request,
                 &surface_request,
                 client_peer_ip,
                 request_id,
-            )?;
+            ) {
+                Ok(session) => session,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    return write_session_continuity_rejection(&mut client_stream, &request.method);
+                }
+                Err(error) => return Err(error),
+            };
             write_debug(
                 runtime,
                 "ambiguous_request_target_rejected",
@@ -3096,13 +3134,51 @@ fn handle_connection(
     };
     let surface_request = surface_request_meta(&request, &path);
     let request_id = RequestId::new();
-    let session = effective_session_context(
+    let session = match effective_session_context(
         runtime,
         &request,
         &surface_request,
         client_peer_ip,
         request_id,
-    )?;
+    ) {
+        Ok(session) => session,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return write_session_continuity_rejection(&mut client_stream, &request.method);
+        }
+        Err(error) => return Err(error),
+    };
+    if session.continuity_outcome == ContinuityOutcome::CapacityFailClosed {
+        write_debug(
+            runtime,
+            "session_continuity_capacity_fail_closed",
+            Some(session.session_id),
+            json!({
+                "request_id": request_id.0,
+                "outcome": session.continuity_outcome.as_str(),
+            }),
+        )?;
+        let decision = policy::PolicyDecision::new(
+            PolicyState::Blocked,
+            RoutingDecision::EidolonOwned,
+            "session continuity capacity saturated; unknown identity failed closed",
+        );
+        return write_direct_response(DirectResponseContext {
+            client_stream,
+            runtime,
+            session: &session,
+            request: &request,
+            path: &path,
+            request_id,
+            decision: &decision,
+            discovery_recon_score: policy::DiscoveryReconAggregationScore::default(),
+            discovery_recon_threshold: policy::discovery_recon_aggregation_score_threshold(),
+            response: surface_text_response(503, "service temporarily unavailable\n"),
+            controlled_reality_interaction: None,
+            controlled_reality_pending_commit: false,
+            intervention_mode,
+            surface_requested_intervention: true,
+        });
+    }
     let (mut policy_state, capacity_fail_closed) =
         policy_state_resolution_for_session(runtime, session.session_id)?;
     if capacity_fail_closed {
@@ -3153,7 +3229,7 @@ fn handle_connection(
             policy_state = floor;
         }
     }
-    note_session_enforcement(runtime, client_peer_ip, session.session_id, policy_state);
+    note_session_enforcement(runtime, &session, policy_state);
     let request_facts =
         request_evaluation::classify_request(request_evaluation::RequestClassificationInput {
             bait_registry: &runtime.bait_registry,
@@ -3181,7 +3257,7 @@ fn handle_connection(
         request_facts,
     });
     for transition in &evaluation.transitions {
-        apply_policy_transition(runtime, session.session_id, request_id, transition)?;
+        apply_policy_transition(runtime, &session, request_id, transition)?;
     }
     policy_state = evaluation.decision.policy_state;
     let discovery_recon_score = evaluation.discovery_recon_score;
@@ -3629,7 +3705,7 @@ fn handle_connection(
                 proof_accepted,
                 action_exposure_id.is_some(),
             ) {
-                apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
+                apply_policy_transition(runtime, &session, request_id, &transition)?;
                 _response_workflow_guard = Some(
                     runtime
                         .controlled_reality_workflow_locks
@@ -3696,7 +3772,7 @@ fn handle_connection(
             )?;
             commit_controlled_reality_interaction(
                 runtime,
-                session.session_id,
+                &session,
                 request_id,
                 response_pending_commit,
             )?;
@@ -3756,7 +3832,7 @@ fn handle_connection(
                 &action_shape_match.bait.id,
                 prior_same_bait_exposure,
             ) {
-                apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
+                apply_policy_transition(runtime, &session, request_id, &transition)?;
                 let response =
                     rate_limited_response(runtime.controlled_reality_config.retry_after_seconds);
                 let action = SurfaceAction::RateLimited {
@@ -3837,7 +3913,7 @@ fn handle_connection(
                 &action_shape_match.bait.id,
                 prior_same_bait_exposure,
             ) {
-                apply_policy_transition(runtime, session.session_id, request_id, &transition)?;
+                apply_policy_transition(runtime, &session, request_id, &transition)?;
                 effective_decision = transition.decision(RoutingDecision::EidolonOwned);
                 return write_direct_response(DirectResponseContext {
                     client_stream,
@@ -3947,7 +4023,7 @@ fn handle_connection(
         )?;
         commit_controlled_reality_interaction(
             runtime,
-            session.session_id,
+            &session,
             request_id,
             controlled_reality_pending_commit,
         )?;
@@ -4208,6 +4284,18 @@ fn maybe_transition_to_blocked_from_reality_escape_attempt(
     ))
 }
 
+fn write_session_continuity_rejection(
+    client_stream: &mut TcpStream,
+    request_method: &str,
+) -> io::Result<()> {
+    let mut response =
+        surface_response_to_http(surface_text_response(400, "invalid ingress continuity\n"));
+    response.set_header("Connection", "close");
+    response.set_header("Content-Length", response.body.len().to_string());
+    client_stream.write_all(&response.to_http_bytes_for_method(request_method))?;
+    client_stream.flush()
+}
+
 struct DirectResponseContext<'a> {
     client_stream: TcpStream,
     runtime: &'a ProxyRuntime,
@@ -4272,7 +4360,7 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
     )?;
     commit_controlled_reality_interaction(
         runtime,
-        session.session_id,
+        session,
         request_id,
         controlled_reality_pending_commit,
     )?;
@@ -4425,8 +4513,7 @@ fn policy_state_resolution_for_session(
 /// rotation-abuse safety net for later requests, never current routing.
 fn note_session_enforcement(
     runtime: &ProxyRuntime,
-    client_peer_ip: Option<IpAddr>,
-    session_id: SessionId,
+    session: &SessionContext,
     policy_state: PolicyState,
 ) {
     let now_unix_secs = SystemTime::now()
@@ -4434,7 +4521,12 @@ fn note_session_enforcement(
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     if let Ok(mut authority) = runtime.session_authority.lock() {
-        authority.note_enforcement(client_peer_ip, session_id, policy_state, now_unix_secs);
+        authority.note_enforcement_with_continuity(
+            session.continuity_key(),
+            session.session_id,
+            policy_state,
+            now_unix_secs,
+        );
     }
 }
 
@@ -4466,10 +4558,11 @@ fn set_policy_state_for_session(
 
 fn apply_policy_transition(
     runtime: &ProxyRuntime,
-    session_id: SessionId,
+    session: &SessionContext,
     request_id: RequestId,
     transition: &policy::PolicyTransition,
 ) -> io::Result<()> {
+    let session_id = session.session_id;
     write_debug(
         runtime,
         "policy_transition_selected",
@@ -4481,6 +4574,7 @@ fn apply_policy_transition(
         }),
     )?;
     set_policy_state_for_session(runtime, session_id, transition.to)?;
+    note_session_enforcement(runtime, session, transition.to);
     write_event(
         &runtime.event_log,
         &policy::policy_changed_event(session_id, request_id, transition),
@@ -4911,7 +5005,7 @@ fn reconcile_all_pending_controlled_reality_interactions(runtime: &ProxyRuntime)
 
 fn commit_controlled_reality_interaction(
     runtime: &ProxyRuntime,
-    session_id: SessionId,
+    session: &SessionContext,
     request_id: RequestId,
     pending_commit: bool,
 ) -> io::Result<()> {
@@ -4919,21 +5013,25 @@ fn commit_controlled_reality_interaction(
         return Ok(());
     }
 
-    let committed = runtime
-        .policy_store
-        .lock()
-        .map_err(|_| io::Error::other("policy state store lock poisoned"))?
-        .commit_controlled_reality_interaction(session_id, request_id)?;
-    if !committed {
-        return Err(invalid_data(
-            "controlled-reality response had no pending state to commit",
-        ));
-    }
+    let session_id = session.session_id;
+    let policy_state = {
+        let mut store = runtime
+            .policy_store
+            .lock()
+            .map_err(|_| io::Error::other("policy state store lock poisoned"))?;
+        if !store.commit_controlled_reality_interaction(session_id, request_id)? {
+            return Err(invalid_data(
+                "controlled-reality response had no pending state to commit",
+            ));
+        }
+        store.policy_state(session_id)
+    };
     runtime
         .event_log
         .lock()
         .map_err(|_| io::Error::other("event log lock poisoned"))?
         .resolve_durable_response(session_id, request_id);
+    note_session_enforcement(runtime, session, policy_state);
     Ok(())
 }
 
@@ -5678,17 +5776,41 @@ fn effective_session_context(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
-    let mut session = {
+    let session_resolution = {
         let mut authority = runtime
             .session_authority
             .lock()
             .map_err(|_| io::Error::other("session authority lock poisoned"))?;
-        session::derive_session_from_headers(
+        session::derive_session_from_headers_with_trusted_ingress_continuity(
             &mut authority,
             headers.iter().copied(),
             client_peer_ip,
             now_unix_secs,
+            runtime.ingress_transport_auth_secret.as_deref(),
+            runtime.require_authenticated_ingress_continuity,
+            !runtime.require_authenticated_ingress_continuity,
         )
+    };
+    let mut session = match session_resolution {
+        Ok(session) => session,
+        Err(rejection) => {
+            write_debug(
+                runtime,
+                "session_continuity_rejected",
+                None,
+                json!({
+                    "request_id": request_id.0,
+                    "reason": rejection.as_str(),
+                }),
+            )?;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "trusted ingress continuity rejected: {}",
+                    rejection.as_str()
+                ),
+            ));
+        }
     };
     write_debug(
         runtime,
@@ -5705,6 +5827,7 @@ fn effective_session_context(
             "presented_key_version": session.presented_key_version,
             "active_key_version": session.active_key_version,
             "continuity_outcome": session.continuity_outcome.as_str(),
+            "continuity_source": session.continuity_source.map(|source| source.as_str()),
             "enforcement_floor": session.enforcement_floor,
         }),
     )?;
@@ -6680,6 +6803,9 @@ Options:
   --ingress-transport-auth-secret-file <PATH>
                          Shared-secret file required before explicit
                          X-Eidolon-Ingress-* identity headers are trusted
+  --require-authenticated-ingress-continuity
+                         Require one valid transport-auth and continuity header
+                         pair on every request. Requires the transport secret
   --trusted-bait-soften-prefix <PATH_PREFIX>
                          Repeatable path prefix where strong trusted identities may
                          skip bait exposure surfaces [default: /docs, /openapi.json]
@@ -6927,6 +7053,7 @@ mod tests {
             surface_controller,
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
@@ -6981,6 +7108,7 @@ mod tests {
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
@@ -7018,6 +7146,7 @@ mod tests {
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
@@ -7057,6 +7186,7 @@ mod tests {
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            require_authenticated_ingress_continuity: false,
             bait_signing_secret,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
             bait_registry,
@@ -7490,6 +7620,7 @@ mod tests {
     }
 
     const TEST_SESSION_KEY: [u8; 32] = [0x5a; 32];
+    const TEST_INGRESS_CONTINUITY_ID: &str = "test_client_0123456789abcdef";
 
     fn test_session_authority() -> SessionAuthority {
         SessionAuthority::new(
@@ -7528,6 +7659,15 @@ mod tests {
     }
 
     fn request_with_cookie(
+        method: &str,
+        path: &str,
+        cookie: &str,
+        headers: &[(&str, &str)],
+    ) -> Vec<u8> {
+        request_with_cookie_exact(method, path, cookie, headers)
+    }
+
+    fn request_with_cookie_exact(
         method: &str,
         path: &str,
         cookie: &str,
@@ -7741,6 +7881,7 @@ mod tests {
         assert_eq!(config.bait_signing_secret_path, None);
         assert_eq!(config.ingress_trust_config_path, None);
         assert_eq!(config.ingress_transport_auth_secret_path, None);
+        assert!(!config.require_authenticated_ingress_continuity);
         assert_eq!(
             config.trusted_bait_soften_path_prefixes,
             default_trusted_bait_soften_path_prefixes()
@@ -7857,6 +7998,7 @@ mod tests {
                 &ingress_transport_auth_secret_path,
                 "transport auth secret path should be utf8",
             ),
+            "--require-authenticated-ingress-continuity",
             "--trusted-bait-soften-prefix",
             "/customer",
             "--trusted-bait-soften-prefix",
@@ -7902,6 +8044,7 @@ mod tests {
             config.ingress_transport_auth_secret_path,
             Some(ingress_transport_auth_secret_path)
         );
+        assert!(config.require_authenticated_ingress_continuity);
         assert_eq!(
             config.trusted_bait_soften_path_prefixes,
             vec!["/customer".to_string(), "/assets".to_string()]
@@ -7938,6 +8081,14 @@ mod tests {
         assert_eq!(config.upstream.to_string(), "http://[::1]:9001");
         assert_eq!(config.upstream.authority, "[::1]:9001");
         assert_eq!(config.upstream.connect_addr, "[::1]:9001");
+    }
+
+    #[test]
+    fn strict_ingress_continuity_requires_transport_secret() {
+        assert_error_contains(
+            &["--require-authenticated-ingress-continuity"],
+            "--ingress-transport-auth-secret-file",
+        );
     }
 
     #[test]
@@ -9179,6 +9330,97 @@ mod tests {
             "replay_seen"
         );
         assert!(actions[1]["kind"]["exposure_id"].is_null());
+    }
+
+    #[test]
+    fn runtime_rejects_invalid_trusted_ingress_continuity_without_upstream_request() {
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            (
+                "missing",
+                &[(session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret")],
+            ),
+            (
+                "duplicate",
+                &[
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        "client_A_0123456789abcdef",
+                    ),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        "client_B_0123456789abcdef",
+                    ),
+                ],
+            ),
+            (
+                "invalid",
+                &[
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (session::INGRESS_CONTINUITY_HEADER_NAME, "too-short"),
+                ],
+            ),
+            (
+                "unauthenticated",
+                &[
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "wrong-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        "client_A_0123456789abcdef",
+                    ),
+                ],
+            ),
+        ];
+
+        for (label, headers) in cases {
+            let event_log = unique_temp_path(&format!("continuity-{label}-events.jsonl"));
+            let (upstream, recorder) =
+                spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+            let mut runtime = test_runtime(
+                upstream,
+                &event_log,
+                unique_temp_path(&format!("continuity-{label}-control.txt")),
+                SurfaceAction::ProtectedUpstream,
+            );
+            runtime.ingress_transport_auth_secret = Some(Arc::from("edge-secret"));
+            runtime.require_authenticated_ingress_continuity = true;
+            let request = request_with_cookie_exact("GET", "/ordinary", &cookie_header(), headers);
+
+            let (result, response) = run_runtime_request_result(runtime, &request);
+
+            assert!(
+                result.is_ok(),
+                "{label} rejection response failed: {result:?}"
+            );
+            assert!(
+                response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+                "{label} continuity returned an unexpected response: {response:?}"
+            );
+            assert!(
+                recorder.finish().is_empty(),
+                "{label} continuity reached protected upstream"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_transport_secret_does_not_break_non_strict_lab_traffic() {
+        let event_log = unique_temp_path("optional-continuity-events.jsonl");
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"ordinary_upstream"}"#)]);
+        let mut runtime = test_runtime(
+            upstream,
+            &event_log,
+            unique_temp_path("optional-continuity-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::from("edge-secret"));
+
+        let response =
+            parse_downstream_response(&run_runtime_request(runtime, &get_request("/ordinary")));
+
+        assert_eq!(response.body, br#"{"mode":"ordinary_upstream"}"#);
+        assert_eq!(recorder.finish().len(), 1);
     }
 
     #[test]
@@ -11570,10 +11812,20 @@ mod tests {
                     "2099-06-04T12:00:00Z",
                 ),
                 (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                (
+                    session::INGRESS_CONTINUITY_HEADER_NAME,
+                    TEST_INGRESS_CONTINUITY_ID,
+                ),
             ],
         );
         let _response = run_runtime_request(runtime, &request);
         must_join(upstream_handle.join(), "upstream thread should join");
+        assert!(!fs::read_to_string(&event_log_path)
+            .expect("event log should read")
+            .contains("test_client_0123456789abcdef"));
+        assert!(!fs::read_to_string(&debug_log_path)
+            .expect("debug log should read")
+            .contains("test_client_0123456789abcdef"));
 
         let request_event = first_event_of_type(&event_log_path, "request_seen");
         assert_eq!(
@@ -11601,6 +11853,11 @@ mod tests {
         assert_eq!(
             request_debug["fields"]["ingress_identity"]["trust_tier"],
             "allowlisted"
+        );
+        let session_debug = first_debug_event(&debug_log_path, "session_resolved");
+        assert_eq!(
+            session_debug["fields"]["continuity_source"],
+            "authenticated_ingress"
         );
     }
 
@@ -11645,6 +11902,10 @@ mod tests {
                 (session::INGRESS_DETECTION_IDS_HEADER_NAME, "3355446,445566"),
                 (session::INGRESS_EDGE_ACTION_HEADER_NAME, "allow"),
                 (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                (
+                    session::INGRESS_CONTINUITY_HEADER_NAME,
+                    TEST_INGRESS_CONTINUITY_ID,
+                ),
             ],
         );
         let _response = run_runtime_request(runtime, &request);
@@ -11717,6 +11978,10 @@ mod tests {
                         "automation_likelihood_inverse",
                     ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                 ],
             ),
         ));
@@ -11795,6 +12060,10 @@ mod tests {
                         "automation_likelihood_inverse",
                     ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                 ],
             ),
         ));
@@ -11966,6 +12235,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -12095,6 +12368,10 @@ mod tests {
                     ),
                     (session::INGRESS_DETECTION_IDS_HEADER_NAME, "3355446,445566"),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                 ],
             ),
         ));
@@ -12196,6 +12473,10 @@ mod tests {
             ),
             (session::INGRESS_DETECTION_IDS_HEADER_NAME, "3355446,445566"),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -12361,6 +12642,10 @@ mod tests {
             ),
             (session::INGRESS_DETECTION_IDS_HEADER_NAME, "3355446,445566"),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -12552,6 +12837,10 @@ mod tests {
                         "automation_likelihood_inverse",
                     ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                 ],
             ),
         ));
@@ -12651,6 +12940,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -12775,6 +13068,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -12874,6 +13171,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -13064,6 +13365,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -13218,6 +13523,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -13411,6 +13720,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -13588,6 +13901,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -13827,6 +14144,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -14047,6 +14368,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -14217,6 +14542,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -14357,6 +14686,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -14502,6 +14835,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -14642,6 +14979,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -14813,6 +15154,10 @@ mod tests {
                 "automation_likelihood_inverse",
             ),
             (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
         ];
 
         let first_response = parse_downstream_response(&run_runtime_request(
@@ -15028,6 +15373,10 @@ mod tests {
                         "automation_likelihood_inverse",
                     ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                 ],
             ),
         ));
@@ -15140,6 +15489,10 @@ mod tests {
                         "2000-01-01T00:00:00Z",
                     ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                 ],
             ),
         ));
@@ -15207,6 +15560,10 @@ mod tests {
                     (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
                     (session::INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                     ("X-Eidolon-Ingress-Vendor-Score", "91"),
                 ],
             ),
@@ -15220,6 +15577,7 @@ mod tests {
         assert!(!upstream_request.contains("X-Eidolon-Ingress-Identity-Source:"));
         assert!(!upstream_request.contains("X-Eidolon-Ingress-Trust-Tier:"));
         assert!(!upstream_request.contains("X-Eidolon-Ingress-Transport-Auth:"));
+        assert!(!upstream_request.contains("X-Eidolon-Ingress-Continuity:"));
         assert!(!upstream_request.contains("X-Eidolon-Ingress-Vendor-Score:"));
     }
 
@@ -15325,6 +15683,10 @@ mod tests {
                 (session::INGRESS_TRUST_TIER_HEADER_NAME, "weakly_asserted"),
                 (session::INGRESS_IDENTITY_LABEL_HEADER_NAME, "edge-bot"),
                 (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                (
+                    session::INGRESS_CONTINUITY_HEADER_NAME,
+                    TEST_INGRESS_CONTINUITY_ID,
+                ),
                 ("X-Eidolon-Trusted-Actor", "internal-crawler"),
             ],
         );
@@ -15390,6 +15752,10 @@ mod tests {
                 (session::INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
                 (session::INGRESS_IDENTITY_LABEL_HEADER_NAME, "signed-agent"),
                 (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                (
+                    session::INGRESS_CONTINUITY_HEADER_NAME,
+                    TEST_INGRESS_CONTINUITY_ID,
+                ),
                 ("X-Eidolon-Trusted-Actor", "internal-crawler"),
             ],
         );
@@ -15464,6 +15830,10 @@ mod tests {
                         "AI Assistant",
                     ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                 ],
             ),
         ));
@@ -15564,6 +15934,10 @@ mod tests {
                         "AI Assistant",
                     ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                 ],
             ),
         ));
@@ -15649,6 +16023,10 @@ mod tests {
                         "AI Assistant",
                     ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                 ],
             ),
         ));
@@ -15871,6 +16249,10 @@ mod tests {
                         "internal-crawler",
                     ),
                     (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
                 ],
             ),
         ));
@@ -17315,6 +17697,84 @@ mod tests {
         );
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+    }
+
+    #[test]
+    fn runtime_continuity_capacity_fails_closed_even_when_interventions_are_disabled() {
+        let event_log_path = unique_temp_path("continuity-capacity-fail-closed-events.jsonl");
+        let debug_log_path = unique_temp_path("continuity-capacity-fail-closed-debug.jsonl");
+        let intervention_path = unique_temp_path("continuity-capacity-fail-closed-control.txt");
+        fs::write(&intervention_path, b"disabled\n").expect("control file should write");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            intervention_path,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::from("edge-secret"));
+        runtime.require_authenticated_ingress_continuity = true;
+
+        {
+            let mut authority = runtime
+                .session_authority
+                .lock()
+                .expect("session authority should lock");
+            authority
+                .set_continuity_capacity(1)
+                .expect("test continuity capacity should configure");
+            let established = session::derive_session_from_headers_with_trusted_ingress_continuity(
+                &mut authority,
+                [
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
+                ],
+                None,
+                now_unix_secs(),
+                Some("edge-secret"),
+                true,
+                false,
+            )
+            .expect("first authenticated continuity identity should bind");
+            authority.note_enforcement_with_continuity(
+                established.continuity_key(),
+                established.session_id,
+                PolicyState::Suspicious,
+                now_unix_secs(),
+            );
+        }
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/ordinary",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        "client_B_0123456789abcdef",
+                    ),
+                ],
+            ),
+        ));
+
+        assert_eq!(response.status, 503);
+        assert!(
+            upstream_recorder.finish().is_empty(),
+            "continuity capacity failure reached protected upstream"
+        );
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+        assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+        assert_eq!(
+            debug_events(&debug_log_path, "session_continuity_capacity_fail_closed").len(),
+            1
+        );
     }
 
     #[test]
@@ -20480,6 +20940,95 @@ mod tests {
             .count();
         assert_eq!(recovered, 1);
         assert_eq!(cooldown_limited, 2);
+    }
+
+    #[test]
+    fn runtime_policy_transition_immediately_protects_against_valid_cookie_swap() {
+        let event_log_path = unique_temp_path("alternate-cookie-floor-events.jsonl");
+        let debug_log_path = unique_temp_path("alternate-cookie-floor-debug.jsonl");
+        let (upstream, recorder) =
+            spawn_recording_upstream([html_response("<html><body>unexpected</body></html>")]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("alternate-cookie-floor-control.txt"),
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::from("edge-secret"));
+        let continuity_headers = [
+            (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (
+                session::INGRESS_CONTINUITY_HEADER_NAME,
+                TEST_INGRESS_CONTINUITY_ID,
+            ),
+        ];
+        let original_cookie = cookie_header();
+        let original_session =
+            session_id_from_cookie(&original_cookie).expect("original cookie should parse");
+        set_runtime_policy_state(&runtime, &original_cookie, PolicyState::Suspicious);
+
+        let exposure = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie(
+                "GET",
+                "/docs/legacy-import",
+                &original_cookie,
+                &continuity_headers,
+            ),
+        ));
+        let transition = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie(
+                "POST",
+                "/api/v2/import/reconcile",
+                &original_cookie,
+                &[
+                    continuity_headers[0],
+                    continuity_headers[1],
+                    ("X-Migration-Trace", "wrong"),
+                ],
+            ),
+        ));
+        let alternate_cookie = cookie_header();
+        let alternate_session =
+            session_id_from_cookie(&alternate_cookie).expect("alternate cookie should parse");
+        let after_swap = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &request_with_cookie(
+                "GET",
+                "/docs/legacy-import",
+                &alternate_cookie,
+                &continuity_headers,
+            ),
+        ));
+
+        assert_eq!(exposure.status, 200);
+        assert_eq!(transition.status, 429);
+        assert_eq!(after_swap.status, 429);
+        assert_eq!(
+            policy_state_for_session(&runtime, original_session)
+                .expect("original policy state should load"),
+            PolicyState::RateLimited
+        );
+        assert_ne!(alternate_session, original_session);
+        assert!(
+            recorder.finish().is_empty(),
+            "alternate valid cookie reached protected upstream"
+        );
+        let resolved = debug_events(&debug_log_path, "session_resolved")
+            .into_iter()
+            .last()
+            .expect("cookie-swap session resolution should be logged");
+        assert_eq!(
+            resolved["fields"]["continuity_outcome"],
+            "continuity_session_preserved"
+        );
+        assert_eq!(resolved["fields"]["enforcement_floor"], "rate_limited");
+        assert_eq!(
+            resolved["session_id"],
+            original_session.0.to_string(),
+            "stable continuity identity must win over the alternate cookie"
+        );
     }
 
     #[test]

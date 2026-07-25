@@ -9,7 +9,8 @@ use eidolon_core::{
 };
 
 use crate::session_auth::{
-    ContinuityOutcome, CookieOutcome, KeyStatus, SessionAuthority, SessionResolution,
+    ContinuityKey, ContinuityOutcome, ContinuitySource, CookieOutcome, KeyStatus, SessionAuthority,
+    SessionResolution,
 };
 
 /// Request header carrying first-party cookies.
@@ -45,6 +46,7 @@ pub const INGRESS_TRUST_TIER_HEADER_NAME: &str = "X-Eidolon-Ingress-Trust-Tier";
 pub const INGRESS_IDENTITY_LABEL_HEADER_NAME: &str = "X-Eidolon-Ingress-Identity-Label";
 pub const INGRESS_IDENTITY_EXPIRES_AT_HEADER_NAME: &str = "X-Eidolon-Ingress-Identity-Expires-At";
 pub const INGRESS_TRANSPORT_AUTH_HEADER_NAME: &str = "X-Eidolon-Ingress-Transport-Auth";
+pub const INGRESS_CONTINUITY_HEADER_NAME: &str = "X-Eidolon-Ingress-Continuity";
 pub const INGRESS_VERIFICATION_STRENGTH_HEADER_NAME: &str =
     "X-Eidolon-Ingress-Verification-Strength";
 pub const INGRESS_ACTOR_KIND_HEADER_NAME: &str = "X-Eidolon-Ingress-Actor-Kind";
@@ -56,12 +58,39 @@ pub const INGRESS_VENDOR_SCORE_SCALE_HEADER_NAME: &str = "X-Eidolon-Ingress-Vend
 pub const INGRESS_DETECTION_IDS_HEADER_NAME: &str = "X-Eidolon-Ingress-Detection-Ids";
 pub const INGRESS_EDGE_ACTION_HEADER_NAME: &str = "X-Eidolon-Ingress-Edge-Action";
 
+const MIN_INGRESS_CONTINUITY_BYTES: usize = 16;
+const MAX_INGRESS_CONTINUITY_BYTES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionSource {
     /// A valid `SessionId` was recovered from the first-party session cookie.
     Cookie,
     /// No valid first-party cookie was present, so a request context was generated.
     Generated,
+}
+
+/// Reason a configured trusted-ingress continuity contract was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuityInputRejection {
+    MissingTransportAuth,
+    DuplicateTransportAuth,
+    InvalidTransportAuth,
+    MissingContinuity,
+    DuplicateContinuity,
+    InvalidContinuity,
+}
+
+impl ContinuityInputRejection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingTransportAuth => "missing_transport_auth",
+            Self::DuplicateTransportAuth => "duplicate_transport_auth",
+            Self::InvalidTransportAuth => "invalid_transport_auth",
+            Self::MissingContinuity => "missing_continuity",
+            Self::DuplicateContinuity => "duplicate_continuity",
+            Self::InvalidContinuity => "invalid_continuity",
+        }
+    }
 }
 
 /// Result of identifying the session for one proxied request.
@@ -77,6 +106,7 @@ pub struct SessionContext {
     pub presented_key_version: Option<u32>,
     pub active_key_version: u32,
     pub continuity_outcome: ContinuityOutcome,
+    pub continuity_source: Option<ContinuitySource>,
     pub enforcement_floor: Option<eidolon_core::PolicyState>,
     pub ingress_identity: IngressIdentity,
     pub authenticated_ingress_rule_rejection: Option<AuthenticatedIngressRuleRejection>,
@@ -84,6 +114,7 @@ pub struct SessionContext {
     pub ingress_signals: IngressAdvisorySignals,
     pub trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
     pub trusted_bait_soften_path_prefixes: Option<Vec<String>>,
+    continuity_key: Option<ContinuityKey>,
     set_cookie_value: Option<String>,
 }
 
@@ -97,6 +128,10 @@ impl SessionContext {
     pub fn set_cookie_value(&self) -> Option<String> {
         self.set_cookie_value.clone()
     }
+
+    pub fn continuity_key(&self) -> Option<ContinuityKey> {
+        self.continuity_key
+    }
 }
 
 /// Authenticate a session cookie or recover a bounded direct-peer continuity session.
@@ -106,6 +141,31 @@ pub fn derive_session_from_headers<I, N, V>(
     peer_ip: Option<IpAddr>,
     now: u64,
 ) -> SessionContext
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
+    derive_session_from_headers_with_trusted_ingress_continuity(
+        authority, headers, peer_ip, now, None, false, true,
+    )
+    .expect("Lab peer continuity has no authenticated ingress contract to reject")
+}
+
+/// Authenticate a session cookie and recover continuity from a trusted ingress.
+///
+/// Strict mode requires authenticated continuity on every request. Outside
+/// strict mode, a presented continuity header must still authenticate, while
+/// requests without one may use the explicitly enabled Lab peer fallback.
+pub fn derive_session_from_headers_with_trusted_ingress_continuity<I, N, V>(
+    authority: &mut SessionAuthority,
+    headers: I,
+    peer_ip: Option<IpAddr>,
+    now: u64,
+    ingress_transport_auth_secret: Option<&str>,
+    require_authenticated_ingress_continuity: bool,
+    allow_lab_peer_fallback: bool,
+) -> Result<SessionContext, ContinuityInputRejection>
 where
     I: IntoIterator<Item = (N, V)>,
     N: AsRef<str>,
@@ -125,21 +185,44 @@ where
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
     );
+    let continuity_header_present = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(INGRESS_CONTINUITY_HEADER_NAME));
+    let continuity_key = match (
+        ingress_transport_auth_secret,
+        require_authenticated_ingress_continuity || continuity_header_present,
+    ) {
+        (Some(shared_secret), true) => Some(authenticated_ingress_continuity_key_from_headers(
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+            shared_secret,
+        )?),
+        (None, true) => return Err(ContinuityInputRejection::MissingTransportAuth),
+        (_, false) if allow_lab_peer_fallback => peer_ip.map(ContinuityKey::lab_peer),
+        (_, false) => None,
+    };
 
-    let resolution = authority.resolve(
+    let resolution = authority.resolve_with_continuity(
         headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
-        peer_ip,
+        continuity_key,
         now,
     );
-    context_from_resolution(resolution, ingress_identity, ingress_signals)
+    Ok(context_from_resolution(
+        resolution,
+        ingress_identity,
+        ingress_signals,
+        continuity_key,
+    ))
 }
 
 fn context_from_resolution(
     resolution: SessionResolution,
     ingress_identity: IngressIdentity,
     ingress_signals: IngressAdvisorySignals,
+    continuity_key: Option<ContinuityKey>,
 ) -> SessionContext {
     SessionContext {
         session_id: resolution.session_id,
@@ -153,6 +236,7 @@ fn context_from_resolution(
         presented_key_version: resolution.presented_key_version,
         active_key_version: resolution.active_key_version,
         continuity_outcome: resolution.continuity_outcome,
+        continuity_source: resolution.continuity_source,
         enforcement_floor: resolution.enforcement_floor,
         ingress_identity,
         authenticated_ingress_rule_rejection: None,
@@ -160,8 +244,63 @@ fn context_from_resolution(
         ingress_signals,
         trusted_ingress_soften_match: None,
         trusted_bait_soften_path_prefixes: None,
+        continuity_key,
         set_cookie_value: resolution.set_cookie_value,
     }
+}
+
+/// Derive a minimized continuity key only from one authenticated ingress value.
+pub(crate) fn authenticated_ingress_continuity_key_from_headers<I, N, V>(
+    headers: I,
+    shared_secret: &str,
+) -> Result<ContinuityKey, ContinuityInputRejection>
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
+    let shared_secret = shared_secret.trim();
+    let headers: Vec<(String, String)> = headers
+        .into_iter()
+        .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
+        .collect();
+
+    let transport_auth: Vec<&str> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(INGRESS_TRANSPORT_AUTH_HEADER_NAME))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    let presented_auth = match transport_auth.as_slice() {
+        [] => return Err(ContinuityInputRejection::MissingTransportAuth),
+        [value] => *value,
+        _ => return Err(ContinuityInputRejection::DuplicateTransportAuth),
+    };
+    if shared_secret.is_empty() || presented_auth != shared_secret {
+        return Err(ContinuityInputRejection::InvalidTransportAuth);
+    }
+
+    let continuity: Vec<&str> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(INGRESS_CONTINUITY_HEADER_NAME))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    let raw = match continuity.as_slice() {
+        [] => return Err(ContinuityInputRejection::MissingContinuity),
+        [value] => value.trim(),
+        _ => return Err(ContinuityInputRejection::DuplicateContinuity),
+    };
+    if !valid_ingress_continuity_value(raw) {
+        return Err(ContinuityInputRejection::InvalidContinuity);
+    }
+
+    Ok(ContinuityKey::authenticated_ingress(raw, shared_secret))
+}
+
+fn valid_ingress_continuity_value(raw: &str) -> bool {
+    (MIN_INGRESS_CONTINUITY_BYTES..=MAX_INGRESS_CONTINUITY_BYTES).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// Return a normalized ingress identity claim from explicit Eidolon trust headers.
@@ -677,6 +816,308 @@ mod tests {
         assert_eq!(identity.source, IngressIdentitySource::SignedAgent);
         assert_eq!(identity.trust_tier, IngressTrustTier::SignedAttested);
         assert_eq!(identity.label.as_deref(), Some("edge-signed-agent"));
+    }
+
+    #[test]
+    fn authenticated_continuity_separates_clients_behind_one_ingress_peer() {
+        let mut authority = test_session_authority();
+        let peer: IpAddr = "10.0.0.10".parse().expect("peer IP should parse");
+        let first = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut authority,
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, "client_A_0123456789abcdef"),
+            ],
+            Some(peer),
+            NOW,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect("first authenticated continuity should resolve");
+        let second = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut authority,
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, "client_B_0123456789abcdef"),
+            ],
+            Some(peer),
+            NOW + 1,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect("second authenticated continuity should resolve");
+        let recovered_first = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut authority,
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, "client_A_0123456789abcdef"),
+            ],
+            Some(peer),
+            NOW + 5,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect("same authenticated continuity should recover");
+
+        assert_ne!(first.session_id, second.session_id);
+        assert_eq!(recovered_first.session_id, first.session_id);
+        assert_eq!(
+            recovered_first.continuity_source,
+            Some(ContinuitySource::AuthenticatedIngress)
+        );
+        assert_eq!(
+            recovered_first.continuity_outcome,
+            ContinuityOutcome::Recovered
+        );
+    }
+
+    #[test]
+    fn configured_secret_without_continuity_preserves_lab_peer_fallback() {
+        let mut authority = test_session_authority();
+        let peer: IpAddr = "10.0.0.10".parse().expect("peer IP should parse");
+        let first = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut authority,
+            [(INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret")],
+            Some(peer),
+            NOW,
+            Some("edge-secret"),
+            false,
+            true,
+        )
+        .expect("non-strict Lab request should resolve");
+        let recovered = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut authority,
+            [("Host", "proxy.local")],
+            Some(peer),
+            NOW + 1,
+            Some("edge-secret"),
+            false,
+            true,
+        )
+        .expect("ordinary Lab request should preserve peer continuity");
+
+        assert_eq!(recovered.session_id, first.session_id);
+        assert_eq!(recovered.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(recovered.continuity_source, Some(ContinuitySource::LabPeer));
+    }
+
+    #[test]
+    fn forged_or_unsigned_continuity_is_not_trusted() {
+        let mut authority = test_session_authority();
+        let raw = "client_A_0123456789abcdef";
+        let legitimate = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut authority,
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, raw),
+            ],
+            None,
+            NOW,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect("legitimate continuity should resolve");
+        let forged = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut authority,
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "wrong-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, raw),
+            ],
+            None,
+            NOW + 1,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect_err("forged transport auth must fail closed");
+        let unsigned = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut authority,
+            [(INGRESS_CONTINUITY_HEADER_NAME, raw)],
+            None,
+            NOW + 2,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect_err("unsigned continuity must fail closed");
+
+        assert_eq!(
+            legitimate.continuity_source,
+            Some(ContinuitySource::AuthenticatedIngress)
+        );
+        assert_eq!(forged, ContinuityInputRejection::InvalidTransportAuth);
+        assert_eq!(unsigned, ContinuityInputRejection::MissingTransportAuth);
+    }
+
+    #[test]
+    fn authenticated_continuity_survives_cookie_discard_with_enforcement_floor() {
+        let mut authority = test_session_authority();
+        let headers = [
+            (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (INGRESS_CONTINUITY_HEADER_NAME, "client_A_0123456789abcdef"),
+        ];
+        let original = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut authority,
+            headers,
+            None,
+            NOW,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect("authenticated continuity should resolve");
+        authority.note_enforcement_with_continuity(
+            original.continuity_key(),
+            original.session_id,
+            eidolon_core::PolicyState::Blocked,
+            NOW + 1,
+        );
+
+        let recovered = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut authority,
+            headers,
+            None,
+            NOW + 5,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect("authenticated continuity should recover");
+
+        assert_eq!(recovered.session_id, original.session_id);
+        assert_eq!(
+            recovered.enforcement_floor,
+            Some(eidolon_core::PolicyState::Blocked)
+        );
+        assert_eq!(recovered.continuity_outcome, ContinuityOutcome::Recovered);
+    }
+
+    #[test]
+    fn continuity_raw_value_is_not_exposed_and_restart_requires_cookie() {
+        let raw = "client_A_0123456789abcdef";
+        let headers = [
+            (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+            (INGRESS_CONTINUITY_HEADER_NAME, raw),
+        ];
+        let mut first_authority = test_session_authority();
+        let original = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut first_authority,
+            headers,
+            None,
+            NOW,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect("authenticated continuity should resolve");
+        let key = original
+            .continuity_key()
+            .expect("authenticated continuity should produce a key");
+        assert!(!format!("{key:?}").contains(raw));
+
+        let mut restarted_without_cookie = test_session_authority();
+        let lost = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut restarted_without_cookie,
+            headers,
+            None,
+            NOW + 1,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect("authenticated continuity remains valid after restart");
+        assert_ne!(lost.session_id, original.session_id);
+        assert_eq!(lost.continuity_outcome, ContinuityOutcome::NoRecord);
+
+        let cookie = format!(
+            "{}={}",
+            SESSION_COOKIE_NAME,
+            first_authority.mint_cookie_value(original.session_id, NOW)
+        );
+        let mut restarted_with_cookie = test_session_authority();
+        let restored = derive_session_from_headers_with_trusted_ingress_continuity(
+            &mut restarted_with_cookie,
+            [
+                ("Cookie", cookie.as_str()),
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, raw),
+            ],
+            None,
+            NOW + 1,
+            Some("edge-secret"),
+            true,
+            false,
+        )
+        .expect("valid signed cookie should survive restart");
+        assert_eq!(restored.session_id, original.session_id);
+        assert_eq!(restored.cookie_outcome, CookieOutcome::Valid);
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_continuity_values_are_rejected() {
+        let valid = "client_A_0123456789abcdef";
+        assert!(authenticated_ingress_continuity_key_from_headers(
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, valid),
+            ],
+            "edge-secret",
+        )
+        .is_ok());
+        for invalid in ["short", "contains spaces 1234", "contains/slash/1234"] {
+            assert!(
+                authenticated_ingress_continuity_key_from_headers(
+                    [
+                        (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                        (INGRESS_CONTINUITY_HEADER_NAME, invalid),
+                    ],
+                    "edge-secret",
+                ) == Err(ContinuityInputRejection::InvalidContinuity)
+            );
+        }
+        let oversized = "a".repeat(MAX_INGRESS_CONTINUITY_BYTES + 1);
+        assert_eq!(
+            authenticated_ingress_continuity_key_from_headers(
+                [
+                    (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (INGRESS_CONTINUITY_HEADER_NAME, oversized.as_str()),
+                ],
+                "edge-secret",
+            ),
+            Err(ContinuityInputRejection::InvalidContinuity)
+        );
+        assert_eq!(
+            authenticated_ingress_continuity_key_from_headers(
+                [(INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret")],
+                "edge-secret",
+            ),
+            Err(ContinuityInputRejection::MissingContinuity)
+        );
+        assert_eq!(
+            authenticated_ingress_continuity_key_from_headers(
+                [
+                    (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (INGRESS_CONTINUITY_HEADER_NAME, valid),
+                ],
+                "edge-secret",
+            ),
+            Err(ContinuityInputRejection::DuplicateTransportAuth)
+        );
+        assert!(
+            authenticated_ingress_continuity_key_from_headers(
+                [
+                    (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (INGRESS_CONTINUITY_HEADER_NAME, valid),
+                    (INGRESS_CONTINUITY_HEADER_NAME, "client_B_0123456789abcdef",),
+                ],
+                "edge-secret",
+            ) == Err(ContinuityInputRejection::DuplicateContinuity)
+        );
     }
 
     #[test]
