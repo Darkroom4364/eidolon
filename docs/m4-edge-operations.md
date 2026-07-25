@@ -103,6 +103,10 @@ Important trust boundary:
 
 Session identity on this deployment:
 
+- the shield proxy is one replica with a `Recreate` rollout strategy; upgrades
+  deliberately stop the old pod before starting the new pod, so planned
+  downtime is expected but not yet measured; the PVC-backed process-lifetime
+  lease is the fail-closed second layer against writer overlap
 - the shield proxy authenticates `eidolon_session` cookies (HMAC-SHA256 over a
   versioned key) and rejects unsigned, forged, or expired values with
   deterministic `session_resolved` audit outcomes
@@ -127,7 +131,9 @@ Session identity on this deployment:
   edge instead of generating raw UUIDs; cookie-jar smokes are unaffected
 
 This continuity persistence slice does not complete issue `#254` or establish
-production readiness.
+production readiness. Graceful request draining and measured rollout downtime
+remain release qualification work, as does live overlapping-pod lease proof on
+the supported PVC profile.
 
 Recorded labels:
 
