@@ -5298,6 +5298,7 @@ fn reason_phrase(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Unknown Status",
     }
 }
@@ -7018,7 +7019,9 @@ Options:
                          Repeatable path prefix where strong trusted identities may
                          skip bait exposure surfaces [default: /docs, /openapi.json]
   --intervention-control <PATH>
-                         Optional control file; write `disabled` to force protected forwarding
+                         Optional control file; write `disabled` to bypass ordinary
+                         surface interventions. Recognized unsafe bait actions and
+                         synthetic follow-ups still fail closed
                          [default: {DEFAULT_INTERVENTION_CONTROL}]
   --policy-state <PATH> Per-session policy state JSON file path [default: {DEFAULT_POLICY_STATE}]
   --controlled-reality-max-depth <N>
@@ -18210,6 +18213,188 @@ mod tests {
             ControlledRealityWorkflowState::Ready
         );
         assert!(record.controlled_reality_pending_update.is_none());
+    }
+
+    #[test]
+    fn runtime_remote_renderer_outage_fails_closed_without_protected_upstream_request() {
+        let profile_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/m3/bait-profiles/docs-session-minted-probe.json");
+        let loaded = load_bait_profile(&profile_path).expect("committed docs profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/legacy-import")
+            .expect("session-minted docs bait should exist")
+            .clone();
+        let signing_secret: Arc<str> = Arc::from("renderer-outage-mint-secret");
+        let event_log_path = unique_temp_path("remote-renderer-outage-events.jsonl");
+        let debug_log_path = unique_temp_path("remote-renderer-outage-debug.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let mut runtime = test_runtime_with_bait_profile(
+            upstream,
+            &event_log_path,
+            unique_temp_path("remote-renderer-outage-control.txt"),
+            loaded,
+            Some(Arc::clone(&signing_secret)),
+        );
+        runtime.debug_log = Some(Arc::new(Mutex::new(
+            FileDebugLogWriter::open(&debug_log_path).expect("debug log should open"),
+        )));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("renderer address should bind");
+        let renderer_address = listener
+            .local_addr()
+            .expect("renderer address should exist");
+        drop(listener);
+        runtime.controlled_reality_backend = Some(Arc::new(ControlledRealityBackendClient::new(
+            renderer_address,
+            test_controlled_reality_backend_secret(),
+        )));
+
+        let session_id = SessionId::new();
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session_id));
+        let rendered = render_bait_for_session(&bait, session_id, Some(signing_secret.as_ref()))
+            .expect("session bait should render")
+            .into_owned();
+        let header_name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("minted action should have a header name");
+        let header_value = rendered
+            .expected_action
+            .header_value
+            .as_deref()
+            .expect("minted action should have a header value");
+
+        let exposure_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &get_request_with_cookie(&bait.surface, &cookie),
+        ));
+        assert_eq!(exposure_response.status, 200);
+        assert!(
+            String::from_utf8(exposure_response.body)
+                .expect("exposure body should be utf8")
+                .contains(header_value),
+            "exposure must publish the same-session minted value"
+        );
+
+        let action_response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            &post_request_with_cookie(
+                &bait.expected_action.path,
+                &cookie,
+                &[(header_name, header_value)],
+            ),
+        ));
+        let upstream_requests = upstream_recorder.finish();
+
+        assert_eq!(action_response.status, 503);
+        assert_eq!(action_response.reason, "Service Unavailable");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&action_response.body)
+                .expect("outage body should be json"),
+            json!({
+                "status": "unavailable",
+                "synthetic": true,
+                "write_committed": false,
+                "message": "controlled reality renderer unavailable",
+            })
+        );
+        assert_session_proof_cache_safety(&action_response);
+        assert_eq!(
+            header_values(&action_response, "content-type"),
+            vec!["application/json; charset=utf-8"]
+        );
+        assert_eq!(
+            header_values(&action_response, "x-eidolon-synthetic"),
+            vec!["true"]
+        );
+        assert!(
+            upstream_requests.is_empty(),
+            "renderer outage action reached protected upstream: {:?}",
+            upstream_request_lines(&upstream_requests)
+        );
+
+        let record = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session_id);
+        assert_eq!(record.policy_state, PolicyState::ControlledReality);
+        assert_eq!(record.controlled_reality_depth, 0);
+        assert_eq!(
+            record.controlled_reality_workflow_state,
+            ControlledRealityWorkflowState::Ready
+        );
+        assert_eq!(record.controlled_reality_origin_request_id, None);
+        assert!(record.controlled_reality_pending_update.is_none());
+
+        let events = event_values(&event_log_path);
+        let exposure = events
+            .iter()
+            .find(|event| event["kind"]["type"].as_str() == Some("bait_exposed"))
+            .expect("bait exposure should be audited");
+        let action = events
+            .iter()
+            .find(|event| event["kind"]["type"].as_str() == Some("bait_action_observed"))
+            .expect("bait action should be audited");
+        let action_request_id = action["request_id"]
+            .as_str()
+            .expect("bait action should have request id");
+        assert_eq!(action["session_id"], exposure["session_id"]);
+        assert_eq!(
+            action["kind"]["exposure_id"],
+            exposure["kind"]["exposure_id"]
+        );
+        assert_eq!(
+            action["kind"]["header_value_mint_status"],
+            "matched_session_value"
+        );
+        let request_seen = events
+            .iter()
+            .find(|event| {
+                event["request_id"].as_str() == Some(action_request_id)
+                    && event["kind"]["type"].as_str() == Some("request_seen")
+            })
+            .expect("action request should be audited");
+        assert_eq!(request_seen["kind"]["method"], "POST");
+        assert_eq!(request_seen["kind"]["path"], "/api/v2/import/reconcile");
+        assert_eq!(request_seen["kind"]["routing_decision"], "eidolon_owned");
+        let policy_changed = events
+            .iter()
+            .find(|event| {
+                event["request_id"].as_str() == Some(action_request_id)
+                    && event["kind"]["type"].as_str() == Some("policy_changed")
+            })
+            .expect("controlled-reality transition should be audited");
+        assert_eq!(policy_changed["kind"]["from"], "observe");
+        assert_eq!(policy_changed["kind"]["to"], "controlled_reality");
+        let action_responses: Vec<&Value> = events
+            .iter()
+            .filter(|event| {
+                event["request_id"].as_str() == Some(action_request_id)
+                    && event["kind"]["type"].as_str() == Some("response_served")
+            })
+            .collect();
+        assert_eq!(action_responses.len(), 1);
+        assert_eq!(action_responses[0]["policy_state"], "controlled_reality");
+        assert_eq!(action_responses[0]["kind"]["status"], 503);
+        assert_eq!(
+            action_responses[0]["kind"]["routing_decision"],
+            "eidolon_owned"
+        );
+        assert!(action_responses[0]["kind"]["controlled_reality"].is_null());
+
+        let failures: Vec<Value> =
+            debug_events(&debug_log_path, "controlled_reality_backend_failed")
+                .into_iter()
+                .filter(|event| event["fields"]["request_id"].as_str() == Some(action_request_id))
+                .collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["session_id"], action["session_id"]);
+        assert_eq!(failures[0]["fields"]["reason"], "connect_failed");
+        assert_eq!(failures[0]["fields"]["response_status"], 503);
+        assert_eq!(failures[0]["fields"]["local_fallback"], false);
     }
 
     #[test]

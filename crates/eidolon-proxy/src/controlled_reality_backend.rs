@@ -130,10 +130,18 @@ pub struct ControlledRealityBackendReplayCache {
 
 impl ControlledRealityBackendReplayCache {
     pub fn new() -> Self {
-        Self::with_capacity(MAX_CONTROLLED_REALITY_BACKEND_REPLAY_ENTRIES)
+        Self::from_validated_capacity(MAX_CONTROLLED_REALITY_BACKEND_REPLAY_ENTRIES)
     }
 
-    fn with_capacity(max_entries: usize) -> Self {
+    pub fn with_capacity(max_entries: usize) -> Result<Self, ControlledRealityBackendError> {
+        if max_entries == 0 || max_entries > MAX_CONTROLLED_REALITY_BACKEND_REPLAY_ENTRIES {
+            return Err(ControlledRealityBackendError::InvalidReplayCacheCapacity);
+        }
+
+        Ok(Self::from_validated_capacity(max_entries))
+    }
+
+    fn from_validated_capacity(max_entries: usize) -> Self {
         Self {
             entries: Mutex::new(HashMap::with_capacity(max_entries)),
             max_entries,
@@ -270,6 +278,7 @@ pub enum ControlledRealityBackendError {
     ReplayDetected { request_id: RequestId },
     ReplayCacheSaturated { request_id: RequestId },
     ReplayCacheUnavailable { request_id: RequestId },
+    InvalidReplayCacheCapacity,
     AuthenticatedResponseGenerationFailed { request_id: RequestId },
     AuthenticatedWriteFailed { request_id: RequestId },
     OversizedFrame,
@@ -301,6 +310,7 @@ impl ControlledRealityBackendError {
             Self::ReplayDetected { .. } => "replay_detected",
             Self::ReplayCacheSaturated { .. } => "replay_cache_saturated",
             Self::ReplayCacheUnavailable { .. } => "replay_cache_unavailable",
+            Self::InvalidReplayCacheCapacity => "invalid_replay_cache_capacity",
             Self::AuthenticatedResponseGenerationFailed { .. } => "response_generation_failed",
             Self::AuthenticatedWriteFailed { .. } => "write_failed",
             Self::OversizedFrame => "oversized_frame",
@@ -1208,7 +1218,8 @@ mod tests {
     #[test]
     fn replay_cache_is_bounded_without_evicting_live_entries() {
         let now = 1_000_000;
-        let cache = ControlledRealityBackendReplayCache::with_capacity(1);
+        let cache = ControlledRealityBackendReplayCache::with_capacity(1)
+            .expect("one replay entry should be accepted");
         let (first, _) = fixture(now);
         let (second, _) = fixture(now);
 
@@ -1229,10 +1240,38 @@ mod tests {
     }
 
     #[test]
+    fn replay_cache_accepts_valid_capacity() {
+        assert!(ControlledRealityBackendReplayCache::with_capacity(1).is_ok());
+        assert!(ControlledRealityBackendReplayCache::with_capacity(
+            MAX_CONTROLLED_REALITY_BACKEND_REPLAY_ENTRIES,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn replay_cache_rejects_zero_capacity() {
+        assert!(matches!(
+            ControlledRealityBackendReplayCache::with_capacity(0),
+            Err(ControlledRealityBackendError::InvalidReplayCacheCapacity)
+        ));
+    }
+
+    #[test]
+    fn replay_cache_rejects_capacity_above_maximum() {
+        assert!(matches!(
+            ControlledRealityBackendReplayCache::with_capacity(
+                MAX_CONTROLLED_REALITY_BACKEND_REPLAY_ENTRIES + 1,
+            ),
+            Err(ControlledRealityBackendError::InvalidReplayCacheCapacity)
+        ));
+    }
+
+    #[test]
     fn expired_replay_entries_are_reclaimed() {
         let issued_at = 1_000_000;
         let later = issued_at + CONTROLLED_REALITY_BACKEND_FRESHNESS_WINDOW.as_secs() + 1;
-        let cache = ControlledRealityBackendReplayCache::with_capacity(1);
+        let cache = ControlledRealityBackendReplayCache::with_capacity(1)
+            .expect("one replay entry should be accepted");
         let (first, _) = fixture(issued_at);
         process_render_request(&secret(), &cache, &first, issued_at)
             .expect("first request should render");

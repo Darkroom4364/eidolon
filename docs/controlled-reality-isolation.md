@@ -1,6 +1,7 @@
 # Controlled-Reality Isolation
 
-Status: issue `#176` foundation; not an isolation or production-readiness claim
+Status: issue `#176` enforced kind boundary; not a hard-isolation or
+production-readiness claim
 
 ## Current boundary
 
@@ -14,9 +15,80 @@ Policy state, request correlation, durable workflow state, evidence, depth
 limits, response headers, and protected-upstream routing remain proxy-owned.
 The kind Shield Lab overlay deploys the renderer in
 `shield-controlled-reality`, routes the proxy through Service DNS, and gives
-the renderer default-deny egress. OrbStack does not deploy it. This remains a
-manifested isolation boundary, not a hard-isolation claim, until live deny
-tests and denied-flow evidence pass.
+the renderer default-deny egress. OrbStack does not deploy it.
+
+On 2026-07-24,
+`examples/shield-lab/smoke-controlled-reality-isolation-kind.sh` passed against
+the pinned local kind/Calico deployment. It correlated one minted bait action
+from the proxy event log to the renderer's `served` audit by request ID,
+required a synthetic `202` response with `write_committed:false`, and proved
+the same probe image could reach the target, Kubernetes API, owned metadata
+canary, and internet from `shield-system` while all four destinations were
+denied from `shield-controlled-reality`. It also proved a non-proxy pod could
+not reach the renderer and matched all five denials to Calico flow records.
+
+`examples/shield-lab/smoke-controlled-reality-outage-kind.sh` adds the outage
+contract. It removes every renderer Pod and Service endpoint, performs a valid
+same-session minted action, and requires the fixed private/no-store synthetic
+`503`, an Eidolon-owned request-linked response event, and one request-linked
+`connect_failed` debug audit with no local fallback. A unique safe marker first
+proves the target-side detector works. Any later protected reconcile audit,
+even if an intermediary strips that marker, fails the smoke. A target Pod
+replacement or container restart also invalidates the proof.
+
+`examples/shield-lab/controlled-reality-kill-switch-kind.sh` is the kind
+operator control for that outage boundary. It first verifies the proxy uses
+the remote backend, stores the positive renderer replica count, scales every
+renderer replica to zero, and acknowledges `disabled` only after both Pods
+and all Service endpoint addresses are gone. It then restarts and waits for
+the single remote-mode proxy replica before rechecking the empty renderer
+boundary, which drains any response already buffered in that process.
+`enable` restores the stored replica count and acknowledges only after rollout
+and endpoints recover.
+Manual scale-to-zero without that metadata is reported as an unmanaged outage,
+not a successful kill-switch activation.
+
+The older intervention control file is not this kill switch. Disabled
+interventions forward ordinary traffic to the protected upstream, intentionally
+retain fail-closed ownership only for recognized unsafe actions and synthetic
+follow-ups, and do not drain in-flight renderer work.
+
+On 2026-07-24, the outage smoke passed through this operator path. Disable
+reached zero renderer Pods and endpoints, restarted the proxy, and acknowledged
+the drained state. A fresh same-session minted action then returned the fixed
+Eidolon-owned `503` with no local fallback and produced zero protected-target
+reconcile requests. Enable restored one available renderer replica and endpoint.
+
+On 2026-07-24,
+`examples/shield-lab/smoke-controlled-reality-escape-kind.sh` also passed. It
+baselined a direct protected `POST /api/v1/imports`, entered controlled reality,
+then repeated that POST through the contained session. The first attempt was a
+renderer-audited synthetic `404`; the second moved the session to blocked and
+returned an Eidolon-owned `403`. The audit covered both owned-target replicas
+after verifying they were the proxy upstream, baselined each replica directly,
+and observed zero escape requests after a quiet period. The target audit
+classifies all standard HTTP write methods without recording arbitrary paths.
+
+The owned demo target is stateless. This proves zero protected write-shaped
+request arrival, not the absence of a storage mutation in a stateful target.
+The backend failure reason currently remains in the debug audit rather than a
+first-class durable event/export field.
+
+On 2026-07-24,
+`examples/shield-lab/smoke-controlled-reality-capacity-kind.sh` passed with all
+four renderer bounds temporarily reduced to one. It forced connection-queue
+saturation and audit drops, then filled the replay cache with one valid action.
+A second request failed closed with a synthetic `503` and no local fallback.
+Renderer audit counters proved all three saturation paths and remained
+monotonic. The target-side detector was baselined on both protected replicas
+and observed zero capacity-test writes. The smoke restored the exact original
+renderer arguments and waited for the default deployment to become ready.
+
+The renderer can name `replay_cache_saturated` because it authenticates and
+rejects the request. The current closed protocol does not return typed error
+frames, so the proxy records the empty error response as `malformed_frame`.
+The live proof requires both request-linked records rather than claiming the
+proxy received a reason the protocol does not transmit.
 
 The renderer protocol is deliberately closed:
 
@@ -34,12 +106,22 @@ The renderer protocol is deliberately closed:
 - authenticated request IDs are checked against a process-local replay cache
   capped at 4,096 live entries
 
-The current renderer implementation has I/O deadlines, 32 fixed connection
-workers, and a 32-entry application queue. Connections above that combined
-capacity are dropped with a quota outcome; the operating system's listen
-backlog remains outside the application limit. Audit output uses a separate
-128-entry nonblocking queue. Backpressure drops audit records instead of
-occupying connection workers, and a later record reports the number dropped.
+The current renderer implementation has I/O deadlines and defaults to 32 fixed
+connection workers with a 32-entry application queue. Connections above that
+combined capacity are dropped with a quota outcome; the operating system's
+listen backlog remains outside the application limit. Audit output defaults to
+a separate 128-entry nonblocking queue. Backpressure drops audit records
+instead of occupying connection workers, and a later record reports the number
+dropped.
+Every JSON audit record includes the configured limits and monotonic counters
+for connection-queue saturation, dropped audit events, and replay-cache
+saturation. These counters are process-local, reset when the renderer restarts,
+and are not aggregates across replicas.
+
+The checked-in deployment keeps those defaults. In an explicitly acknowledged
+owned lab, CLI flags may lower the worker, connection-queue, audit-queue, and
+replay-cache bounds to exercise overload behavior. They cannot raise a bound
+above its default maximum.
 
 The implementation currently contains no outbound connector and writes no
 persistent filesystem state after loading its dedicated secret. The ordinary
@@ -67,7 +149,8 @@ supplied request ID.
 
 ## Deployment status
 
-The local profiles still cannot support an honest hard-isolation claim:
+Deployment claims differ by profile. OrbStack remains a behavioral harness;
+the pinned kind/Calico path carries the local hard-isolation proof:
 
 - the OrbStack deploy and status paths do not verify NetworkPolicy
   enforcement; the local validation node inspected on 2026-07-24 was started
@@ -76,22 +159,18 @@ The local profiles still cannot support an honest hard-isolation claim:
   which creates a host-level bypass around a pod-only policy boundary
 - kind pins its node image, disables kindnet, installs Calico `v3.32.1`, and
   deploys the remote renderer without NodePorts
-- kind still lacks a checked-in live allow/deny smoke and denied-flow capture
-- the kind path was not run locally for this slice because `kind` was not
-  installed
-- NetworkPolicy objects and cluster-free rendering do not prove enforcement
+- the checked-in kind smoke now proves the active renderer path, paired
+  allow/deny behavior, and request/pod-correlated denied-flow evidence
+- the capacity smoke proves bounded single-replica overload behavior
+- these proofs do not cover managed-cluster networking, host compromise,
+  restart continuity, or multi-replica aggregation
 
-## Required deployment slice
+## Stateful renderer guardrail
 
-Before issue `#176` can claim the enforced boundary:
-
-1. Prove live negative access to the protected target ClusterIP, node
-   NodePorts, Kubernetes API, metadata destinations, and internet.
-2. Capture denied-flow evidence from the enforcing CNI.
-3. Live-test worker, audit, and replay-cache saturation; expose drop and
-   saturation counters to operators.
-4. Define restart and multi-replica replay behavior before allowing stateful
-    rendering.
+The renderer is deliberately stateless. Restart and multi-replica replay
+semantics must be defined and live-tested before synthetic application state
+or more than one renderer replica is allowed. That future work is not required
+for the current stateless, single-replica isolation claim.
 
 ## Proxy integration contract
 
@@ -107,16 +186,13 @@ Remote proxy integration preserves these failure rules:
 - policy, evidence interaction, durable response expectations, headers, cache
   policy, and artifact digest remain proxy-owned
 
-## Remaining acceptance work
+## Acceptance status
 
-Issue `#176` stays open until:
-
-- the active controlled-reality response path crosses the enforced boundary
-- synthetic application state is isolated from protected and proxy enforcement
-  state
-- quotas and an operator kill switch are live-tested
-- boundary violations are auditable
-- outage and escape tests prove zero protected writes
-
-The standalone renderer is a prerequisite for that work, not proof that the
-work is complete.
+The checked-in kind path now covers issue `#176`'s isolation acceptance
+criteria: the active response path crosses the authenticated process boundary,
+the stateless renderer has no protected state or upstream connector, Calico
+enforces default-deny egress, quotas are live-tested, the operator kill switch
+is explicit, and escape attempts and saturation are auditable. Managed-cluster
+portability, host isolation, stateful restart semantics, and multi-replica
+aggregation remain separate hardening work rather than claims of this lab
+proof.

@@ -61,6 +61,11 @@ Keep out of the private repo:
   shield-lab/
   kind-config.yaml
   deploy-kind.sh
+  controlled-reality-kill-switch-kind.sh
+  smoke-controlled-reality-isolation-kind.sh
+  smoke-controlled-reality-outage-kind.sh
+  smoke-controlled-reality-escape-kind.sh
+  smoke-controlled-reality-capacity-kind.sh
   status-orbstack.sh
   metrics-orbstack.sh
   logs-orbstack.sh
@@ -143,6 +148,8 @@ Namespaces:
 - persists proxy event, debug, intervention, and policy state on a PVC
 - deploys the renderer only in kind with a dedicated secret, hardened container,
   proxy-only ingress, and namespace-wide default-deny egress
+- includes an acknowledged kind renderer kill switch that drains all renderer
+  Pods/endpoints and restarts the single remote-mode proxy before returning
 - pins a kind node image and installs pinned Calico manifests before deployment
 - includes local image build and OrbStack deploy scripts
 - includes operator scripts for status, logs, and redacted evidence export
@@ -181,7 +188,7 @@ local files first.
 
 - deploy ingress controllers
 - provision SIEM or webhook exporters
-- prove the kind boundary with live allow/deny and denied-flow evidence
+- live-test renderer state/restart behavior
 - run workload generators
 - integrate an external production secret manager
 
@@ -228,6 +235,44 @@ Create the pinned kind cluster, install Calico, load the images, and deploy:
 
 ```sh
 examples/shield-lab/deploy-kind.sh
+```
+
+Prove the live proxy-to-renderer path, paired unrestricted/isolated egress,
+proxy-only renderer ingress, and matching Calico denied-flow records:
+
+```sh
+examples/shield-lab/smoke-controlled-reality-isolation-kind.sh
+```
+
+Prove a valid same-session minted action fails closed when the renderer is
+unavailable and sends no protected write-shaped request to the owned target:
+
+```sh
+examples/shield-lab/smoke-controlled-reality-outage-kind.sh
+```
+
+Prove repeated POST requests outside the controlled branch stay synthetic,
+become blocked, and send zero writes to every active owned-target replica:
+
+```sh
+examples/shield-lab/smoke-controlled-reality-escape-kind.sh
+```
+
+Temporarily lower every renderer capacity to one, prove connection, audit, and
+replay saturation are observable, require replay saturation to fail closed,
+and restore the original deployment arguments:
+
+```sh
+examples/shield-lab/smoke-controlled-reality-capacity-kind.sh
+```
+
+Inspect, disable, or restore every kind renderer replica through the
+acknowledged operator kill switch:
+
+```sh
+examples/shield-lab/controlled-reality-kill-switch-kind.sh status
+examples/shield-lab/controlled-reality-kill-switch-kind.sh disable
+examples/shield-lab/controlled-reality-kill-switch-kind.sh enable
 ```
 
 The kind path has no NodePort. Reach the proxy with the port-forward command
