@@ -43,6 +43,7 @@ use eidolon_proxy::{
     request_evaluation::{self, RequestEvaluationInput, RequestPolicyFacts},
     session::{self, SessionContext},
     session_auth::{enforcement_rank, SessionAuthority},
+    state_lease::DurableStateLease,
     surface::{
         rewrite_response_body, HtmlInsertion, OpenApiPathInsertion, ResponseCachePolicy,
         RewritePlan, SurfaceAction, SurfaceController, SurfaceHeader, SurfaceRequestMeta,
@@ -1146,6 +1147,7 @@ impl Drop for ConnectionPermit {
 }
 
 fn run_proxy(config: ProxyConfig) -> io::Result<()> {
+    let state_lease = DurableStateLease::acquire_for_policy_state(&config.policy_state_path)?;
     let listener = TcpListener::bind(config.listen_addr)?;
     println!(
         "eidolon-proxy listening on http://{}",
@@ -1315,6 +1317,10 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 "fail_closed_for_unknown_sessions": policy_store_fail_closed_for_unknown_sessions,
                 "max_sessions": eidolon_proxy::policy_store::MAX_POLICY_SESSIONS,
                 "session_ttl_secs": eidolon_proxy::policy_store::POLICY_SESSION_TTL_SECS,
+            },
+            "durable_state_writer": {
+                "mode": "single_writer",
+                "lease_path": state_lease.path(),
             },
             "debug_log_visibility": "server_side_only",
         }),
