@@ -146,6 +146,9 @@ Namespaces:
 - deploys a simple Eidolon proxy service and owned demo target
 - wires the proxy to the target with a config map
 - persists proxy event, debug, intervention, and policy state on a PVC
+- requires an operator-owned session-signing key ring from the read-only
+  `eidolon-session-signing` Secret so cookie signatures can survive pod
+  replacement when that Secret is retained
 - deploys the renderer only in kind with a dedicated secret, hardened container,
   proxy-only ingress, and namespace-wide default-deny egress
 - includes an acknowledged kind renderer kill switch that drains all renderer
@@ -184,11 +187,37 @@ That is intentional:
 If you later want multi-replica proxy scale, move those state paths out of
 local files first.
 
+Legacy PVCs may contain `root:root 0600` files that the non-root proxy cannot
+open. The manifests therefore run a bounded `normalize-eidolon-state` init
+container before the proxy. It uses the proxy image, mounts only
+`eidolon-state`, receives no service-account token or environment data, and
+runs as UID/GID 0 with a read-only root filesystem, no privilege escalation,
+`ALL` capabilities dropped, and only `CHOWN` added. Its fixed command touches
+only known top-level Eidolon state and event/debug archives with all-digit
+ASCII suffixes. Recognized symlinks fail closed; names such as
+`events.jsonl.1-secret` remain untouched. Files become `65532:65532 0600`, the
+state directory becomes `65532:65532 0770`, and the init exits. Repeat runs
+rely on the enforced pod `fsGroup: 65532` for directory traversal. This is a
+migration exception for the observed legacy ownership problem, not proof of
+the complete lifecycle.
+
+The proxy also requires Secret `eidolon-session-signing` with data key
+`key-ring.json`. The file is mounted read-only at
+`/var/run/secrets/eidolon-session-signing/key-ring.json`. The key ring must use
+the JSON shape documented in
+[`docs/lab-runbook.md`](../../docs/lab-runbook.md), and the Secret must exist
+before the proxy pod starts. Back it up and restore it with the PVC. For
+rotation, retain the previous verifying version, select a new active version,
+update the Secret, and restart the `Recreate` Deployment; remove the retired
+version only after the 7-day cookie lifetime has elapsed.
+
 ## What it does not do yet
 
 - deploy ingress controllers
 - provision SIEM or webhook exporters
 - live-test renderer state/restart behavior
+- prove session continuity across upgrade, rollback, backup/restore, or
+  session-signing key rotation
 - run workload generators
 - integrate an external production secret manager
 

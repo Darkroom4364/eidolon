@@ -109,17 +109,37 @@ Session identity on this deployment:
   deliberately stop the old pod before starting the new pod, so planned
   downtime is expected but not yet measured; the PVC-backed process-lifetime
   lease is the fail-closed second layer against writer overlap
+- before that non-root proxy starts, the `normalize-eidolon-state` init
+  container repairs only known top-level legacy PVC state owned by
+  `root:root`; it uses the proxy image, mounts only `eidolon-state`, and
+  recognizes fixed state paths plus event/debug archives whose suffix is all
+  ASCII digits; recognized symlinks fail closed, names such as
+  `events.jsonl.1-secret` stay untouched, files become `65532:65532 0600`, and
+  the directory becomes `65532:65532 0770`
+- this is an explicit UID/GID 0 migration exception with a read-only root
+  filesystem, no privilege escalation or service-account token, `ALL`
+  capabilities dropped, and only `CHOWN` added; command ordering makes
+  `FOWNER` and `DAC_OVERRIDE` unnecessary, while the enforced pod
+  `fsGroup: 65532` permits repeat-run traversal
 - the shield proxy authenticates `eidolon_session` cookies (HMAC-SHA256 over a
   versioned key) and rejects unsigned, forged, or expired values with
   deterministic `session_resolved` audit outcomes
-- the current manifests do not pass `--session-signing-key-file`, so the proxy
-  runs with an ephemeral per-process key: a pod restart rejects all
-  outstanding cookies and clears process-local Lab peer continuity, while the
-  PVC-backed policy store and HMAC-minimized authenticated-ingress continuity
-  records survive in `<policy-state-path>.continuity.json`; raw continuity
-  identities and Lab peer keys are never written there; the sidecar is
-  HMAC-authenticated and admits at most 64 new durable mappings per rolling
-  60-second window
+- the manifests require `--session-signing-key-file` from Secret
+  `eidolon-session-signing`, key `key-ring.json`, mounted read-only at
+  `/var/run/secrets/eidolon-session-signing/key-ring.json`; the Secret must
+  exist before the proxy pod starts
+- keep the session-signing Secret with the PVC backup and restore them
+  together; losing or replacing the ring invalidates outstanding cookies even
+  when the PVC-backed policy store survives
+- rotate session signing by adding a new version, retaining the old version for
+  verification, selecting the new active version, and restarting the
+  `Recreate` Deployment; remove the retired version only after the 7-day cookie
+  lifetime and a later controlled restart
+- the PVC-backed policy store and HMAC-minimized authenticated-ingress
+  continuity records survive in `<policy-state-path>.continuity.json`; raw
+  continuity identities and Lab peer keys are never written there; the
+  sidecar is HMAC-authenticated and admits at most 64 new durable mappings per
+  rolling 60-second window
 - a newly created trusted-ingress Secret initializes `continuity-key.txt` with
   the same bytes as `transport-auth.txt`, preserving compatibility with state
   created before the keys were separated
@@ -139,17 +159,15 @@ Session identity on this deployment:
   continuity-key rotation, and live lifecycle proof remain tracked by issue
   `#254`; old-key state is never trusted merely because its unverified
   timestamps appear expired
-- for restart-stable cookies, mount a JSON key ring (same
-  secret pattern as the transport-auth secret) and pass
-  `--session-signing-key-file`; rotate by adding the new version as active and
-  dropping retired versions after the 7-day cookie lifetime
 - the explicit-cookie smoke scripts mint their session cookies from the live
   edge instead of generating raw UUIDs; cookie-jar smokes are unaffected
 
-This continuity persistence slice does not complete issue `#254` or establish
-production readiness. Graceful request draining and measured rollout downtime
-remain release qualification work, as does live overlapping-pod lease proof on
-the supported PVC profile.
+This manifest wiring and ownership migration do not complete issue `#254`,
+prove session continuity, or establish production readiness. Upgrade,
+rollback, backup/restore, session-key rotation, and storage-driver portability
+still need live lifecycle proof. Graceful request draining and measured rollout
+downtime remain release qualification work, as does live overlapping-pod lease
+proof on the supported PVC profile.
 
 Recorded labels:
 

@@ -11,10 +11,12 @@
 *.db
 *.log
 *.orig
+*.py[cod]
 *.rej
 *.secret
 *.sqlite
 *.sqlite3
+__pycache__/
 secrets/
 eidolon-debug.jsonl
 eidolon-events.jsonl
