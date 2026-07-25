@@ -118,6 +118,21 @@ pub struct SessionContext {
     set_cookie_value: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub struct TrustedIngressContinuityKeys<'a> {
+    transport_auth_secret: &'a str,
+    continuity_key: &'a str,
+}
+
+impl<'a> TrustedIngressContinuityKeys<'a> {
+    pub fn new(transport_auth_secret: &'a str, continuity_key: &'a str) -> Self {
+        Self {
+            transport_auth_secret,
+            continuity_key,
+        }
+    }
+}
+
 impl SessionContext {
     /// Whether the response should include a `Set-Cookie` header.
     pub fn should_set_cookie(&self) -> bool {
@@ -171,6 +186,34 @@ where
     N: AsRef<str>,
     V: AsRef<str>,
 {
+    derive_session_from_headers_with_trusted_ingress_continuity_key(
+        authority,
+        headers,
+        peer_ip,
+        now,
+        ingress_transport_auth_secret
+            .map(|secret| TrustedIngressContinuityKeys::new(secret, secret)),
+        require_authenticated_ingress_continuity,
+        allow_lab_peer_fallback,
+    )
+}
+
+/// Authenticate a session cookie while deriving trusted-ingress continuity
+/// from a key that remains stable across transport credential rotation.
+pub fn derive_session_from_headers_with_trusted_ingress_continuity_key<I, N, V>(
+    authority: &mut SessionAuthority,
+    headers: I,
+    peer_ip: Option<IpAddr>,
+    now: u64,
+    trusted_ingress_keys: Option<TrustedIngressContinuityKeys<'_>>,
+    require_authenticated_ingress_continuity: bool,
+    allow_lab_peer_fallback: bool,
+) -> Result<SessionContext, ContinuityInputRejection>
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
     let headers: Vec<(String, String)> = headers
         .into_iter()
         .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
@@ -189,16 +232,19 @@ where
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case(INGRESS_CONTINUITY_HEADER_NAME));
     let continuity_key = match (
-        ingress_transport_auth_secret,
+        trusted_ingress_keys,
         require_authenticated_ingress_continuity || continuity_header_present,
     ) {
-        (Some(shared_secret), true) => Some(authenticated_ingress_continuity_key_from_headers(
+        (Some(keys), true) => Some(authenticated_ingress_continuity_key_from_headers_with_key(
             headers
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
-            shared_secret,
+            keys.transport_auth_secret,
+            keys.continuity_key,
         )?),
-        (None, true) => return Err(ContinuityInputRejection::MissingTransportAuth),
+        (None, true) => {
+            return Err(ContinuityInputRejection::MissingTransportAuth);
+        }
         (_, false) if allow_lab_peer_fallback => peer_ip.map(ContinuityKey::lab_peer),
         (_, false) => None,
     };
@@ -250,6 +296,7 @@ fn context_from_resolution(
 }
 
 /// Derive a minimized continuity key only from one authenticated ingress value.
+#[cfg(test)]
 pub(crate) fn authenticated_ingress_continuity_key_from_headers<I, N, V>(
     headers: I,
     shared_secret: &str,
@@ -259,7 +306,25 @@ where
     N: AsRef<str>,
     V: AsRef<str>,
 {
+    authenticated_ingress_continuity_key_from_headers_with_key(
+        headers,
+        shared_secret,
+        shared_secret,
+    )
+}
+
+pub(crate) fn authenticated_ingress_continuity_key_from_headers_with_key<I, N, V>(
+    headers: I,
+    shared_secret: &str,
+    continuity_key: &str,
+) -> Result<ContinuityKey, ContinuityInputRejection>
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
     let shared_secret = shared_secret.trim();
+    let continuity_key = continuity_key.trim();
     let headers: Vec<(String, String)> = headers
         .into_iter()
         .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
@@ -275,7 +340,7 @@ where
         [value] => *value,
         _ => return Err(ContinuityInputRejection::DuplicateTransportAuth),
     };
-    if shared_secret.is_empty() || presented_auth != shared_secret {
+    if shared_secret.is_empty() || continuity_key.is_empty() || presented_auth != shared_secret {
         return Err(ContinuityInputRejection::InvalidTransportAuth);
     }
 
@@ -293,7 +358,7 @@ where
         return Err(ContinuityInputRejection::InvalidContinuity);
     }
 
-    Ok(ContinuityKey::authenticated_ingress(raw, shared_secret))
+    Ok(ContinuityKey::authenticated_ingress(raw, continuity_key))
 }
 
 fn valid_ingress_continuity_value(raw: &str) -> bool {
@@ -572,10 +637,32 @@ fn stale_ingress_identity_to_weakly_asserted(
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use super::*;
     use crate::session_auth::SessionKeyVersion;
 
     const NOW: u64 = 1_750_000_000;
+    const ISSUE_259_TRANSPORT_SECRET: &str = "old-transport-secret";
+    const ISSUE_259_CONTINUITY_ID: &str = "client_A_0123456789abcdef";
+    const ISSUE_259_SESSION_ID: &str = "11111111-2222-4333-8444-555555555555";
+    // Captured from #259's v1 wire format. Keep this literal independent of
+    // current key-derivation and serialization helpers.
+    const ISSUE_259_V1_SIDECAR: &str = r#"{
+  "schema_version": 1,
+  "transport_key_id_hex": "62baf2f89250ff75e9487d4f765d054e4966f8fe646840d6d972ce45735b8c4b",
+  "records": [
+    {
+      "key_digest_hex": "9841f72fbe6e5d5c5ba40d686b2712ff874b3672df32a823d84c7dbc4ab64094",
+      "session_id": "11111111-2222-4333-8444-555555555555",
+      "enforcement_floor": "blocked",
+      "last_seen": 1750000000,
+      "recovery_count": 0
+    }
+  ],
+  "integrity_mac_hex": "301ac65ce1c09f5048270d18fbd5f4dc05f74af7afb42bb7879e1e89580f6cc0"
+}
+"#;
 
     fn test_session_authority() -> SessionAuthority {
         SessionAuthority::new(
@@ -586,6 +673,29 @@ mod tests {
             1,
         )
         .expect("test session authority should build")
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "eidolon-session-continuity-test-{}",
+                SessionId::new().0
+            ));
+            fs::create_dir(&path).expect("test directory should create");
+            Self(path)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
@@ -1055,6 +1165,101 @@ mod tests {
         .expect("valid signed cookie should survive restart");
         assert_eq!(restored.session_id, original.session_id);
         assert_eq!(restored.cookie_outcome, CookieOutcome::Valid);
+    }
+
+    #[test]
+    fn transport_auth_rotation_preserves_a_stable_continuity_key() {
+        let raw = "client_A_0123456789abcdef";
+        let stable_continuity_key = "stable-continuity-key";
+        let old = authenticated_ingress_continuity_key_from_headers_with_key(
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "old-transport-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, raw),
+            ],
+            "old-transport-secret",
+            stable_continuity_key,
+        )
+        .expect("old transport secret should authenticate");
+        let rotated = authenticated_ingress_continuity_key_from_headers_with_key(
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "new-transport-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, raw),
+            ],
+            "new-transport-secret",
+            stable_continuity_key,
+        )
+        .expect("new transport secret should authenticate");
+
+        assert_eq!(old, rotated);
+        assert_eq!(
+            authenticated_ingress_continuity_key_from_headers_with_key(
+                [
+                    (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "old-transport-secret"),
+                    (INGRESS_CONTINUITY_HEADER_NAME, raw),
+                ],
+                "new-transport-secret",
+                stable_continuity_key,
+            ),
+            Err(ContinuityInputRejection::InvalidTransportAuth)
+        );
+    }
+
+    #[test]
+    fn issue_259_v1_sidecar_survives_transport_auth_rotation() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        fs::write(&state_path, ISSUE_259_V1_SIDECAR)
+            .expect("fixed #259 continuity sidecar should write");
+
+        let mut restarted = test_session_authority();
+        let startup = restarted
+            .enable_durable_continuity(&state_path, ISSUE_259_TRANSPORT_SECRET, true, NOW + 1)
+            .expect("#259 state should load when the continuity key keeps the old secret");
+        assert_eq!(startup.restored_record_count, 1);
+        let recovered = derive_session_from_headers_with_trusted_ingress_continuity_key(
+            &mut restarted,
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "new-transport-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, ISSUE_259_CONTINUITY_ID),
+            ],
+            None,
+            NOW + 1,
+            Some(TrustedIngressContinuityKeys::new(
+                "new-transport-secret",
+                ISSUE_259_TRANSPORT_SECRET,
+            )),
+            true,
+            false,
+        )
+        .expect("rotated transport secret should authenticate");
+
+        assert_eq!(recovered.session_id.0.to_string(), ISSUE_259_SESSION_ID);
+        assert_eq!(
+            recovered.enforcement_floor,
+            Some(eidolon_core::PolicyState::Blocked)
+        );
+        assert_eq!(recovered.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(
+            derive_session_from_headers_with_trusted_ingress_continuity_key(
+                &mut restarted,
+                [
+                    (
+                        INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        ISSUE_259_TRANSPORT_SECRET,
+                    ),
+                    (INGRESS_CONTINUITY_HEADER_NAME, ISSUE_259_CONTINUITY_ID),
+                ],
+                None,
+                NOW + 2,
+                Some(TrustedIngressContinuityKeys::new(
+                    "new-transport-secret",
+                    ISSUE_259_TRANSPORT_SECRET,
+                )),
+                true,
+                false,
+            ),
+            Err(ContinuityInputRejection::InvalidTransportAuth)
+        );
     }
 
     #[test]

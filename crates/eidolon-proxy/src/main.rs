@@ -145,6 +145,16 @@ fn main() -> ExitCode {
                 }
             );
             println!(
+                "ingress_continuity_key: {}",
+                if config.ingress_continuity_key_path.is_some() {
+                    "configured"
+                } else if config.ingress_transport_auth_secret_path.is_some() {
+                    "legacy_transport_auth_fallback"
+                } else {
+                    "disabled"
+                }
+            );
+            println!(
                 "authenticated_ingress_continuity: {}",
                 if config.require_authenticated_ingress_continuity {
                     "required"
@@ -208,6 +218,7 @@ struct ProxyConfig {
     session_signing_key_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
+    ingress_continuity_key_path: Option<PathBuf>,
     require_authenticated_ingress_continuity: bool,
     trusted_bait_soften_path_prefixes: Vec<String>,
     intervention_control_path: PathBuf,
@@ -322,6 +333,14 @@ impl CliAction {
                         parse_ingress_transport_auth_secret_path(&value)?,
                     )?;
                 }
+                "--ingress-continuity-key-file" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.ingress_continuity_key_path,
+                        flag,
+                        parse_ingress_continuity_key_path(&value)?,
+                    )?;
+                }
                 "--require-authenticated-ingress-continuity" => {
                     if builder.require_authenticated_ingress_continuity {
                         return Err(ConfigError::new(format!("duplicate option `{flag}`")));
@@ -420,6 +439,7 @@ struct ConfigBuilder {
     session_signing_key_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
+    ingress_continuity_key_path: Option<PathBuf>,
     require_authenticated_ingress_continuity: bool,
     trusted_bait_soften_path_prefixes: Vec<String>,
     intervention_control_path: Option<PathBuf>,
@@ -439,6 +459,14 @@ impl ConfigBuilder {
         {
             return Err(ConfigError::new(
                 "`--require-authenticated-ingress-continuity` requires \
+                 `--ingress-transport-auth-secret-file`",
+            ));
+        }
+        if self.ingress_continuity_key_path.is_some()
+            && self.ingress_transport_auth_secret_path.is_none()
+        {
+            return Err(ConfigError::new(
+                "`--ingress-continuity-key-file` requires \
                  `--ingress-transport-auth-secret-file`",
             ));
         }
@@ -476,6 +504,7 @@ impl ConfigBuilder {
             session_signing_key_path: self.session_signing_key_path,
             ingress_trust_config_path: self.ingress_trust_config_path,
             ingress_transport_auth_secret_path: self.ingress_transport_auth_secret_path,
+            ingress_continuity_key_path: self.ingress_continuity_key_path,
             require_authenticated_ingress_continuity: self.require_authenticated_ingress_continuity,
             trusted_bait_soften_path_prefixes: if self.trusted_bait_soften_path_prefixes.is_empty()
             {
@@ -871,6 +900,18 @@ fn parse_ingress_transport_auth_secret_path(raw: &str) -> Result<PathBuf, Config
     Ok(path)
 }
 
+fn parse_ingress_continuity_key_path(raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = parse_file_path(raw, "ingress continuity key")?;
+    if !path.is_file() {
+        return Err(ConfigError::new(format!(
+            "ingress continuity key path must be an existing file: `{}`",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
 fn parse_controlled_reality_backend_auth_secret_path(raw: &str) -> Result<PathBuf, ConfigError> {
     let path = parse_file_path(raw, "controlled reality backend auth secret")?;
     if !path.is_absolute()
@@ -893,6 +934,10 @@ fn parse_controlled_reality_backend_auth_secret_path(raw: &str) -> Result<PathBu
 
 fn load_ingress_transport_auth_secret(path: &Path) -> io::Result<Arc<str>> {
     load_non_empty_secret(path, "ingress transport auth secret")
+}
+
+fn load_ingress_continuity_key(path: &Path) -> io::Result<Arc<str>> {
+    load_non_empty_secret(path, "ingress continuity key")
 }
 
 fn load_bait_signing_secret(path: &Path) -> io::Result<Arc<str>> {
@@ -1211,6 +1256,18 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         Some(path) => Some(load_ingress_transport_auth_secret(path)?),
         None => None,
     };
+    let (ingress_continuity_key, ingress_continuity_key_mode) =
+        match &config.ingress_continuity_key_path {
+            Some(path) => (Some(load_ingress_continuity_key(path)?), "configured"),
+            None => (
+                ingress_transport_auth_secret.clone(),
+                if ingress_transport_auth_secret.is_some() {
+                    "legacy_transport_auth_fallback"
+                } else {
+                    "disabled"
+                },
+            ),
+        };
     let (debug_log, debug_log_tail_repair) = match &config.debug_log_path {
         Some(path) => {
             let writer = FileDebugLogWriter::open(path)?;
@@ -1254,28 +1311,28 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     let policy_store_session_count = policy_store.len();
     let policy_store_fail_closed_for_unknown_sessions =
         policy_store.fail_closed_for_unknown_sessions();
-    let durable_continuity_startup =
-        if let Some(transport_secret) = ingress_transport_auth_secret.as_deref() {
-            let continuity_state_path =
-                sidecar_state_path(&config.policy_state_path, ".continuity.json");
-            let startup = session_authority.enable_durable_continuity(
-                &continuity_state_path,
-                transport_secret,
-                continuity_history_exists,
-                now,
-            )?;
-            let reconciled_floor_count =
-                session_authority.reconcile_durable_continuity_floors(|session_id| {
-                    if policy_store.uses_fail_closed_fallback(session_id) {
-                        PolicyState::Blocked
-                    } else {
-                        policy_store.policy_state(session_id)
-                    }
-                })?;
-            Some((startup, reconciled_floor_count))
-        } else {
-            None
-        };
+    let durable_continuity_startup = if let Some(continuity_key) = ingress_continuity_key.as_deref()
+    {
+        let continuity_state_path =
+            sidecar_state_path(&config.policy_state_path, ".continuity.json");
+        let startup = session_authority.enable_durable_continuity(
+            &continuity_state_path,
+            continuity_key,
+            continuity_history_exists,
+            now,
+        )?;
+        let reconciled_floor_count =
+            session_authority.reconcile_durable_continuity_floors(|session_id| {
+                if policy_store.uses_fail_closed_fallback(session_id) {
+                    PolicyState::Blocked
+                } else {
+                    policy_store.policy_state(session_id)
+                }
+            })?;
+        Some((startup, reconciled_floor_count))
+    } else {
+        None
+    };
     let durable_continuity_debug =
         durable_continuity_startup
             .as_ref()
@@ -1324,6 +1381,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         )),
         ingress_identity_resolver: Arc::new(ingress_identity_resolver),
         ingress_transport_auth_secret,
+        ingress_continuity_key,
         require_authenticated_ingress_continuity: config.require_authenticated_ingress_continuity,
         bait_signing_secret: bait_signing_secret.clone(),
         trusted_bait_soften_path_prefixes: config.trusted_bait_soften_path_prefixes,
@@ -1367,6 +1425,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 .unwrap_or(0),
             "ingress_identity_rule_count": runtime.ingress_identity_resolver.len(),
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
+            "ingress_continuity_key_mode": ingress_continuity_key_mode,
             "continuity_mode": if runtime.require_authenticated_ingress_continuity {
                 "authenticated_ingress_required"
             } else {
@@ -1462,6 +1521,7 @@ struct ProxyRuntime {
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
     ingress_identity_resolver: Arc<IngressIdentityResolver>,
     ingress_transport_auth_secret: Option<Arc<str>>,
+    ingress_continuity_key: Option<Arc<str>>,
     require_authenticated_ingress_continuity: bool,
     bait_signing_secret: Option<Arc<str>>,
     trusted_bait_soften_path_prefixes: Vec<String>,
@@ -5879,12 +5939,23 @@ fn effective_session_context(
             .session_authority
             .lock()
             .map_err(|_| io::Error::other("session authority lock poisoned"))?;
-        session::derive_session_from_headers_with_trusted_ingress_continuity(
+        session::derive_session_from_headers_with_trusted_ingress_continuity_key(
             &mut authority,
             headers.iter().copied(),
             client_peer_ip,
             now_unix_secs,
-            runtime.ingress_transport_auth_secret.as_deref(),
+            runtime
+                .ingress_transport_auth_secret
+                .as_deref()
+                .map(|transport_auth_secret| {
+                    session::TrustedIngressContinuityKeys::new(
+                        transport_auth_secret,
+                        runtime
+                            .ingress_continuity_key
+                            .as_deref()
+                            .unwrap_or(transport_auth_secret),
+                    )
+                }),
             runtime.require_authenticated_ingress_continuity,
             !runtime.require_authenticated_ingress_continuity,
         )
@@ -6901,6 +6972,11 @@ Options:
   --ingress-transport-auth-secret-file <PATH>
                          Shared-secret file required before explicit
                          X-Eidolon-Ingress-* identity headers are trusted
+  --ingress-continuity-key-file <PATH>
+                         Persistent key used only to minimize ingress continuity
+                         identities and authenticate continuity state. Requires
+                         the transport secret; defaults to that secret for
+                         backward compatibility
   --require-authenticated-ingress-continuity
                          Require one valid transport-auth and continuity header
                          pair on every request. Requires the transport secret
@@ -7061,6 +7137,15 @@ mod tests {
         path
     }
 
+    fn write_ingress_continuity_key(contents: &str) -> PathBuf {
+        let path = unique_temp_path("ingress-continuity-key.txt");
+        must_ok(
+            fs::write(&path, contents),
+            "ingress continuity key should write",
+        );
+        path
+    }
+
     fn write_bait_signing_secret(contents: &str) -> PathBuf {
         let path = unique_temp_path("bait-signing-secret.txt");
         must_ok(
@@ -7151,6 +7236,7 @@ mod tests {
             surface_controller,
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            ingress_continuity_key: None,
             require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
@@ -7206,6 +7292,7 @@ mod tests {
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            ingress_continuity_key: None,
             require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
@@ -7244,6 +7331,7 @@ mod tests {
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            ingress_continuity_key: None,
             require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
@@ -7284,6 +7372,7 @@ mod tests {
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            ingress_continuity_key: None,
             require_authenticated_ingress_continuity: false,
             bait_signing_secret,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
@@ -7979,6 +8068,7 @@ mod tests {
         assert_eq!(config.bait_signing_secret_path, None);
         assert_eq!(config.ingress_trust_config_path, None);
         assert_eq!(config.ingress_transport_auth_secret_path, None);
+        assert_eq!(config.ingress_continuity_key_path, None);
         assert!(!config.require_authenticated_ingress_continuity);
         assert_eq!(
             config.trusted_bait_soften_path_prefixes,
@@ -8061,6 +8151,7 @@ mod tests {
         let bait_signing_secret_path = write_bait_signing_secret("mint-secret");
         let ingress_trust_config_path = unique_temp_path("ingress-trust-config.json");
         let ingress_transport_auth_secret_path = write_ingress_transport_auth_secret("edge-secret");
+        let ingress_continuity_key_path = write_ingress_continuity_key("continuity-key");
         must_ok(
             fs::write(&bait_profile_path, "{}"),
             "bait profile placeholder should write",
@@ -8095,6 +8186,11 @@ mod tests {
             path_str(
                 &ingress_transport_auth_secret_path,
                 "transport auth secret path should be utf8",
+            ),
+            "--ingress-continuity-key-file",
+            path_str(
+                &ingress_continuity_key_path,
+                "continuity key path should be utf8",
             ),
             "--require-authenticated-ingress-continuity",
             "--trusted-bait-soften-prefix",
@@ -8142,6 +8238,10 @@ mod tests {
             config.ingress_transport_auth_secret_path,
             Some(ingress_transport_auth_secret_path)
         );
+        assert_eq!(
+            config.ingress_continuity_key_path,
+            Some(ingress_continuity_key_path)
+        );
         assert!(config.require_authenticated_ingress_continuity);
         assert_eq!(
             config.trusted_bait_soften_path_prefixes,
@@ -8185,6 +8285,18 @@ mod tests {
     fn strict_ingress_continuity_requires_transport_secret() {
         assert_error_contains(
             &["--require-authenticated-ingress-continuity"],
+            "--ingress-transport-auth-secret-file",
+        );
+    }
+
+    #[test]
+    fn ingress_continuity_key_requires_transport_secret() {
+        let continuity_key_path = write_ingress_continuity_key("continuity-key");
+        assert_error_contains(
+            &[
+                "--ingress-continuity-key-file",
+                path_str(&continuity_key_path, "continuity key path should be utf8"),
+            ],
             "--ingress-transport-auth-secret-file",
         );
     }
@@ -9499,6 +9611,46 @@ mod tests {
                 "{label} continuity reached protected upstream"
             );
         }
+    }
+
+    #[test]
+    fn runtime_rejects_retired_transport_secret_with_stable_continuity_key() {
+        let event_log = unique_temp_path("retired-transport-events.jsonl");
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let mut runtime = test_runtime(
+            upstream,
+            &event_log,
+            unique_temp_path("retired-transport-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::from("new-transport-secret"));
+        runtime.ingress_continuity_key = Some(Arc::from("stable-continuity-key"));
+        runtime.require_authenticated_ingress_continuity = true;
+        let request = request_with_cookie_exact(
+            "GET",
+            "/ordinary",
+            &cookie_header(),
+            &[
+                (
+                    session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                    "old-transport-secret",
+                ),
+                (
+                    session::INGRESS_CONTINUITY_HEADER_NAME,
+                    TEST_INGRESS_CONTINUITY_ID,
+                ),
+            ],
+        );
+
+        let (result, response) = run_runtime_request_result(runtime, &request);
+
+        assert!(result.is_ok(), "rejection response failed: {result:?}");
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        assert!(
+            recorder.finish().is_empty(),
+            "retired transport secret reached protected upstream"
+        );
     }
 
     #[test]

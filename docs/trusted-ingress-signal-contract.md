@@ -169,8 +169,12 @@ transport-auth header is not part of the identity model; it is a transport-only
 attestation check that must match the proxy's configured shared secret before
 the explicit identity is trusted. The continuity header is an opaque,
 adapter-minted identity used only for session continuity. Eidolon immediately
-reduces it to an HMAC-SHA256 key under the transport secret; the raw value is
-not stored, logged, exported, or forwarded upstream.
+reduces it to an HMAC-SHA256 key under the configured continuity key; when no
+separate continuity key is configured, the transport secret is used as a
+legacy fallback. The raw value is not stored, logged, exported, or forwarded
+upstream. Keeping an explicit continuity key stable allows the transport
+credential to change without changing the recovered session or enforcement
+floor.
 
 Reserved and now captured in authenticated request audit events:
 
@@ -211,9 +215,10 @@ Reserved and now captured in authenticated request audit events:
   state rewrites.
 - If the sidecar is missing while prior state exists, unknown authenticated
   identities fail closed for a bounded migration quarantine. Corrupt state or
-  state bound to a different transport key prevents startup.
-- Transport-key rotation for live continuity state remains part of issue
-  `#254`; this slice never trusts old-key timestamps to bypass verification.
+  state bound to a different continuity key prevents startup.
+- Overlap automation for transport-key rotation and continuity-key rotation
+  remain part of issue `#254`; this slice never trusts old-key timestamps to
+  bypass verification.
 - This persistence slice does not complete issue `#254` or establish
   production readiness.
 - Adapters must only emit normalized values, never secrets or raw signatures.

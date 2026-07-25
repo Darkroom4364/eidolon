@@ -65,6 +65,14 @@ printf '%s' "$rendered_yaml" | "$RUBY_BIN" -e '
     args = proxy.dig("spec", "template", "spec", "containers", 0, "args")
     index = args.index("--policy-state")
     args.slice!(index, 2)
+  when "continuity_key_arg"
+    args = proxy.dig("spec", "template", "spec", "containers", 0, "args")
+    index = args.index("--ingress-continuity-key-file")
+    args.slice!(index, 2)
+  when "continuity_key_path"
+    args = proxy.dig("spec", "template", "spec", "containers", 0, "args")
+    index = args.index("--ingress-continuity-key-file")
+    args[index + 1] = "/tmp/continuity-key.txt"
   when "policy_env"
     env = proxy.dig("spec", "template", "spec", "containers", 0, "env").find do |item|
       item["name"] == "EIDOLON_POLICY_STATE_PATH"
@@ -77,6 +85,21 @@ printf '%s' "$rendered_yaml" | "$RUBY_BIN" -e '
       item["name"] == "eidolon-state"
     end
     mount["mountPath"] = "/tmp/eidolon"
+  when "trusted_ingress_mount"
+    mount = proxy.dig("spec", "template", "spec", "containers", 0, "volumeMounts").find do |item|
+      item["name"] == "eidolon-trusted-ingress"
+    end
+    mount["readOnly"] = false
+  when "trusted_ingress_secret"
+    volume = proxy.dig("spec", "template", "spec", "volumes").find do |item|
+      item["name"] == "eidolon-trusted-ingress"
+    end
+    volume["secret"]["secretName"] = "other-secret"
+  when "continuity_key_projection"
+    volume = proxy.dig("spec", "template", "spec", "volumes").find do |item|
+      item["name"] == "eidolon-trusted-ingress"
+    end
+    volume["secret"]["items"].reject! { |item| item["key"] == "continuity-key.txt" }
   when "wrong_pvc"
     volume = proxy.dig("spec", "template", "spec", "volumes").find do |item|
       item["name"] == "eidolon-state"
@@ -130,9 +153,14 @@ assert_rejected "strategy" "proxy must use Recreate strategy" "examples/shield-l
 assert_rejected "rolling_update" "proxy must not configure rollingUpdate"
 assert_rejected "policy_path" "proxy ConfigMap must keep EIDOLON_POLICY_STATE_PATH on the PVC"
 assert_rejected "policy_arg" "proxy must use EIDOLON_POLICY_STATE_PATH"
+assert_rejected "continuity_key_arg" "proxy must use the mounted ingress continuity key"
+assert_rejected "continuity_key_path" "proxy must use the mounted ingress continuity key"
 assert_rejected "policy_env" "proxy must load EIDOLON_POLICY_STATE_PATH from the proxy ConfigMap"
 assert_rejected "event_path" "proxy ConfigMap must keep EIDOLON_EVENT_LOG_PATH on the PVC"
 assert_rejected "mount_path" "proxy state volume must mount at /var/lib/eidolon"
+assert_rejected "trusted_ingress_mount" "proxy trusted-ingress Secret must use its read-only mount"
+assert_rejected "trusted_ingress_secret" "proxy trusted-ingress volume must use the supported Secret"
+assert_rejected "continuity_key_projection" "proxy trusted-ingress Secret must project transport and continuity keys"
 assert_rejected "wrong_pvc" "proxy state volume must use the supported PVC"
 assert_rejected "state_volume" "proxy state volume must use the supported PVC"
 assert_rejected "pvc_access" "proxy state PVC must remain single-node ReadWriteOnce"

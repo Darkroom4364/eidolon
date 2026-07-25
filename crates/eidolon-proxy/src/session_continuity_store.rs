@@ -28,21 +28,21 @@ type StoreMac = Hmac<Sha256>;
 
 /// Domain-separated key used only to authenticate the continuity sidecar.
 ///
-/// The configured transport secret is never retained. Debug output is
+/// The configured continuity key is never retained. Debug output is
 /// intentionally redacted because this derived key can authenticate state.
 #[derive(Clone, PartialEq, Eq)]
 pub struct IntegrityKey([u8; 32]);
 
 impl IntegrityKey {
-    pub fn derive(transport_secret: &str) -> io::Result<Self> {
-        if transport_secret.is_empty() {
+    pub fn derive(continuity_key: &str) -> io::Result<Self> {
+        if continuity_key.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "continuity integrity key requires a non-empty transport secret",
+                "continuity integrity key requires a non-empty continuity key",
             ));
         }
-        let mut mac = <StoreMac as Mac>::new_from_slice(transport_secret.as_bytes())
-            .expect("HMAC-SHA256 accepts any transport secret length");
+        let mut mac = <StoreMac as Mac>::new_from_slice(continuity_key.as_bytes())
+            .expect("HMAC-SHA256 accepts any continuity key length");
         mac.update(INTEGRITY_KEY_DOMAIN);
         Ok(Self(mac.finalize().into_bytes().into()))
     }
@@ -58,8 +58,8 @@ impl fmt::Debug for IntegrityKey {
 #[serde(deny_unknown_fields)]
 pub struct State {
     pub schema_version: u16,
-    /// Domain-separated identifier for the transport key used to derive the
-    /// keyed continuity digests.
+    /// Historical schema field name for the domain-separated key identifier
+    /// used to derive continuity digests and authenticate this sidecar.
     pub transport_key_id_hex: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_quarantine_until: Option<u64>,
@@ -134,7 +134,7 @@ pub fn load(
 
     if state.transport_key_id_hex != expected_transport_key_id_hex {
         return Err(invalid_data(
-            "continuity state transport key identifier does not match the configured secret",
+            "continuity state key identifier does not match the configured continuity key",
         ));
     }
     verify_integrity(&state, integrity_key)?;
