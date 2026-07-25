@@ -47,7 +47,7 @@ use eidolon_proxy::{
     },
     request_evaluation::{self, RequestEvaluationInput, RequestPolicyFacts},
     session::{self, SessionContext},
-    session_auth::{enforcement_rank, SessionAuthority},
+    session_auth::{enforcement_rank, ContinuityOutcome, SessionAuthority},
     state_lease::DurableStateLease,
     surface::{
         rewrite_response_body, HtmlInsertion, OpenApiPathInsertion, ResponseCachePolicy,
@@ -3147,6 +3147,38 @@ fn handle_connection(
         }
         Err(error) => return Err(error),
     };
+    if session.continuity_outcome == ContinuityOutcome::CapacityFailClosed {
+        write_debug(
+            runtime,
+            "session_continuity_capacity_fail_closed",
+            Some(session.session_id),
+            json!({
+                "request_id": request_id.0,
+                "outcome": session.continuity_outcome.as_str(),
+            }),
+        )?;
+        let decision = policy::PolicyDecision::new(
+            PolicyState::Blocked,
+            RoutingDecision::EidolonOwned,
+            "session continuity capacity saturated; unknown identity failed closed",
+        );
+        return write_direct_response(DirectResponseContext {
+            client_stream,
+            runtime,
+            session: &session,
+            request: &request,
+            path: &path,
+            request_id,
+            decision: &decision,
+            discovery_recon_score: policy::DiscoveryReconAggregationScore::default(),
+            discovery_recon_threshold: policy::discovery_recon_aggregation_score_threshold(),
+            response: surface_text_response(503, "service temporarily unavailable\n"),
+            controlled_reality_interaction: None,
+            controlled_reality_pending_commit: false,
+            intervention_mode,
+            surface_requested_intervention: true,
+        });
+    }
     let (mut policy_state, capacity_fail_closed) =
         policy_state_resolution_for_session(runtime, session.session_id)?;
     if capacity_fail_closed {
@@ -17665,6 +17697,84 @@ mod tests {
         );
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+    }
+
+    #[test]
+    fn runtime_continuity_capacity_fails_closed_even_when_interventions_are_disabled() {
+        let event_log_path = unique_temp_path("continuity-capacity-fail-closed-events.jsonl");
+        let debug_log_path = unique_temp_path("continuity-capacity-fail-closed-debug.jsonl");
+        let intervention_path = unique_temp_path("continuity-capacity-fail-closed-control.txt");
+        fs::write(&intervention_path, b"disabled\n").expect("control file should write");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            intervention_path,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::from("edge-secret"));
+        runtime.require_authenticated_ingress_continuity = true;
+
+        {
+            let mut authority = runtime
+                .session_authority
+                .lock()
+                .expect("session authority should lock");
+            authority
+                .set_continuity_capacity(1)
+                .expect("test continuity capacity should configure");
+            let established = session::derive_session_from_headers_with_trusted_ingress_continuity(
+                &mut authority,
+                [
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
+                ],
+                None,
+                now_unix_secs(),
+                Some("edge-secret"),
+                true,
+                false,
+            )
+            .expect("first authenticated continuity identity should bind");
+            authority.note_enforcement_with_continuity(
+                established.continuity_key(),
+                established.session_id,
+                PolicyState::Suspicious,
+                now_unix_secs(),
+            );
+        }
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/ordinary",
+                &cookie_header(),
+                &[
+                    (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "edge-secret"),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        "client_B_0123456789abcdef",
+                    ),
+                ],
+            ),
+        ));
+
+        assert_eq!(response.status, 503);
+        assert!(
+            upstream_recorder.finish().is_empty(),
+            "continuity capacity failure reached protected upstream"
+        );
+        assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
+        assert_event_routing(&event_log_path, "response_served", "eidolon_owned");
+        assert_eq!(
+            debug_events(&debug_log_path, "session_continuity_capacity_fail_closed").len(),
+            1
+        );
     }
 
     #[test]

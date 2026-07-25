@@ -197,6 +197,15 @@ Reserved and now captured in authenticated request audit events:
   every request; missing, duplicate, malformed, or unauthenticated continuity
   then returns `400` before protected-upstream access. Merely configuring the
   transport secret keeps existing Lab peer continuity compatible.
+- Authenticated continuity remains bound to one stable session through cookie
+  loss, malformed cookies, and conflicting valid cookies. One valid cookie
+  cannot bind multiple authenticated continuity identities.
+- Continuity storage is TTL- and capacity-bounded. Suspicious-or-higher records
+  are not evicted; if they saturate capacity, an unknown identity receives a
+  `503` Eidolon-owned response even when interventions are disabled.
+- Continuity records are currently in memory. After restart, a valid signed
+  session cookie is still required until the durable-continuity follow-up in
+  issue `#254` lands.
 - Adapters must only emit normalized values, never secrets or raw signatures.
 - Headers are request-scoped, not session-scoped storage.
 - Large raw payloads belong in sidecar logs or webhooks, not inline request

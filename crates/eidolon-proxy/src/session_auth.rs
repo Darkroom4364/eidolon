@@ -11,8 +11,9 @@
 //! - cookie discard/rotation is absorbed by a bounded continuity map keyed by
 //!   an HMAC-minimized trusted-ingress identity, or by a hashed direct peer in
 //!   explicit Lab mode, and carries an enforcement floor;
-//!   recoveries are cooldown-limited so rapid rotation cannot amplify
-//!   evidence or store churn either;
+//!   authenticated-ingress recoveries preserve the stable session through the
+//!   cooldown, while explicit Lab peer recoveries mint distinct sessions so
+//!   shared peers are not merged;
 //! - key rotation is explicit: cookies signed by retired key versions still
 //!   verify and are transparently re-minted under the active version.
 //!
@@ -47,11 +48,11 @@ pub const DEFAULT_CONTINUITY_TTL_SECS: u64 = 24 * 60 * 60;
 /// Minimum gap between continuity recoveries for one peer.
 ///
 /// The first cookie-less or invalid-cookie request inside the gap re-binds to
-/// the peer's existing session; further requests mint fresh sessions that
-/// still inherit the peer's enforcement floor. This bounds evidence churn and
-/// policy-store growth under rapid rotation while keeping enforcement
-/// rotation-proof, and it gives operators a deterministic way to mint
-/// additional distinct lab sessions from one host.
+/// the continuity identity's existing session. Further authenticated-ingress
+/// requests preserve that stable session so cookie loss or forgery cannot
+/// split its evidence identity. Further explicit Lab peer requests mint fresh
+/// sessions that still inherit the peer's enforcement floor, so unrelated
+/// clients sharing one peer are not merged.
 pub const CONTINUITY_RECOVERY_COOLDOWN_SECS: u64 = 60;
 
 /// Default bound on tracked continuity identities.
@@ -204,8 +205,12 @@ pub enum ContinuityOutcome {
     /// The identity was re-bound to its existing session after the cookie was
     /// missing, invalid, tampered, stale, or unknown.
     Recovered,
+    /// An authenticated-ingress recovery was attempted inside the cooldown
+    /// window. The stable continuity session was preserved and re-issued.
+    CooldownSessionPreserved,
     /// A recovery already happened inside the cooldown window, so a fresh
-    /// session was minted that still inherits the peer's enforcement floor.
+    /// Lab session was minted that still inherits the peer's enforcement
+    /// floor.
     CooldownLimited,
     /// Capacity was exhausted by protected records. The unknown identity was
     /// assigned a fresh blocked session without inserting a continuity record.
@@ -220,6 +225,7 @@ impl ContinuityOutcome {
             Self::ContinuitySessionPreserved => "continuity_session_preserved",
             Self::CookieSessionAlreadyBound => "cookie_session_already_bound",
             Self::Recovered => "recovered",
+            Self::CooldownSessionPreserved => "cooldown_session_preserved",
             Self::CooldownLimited => "cooldown_limited",
             Self::CapacityFailClosed => "capacity_fail_closed",
         }
@@ -380,6 +386,28 @@ impl SessionAuthority {
 
     pub fn key_version_count(&self) -> usize {
         self.keys.len()
+    }
+
+    /// Configure the maximum number of continuity identities retained.
+    ///
+    /// Capacity must be configured before the authority has observed any
+    /// continuity identity so changing the bound cannot silently evict or
+    /// reinterpret live enforcement state.
+    pub fn set_continuity_capacity(&mut self, capacity: usize) -> io::Result<()> {
+        if capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "continuity capacity must be greater than zero",
+            ));
+        }
+        if !self.continuity.is_empty() || !self.continuity_order.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "continuity capacity must be configured before records exist",
+            ));
+        }
+        self.continuity_capacity = capacity;
+        Ok(())
     }
 
     /// Mint the opaque cookie value (without attributes) for a session.
@@ -683,10 +711,30 @@ impl SessionAuthority {
                         };
                     }
 
-                    // Recovery is inside the cooldown window: mint a fresh
-                    // session so rapid rotation cannot amplify evidence or
-                    // store churn, but keep the peer's enforcement floor so it
-                    // cannot reset enforcement either.
+                    if continuity_key.source() == ContinuitySource::AuthenticatedIngress {
+                        let current = self
+                            .continuity
+                            .get_mut(&continuity_key)
+                            .expect("fresh continuity record was read above");
+                        current.last_seen = now;
+                        return SessionResolution {
+                            session_id: record.session_id,
+                            cookie_outcome,
+                            key_status: None,
+                            presented_key_version,
+                            active_key_version: self.active_key_version,
+                            continuity_outcome: ContinuityOutcome::CooldownSessionPreserved,
+                            continuity_source: Some(continuity_key.source()),
+                            enforcement_floor: record.floor,
+                            set_cookie_value: Some(
+                                self.mint_set_cookie_value(record.session_id, now),
+                            ),
+                        };
+                    }
+
+                    // A direct Lab peer can represent multiple clients.
+                    // Preserve its existing distinct-session behavior while
+                    // carrying the monotonic enforcement floor forward.
                     let session_id = SessionId::new();
                     self.continuity.insert(
                         continuity_key,
@@ -1195,6 +1243,87 @@ mod tests {
         assert_ne!(second.session_id, original.session_id);
         assert_eq!(second.enforcement_floor, Some(PolicyState::Blocked));
         assert!(second.set_cookie_value.is_some());
+        assert_eq!(authority.continuity.len(), 1);
+        assert_eq!(
+            authority
+                .continuity
+                .get(&ContinuityKey::lab_peer(peer()))
+                .map(|record| record.session_id),
+            Some(second.session_id)
+        );
+    }
+
+    #[test]
+    fn authenticated_cooldown_preserves_session_across_repeated_cookie_failures() {
+        let mut authority = test_authority();
+        let continuity_key = ingress_key("client_A_0123456789abcdef");
+        let original =
+            authority.resolve_with_continuity([("Host", "proxy.local")], Some(continuity_key), NOW);
+        authority.note_enforcement_with_continuity(
+            Some(continuity_key),
+            original.session_id,
+            PolicyState::Blocked,
+            NOW + 1,
+        );
+
+        let recovered = authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(continuity_key),
+            NOW + 5,
+        );
+        assert_eq!(recovered.continuity_outcome, ContinuityOutcome::Recovered);
+        assert_eq!(recovered.session_id, original.session_id);
+
+        let forged = format!(
+            "{}.1.{}.{}.{}",
+            COOKIE_FORMAT_TAG,
+            NOW,
+            SessionId::new().0,
+            "f".repeat(MAC_HEX_CHARS)
+        );
+        let failures = [
+            authority.resolve_with_continuity(
+                [("Host", "proxy.local")],
+                Some(continuity_key),
+                NOW + 6,
+            ),
+            authority.resolve_with_continuity(
+                cookie_header("malformed"),
+                Some(continuity_key),
+                NOW + 7,
+            ),
+            authority.resolve_with_continuity(
+                cookie_header(&forged),
+                Some(continuity_key),
+                NOW + 8,
+            ),
+        ];
+
+        assert_eq!(failures[0].cookie_outcome, CookieOutcome::Absent);
+        assert_eq!(failures[1].cookie_outcome, CookieOutcome::Malformed);
+        assert_eq!(failures[2].cookie_outcome, CookieOutcome::BadSignature);
+        for failure in failures {
+            assert_eq!(failure.session_id, original.session_id);
+            assert_eq!(
+                failure.continuity_outcome,
+                ContinuityOutcome::CooldownSessionPreserved
+            );
+            assert_eq!(failure.enforcement_floor, Some(PolicyState::Blocked));
+            assert!(failure
+                .set_cookie_value
+                .as_deref()
+                .is_some_and(|cookie| cookie.contains(&original.session_id.0.to_string())));
+        }
+
+        assert_eq!(authority.continuity.len(), 1);
+        let record = authority
+            .continuity
+            .get(&continuity_key)
+            .expect("authenticated continuity record remains present");
+        assert_eq!(record.session_id, original.session_id);
+        assert_eq!(record.floor, Some(PolicyState::Blocked));
+        assert_eq!(record.last_recovery_at, Some(NOW + 5));
+        assert_eq!(record.recovery_count, 1);
     }
 
     #[test]
@@ -1309,11 +1438,34 @@ mod tests {
     }
 
     #[test]
+    fn continuity_capacity_must_be_positive_and_configured_before_use() {
+        let mut authority = test_authority();
+
+        let zero = authority
+            .set_continuity_capacity(0)
+            .expect_err("zero capacity must be rejected");
+        assert_eq!(zero.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(authority.continuity_capacity, DEFAULT_CONTINUITY_CAPACITY);
+
+        authority
+            .set_continuity_capacity(2)
+            .expect("empty authority accepts positive capacity");
+        authority.resolve([("Host", "proxy.local")], Some(peer()), NOW);
+
+        let live = authority
+            .set_continuity_capacity(3)
+            .expect_err("live continuity state must prevent reconfiguration");
+        assert_eq!(live.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(authority.continuity_capacity, 2);
+        assert_eq!(authority.continuity.len(), 1);
+    }
+
+    #[test]
     fn continuity_map_is_capacity_bounded() {
-        let mut authority = SessionAuthority {
-            continuity_capacity: 2,
-            ..test_authority()
-        };
+        let mut authority = test_authority();
+        authority
+            .set_continuity_capacity(2)
+            .expect("empty authority accepts positive capacity");
         let peer_a = peer();
         let peer_b: IpAddr = "127.0.0.2".parse().expect("peer IP should parse");
         let peer_c: IpAddr = "127.0.0.3".parse().expect("peer IP should parse");
@@ -1333,10 +1485,10 @@ mod tests {
 
     #[test]
     fn capacity_evicts_only_records_below_suspicious() {
-        let mut authority = SessionAuthority {
-            continuity_capacity: 2,
-            ..test_authority()
-        };
+        let mut authority = test_authority();
+        authority
+            .set_continuity_capacity(2)
+            .expect("empty authority accepts positive capacity");
         let protected_key = ingress_key("protected_0123456789abcdef");
         let evictable_key = ingress_key("evictable_0123456789abcdef");
         let new_key = ingress_key("new_client_0123456789abcdef");
@@ -1371,10 +1523,10 @@ mod tests {
 
     #[test]
     fn protected_capacity_fails_unknown_identity_closed_without_insertion() {
-        let mut authority = SessionAuthority {
-            continuity_capacity: 2,
-            ..test_authority()
-        };
+        let mut authority = test_authority();
+        authority
+            .set_continuity_capacity(2)
+            .expect("empty authority accepts positive capacity");
         let key_a = ingress_key("protected_A_0123456789abcdef");
         let key_b = ingress_key("protected_B_0123456789abcdef");
         let unknown_key = ingress_key("unknown_0123456789abcdef");
@@ -1420,10 +1572,12 @@ mod tests {
     #[test]
     fn authenticated_continuity_is_secret_keyed_capacity_and_ttl_bounded() {
         let mut authority = SessionAuthority {
-            continuity_capacity: 2,
             continuity_ttl_secs: 10,
             ..test_authority()
         };
+        authority
+            .set_continuity_capacity(2)
+            .expect("empty authority accepts positive capacity");
         let key_a = ingress_key("client_A_0123456789abcdef");
         let key_b = ingress_key("client_B_0123456789abcdef");
         let key_c = ingress_key("client_C_0123456789abcdef");
