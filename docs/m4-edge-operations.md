@@ -201,12 +201,26 @@ protected-upstream writes, and the original Secret and a healthy deployment to
 be restored.
 
 This manifest wiring and ownership migration do not complete issue `#254`,
-or establish production readiness. Backup/restore and overlapping session-key
-rotation are live-proven only for the owned kind/local-path path above.
-Upgrade, rollback, retired-version removal, storage-driver portability, and HA
-still need lifecycle proof. Graceful request draining and measured rollout
-downtime remain release qualification work, as does live overlapping-pod lease
-proof on the supported PVC profile.
+or establish production readiness. Backup/restore, overlapping session-key
+rotation, and the overlapping-writer lease fail-closed path are live-proven
+only for the owned kind/local-path path above. Upgrade, rollback,
+retired-version removal, storage-driver portability, and HA still need
+lifecycle proof. Graceful request draining and measured rollout downtime
+remain release qualification work.
+
+Run the kind overlapping-writer lease proof with:
+
+```sh
+examples/shield-lab/smoke-overlapping-writer-lease-kind.sh
+```
+
+The script starts a second proxy pod pinned to the same node and the same
+`ReadWriteOnce` PVC while the supported single writer holds the durable state
+lease. The live evidence requires the overlapping writer to fail closed at
+startup with the active-writer lease error, the primary writer to keep its pod
+identity, readiness, and restart count, every durable state file to stay
+byte-identical with no new writer start, and the protected target to observe
+zero writes beyond the labelled baseline.
 
 Recorded labels:
 
