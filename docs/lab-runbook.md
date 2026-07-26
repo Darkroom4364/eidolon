@@ -142,10 +142,10 @@ If the authenticated-continuity sidecar is missing while prior state exists,
 unknown authenticated identities fail closed for a bounded migration
 quarantine. Corrupt state or state bound to a different continuity key prevents
 startup. Planned transport-auth rotation can preserve continuity when the
-continuity key stays fixed. The session-signing Secret wiring alone does not
-prove upgrade, rollback, or key-rotation behavior; those live checks,
-transport overlap windows, and continuity-key rotation remain tracked by issue
-`#254`. The kind backup/restore proof is documented below. Reusing the old
+continuity key stays fixed. The session-signing key-rotation live check is
+documented below; upgrade, rollback, transport overlap windows, and
+continuity-key rotation remain tracked by issue `#254`. The kind
+backup/restore proof is documented below. Reusing the old
 transport-secret bytes for migration compatibility also means transport
 rotation does not remediate compromise of those bytes. Old-key state is never
 trusted based on unverified timestamps. This slice does not complete issue
@@ -218,6 +218,37 @@ upstream writes.
 This is a live proof only for the owned kind cluster and its local-path storage.
 It does not prove cross-cluster or storage-driver portability, CSI snapshot
 behavior, HA, multi-writer coordination, or a zero-downtime lifecycle.
+
+### Kind Session-Signing Key Rotation Validation
+
+Run the owned kind rotation smoke:
+
+```sh
+examples/shield-lab/smoke-session-key-rotation-kind.sh
+```
+
+The smoke installs a controlled single-version v1 key ring, creates a contained
+session plus a consumed replay-control proof under v1, then rotates the
+`eidolon-session-signing` Secret to overlapping v1+v2 keys with v2 active and
+restarts the `Recreate` proxy Deployment. It then proves that:
+
+- the v1 cookie retains its session identity and is transparently reminted
+  under v2 (`session_resolved` reports `key_status: "previous"` with presented
+  version 1 and active version 2)
+- policy state, workflow state, and request links survive the restart unchanged
+- the consumed proof stays durably consumed and its replay keeps failing closed
+  with 403, uncorrelated as new evidence
+- after a second restart the reminted v2 cookie remains valid and active, and
+  the replay stays rejected
+- the protected upstream observes zero writes beyond the labelled baseline
+- the original Secret and a healthy deployment are restored on success or
+  failure
+
+The smoke records only derived facts (key version numbers, session identifiers,
+digests, counts); raw keys, cookies, and proofs never reach logs or evidence.
+This proves only the documented overlapping rotation on the owned kind cluster.
+It does not prove upgrade, rollback, retired-version removal, transport-auth or
+continuity-key rotation, or a zero-downtime lifecycle.
 
 Every request handled by the proxy is assigned an opaque `request_id` (a random v4 UUID; it encodes no secrets, client identity, or request data). Every event derived from that request — `request_seen`, bait exposure and action events, policy decisions and changes, responses, rate limits, and reality-escape audits — carries that id, so concurrent requests sharing one session cookie can still be separated causally. Trace and edge-export reducers join events strictly by `request_id`; sessions whose events predate request identifiers are exported with `request_linkage: unknown_legacy` and no cross-event joins are attempted.
 

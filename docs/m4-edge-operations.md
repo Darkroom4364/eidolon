@@ -186,12 +186,27 @@ request links, an old authenticated session cookie to remain valid, a consumed
 proof replay to remain rejected and uncorrelated, and the protected target to
 observe zero matching writes.
 
+Run the kind session-signing key-rotation proof with:
+
+```sh
+examples/shield-lab/smoke-session-key-rotation-kind.sh
+```
+
+The script installs a controlled v1 key ring, rotates to overlapping v1+v2
+keys with v2 active, and restarts the `Recreate` proxy Deployment. The live
+evidence requires the v1 cookie to retain its session and remint under v2,
+policy, workflow, request-link, and consumed-proof replay rejection to survive
+both restarts, the v2 cookie to remain valid after a further restart, zero
+protected-upstream writes, and the original Secret and a healthy deployment to
+be restored.
+
 This manifest wiring and ownership migration do not complete issue `#254`,
-or establish production readiness. Backup/restore is live-proven only for the
-owned kind/local-path path above. Upgrade, rollback, session-key rotation,
-storage-driver portability, and HA still need lifecycle proof. Graceful request
-draining and measured rollout downtime remain release qualification work, as
-does live overlapping-pod lease proof on the supported PVC profile.
+or establish production readiness. Backup/restore and overlapping session-key
+rotation are live-proven only for the owned kind/local-path path above.
+Upgrade, rollback, retired-version removal, storage-driver portability, and HA
+still need lifecycle proof. Graceful request draining and measured rollout
+downtime remain release qualification work, as does live overlapping-pod lease
+proof on the supported PVC profile.
 
 Recorded labels:
 

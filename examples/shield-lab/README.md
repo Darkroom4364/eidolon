@@ -159,6 +159,8 @@ Namespaces:
 - includes live edge-decision export for webhook/SIEM handoff
 - includes a lightweight live metrics surface over cluster status and PVC-backed proxy state
 - includes a live kind state backup/restore smoke against a fresh local-path PVC
+- includes a live kind session-signing key-rotation smoke with overlapping
+  v1+v2 keys, cookie reminting, and consumed-proof replay survival
 - includes a dedicated Kali VM pwnkit wrapper for the OrbStack NodePort validation topology
 
 ## Explicit cluster-lab mode
@@ -235,8 +237,7 @@ value.
 - deploy ingress controllers
 - provision SIEM or webhook exporters
 - live-test renderer state/restart behavior
-- prove session continuity across upgrade, rollback, or session-signing key
-  rotation
+- prove session continuity across upgrade or rollback
 - prove backup/restore portability beyond kind local-path storage or any
   HA/multi-writer behavior
 - run workload generators
@@ -328,6 +329,21 @@ preserves the contained workflow and its session/request links, rejects a
 consumed-proof replay without correlating it as new evidence, and observes zero
 matching writes at the protected upstream. This proves only the owned kind
 local-path recovery path, not storage portability or HA.
+
+Install a controlled v1 session-signing key, rotate to overlapping v1+v2 keys
+with v2 active, restart the `Recreate` proxy Deployment, and verify the v1
+cookie keeps its session and is reminted under v2:
+
+```sh
+examples/shield-lab/smoke-session-key-rotation-kind.sh
+```
+
+The smoke requires policy, workflow, request-link, and consumed-proof replay
+rejection to survive both restarts, the reminted v2 cookie to remain valid
+across a further restart, zero protected-upstream writes, and restores the
+original Secret and a healthy deployment at the end. This proves only the
+documented overlapping rotation on the owned kind cluster, not upgrade,
+rollback, or retired-version removal.
 
 Inspect, disable, or restore every kind renderer replica through the
 acknowledged operator kill switch:
