@@ -101,6 +101,7 @@ artifact must provide the evidence for every checked item.
   documented without autonomous-attacker attribution claims.
 - CLI/config, event, evidence, and edge-export contracts are versioned.
 - The compatibility policy states what is stable under semantic versioning.
+  The policy lives in `docs/compatibility-policy.md`.
 - Upgrade from the one exact beta artifact named by the release candidate
   succeeds without losing enforcement, replay, workflow, or
   request-correlation state. Arbitrary alpha and development state is not
