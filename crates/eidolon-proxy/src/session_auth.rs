@@ -308,10 +308,20 @@ impl SessionResolution {
 }
 
 /// One versioned HMAC signing key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SessionKeyVersion {
     pub version: u32,
     pub key: [u8; SESSION_KEY_BYTES],
+}
+
+impl fmt::Debug for SessionKeyVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionKeyVersion")
+            .field("version", &self.version)
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// JSON key-file shape for `--session-signing-key-file`:
@@ -329,16 +339,36 @@ pub struct SessionKeyVersion {
 /// All listed versions verify cookies; only `active_key_version` mints.
 /// Rotate by adding the new version, marking it active, and removing retired
 /// versions once their cookies have aged out of the cookie lifetime.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct SessionKeyFile {
     pub active_key_version: u32,
     pub keys: Vec<SessionKeyFileEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+impl fmt::Debug for SessionKeyFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionKeyFile")
+            .field("active_key_version", &self.active_key_version)
+            .field("keys", &self.keys)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 pub struct SessionKeyFileEntry {
     pub version: u32,
     pub key_hex: String,
+}
+
+impl fmt::Debug for SessionKeyFileEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionKeyFileEntry")
+            .field("version", &self.version)
+            .field("key_hex", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -358,7 +388,7 @@ enum ContinuityInsertOutcome {
 }
 
 /// Issues, verifies, and recovers session identities.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionAuthority {
     keys: Vec<SessionKeyVersion>,
     active_key_version: u32,
@@ -377,6 +407,45 @@ pub struct SessionAuthority {
     continuity_security_revision: u64,
     continuity_metadata_revision: u64,
     durable_continuity_insert_times: VecDeque<u64>,
+}
+
+impl fmt::Debug for SessionAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionAuthority")
+            .field("active_key_version", &self.active_key_version)
+            .field("keys", &self.keys)
+            .field("cookie_lifetime_secs", &self.cookie_lifetime_secs)
+            .field("continuity_ttl_secs", &self.continuity_ttl_secs)
+            .field("continuity_capacity", &self.continuity_capacity)
+            .field("continuity_records", &self.continuity.len())
+            .field("continuity_state_path", &self.continuity_state_path)
+            .field(
+                "continuity_state_key_id_hex",
+                &self
+                    .continuity_state_key_id_hex
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
+            .field("continuity_integrity_key", &self.continuity_integrity_key)
+            .field(
+                "continuity_migration_quarantine_until",
+                &self.continuity_migration_quarantine_until,
+            )
+            .field(
+                "continuity_security_revision",
+                &self.continuity_security_revision,
+            )
+            .field(
+                "continuity_metadata_revision",
+                &self.continuity_metadata_revision,
+            )
+            .field(
+                "durable_continuity_insert_times",
+                &self.durable_continuity_insert_times.len(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1608,6 +1677,42 @@ mod tests {
 
     fn peer() -> IpAddr {
         "127.0.0.1".parse().expect("peer IP should parse")
+    }
+
+    #[test]
+    fn session_key_version_debug_redacts_key_bytes() {
+        let key = SessionKeyVersion {
+            version: 7,
+            key: test_key(0x42),
+        };
+        let rendered = format!("{key:?}");
+        assert!(rendered.contains("version: 7"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("[66, 66"), "{rendered}");
+    }
+
+    #[test]
+    fn session_key_file_debug_redacts_key_hex() {
+        let key_hex = "4242424242424242424242424242424242424242424242424242424242424242";
+        let document = format!(
+            r#"{{"active_key_version":2,"keys":[{{"version":1,"key_hex":"{key_hex}"}},{{"version":2,"key_hex":"{key_hex}"}}]}}"#
+        );
+        let key_file: SessionKeyFile =
+            serde_json::from_str(&document).expect("key file should parse");
+        let rendered = format!("{key_file:?}");
+        assert!(rendered.contains("active_key_version: 2"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains(key_hex), "{rendered}");
+    }
+
+    #[test]
+    fn session_authority_debug_redacts_key_material() {
+        let authority = test_authority();
+        let rendered = format!("{authority:?}");
+        assert!(rendered.contains("active_key_version: 1"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("[66, 66"), "{rendered}");
+        assert!(!rendered.contains("0x42"), "{rendered}");
     }
 
     fn peer_key() -> ContinuityKey {
