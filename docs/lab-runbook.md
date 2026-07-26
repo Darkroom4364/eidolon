@@ -250,6 +250,33 @@ This proves only the documented overlapping rotation on the owned kind cluster.
 It does not prove upgrade, rollback, retired-version removal, transport-auth or
 continuity-key rotation, or a zero-downtime lifecycle.
 
+### Kind Overlapping-Writer Lease Validation
+
+Run the owned kind lease proof:
+
+```sh
+examples/shield-lab/smoke-overlapping-writer-lease-kind.sh
+```
+
+The proxy takes an exclusive operating-system writer lease at
+`<policy-state-path>.lock` before binding its listener or opening durable
+stores. The smoke starts a second proxy pod pinned to the same node and the
+same `ReadWriteOnce` PVC while the supported single writer is healthy, and
+proves that:
+
+- the overlapping writer fails closed at startup with the active-writer lease
+  error and never reaches listener or durable stores
+- the primary writer keeps its pod identity, readiness, and restart count
+- the event log and policy state stay byte-identical and no new writer start
+  is recorded (kubelet probe connection records are the only tolerated debug
+  delta)
+- the protected upstream observes zero writes beyond the labelled baseline
+
+This proves the single-writer guarantee against a forced overlap on the owned
+kind/local-path profile only. It does not prove cross-node storage
+portability, HA coordination, or lease behavior after a holder crash (the
+operating system releases process-held leases on exit).
+
 Every request handled by the proxy is assigned an opaque `request_id` (a random v4 UUID; it encodes no secrets, client identity, or request data). Every event derived from that request — `request_seen`, bait exposure and action events, policy decisions and changes, responses, rate limits, and reality-escape audits — carries that id, so concurrent requests sharing one session cookie can still be separated causally. Trace and edge-export reducers join events strictly by `request_id`; sessions whose events predate request identifiers are exported with `request_linkage: unknown_legacy` and no cross-event joins are attempted.
 
 Every request handled by the proxy is assigned an opaque `request_id` (a random v4 UUID; it encodes no secrets, client identity, or request data). Every event derived from that request — `request_seen`, bait exposure and action events, policy decisions and changes, responses, rate limits, and reality-escape audits — carries that id, so concurrent requests sharing one session cookie can still be separated causally. Trace and edge-export reducers join events strictly by `request_id`; sessions whose events predate request identifiers are exported with `request_linkage: unknown_legacy` and no cross-event joins are attempted.

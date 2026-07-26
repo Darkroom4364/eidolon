@@ -161,6 +161,8 @@ Namespaces:
 - includes a live kind state backup/restore smoke against a fresh local-path PVC
 - includes a live kind session-signing key-rotation smoke with overlapping
   v1+v2 keys, cookie reminting, and consumed-proof replay survival
+- includes a live kind overlapping-writer lease smoke proving a forced second
+  writer on the same PVC fails closed while the primary writer stays stable
 - includes a dedicated Kali VM pwnkit wrapper for the OrbStack NodePort validation topology
 
 ## Explicit cluster-lab mode
@@ -344,6 +346,21 @@ across a further restart, zero protected-upstream writes, and restores the
 original Secret and a healthy deployment at the end. This proves only the
 documented overlapping rotation on the owned kind cluster, not upgrade,
 rollback, or retired-version removal.
+
+Start a second proxy pod pinned to the same node and the same `ReadWriteOnce`
+PVC while the supported single writer holds the durable state lease, and verify
+the overlapping writer fails closed:
+
+```sh
+examples/shield-lab/smoke-overlapping-writer-lease-kind.sh
+```
+
+The smoke requires the interloper to fail startup with the active-writer lease
+error, the primary writer to keep its pod identity, readiness, and restart
+count, durable state files to stay byte-identical with no new writer start,
+and zero protected-upstream writes beyond the labelled baseline. This proves
+only the forced-overlap path on the owned kind cluster, not cross-node storage
+portability or HA coordination.
 
 Inspect, disable, or restore every kind renderer replica through the
 acknowledged operator kill switch:
