@@ -785,7 +785,7 @@ impl SessionAuthority {
             >= self
                 .continuity_last_checkpoint_at
                 .saturating_add(CONTINUITY_CHECKPOINT_INTERVAL_SECS);
-        if !self.continuity_dirty && !(self.continuity_checkpoint_dirty && checkpoint_due) {
+        if !(self.continuity_dirty || self.continuity_checkpoint_dirty && checkpoint_due) {
             return resolution;
         }
 
