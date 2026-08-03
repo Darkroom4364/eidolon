@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fmt, fs,
+    future::Future,
     io::{self, BufRead, BufReader, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Component, Path, PathBuf},
@@ -13,6 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use eidolon_bait::{docs_for_bait, render_bait_for_session, BaitRegistry};
 use eidolon_core::{
     Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, ControlledRealityInteraction,
@@ -45,15 +47,26 @@ use eidolon_proxy::{
         ControlledRealityPendingInteractionKind, ControlledRealityPendingResponse,
         ControlledRealityProgress, PolicyStateStore,
     },
+    production_runtime::{
+        dispatch_production_upstream, serve_production_http1, ProductionPreServiceRejection,
+        ProductionProcessorError, ProductionRejectedRequest, ProductionRequestContext,
+        ProductionRequestProcessor, ProductionResponse, ProductionRuntimeConfig,
+        ProductionUpstreamConfig, ProductionUpstreamTarget,
+    },
     request_evaluation::{self, RequestEvaluationInput, RequestPolicyFacts},
     session::{self, SessionContext},
     session_auth::{enforcement_rank, ContinuityOutcome, SessionAuthority},
-    state_lease::DurableStateLease,
+    state_lease::{state_lease_path, DurableStateLease},
     surface::{
         rewrite_response_body, HtmlInsertion, OpenApiPathInsertion, ResponseCachePolicy,
         RewritePlan, SurfaceAction, SurfaceController, SurfaceHeader, SurfaceRequestMeta,
         SurfaceResponse, SurfaceResponseMeta,
     },
+};
+use hyper::{
+    header::{HeaderMap, HeaderName, HeaderValue},
+    http::uri::Authority,
+    StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -90,6 +103,17 @@ const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const PRODUCTION_UPSTREAM_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(2);
+const PRODUCTION_UPSTREAM_RESOLVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+const PRODUCTION_UPSTREAM_DISPATCH_DEADLINE_MARGIN: Duration = Duration::from_secs(1);
+const CACHE_CONDITIONAL_AND_RANGE_HEADERS: &[&str] = &[
+    "If-Match",
+    "If-Modified-Since",
+    "If-None-Match",
+    "If-Range",
+    "If-Unmodified-Since",
+    "Range",
+];
 const SAFE_HEADER_NAMES: &[&str] = &[
     "accept",
     "authorization",
@@ -119,8 +143,13 @@ fn main() -> ExitCode {
             print!("{}", usage());
             ExitCode::SUCCESS
         }
+        Ok(CliAction::PrintEffectiveConfig(config)) => {
+            print!("{}", effective_config_output(&config));
+            ExitCode::SUCCESS
+        }
         Ok(CliAction::Run(config)) => {
             println!("eidolon-proxy configured");
+            println!("profile: {}", config.profile.as_str());
             println!("listen_addr: {}", config.listen_addr);
             println!("upstream: {}", config.upstream);
             println!("event_log: {}", config.event_log_path.display());
@@ -209,6 +238,7 @@ fn main() -> ExitCode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProxyConfig {
+    profile: RuntimeProfile,
     listen_addr: SocketAddr,
     upstream: UpstreamTarget,
     event_log_path: PathBuf,
@@ -226,6 +256,156 @@ struct ProxyConfig {
     controlled_reality_config: ControlledRealityConfig,
     controlled_reality_backend: Option<ControlledRealityBackendConfig>,
     owned_cluster_lab: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProfile {
+    Lab,
+    Production,
+}
+
+impl RuntimeProfile {
+    fn parse(raw: &str) -> Result<Self, ConfigError> {
+        match raw {
+            "lab" => Ok(Self::Lab),
+            "production" => Ok(Self::Production),
+            _ => Err(ConfigError::new(
+                "`--profile` must be either `lab` or `production`",
+            )),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lab => "lab",
+            Self::Production => "production",
+        }
+    }
+
+    const fn cookie_policy(self) -> session::SessionCookiePolicy {
+        match self {
+            Self::Lab => session::SessionCookiePolicy::Lab,
+            Self::Production => session::SessionCookiePolicy::Production,
+        }
+    }
+
+    const fn audit_projection(self) -> AuditProjection {
+        match self {
+            Self::Lab => AuditProjection::Lab,
+            Self::Production => AuditProjection::Production,
+        }
+    }
+}
+
+/// Profile-selected projection for request-path and ingress diagnostics in
+/// the v2 event log and v1 debug log. Lab preserves the exact schema-v2 raw
+/// values (raw paths with query/fragment values redacted, full policy
+/// reasons); Production emits bounded route classes and redacted ingress
+/// values so durable sinks never carry raw path data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditProjection {
+    Lab,
+    Production,
+}
+
+impl AuditProjection {
+    /// Target recorded in v2 route-bearing events.
+    fn event_target(self, target: &str) -> String {
+        match self {
+            Self::Lab => redacted_event_target(target),
+            Self::Production => bounded_route_class(target).to_string(),
+        }
+    }
+
+    /// Path recorded in v1 debug diagnostics.
+    fn debug_path(self, target: &str) -> String {
+        match self {
+            Self::Lab => lab_debug_path(target),
+            Self::Production => bounded_route_class(target).to_string(),
+        }
+    }
+
+    /// Path embedded in policy transition reasons. Production reasons carry
+    /// only the bounded route class; Lab reasons keep the raw request path.
+    fn reason_path(self, path: &str) -> &str {
+        match self {
+            Self::Lab => path,
+            Self::Production => bounded_route_class(path),
+        }
+    }
+
+    /// Path prefix lists recorded in diagnostics.
+    fn path_prefixes(self, prefixes: &[String]) -> Vec<String> {
+        match self {
+            Self::Lab => prefixes.to_vec(),
+            Self::Production => bounded_route_classes(prefixes),
+        }
+    }
+
+    fn optional_path_prefixes(self, prefixes: &Option<Vec<String>>) -> Option<Vec<String>> {
+        match self {
+            Self::Lab => prefixes.clone(),
+            Self::Production => prefixes.as_deref().map(bounded_route_classes),
+        }
+    }
+
+    /// Request-host diagnostic field name and value for `request_received`.
+    fn request_host_field(self, request: &HttpRequest) -> (&'static str, Value) {
+        match self {
+            Self::Lab => ("request_host", json!(effective_request_host(request))),
+            Self::Production => ("request_host_kind", json!(safe_request_host_kind(request))),
+        }
+    }
+
+    fn ingress_identity(
+        self,
+        identity: &eidolon_core::IngressIdentity,
+    ) -> eidolon_core::IngressIdentity {
+        match self {
+            Self::Lab => identity.clone(),
+            Self::Production => persisted_ingress_identity(identity.clone()),
+        }
+    }
+
+    fn ingress_signals(
+        self,
+        signals: &eidolon_core::IngressAdvisorySignals,
+    ) -> eidolon_core::IngressAdvisorySignals {
+        match self {
+            Self::Lab => signals.clone(),
+            Self::Production => persisted_ingress_signals(signals.clone()),
+        }
+    }
+
+    fn authenticated_ingress_rule_rejection(
+        self,
+        rejection: &Option<eidolon_core::AuthenticatedIngressRuleRejection>,
+    ) -> Option<eidolon_core::AuthenticatedIngressRuleRejection> {
+        match self {
+            Self::Lab => rejection.clone(),
+            Self::Production => persisted_authenticated_ingress_rule_rejection(rejection.clone()),
+        }
+    }
+
+    fn local_ingress_trust_scope_rejection(
+        self,
+        rejection: &Option<eidolon_core::LocalIngressTrustScopeRejection>,
+    ) -> Option<eidolon_core::LocalIngressTrustScopeRejection> {
+        match self {
+            Self::Lab => rejection.clone(),
+            Self::Production => persisted_local_ingress_trust_scope_rejection(rejection.clone()),
+        }
+    }
+
+    fn trusted_ingress_soften_match(
+        self,
+        trust: &Option<eidolon_core::TrustedIngressSoftenMatch>,
+    ) -> Option<eidolon_core::TrustedIngressSoftenMatch> {
+        match self {
+            Self::Lab => trust.clone(),
+            Self::Production => persisted_trusted_ingress_soften_match(trust.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +430,7 @@ impl fmt::Display for UpstreamTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     Run(Box<ProxyConfig>),
+    PrintEffectiveConfig(Box<ProxyConfig>),
     Help,
 }
 
@@ -269,6 +450,16 @@ impl CliAction {
 
             let (flag, inline_value) = split_option(&arg)?;
             match flag {
+                "--profile" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(&mut builder.profile, flag, RuntimeProfile::parse(&value)?)?;
+                }
+                "--print-effective-config" => {
+                    if builder.print_effective_config {
+                        return Err(ConfigError::new(format!("duplicate option `{flag}`")));
+                    }
+                    builder.print_effective_config = true;
+                }
                 "--listen-addr" => {
                     let value = option_value(flag, inline_value, &mut args)?;
                     set_once(&mut builder.listen_addr, flag, value)?;
@@ -424,12 +615,19 @@ impl CliAction {
             }
         }
 
-        builder.build().map(Box::new).map(Self::Run)
+        let print_effective_config = builder.print_effective_config;
+        let config = builder.build().map(Box::new)?;
+        if print_effective_config {
+            Ok(Self::PrintEffectiveConfig(config))
+        } else {
+            Ok(Self::Run(config))
+        }
     }
 }
 
 #[derive(Debug, Default)]
 struct ConfigBuilder {
+    profile: Option<RuntimeProfile>,
     listen_addr: Option<String>,
     upstream: Option<String>,
     event_log_path: Option<PathBuf>,
@@ -450,10 +648,61 @@ struct ConfigBuilder {
     controlled_reality_backend_addr: Option<String>,
     controlled_reality_backend_auth_secret_path: Option<PathBuf>,
     owned_cluster_lab: bool,
+    print_effective_config: bool,
 }
 
 impl ConfigBuilder {
     fn build(self) -> Result<ProxyConfig, ConfigError> {
+        let profile = self.profile.unwrap_or(RuntimeProfile::Lab);
+        if profile == RuntimeProfile::Production {
+            if self.listen_addr.is_none() {
+                return Err(ConfigError::new(
+                    "`--profile production` requires an explicit `--listen-addr`",
+                ));
+            }
+            if self.upstream.is_none() {
+                return Err(ConfigError::new(
+                    "`--profile production` requires an explicit `--upstream`",
+                ));
+            }
+            if self.session_signing_key_path.is_none() {
+                return Err(ConfigError::new(
+                    "`--profile production` requires `--session-signing-key-file`",
+                ));
+            }
+            if self.ingress_transport_auth_secret_path.is_none() {
+                return Err(ConfigError::new(
+                    "`--profile production` requires `--ingress-transport-auth-secret-file`",
+                ));
+            }
+            if self.ingress_continuity_key_path.is_none() {
+                return Err(ConfigError::new(
+                    "`--profile production` requires `--ingress-continuity-key-file`; legacy transport-auth fallback is not allowed",
+                ));
+            }
+            // Both secrets are startup inputs. Their canonical/inode separation
+            // is checked with the remaining production storage isolation below.
+            if !self.require_authenticated_ingress_continuity {
+                return Err(ConfigError::new(
+                    "`--profile production` requires `--require-authenticated-ingress-continuity`",
+                ));
+            }
+            if self.event_log_path.is_none() {
+                return Err(ConfigError::new(
+                    "`--profile production` requires an explicit `--event-log`",
+                ));
+            }
+            if self.policy_state_path.is_none() {
+                return Err(ConfigError::new(
+                    "`--profile production` requires an explicit `--policy-state`",
+                ));
+            }
+            if self.debug_log_path.is_none() {
+                return Err(ConfigError::new(
+                    "`--profile production` requires an explicit `--debug-log`",
+                ));
+            }
+        }
         if self.require_authenticated_ingress_continuity
             && self.ingress_transport_auth_secret_path.is_none()
         {
@@ -485,20 +734,127 @@ impl ConfigBuilder {
                 ));
             }
         };
+        if profile == RuntimeProfile::Production && controlled_reality_backend.is_none() {
+            return Err(ConfigError::new(
+                "`--profile production` requires a remote controlled-reality renderer; in-process rendering is not allowed",
+            ));
+        }
+        let event_log_path = match self.event_log_path {
+            Some(value) => value,
+            None => parse_event_log_path(DEFAULT_EVENT_LOG)?,
+        };
+        let policy_state_path = match self.policy_state_path {
+            Some(value) => value,
+            None => parse_policy_state_path(DEFAULT_POLICY_STATE)?,
+        };
+        let debug_log_path = self.debug_log_path;
+        let intervention_control_path = match self.intervention_control_path {
+            Some(value) => value,
+            None => parse_control_path(DEFAULT_INTERVENTION_CONTROL)?,
+        };
+        if profile == RuntimeProfile::Production {
+            let debug_log_path = debug_log_path.as_deref().expect("validated above");
+            let event_exposures_path = sidecar_state_path(&event_log_path, ".exposures.json");
+            let event_consumed_proofs_path =
+                sidecar_state_path(&event_log_path, ".consumed-proofs.json");
+            let continuity_path = sidecar_state_path(&policy_state_path, ".continuity.json");
+            let writable_paths = vec![
+                ("event-log", event_log_path.clone()),
+                ("event-log-exposures", event_exposures_path.clone()),
+                (
+                    "event-log-exposures-temp",
+                    sidecar_state_path(&event_exposures_path, ".tmp"),
+                ),
+                (
+                    "event-log-consumed-proofs",
+                    event_consumed_proofs_path.clone(),
+                ),
+                (
+                    "event-log-consumed-proofs-temp",
+                    sidecar_state_path(&event_consumed_proofs_path, ".tmp"),
+                ),
+                ("policy-state", policy_state_path.clone()),
+                ("policy-state-lease", state_lease_path(&policy_state_path)),
+                ("policy-state-temp", policy_state_path.with_extension("tmp")),
+                ("policy-continuity", continuity_path.clone()),
+                (
+                    "policy-continuity-temp",
+                    sidecar_state_path(&continuity_path, ".tmp"),
+                ),
+                ("debug-log", debug_log_path.to_path_buf()),
+            ];
+            let writable_path_refs = writable_paths
+                .iter()
+                .map(|(label, path)| (*label, path.as_path()))
+                .collect::<Vec<_>>();
+            ensure_production_durable_paths_are_distinct(&writable_path_refs)?;
+            let read_only_inputs = [
+                ("bait-profile", self.bait_profile_path.as_deref()),
+                (
+                    "bait-signing-secret",
+                    self.bait_signing_secret_path.as_deref(),
+                ),
+                (
+                    "session-signing-key",
+                    self.session_signing_key_path.as_deref(),
+                ),
+                (
+                    "ingress-trust-config",
+                    self.ingress_trust_config_path.as_deref(),
+                ),
+                (
+                    "ingress-transport-auth-secret",
+                    self.ingress_transport_auth_secret_path.as_deref(),
+                ),
+                (
+                    "ingress-continuity-key",
+                    self.ingress_continuity_key_path.as_deref(),
+                ),
+                (
+                    "controlled-reality-backend-auth-secret",
+                    controlled_reality_backend
+                        .as_ref()
+                        .map(|backend| backend.auth_secret_path.as_path()),
+                ),
+                (
+                    "intervention-control",
+                    Some(intervention_control_path.as_path()),
+                ),
+            ];
+            ensure_production_writable_paths_do_not_alias_inputs(
+                &writable_path_refs,
+                &read_only_inputs,
+            )?;
+            ensure_production_transport_and_continuity_keys_are_distinct(
+                self.ingress_transport_auth_secret_path
+                    .as_deref()
+                    .expect("validated above"),
+                self.ingress_continuity_key_path
+                    .as_deref()
+                    .expect("validated above"),
+            )?;
+        }
+
         Ok(ProxyConfig {
+            profile,
             listen_addr: match self.listen_addr {
-                Some(value) => parse_listen_addr(&value, self.owned_cluster_lab)?,
-                None => parse_listen_addr(DEFAULT_LISTEN_ADDR, self.owned_cluster_lab)?,
+                Some(value) => parse_listen_addr(
+                    &value,
+                    self.owned_cluster_lab,
+                    profile == RuntimeProfile::Production,
+                )?,
+                None => parse_listen_addr(
+                    DEFAULT_LISTEN_ADDR,
+                    self.owned_cluster_lab,
+                    profile == RuntimeProfile::Production,
+                )?,
             },
             upstream: match self.upstream {
                 Some(value) => parse_upstream(&value, self.owned_cluster_lab)?,
                 None => parse_upstream(DEFAULT_UPSTREAM, self.owned_cluster_lab)?,
             },
-            event_log_path: match self.event_log_path {
-                Some(value) => value,
-                None => parse_event_log_path(DEFAULT_EVENT_LOG)?,
-            },
-            debug_log_path: self.debug_log_path,
+            event_log_path,
+            debug_log_path,
             bait_profile_path: self.bait_profile_path,
             bait_signing_secret_path: self.bait_signing_secret_path,
             session_signing_key_path: self.session_signing_key_path,
@@ -512,14 +868,8 @@ impl ConfigBuilder {
             } else {
                 self.trusted_bait_soften_path_prefixes
             },
-            intervention_control_path: match self.intervention_control_path {
-                Some(value) => value,
-                None => parse_control_path(DEFAULT_INTERVENTION_CONTROL)?,
-            },
-            policy_state_path: match self.policy_state_path {
-                Some(value) => value,
-                None => parse_policy_state_path(DEFAULT_POLICY_STATE)?,
-            },
+            intervention_control_path,
+            policy_state_path,
             controlled_reality_config: ControlledRealityConfig {
                 max_action_depth: self
                     .controlled_reality_max_depth
@@ -554,6 +904,43 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
     }
+}
+
+fn effective_config_projection(config: &ProxyConfig) -> Value {
+    json!({
+        "schema_version": 1,
+        "profile": config.profile.as_str(),
+        "session": {
+            "signing_key": if config.session_signing_key_path.is_some() {
+                "configured"
+            } else {
+                "ephemeral"
+            },
+            "cookie_policy": match config.profile {
+                RuntimeProfile::Lab => "lab",
+                RuntimeProfile::Production => "production",
+            },
+        },
+        "ingress": {
+            "transport_auth": config.ingress_transport_auth_secret_path.is_some(),
+            "continuity_key": config.ingress_continuity_key_path.is_some(),
+            "authenticated_continuity_required": config.require_authenticated_ingress_continuity,
+        },
+        "state": {
+            "event_log": "configured",
+            "policy_state": "configured",
+            "debug_log": config.debug_log_path.is_some(),
+        },
+        "controlled_reality_renderer": if config.controlled_reality_backend.is_some() {
+            "remote"
+        } else {
+            "in_process"
+        },
+    })
+}
+
+fn effective_config_output(config: &ProxyConfig) -> String {
+    format!("{}\n", effective_config_projection(config))
 }
 
 fn split_option(arg: &str) -> Result<(&str, Option<String>), ConfigError> {
@@ -608,7 +995,11 @@ where
     Ok(())
 }
 
-fn parse_listen_addr(raw: &str, owned_cluster_lab: bool) -> Result<SocketAddr, ConfigError> {
+fn parse_listen_addr(
+    raw: &str,
+    owned_cluster_lab: bool,
+    allow_ephemeral_port: bool,
+) -> Result<SocketAddr, ConfigError> {
     let addr = raw.parse::<SocketAddr>().map_err(|error| {
         ConfigError::new(format!(
             "listen address must be a socket address such as {DEFAULT_LISTEN_ADDR}: {error}"
@@ -621,7 +1012,7 @@ fn parse_listen_addr(raw: &str, owned_cluster_lab: bool) -> Result<SocketAddr, C
         ));
     }
 
-    if addr.port() == 0 {
+    if addr.port() == 0 && !allow_ephemeral_port {
         return Err(ConfigError::new("listen address port must not be 0"));
     }
 
@@ -1079,6 +1470,146 @@ fn meaningful_parent(path: &Path) -> Option<&Path> {
         .filter(|parent| !parent.as_os_str().is_empty())
 }
 
+fn ensure_production_durable_paths_are_distinct(
+    paths: &[(&str, &Path)],
+) -> Result<(), ConfigError> {
+    for (index, (left_label, left_path)) in paths.iter().enumerate() {
+        for (right_label, right_path) in &paths[index + 1..] {
+            if durable_paths_alias(left_path, right_path)? {
+                return Err(ConfigError::new(format!(
+                    "`--profile production` requires distinct durable paths: {left_label} and {right_label} resolve to the same target"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_production_writable_paths_do_not_alias_inputs(
+    writable_paths: &[(&str, &Path)],
+    read_only_inputs: &[(&str, Option<&Path>)],
+) -> Result<(), ConfigError> {
+    for (writable_label, writable_path) in writable_paths {
+        for (input_label, input_path) in read_only_inputs {
+            let Some(input_path) = input_path else {
+                continue;
+            };
+            if durable_paths_alias(writable_path, input_path)? {
+                return Err(ConfigError::new(format!(
+                    "`--profile production` requires writable targets not to alias startup inputs: {writable_label} and {input_label} resolve to the same target"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_production_transport_and_continuity_keys_are_distinct(
+    transport_auth_secret_path: &Path,
+    continuity_key_path: &Path,
+) -> Result<(), ConfigError> {
+    if durable_paths_alias(transport_auth_secret_path, continuity_key_path)? {
+        return Err(ConfigError::new(
+            "`--profile production` requires distinct transport authentication and continuity key files",
+        ));
+    }
+
+    Ok(())
+}
+
+fn durable_paths_alias(left: &Path, right: &Path) -> Result<bool, ConfigError> {
+    let left_metadata = production_path_metadata(left)?;
+    let right_metadata = production_path_metadata(right)?;
+    let resolved_left = canonical_durable_file_target(left)?;
+    let resolved_right = canonical_durable_file_target(right)?;
+    if resolved_left == resolved_right {
+        return Ok(true);
+    }
+
+    #[cfg(unix)]
+    if let (Some(left_metadata), Some(right_metadata)) = (left_metadata, right_metadata) {
+        use std::os::unix::fs::MetadataExt;
+
+        return Ok(left_metadata.dev() == right_metadata.dev()
+            && left_metadata.ino() == right_metadata.ino());
+    }
+
+    Ok(false)
+}
+
+fn ensure_production_path_components_are_not_symlinks(path: &Path) -> Result<(), ConfigError> {
+    let mut component = Some(path);
+    while let Some(current) = component {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ConfigError::new(format!(
+                    "`--profile production` does not allow symlink paths: `{}`",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ConfigError::new(format!(
+                    "cannot inspect production path `{}`: {error}",
+                    current.display()
+                )));
+            }
+        }
+        component = current
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+    }
+
+    Ok(())
+}
+
+fn production_path_metadata(path: &Path) -> Result<Option<fs::Metadata>, ConfigError> {
+    ensure_production_path_components_are_not_symlinks(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(ConfigError::new(format!(
+            "`--profile production` does not allow symlink paths: `{}`",
+            path.display()
+        ))),
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ConfigError::new(format!(
+            "cannot inspect production path `{}`: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn canonical_durable_file_target(path: &Path) -> Result<PathBuf, ConfigError> {
+    match production_path_metadata(path)? {
+        Some(_) => fs::canonicalize(path).map_err(|error| {
+            ConfigError::new(format!(
+                "cannot canonicalize durable path `{}`: {error}",
+                path.display()
+            ))
+        }),
+        None => {
+            let parent = meaningful_parent(path).unwrap_or_else(|| Path::new("."));
+            let file_name = path.file_name().ok_or_else(|| {
+                ConfigError::new(format!(
+                    "durable path must name a file target: `{}`",
+                    path.display()
+                ))
+            })?;
+            fs::canonicalize(parent)
+                .map(|parent| parent.join(file_name))
+                .map_err(|error| {
+                    ConfigError::new(format!(
+                        "cannot canonicalize durable path parent `{}`: {error}",
+                        parent.display()
+                    ))
+                })
+        }
+    }
+}
+
 fn connect_addr(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
@@ -1223,14 +1754,20 @@ impl Drop for ConnectionPermit {
 }
 
 fn run_proxy(config: ProxyConfig) -> io::Result<()> {
-    let state_lease = DurableStateLease::acquire_for_policy_state(&config.policy_state_path)?;
-    let listener = TcpListener::bind(config.listen_addr)?;
-    println!(
-        "eidolon-proxy listening on http://{}",
-        listener.local_addr()?
-    );
-    println!("forwarding normal traffic to {}", config.upstream);
+    run_proxy_with_production_shutdown(config, std::future::pending(), None)
+}
 
+fn run_proxy_with_production_shutdown<F>(
+    config: ProxyConfig,
+    production_shutdown: F,
+    production_started: Option<std::sync::mpsc::Sender<SocketAddr>>,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    let profile = config.profile;
+    let listen_addr = config.listen_addr;
+    let state_lease = DurableStateLease::acquire_for_policy_state(&config.policy_state_path)?;
     let loaded_bait_profile = match &config.bait_profile_path {
         Some(path) => load_bait_profile(path).map_err(|error| invalid_data(error.to_string()))?,
         None => default_loaded_bait_profile(),
@@ -1283,6 +1820,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         ),
         None => (SessionAuthority::ephemeral(), "ephemeral"),
     };
+    session_authority.set_cookie_policy(profile.cookie_policy());
     let session_signing_debug = json!({
         "mode": session_signing_mode,
         "active_key_version": session_authority.active_key_version(),
@@ -1364,6 +1902,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     };
     let runtime = ProxyRuntime {
         upstream: config.upstream,
+        audit_projection: profile.audit_projection(),
         client_request_deadline: CLIENT_REQUEST_DEADLINE,
         event_log: Arc::new(Mutex::new(event_log_writer)),
         debug_log,
@@ -1396,7 +1935,7 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         "proxy_started",
         None,
         json!({
-            "listen_addr": listener.local_addr()?.to_string(),
+            "listen_addr": listen_addr.to_string(),
             "upstream": runtime.upstream.to_string(),
             "controlled_reality": {
                 "max_depth": runtime.controlled_reality_config.max_action_depth,
@@ -1436,7 +1975,9 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
                 "max_new_mappings": eidolon_proxy::session_auth::MAX_DURABLE_CONTINUITY_INSERTS_PER_WINDOW,
                 "window_secs": eidolon_proxy::session_auth::DURABLE_CONTINUITY_INSERT_WINDOW_SECS,
             },
-            "trusted_bait_soften_path_prefixes": runtime.trusted_bait_soften_path_prefixes,
+            "trusted_bait_soften_path_prefixes": runtime
+                .audit_projection
+                .path_prefixes(&runtime.trusted_bait_soften_path_prefixes),
             "restored_bait_exposure_count": restored_bait_exposure_count,
             "restored_bait_exposure_ttl_evicted": restored_bait_exposure_ttl_evicted,
             "restored_bait_exposure_torn_tail_line": restored_bait_exposure_torn_tail_line,
@@ -1463,6 +2004,21 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
         }),
     )?;
 
+    if profile == RuntimeProfile::Production {
+        return run_production_proxy(
+            listen_addr,
+            runtime,
+            production_shutdown,
+            production_started,
+        );
+    }
+
+    let listener = TcpListener::bind(listen_addr)?;
+    println!(
+        "eidolon-proxy listening on http://{}",
+        listener.local_addr()?
+    );
+    println!("forwarding normal traffic to {}", runtime.upstream);
     let connection_limiter = ConnectionLimiter::new(MAX_CONCURRENT_CONNECTIONS);
     for stream in listener.incoming() {
         match stream {
@@ -1483,6 +2039,176 @@ fn run_proxy(config: ProxyConfig) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn production_upstream_config_within_processor_deadline(
+    processor_timeout: Duration,
+) -> io::Result<ProductionUpstreamConfig> {
+    let dispatch_timeout = processor_timeout
+        .checked_sub(PRODUCTION_UPSTREAM_DISPATCH_DEADLINE_MARGIN)
+        .filter(|timeout| !timeout.is_zero())
+        .ok_or_else(|| {
+            invalid_data("production processor timeout leaves no bounded typed upstream deadline")
+        })?;
+    Ok(ProductionUpstreamConfig {
+        dispatch_timeout,
+        ..ProductionUpstreamConfig::default()
+    })
+}
+
+fn run_production_proxy<F>(
+    listen_addr: SocketAddr,
+    runtime: ProxyRuntime,
+    shutdown: F,
+    started: Option<std::sync::mpsc::Sender<SocketAddr>>,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let production_config = ProductionRuntimeConfig::default();
+    let upstream_config =
+        production_upstream_config_within_processor_deadline(production_config.processor_timeout)?;
+    let upstream = match tokio_runtime.block_on(production_upstream_target(&runtime.upstream)) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            tokio_runtime.shutdown_timeout(PRODUCTION_UPSTREAM_RESOLVER_SHUTDOWN_TIMEOUT);
+            return Err(error);
+        }
+    };
+    let processor = Arc::new(ProductionLifecycleProcessor {
+        runtime,
+        upstream,
+        upstream_config,
+        runtime_handle: tokio_runtime.handle().clone(),
+    });
+    tokio_runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+        let local_addr = listener.local_addr()?;
+        if let Some(started) = started {
+            let _ = started.send(local_addr);
+        }
+        println!("eidolon-proxy listening on http://{local_addr}");
+        println!(
+            "forwarding normal traffic to {}",
+            processor.runtime.upstream
+        );
+        serve_production_http1(listener, production_config, processor, shutdown)
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))
+    })
+}
+
+#[derive(Clone)]
+struct ProductionLifecycleProcessor {
+    runtime: ProxyRuntime,
+    upstream: ProductionUpstreamTarget,
+    upstream_config: ProductionUpstreamConfig,
+    runtime_handle: tokio::runtime::Handle,
+}
+
+/// Fixed non-sensitive code for production request-processing failures. The
+/// propagated error can carry event-log filesystem paths, so stderr never
+/// formats it; the client outcome stays an empty 500.
+const PRODUCTION_REQUEST_PROCESSING_FAILED_STDERR: &str =
+    "production request processing failed: code=processor_failed";
+
+fn production_request_processing_failed(error: &io::Error) -> ProductionProcessorError {
+    let stderr = io::stderr();
+    let mut stderr = stderr.lock();
+    production_request_processing_failed_with_writer(error, &mut stderr)
+}
+
+/// Emit the fixed failure code to `writer` and map to `Failed`. The error is
+/// never formatted, so the emitted bytes cannot carry filesystem paths or
+/// other sensitive detail. A stderr write failure does not change the
+/// client-visible 500 mapping.
+fn production_request_processing_failed_with_writer<W: io::Write>(
+    _error: &io::Error,
+    writer: &mut W,
+) -> ProductionProcessorError {
+    let _ = writeln!(writer, "{PRODUCTION_REQUEST_PROCESSING_FAILED_STDERR}");
+    ProductionProcessorError::Failed
+}
+
+impl ProductionRequestProcessor for ProductionLifecycleProcessor {
+    fn process(
+        &self,
+        request: eidolon_proxy::production_http::ProductionHttpRequest,
+        context: ProductionRequestContext,
+    ) -> Result<ProductionResponse, ProductionProcessorError> {
+        let lifecycle_request = request.to_lifecycle_request();
+        process_request(
+            &self.runtime,
+            lifecycle_request,
+            context.peer_addr,
+            UpstreamTransport::Production {
+                request: &request,
+                upstream: &self.upstream,
+                config: self.upstream_config,
+                runtime_handle: self.runtime_handle.clone(),
+                request_deadline: context.request_deadline,
+            },
+        )
+        .and_then(http_response_to_production)
+        .map_err(|error| production_request_processing_failed(&error))
+    }
+
+    fn reject(
+        &self,
+        rejection: eidolon_proxy::production_http::ProductionRequestRejection,
+        _request: ProductionRejectedRequest,
+        _context: ProductionRequestContext,
+    ) -> Result<ProductionResponse, ProductionProcessorError> {
+        if self.runtime.debug_log.is_none() {
+            return Err(ProductionProcessorError::Unavailable);
+        }
+
+        let status = StatusCode::from_u16(rejection.response_status())
+            .map_err(|_| ProductionProcessorError::Unavailable)?;
+        let request_id = RequestId::new();
+        write_debug(
+            &self.runtime,
+            "production_request_rejected",
+            None,
+            json!({
+                "request_id": request_id.0,
+                "rejection": rejection.audit_code(),
+                "response_status": status.as_u16(),
+            }),
+        )
+        .map_err(|error| {
+            eprintln!("production rejection audit failed: {error}");
+            ProductionProcessorError::Unavailable
+        })?;
+        Ok(ProductionResponse::new(status, Bytes::new()))
+    }
+
+    fn reject_pre_service(
+        &self,
+        rejection: ProductionPreServiceRejection,
+        _context: ProductionRequestContext,
+    ) -> Result<(), ProductionProcessorError> {
+        if self.runtime.debug_log.is_none() {
+            return Err(ProductionProcessorError::Unavailable);
+        }
+
+        write_debug(
+            &self.runtime,
+            "production_pre_service_rejected",
+            None,
+            json!({
+                "request_id": RequestId::new().0,
+                "rejection": rejection.audit_code(),
+            }),
+        )
+        .map_err(|error| {
+            eprintln!("production pre-service rejection audit failed: {error}");
+            ProductionProcessorError::Unavailable
+        })
+    }
 }
 
 fn jsonl_tail_repair_debug(outcome: JsonlTailRepairOutcome) -> Value {
@@ -1508,6 +2234,7 @@ fn jsonl_tail_repair_debug(outcome: JsonlTailRepairOutcome) -> Value {
 #[derive(Clone)]
 struct ProxyRuntime {
     upstream: UpstreamTarget,
+    audit_projection: AuditProjection,
     client_request_deadline: Duration,
     event_log: Arc<Mutex<FileEventLogWriter>>,
     debug_log: Option<Arc<Mutex<FileDebugLogWriter>>>,
@@ -3163,7 +3890,6 @@ fn handle_connection(
 
     let client_peer_addr = client_stream.peer_addr().ok();
     let client_peer = client_peer_addr.as_ref().map(ToString::to_string);
-    let client_peer_ip = client_peer_addr.map(|addr| addr.ip());
     let request = {
         let mut reader =
             DeadlineTcpReader::new(&mut client_stream, runtime.client_request_deadline);
@@ -3180,7 +3906,31 @@ fn handle_connection(
         )?;
         return Ok(());
     };
-    reconcile_all_pending_controlled_reality_interactions(runtime)?;
+    let request_method = request.method.clone();
+    let response = process_request(runtime, request, client_peer_addr, UpstreamTransport::Lab)?;
+    client_stream.write_all(&response.to_http_bytes_for_method(&request_method))?;
+    client_stream.flush()
+}
+
+enum UpstreamTransport<'a> {
+    Lab,
+    Production {
+        request: &'a eidolon_proxy::production_http::ProductionHttpRequest,
+        upstream: &'a ProductionUpstreamTarget,
+        config: ProductionUpstreamConfig,
+        runtime_handle: tokio::runtime::Handle,
+        request_deadline: Instant,
+    },
+}
+
+fn process_request(
+    runtime: &ProxyRuntime,
+    request: HttpRequest,
+    client_peer_addr: Option<SocketAddr>,
+    upstream_transport: UpstreamTransport<'_>,
+) -> io::Result<HttpResponse> {
+    let client_peer = client_peer_addr.as_ref().map(ToString::to_string);
+    let client_peer_ip = client_peer_addr.map(|addr| addr.ip());
 
     let intervention_mode = intervention_mode_from_control_file(&runtime.intervention_control_path);
     let path = match normalized_event_path(&request) {
@@ -3201,13 +3951,12 @@ fn handle_connection(
             ) {
                 Ok(session) => session,
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                    return write_session_continuity_rejection(&mut client_stream, &request.method);
+                    return Ok(session_continuity_rejection());
                 }
                 Err(error) => return Err(error),
             };
             if session.continuity_outcome.is_fail_closed() {
-                return write_session_continuity_fail_closed(
-                    client_stream,
+                return session_continuity_fail_closed(
                     runtime,
                     &session,
                     &request,
@@ -3231,8 +3980,7 @@ fn handle_connection(
                 RoutingDecision::EidolonOwned,
                 "ambiguous HTTP request target rejected before policy evaluation",
             );
-            return write_direct_response(DirectResponseContext {
-                client_stream,
+            return direct_response(DirectResponseContext {
                 runtime,
                 session: &session,
                 request: &request,
@@ -3260,13 +4008,12 @@ fn handle_connection(
     ) {
         Ok(session) => session,
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            return write_session_continuity_rejection(&mut client_stream, &request.method);
+            return Ok(session_continuity_rejection());
         }
         Err(error) => return Err(error),
     };
     if session.continuity_outcome.is_fail_closed() {
-        return write_session_continuity_fail_closed(
-            client_stream,
+        return session_continuity_fail_closed(
             runtime,
             &session,
             &request,
@@ -3275,6 +4022,7 @@ fn handle_connection(
             intervention_mode,
         );
     }
+    reconcile_all_pending_controlled_reality_interactions(runtime)?;
     let (mut policy_state, capacity_fail_closed) =
         policy_state_resolution_for_session(runtime, session.session_id)?;
     if capacity_fail_closed {
@@ -3293,8 +4041,7 @@ fn handle_connection(
             RoutingDecision::EidolonOwned,
             "policy state capacity saturated; unknown session failed closed",
         );
-        return write_direct_response(DirectResponseContext {
-            client_stream,
+        return direct_response(DirectResponseContext {
             runtime,
             session: &session,
             request: &request,
@@ -3346,6 +4093,7 @@ fn handle_connection(
         starting_policy_state: policy_state,
         intervention_mode,
         path: &surface_request.path,
+        reason_path: runtime.audit_projection.reason_path(&surface_request.path),
         trusted_bait_soften_path_prefixes: &runtime.trusted_bait_soften_path_prefixes,
         ingress_identity: &session.ingress_identity,
         ingress_signals: &session.ingress_signals,
@@ -3359,66 +4107,76 @@ fn handle_connection(
     let discovery_recon_score = evaluation.discovery_recon_score;
     let discovery_recon_threshold = evaluation.discovery_recon_threshold;
     let decision = evaluation.decision;
+    let (request_host_key, request_host_value) =
+        runtime.audit_projection.request_host_field(&request);
+    let mut request_received_fields = json!({
+    "client_peer": client_peer,
+    "method": request.method.as_str(),
+    "target_form": debug_target_form(&request.target),
+    "path": runtime.audit_projection.debug_path(&path),
+    "query_present": debug_query_present(&path),
+    "http_version": request.version.as_str(),
+    "body_len": request.body.len(),
+    "header_count": request.headers.len(),
+    "safe_headers": safe_header_observations(&request.headers),
+    "session_source": debug_session_source(session.source),
+    "ingress_identity": runtime
+        .audit_projection
+        .ingress_identity(&session.ingress_identity),
+    "authenticated_ingress_rule_rejection": runtime
+        .audit_projection
+        .authenticated_ingress_rule_rejection(&session.authenticated_ingress_rule_rejection),
+    "local_ingress_trust_scope_rejection": runtime
+        .audit_projection
+        .local_ingress_trust_scope_rejection(&session.local_ingress_trust_scope_rejection),
+    "ingress_signals": runtime
+        .audit_projection
+        .ingress_signals(&session.ingress_signals),
+    "trusted_ingress_local_soften_path_prefixes": runtime
+        .audit_projection
+        .optional_path_prefixes(&session.trusted_bait_soften_path_prefixes),
+        "discovery_surface_fanout":
+            debug_discovery_surface_fanout(discovery_recon_state.fanout),
+        "discovery_request_count": discovery_recon_state.request_count,
+        "discovery_query_seen": discovery_recon_state.query_seen,
+        "discovery_legacy_openapi_query_seen":
+            discovery_recon_state.legacy_openapi_query_seen,
+        "discovery_linked_bait_surface_seen":
+            discovery_recon_state.linked_bait_surface_seen,
+        "discovery_linked_bait_surface_classes":
+            discovery_recon_state.linked_bait_surface_classes,
+        "discovery_decoy_write_probe_seen":
+            discovery_recon_state.decoy_write_probe_seen,
+        "discovery_decoy_write_probe_count":
+            discovery_recon_state.decoy_write_probe_count,
+        "discovery_decoy_write_probe_path_classes":
+            discovery_recon_state.decoy_write_probe_path_classes,
+        "discovery_recon_score": {
+            "repeated_discovery_score": discovery_recon_score.repeated_discovery_score,
+            "query_score": discovery_recon_score.query_score,
+            "legacy_openapi_query_score":
+                discovery_recon_score.legacy_openapi_query_score,
+            "linked_bait_surface_score":
+                discovery_recon_score.linked_bait_surface_score,
+            "linked_bait_class_fanout_bonus":
+                discovery_recon_score.linked_bait_class_fanout_bonus,
+            "decoy_write_probe_score":
+                discovery_recon_score.decoy_write_probe_score,
+            "decoy_write_probe_path_fanout_bonus":
+                discovery_recon_score.decoy_write_probe_path_fanout_bonus,
+            "detection_score": discovery_recon_score.detection_score,
+            "total": discovery_recon_score.total,
+            "threshold": discovery_recon_threshold,
+        },
+        "policy_state": policy_state,
+        "intervention_mode": debug_intervention_mode(intervention_mode),
+    });
+    request_received_fields[request_host_key] = request_host_value;
     write_debug(
         runtime,
         "request_received",
         Some(session.session_id),
-        json!({
-            "client_peer": client_peer,
-            "method": request.method.as_str(),
-            "target_form": debug_target_form(&request.target),
-            "request_host": effective_request_host(&request),
-            "path": debug_path(&path),
-            "query_present": debug_query_present(&path),
-            "http_version": request.version.as_str(),
-            "body_len": request.body.len(),
-            "header_count": request.headers.len(),
-            "safe_headers": safe_header_observations(&request.headers),
-            "session_source": debug_session_source(session.source),
-            "ingress_identity": &session.ingress_identity,
-            "authenticated_ingress_rule_rejection":
-                &session.authenticated_ingress_rule_rejection,
-            "local_ingress_trust_scope_rejection":
-                &session.local_ingress_trust_scope_rejection,
-            "ingress_signals": &session.ingress_signals,
-            "trusted_ingress_local_soften_path_prefixes":
-                &session.trusted_bait_soften_path_prefixes,
-            "discovery_surface_fanout":
-                debug_discovery_surface_fanout(discovery_recon_state.fanout),
-            "discovery_request_count": discovery_recon_state.request_count,
-            "discovery_query_seen": discovery_recon_state.query_seen,
-            "discovery_legacy_openapi_query_seen":
-                discovery_recon_state.legacy_openapi_query_seen,
-            "discovery_linked_bait_surface_seen":
-                discovery_recon_state.linked_bait_surface_seen,
-            "discovery_linked_bait_surface_classes":
-                discovery_recon_state.linked_bait_surface_classes,
-            "discovery_decoy_write_probe_seen":
-                discovery_recon_state.decoy_write_probe_seen,
-            "discovery_decoy_write_probe_count":
-                discovery_recon_state.decoy_write_probe_count,
-            "discovery_decoy_write_probe_path_classes":
-                discovery_recon_state.decoy_write_probe_path_classes,
-            "discovery_recon_score": {
-                "repeated_discovery_score": discovery_recon_score.repeated_discovery_score,
-                "query_score": discovery_recon_score.query_score,
-                "legacy_openapi_query_score":
-                    discovery_recon_score.legacy_openapi_query_score,
-                "linked_bait_surface_score":
-                    discovery_recon_score.linked_bait_surface_score,
-                "linked_bait_class_fanout_bonus":
-                    discovery_recon_score.linked_bait_class_fanout_bonus,
-                "decoy_write_probe_score":
-                    discovery_recon_score.decoy_write_probe_score,
-                "decoy_write_probe_path_fanout_bonus":
-                    discovery_recon_score.decoy_write_probe_path_fanout_bonus,
-                "detection_score": discovery_recon_score.detection_score,
-                "total": discovery_recon_score.total,
-                "threshold": discovery_recon_threshold,
-            },
-            "policy_state": policy_state,
-            "intervention_mode": debug_intervention_mode(intervention_mode),
-        }),
+        request_received_fields,
     )?;
 
     if is_controlled_follow_up_path(&surface_request.path)
@@ -3431,8 +4189,7 @@ fn handle_connection(
             RoutingDecision::EidolonOwned,
             "synthetic controlled-reality follow-up namespace failed closed",
         );
-        return write_direct_response(DirectResponseContext {
-            client_stream,
+        return direct_response(DirectResponseContext {
             runtime,
             session: &session,
             request: &request,
@@ -3461,7 +4218,7 @@ fn handle_connection(
             Some(session.session_id),
             json!({
                 "method": request.method.as_str(),
-                "path": debug_path(&surface_request.path),
+                "path": runtime.audit_projection.debug_path(&surface_request.path),
                 "query_present": surface_request.query.is_some(),
                 "response_status": response.status,
                 "response_body_len": response.body.len(),
@@ -3470,8 +4227,7 @@ fn handle_connection(
         let decision =
             request_evaluation::interventions_disabled_bait_action_decision(policy_state);
 
-        return write_direct_response(DirectResponseContext {
-            client_stream,
+        return direct_response(DirectResponseContext {
             runtime,
             session: &session,
             request: &request,
@@ -3543,8 +4299,7 @@ fn handle_connection(
                 let SurfaceAction::EidolonOwned { response } = action else {
                     panic!("blocked controlled-reality action should be eidolon owned");
                 };
-                return write_direct_response(DirectResponseContext {
-                    client_stream,
+                return direct_response(DirectResponseContext {
                     runtime,
                     session: &session,
                     request: &request,
@@ -3660,8 +4415,7 @@ fn handle_connection(
                     &session.trusted_bait_soften_path_prefixes,
             }),
         )?;
-        return write_direct_response(DirectResponseContext {
-            client_stream,
+        return direct_response(DirectResponseContext {
             runtime,
             session: &session,
             request: &request,
@@ -3752,6 +4506,7 @@ fn handle_connection(
                     &effective_decision,
                     discovery_recon_score,
                     discovery_recon_threshold,
+                    runtime.audit_projection,
                 ),
             )?;
             let action_exposure_id = write_bait_action_observed_event(
@@ -3771,7 +4526,7 @@ fn handle_connection(
                 json!({
                     "bait_id": &action_match.bait.id,
                     "method": request.method.as_str(),
-                    "path": debug_path(&surface_request.path),
+                    "path": runtime.audit_projection.debug_path(&surface_request.path),
                     "query_present": surface_request.query.is_some(),
                     "matched_prior_exposure": action_exposure_id.is_some(),
                     "exposure_id": &action_exposure_id,
@@ -3887,8 +4642,7 @@ fn handle_connection(
                 }),
             )?;
 
-            client_stream.write_all(&response.to_http_bytes_for_method(&request.method))?;
-            return client_stream.flush();
+            return Ok(response);
         }
     }
 
@@ -3916,7 +4670,7 @@ fn handle_connection(
                 json!({
                     "bait_id": &action_shape_match.bait.id,
                     "method": request.method.as_str(),
-                    "path": debug_path(&surface_request.path),
+                    "path": runtime.audit_projection.debug_path(&surface_request.path),
                     "query_present": surface_request.query.is_some(),
                     "prior_same_bait_exposure": prior_same_bait_exposure,
                 }),
@@ -3924,7 +4678,7 @@ fn handle_connection(
 
             if let Some(transition) = request_evaluation::same_bait_near_miss_transition(
                 decision.policy_state,
-                &surface_request.path,
+                runtime.audit_projection.reason_path(&surface_request.path),
                 &action_shape_match.bait.id,
                 prior_same_bait_exposure,
             ) {
@@ -3941,8 +4695,7 @@ fn handle_connection(
                     transition.reason,
                     transition.persistence,
                 );
-                return write_direct_response(DirectResponseContext {
-                    client_stream,
+                return direct_response(DirectResponseContext {
                     runtime,
                     session: &session,
                     request: &request,
@@ -3997,7 +4750,7 @@ fn handle_connection(
                 json!({
                     "bait_id": &action_shape_match.bait.id,
                     "method": request.method.as_str(),
-                    "path": debug_path(&surface_request.path),
+                    "path": runtime.audit_projection.debug_path(&surface_request.path),
                     "query_present": surface_request.query.is_some(),
                     "prior_same_bait_exposure": prior_same_bait_exposure,
                 }),
@@ -4005,14 +4758,13 @@ fn handle_connection(
 
             if let Some(transition) = request_evaluation::same_bait_near_miss_transition(
                 decision.policy_state,
-                &surface_request.path,
+                runtime.audit_projection.reason_path(&surface_request.path),
                 &action_shape_match.bait.id,
                 prior_same_bait_exposure,
             ) {
                 apply_policy_transition(runtime, &session, request_id, &transition)?;
                 effective_decision = transition.decision(RoutingDecision::EidolonOwned);
-                return write_direct_response(DirectResponseContext {
-                    client_stream,
+                return direct_response(DirectResponseContext {
                     runtime,
                     session: &session,
                     request: &request,
@@ -4042,13 +4794,12 @@ fn handle_connection(
             Some(session.session_id),
             json!({
                 "method": request.method.as_str(),
-                "path": debug_path(&surface_request.path),
+                "path": runtime.audit_projection.debug_path(&surface_request.path),
                 "query_present": surface_request.query.is_some(),
                 "response_status": 403,
             }),
         )?;
-        return write_direct_response(DirectResponseContext {
-            client_stream,
+        return direct_response(DirectResponseContext {
             runtime,
             session: &session,
             request: &request,
@@ -4084,6 +4835,7 @@ fn handle_connection(
                 &effective_decision,
                 discovery_recon_score,
                 discovery_recon_threshold,
+                runtime.audit_projection,
             ),
             request_id,
             &effective_decision,
@@ -4128,6 +4880,7 @@ fn handle_connection(
             "response_served",
             Some(session.session_id),
             json!({
+                "request_id": request_id.0,
                 "route": "direct_surface",
                 "decision": {
                     "policy_state": effective_decision.policy_state,
@@ -4138,8 +4891,7 @@ fn handle_connection(
             }),
         )?;
 
-        client_stream.write_all(&response.to_http_bytes_for_method(&request.method))?;
-        return client_stream.flush();
+        return Ok(response);
     }
 
     let upstream_request_decision = request_evaluation::upstream_request_decision(
@@ -4158,6 +4910,7 @@ fn handle_connection(
             &upstream_request_decision,
             discovery_recon_score,
             discovery_recon_threshold,
+            runtime.audit_projection,
         ),
     )?;
     if intervention_mode == InterventionMode::Disabled {
@@ -4175,32 +4928,71 @@ fn handle_connection(
         SurfaceAction::RewrittenUpstream { plan } => plan.cache_policy,
         _ => ResponseCachePolicy::Preserve,
     };
-    let mut upstream_request_source = request.clone();
-    let stripped_cache_request_headers =
-        if upstream_cache_policy == ResponseCachePolicy::PrivateNoStore {
-            strip_session_proof_cache_request_headers(&mut upstream_request_source)
-        } else {
-            0
-        };
-    let upstream_request = request_to_upstream_bytes(&upstream_request_source, &runtime.upstream)?;
+    let (mut response, stripped_cache_request_headers, request_bytes) = match upstream_transport {
+        UpstreamTransport::Lab => {
+            let mut upstream_request_source = request.clone();
+            let stripped_cache_request_headers =
+                if upstream_cache_policy == ResponseCachePolicy::PrivateNoStore {
+                    strip_session_proof_cache_request_headers(&mut upstream_request_source)
+                } else {
+                    0
+                };
+            let upstream_request =
+                request_to_upstream_bytes(&upstream_request_source, &runtime.upstream)?;
+            let mut upstream_stream = connect_upstream(&runtime.upstream)?;
+            upstream_stream.write_all(&upstream_request)?;
+            upstream_stream.flush()?;
+            let response = read_http_response_for_method(&mut upstream_stream, &request.method)?;
+            (
+                response,
+                stripped_cache_request_headers,
+                upstream_request.len(),
+            )
+        }
+        UpstreamTransport::Production {
+            request,
+            upstream,
+            config,
+            runtime_handle,
+            request_deadline,
+        } => {
+            let original_header_count = request.headers().len();
+            let request = if upstream_cache_policy == ResponseCachePolicy::PrivateNoStore {
+                request.without_headers_case_insensitive(CACHE_CONDITIONAL_AND_RANGE_HEADERS)
+            } else {
+                request.clone()
+            };
+            let stripped_cache_request_headers =
+                original_header_count.saturating_sub(request.headers().len());
+            let response = runtime_handle
+                .block_on(dispatch_production_upstream(
+                    &request,
+                    upstream,
+                    config,
+                    request_deadline,
+                ))
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let request_bytes = request.body().len();
+            (
+                production_response_to_http(response)?,
+                stripped_cache_request_headers,
+                request_bytes,
+            )
+        }
+    };
     write_debug(
         runtime,
         "upstream_request_forwarding",
         Some(session.session_id),
         json!({
             "method": request.method.as_str(),
-            "path": debug_path(&path),
+            "path": runtime.audit_projection.debug_path(&path),
             "query_present": debug_query_present(&path),
             "connect_addr": runtime.upstream.connect_addr.as_str(),
-            "request_bytes": upstream_request.len(),
+            "request_bytes": request_bytes,
             "session_proof_cache_request_headers_stripped": stripped_cache_request_headers,
         }),
     )?;
-    let mut upstream_stream = connect_upstream(&runtime.upstream)?;
-    upstream_stream.write_all(&upstream_request)?;
-    upstream_stream.flush()?;
-
-    let mut response = read_http_response_for_method(&mut upstream_stream, &request.method)?;
     write_debug(
         runtime,
         "upstream_response_received",
@@ -4227,7 +5019,7 @@ fn handle_connection(
                     "refusal": outcome.refusal().map(ToString::to_string),
                     "original_body_len": response.body.len(),
                     "output_body_len": outcome.body().len(),
-                    "surface_path": debug_path(&path),
+                    "surface_path": runtime.audit_projection.debug_path(&path),
                     "query_present": debug_query_present(&path),
                 }),
             )?;
@@ -4314,8 +5106,110 @@ fn handle_connection(
         }),
     )?;
 
-    client_stream.write_all(&response.to_http_bytes_for_method(&request.method))?;
-    client_stream.flush()
+    Ok(response)
+}
+
+/// Resolve the typed production target once before binding the listener.
+///
+/// Tokio bounds startup lookup time. On lookup timeout or failure, the runtime
+/// is shut down with an explicit bounded timeout before listener admission.
+/// This does not claim to cancel a system resolver operation that outlives its
+/// lookup future.
+async fn production_upstream_target(
+    upstream: &UpstreamTarget,
+) -> io::Result<ProductionUpstreamTarget> {
+    let connect_addr = upstream.connect_addr.clone();
+    production_upstream_target_with_resolver(upstream, move |_| async move {
+        let addresses = tokio::time::timeout(
+            PRODUCTION_UPSTREAM_RESOLUTION_TIMEOUT,
+            tokio::net::lookup_host(connect_addr),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "production upstream resolution timed out",
+            )
+        })??;
+        Ok(addresses.collect())
+    })
+    .await
+}
+
+async fn production_upstream_target_with_resolver<F, R>(
+    upstream: &UpstreamTarget,
+    resolve: F,
+) -> io::Result<ProductionUpstreamTarget>
+where
+    F: FnOnce(&str) -> R,
+    R: Future<Output = io::Result<Vec<SocketAddr>>>,
+{
+    let authority = production_upstream_authority(upstream)?;
+    let connect_addrs = resolve(&upstream.connect_addr).await?;
+    production_upstream_target_with_addresses(authority, &upstream.connect_addr, connect_addrs)
+}
+
+fn production_upstream_authority(upstream: &UpstreamTarget) -> io::Result<Authority> {
+    upstream
+        .authority
+        .parse::<Authority>()
+        .map_err(|error| invalid_data(format!("invalid production upstream authority: {error}")))
+}
+
+fn production_upstream_target_with_addresses(
+    authority: Authority,
+    connect_addr: &str,
+    connect_addrs: Vec<SocketAddr>,
+) -> io::Result<ProductionUpstreamTarget> {
+    if connect_addrs.is_empty() {
+        return Err(invalid_data(format!(
+            "upstream target `{connect_addr}` resolved to no socket addresses"
+        )));
+    }
+    ProductionUpstreamTarget::new(authority, connect_addrs)
+        .map_err(|error| invalid_data(format!("upstream target `{connect_addr}`: {error}")))
+}
+
+fn production_response_to_http(response: ProductionResponse) -> io::Result<HttpResponse> {
+    let mut headers = Vec::with_capacity(response.headers.len());
+    for (name, value) in response.headers {
+        let Some(name) = name else {
+            continue;
+        };
+        let value = value
+            .to_str()
+            .map_err(|_| invalid_data("production upstream returned a non-ASCII header value"))?;
+        headers.push(HttpHeader {
+            name: name.as_str().to_string(),
+            value: value.to_string(),
+        });
+    }
+    Ok(HttpResponse {
+        version: "HTTP/1.1".to_string(),
+        status: response.status.as_u16(),
+        reason: reason_phrase(response.status.as_u16()).to_string(),
+        headers,
+        body: response.body.to_vec(),
+        cache_policy: ResponseCachePolicy::Preserve,
+    })
+}
+
+fn http_response_to_production(response: HttpResponse) -> io::Result<ProductionResponse> {
+    let status = StatusCode::from_u16(response.status)
+        .map_err(|_| invalid_data("lifecycle returned an invalid HTTP response status"))?;
+    let mut headers = HeaderMap::with_capacity(response.headers.len());
+    for header in response.headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| invalid_data("lifecycle returned an invalid response header name"))?;
+        let value = HeaderValue::from_str(&header.value)
+            .map_err(|_| invalid_data("lifecycle returned an invalid response header value"))?;
+        headers.append(name, value);
+    }
+    Ok(ProductionResponse {
+        status,
+        headers,
+        body: Bytes::from(response.body),
+    })
 }
 
 fn maybe_transition_to_blocked_from_reality_escape_attempt(
@@ -4352,7 +5246,7 @@ fn maybe_transition_to_blocked_from_reality_escape_attempt(
         Some(session.session_id),
         json!({
             "method": request.method.as_str(),
-            "path": debug_path(&surface_request.path),
+            "path": runtime.audit_projection.debug_path(&surface_request.path),
             "query_present": surface_request.query.is_some(),
             "policy_state": decision.policy_state,
             "routing_decision": decision.routing_decision,
@@ -4367,7 +5261,7 @@ fn maybe_transition_to_blocked_from_reality_escape_attempt(
             request_id,
             decision.policy_state,
             request.method.clone(),
-            redacted_event_target(&surface_request.path),
+            runtime.audit_projection.event_target(&surface_request.path),
             decision.routing_decision,
             "controlled session requested a path outside the configured controlled-reality branch",
         ),
@@ -4375,32 +5269,27 @@ fn maybe_transition_to_blocked_from_reality_escape_attempt(
 
     Ok(request_evaluation::reality_escape_transition(
         decision.policy_state,
-        &surface_request.path,
+        runtime.audit_projection.reason_path(&surface_request.path),
         attempt_count,
     ))
 }
 
-fn write_session_continuity_rejection(
-    client_stream: &mut TcpStream,
-    request_method: &str,
-) -> io::Result<()> {
+fn session_continuity_rejection() -> HttpResponse {
     let mut response =
         surface_response_to_http(surface_text_response(400, "invalid ingress continuity\n"));
     response.set_header("Connection", "close");
     response.set_header("Content-Length", response.body.len().to_string());
-    client_stream.write_all(&response.to_http_bytes_for_method(request_method))?;
-    client_stream.flush()
+    response
 }
 
-fn write_session_continuity_fail_closed(
-    client_stream: TcpStream,
+fn session_continuity_fail_closed(
     runtime: &ProxyRuntime,
     session: &SessionContext,
     request: &HttpRequest,
     path: &str,
     request_id: RequestId,
     intervention_mode: InterventionMode,
-) -> io::Result<()> {
+) -> io::Result<HttpResponse> {
     let (debug_event, reason) = match session.continuity_outcome {
         ContinuityOutcome::CapacityFailClosed => (
             "session_continuity_capacity_fail_closed",
@@ -4436,8 +5325,7 @@ fn write_session_continuity_fail_closed(
     )?;
     let decision =
         policy::PolicyDecision::new(PolicyState::Blocked, RoutingDecision::EidolonOwned, reason);
-    write_direct_response(DirectResponseContext {
-        client_stream,
+    direct_response(DirectResponseContext {
         runtime,
         session,
         request,
@@ -4455,7 +5343,6 @@ fn write_session_continuity_fail_closed(
 }
 
 struct DirectResponseContext<'a> {
-    client_stream: TcpStream,
     runtime: &'a ProxyRuntime,
     session: &'a SessionContext,
     request: &'a HttpRequest,
@@ -4471,9 +5358,8 @@ struct DirectResponseContext<'a> {
     surface_requested_intervention: bool,
 }
 
-fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
+fn direct_response(context: DirectResponseContext<'_>) -> io::Result<HttpResponse> {
     let DirectResponseContext {
-        mut client_stream,
         runtime,
         session,
         request,
@@ -4538,8 +5424,7 @@ fn write_direct_response(context: DirectResponseContext<'_>) -> io::Result<()> {
         }),
     )?;
 
-    client_stream.write_all(&response.to_http_bytes_for_method(&request.method))?;
-    client_stream.flush()
+    Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4572,6 +5457,7 @@ fn write_direct_response_request_audit(
         request_decision,
         discovery_recon_score,
         discovery_recon_threshold,
+        runtime.audit_projection,
     );
     if precommit_decision.is_some() {
         // A staged transition is not an observed policy outcome until its
@@ -4891,7 +5777,7 @@ fn controlled_reality_action(
         }
         let transition = request_evaluation::controlled_reality_depth_transition(
             PolicyState::ControlledReality,
-            &request.path,
+            runtime.audit_projection.reason_path(&request.path),
             depth,
             depth_limit,
         );
@@ -5271,7 +6157,7 @@ fn write_bait_exposed_event(
             bait_id: bait.id.clone(),
             bait_class: Some(bait.bait_class),
             exposure_id: exposure_id.clone(),
-            surface: redacted_event_target(&surface),
+            surface: runtime.audit_projection.event_target(&surface),
             header_value_mint: bait.header_value_mint_audit(),
         },
     )
@@ -5299,8 +6185,8 @@ fn write_bait_exposed_event(
             "request_id": request_id.0,
             "bait_id": &bait.id,
             "bait_class": bait.bait_class,
-            "surface": debug_path(&bait.surface),
-            "requested_surface": debug_path(&surface),
+            "surface": runtime.audit_projection.debug_path(&bait.surface),
+            "requested_surface": runtime.audit_projection.debug_path(&surface),
             "exposure_id": &exposure_id,
             "stored_exposure_count": exposures.exposures.len(),
         }),
@@ -5357,7 +6243,7 @@ fn write_bait_action_observed_event_with_exposure(
                 bait_class: Some(bait.bait_class),
                 exposure_id: exposure_id.clone(),
                 method: method.to_string(),
-                path: redacted_event_target(path),
+                path: runtime.audit_projection.event_target(path),
                 header_value_mint: bait.header_value_mint_audit(),
                 header_value_mint_status,
             },
@@ -5373,7 +6259,7 @@ fn write_bait_action_observed_event_with_exposure(
             "request_id": request_id.0,
             "bait_id": &bait.id,
             "method": method,
-            "path": debug_path(path),
+            "path": runtime.audit_projection.debug_path(path),
             "query_present": debug_query_present(path),
             "matched_prior_exposure": matched_prior_exposure,
             "prior_same_bait_exposure": prior_same_bait_exposure,
@@ -5465,15 +6351,6 @@ fn header_pairs(headers: &[HttpHeader]) -> impl Iterator<Item = (&str, &str)> {
 }
 
 fn strip_session_proof_cache_request_headers(request: &mut HttpRequest) -> usize {
-    const CACHE_CONDITIONAL_AND_RANGE_HEADERS: &[&str] = &[
-        "If-Match",
-        "If-Modified-Since",
-        "If-None-Match",
-        "If-Range",
-        "If-Unmodified-Since",
-        "Range",
-    ];
-
     let original_len = request.headers.len();
     request.headers.retain(|header| {
         !CACHE_CONDITIONAL_AND_RANGE_HEADERS
@@ -5589,6 +6466,11 @@ fn event_discovery_recon_score(
     }
 }
 
+// Eight arguments are intrinsic to the audit payload (request, path, session,
+// request linkage, decision, recon score pair, and the profile-selected audit
+// projection); packing only the projection into a partial struct would obscure
+// the payload boundary.
+#[allow(clippy::too_many_arguments)]
 fn request_seen_event(
     request: &HttpRequest,
     path: &str,
@@ -5597,6 +6479,7 @@ fn request_seen_event(
     decision: &policy::PolicyDecision,
     discovery_recon_score: policy::DiscoveryReconAggregationScore,
     discovery_recon_threshold: u8,
+    audit_projection: AuditProjection,
 ) -> Event {
     Event::new(
         session.session_id,
@@ -5604,17 +6487,18 @@ fn request_seen_event(
         decision.policy_state,
         EventKind::RequestSeen {
             method: request.method.clone(),
-            path: redacted_event_target(path),
+            path: audit_projection.event_target(path),
             safe_headers: safe_header_observations(&request.headers),
-            ingress_identity: session.ingress_identity.clone(),
-            authenticated_ingress_rule_rejection: session
-                .authenticated_ingress_rule_rejection
-                .clone(),
-            local_ingress_trust_scope_rejection: session
-                .local_ingress_trust_scope_rejection
-                .clone(),
-            trusted_ingress_soften_match: session.trusted_ingress_soften_match.clone(),
-            ingress_signals: session.ingress_signals.clone(),
+            ingress_identity: audit_projection.ingress_identity(&session.ingress_identity),
+            authenticated_ingress_rule_rejection: audit_projection
+                .authenticated_ingress_rule_rejection(
+                    &session.authenticated_ingress_rule_rejection,
+                ),
+            local_ingress_trust_scope_rejection: audit_projection
+                .local_ingress_trust_scope_rejection(&session.local_ingress_trust_scope_rejection),
+            trusted_ingress_soften_match: audit_projection
+                .trusted_ingress_soften_match(&session.trusted_ingress_soften_match),
+            ingress_signals: audit_projection.ingress_signals(&session.ingress_signals),
             discovery_recon_score: event_discovery_recon_score(
                 discovery_recon_score,
                 discovery_recon_threshold,
@@ -5929,7 +6813,7 @@ fn effective_session_context(
     request_id: RequestId,
 ) -> io::Result<SessionContext> {
     let headers: Vec<(&str, &str)> = header_pairs(&request.headers).collect();
-    let request_host = effective_request_host(request);
+    let request_host = normalized_request_host(request).ok();
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -6119,7 +7003,28 @@ fn write_debug(
     result
 }
 
-fn debug_path(target: &str) -> String {
+fn bounded_route_class(target: &str) -> &'static str {
+    let end = target.find(['?', '#']).unwrap_or(target.len());
+    let path = &target[..end];
+    if path == DOCS_DISCOVERY_TARGET || path.starts_with("/docs/") {
+        "route:docs"
+    } else if path == OPENAPI_DISCOVERY_TARGET {
+        "route:openapi"
+    } else if path.starts_with("/api/") {
+        "route:api"
+    } else if path.starts_with("/assets/") {
+        "route:asset"
+    } else if is_controlled_follow_up_path(path) {
+        "route:controlled_follow_up"
+    } else if path == "/" {
+        "route:root"
+    } else {
+        "route:other"
+    }
+}
+
+/// Lab v1 debug projection: raw path with query and fragment removed.
+fn lab_debug_path(target: &str) -> String {
     let query_index = target.find('?');
     let fragment_index = target.find('#');
     let end = match (query_index, fragment_index) {
@@ -6132,6 +7037,7 @@ fn debug_path(target: &str) -> String {
     target[..end].to_string()
 }
 
+/// Lab v2 event projection: raw path with query and fragment values redacted.
 fn redacted_event_target(target: &str) -> String {
     let (target_without_fragment, fragment_present) = target
         .split_once('#')
@@ -6151,6 +7057,98 @@ fn redacted_event_target(target: &str) -> String {
     }
 
     redacted
+}
+
+fn bounded_route_classes(paths: &[String]) -> Vec<String> {
+    let mut classes = Vec::new();
+    for path in paths {
+        let class = bounded_route_class(path).to_string();
+        if !classes.contains(&class) {
+            classes.push(class);
+        }
+    }
+    classes
+}
+
+fn bounded_host_kind(host: &str) -> &'static str {
+    let host = host.trim().trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.") {
+        "host:loopback"
+    } else {
+        "host:non_loopback"
+    }
+}
+
+fn bounded_host_kinds(hosts: &[String]) -> Vec<String> {
+    let mut kinds = Vec::new();
+    for host in hosts {
+        let kind = bounded_host_kind(host).to_string();
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
+}
+
+fn persisted_ingress_identity(
+    mut identity: eidolon_core::IngressIdentity,
+) -> eidolon_core::IngressIdentity {
+    identity.label = None;
+    identity.not_before = None;
+    identity.expires_at = None;
+    identity
+}
+
+fn persisted_ingress_signals(
+    mut signals: eidolon_core::IngressAdvisorySignals,
+) -> eidolon_core::IngressAdvisorySignals {
+    signals.verified_category = None;
+    signals.attestation_ref = None;
+    signals.vendor_score_kind = None;
+    signals.vendor_score_scale = None;
+    signals.detection_ids.clear();
+    signals
+}
+
+fn persisted_authenticated_ingress_rule_rejection(
+    rejection: Option<eidolon_core::AuthenticatedIngressRuleRejection>,
+) -> Option<eidolon_core::AuthenticatedIngressRuleRejection> {
+    rejection.map(|mut rejection| {
+        rejection.label = None;
+        rejection.path_prefixes = bounded_route_classes(&rejection.path_prefixes);
+        rejection.bait_soften_path_prefixes =
+            bounded_route_classes(&rejection.bait_soften_path_prefixes);
+        rejection.verified_categories.clear();
+        rejection
+    })
+}
+
+fn persisted_local_ingress_trust_scope_rejection(
+    rejection: Option<eidolon_core::LocalIngressTrustScopeRejection>,
+) -> Option<eidolon_core::LocalIngressTrustScopeRejection> {
+    rejection.map(|mut rejection| {
+        rejection.label = None;
+        rejection.path_prefixes = bounded_route_classes(&rejection.path_prefixes);
+        rejection.bait_soften_path_prefixes =
+            bounded_route_classes(&rejection.bait_soften_path_prefixes);
+        rejection.user_agent_substrings.clear();
+        rejection.hosts = bounded_host_kinds(&rejection.hosts);
+        rejection
+    })
+}
+
+fn persisted_trusted_ingress_soften_match(
+    trust: Option<eidolon_core::TrustedIngressSoftenMatch>,
+) -> Option<eidolon_core::TrustedIngressSoftenMatch> {
+    trust.map(|mut trust| {
+        trust.label = None;
+        trust.path_prefixes = bounded_route_classes(&trust.path_prefixes);
+        trust.bait_soften_path_prefixes = bounded_route_classes(&trust.bait_soften_path_prefixes);
+        trust.user_agent_substrings.clear();
+        trust.verified_categories.clear();
+        trust.hosts = bounded_host_kinds(&trust.hosts);
+        trust
+    })
 }
 
 fn debug_query_present(target: &str) -> bool {
@@ -6914,6 +7912,13 @@ fn effective_request_host(request: &HttpRequest) -> Option<String> {
     normalized_request_host(request).ok()
 }
 
+fn safe_request_host_kind(request: &HttpRequest) -> &'static str {
+    match normalized_request_host(request) {
+        Ok(host) => bounded_host_kind(&host),
+        Err(_) => "host:missing_or_invalid",
+    }
+}
+
 fn connection_nominated_headers(headers: &[HttpHeader]) -> Vec<String> {
     headers
         .iter()
@@ -6953,6 +7958,12 @@ fn usage() -> String {
 Usage: eidolon-proxy [OPTIONS]
 
 Options:
+  --profile <lab|production>
+                         Runtime profile [default: lab]. Production uses only the
+                         Hyper HTTP/1.1 listener and requires explicit durable
+                         session, ingress, state, debug-log, and remote renderer inputs
+  --print-effective-config
+                         Print a versioned redacted JSON configuration projection and exit
   --listen-addr <ADDR>  Loopback socket address to listen on [default: {DEFAULT_LISTEN_ADDR}]
   --upstream <URL>      Loopback HTTP upstream target URL [default: {DEFAULT_UPSTREAM}]
   --event-log <PATH>    JSONL event log file path [default: {DEFAULT_EVENT_LOG}]
@@ -7059,8 +8070,14 @@ mod tests {
     fn run_config(args: &[&str]) -> Result<ProxyConfig, ConfigError> {
         match CliAction::from_args(args.iter().copied())? {
             CliAction::Run(config) => Ok(*config),
+            CliAction::PrintEffectiveConfig(_) => Err(ConfigError::new("expected runnable config")),
             CliAction::Help => Err(ConfigError::new("expected runnable config")),
         }
+    }
+
+    fn persisted_path_equals(actual: &Value, raw_path: &str) -> bool {
+        let expected = redacted_event_target(raw_path);
+        actual.as_str() == Some(expected.as_str())
     }
 
     fn assert_error_contains(args: &[&str], expected: &str) {
@@ -7107,10 +8124,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("system clock should be after epoch: {error}"))
             .as_nanos();
 
-        env::temp_dir().join(format!(
-            "eidolon-proxy-{label}-{}-{counter}-{nanos}",
-            std::process::id()
-        ))
+        fs::canonicalize(env::temp_dir())
+            .unwrap_or_else(|error| panic!("temporary directory should canonicalize: {error}"))
+            .join(format!(
+                "eidolon-proxy-{label}-{}-{counter}-{nanos}",
+                std::process::id()
+            ))
     }
 
     fn write_bait_profile(contents: &str) -> PathBuf {
@@ -7170,6 +8189,18 @@ mod tests {
         path
     }
 
+    fn write_session_signing_key() -> PathBuf {
+        let path = unique_temp_path("session-signing-key.json");
+        must_ok(
+            fs::write(
+                &path,
+                r#"{"active_key_version":1,"keys":[{"version":1,"key_hex":"5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"}]}"#,
+            ),
+            "session signing key should write",
+        );
+        path
+    }
+
     fn test_controlled_reality_backend_secret() -> ControlledRealityBackendAuthSecret {
         ControlledRealityBackendAuthSecret::new(b"0123456789abcdef0123456789abcdef".to_vec())
             .expect("test backend secret should be accepted")
@@ -7221,6 +8252,7 @@ mod tests {
         let bait_registry = Arc::new(BaitRegistry::m3_catalog());
         ProxyRuntime {
             upstream,
+            audit_projection: AuditProjection::Lab,
             client_request_deadline: CLIENT_REQUEST_DEADLINE,
             event_log: Arc::new(Mutex::new(
                 FileEventLogWriter::open(event_log_path).expect("event log should open"),
@@ -7269,6 +8301,7 @@ mod tests {
         let bait_registry = Arc::new(BaitRegistry::m3_catalog());
         ProxyRuntime {
             upstream,
+            audit_projection: AuditProjection::Lab,
             client_request_deadline: CLIENT_REQUEST_DEADLINE,
             event_log: Arc::new(Mutex::new(must_ok(
                 FileEventLogWriter::open(event_log_path),
@@ -7312,6 +8345,7 @@ mod tests {
         let bait_registry = Arc::new(BaitRegistry::m3_catalog());
         ProxyRuntime {
             upstream,
+            audit_projection: AuditProjection::Lab,
             client_request_deadline: CLIENT_REQUEST_DEADLINE,
             event_log: Arc::new(Mutex::new(
                 FileEventLogWriter::open(event_log_path).expect("event log should open"),
@@ -7353,6 +8387,7 @@ mod tests {
         let bait_content = loaded_profile.content;
         ProxyRuntime {
             upstream,
+            audit_projection: AuditProjection::Lab,
             client_request_deadline: CLIENT_REQUEST_DEADLINE,
             event_log: Arc::new(Mutex::new(
                 FileEventLogWriter::open(event_log_path).expect("event log should open"),
@@ -7674,9 +8709,16 @@ mod tests {
                         let mut request = Vec::new();
                         let mut chunk = [0_u8; 1024];
                         loop {
-                            let bytes_read = stream
-                                .read(&mut chunk)
-                                .expect("recording upstream request should read");
+                            let bytes_read = match stream.read(&mut chunk) {
+                                Ok(bytes_read) => bytes_read,
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                    thread::sleep(Duration::from_millis(2));
+                                    continue;
+                                }
+                                Err(error) => {
+                                    panic!("recording upstream request should read: {error}")
+                                }
+                            };
                             if bytes_read == 0 {
                                 break;
                             }
@@ -7800,6 +8842,333 @@ mod tests {
         let result = handle.join().expect("proxy thread should join");
 
         (result, response)
+    }
+
+    fn run_production_runtime_request(runtime: ProxyRuntime, request: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("production proxy should bind");
+        let addr = listener
+            .local_addr()
+            .expect("production proxy should have address");
+        listener
+            .set_nonblocking(true)
+            .expect("production listener should become nonblocking");
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("production Tokio runtime should build");
+            let upstream = tokio_runtime
+                .block_on(production_upstream_target(&runtime.upstream))
+                .expect("production upstream should resolve");
+            let processor = Arc::new(ProductionLifecycleProcessor {
+                runtime,
+                upstream,
+                upstream_config: ProductionUpstreamConfig::default(),
+                runtime_handle: tokio_runtime.handle().clone(),
+            });
+            tokio_runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener)
+                    .expect("production listener should convert");
+                serve_production_http1(
+                    listener,
+                    ProductionRuntimeConfig::default(),
+                    processor,
+                    async move {
+                        let _ = tokio::task::spawn_blocking(move || stop_rx.recv()).await;
+                    },
+                )
+                .await
+                .expect("production listener should serve");
+            });
+        });
+
+        let header_end = find_header_end(request).expect("production request should end headers");
+        let mut request_with_close = Vec::with_capacity(request.len() + 19);
+        request_with_close.extend_from_slice(&request[..header_end - 2]);
+        request_with_close.extend_from_slice(b"Connection: close\r\n\r\n");
+        request_with_close.extend_from_slice(&request[header_end..]);
+        let mut client = TcpStream::connect(addr).expect("production client should connect");
+        client
+            .write_all(&request_with_close)
+            .expect("production request should write");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .expect("production response should read");
+        stop_tx
+            .send(())
+            .expect("production listener should accept stop signal");
+        handle
+            .join()
+            .expect("production listener thread should join");
+        response
+    }
+
+    struct BoundedControlledRealityBackend {
+        address: SocketAddr,
+        shutdown: mpsc::Sender<()>,
+        handle: JoinHandle<()>,
+    }
+
+    impl BoundedControlledRealityBackend {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("renderer should bind");
+            listener
+                .set_nonblocking(true)
+                .expect("renderer listener should become nonblocking");
+            let address = listener
+                .local_addr()
+                .expect("renderer listener should have an address");
+            let (shutdown, shutdown_received) = mpsc::channel();
+            let handle = thread::spawn(move || {
+                let replay_cache = ControlledRealityBackendReplayCache::new();
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = serve_render_connection(
+                                stream,
+                                &test_controlled_reality_backend_secret(),
+                                &replay_cache,
+                            );
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            if shutdown_received
+                                .recv_timeout(Duration::from_millis(10))
+                                .is_ok()
+                            {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+            Self {
+                address,
+                shutdown,
+                handle,
+            }
+        }
+
+        fn stop(self) {
+            let _ = self.shutdown.send(());
+            must_join(self.handle.join(), "renderer listener should join");
+        }
+    }
+
+    struct CompleteProductionProfileFixture {
+        args: Vec<String>,
+        event_log_path: PathBuf,
+        policy_state_path: PathBuf,
+        debug_log_path: PathBuf,
+        intervention_control_path: PathBuf,
+        supplied_paths: Vec<PathBuf>,
+        supplied_secrets: Vec<String>,
+        renderer: BoundedControlledRealityBackend,
+    }
+
+    impl CompleteProductionProfileFixture {
+        fn new(
+            upstream: &UpstreamTarget,
+            bait_profile: &Path,
+            bait_signing_secret: &Path,
+            bait_signing_secret_value: &str,
+        ) -> Self {
+            let renderer = BoundedControlledRealityBackend::start();
+            let session_key = write_session_signing_key();
+            let transport_secret = write_ingress_transport_auth_secret("transport-secret");
+            let continuity_key = write_ingress_continuity_key("continuity-key");
+            let renderer_secret = write_controlled_reality_backend_secret();
+            let event_log_path = unique_temp_path("production-profile-events.jsonl");
+            let policy_state_path = unique_temp_path("production-profile-policy.json");
+            let debug_log_path = unique_temp_path("production-profile-debug.jsonl");
+            let intervention_control_path = unique_temp_path("production-profile-control.txt");
+            let args = vec![
+                "--profile".to_string(),
+                "production".to_string(),
+                "--listen-addr".to_string(),
+                "127.0.0.1:0".to_string(),
+                "--upstream".to_string(),
+                upstream.to_string(),
+                "--event-log".to_string(),
+                path_str(&event_log_path, "event log path should be UTF-8").to_string(),
+                "--policy-state".to_string(),
+                path_str(&policy_state_path, "policy path should be UTF-8").to_string(),
+                "--debug-log".to_string(),
+                path_str(&debug_log_path, "debug log path should be UTF-8").to_string(),
+                "--intervention-control".to_string(),
+                path_str(&intervention_control_path, "control path should be UTF-8").to_string(),
+                "--bait-profile".to_string(),
+                path_str(bait_profile, "bait profile path should be UTF-8").to_string(),
+                "--bait-signing-secret-file".to_string(),
+                path_str(
+                    bait_signing_secret,
+                    "bait signing secret path should be UTF-8",
+                )
+                .to_string(),
+                "--session-signing-key-file".to_string(),
+                path_str(&session_key, "session key path should be UTF-8").to_string(),
+                "--ingress-transport-auth-secret-file".to_string(),
+                path_str(&transport_secret, "transport secret path should be UTF-8").to_string(),
+                "--ingress-continuity-key-file".to_string(),
+                path_str(&continuity_key, "continuity key path should be UTF-8").to_string(),
+                "--require-authenticated-ingress-continuity".to_string(),
+                "--controlled-reality-backend-addr".to_string(),
+                renderer.address.to_string(),
+                "--controlled-reality-backend-auth-secret-file".to_string(),
+                path_str(&renderer_secret, "renderer secret path should be UTF-8").to_string(),
+            ];
+            let supplied_paths = vec![
+                bait_profile.to_path_buf(),
+                bait_signing_secret.to_path_buf(),
+                session_key.clone(),
+                transport_secret.clone(),
+                continuity_key.clone(),
+                renderer_secret.clone(),
+                event_log_path.clone(),
+                policy_state_path.clone(),
+                debug_log_path.clone(),
+                intervention_control_path.clone(),
+            ];
+            let supplied_secrets = vec![
+                bait_signing_secret_value.to_string(),
+                fs::read_to_string(&session_key).expect("session key should read"),
+                fs::read_to_string(&transport_secret).expect("transport secret should read"),
+                fs::read_to_string(&continuity_key).expect("continuity key should read"),
+                fs::read_to_string(&renderer_secret).expect("renderer secret should read"),
+            ];
+            Self {
+                args,
+                event_log_path,
+                policy_state_path,
+                debug_log_path,
+                intervention_control_path,
+                supplied_paths,
+                supplied_secrets,
+                renderer,
+            }
+        }
+
+        fn parse(&self) -> ProxyConfig {
+            let args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
+            run_config(&args).expect("complete production config should parse")
+        }
+
+        fn print_effective_config(&self) -> String {
+            let mut args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
+            args.push("--print-effective-config");
+            let action =
+                CliAction::from_args(args).expect("production effective config should parse");
+            let CliAction::PrintEffectiveConfig(config) = action else {
+                panic!("production effective config should not start the runtime");
+            };
+            effective_config_output(&config)
+        }
+
+        fn stop(self) {
+            self.renderer.stop();
+        }
+    }
+    struct ProductionProfileServer {
+        address: SocketAddr,
+        event_log_path: PathBuf,
+        debug_log_path: PathBuf,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        handle: JoinHandle<io::Result<()>>,
+        fixture: CompleteProductionProfileFixture,
+    }
+
+    impl ProductionProfileServer {
+        fn stop(self) {
+            self.shutdown
+                .send(())
+                .expect("production profile server should accept shutdown");
+            must_join(self.handle.join(), "production profile server should join")
+                .expect("production profile server should stop cleanly");
+            self.fixture.stop();
+        }
+    }
+
+    fn start_production_profile_server(
+        fixture: CompleteProductionProfileFixture,
+    ) -> ProductionProfileServer {
+        let config = fixture.parse();
+        let event_log_path = fixture.event_log_path.clone();
+        let debug_log_path = fixture.debug_log_path.clone();
+        let (shutdown, shutdown_received) = tokio::sync::oneshot::channel();
+        let (started, started_received) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            run_proxy_with_production_shutdown(
+                config,
+                async move {
+                    let _ = shutdown_received.await;
+                },
+                Some(started),
+            )
+        });
+        let address = started_received
+            .recv_timeout(Duration::from_secs(3))
+            .expect("production profile server should bind");
+
+        ProductionProfileServer {
+            address,
+            event_log_path,
+            debug_log_path,
+            shutdown,
+            handle,
+            fixture,
+        }
+    }
+
+    fn production_profile_request(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+        let header_end = find_header_end(request).expect("production request should end headers");
+        let mut request_with_close = Vec::with_capacity(request.len() + 19);
+        request_with_close.extend_from_slice(&request[..header_end - 2]);
+        request_with_close.extend_from_slice(b"Connection: close\r\n\r\n");
+        request_with_close.extend_from_slice(&request[header_end..]);
+        let mut client = TcpStream::connect(address).expect("production client should connect");
+        client
+            .write_all(&request_with_close)
+            .expect("production request should write");
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+        response
+    }
+
+    fn production_profile_partial_request(address: SocketAddr, request: &[u8]) {
+        let mut client = TcpStream::connect(address).expect("production client should connect");
+        client
+            .write_all(request)
+            .expect("partial production request should write");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("partial production request should disconnect");
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response);
+    }
+
+    fn hyper_rejection_responded_or_closed(response: &[u8]) -> bool {
+        response.is_empty() || response.starts_with(b"HTTP/1.1 ")
+    }
+
+    fn authenticated_production_request(
+        method: &str,
+        path: &str,
+        session_id: SessionId,
+        continuity_id: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session_id));
+        let mut headers = vec![
+            (
+                session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                "transport-secret",
+            ),
+            (session::INGRESS_CONTINUITY_HEADER_NAME, continuity_id),
+        ];
+        headers.extend_from_slice(extra_headers);
+        request_with_cookie(method, path, &cookie, &headers)
     }
 
     fn parse_downstream_response(response: &[u8]) -> HttpResponse {
@@ -8056,6 +9425,7 @@ mod tests {
     #[test]
     fn defaults_match_local_lab_shape() {
         let config = run_config(&[]).expect("default config should parse");
+        assert_eq!(config.profile, RuntimeProfile::Lab);
 
         assert_eq!(
             config.listen_addr,
@@ -8088,6 +9458,468 @@ mod tests {
         );
         assert_eq!(config.controlled_reality_backend, None);
         assert!(!config.owned_cluster_lab);
+    }
+
+    #[test]
+    fn production_profile_requires_explicit_fail_closed_dependencies_and_prints_redacted_config() {
+        let session_key = write_session_signing_key();
+        let transport_secret = write_ingress_transport_auth_secret("transport-secret");
+        let continuity_key = write_ingress_continuity_key("continuity-key");
+        let renderer_secret = write_controlled_reality_backend_secret();
+        let event_log = unique_temp_path("production-events.jsonl");
+        let policy_state = unique_temp_path("production-policy.json");
+        let debug_log = unique_temp_path("production-debug.jsonl");
+        let intervention_control = unique_temp_path("production-control.txt");
+        let args = vec![
+            "--profile",
+            "production",
+            "--listen-addr",
+            "127.0.0.1:0",
+            "--upstream",
+            "http://127.0.0.1:9101",
+            "--session-signing-key-file",
+            path_str(&session_key, "session key path should be UTF-8"),
+            "--ingress-transport-auth-secret-file",
+            path_str(&transport_secret, "transport secret path should be UTF-8"),
+            "--ingress-continuity-key-file",
+            path_str(&continuity_key, "continuity key path should be UTF-8"),
+            "--require-authenticated-ingress-continuity",
+            "--event-log",
+            path_str(&event_log, "event path should be UTF-8"),
+            "--policy-state",
+            path_str(&policy_state, "policy state path should be UTF-8"),
+            "--debug-log",
+            path_str(&debug_log, "debug log path should be UTF-8"),
+            "--intervention-control",
+            path_str(&intervention_control, "control path should be UTF-8"),
+            "--controlled-reality-backend-addr",
+            "127.0.0.1:9103",
+            "--controlled-reality-backend-auth-secret-file",
+            path_str(&renderer_secret, "renderer secret path should be UTF-8"),
+        ];
+        let config = run_config(&args).expect("complete production config should parse");
+        assert_eq!(config.profile, RuntimeProfile::Production);
+        assert!(config.require_authenticated_ingress_continuity);
+        assert!(config.debug_log_path.is_some());
+        assert!(config.controlled_reality_backend.is_some());
+
+        let mut print_args = args.clone();
+        print_args.push("--print-effective-config");
+        let action =
+            CliAction::from_args(print_args).expect("production effective config should parse");
+        let CliAction::PrintEffectiveConfig(config) = action else {
+            panic!("production effective config should not start the runtime");
+        };
+        let output = effective_config_output(&config);
+        let effective: Value =
+            serde_json::from_str(&output).expect("effective config should be JSON");
+        assert_eq!(effective["profile"], "production");
+        assert_eq!(effective["session"]["signing_key"], "configured");
+        assert_eq!(effective["controlled_reality_renderer"], "remote");
+        for sensitive in [
+            path_str(&session_key, "session key path should be UTF-8"),
+            path_str(&transport_secret, "transport secret path should be UTF-8"),
+            path_str(&continuity_key, "continuity key path should be UTF-8"),
+            path_str(&renderer_secret, "renderer secret path should be UTF-8"),
+            path_str(&event_log, "event path should be UTF-8"),
+            path_str(&policy_state, "policy path should be UTF-8"),
+            path_str(&debug_log, "debug path should be UTF-8"),
+            path_str(&intervention_control, "control path should be UTF-8"),
+            "transport-secret",
+            "continuity-key",
+            "3031323334353637",
+        ] {
+            assert!(
+                !output.contains(sensitive),
+                "effective config leaked `{sensitive}`"
+            );
+        }
+
+        let mut missing_debug = args.clone();
+        let debug_flag_index = missing_debug
+            .iter()
+            .position(|value| *value == "--debug-log")
+            .expect("complete production config should include debug log");
+        missing_debug.drain(debug_flag_index..=debug_flag_index + 1);
+        assert_error_contains(&missing_debug, "requires an explicit `--debug-log`");
+
+        let action = CliAction::from_args(["--profile", "lab", "--print-effective-config"])
+            .expect("effective config should parse");
+        let CliAction::PrintEffectiveConfig(config) = action else {
+            panic!("effective config should not start the runtime");
+        };
+        let effective: Value =
+            serde_json::from_str(&effective_config_output(&config)).expect("effective config JSON");
+        assert_eq!(effective["profile"], "lab");
+        assert_eq!(effective["session"]["cookie_policy"], "lab");
+    }
+
+    #[test]
+    fn production_profile_requires_explicit_listener_and_upstream() {
+        assert_error_contains(
+            &["--profile", "production"],
+            "requires an explicit `--listen-addr`",
+        );
+        assert_error_contains(
+            &["--profile", "production", "--listen-addr", "127.0.0.1:0"],
+            "requires an explicit `--upstream`",
+        );
+    }
+
+    #[test]
+    fn production_profile_rejects_all_durable_path_aliases() {
+        let bait_profile = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9101", false),
+            "production upstream should parse",
+        );
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &bait_profile,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        must_ok(
+            fs::write(&fixture.event_log_path, "existing event log"),
+            "event log fixture should exist",
+        );
+        let event_exposures = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let event_consumed_proofs =
+            sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let continuity = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let canonical_parent_alias = fixture
+            .event_log_path
+            .parent()
+            .expect("event log should have a parent")
+            .join(".")
+            .join(
+                fixture
+                    .event_log_path
+                    .file_name()
+                    .expect("event log should have a file name"),
+            );
+        let hard_link_alias = unique_temp_path("production-event-hard-link.jsonl");
+        must_ok(
+            fs::hard_link(&fixture.event_log_path, &hard_link_alias),
+            "hard link fixture should create",
+        );
+        let writable_aliases = vec![
+            ("policy-state", fixture.event_log_path.clone()),
+            ("debug-log", fixture.event_log_path.clone()),
+            ("policy-state", event_exposures.clone()),
+            ("debug-log", sidecar_state_path(&event_exposures, ".tmp")),
+            ("debug-log", event_consumed_proofs.clone()),
+            (
+                "debug-log",
+                sidecar_state_path(&event_consumed_proofs, ".tmp"),
+            ),
+            ("debug-log", state_lease_path(&fixture.policy_state_path)),
+            ("debug-log", fixture.policy_state_path.with_extension("tmp")),
+            ("debug-log", continuity.clone()),
+            ("debug-log", sidecar_state_path(&continuity, ".tmp")),
+            ("policy-state", canonical_parent_alias),
+            ("debug-log", hard_link_alias),
+        ];
+
+        for (flag, alias) in writable_aliases {
+            let mut args = fixture.args.clone();
+            let flag_index = args
+                .iter()
+                .position(|value| value == &format!("--{flag}"))
+                .unwrap_or_else(|| panic!("fixture should include --{flag}"));
+            args[flag_index + 1] = path_str(&alias, "alias path should be UTF-8").to_string();
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let error = run_config(&args).expect_err("production writable alias must fail");
+            assert!(
+                error.to_string().contains("resolve to the same target"),
+                "unexpected writable alias error for --{flag}: {error}"
+            );
+        }
+
+        let writable_input_aliases = [
+            ("--bait-profile", fixture.event_log_path.clone()),
+            ("--bait-signing-secret-file", event_exposures.clone()),
+            (
+                "--session-signing-key-file",
+                sidecar_state_path(&event_exposures, ".tmp"),
+            ),
+            ("--ingress-trust-config", event_consumed_proofs.clone()),
+            (
+                "--ingress-transport-auth-secret-file",
+                sidecar_state_path(&event_consumed_proofs, ".tmp"),
+            ),
+            (
+                "--ingress-continuity-key-file",
+                fixture.policy_state_path.clone(),
+            ),
+            (
+                "--controlled-reality-backend-auth-secret-file",
+                fixture.policy_state_path.with_extension("tmp"),
+            ),
+            (
+                "--intervention-control",
+                sidecar_state_path(&continuity, ".tmp"),
+            ),
+        ];
+        for (_, alias) in &writable_input_aliases {
+            must_ok(
+                fs::write(alias, "writable alias fixture"),
+                "writable input-alias target should exist",
+            );
+        }
+        for (flag, alias) in writable_input_aliases {
+            let mut args = fixture.args.clone();
+            if let Some(index) = args.iter().position(|value| value == flag) {
+                args[index + 1] = path_str(&alias, "input alias should be UTF-8").to_string();
+            } else {
+                args.push(flag.to_string());
+                args.push(path_str(&alias, "input alias should be UTF-8").to_string());
+            }
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let error = run_config(&args).expect_err("production writable/input alias must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("writable targets not to alias startup inputs"),
+                "unexpected writable/input alias error for {flag}: {error}"
+            );
+        }
+
+        let dangling_symlink = unique_temp_path("production-dangling-symlink");
+        std::os::unix::fs::symlink(
+            unique_temp_path("production-missing-symlink-target"),
+            &dangling_symlink,
+        )
+        .expect("dangling symlink should create");
+        for flag in ["--debug-log", "--intervention-control"] {
+            let mut args = fixture.args.clone();
+            let index = args
+                .iter()
+                .position(|value| value == flag)
+                .expect("fixture should configure the dangling-symlink destination");
+            args[index + 1] =
+                path_str(&dangling_symlink, "dangling symlink should be UTF-8").to_string();
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let error = run_config(&args)
+                .expect_err("production destination and input paths must reject dangling symlinks");
+            assert!(
+                error.to_string().contains("does not allow symlink paths"),
+                "unexpected dangling symlink error for {flag}: {error}"
+            );
+        }
+
+        let symlinked_parent_target = unique_temp_path("production-symlink-parent-target");
+        must_ok(
+            fs::create_dir(&symlinked_parent_target),
+            "symlink parent target should create",
+        );
+        let symlinked_parent = unique_temp_path("production-symlink-parent");
+        std::os::unix::fs::symlink(&symlinked_parent_target, &symlinked_parent)
+            .expect("symlink parent should create");
+        for flag in ["--debug-log", "--intervention-control"] {
+            let mut args = fixture.args.clone();
+            let index = args
+                .iter()
+                .position(|value| value == flag)
+                .expect("fixture should configure the symlink-parent destination");
+            args[index + 1] = path_str(
+                &symlinked_parent.join("configured-path"),
+                "symlink-parent path should be UTF-8",
+            )
+            .to_string();
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let error =
+                run_config(&args).expect_err("production paths must reject symlinked parents");
+            assert!(
+                error.to_string().contains("does not allow symlink paths"),
+                "unexpected symlink parent error for {flag}: {error}"
+            );
+        }
+
+        let mut default_control_args = fixture.args.clone();
+        let control_index = default_control_args
+            .iter()
+            .position(|value| value == "--intervention-control")
+            .expect("fixture should configure intervention control");
+        default_control_args.drain(control_index..=control_index + 1);
+        let event_index = default_control_args
+            .iter()
+            .position(|value| value == "--event-log")
+            .expect("fixture should configure event log");
+        default_control_args[event_index + 1] = DEFAULT_INTERVENTION_CONTROL.to_string();
+        let default_control_args = default_control_args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let error = run_config(&default_control_args)
+            .expect_err("default intervention control must remain an input");
+        let message = error.to_string();
+        assert!(
+            message.contains("writable targets not to alias startup inputs")
+                || message.contains("does not allow symlink paths")
+        );
+
+        let transport_index = fixture
+            .args
+            .iter()
+            .position(|value| value == "--ingress-transport-auth-secret-file")
+            .expect("fixture should configure transport authentication");
+        let transport_path = PathBuf::from(&fixture.args[transport_index + 1]);
+        let normalized_transport_alias = transport_path
+            .parent()
+            .expect("transport path should have parent")
+            .join(".")
+            .join(
+                transport_path
+                    .file_name()
+                    .expect("transport path should have file name"),
+            );
+        let symlink_transport_alias = unique_temp_path("production-transport-symlink");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&transport_path, &symlink_transport_alias)
+            .expect("transport symlink should create");
+        let hard_link_transport_alias = unique_temp_path("production-transport-hard-link");
+        must_ok(
+            fs::hard_link(&transport_path, &hard_link_transport_alias),
+            "transport hard link should create",
+        );
+        for alias in [
+            transport_path,
+            normalized_transport_alias,
+            symlink_transport_alias,
+            hard_link_transport_alias,
+        ] {
+            let mut args = fixture.args.clone();
+            let continuity_index = args
+                .iter()
+                .position(|value| value == "--ingress-continuity-key-file")
+                .expect("fixture should configure continuity key");
+            args[continuity_index + 1] =
+                path_str(&alias, "transport alias should be UTF-8").to_string();
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let error = run_config(&args).expect_err("transport and continuity aliases must fail");
+            let message = error.to_string();
+            assert!(
+                message.contains(
+                    "requires distinct transport authentication and continuity key files"
+                ) || message.contains("does not allow symlink paths"),
+                "unexpected transport/continuity alias error: {error}"
+            );
+        }
+
+        fixture.stop();
+    }
+    #[test]
+    fn complete_production_profile_effective_config_is_redacted() {
+        let bait_profile = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9101", false),
+            "production upstream should parse",
+        );
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &bait_profile,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+
+        let output = fixture.print_effective_config();
+        let effective: Value =
+            serde_json::from_str(&output).expect("effective config should be JSON");
+        assert_eq!(
+            effective,
+            json!({
+                "schema_version": 1,
+                "profile": "production",
+                "session": {
+                    "signing_key": "configured",
+                    "cookie_policy": "production",
+                },
+                "ingress": {
+                    "transport_auth": true,
+                    "continuity_key": true,
+                    "authenticated_continuity_required": true,
+                },
+                "state": {
+                    "event_log": "configured",
+                    "policy_state": "configured",
+                    "debug_log": true,
+                },
+                "controlled_reality_renderer": "remote",
+            })
+        );
+        for secret in &fixture.supplied_secrets {
+            assert!(
+                !output.contains(secret),
+                "effective config leaked a supplied secret"
+            );
+        }
+        for path in &fixture.supplied_paths {
+            assert!(
+                !output.contains(path_str(path, "fixture path should be UTF-8")),
+                "effective config leaked a supplied filesystem path"
+            );
+        }
+
+        fixture.stop();
+    }
+
+    #[tokio::test]
+    async fn production_upstream_resolution_is_startup_owned_and_reuses_resolved_target() {
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9101", false),
+            "production upstream should parse",
+        );
+        let expected = vec![
+            "127.0.0.1:9101"
+                .parse::<SocketAddr>()
+                .expect("first address should parse"),
+            "127.0.0.1:9102"
+                .parse::<SocketAddr>()
+                .expect("second address should parse"),
+        ];
+        let resolution_calls = AtomicUsize::new(0);
+        let target = production_upstream_target_with_resolver(&upstream, |connect_addr| {
+            resolution_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(connect_addr, "127.0.0.1:9101");
+            std::future::ready(Ok(expected.clone()))
+        })
+        .await
+        .expect("startup resolver should build a typed target");
+
+        let reused_target = target.clone();
+        assert_eq!(resolution_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target.authority.as_str(), "127.0.0.1:9101");
+        assert_eq!(target.connect_addrs, expected);
+        assert_eq!(reused_target, target);
+        assert_eq!(
+            resolution_calls.load(Ordering::SeqCst),
+            1,
+            "ordinary production processing receives only the resolved target"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_upstream_resolution_rejects_unbounded_address_sets() {
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9101", false),
+            "production upstream should parse",
+        );
+        let address = "127.0.0.1:9101"
+            .parse::<SocketAddr>()
+            .expect("test address should parse");
+        let error = production_upstream_target_with_resolver(&upstream, |_| {
+            std::future::ready(Ok(vec![
+                address;
+                eidolon_proxy::production_runtime::MAX_PRODUCTION_UPSTREAM_ADDRESSES
+                    + 1
+            ]))
+        })
+        .await
+        .expect_err("startup must fail closed on an unbounded address set");
+        assert!(error.to_string().contains("too_many_addresses"));
     }
 
     #[test]
@@ -9318,7 +11150,7 @@ mod tests {
             .iter()
             .any(|event| {
                 event["request_id"] == action["request_id"]
-                    && event["kind"]["path"] == "/api/v2/import/reconcile"
+                    && persisted_path_equals(&event["kind"]["path"], "/api/v2/import/reconcile")
                     && event["kind"]["routing_decision"] == "eidolon_owned"
             }));
         assert!(events_of_type(&event_log_path, "policy_changed")
@@ -10029,7 +11861,7 @@ mod tests {
             .into_iter()
             .find(|event| {
                 event["session_id"] == session_b.0.to_string()
-                    && event["kind"]["path"] == "/api/v2/import/reconcile"
+                    && persisted_path_equals(&(event["kind"]["path"]), "/api/v2/import/reconcile")
             })
             .expect("replayed minted request_seen should exist");
         assert_eq!(replay_request["policy_state"], "observe");
@@ -10078,6 +11910,666 @@ mod tests {
             "missing_session_value"
         );
         assert!(action["kind"]["exposure_id"].is_null());
+    }
+
+    #[test]
+    fn production_hyper_loopback_forwards_normal_traffic_and_never_forwards_unsafe_proofs() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&profile_path).expect("profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait should exist")
+            .clone();
+        let secret: Arc<str> = Arc::from("mint-secret");
+        let (upstream, recorder) = spawn_recording_upstream([json_response(r#"{"normal":true}"#)]);
+
+        let normal_runtime = test_runtime(
+            upstream.clone(),
+            &unique_temp_path("production-normal-events.jsonl"),
+            unique_temp_path("production-normal-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let normal = parse_downstream_response(&run_production_runtime_request(
+            normal_runtime,
+            &get_request("/normal"),
+        ));
+        assert_eq!(normal.status, 200);
+
+        let session = SessionId::new();
+        let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
+            .expect("minted bait should render")
+            .into_owned();
+        let header_name = rendered
+            .expected_action
+            .header_name
+            .as_deref()
+            .expect("minted bait should have a proof header")
+            .to_string();
+        let header_value = rendered
+            .expected_action
+            .header_value
+            .expect("minted bait should have a proof value");
+
+        let unsafe_runtime = test_runtime_with_bait_profile(
+            upstream.clone(),
+            &unique_temp_path("production-unsafe-events.jsonl"),
+            unique_temp_path("production-unsafe-control.txt"),
+            loaded.clone(),
+            Some(Arc::clone(&secret)),
+        );
+        assert_eq!(
+            parse_downstream_response(&run_production_runtime_request(
+                unsafe_runtime,
+                &post_request_with_cookie(&bait.expected_action.path, &cookie, &[]),
+            ))
+            .status,
+            403
+        );
+
+        let replay_runtime = test_runtime_with_bait_profile(
+            upstream.clone(),
+            &unique_temp_path("production-replay-events.jsonl"),
+            unique_temp_path("production-replay-control.txt"),
+            loaded.clone(),
+            Some(Arc::clone(&secret)),
+        );
+        assert_eq!(
+            parse_downstream_response(&run_production_runtime_request(
+                replay_runtime.clone(),
+                &post_request_with_cookie(
+                    &bait.expected_action.path,
+                    &cookie,
+                    &[(&header_name, &header_value)],
+                ),
+            ))
+            .status,
+            202
+        );
+        assert_eq!(
+            parse_downstream_response(&run_production_runtime_request(
+                replay_runtime,
+                &post_request_with_cookie(
+                    &bait.expected_action.path,
+                    &cookie,
+                    &[(&header_name, &header_value)],
+                ),
+            ))
+            .status,
+            403
+        );
+
+        let expired_runtime = test_runtime_with_bait_profile(
+            upstream.clone(),
+            &unique_temp_path("production-expired-events.jsonl"),
+            unique_temp_path("production-expired-control.txt"),
+            loaded.clone(),
+            Some(Arc::clone(&secret)),
+        );
+        let expired = eidolon_bait::render_bait_for_session_at(
+            &bait,
+            session,
+            Some(secret.as_ref()),
+            now_unix_secs().saturating_sub(180),
+        )
+        .expect("expired bait should render")
+        .into_owned();
+        assert_eq!(
+            parse_downstream_response(&run_production_runtime_request(
+                expired_runtime,
+                &post_request_with_cookie(
+                    &bait.expected_action.path,
+                    &cookie,
+                    &[(
+                        expired
+                            .expected_action
+                            .header_name
+                            .as_deref()
+                            .expect("expired bait should name its proof"),
+                        expired
+                            .expected_action
+                            .header_value
+                            .as_deref()
+                            .expect("expired bait should carry its proof"),
+                    )],
+                ),
+            ))
+            .status,
+            403
+        );
+
+        let malformed_runtime = test_runtime_with_bait_profile(
+            upstream,
+            &unique_temp_path("production-malformed-events.jsonl"),
+            unique_temp_path("production-malformed-control.txt"),
+            loaded,
+            Some(secret),
+        );
+        assert_eq!(
+            parse_downstream_response(&run_production_runtime_request(
+                malformed_runtime,
+                &post_request_with_cookie(
+                    &bait.expected_action.path,
+                    &cookie,
+                    &[(&header_name, "minted.not-a-valid-proof")],
+                ),
+            ))
+            .status,
+            403
+        );
+
+        let upstream_requests = recorder.finish();
+        assert_eq!(
+            upstream_requests.len(),
+            1,
+            "only normal traffic may forward"
+        );
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec!["GET /normal HTTP/1.1"]
+        );
+    }
+
+    #[test]
+    fn production_profile_loopback_preserves_lifecycle_and_audits_pre_service_rejections() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let loaded = load_bait_profile(&profile_path).expect("profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait should exist")
+            .clone();
+        let (upstream, recorder) = spawn_recording_upstream([json_response(r#"{"normal":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        assert_eq!(
+            [
+                &fixture.event_log_path,
+                &fixture.policy_state_path,
+                &fixture.debug_log_path,
+                &fixture.intervention_control_path,
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .len(),
+            4,
+            "production fixture requires distinct durable event, policy, debug, and control paths"
+        );
+        let server = start_production_profile_server(fixture);
+
+        let normal = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request(
+                "GET",
+                "/normal",
+                SessionId::new(),
+                "client_normal_0123456789abcdef",
+                &[],
+            ),
+        ));
+        assert_eq!(normal.status, 200);
+
+        let missing_session = SessionId::new();
+        assert_eq!(
+            parse_downstream_response(&production_profile_request(
+                server.address,
+                &authenticated_production_request(
+                    "POST",
+                    &bait.expected_action.path,
+                    missing_session,
+                    "client_missing_0123456789abcdef",
+                    &[],
+                ),
+            ))
+            .status,
+            403
+        );
+
+        let replay_session = SessionId::new();
+        let replay_proof = render_bait_for_session(&bait, replay_session, Some("mint-secret"))
+            .expect("minted bait should render")
+            .into_owned();
+        let proof_header_name = replay_proof
+            .expected_action
+            .header_name
+            .expect("minted bait should have a proof header");
+        let proof_header_value = replay_proof
+            .expected_action
+            .header_value
+            .expect("minted bait should have a proof value");
+        let replay_headers = [(proof_header_name.as_str(), proof_header_value.as_str())];
+        assert_eq!(
+            parse_downstream_response(&production_profile_request(
+                server.address,
+                &authenticated_production_request(
+                    "POST",
+                    &bait.expected_action.path,
+                    replay_session,
+                    "client_replay_0123456789abcdef",
+                    &replay_headers,
+                ),
+            ))
+            .status,
+            202
+        );
+        assert_eq!(
+            parse_downstream_response(&production_profile_request(
+                server.address,
+                &authenticated_production_request(
+                    "POST",
+                    &bait.expected_action.path,
+                    replay_session,
+                    "client_replay_0123456789abcdef",
+                    &replay_headers,
+                ),
+            ))
+            .status,
+            403
+        );
+
+        let expired_session = SessionId::new();
+        let expired_proof = eidolon_bait::render_bait_for_session_at(
+            &bait,
+            expired_session,
+            Some("mint-secret"),
+            now_unix_secs().saturating_sub(180),
+        )
+        .expect("expired bait should render")
+        .into_owned();
+        let expired_headers = [(
+            expired_proof
+                .expected_action
+                .header_name
+                .as_deref()
+                .expect("expired bait should have a proof header"),
+            expired_proof
+                .expected_action
+                .header_value
+                .as_deref()
+                .expect("expired bait should have a proof value"),
+        )];
+        assert_eq!(
+            parse_downstream_response(&production_profile_request(
+                server.address,
+                &authenticated_production_request(
+                    "POST",
+                    &bait.expected_action.path,
+                    expired_session,
+                    "client_expired_0123456789abcdef",
+                    &expired_headers,
+                ),
+            ))
+            .status,
+            403
+        );
+
+        let malformed_session = SessionId::new();
+        assert_eq!(
+            parse_downstream_response(&production_profile_request(
+                server.address,
+                &authenticated_production_request(
+                    "POST",
+                    &bait.expected_action.path,
+                    malformed_session,
+                    "client_malformed_0123456789abcdef",
+                    &[(proof_header_name.as_str(), "minted.not-a-valid-proof")],
+                ),
+            ))
+            .status,
+            403
+        );
+
+        let event_before_boundary =
+            fs::read_to_string(&server.event_log_path).expect("event log should read");
+        assert_eq!(
+            parse_downstream_response(&production_profile_request(
+                server.address,
+                b"GET /normal HTTP/1.1\r\nHost: proxy.local\r\nExpect: 100-continue\r\n\r\n",
+            ))
+            .status,
+            417
+        );
+        assert_eq!(
+            fs::read_to_string(&server.event_log_path).expect("event log should read"),
+            event_before_boundary,
+            "a parsed boundary rejection must not create normal lifecycle events"
+        );
+
+        let event_before_pre_service =
+            fs::read_to_string(&server.event_log_path).expect("event log should read");
+        let malformed_response = production_profile_request(
+            server.address,
+            b"GET /secret-route/top-secret?credential=do-not-log HTTP/1.1\r\nHost: secret-host.example\r\nBad Header: x\r\n\r\n",
+        );
+        assert!(hyper_rejection_responded_or_closed(&malformed_response));
+        let mut too_many_headers =
+            b"GET /secret-route/top-secret HTTP/1.1\r\nHost: secret-host.example\r\n".to_vec();
+        for index in 0..=eidolon_proxy::production_http::MAX_PRODUCTION_HEADER_COUNT {
+            too_many_headers.extend_from_slice(format!("X-{index}: x\r\n").as_bytes());
+        }
+        too_many_headers.extend_from_slice(b"\r\n");
+        let header_limit_response = production_profile_request(server.address, &too_many_headers);
+        assert!(hyper_rejection_responded_or_closed(&header_limit_response));
+        assert_eq!(
+            fs::read_to_string(&server.event_log_path).expect("event log should read"),
+            event_before_pre_service,
+            "pre-service rejections must not create normal lifecycle events"
+        );
+
+        let records = fs::read_to_string(&server.debug_log_path)
+            .expect("debug log should read")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("debug record should parse"))
+            .collect::<Vec<_>>();
+        let boundary_audits = records
+            .iter()
+            .filter(|record| record["event"] == "production_request_rejected")
+            .collect::<Vec<_>>();
+        assert_eq!(boundary_audits.len(), 1);
+        let boundary_fields = boundary_audits[0]["fields"]
+            .as_object()
+            .expect("boundary audit fields should be an object");
+        assert!(boundary_audits[0]["session_id"].is_null());
+        assert_eq!(
+            boundary_fields
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["rejection", "request_id", "response_status"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        let pre_service_audits = records
+            .iter()
+            .filter(|record| record["event"] == "production_pre_service_rejected")
+            .collect::<Vec<_>>();
+        assert_eq!(pre_service_audits.len(), 2);
+        for expected_rejection in ["headers_too_large", "malformed_transport"] {
+            assert_eq!(
+                pre_service_audits
+                    .iter()
+                    .filter(|record| record["fields"]["rejection"] == expected_rejection)
+                    .count(),
+                1,
+                "each raw-wire rejection must produce exactly one audit"
+            );
+        }
+        assert_ne!(
+            pre_service_audits[0]["fields"]["request_id"],
+            pre_service_audits[1]["fields"]["request_id"],
+            "pre-service audits must use fresh request IDs"
+        );
+        for record in &pre_service_audits {
+            assert!(record["session_id"].is_null());
+            assert_eq!(
+                record["fields"]
+                    .as_object()
+                    .expect("pre-service audit fields should be an object")
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                ["rejection", "request_id"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            );
+        }
+        let debug = fs::read_to_string(&server.debug_log_path).expect("debug log should read");
+        assert!(!debug.contains("secret-route"));
+        assert!(!debug.contains("top-secret"));
+        assert!(!debug.contains("secret-host.example"));
+        assert!(!debug.contains("credential=do-not-log"));
+        assert!(!debug.contains("Bad Header"));
+
+        server.stop();
+        let upstream_requests = recorder.finish();
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec!["GET /normal HTTP/1.1"]
+        );
+    }
+
+    #[test]
+    fn production_policy_transition_omits_sentinel_path_from_event_and_debug_jsonl() {
+        const SENTINEL_PATH: &str = "/secret-route/production-policy-path-secret";
+
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let event_log_path = unique_temp_path("production-policy-redaction-events.jsonl");
+        let debug_log_path = unique_temp_path("production-policy-redaction-debug.jsonl");
+        let mut runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            unique_temp_path("production-policy-redaction-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.audit_projection = AuditProjection::Production;
+        runtime.debug_log = Some(Arc::new(Mutex::new(must_ok(
+            FileDebugLogWriter::open(&debug_log_path),
+            "debug log should open",
+        ))));
+        let cookie = cookie_header();
+        set_runtime_policy_state(&runtime, &cookie, PolicyState::ControlledReality);
+
+        assert_eq!(
+            parse_downstream_response(&run_production_runtime_request(
+                runtime.clone(),
+                &get_request_with_cookie(SENTINEL_PATH, &cookie),
+            ))
+            .status,
+            404
+        );
+        assert_eq!(
+            parse_downstream_response(&run_production_runtime_request(
+                runtime,
+                &get_request_with_cookie(SENTINEL_PATH, &cookie),
+            ))
+            .status,
+            403
+        );
+
+        let event_jsonl = fs::read_to_string(&event_log_path).expect("event log should read");
+        let debug_jsonl = fs::read_to_string(&debug_log_path).expect("debug log should read");
+        assert!(
+            !event_jsonl.contains(SENTINEL_PATH),
+            "event JSONL leaked a raw policy path"
+        );
+        assert!(
+            !debug_jsonl.contains(SENTINEL_PATH),
+            "debug JSONL leaked a raw policy path"
+        );
+        assert!(
+            events_of_type(&event_log_path, "policy_changed")
+                .into_iter()
+                .any(|event| {
+                    event["kind"]["from"] == "controlled_reality"
+                        && event["kind"]["to"] == "blocked"
+                        && event["kind"]["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains("path=route:other"))
+                }),
+            "production request should persist the policy transition"
+        );
+        assert!(
+            recorder.finish().is_empty(),
+            "controlled-reality transition must not reach the protected upstream"
+        );
+    }
+
+    #[test]
+    fn production_partial_body_disconnect_has_no_boundary_audit_event_or_upstream() {
+        let bait_profile = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &bait_profile,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let server = start_production_profile_server(fixture);
+        let event_log_path = server.event_log_path.clone();
+        let debug_log_path = server.debug_log_path.clone();
+
+        production_profile_partial_request(
+            server.address,
+            b"POST /normal HTTP/1.1\r\nHost: proxy.local\r\nContent-Length: 12\r\nConnection: close\r\n\r\npartial",
+        );
+
+        server.stop();
+        assert!(
+            fs::read_to_string(&event_log_path)
+                .expect("event log should read")
+                .is_empty(),
+            "partial body disconnect must not create normal lifecycle events"
+        );
+        assert!(
+            debug_events(&debug_log_path, "production_request_rejected").is_empty(),
+            "partial body disconnect must not create a boundary audit"
+        );
+        assert!(
+            debug_events(&debug_log_path, "production_pre_service_rejected").is_empty(),
+            "partial body disconnect must not create a pre-service audit"
+        );
+        assert!(
+            recorder.finish().is_empty(),
+            "partial body disconnect must not reach the protected upstream"
+        );
+    }
+
+    #[test]
+    fn production_malformed_body_remains_audited_boundary_rejection() {
+        let bait_profile = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &bait_profile,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let server = start_production_profile_server(fixture);
+        let event_log_path = server.event_log_path.clone();
+        let debug_log_path = server.debug_log_path.clone();
+
+        let response = production_profile_request(
+            server.address,
+            b"POST /normal HTTP/1.1\r\nHost: proxy.local\r\nTransfer-Encoding: chunked\r\n\r\nnot-a-chunk\r\n",
+        );
+        assert_eq!(parse_downstream_response(&response).status, 400);
+
+        server.stop();
+        assert!(
+            fs::read_to_string(&event_log_path)
+                .expect("event log should read")
+                .is_empty(),
+            "malformed body boundary rejection must not create normal lifecycle events"
+        );
+        let audits = debug_events(&debug_log_path, "production_request_rejected");
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0]["fields"]["rejection"], "body_read_failed");
+        assert!(
+            recorder.finish().is_empty(),
+            "malformed body boundary rejection must not reach the protected upstream"
+        );
+    }
+
+    #[test]
+    fn production_boundary_rejections_are_redacted_audited_and_fail_closed_without_debug_log() {
+        let request = b"GET /normal HTTP/1.1\r\nHost: proxy.local\r\nExpect: 100-continue\r\n\r\n";
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let event_log = unique_temp_path("production-boundary-events.jsonl");
+        let debug_log = unique_temp_path("production-boundary-debug.jsonl");
+        let response = parse_downstream_response(&run_production_runtime_request(
+            test_runtime_with_m1_controller_and_debug_log(
+                upstream.clone(),
+                &event_log,
+                &debug_log,
+                unique_temp_path("production-boundary-control.txt"),
+            ),
+            request,
+        ));
+        assert_eq!(response.status, 417);
+        assert!(
+            !event_log.exists()
+                || fs::read_to_string(&event_log)
+                    .expect("event log should read")
+                    .is_empty(),
+            "boundary rejection must not create a normal event"
+        );
+
+        let records = fs::read_to_string(&debug_log)
+            .expect("production debug audit should write")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("debug record should be JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["event"], "production_request_rejected");
+        assert!(record["session_id"].is_null());
+        let fields = record["fields"]
+            .as_object()
+            .expect("fields should be an object");
+        let mut field_names = fields.keys().cloned().collect::<Vec<_>>();
+        field_names.sort();
+        assert_eq!(
+            field_names,
+            vec!["rejection", "request_id", "response_status"]
+        );
+        assert_eq!(fields["rejection"], "unsupported_expectation");
+        assert_eq!(fields["response_status"], 417);
+        assert!(!record.to_string().contains("/normal"));
+
+        let audit_unavailable = parse_downstream_response(&run_production_runtime_request(
+            test_runtime_with_m1_controller(
+                upstream,
+                &unique_temp_path("production-no-debug-events.jsonl"),
+                unique_temp_path("production-no-debug-control.txt"),
+            ),
+            request,
+        ));
+        assert_eq!(audit_unavailable.status, 503);
+        assert!(
+            recorder.finish().is_empty(),
+            "boundary rejection must never reach the protected upstream"
+        );
+
+        let (poisoned_upstream, poisoned_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let mut poisoned_runtime = test_runtime_with_m1_controller(
+            poisoned_upstream,
+            &unique_temp_path("production-poisoned-debug-events.jsonl"),
+            unique_temp_path("production-poisoned-debug-control.txt"),
+        );
+        let poisoned_debug_log = Arc::new(Mutex::new(
+            FileDebugLogWriter::open(unique_temp_path("production-poisoned-debug.jsonl"))
+                .expect("debug log should open"),
+        ));
+        poisoned_runtime.debug_log = Some(Arc::clone(&poisoned_debug_log));
+        let _ = thread::spawn(move || {
+            let _guard = poisoned_debug_log
+                .lock()
+                .expect("test debug lock should acquire");
+            panic!("poison debug audit lock");
+        })
+        .join();
+        let poisoned_audit =
+            parse_downstream_response(&run_production_runtime_request(poisoned_runtime, request));
+        assert_eq!(poisoned_audit.status, 503);
+        assert!(
+            poisoned_recorder.finish().is_empty(),
+            "a failed debug audit must never reach the protected upstream"
+        );
     }
 
     #[test]
@@ -11993,17 +14485,21 @@ mod tests {
 
         let raw_event_log = fs::read_to_string(&event_log_path).expect("event log should read");
         assert!(!raw_event_log.contains("secret-value"));
-        assert_eq!(
-            first_event_of_type(&event_log_path, "request_seen")["kind"]["path"],
+        assert!(persisted_path_equals(
+            &first_event_of_type(&event_log_path, "request_seen")["kind"]["path"],
             "/docs/legacy-import?<redacted>"
-        );
+        ));
 
         let request_debug = first_debug_event(&debug_log_path, "request_received");
         assert_eq!(request_debug["run_kind"], "eidolon_proxy_debug");
         assert_eq!(request_debug["fields"]["method"], "POST");
-        assert_eq!(request_debug["fields"]["path"], "/docs/legacy-import");
+        assert!(persisted_path_equals(
+            &request_debug["fields"]["path"],
+            "/docs/legacy-import"
+        ));
         assert_eq!(request_debug["fields"]["query_present"], true);
         assert_eq!(request_debug["fields"]["body_len"], 7);
+        assert_eq!(request_debug["fields"]["request_host"], "proxy.local");
         assert_eq!(
             request_debug["fields"]["ingress_identity"]["source"],
             "none"
@@ -12030,7 +14526,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_records_normalized_ingress_identity_in_request_audit() {
+    fn production_projection_redacts_authenticated_ingress_values_from_durable_audits() {
         let event_log_path = unique_temp_path("ingress-identity-events.jsonl");
         let debug_log_path = unique_temp_path("ingress-identity-debug.jsonl");
         let (upstream, upstream_handle) =
@@ -12041,6 +14537,7 @@ mod tests {
             &debug_log_path,
             unique_temp_path("ingress-identity-control.txt"),
         );
+        runtime.audit_projection = AuditProjection::Production;
         runtime.ingress_transport_auth_secret = Some(Arc::<str>::from("edge-secret"));
 
         let request = request_with_cookie(
@@ -12070,12 +14567,17 @@ mod tests {
         );
         let _response = run_runtime_request(runtime, &request);
         must_join(upstream_handle.join(), "upstream thread should join");
-        assert!(!fs::read_to_string(&event_log_path)
-            .expect("event log should read")
-            .contains("test_client_0123456789abcdef"));
-        assert!(!fs::read_to_string(&debug_log_path)
-            .expect("debug log should read")
-            .contains("test_client_0123456789abcdef"));
+        let raw_event_log = fs::read_to_string(&event_log_path).expect("event log should read");
+        let raw_debug_log = fs::read_to_string(&debug_log_path).expect("debug log should read");
+        for raw_value in [
+            "test_client_0123456789abcdef",
+            "internal-crawler",
+            "2099-06-04T12:00:00Z",
+            "edge-secret",
+        ] {
+            assert!(!raw_event_log.contains(raw_value));
+            assert!(!raw_debug_log.contains(raw_value));
+        }
 
         let request_event = first_event_of_type(&event_log_path, "request_seen");
         assert_eq!(
@@ -12086,14 +14588,8 @@ mod tests {
             request_event["kind"]["ingress_identity"]["trust_tier"],
             "allowlisted"
         );
-        assert_eq!(
-            request_event["kind"]["ingress_identity"]["label"],
-            "internal-crawler"
-        );
-        assert_eq!(
-            request_event["kind"]["ingress_identity"]["expires_at"],
-            "2099-06-04T12:00:00Z"
-        );
+        assert!(request_event["kind"]["ingress_identity"]["label"].is_null());
+        assert!(request_event["kind"]["ingress_identity"]["expires_at"].is_null());
 
         let request_debug = first_debug_event(&debug_log_path, "request_received");
         assert_eq!(
@@ -12256,7 +14752,10 @@ mod tests {
             )));
         let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(bait_exposed["kind"]["bait_id"], "rel_2025_04_b7f2");
-        assert_eq!(bait_exposed["kind"]["surface"], "/docs");
+        assert!(persisted_path_equals(
+            &(bait_exposed["kind"]["surface"]),
+            "/docs"
+        ));
 
         let surface_debug = debug_values(&debug_log_path)
             .into_iter()
@@ -12343,7 +14842,10 @@ mod tests {
             )));
         let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
-        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
+        assert!(persisted_path_equals(
+            &(bait_exposed["kind"]["surface"]),
+            "/openapi.json"
+        ));
 
         let surface_debug = first_debug_event(&debug_log_path, "surface_action_selected");
         assert_eq!(surface_debug["fields"]["policy_state"], "suspicious");
@@ -12416,7 +14918,10 @@ mod tests {
             request_events[1]["kind"]["routing_decision"],
             "eidolon_owned"
         );
-        assert_eq!(request_events[1]["kind"]["path"], "/openapi.json");
+        assert!(persisted_path_equals(
+            &(request_events[1]["kind"]["path"]),
+            "/openapi.json"
+        ));
 
         let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
         assert_eq!(policy_changed["kind"]["from"], "observe");
@@ -12432,7 +14937,10 @@ mod tests {
 
         let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
-        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
+        assert!(persisted_path_equals(
+            &(bait_exposed["kind"]["surface"]),
+            "/openapi.json"
+        ));
 
         let request_debugs: Vec<Value> = debug_values(&debug_log_path)
             .into_iter()
@@ -13137,7 +15645,10 @@ mod tests {
 
         let request_debug = first_debug_event(&debug_log_path, "request_received");
         assert_eq!(request_debug["fields"]["policy_state"], "suspicious");
-        assert_eq!(request_debug["fields"]["path"], "/openapi.json");
+        assert!(persisted_path_equals(
+            &(request_debug["fields"]["path"]),
+            "/openapi.json"
+        ));
         assert_eq!(request_debug["fields"]["query_present"], true);
         assert_eq!(request_debug["fields"]["discovery_request_count"], 1);
         assert_eq!(request_debug["fields"]["discovery_query_seen"], true);
@@ -13164,7 +15675,10 @@ mod tests {
 
         let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
-        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
+        assert!(persisted_path_equals(
+            &(bait_exposed["kind"]["surface"]),
+            "/openapi.json"
+        ));
     }
 
     #[test]
@@ -13555,10 +16069,10 @@ mod tests {
             request_debugs[1]["fields"]["discovery_decoy_write_probe_count"],
             1
         );
-        assert_eq!(
-            request_debugs[2]["fields"]["path"],
+        assert!(persisted_path_equals(
+            &(request_debugs[2]["fields"]["path"]),
             "/api/v2/import/reconcile"
-        );
+        ));
         assert_eq!(
             request_debugs[2]["fields"]["discovery_decoy_write_probe_seen"],
             true
@@ -13576,7 +16090,10 @@ mod tests {
             4
         );
         assert_eq!(request_debugs[3]["fields"]["policy_state"], "rate_limited");
-        assert_eq!(request_debugs[3]["fields"]["path"], "/docs");
+        assert!(persisted_path_equals(
+            &(request_debugs[3]["fields"]["path"]),
+            "/docs"
+        ));
         assert_eq!(
             request_debugs[3]["fields"]["discovery_decoy_write_probe_count"],
             2
@@ -17572,7 +20089,10 @@ mod tests {
 
         let exposure = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(exposure["kind"]["bait_id"], "rel_2025_04_b7f2");
-        assert_eq!(exposure["kind"]["surface"], "/docs/legacy-import");
+        assert!(persisted_path_equals(
+            &(exposure["kind"]["surface"]),
+            "/docs/legacy-import"
+        ));
         assert!(exposure["kind"]["exposure_id"]
             .as_str()
             .is_some_and(|id| id.starts_with("exp-")));
@@ -17623,7 +20143,10 @@ mod tests {
 
         let exposure = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(exposure["kind"]["bait_id"], "openapi_reconcile_trace");
-        assert_eq!(exposure["kind"]["surface"], "/openapi.json?<redacted>");
+        assert!(persisted_path_equals(
+            &(exposure["kind"]["surface"]),
+            "/openapi.json?<redacted>"
+        ));
     }
 
     #[test]
@@ -17655,7 +20178,10 @@ mod tests {
 
         let exposure = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(exposure["kind"]["bait_id"], "openapi_reconcile_trace");
-        assert_eq!(exposure["kind"]["surface"], "/openapi.json");
+        assert!(persisted_path_equals(
+            &(exposure["kind"]["surface"]),
+            "/openapi.json"
+        ));
     }
 
     #[test]
@@ -18196,7 +20722,10 @@ mod tests {
             exposure["kind"]["exposure_id"]
         );
         assert_eq!(action["kind"]["method"], "POST");
-        assert_eq!(action["kind"]["path"], "/api/v2/import/reconcile");
+        assert!(persisted_path_equals(
+            &(action["kind"]["path"]),
+            "/api/v2/import/reconcile"
+        ));
         assert_event_routing(&event_log_path, "request_seen", "eidolon_owned");
         let policy_changed = first_event_of_type(&event_log_path, "policy_changed");
         assert_eq!(policy_changed["kind"]["from"], "observe");
@@ -18554,7 +21083,9 @@ mod tests {
         );
         let request_seen = events_of_type(&event_log_path, "request_seen")
             .into_iter()
-            .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .find(|event| {
+                persisted_path_equals(&(event["kind"]["path"]), "/api/v2/import/reconcile")
+            })
             .unwrap_or_else(|| panic!("rate-limited request_seen should exist"));
         assert_eq!(request_seen["policy_state"], "rate_limited");
         assert_eq!(request_seen["kind"]["routing_decision"], "rate_limited");
@@ -18619,7 +21150,9 @@ mod tests {
 
         let blocked_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()
-            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .rfind(|event| {
+                persisted_path_equals(&(event["kind"]["path"]), "/api/v2/import/reconcile")
+            })
             .unwrap_or_else(|| panic!("blocked request_seen should exist"));
         assert_eq!(blocked_request["policy_state"], "blocked");
         assert_eq!(blocked_request["kind"]["routing_decision"], "eidolon_owned");
@@ -18908,7 +21441,10 @@ mod tests {
             })
             .expect("action request should be audited");
         assert_eq!(request_seen["kind"]["method"], "POST");
-        assert_eq!(request_seen["kind"]["path"], "/api/v2/import/reconcile");
+        assert!(persisted_path_equals(
+            &(request_seen["kind"]["path"]),
+            "/api/v2/import/reconcile"
+        ));
         assert_eq!(request_seen["kind"]["routing_decision"], "eidolon_owned");
         let policy_changed = events
             .iter()
@@ -19031,7 +21567,9 @@ mod tests {
 
         let action_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()
-            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .rfind(|event| {
+                persisted_path_equals(&(event["kind"]["path"]), "/api/v2/import/reconcile")
+            })
             .unwrap_or_else(|| panic!("exact bait action request_seen should exist"));
         assert_eq!(action_request["policy_state"], "rate_limited");
         assert_eq!(action_request["kind"]["routing_decision"], "eidolon_owned");
@@ -19105,7 +21643,9 @@ mod tests {
         );
         let request_seen = events_of_type(&event_log_path, "request_seen")
             .into_iter()
-            .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .find(|event| {
+                persisted_path_equals(&(event["kind"]["path"]), "/api/v2/import/reconcile")
+            })
             .unwrap_or_else(|| panic!("rate-limited request_seen should exist"));
         assert_eq!(request_seen["policy_state"], "rate_limited");
         assert_eq!(request_seen["kind"]["routing_decision"], "rate_limited");
@@ -19151,7 +21691,10 @@ mod tests {
 
         let bait_exposed = first_event_of_type(&event_log_path, "bait_exposed");
         assert_eq!(bait_exposed["kind"]["bait_id"], "openapi_reconcile_trace");
-        assert_eq!(bait_exposed["kind"]["surface"], "/openapi.json");
+        assert!(persisted_path_equals(
+            &(bait_exposed["kind"]["surface"]),
+            "/openapi.json"
+        ));
 
         let near_miss = first_event_of_type(&event_log_path, "bait_action_observed");
         assert_eq!(near_miss["policy_state"], "suspicious");
@@ -19167,7 +21710,9 @@ mod tests {
 
         let request_seen = events_of_type(&event_log_path, "request_seen")
             .into_iter()
-            .find(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .find(|event| {
+                persisted_path_equals(&(event["kind"]["path"]), "/api/v2/import/reconcile")
+            })
             .unwrap_or_else(|| panic!("rate-limited request_seen should exist"));
         assert_eq!(request_seen["policy_state"], "rate_limited");
         assert_eq!(request_seen["kind"]["routing_decision"], "rate_limited");
@@ -19420,10 +21965,10 @@ mod tests {
         assert_eq!(response.status, 400);
         assert!(upstream_requests.is_empty());
         assert!(!raw_events.contains("secret-value"));
-        assert_eq!(
-            first_event_of_type(&event_log_path, "request_seen")["kind"]["path"],
+        assert!(persisted_path_equals(
+            &(first_event_of_type(&event_log_path, "request_seen")["kind"]["path"]),
             REJECTED_REQUEST_TARGET
-        );
+        ));
     }
 
     #[test]
@@ -20172,6 +22717,70 @@ mod tests {
     }
 
     #[test]
+    fn malformed_target_does_not_reconcile_pending_controlled_reality_workflow() {
+        let event_log_path = unique_temp_path("malformed-target-pending-workflow-events.jsonl");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let runtime = test_runtime(
+            upstream,
+            &event_log_path,
+            unique_temp_path("malformed-target-pending-workflow-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        let request_id = RequestId::new();
+        let request = parse_http_request_head(
+            b"GET /api/v2/import/reconcile/jobs/job_0123456789abcdef HTTP/1.1\r\nHost: proxy.local\r\n\r\n",
+        )
+        .expect("request should parse");
+        let surface_request = surface_request_meta(&request, &request.target);
+        let session = effective_session_context(
+            &runtime,
+            &request,
+            &surface_request,
+            Some("127.0.0.1".parse().expect("loopback IP should parse")),
+            request_id,
+        )
+        .expect("session should resolve");
+        {
+            let mut store = runtime
+                .policy_store
+                .lock()
+                .expect("policy store should lock");
+            store
+                .set_policy_state(session.session_id, PolicyState::ControlledReality)
+                .expect("controlled state should persist");
+            store
+                .note_controlled_reality_interaction(
+                    session.session_id,
+                    request_id,
+                    eidolon_proxy::policy_store::ControlledRealityRequestAction::BranchRead,
+                    MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+                )
+                .expect("pending workflow should persist");
+        }
+
+        let response = parse_downstream_response(&run_runtime_request(
+            runtime.clone(),
+            b"GET /api/v2/import/reconcile/jobs/job_0123456789abcdef#fragment HTTP/1.1\r\nHost: proxy.local\r\n\r\n",
+        ));
+        let record = runtime
+            .policy_store
+            .lock()
+            .expect("policy store should lock")
+            .record(session.session_id);
+        let upstream_requests = upstream_recorder.finish();
+
+        assert_eq!(response.status, 400);
+        assert!(upstream_requests.is_empty());
+        assert_eq!(record.policy_state, PolicyState::ControlledReality);
+        assert!(record.controlled_reality_pending_update.is_some());
+        assert!(events_of_type(&event_log_path, "policy_changed").is_empty());
+        assert!(events_of_type(&event_log_path, "response_served")
+            .iter()
+            .all(|event| event["kind"]["controlled_reality"].is_null()));
+    }
+
+    #[test]
     fn crash_after_response_fsync_rolls_pending_workflow_forward() {
         let event_log_path = unique_temp_path("controlled-fsync-recovery-events.jsonl");
         let policy_store_path = unique_temp_path("controlled-fsync-recovery-policy.json");
@@ -20898,7 +23507,9 @@ mod tests {
 
         let precommit_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()
-            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v2/import/reconcile"))
+            .rfind(|event| {
+                persisted_path_equals(&(event["kind"]["path"]), "/api/v2/import/reconcile")
+            })
             .unwrap_or_else(|| panic!("pre-commit request_seen should exist"));
         assert_eq!(precommit_request["policy_state"], "controlled_reality");
         assert_eq!(
@@ -20972,7 +23583,10 @@ mod tests {
         let escape = first_event_of_type(&event_log_path, "reality_escape_attempt");
         assert_eq!(escape["policy_state"], "controlled_reality");
         assert_eq!(escape["kind"]["method"], "GET");
-        assert_eq!(escape["kind"]["path"], "/api/v1/projects");
+        assert!(persisted_path_equals(
+            &(escape["kind"]["path"]),
+            "/api/v1/projects"
+        ));
         assert_eq!(escape["kind"]["routing_decision"], "controlled_reality");
     }
 
@@ -21011,7 +23625,10 @@ mod tests {
         let escape_attempts = events_of_type(&event_log_path, "reality_escape_attempt");
         assert_eq!(escape_attempts.len(), 2);
         assert_eq!(escape_attempts[1]["policy_state"], "controlled_reality");
-        assert_eq!(escape_attempts[1]["kind"]["path"], "/api/v1/projects");
+        assert!(persisted_path_equals(
+            &(escape_attempts[1]["kind"]["path"]),
+            "/api/v1/projects"
+        ));
         assert_eq!(
             escape_attempts[1]["kind"]["routing_decision"],
             "controlled_reality"
@@ -21036,7 +23653,7 @@ mod tests {
 
         let precommit_request = events_of_type(&event_log_path, "request_seen")
             .into_iter()
-            .rfind(|event| event["kind"]["path"].as_str() == Some("/api/v1/projects"))
+            .rfind(|event| persisted_path_equals(&(event["kind"]["path"]), "/api/v1/projects"))
             .unwrap_or_else(|| panic!("pre-commit request_seen should exist"));
         assert_eq!(precommit_request["policy_state"], "controlled_reality");
         assert_eq!(
@@ -21573,9 +24190,12 @@ mod tests {
 
     #[test]
     fn debug_path_strips_query_and_fragment_values() {
-        assert_eq!(debug_path("/docs?token=secret"), "/docs");
-        assert_eq!(debug_path("/docs#secret-fragment"), "/docs");
-        assert_eq!(debug_path("/docs#secret-fragment?token=secret"), "/docs");
+        assert_eq!(lab_debug_path("/docs?token=secret"), "/docs");
+        assert_eq!(lab_debug_path("/docs#secret-fragment"), "/docs");
+        assert_eq!(
+            lab_debug_path("/docs#secret-fragment?token=secret"),
+            "/docs"
+        );
     }
 
     #[test]
@@ -21598,6 +24218,94 @@ mod tests {
         );
         assert_eq!(redacted_event_target("/docs?"), "/docs?<redacted>");
         assert_eq!(redacted_event_target("/docs"), "/docs");
+    }
+
+    #[test]
+    fn lab_audit_projection_preserves_schema_v2_raw_paths() {
+        let lab = AuditProjection::Lab;
+        assert_eq!(
+            lab.event_target("/customer/import-checklist?token=secret"),
+            "/customer/import-checklist?<redacted>"
+        );
+        assert_eq!(
+            lab.debug_path("/customer/import-checklist?token=secret"),
+            "/customer/import-checklist"
+        );
+        assert_eq!(
+            lab.reason_path("/customer/import-checklist"),
+            "/customer/import-checklist"
+        );
+        assert_eq!(
+            lab.path_prefixes(&["/customer".to_string()]),
+            vec!["/customer".to_string()]
+        );
+        let signals = eidolon_core::IngressAdvisorySignals {
+            detection_ids: vec!["det-1".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            lab.ingress_signals(&signals).detection_ids,
+            vec!["det-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn production_audit_projection_redacts_paths_and_reason_paths() {
+        let production = AuditProjection::Production;
+        for target in [
+            "/docs?token=secret",
+            "/docs#secret-fragment",
+            "/docs?token=secret&mode=debug#secret-fragment",
+        ] {
+            assert_eq!(production.event_target(target), "route:docs");
+            assert_eq!(production.debug_path(target), "route:docs");
+        }
+        assert_eq!(production.event_target("/customer-secret"), "route:other");
+        assert_eq!(production.event_target("/api/v1/secret"), "route:api");
+        assert_eq!(
+            production.reason_path("/customer/import-checklist"),
+            "route:other"
+        );
+        assert!(!production
+            .reason_path("/customer/import-checklist")
+            .contains("customer"));
+        assert_eq!(
+            production.path_prefixes(&["/customer".to_string(), "/docs".to_string()]),
+            vec!["route:other".to_string(), "route:docs".to_string()]
+        );
+        let signals = eidolon_core::IngressAdvisorySignals {
+            detection_ids: vec!["det-1".to_string()],
+            ..Default::default()
+        };
+        assert!(production
+            .ingress_signals(&signals)
+            .detection_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn production_processing_failure_stderr_code_omits_error_display() {
+        const SENTINEL_PATH: &str = "/var/lib/eidolon/production-events.segment-7.jsonl";
+        let error = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("failed to append event log segment `{SENTINEL_PATH}`"),
+        );
+
+        let mut emitted = Vec::new();
+        let mapped = production_request_processing_failed_with_writer(&error, &mut emitted);
+
+        assert_eq!(mapped, ProductionProcessorError::Failed);
+        assert_eq!(
+            emitted, b"production request processing failed: code=processor_failed\n",
+            "emitted bytes must be exactly the fixed code plus newline"
+        );
+        assert!(
+            !emitted
+                .windows(SENTINEL_PATH.len())
+                .any(|window| window == SENTINEL_PATH.as_bytes()),
+            "emitted bytes must not carry the propagated filesystem path"
+        );
+        assert!(error.to_string().contains(SENTINEL_PATH));
     }
 
     #[test]

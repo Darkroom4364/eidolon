@@ -8,13 +8,17 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes.workspace = true
 chrono.workspace = true
 eidolon-bait = { path = "../eidolon-bait" }
 eidolon-core = { path = "../eidolon-core" }
 hmac.workspace = true
 hyper.workspace = true
+http-body-util.workspace = true
 ipnet.workspace = true
 serde.workspace = true
+hyper-util.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 uuid.workspace = true
+tokio.workspace = true

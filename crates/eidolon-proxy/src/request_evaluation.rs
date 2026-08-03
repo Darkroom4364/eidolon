@@ -289,7 +289,12 @@ fn action_hex_value(byte: u8) -> Option<u8> {
 pub struct RequestEvaluationInput<'a> {
     pub starting_policy_state: PolicyState,
     pub intervention_mode: InterventionMode,
+    /// Raw request path. Drives policy predicates (for example discovery
+    /// prefix matching); never pre-projected.
     pub path: &'a str,
+    /// Profile-projected path embedded in transition reason text only. Lab
+    /// passes the raw path; Production passes a bounded route class.
+    pub reason_path: &'a str,
     pub trusted_bait_soften_path_prefixes: &'a [String],
     pub ingress_identity: &'a IngressIdentity,
     pub ingress_signals: &'a IngressAdvisorySignals,
@@ -322,11 +327,12 @@ pub fn evaluate_request(input: RequestEvaluationInput<'_>) -> RequestEvaluation 
             input.trusted_bait_soften_path_prefixes,
             input.ingress_identity,
             input.ingress_signals,
+            input.reason_path,
         )
         .or_else(|| {
             policy::transition_to_suspicious_from_discovery_fanout(
                 policy_state,
-                input.path,
+                input.reason_path,
                 input.ingress_identity,
                 input.discovery_recon_state.fanout,
             )
@@ -334,7 +340,7 @@ pub fn evaluate_request(input: RequestEvaluationInput<'_>) -> RequestEvaluation 
         .or_else(|| {
             policy::transition_to_suspicious_from_aggregated_discovery_recon(
                 policy_state,
-                input.path,
+                input.reason_path,
                 input.request_facts.aggregated_discovery_recon_candidate(),
                 input.ingress_identity,
                 input.ingress_signals,
@@ -350,7 +356,7 @@ pub fn evaluate_request(input: RequestEvaluationInput<'_>) -> RequestEvaluation 
         let persistence_transition = if input.starting_policy_state == PolicyState::Suspicious {
             policy::transition_to_rate_limited_from_suspicious_discovery_recon(
                 policy_state,
-                input.path,
+                input.reason_path,
                 input.request_facts.discovery_surface.is_some(),
                 input.request_facts.blind_decoy_write_probe.is_some(),
                 input.ingress_identity,
@@ -360,7 +366,7 @@ pub fn evaluate_request(input: RequestEvaluationInput<'_>) -> RequestEvaluation 
         } else if input.starting_policy_state == PolicyState::RateLimited {
             policy::transition_to_blocked_from_repeated_discovery_recon(
                 policy_state,
-                input.path,
+                input.reason_path,
                 input.request_facts.discovery_surface.is_some(),
                 input.request_facts.blind_decoy_write_probe.is_some(),
                 input.ingress_identity,
@@ -856,6 +862,7 @@ mod tests {
             starting_policy_state: PolicyState::Observe,
             intervention_mode: InterventionMode::Disabled,
             path: "/docs",
+            reason_path: "/docs",
             trusted_bait_soften_path_prefixes: &prefixes,
             ingress_identity: &identity,
             ingress_signals: &signals,
@@ -894,6 +901,7 @@ mod tests {
             starting_policy_state: PolicyState::Observe,
             intervention_mode: InterventionMode::Enabled,
             path: "/docs",
+            reason_path: "/docs",
             trusted_bait_soften_path_prefixes: &prefixes,
             ingress_identity: &identity,
             ingress_signals: &signals,
@@ -935,6 +943,7 @@ mod tests {
             starting_policy_state: PolicyState::Observe,
             intervention_mode: InterventionMode::Enabled,
             path: "/openapi.json",
+            reason_path: "/openapi.json",
             trusted_bait_soften_path_prefixes: &prefixes,
             ingress_identity: &identity,
             ingress_signals: &default_signals,
@@ -961,6 +970,7 @@ mod tests {
             starting_policy_state: PolicyState::Observe,
             intervention_mode: InterventionMode::Enabled,
             path: "/docs",
+            reason_path: "/docs",
             trusted_bait_soften_path_prefixes: &prefixes,
             ingress_identity: &identity,
             ingress_signals: &aggregate_signals,
@@ -982,6 +992,45 @@ mod tests {
     }
 
     #[test]
+    fn projected_reason_path_preserves_raw_path_discovery_predicates() {
+        // Production projects reason text to a route class, but the discovery
+        // prefix predicate must still see the raw request path: `route:docs`
+        // never matches the configured `/docs` prefix.
+        let prefixes = vec!["/docs".to_string()];
+        let identity = IngressIdentity::default();
+        let signals = agentic_signals(12);
+
+        let evaluation = evaluate_request(RequestEvaluationInput {
+            starting_policy_state: PolicyState::Observe,
+            intervention_mode: InterventionMode::Enabled,
+            path: "/docs/legacy-import",
+            reason_path: "route:docs",
+            trusted_bait_soften_path_prefixes: &prefixes,
+            ingress_identity: &identity,
+            ingress_signals: &signals,
+            discovery_recon_state: DiscoveryReconState::default(),
+            request_facts: RequestPolicyFacts {
+                discovery_surface: Some(DiscoverySurfaceKind::Docs),
+                linked_bait_surface: None,
+                blind_decoy_write_probe: None,
+                ..Default::default()
+            },
+        });
+
+        assert_eq!(
+            evaluation.transitions.len(),
+            1,
+            "raw `/docs` prefix policy must still fire under a projected reason path"
+        );
+        let reason = &evaluation.transitions[0].reason;
+        assert!(reason.contains("path=route:docs"));
+        assert!(
+            !reason.contains("/docs/legacy-import"),
+            "projected reason must not carry the raw request path"
+        );
+    }
+
+    #[test]
     fn pre_containment_persistence_transition_reaches_decision() {
         let prefixes = vec!["/docs".to_string()];
         let identity = IngressIdentity::default();
@@ -994,6 +1043,7 @@ mod tests {
             starting_policy_state: PolicyState::Suspicious,
             intervention_mode: InterventionMode::Enabled,
             path: "/docs",
+            reason_path: "/docs",
             trusted_bait_soften_path_prefixes: &prefixes,
             ingress_identity: &identity,
             ingress_signals: &signals,
@@ -1037,6 +1087,7 @@ mod tests {
             starting_policy_state: PolicyState::RateLimited,
             intervention_mode: InterventionMode::Enabled,
             path: "/docs",
+            reason_path: "/docs",
             trusted_bait_soften_path_prefixes: &prefixes,
             ingress_identity: &identity,
             ingress_signals: &signals,

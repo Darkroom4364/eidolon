@@ -27,6 +27,25 @@ pub const SESSION_COOKIE_NAME: &str = "eidolon_session";
 
 /// Scope the lab session to all paths on the current first-party host.
 pub const SESSION_COOKIE_PATH: &str = "/";
+/// Cookie emission policy selected by the runtime profile.
+///
+/// Both policies intentionally omit `Domain`, keeping the session host-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCookiePolicy {
+    /// Existing local HTTP lab attributes.
+    Lab,
+    /// HTTPS production attributes.
+    Production,
+}
+
+impl SessionCookiePolicy {
+    pub const fn attributes(self) -> &'static str {
+        match self {
+            Self::Lab => "Path=/; HttpOnly; SameSite=Lax",
+            Self::Production => "Path=/; Secure; HttpOnly; SameSite=Strict",
+        }
+    }
+}
 
 /// `Lax` keeps ordinary top-level navigation working while reducing ambient
 /// cross-site cookie attachment.
@@ -35,10 +54,9 @@ pub const SESSION_COOKIE_SAME_SITE: &str = "Lax";
 /// Stable attributes for local HTTP lab use.
 ///
 /// `Secure` is intentionally omitted because this proxy is expected to run on
-/// local HTTP during M1. Production HTTPS deployments should add `Secure`.
-/// `Max-Age` and `Expires` are also omitted, making this a browser-session
-/// cookie with minimal retention.
-pub const SESSION_COOKIE_ATTRIBUTES: &str = "Path=/; HttpOnly; SameSite=Lax";
+/// local HTTP during M1. `Max-Age` and `Expires` are also omitted, making this
+/// a browser-session cookie with minimal retention.
+pub const SESSION_COOKIE_ATTRIBUTES: &str = SessionCookiePolicy::Lab.attributes();
 
 /// Normalized ingress trust signal headers reserved for Eidolon edge adapters.
 pub const INGRESS_IDENTITY_SOURCE_HEADER_NAME: &str = "X-Eidolon-Ingress-Identity-Source";
