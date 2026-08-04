@@ -70,8 +70,28 @@ grep -q 'host_bundle_dir' "$HOST_OUTPUT_DIR/README.md"
 grep -q 'host_bundle_readme_sha256' "$HOST_OUTPUT_DIR/README.md"
 grep -q 'edge_decisions_sha256' "$HOST_OUTPUT_DIR/README.md"
 
+VM_EXPECTED_ERROR="$TMP_ROOT/vm-copy.expected.err"
+printf 'error: missing required tool: %s\n' "$TMP_ROOT/not-an-orb" > "$VM_EXPECTED_ERROR"
+VM_ERROR_LOG="$TMP_ROOT/vm-copy.err"
+if ORB_BIN="$TMP_ROOT/not-an-orb" \
+  "$REPO_ROOT/examples/shield-lab/collect-kali-vm-sample.sh" \
+  --host-bundle-dir "$HOST_BUNDLE_DIR" \
+  --edge-decisions "$EDGE_DECISIONS_PATH" \
+  "$TMP_ROOT/missing-sample" \
+  "$TMP_ROOT/host-output-vm" 2>"$VM_ERROR_LOG"; then
+  echo "expected VM copy to require orb" >&2
+  exit 1
+fi
+if ! cmp -s "$VM_EXPECTED_ERROR" "$VM_ERROR_LOG"; then
+  echo "expected exactly: error: missing required tool: $TMP_ROOT/not-an-orb" >&2
+  echo "actual VM copy stderr:" >&2
+  cat "$VM_ERROR_LOG" >&2
+  exit 1
+fi
+
 LOCAL_OUTPUT_DIR="$TMP_ROOT/host-output-local"
-"$REPO_ROOT/examples/shield-lab/collect-kali-vm-sample.sh" \
+ORB_BIN="$TMP_ROOT/not-an-orb" \
+  "$REPO_ROOT/examples/shield-lab/collect-kali-vm-sample.sh" \
   --host-bundle-dir "$HOST_BUNDLE_DIR" \
   --edge-decisions "$EDGE_DECISIONS_PATH" \
   "$HOST_OUTPUT_DIR" \

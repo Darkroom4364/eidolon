@@ -76,6 +76,7 @@ copy_sample_tree() {
 
   quoted_sample_dir="$(printf '%q' "$sample_dir")"
   mkdir -p "$host_output_dir"
+  require_command "$ORB_BIN"
 
   orb_cmd "
 set -euo pipefail
@@ -187,7 +188,6 @@ if [[ -n "$EDGE_DECISIONS_PATH" && ! -f "$EDGE_DECISIONS_PATH" ]]; then
   fail "edge-decisions file does not exist: $EDGE_DECISIONS_PATH"
 fi
 
-require_command "$ORB_BIN"
 require_command shasum
 
 mkdir -p "$HOST_OUTPUT_DIR"
