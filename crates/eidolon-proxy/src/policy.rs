@@ -301,6 +301,7 @@ pub fn transition_to_suspicious_from_ingress_signals(
     discovery_path_prefixes: &[String],
     ingress_identity: &IngressIdentity,
     ingress_signals: &IngressAdvisorySignals,
+    reason_path: &str,
 ) -> Option<PolicyTransition> {
     if !matches!(current_state, PolicyState::Normal | PolicyState::Observe) {
         return None;
@@ -334,7 +335,7 @@ pub fn transition_to_suspicious_from_ingress_signals(
         current_state,
         PolicyState::Suspicious,
         format!(
-            "{DISCOVERY_INGRESS_SUSPICIOUS_REASON_PREFIX}: path={path} actor_kind={} vendor_score={vendor_score} kind={AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND}",
+            "{DISCOVERY_INGRESS_SUSPICIOUS_REASON_PREFIX}: path={reason_path} actor_kind={} vendor_score={vendor_score} kind={AUTOMATION_LIKELIHOOD_INVERSE_SCORE_KIND}",
             snake_case_actor_kind(ingress_signals.actor_kind),
         ),
     ))
@@ -1000,6 +1001,7 @@ mod tests {
                 vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
                 ..Default::default()
             },
+            "/docs/legacy-import",
         ) else {
             panic!("observe should transition to suspicious");
         };
@@ -1032,6 +1034,7 @@ mod tests {
                 vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
                 ..Default::default()
             },
+            "/docs/legacy-import",
         );
 
         assert_eq!(transition, None);
@@ -1050,6 +1053,7 @@ mod tests {
                 vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
                 ..Default::default()
             },
+            "/docs/legacy-import",
         );
         let non_discovery = transition_to_suspicious_from_ingress_signals(
             PolicyState::Observe,
@@ -1062,6 +1066,7 @@ mod tests {
                 vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
                 ..Default::default()
             },
+            "/health",
         );
         let near_prefix = transition_to_suspicious_from_ingress_signals(
             PolicyState::Observe,
@@ -1074,6 +1079,7 @@ mod tests {
                 vendor_score_kind: Some("automation_likelihood_inverse".to_string()),
                 ..Default::default()
             },
+            "/docs2",
         );
 
         assert_eq!(high_score, None);

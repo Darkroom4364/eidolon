@@ -7,6 +7,7 @@ pub mod ingress_identity;
 pub mod policy;
 pub mod policy_store;
 pub mod production_http;
+pub mod production_runtime;
 pub mod request_evaluation;
 pub mod session;
 pub mod session_auth;

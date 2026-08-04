@@ -33,7 +33,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::session::{SESSION_COOKIE_ATTRIBUTES, SESSION_COOKIE_NAME};
+use crate::session::{SessionCookiePolicy, SESSION_COOKIE_NAME};
 use crate::session_continuity_store::{
     self, IntegrityKey, StateCommitOutcome, StoredContinuityRecord, StoredContinuityState,
 };
@@ -393,6 +393,7 @@ pub struct SessionAuthority {
     keys: Vec<SessionKeyVersion>,
     active_key_version: u32,
     cookie_lifetime_secs: u64,
+    cookie_policy: SessionCookiePolicy,
     continuity_ttl_secs: u64,
     continuity_capacity: usize,
     continuity: HashMap<ContinuityKey, ContinuityRecord>,
@@ -479,6 +480,7 @@ impl SessionAuthority {
             keys,
             active_key_version,
             cookie_lifetime_secs: DEFAULT_COOKIE_LIFETIME_SECS,
+            cookie_policy: SessionCookiePolicy::Lab,
             continuity_ttl_secs: DEFAULT_CONTINUITY_TTL_SECS,
             continuity_capacity: DEFAULT_CONTINUITY_CAPACITY,
             continuity: HashMap::new(),
@@ -535,6 +537,10 @@ impl SessionAuthority {
 
     pub fn key_version_count(&self) -> usize {
         self.keys.len()
+    }
+    /// Select the attributes attached to newly minted session cookies.
+    pub fn set_cookie_policy(&mut self, policy: SessionCookiePolicy) {
+        self.cookie_policy = policy;
     }
 
     /// Configure the maximum number of continuity identities retained.
@@ -717,7 +723,7 @@ impl SessionAuthority {
             "{}={}; {}",
             SESSION_COOKIE_NAME,
             self.mint_cookie_value(session_id, iat),
-            SESSION_COOKIE_ATTRIBUTES
+            self.cookie_policy.attributes()
         )
     }
 

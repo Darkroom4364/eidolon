@@ -1,29 +1,71 @@
 use std::{error::Error, fmt};
 
+use bytes::Bytes;
 use hyper::{
     header::{CONNECTION, CONTENT_LENGTH, EXPECT, HOST, TRAILER, TRANSFER_ENCODING, UPGRADE},
     Method, Request, Version,
 };
 
 use crate::http_request::{
-    canonical_request_target, HttpHeader, HttpRequest, HttpVersion, RequestTargetMode,
-    RequestTargetRejection, MAX_HTTP_BODY_BYTES, MAX_HTTP_HEADER_BYTES,
+    canonical_request_target, HttpHeader, HttpRequest, RequestTargetMode, RequestTargetRejection,
+    MAX_HTTP_BODY_BYTES, MAX_HTTP_HEADER_BYTES,
 };
 
 pub const MAX_PRODUCTION_HEADER_COUNT: usize = 100;
 pub const MAX_PRODUCTION_HEADER_BYTES: usize = MAX_HTTP_HEADER_BYTES;
 pub const MAX_PRODUCTION_BODY_BYTES: usize = MAX_HTTP_BODY_BYTES;
 
-pub type ProductionHttpVersion = HttpVersion;
-pub type ProductionHttpHeader = HttpHeader;
+/// Production exposes HTTP/1.1 only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductionHttpVersion {
+    Http11,
+}
+
+impl ProductionHttpVersion {
+    pub const fn as_str(self) -> &'static str {
+        "HTTP/1.1"
+    }
+}
+
+/// Bytes and trailer presence observed while Hyper collected an inbound body.
+///
+/// Trailer values are deliberately never retained: unsupported trailers cannot
+/// reach a processor hook or a rejection audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProductionInboundBody {
+    bytes: Bytes,
+    trailers_observed: bool,
+}
+
+impl ProductionInboundBody {
+    pub fn new(bytes: impl Into<Bytes>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            trailers_observed: false,
+        }
+    }
+
+    pub fn with_observed_trailers(bytes: impl Into<Bytes>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            trailers_observed: true,
+        }
+    }
+}
+
+/// The fixed production transport policy. It admits HTTP/1.1 only; the Lab
+/// parser and serializer are outside this boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProductionHttpPolicy;
 
 /// Request accepted by the production adapter after all boundary validation.
 ///
-/// The inner parsed request stays private so callers cannot construct or
-/// mutate a production request without passing through `adapt_hyper_request`.
+/// Its internal parsed request remains private so callers cannot create an
+/// upstream-eligible request without crossing this boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProductionHttpRequest {
     request: HttpRequest,
+    body: Bytes,
 }
 
 impl ProductionHttpRequest {
@@ -35,16 +77,44 @@ impl ProductionHttpRequest {
         self.request.target()
     }
 
-    pub fn version(&self) -> ProductionHttpVersion {
-        self.request.version()
+    pub const fn version(&self) -> ProductionHttpVersion {
+        ProductionHttpVersion::Http11
     }
 
-    pub fn headers(&self) -> &[ProductionHttpHeader] {
+    pub fn headers(&self) -> &[HttpHeader] {
         self.request.headers()
     }
 
     pub fn body(&self) -> &[u8] {
-        self.request.body()
+        &self.body
+    }
+
+    pub fn body_bytes(&self) -> Bytes {
+        self.body.clone()
+    }
+
+    /// Return a validated request with the named end-to-end headers removed.
+    /// This preserves the cache-proof boundary without exposing a constructor.
+    pub fn without_headers_case_insensitive(&self, names: &[&str]) -> Self {
+        let mut request = self.request.clone();
+        request.headers.retain(|header| {
+            !names
+                .iter()
+                .any(|name| header.name.eq_ignore_ascii_case(name))
+        });
+        Self {
+            request,
+            body: self.body.clone(),
+        }
+    }
+
+    /// Return a lifecycle-owned view for the existing session, policy, surface,
+    /// and audit pipeline. The typed body stays private for Hyper upstream
+    /// dispatch; this one copy keeps the Lab request representation isolated.
+    pub fn to_lifecycle_request(&self) -> HttpRequest {
+        let mut request = self.request.clone();
+        request.body = self.body.to_vec();
+        request
     }
 }
 
@@ -68,10 +138,12 @@ pub enum ProductionRequestRejection {
     InvalidContentLength,
     MultipleContentLengths,
     ContentLengthMismatch,
+    RequestTimedOut,
+    BodyReadFailed,
 }
 
 impl ProductionRequestRejection {
-    pub fn audit_code(self) -> &'static str {
+    pub const fn audit_code(self) -> &'static str {
         match self {
             Self::UnsupportedHttpVersion => "unsupported_http_version",
             Self::UnsupportedConnect => "unsupported_connect",
@@ -91,13 +163,16 @@ impl ProductionRequestRejection {
             Self::InvalidContentLength => "invalid_content_length",
             Self::MultipleContentLengths => "multiple_content_lengths",
             Self::ContentLengthMismatch => "content_length_mismatch",
+            Self::RequestTimedOut => "request_timed_out",
+            Self::BodyReadFailed => "body_read_failed",
         }
     }
 
-    pub fn response_status(self) -> u16 {
+    pub const fn response_status(self) -> u16 {
         match self {
             Self::BodyTooLarge => 413,
             Self::UnsupportedExpectation => 417,
+            Self::RequestTimedOut => 408,
             _ => 400,
         }
     }
@@ -111,73 +186,88 @@ impl fmt::Display for ProductionRequestRejection {
 
 impl Error for ProductionRequestRejection {}
 
-/// Convert a request parsed by Hyper into the only request shape that the
-/// production policy path may consume. The runtime activation slice will
-/// collect Hyper's body into bytes before calling this boundary.
+/// Adapt a collected Hyper request with the fixed production HTTP/1.1 policy.
 ///
-/// This adapter deliberately supports less than Hyper can parse. Unsupported
-/// protocol features fail before request evaluation or upstream dispatch.
+/// This compatibility entry point is for fully collected byte bodies. The
+/// production listener uses [`ProductionHttpPolicy::adapt`] so trailer
+/// presence stays visible to the boundary.
 pub fn adapt_hyper_request<B>(
     request: Request<B>,
 ) -> Result<ProductionHttpRequest, ProductionRequestRejection>
 where
     B: AsRef<[u8]>,
 {
-    let version = match request.version() {
-        Version::HTTP_10 => ProductionHttpVersion::Http10,
-        Version::HTTP_11 => ProductionHttpVersion::Http11,
-        _ => return Err(ProductionRequestRejection::UnsupportedHttpVersion),
-    };
-    if request.method() == Method::CONNECT {
-        return Err(ProductionRequestRejection::UnsupportedConnect);
-    }
+    let (parts, body) = request.into_parts();
+    ProductionHttpPolicy.adapt(Request::from_parts(
+        parts,
+        ProductionInboundBody::new(Bytes::copy_from_slice(body.as_ref())),
+    ))
+}
 
-    let target = request.uri().to_string();
+impl ProductionHttpPolicy {
+    pub fn adapt(
+        self,
+        request: Request<ProductionInboundBody>,
+    ) -> Result<ProductionHttpRequest, ProductionRequestRejection> {
+        if request.version() != Version::HTTP_11 {
+            return Err(ProductionRequestRejection::UnsupportedHttpVersion);
+        }
+        if request.method() == Method::CONNECT {
+            return Err(ProductionRequestRejection::UnsupportedConnect);
+        }
+        if request.body().trailers_observed {
+            return Err(ProductionRequestRejection::UnsupportedTrailers);
+        }
 
-    let header_count = request.headers().iter().count();
-    if header_count > MAX_PRODUCTION_HEADER_COUNT {
-        return Err(ProductionRequestRejection::TooManyHeaders);
-    }
-    if encoded_head_len(&request, &target)? > MAX_PRODUCTION_HEADER_BYTES {
-        return Err(ProductionRequestRejection::HeadersTooLarge);
-    }
+        let target = request.uri().to_string();
+        let header_count = request.headers().iter().count();
+        if header_count > MAX_PRODUCTION_HEADER_COUNT {
+            return Err(ProductionRequestRejection::TooManyHeaders);
+        }
+        if encoded_head_len(&request, &target)? > MAX_PRODUCTION_HEADER_BYTES {
+            return Err(ProductionRequestRejection::HeadersTooLarge);
+        }
 
-    reject_unsupported_protocol_headers(&request)?;
+        reject_unsupported_protocol_headers(&request)?;
 
-    let body = request.body().as_ref();
-    if body.len() > MAX_PRODUCTION_BODY_BYTES {
-        return Err(ProductionRequestRejection::BodyTooLarge);
-    }
-    validate_content_length(&request, body.len())?;
+        let body = request.body().bytes.clone();
+        if body.len() > MAX_PRODUCTION_BODY_BYTES {
+            return Err(ProductionRequestRejection::BodyTooLarge);
+        }
+        validate_content_length(&request, body.len())?;
 
-    let headers = request
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            let value = value.to_str().map_err(|_| {
-                if name == HOST {
-                    ProductionRequestRejection::InvalidHost
-                } else {
-                    ProductionRequestRejection::NonAsciiHeaderValue
-                }
-            })?;
-            Ok(ProductionHttpHeader {
-                name: name.as_str().to_string(),
-                value: value.to_string(),
+        let headers = request
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                let value = value.to_str().map_err(|_| {
+                    if name == HOST {
+                        ProductionRequestRejection::InvalidHost
+                    } else {
+                        ProductionRequestRejection::NonAsciiHeaderValue
+                    }
+                })?;
+                Ok(HttpHeader {
+                    name: name.as_str().to_string(),
+                    value: value.to_string(),
+                })
             })
-        })
-        .collect::<Result<Vec<_>, ProductionRequestRejection>>()?;
+            .collect::<Result<Vec<_>, ProductionRequestRejection>>()?;
 
-    let mut adapted = HttpRequest {
-        method: request.method().as_str().to_string(),
-        target,
-        version,
-        headers,
-        body: body.to_vec(),
-    };
-    adapted.target = canonical_request_target(&adapted, RequestTargetMode::OriginOnly)
-        .map_err(map_target_rejection)?;
-    Ok(ProductionHttpRequest { request: adapted })
+        let mut adapted = HttpRequest {
+            method: request.method().as_str().to_string(),
+            target,
+            version: crate::http_request::HttpVersion::Http11,
+            headers,
+            body: Vec::new(),
+        };
+        adapted.target = canonical_request_target(&adapted, RequestTargetMode::OriginOnly)
+            .map_err(map_target_rejection)?;
+        Ok(ProductionHttpRequest {
+            request: adapted,
+            body,
+        })
+    }
 }
 
 fn encoded_head_len<B>(
@@ -338,14 +428,12 @@ mod tests {
     }
 
     #[test]
-    fn supports_only_http10_and_http11() {
+    fn supports_only_http11() {
         let mut http10_request = request(Method::GET, "/docs", Vec::new());
         *http10_request.version_mut() = Version::HTTP_10;
-        assert_eq!(
-            adapt_hyper_request(http10_request)
-                .expect("HTTP/1.0 request should adapt")
-                .version(),
-            ProductionHttpVersion::Http10
+        assert_rejected_before_dispatch(
+            http10_request,
+            ProductionRequestRejection::UnsupportedHttpVersion,
         );
 
         for version in [Version::HTTP_2, Version::HTTP_3] {

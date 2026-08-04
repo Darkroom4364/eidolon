@@ -41,7 +41,43 @@ Eidolon releases use semantic versioning. Within a major release line:
 | Edge decision export | `contract_version` | `2026-06-05.v1` | Producer-stamped today; consumer-side validation is tracked by issue #252. |
 | Smoke evidence JSON (kind/orbstack smokes) | `schema_version` | `1` | Fixture validators (`--validate-fixture`) reject missing/extra files and violated invariants; m3 packaging enforces via `pe_expect`. |
 | Metrics summary (lab) | `schema_version` | `0` | Lab artifact, not part of the supported envelope. |
-| Proxy CLI/config | — | none yet | Unknown flags are rejected; a `--version` flag and a config-contract doc are tracked by issue #252. |
+| Proxy effective configuration (`--print-effective-config`) | `schema_version` | `1` | Redacted output projection only; it never starts the runtime. Unknown CLI flags and invalid profile inputs are rejected before startup (`main.rs`). |
+
+
+### Lab and production audit projections
+
+Route-bearing event fields, debug diagnostics, and policy transition reasons
+are projected per runtime profile. The Lab profile preserves the schema-v2
+values exactly: raw request paths with query and fragment values redacted,
+full ingress identity and advisory detail, and raw `path=` segments in
+transition reasons. The production profile emits bounded route classes (for
+example `route:docs`), redacted ingress values, and route-class reason paths
+so production durable sinks never carry raw path data. This is a projection
+of identical field semantics, not a schema change: `events.jsonl` remains
+version 2 and the debug envelope remains version 1.
+
+### Production diagnostic and configuration projections
+
+Production requires the server-side debug JSONL v1 envelope. Rejections that
+never enter the normal lifecycle use fixed, redacted diagnostic records with a
+fresh request ID and `session_id: null`: `production_pre_service_rejected`
+records terminal Hyper boundary classifications before the request service
+(`request_id`, `rejection`), while `production_request_rejected` records
+post-service adapter rejections (`request_id`, `rejection`,
+`response_status`). These records contain no request payload, error text,
+normal Event, trace, or export data; their rejection codes are fixed v1
+values. They are diagnostic audit records, not additions to the Event schema.
+
+The effective-config v1 projection contains only the selected profile,
+session-signing/cookie mode, ingress dependency booleans, required-sink
+configuration state, and renderer mode. It omits supplied secrets and
+filesystem paths and exits without starting the runtime.
+
+Production resolves its upstream once through Tokio before binding the
+listener, retains the complete ordered address set for typed dispatch, and
+fails startup on its explicit resolution timeout or lookup error. Failure uses
+the runtime's bounded shutdown path; it does not claim to cancel a system
+resolver operation that has already outlived the lookup future.
 
 ## Compatibility rules
 
