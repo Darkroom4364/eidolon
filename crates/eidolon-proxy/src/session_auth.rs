@@ -29,7 +29,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use eidolon_core::{PolicyState, SessionId};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -110,7 +110,7 @@ pub struct ContinuityKey {
 
 impl ContinuityKey {
     pub(crate) fn authenticated_ingress(raw: &str, continuity_key: &str) -> Self {
-        let mut mac = <SessionMac as Mac>::new_from_slice(continuity_key.as_bytes())
+        let mut mac = <SessionMac as KeyInit>::new_from_slice(continuity_key.as_bytes())
             .expect("HMAC-SHA256 accepts any continuity key length");
         mac.update(CONTINUITY_HASH_DOMAIN_INGRESS);
         mac.update(raw.as_bytes());
@@ -1266,8 +1266,8 @@ impl SessionAuthority {
         };
 
         let payload = format!("{tag}.{key_version}.{iat}.{session_uuid}");
-        let mut mac_verifier =
-            <SessionMac as Mac>::new_from_slice(&key).expect("HMAC-SHA256 accepts any key length");
+        let mut mac_verifier = <SessionMac as KeyInit>::new_from_slice(&key)
+            .expect("HMAC-SHA256 accepts any key length");
         mac_verifier.update(b"eidolon-session:");
         mac_verifier.update(payload.as_bytes());
         if mac_verifier.verify_slice(&mac_bytes).is_err() {
@@ -1294,8 +1294,8 @@ impl SessionAuthority {
             .find(|key| key.version == key_version)
             .expect("signing requires a known key version")
             .key;
-        let mut mac =
-            <SessionMac as Mac>::new_from_slice(&key).expect("HMAC-SHA256 accepts any key length");
+        let mut mac = <SessionMac as KeyInit>::new_from_slice(&key)
+            .expect("HMAC-SHA256 accepts any key length");
         Mac::update(&mut mac, b"eidolon-session:");
         Mac::update(&mut mac, payload.as_bytes());
         let bytes = mac.finalize().into_bytes();
@@ -1605,7 +1605,7 @@ pub fn enforcement_rank(state: PolicyState) -> u8 {
 }
 
 fn continuity_state_key_id_hex(continuity_key: &str) -> String {
-    let mut mac = <SessionMac as Mac>::new_from_slice(continuity_key.as_bytes())
+    let mut mac = <SessionMac as KeyInit>::new_from_slice(continuity_key.as_bytes())
         .expect("HMAC-SHA256 accepts any continuity key length");
     mac.update(CONTINUITY_STATE_KEY_ID_DOMAIN);
     encode_hex(&mac.finalize().into_bytes())
