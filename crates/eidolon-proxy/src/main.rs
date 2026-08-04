@@ -12272,11 +12272,32 @@ mod tests {
             "pre-service rejections must not create normal lifecycle events"
         );
 
-        let records = fs::read_to_string(&server.debug_log_path)
-            .expect("debug log should read")
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).expect("debug record should parse"))
-            .collect::<Vec<_>>();
+        let audit_deadline = Instant::now() + Duration::from_secs(1);
+        let mut observed_pre_service_audits = 0;
+        let records = loop {
+            let debug_jsonl =
+                fs::read_to_string(&server.debug_log_path).expect("debug log should read");
+            if debug_jsonl.ends_with('\n') {
+                let records = debug_jsonl
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str::<Value>(line).expect("debug record should parse")
+                    })
+                    .collect::<Vec<_>>();
+                observed_pre_service_audits = records
+                    .iter()
+                    .filter(|record| record["event"] == "production_pre_service_rejected")
+                    .count();
+                if observed_pre_service_audits >= 2 {
+                    break records;
+                }
+            }
+            assert!(
+                Instant::now() < audit_deadline,
+                "timed out waiting for pre-service audits; observed {observed_pre_service_audits}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
         let boundary_audits = records
             .iter()
             .filter(|record| record["event"] == "production_request_rejected")
