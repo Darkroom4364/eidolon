@@ -9,7 +9,7 @@ use eidolon_core::{
     Bait, BaitClass, BaitHeaderValueMintStatus, BaitId, ExpectedAction, HeaderValueMintKind,
     SessionId, SurfaceKind,
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 pub const DECOY_RECONCILE_PATH: &str = "/api/v2/import/reconcile";

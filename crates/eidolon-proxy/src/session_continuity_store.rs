@@ -12,7 +12,7 @@ use std::{
 };
 
 use eidolon_core::{PolicyState, SessionId};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -41,7 +41,7 @@ impl IntegrityKey {
                 "continuity integrity key requires a non-empty continuity key",
             ));
         }
-        let mut mac = <StoreMac as Mac>::new_from_slice(continuity_key.as_bytes())
+        let mut mac = <StoreMac as KeyInit>::new_from_slice(continuity_key.as_bytes())
             .expect("HMAC-SHA256 accepts any continuity key length");
         mac.update(INTEGRITY_KEY_DOMAIN);
         Ok(Self(mac.finalize().into_bytes().into()))
@@ -272,7 +272,7 @@ fn integrity_payload(state: &State) -> io::Result<Vec<u8>> {
 
 fn integrity_mac(state: &State, integrity_key: &IntegrityKey) -> io::Result<[u8; 32]> {
     let payload = integrity_payload(state)?;
-    let mut mac = <StoreMac as Mac>::new_from_slice(&integrity_key.0)
+    let mut mac = <StoreMac as KeyInit>::new_from_slice(&integrity_key.0)
         .expect("HMAC-SHA256 accepts a 32-byte integrity key");
     mac.update(INTEGRITY_MAC_DOMAIN);
     mac.update(&(payload.len() as u64).to_be_bytes());
@@ -290,7 +290,7 @@ fn verify_integrity(state: &State, integrity_key: &IntegrityKey) -> io::Result<(
     let presented = decode_sha256_hex(&state.integrity_mac_hex).ok_or_else(|| {
         invalid_data("integrity_mac_hex must be exactly 64 lowercase hex characters")
     })?;
-    let mut verifier = <StoreMac as Mac>::new_from_slice(&integrity_key.0)
+    let mut verifier = <StoreMac as KeyInit>::new_from_slice(&integrity_key.0)
         .expect("HMAC-SHA256 accepts a 32-byte integrity key");
     verifier.update(INTEGRITY_MAC_DOMAIN);
     let payload = integrity_payload(state)?;
