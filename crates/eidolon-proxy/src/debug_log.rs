@@ -73,6 +73,10 @@ impl FileDebugLogWriter {
             startup_tail_repair,
         })
     }
+    pub fn sync_all(&mut self) -> io::Result<()> {
+        self.sink.flush()?;
+        self.sink.get_ref().sync_all()
+    }
 }
 
 impl<W: Write> DebugLogWriter<W> {
