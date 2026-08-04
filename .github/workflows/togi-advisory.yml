@@ -8,9 +8,14 @@ permissions:
   pull-requests: write
   security-events: write
 
+concurrency:
+  group: togi-advisory-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   mutation-test:
     name: Mutation testing (advisory)
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
