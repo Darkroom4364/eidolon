@@ -4247,90 +4247,100 @@ fn process_request(
     let mut controlled_reality_interaction = None;
     let mut controlled_reality_pending_commit = false;
     let mut _controlled_reality_workflow_guard = None;
-    let controller_surface_action = match request_evaluation::initial_route_plan(
-        &decision,
-        intervention_mode,
-    ) {
-        request_evaluation::InitialRoutePlan::ProtectedUpstream => SurfaceAction::ProtectedUpstream,
-        request_evaluation::InitialRoutePlan::SurfaceController => runtime
-            .surface_controller
-            .decide(&surface_request, session.session_id)?,
-        request_evaluation::InitialRoutePlan::ControlledReality => {
-            _controlled_reality_workflow_guard = Some(
+    let trusted_bait_soften_path_prefixes = runtime
+        .audit_projection
+        .path_prefixes(&runtime.trusted_bait_soften_path_prefixes);
+    let trusted_ingress_local_soften_path_prefixes = runtime
+        .audit_projection
+        .optional_path_prefixes(&session.trusted_bait_soften_path_prefixes);
+    let controller_surface_action =
+        match request_evaluation::initial_route_plan(&decision, intervention_mode) {
+            request_evaluation::InitialRoutePlan::ProtectedUpstream => {
+                SurfaceAction::ProtectedUpstream
+            }
+            request_evaluation::InitialRoutePlan::SurfaceController => {
                 runtime
-                    .controlled_reality_workflow_locks
-                    .lock(session.session_id)?,
-            );
-            let (action, transition, interaction, pending_commit) = controlled_reality_action(
-                runtime,
-                session.session_id,
-                request_id,
-                &surface_request,
-                decision.reason.clone(),
-            )?;
-            controlled_reality_pending_commit = pending_commit;
-            if let Some(transition) = transition {
-                stage_controlled_reality_policy_transition(
+                    .surface_controller
+                    .decide(&surface_request, session.session_id)?
+            }
+            request_evaluation::InitialRoutePlan::ControlledReality => {
+                _controlled_reality_workflow_guard = Some(
+                    runtime
+                        .controlled_reality_workflow_locks
+                        .lock(session.session_id)?,
+                );
+                let (action, transition, interaction, pending_commit) = controlled_reality_action(
                     runtime,
                     session.session_id,
                     request_id,
-                    &transition,
+                    &surface_request,
+                    decision.reason.clone(),
                 )?;
-                let blocked_decision = transition.decision(action.routing_decision());
-                write_debug(
-                    runtime,
-                    "surface_action_selected",
-                    Some(session.session_id),
-                    json!({
-                        "policy_state": blocked_decision.policy_state,
-                        "policy_routing_decision": blocked_decision.routing_decision,
-                        "policy_reason": blocked_decision.reason.as_str(),
-                        "controller_surface_action": debug_surface_action(&action),
-                        "candidate_surface_action": debug_surface_action(&action),
-                        "surface_action": debug_surface_action(&action),
-                        "surface_requested_intervention": true,
-                        "trusted_ingress_softened_surface": false,
-                        "trusted_ingress_softening_reason": Value::Null,
-                        "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
-                        "trusted_ingress_local_soften_path_prefixes":
-                            &session.trusted_bait_soften_path_prefixes,
-                    }),
-                )?;
-                let SurfaceAction::EidolonOwned { response } = action else {
-                    panic!("blocked controlled-reality action should be eidolon owned");
-                };
-                return direct_response(DirectResponseContext {
-                    runtime,
-                    session: &session,
-                    request: &request,
-                    path: &path,
-                    request_id,
-                    decision: &blocked_decision,
-                    discovery_recon_score,
-                    discovery_recon_threshold,
-                    response,
-                    controlled_reality_interaction: None,
-                    controlled_reality_pending_commit,
-                    intervention_mode,
-                    surface_requested_intervention: true,
-                });
+                controlled_reality_pending_commit = pending_commit;
+                if let Some(transition) = transition {
+                    stage_controlled_reality_policy_transition(
+                        runtime,
+                        session.session_id,
+                        request_id,
+                        &transition,
+                    )?;
+                    let blocked_decision = transition.decision(action.routing_decision());
+                    write_debug(
+                        runtime,
+                        "surface_action_selected",
+                        Some(session.session_id),
+                        json!({
+                            "policy_state": blocked_decision.policy_state,
+                            "policy_routing_decision": blocked_decision.routing_decision,
+                            "policy_reason": blocked_decision.reason.as_str(),
+                            "controller_surface_action": debug_surface_action(&action),
+                            "candidate_surface_action": debug_surface_action(&action),
+                            "surface_action": debug_surface_action(&action),
+                            "surface_requested_intervention": true,
+                            "trusted_ingress_softened_surface": false,
+                            "trusted_ingress_softening_reason": Value::Null,
+                            "trusted_bait_soften_path_prefixes": &trusted_bait_soften_path_prefixes,
+                            "trusted_ingress_local_soften_path_prefixes":
+                                &trusted_ingress_local_soften_path_prefixes,
+                        }),
+                    )?;
+                    let SurfaceAction::EidolonOwned { response } = action else {
+                        panic!("blocked controlled-reality action should be eidolon owned");
+                    };
+                    return direct_response(DirectResponseContext {
+                        runtime,
+                        session: &session,
+                        request: &request,
+                        path: &path,
+                        request_id,
+                        decision: &blocked_decision,
+                        discovery_recon_score,
+                        discovery_recon_threshold,
+                        response,
+                        controlled_reality_interaction: None,
+                        controlled_reality_pending_commit,
+                        intervention_mode,
+                        surface_requested_intervention: true,
+                    });
+                }
+                controlled_reality_interaction = interaction;
+                action
             }
-            controlled_reality_interaction = interaction;
-            action
-        }
-        request_evaluation::InitialRoutePlan::RateLimited => SurfaceAction::RateLimited {
-            reason: decision.reason.clone(),
-            response: rate_limited_response(runtime.controlled_reality_config.retry_after_seconds),
-        },
-        request_evaluation::InitialRoutePlan::Blocked => SurfaceAction::EidolonOwned {
-            response: surface_text_response(403, "blocked by eidolon policy\n"),
-        },
-        request_evaluation::InitialRoutePlan::InvalidRewrittenUpstream => {
-            return Err(invalid_data(
-                "policy requested rewritten upstream without a surface rewrite plan",
-            ));
-        }
-    };
+            request_evaluation::InitialRoutePlan::RateLimited => SurfaceAction::RateLimited {
+                reason: decision.reason.clone(),
+                response: rate_limited_response(
+                    runtime.controlled_reality_config.retry_after_seconds,
+                ),
+            },
+            request_evaluation::InitialRoutePlan::Blocked => SurfaceAction::EidolonOwned {
+                response: surface_text_response(403, "blocked by eidolon policy\n"),
+            },
+            request_evaluation::InitialRoutePlan::InvalidRewrittenUpstream => {
+                return Err(invalid_data(
+                    "policy requested rewritten upstream without a surface rewrite plan",
+                ));
+            }
+        };
     let suspicious_discovery_plan = request_evaluation::suspicious_discovery_plan(
         decision.policy_state,
         &controller_surface_action,
@@ -4372,9 +4382,9 @@ fn process_request(
             "surface_requested_intervention": surface_requested_intervention,
             "trusted_ingress_softened_surface": trusted_ingress_softening_reason.is_some(),
             "trusted_ingress_softening_reason": trusted_ingress_softening_reason,
-            "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
+            "trusted_bait_soften_path_prefixes": &trusted_bait_soften_path_prefixes,
             "trusted_ingress_local_soften_path_prefixes":
-                &session.trusted_bait_soften_path_prefixes,
+                &trusted_ingress_local_soften_path_prefixes,
         }),
     )?;
     if let Some(transition) = maybe_transition_to_blocked_from_reality_escape_attempt(
@@ -4410,9 +4420,9 @@ fn process_request(
                 "surface_requested_intervention": true,
                 "trusted_ingress_softened_surface": false,
                 "trusted_ingress_softening_reason": Value::Null,
-                "trusted_bait_soften_path_prefixes": &runtime.trusted_bait_soften_path_prefixes,
+                "trusted_bait_soften_path_prefixes": &trusted_bait_soften_path_prefixes,
                 "trusted_ingress_local_soften_path_prefixes":
-                    &session.trusted_bait_soften_path_prefixes,
+                    &trusted_ingress_local_soften_path_prefixes,
             }),
         )?;
         return direct_response(DirectResponseContext {
@@ -12400,6 +12410,78 @@ mod tests {
         assert!(
             recorder.finish().is_empty(),
             "controlled-reality transition must not reach the protected upstream"
+        );
+    }
+
+    #[test]
+    fn production_surface_action_audit_projects_trusted_bait_soften_prefixes() {
+        const GLOBAL_SENTINEL: &str = "/global-sensitive-production-prefix";
+        const LOCAL_SENTINEL: &str = "/api/local-sensitive-production-prefix";
+
+        let trust_config_path = write_ingress_trust_config(&format!(
+            r#"{{
+              "schema_version": 1,
+              "entries": [
+                {{
+                  "label": "production-prefix-audit-test",
+                  "source": "local_allowlist",
+                  "trust_tier": "allowlisted",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/docs"],
+                  "bait_soften_path_prefixes": ["{LOCAL_SENTINEL}"],
+                  "required_headers": [
+                    {{ "name": "X-Eidolon-Trusted-Actor", "value": "production-prefix-audit-test" }}
+                  ]
+                }}
+              ]
+            }}"#
+        ));
+        let event_log_path = unique_temp_path("production-prefix-audit-events.jsonl");
+        let debug_log_path = unique_temp_path("production-prefix-audit-debug.jsonl");
+        let (upstream, upstream_handle) =
+            spawn_upstream(html_response("<html><body>docs</body></html>"));
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("production-prefix-audit-control.txt"),
+        );
+        runtime.audit_projection = AuditProjection::Production;
+        runtime.trusted_bait_soften_path_prefixes = vec![GLOBAL_SENTINEL.to_string()];
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&trust_config_path),
+            "ingress trust config should load",
+        ));
+
+        let response = parse_downstream_response(&run_production_runtime_request(
+            runtime,
+            &request_with_cookie(
+                "GET",
+                "/docs",
+                &cookie_header(),
+                &[("X-Eidolon-Trusted-Actor", "production-prefix-audit-test")],
+            ),
+        ));
+        upstream_handle.join().expect("upstream thread should join");
+        assert_eq!(response.status, 200);
+
+        let debug_jsonl = fs::read_to_string(&debug_log_path).expect("debug log should read");
+        assert!(
+            !debug_jsonl.contains(GLOBAL_SENTINEL),
+            "production debug JSONL leaked the global trusted prefix"
+        );
+        assert!(
+            !debug_jsonl.contains(LOCAL_SENTINEL),
+            "production debug JSONL leaked the local trusted prefix"
+        );
+        let surface_audit = first_debug_event(&debug_log_path, "surface_action_selected");
+        assert_eq!(
+            surface_audit["fields"]["trusted_bait_soften_path_prefixes"],
+            json!(["route:other"])
+        );
+        assert_eq!(
+            surface_audit["fields"]["trusted_ingress_local_soften_path_prefixes"],
+            json!(["route:api"])
         );
     }
 
