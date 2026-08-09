@@ -5,6 +5,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Component, Path, PathBuf},
+    pin::Pin,
     process::ExitCode,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -51,7 +52,8 @@ use eidolon_proxy::{
         dispatch_production_upstream, serve_production_http1, ProductionPreServiceRejection,
         ProductionProcessorError, ProductionRejectedRequest, ProductionRequestContext,
         ProductionRequestProcessor, ProductionResponse, ProductionRuntimeConfig,
-        ProductionUpstreamConfig, ProductionUpstreamTarget,
+        ProductionUpstreamConfig, ProductionUpstreamTarget, DEFAULT_PRODUCTION_SHUTDOWN_GRACE,
+        MAX_PRODUCTION_SHUTDOWN_GRACE,
     },
     request_evaluation::{self, RequestEvaluationInput, RequestPolicyFacts},
     session::{self, SessionContext},
@@ -256,6 +258,7 @@ struct ProxyConfig {
     controlled_reality_config: ControlledRealityConfig,
     controlled_reality_backend: Option<ControlledRealityBackendConfig>,
     owned_cluster_lab: bool,
+    production_shutdown_grace: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,6 +457,14 @@ impl CliAction {
                     let value = option_value(flag, inline_value, &mut args)?;
                     set_once(&mut builder.profile, flag, RuntimeProfile::parse(&value)?)?;
                 }
+                "--shutdown-grace-secs" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.production_shutdown_grace,
+                        flag,
+                        parse_production_shutdown_grace(&value)?,
+                    )?;
+                }
                 "--print-effective-config" => {
                     if builder.print_effective_config {
                         return Err(ConfigError::new(format!("duplicate option `{flag}`")));
@@ -645,6 +656,7 @@ struct ConfigBuilder {
     controlled_reality_max_depth: Option<u32>,
     controlled_reality_tarpit_delay: Option<Duration>,
     controlled_reality_retry_after_seconds: Option<u64>,
+    production_shutdown_grace: Option<Duration>,
     controlled_reality_backend_addr: Option<String>,
     controlled_reality_backend_auth_secret_path: Option<PathBuf>,
     owned_cluster_lab: bool,
@@ -654,6 +666,11 @@ struct ConfigBuilder {
 impl ConfigBuilder {
     fn build(self) -> Result<ProxyConfig, ConfigError> {
         let profile = self.profile.unwrap_or(RuntimeProfile::Lab);
+        if profile == RuntimeProfile::Lab && self.production_shutdown_grace.is_some() {
+            return Err(ConfigError::new(
+                "`--shutdown-grace-secs` is only available in the production profile",
+            ));
+        }
         if profile == RuntimeProfile::Production {
             if self.listen_addr.is_none() {
                 return Err(ConfigError::new(
@@ -868,6 +885,9 @@ impl ConfigBuilder {
             } else {
                 self.trusted_bait_soften_path_prefixes
             },
+            production_shutdown_grace: self
+                .production_shutdown_grace
+                .unwrap_or(DEFAULT_PRODUCTION_SHUTDOWN_GRACE),
             intervention_control_path,
             policy_state_path,
             controlled_reality_config: ControlledRealityConfig {
@@ -930,6 +950,13 @@ fn effective_config_projection(config: &ProxyConfig) -> Value {
             "event_log": "configured",
             "policy_state": "configured",
             "debug_log": config.debug_log_path.is_some(),
+        },
+        "shutdown": {
+            "grace_secs": if config.profile == RuntimeProfile::Production {
+                Value::from(config.production_shutdown_grace.as_secs())
+            } else {
+                Value::Null
+            },
         },
         "controlled_reality_renderer": if config.controlled_reality_backend.is_some() {
             "remote"
@@ -1137,6 +1164,22 @@ fn parse_u64_option(raw: &str, label: &str) -> Result<u64, ConfigError> {
     raw.parse::<u64>().map_err(|error| {
         ConfigError::new(format!("{label} must be a non-negative integer: {error}"))
     })
+}
+fn parse_production_shutdown_grace(raw: &str) -> Result<Duration, ConfigError> {
+    let seconds = parse_u64_option(raw, "shutdown grace seconds")?;
+    let grace = Duration::from_secs(seconds);
+    if grace.is_zero() {
+        return Err(ConfigError::new(
+            "shutdown grace seconds must be greater than zero",
+        ));
+    }
+    if grace > MAX_PRODUCTION_SHUTDOWN_GRACE {
+        return Err(ConfigError::new(format!(
+            "shutdown grace seconds must be at most {}",
+            MAX_PRODUCTION_SHUTDOWN_GRACE.as_secs()
+        )));
+    }
+    Ok(grace)
 }
 
 fn parse_tarpit_delay(raw: &str, label: &str) -> Result<Duration, ConfigError> {
@@ -1754,17 +1797,37 @@ impl Drop for ConnectionPermit {
 }
 
 fn run_proxy(config: ProxyConfig) -> io::Result<()> {
-    run_proxy_with_production_shutdown(config, std::future::pending(), None)
+    run_proxy_with_shutdown(config, ProductionShutdown::Sigterm, None)
 }
 
+enum ProductionShutdown {
+    Sigterm,
+    #[cfg(test)]
+    Injected(Pin<Box<dyn Future<Output = ()> + Send>>),
+}
+
+#[cfg(test)]
 fn run_proxy_with_production_shutdown<F>(
     config: ProxyConfig,
     production_shutdown: F,
     production_started: Option<std::sync::mpsc::Sender<SocketAddr>>,
 ) -> io::Result<()>
 where
-    F: Future<Output = ()> + Send,
+    F: Future<Output = ()> + Send + 'static,
 {
+    run_proxy_with_shutdown(
+        config,
+        ProductionShutdown::Injected(Box::pin(production_shutdown)),
+        production_started,
+    )
+}
+
+fn run_proxy_with_shutdown(
+    config: ProxyConfig,
+    production_shutdown: ProductionShutdown,
+    production_started: Option<std::sync::mpsc::Sender<SocketAddr>>,
+) -> io::Result<()> {
+    let production_shutdown_grace = config.production_shutdown_grace;
     let profile = config.profile;
     let listen_addr = config.listen_addr;
     let state_lease = DurableStateLease::acquire_for_policy_state(&config.policy_state_path)?;
@@ -2008,6 +2071,7 @@ where
         return run_production_proxy(
             listen_addr,
             runtime,
+            production_shutdown_grace,
             production_shutdown,
             production_started,
         );
@@ -2056,19 +2120,20 @@ fn production_upstream_config_within_processor_deadline(
     })
 }
 
-fn run_production_proxy<F>(
+fn run_production_proxy(
     listen_addr: SocketAddr,
     runtime: ProxyRuntime,
-    shutdown: F,
+    shutdown_grace: Duration,
+    shutdown: ProductionShutdown,
     started: Option<std::sync::mpsc::Sender<SocketAddr>>,
-) -> io::Result<()>
-where
-    F: Future<Output = ()> + Send,
-{
+) -> io::Result<()> {
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let production_config = ProductionRuntimeConfig::default();
+    let production_config = ProductionRuntimeConfig {
+        shutdown_grace,
+        ..ProductionRuntimeConfig::default()
+    };
     let upstream_config =
         production_upstream_config_within_processor_deadline(production_config.processor_timeout)?;
     let upstream = match tokio_runtime.block_on(production_upstream_target(&runtime.upstream)) {
@@ -2078,13 +2143,19 @@ where
             return Err(error);
         }
     };
+    let finalizer = runtime.clone();
     let processor = Arc::new(ProductionLifecycleProcessor {
         runtime,
         upstream,
         upstream_config,
         runtime_handle: tokio_runtime.handle().clone(),
     });
-    tokio_runtime.block_on(async move {
+    let result = tokio_runtime.block_on(async move {
+        let shutdown = match shutdown {
+            ProductionShutdown::Sigterm => production_sigterm_shutdown()?,
+            #[cfg(test)]
+            ProductionShutdown::Injected(shutdown) => shutdown,
+        };
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
         let local_addr = listener.local_addr()?;
         if let Some(started) = started {
@@ -2098,7 +2169,61 @@ where
         serve_production_http1(listener, production_config, processor, shutdown)
             .await
             .map_err(|error| io::Error::other(error.to_string()))
-    })
+    });
+    match result {
+        Ok(()) => {
+            let finalization = finalize_production_drain(&finalizer);
+            tokio_runtime.shutdown_timeout(Duration::ZERO);
+            finalization
+        }
+        Err(error) => {
+            tokio_runtime.shutdown_timeout(Duration::ZERO);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn production_sigterm_shutdown() -> io::Result<Pin<Box<dyn Future<Output = ()> + Send>>> {
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(Box::pin(async move {
+        signal.recv().await;
+    }))
+}
+
+#[cfg(not(unix))]
+fn production_sigterm_shutdown() -> io::Result<Pin<Box<dyn Future<Output = ()> + Send>>> {
+    Err(io::Error::other(
+        "production SIGTERM handling is unavailable on this platform",
+    ))
+}
+
+fn finalize_production_drain(runtime: &ProxyRuntime) -> io::Result<()> {
+    finalize_production_drain_with_log_syncs(
+        runtime,
+        FileEventLogWriter::sync_all,
+        FileDebugLogWriter::sync_all,
+    )
+}
+
+fn finalize_production_drain_with_log_syncs(
+    runtime: &ProxyRuntime,
+    sync_event_log: impl FnOnce(&mut FileEventLogWriter) -> io::Result<()>,
+    sync_debug_log: impl FnOnce(&mut FileDebugLogWriter) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut event_log = runtime
+        .event_log
+        .lock()
+        .map_err(|_| io::Error::other("event log lock poisoned"))?;
+    sync_event_log(&mut event_log)?;
+    drop(event_log);
+    if let Some(debug_log) = &runtime.debug_log {
+        let mut debug_log = debug_log
+            .lock()
+            .map_err(|_| io::Error::other("debug log lock poisoned"))?;
+        sync_debug_log(&mut debug_log)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -7972,6 +8097,10 @@ Options:
                          Runtime profile [default: lab]. Production uses only the
                          Hyper HTTP/1.1 listener and requires explicit durable
                          session, ingress, state, debug-log, and remote renderer inputs
+  --shutdown-grace-secs <SECONDS>
+                         Production-only successful-drain grace; failure waits
+                         for non-cancellable accepted work to quiesce
+                         [default: {default_shutdown_grace_secs}; max: {max_shutdown_grace_secs}]
   --print-effective-config
                          Print a versioned redacted JSON configuration projection and exit
   --listen-addr <ADDR>  Loopback socket address to listen on [default: {DEFAULT_LISTEN_ADDR}]
@@ -8035,7 +8164,9 @@ Owned cluster lab:
 "
 ,
         default_tarpit_ms = DEFAULT_TARPIT_DELAY.as_millis(),
-        max_tarpit_ms = MAX_TARPIT_DELAY.as_millis()
+        max_tarpit_ms = MAX_TARPIT_DELAY.as_millis(),
+        default_shutdown_grace_secs = DEFAULT_PRODUCTION_SHUTDOWN_GRACE.as_secs(),
+        max_shutdown_grace_secs = MAX_PRODUCTION_SHUTDOWN_GRACE.as_secs(),
     )
 }
 
@@ -9857,6 +9988,9 @@ mod tests {
                     "policy_state": "configured",
                     "debug_log": true,
                 },
+                "shutdown": {
+                    "grace_secs": 60,
+                },
                 "controlled_reality_renderer": "remote",
             })
         );
@@ -9873,6 +10007,139 @@ mod tests {
             );
         }
 
+        fixture.stop();
+    }
+
+    #[test]
+    fn production_finalization_invokes_optional_debug_sync() {
+        let event_log_path = unique_temp_path("production-finalization-events.jsonl");
+        let debug_log_path = unique_temp_path("production-finalization-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("production-finalization-control.txt"),
+        );
+        let sync_calls = AtomicUsize::new(0);
+
+        finalize_production_drain_with_log_syncs(
+            &runtime,
+            FileEventLogWriter::sync_all,
+            |debug_log| {
+                sync_calls.fetch_add(1, Ordering::SeqCst);
+                debug_log.sync_all()
+            },
+        )
+        .expect("production finalization should sync logs");
+
+        assert_eq!(
+            sync_calls.load(Ordering::SeqCst),
+            1,
+            "production finalization must invoke the optional debug log sync"
+        );
+    }
+
+    #[test]
+    fn production_finalization_syncs_results_before_propagating_debug_sync_failure() {
+        let event_log_path = unique_temp_path("production-finalization-order-events.jsonl");
+        let debug_log_path = unique_temp_path("production-finalization-order-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("production-finalization-order-control.txt"),
+        );
+        runtime
+            .event_log
+            .lock()
+            .expect("event log should lock")
+            .write_event(&Event::new(
+                SessionId::new(),
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::ResponseServed {
+                    status: 200,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                    controlled_reality: None,
+                },
+            ))
+            .expect("recorded result should buffer");
+        let event_sync_calls = AtomicUsize::new(0);
+        let event_sync_complete = std::sync::atomic::AtomicBool::new(false);
+        let debug_sync_calls = AtomicUsize::new(0);
+
+        let error = finalize_production_drain_with_log_syncs(
+            &runtime,
+            |event_log| {
+                event_sync_calls.fetch_add(1, Ordering::SeqCst);
+                event_log.sync_all()?;
+                event_sync_complete.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            |_| {
+                debug_sync_calls.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    event_sync_complete.load(Ordering::SeqCst),
+                    "event results must sync before debug finalization starts"
+                );
+                Err(io::Error::other("injected debug log sync failure"))
+            },
+        )
+        .expect_err("debug sync failure must fail production shutdown");
+        assert_eq!(error.to_string(), "injected debug log sync failure");
+        assert_eq!(
+            event_sync_calls.load(Ordering::SeqCst),
+            1,
+            "production finalization must sync recorded results"
+        );
+        assert_eq!(
+            debug_sync_calls.load(Ordering::SeqCst),
+            1,
+            "production finalization must attempt the optional debug log sync"
+        );
+    }
+
+    #[test]
+    fn production_shutdown_grace_is_bounded_and_production_only() {
+        for (args, expected) in [
+            (
+                vec!["--shutdown-grace-secs", "0"],
+                "shutdown grace seconds must be greater than zero",
+            ),
+            (
+                vec!["--shutdown-grace-secs", "301"],
+                "shutdown grace seconds must be at most 300",
+            ),
+            (
+                vec!["--shutdown-grace-secs", "60"],
+                "`--shutdown-grace-secs` is only available in the production profile",
+            ),
+        ] {
+            let error = run_config(&args).expect_err("invalid shutdown grace must fail");
+            assert_eq!(error.to_string(), expected);
+        }
+
+        let bait_profile = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9101", false),
+            "production upstream should parse",
+        );
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &bait_profile,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let mut args = fixture.args.clone();
+        args.extend(
+            ["--shutdown-grace-secs", "300"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let config = run_config(&args).expect("valid production shutdown grace should parse");
+        assert_eq!(config.production_shutdown_grace, Duration::from_secs(300));
         fixture.stop();
     }
 
@@ -12358,8 +12625,31 @@ mod tests {
         assert!(!debug.contains("secret-host.example"));
         assert!(!debug.contains("credential=do-not-log"));
         assert!(!debug.contains("Bad Header"));
+        let event_log_path = server.event_log_path.clone();
+        let debug_log_path = server.debug_log_path.clone();
 
         server.stop();
+        let events = fs::read_to_string(&event_log_path)
+            .expect("final event log should read")
+            .lines()
+            .map(|line| serde_json::from_str::<Event>(line).expect("final event should parse"))
+            .collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, EventKind::ResponseServed { .. })),
+            "the final response audit must survive successful shutdown"
+        );
+        assert!(
+            fs::read_to_string(&debug_log_path)
+                .expect("final debug log should read")
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).expect("final debug record should parse")
+                })
+                .any(|record| record["event"] == "response_served"),
+            "the final response debug audit must survive successful shutdown"
+        );
         let upstream_requests = recorder.finish();
         assert_eq!(
             upstream_request_lines(&upstream_requests),

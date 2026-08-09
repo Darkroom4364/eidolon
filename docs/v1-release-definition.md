@@ -121,8 +121,13 @@ artifact must provide the evidence for every checked item.
   no protected-upstream request.
 - Unsupported upgrades and protocol features are rejected explicitly.
 - Fuzz or differential tests cover request parsing and canonicalization.
-- Graceful shutdown drains accepted requests without losing their final audit
-  or policy result.
+- `SIGTERM` stops new production admission, uses HTTP/1 graceful shutdown to
+  drain accepted connections, and syncs final audit output before a successful exit.
+  The production-only `--shutdown-grace-secs` is a 1–300 second (default 60)
+  successful-drain grace period. Deadline expiry establishes a nonzero failure,
+  waits for non-cancellable accepted work to quiesce, then returns that failure;
+  it is not a hard
+  process-exit deadline.
 
 ### Gate 3: Safety And Causal Correctness
 
@@ -193,8 +198,10 @@ artifact must provide the evidence for every checked item.
 - Backup, restore, emergency disable, and renderer outage runbooks are tested.
 - Readiness, liveness, startup, shutdown, and dependency health have distinct
   semantics and do not report ready while the safety boundary is unavailable.
-- `SIGTERM` removes readiness, drains accepted work, persists final decisions,
-  and exits within the documented grace period.
+- `SIGTERM` stops admission before listener teardown, drains accepted work through
+  HTTP/1 graceful shutdown, persists final audit output, and exits successfully
+  only within the documented successful-drain grace period. On expiry it reports
+  failure and waits for non-cancellable accepted work to quiesce before returning.
 
 ### Gate 7: Operator Evidence, Privacy, And Observability
 

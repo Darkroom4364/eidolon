@@ -4,7 +4,7 @@ use std::{
     fmt,
     future::Future,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -25,8 +25,8 @@ use hyper::{
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
-    task::JoinHandle,
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
     time::{timeout, timeout_at},
 };
 
@@ -42,6 +42,8 @@ const DEFAULT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_UPSTREAM_DISPATCH_TIMEOUT: Duration = Duration::from_secs(29);
 const DEFAULT_MAX_UPSTREAM_RESPONSE_BODY_BYTES: usize = MAX_PRODUCTION_BODY_BYTES;
+pub const DEFAULT_PRODUCTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(60);
+pub const MAX_PRODUCTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(300);
 pub const MAX_PRODUCTION_UPSTREAM_ADDRESSES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +53,10 @@ pub struct ProductionRuntimeConfig {
     /// Absolute request budget supplied to typed outbound dispatch. It does
     /// not interrupt synchronous processor work already in progress.
     pub processor_timeout: Duration,
+    /// Grace period for a successful drain of already-admitted connections.
+    /// Expiry reports failure, then waits for non-cancellable accepted work to
+    /// quiesce before returning.
+    pub shutdown_grace: Duration,
 }
 
 impl Default for ProductionRuntimeConfig {
@@ -59,6 +65,7 @@ impl Default for ProductionRuntimeConfig {
             max_concurrent_connections: DEFAULT_MAX_CONCURRENT_CONNECTIONS,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             processor_timeout: DEFAULT_PROCESSOR_TIMEOUT,
+            shutdown_grace: DEFAULT_PRODUCTION_SHUTDOWN_GRACE,
         }
     }
 }
@@ -68,6 +75,8 @@ impl ProductionRuntimeConfig {
         self.max_concurrent_connections > 0
             && !self.request_timeout.is_zero()
             && !self.processor_timeout.is_zero()
+            && !self.shutdown_grace.is_zero()
+            && self.shutdown_grace <= MAX_PRODUCTION_SHUTDOWN_GRACE
     }
 }
 
@@ -182,6 +191,7 @@ pub enum ProductionRuntimeError {
     InvalidConfiguration,
     CurrentThreadRuntimeUnsupported,
     AcceptFailed,
+    DrainDeadlineExceeded,
 }
 
 impl fmt::Display for ProductionRuntimeError {
@@ -192,11 +202,14 @@ impl fmt::Display for ProductionRuntimeError {
                 "production_runtime_requires_multi_thread_tokio"
             }
             Self::AcceptFailed => "production_listener_accept_failed",
+            Self::DrainDeadlineExceeded => "drain_deadline_exceeded",
         })
     }
 }
 
 impl Error for ProductionRuntimeError {}
+#[cfg(test)]
+type BodyCollectionStarted = Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
 
 /// Serve the Hyper HTTP/1.1 production ingress until `shutdown` resolves.
 /// This API requires Tokio's multi-thread runtime because synchronous
@@ -206,6 +219,48 @@ pub async fn serve_production_http1<F>(
     config: ProductionRuntimeConfig,
     processor: Arc<dyn ProductionRequestProcessor>,
     shutdown: F,
+) -> Result<(), ProductionRuntimeError>
+where
+    F: Future<Output = ()> + Send,
+{
+    serve_production_http1_inner(
+        listener,
+        config,
+        processor,
+        shutdown,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn serve_production_http1_with_body_collection_signal<F>(
+    listener: TcpListener,
+    config: ProductionRuntimeConfig,
+    processor: Arc<dyn ProductionRequestProcessor>,
+    shutdown: F,
+    body_collection_started: tokio::sync::oneshot::Sender<()>,
+) -> Result<(), ProductionRuntimeError>
+where
+    F: Future<Output = ()> + Send,
+{
+    serve_production_http1_inner(
+        listener,
+        config,
+        processor,
+        shutdown,
+        Some(Arc::new(Mutex::new(Some(body_collection_started)))),
+    )
+    .await
+}
+
+async fn serve_production_http1_inner<F>(
+    listener: TcpListener,
+    config: ProductionRuntimeConfig,
+    processor: Arc<dyn ProductionRequestProcessor>,
+    shutdown: F,
+    #[cfg(test)] body_collection_started: Option<BodyCollectionStarted>,
 ) -> Result<(), ProductionRuntimeError>
 where
     F: Future<Output = ()> + Send,
@@ -222,10 +277,14 @@ where
 
     let permits = Arc::new(Semaphore::new(config.max_concurrent_connections));
     let processor_permits = Arc::new(Semaphore::new(config.max_concurrent_connections));
+    let admission_gate = Arc::new(AdmissionGate::default());
+    let (drain_sender, _) = watch::channel(false);
+    let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
-            _ = &mut shutdown => return Ok(()),
+            biased;
+            _ = &mut shutdown => break,
             accepted = listener.accept() => {
                 let (stream, peer_addr) = accepted.map_err(|_| ProductionRuntimeError::AcceptFailed)?;
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
@@ -234,13 +293,102 @@ where
                 };
                 let processor = Arc::clone(&processor);
                 let processor_permits = Arc::clone(&processor_permits);
-                tokio::spawn(async move {
+                let admission_gate = Arc::clone(&admission_gate);
+                let drain = ConnectionDrain {
+                    receiver: drain_sender.subscribe(),
+                    #[cfg(test)]
+                    body_collection_started: body_collection_started.clone(),
+                };
+                connections.spawn(async move {
                     let _permit = permit;
-                    serve_connection(stream, peer_addr, config, processor, processor_permits).await;
+                    serve_connection(
+                        stream,
+                        peer_addr,
+                        config,
+                        processor,
+                        processor_permits,
+                        admission_gate,
+                        drain,
+                    )
+                    .await;
                 });
             }
         }
     }
+
+    admission_gate.close();
+    let _ = drain_sender.send(true);
+    drop(listener);
+    let deadline = tokio::time::Instant::now() + config.shutdown_grace;
+    while !connections.is_empty() {
+        tokio::select! {
+            _ = connections.join_next() => {}
+            _ = tokio::time::sleep_until(deadline) => {
+                connections.abort_all();
+                // `block_in_place` work cannot be canceled. Report the missed
+                // deadline only after every accepted connection has quiesced.
+                while connections.join_next().await.is_some() {}
+                return Err(ProductionRuntimeError::DrainDeadlineExceeded);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Default)]
+struct AdmissionGate {
+    state: Mutex<AdmissionState>,
+}
+
+#[derive(Default)]
+struct AdmissionState {
+    closed: bool,
+    in_flight: usize,
+}
+
+struct AdmissionGuard {
+    gate: Arc<AdmissionGate>,
+}
+
+impl AdmissionGate {
+    fn try_acquire(self: &Arc<Self>) -> Option<AdmissionGuard> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            return None;
+        }
+        state.in_flight += 1;
+        Some(AdmissionGuard {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed = true;
+    }
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert!(state.in_flight > 0, "admission guard underflow");
+        state.in_flight = state.in_flight.saturating_sub(1);
+    }
+}
+struct ConnectionDrain {
+    receiver: watch::Receiver<bool>,
+    #[cfg(test)]
+    body_collection_started: Option<BodyCollectionStarted>,
 }
 
 async fn serve_connection(
@@ -249,15 +397,35 @@ async fn serve_connection(
     config: ProductionRuntimeConfig,
     processor: Arc<dyn ProductionRequestProcessor>,
     processor_permits: Arc<Semaphore>,
+    admission_gate: Arc<AdmissionGate>,
+    mut drain: ConnectionDrain,
 ) {
     let rejected_processor = Arc::clone(&processor);
     let rejected_processor_permits = Arc::clone(&processor_permits);
+    let rejected_admission_gate = Arc::clone(&admission_gate);
+    #[cfg(test)]
+    let body_collection_started = drain.body_collection_started.clone();
     let service = service_fn(move |request| {
+        let admission = admission_gate.try_acquire();
         let processor = Arc::clone(&processor);
         let processor_permits = Arc::clone(&processor_permits);
+        #[cfg(test)]
+        let body_collection_started = body_collection_started.clone();
         async move {
+            let Some(_admission) = admission else {
+                return Ok::<_, Infallible>(admission_closed_response());
+            };
             Ok::<_, Infallible>(
-                handle_request(request, peer_addr, config, processor, processor_permits).await,
+                handle_request(
+                    request,
+                    peer_addr,
+                    config,
+                    processor,
+                    processor_permits,
+                    #[cfg(test)]
+                    body_collection_started,
+                )
+                .await,
             )
         }
     });
@@ -266,20 +434,41 @@ async fn serve_connection(
     builder.max_buf_size(MAX_PRODUCTION_HEADER_BYTES);
     builder.timer(TokioTimer::new());
     builder.header_read_timeout(config.request_timeout);
-    if let Err(error) = builder
-        .serve_connection(TokioIo::new(stream), service)
-        .await
-    {
+    let connection = builder.serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+    let result = if *drain.receiver.borrow_and_update() {
+        connection.as_mut().graceful_shutdown();
+        connection.as_mut().await
+    } else {
+        tokio::select! {
+            result = connection.as_mut() => result,
+            _ = drain.receiver.changed() => {
+                connection.as_mut().graceful_shutdown();
+                connection.as_mut().await
+            }
+        }
+    };
+    if let Err(error) = result {
         if let Some(rejection) = pre_service_transport_rejection(&error) {
             reject_pre_service_transport(
                 rejected_processor,
                 rejected_processor_permits,
+                rejected_admission_gate,
                 rejection,
                 peer_addr,
             )
             .await;
         }
     }
+}
+
+fn admission_closed_response() -> Response<Full<Bytes>> {
+    let mut response = Response::new(Full::new(Bytes::new()));
+    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    response
 }
 
 fn pre_service_transport_rejection(error: &hyper::Error) -> Option<ProductionPreServiceRejection> {
@@ -313,9 +502,13 @@ async fn acquire_processor_permit(
 async fn reject_pre_service_transport(
     processor: Arc<dyn ProductionRequestProcessor>,
     processor_permits: Arc<Semaphore>,
+    admission_gate: Arc<AdmissionGate>,
     rejection: ProductionPreServiceRejection,
     peer_addr: SocketAddr,
 ) {
+    let Some(_admission) = admission_gate.try_acquire() else {
+        return;
+    };
     // A pre-service rejection has no response channel; if the permit
     // invariant is ever broken there is no response to fail closed with.
     let Ok(processor_permit) = acquire_processor_permit(&processor_permits).await else {
@@ -339,6 +532,7 @@ async fn handle_request(
     config: ProductionRuntimeConfig,
     processor: Arc<dyn ProductionRequestProcessor>,
     processor_permits: Arc<Semaphore>,
+    #[cfg(test)] body_collection_started: Option<BodyCollectionStarted>,
 ) -> Response<Full<Bytes>> {
     let request_deadline = Instant::now()
         .checked_add(config.processor_timeout)
@@ -348,7 +542,16 @@ async fn handle_request(
         request_deadline,
     };
     let (parts, body) = request.into_parts();
-    let adapted = match timeout(config.request_timeout, collect_inbound_body(body)).await {
+    let adapted = match timeout(
+        config.request_timeout,
+        collect_inbound_body(
+            body,
+            #[cfg(test)]
+            body_collection_started,
+        ),
+    )
+    .await
+    {
         Ok(Ok(body)) => ProductionHttpPolicy.adapt(Request::from_parts(parts, body)),
         Ok(Err(InboundBodyCollectionError::ClientDisconnected)) => {
             return Response::new(Full::new(Bytes::new()));
@@ -401,7 +604,18 @@ fn is_client_body_disconnect(error: &hyper::Error) -> bool {
 
 async fn collect_inbound_body(
     mut body: Incoming,
+    #[cfg(test)] body_collection_started: Option<BodyCollectionStarted>,
 ) -> Result<ProductionInboundBody, InboundBodyCollectionError> {
+    #[cfg(test)]
+    if let Some(body_collection_started) = body_collection_started {
+        if let Some(sender) = body_collection_started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
     let mut collected = BytesMut::new();
     let mut trailers_observed = false;
     while let Some(frame) = body.frame().await {
@@ -648,14 +862,6 @@ async fn dispatch_production_upstream_within_deadline(
     Err(last_pre_commit_error.unwrap_or(ProductionUpstreamError::ConnectFailed))
 }
 
-struct UpstreamConnectionDriver(JoinHandle<()>);
-
-impl Drop for UpstreamConnectionDriver {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 async fn dispatch_production_upstream_to_address(
     request: &ProductionHttpRequest,
     target: &ProductionUpstreamTarget,
@@ -670,36 +876,48 @@ async fn dispatch_production_upstream_to_address(
     let (mut sender, connection) = client_http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|_| ProductionUpstreamError::HandshakeFailed)?;
-    let _driver = UpstreamConnectionDriver(tokio::spawn(async move {
-        let _ = connection.await;
-    }));
+    let response_future = async move {
+        let response = match timeout(config.response_timeout, sender.send_request(request)).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => return Err(ProductionUpstreamError::ResponseFailed),
+            Err(_) => return Err(ProductionUpstreamError::ResponseTimedOut),
+        };
+        drop(sender);
+        let (parts, body) = response.into_parts();
+        let body = match timeout(
+            config.response_timeout,
+            collect_upstream_response_body(body, config.max_response_body_bytes),
+        )
+        .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(ProductionUpstreamError::ResponseTimedOut),
+        };
 
-    let response = match timeout(config.response_timeout, sender.send_request(request)).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(_)) => return Err(ProductionUpstreamError::ResponseFailed),
-        Err(_) => return Err(ProductionUpstreamError::ResponseTimedOut),
+        let mut headers = parts.headers;
+        sanitize_response_headers(&mut headers);
+        headers.remove(CONTENT_LENGTH);
+        Ok(ProductionResponse {
+            status: parts.status,
+            headers,
+            body,
+        })
     };
-    drop(sender);
-    let (parts, body) = response.into_parts();
-    let body = match timeout(
-        config.response_timeout,
-        collect_upstream_response_body(body, config.max_response_body_bytes),
-    )
-    .await
-    {
-        Ok(Ok(body)) => body,
-        Ok(Err(error)) => return Err(error),
-        Err(_) => return Err(ProductionUpstreamError::ResponseTimedOut),
-    };
-
-    let mut headers = parts.headers;
-    sanitize_response_headers(&mut headers);
-    headers.remove(CONTENT_LENGTH);
-    Ok(ProductionResponse {
-        status: parts.status,
-        headers,
-        body,
-    })
+    tokio::pin!(response_future);
+    tokio::pin!(connection);
+    // Drive the Hyper connection in this dispatch task. Cancellation drops both
+    // branches together instead of leaving a detached driver task behind.
+    let mut connection_finished = false;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut response_future => break result,
+            _ = &mut connection, if !connection_finished => {
+                connection_finished = true;
+            }
+        }
+    }
 }
 
 async fn collect_upstream_response_body(
@@ -785,7 +1003,10 @@ fn sanitize_response_headers(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
         time::Duration,
     };
 
@@ -798,13 +1019,15 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::{oneshot, Semaphore},
+        sync::{oneshot, watch, Semaphore},
         time::{timeout, Instant},
     };
 
     use super::{
         acquire_processor_permit, dispatch_production_upstream,
-        dispatch_production_upstream_within_deadline, serve_production_http1,
+        dispatch_production_upstream_within_deadline, reject_pre_service_transport,
+        serve_connection, serve_production_http1,
+        serve_production_http1_with_body_collection_signal, AdmissionGate, ConnectionDrain,
         ProductionPreServiceRejection, ProductionProcessorError, ProductionRejectedRequest,
         ProductionRequestContext, ProductionRequestProcessor, ProductionResponse,
         ProductionRuntimeConfig, ProductionRuntimeError, ProductionUpstreamConfig,
@@ -827,6 +1050,8 @@ mod tests {
             Arc::new(DelayedProcessor {
                 started: Mutex::new(None),
                 release: Mutex::new(release_rx),
+                invocations: AtomicUsize::new(0),
+                completed: AtomicUsize::new(0),
             }),
             std::future::pending(),
         )
@@ -966,7 +1191,12 @@ mod tests {
             first_request_sent
                 .send(())
                 .expect("test should await stalled request");
-            std::future::pending::<()>().await;
+            let mut trailing = [0_u8; 1];
+            timeout(Duration::from_secs(1), stream.read(&mut trailing))
+                .await
+                .expect("dispatch cancellation should close the upstream connection")
+                .expect("stalled upstream should observe the connection close")
+                == 0
         });
         let fallback = tokio::spawn(async move {
             timeout(Duration::from_millis(300), fallback_listener.accept())
@@ -1031,11 +1261,19 @@ mod tests {
             .await
             .expect("completed blocking dispatch should release its processor permit")
             .expect("processor permit owner should outlive the test");
-        stalled.abort();
+        assert!(
+            timeout(Duration::from_millis(250), stalled)
+                .await
+                .expect("structured upstream driver should quiesce")
+                .expect("stalled upstream task should join"),
+            "dispatch deadline must stop the upstream connection driver before returning"
+        );
     }
     struct DelayedProcessor {
         started: Mutex<Option<oneshot::Sender<()>>>,
         release: Mutex<std::sync::mpsc::Receiver<()>>,
+        invocations: AtomicUsize,
+        completed: AtomicUsize,
     }
 
     impl ProductionRequestProcessor for DelayedProcessor {
@@ -1044,6 +1282,7 @@ mod tests {
             _request: ProductionHttpRequest,
             _context: ProductionRequestContext,
         ) -> Result<ProductionResponse, ProductionProcessorError> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
             if let Some(started) = self
                 .started
                 .lock()
@@ -1057,6 +1296,7 @@ mod tests {
                 .expect("delayed processor release signal should lock")
                 .recv()
                 .expect("test should release delayed processor");
+            self.completed.fetch_add(1, Ordering::SeqCst);
             Ok(ProductionResponse::new(StatusCode::OK, Bytes::new()))
         }
 
@@ -1077,6 +1317,44 @@ mod tests {
             _rejection: ProductionPreServiceRejection,
             _context: ProductionRequestContext,
         ) -> Result<(), ProductionProcessorError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingProcessor {
+        invocations: AtomicUsize,
+        pre_service_invocations: AtomicUsize,
+    }
+
+    impl ProductionRequestProcessor for CountingProcessor {
+        fn process(
+            &self,
+            _request: ProductionHttpRequest,
+            _context: ProductionRequestContext,
+        ) -> Result<ProductionResponse, ProductionProcessorError> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Ok(ProductionResponse::new(StatusCode::OK, Bytes::new()))
+        }
+
+        fn reject(
+            &self,
+            _rejection: ProductionRequestRejection,
+            _request: ProductionRejectedRequest,
+            _context: ProductionRequestContext,
+        ) -> Result<ProductionResponse, ProductionProcessorError> {
+            Ok(ProductionResponse::new(
+                StatusCode::BAD_REQUEST,
+                Bytes::new(),
+            ))
+        }
+
+        fn reject_pre_service(
+            &self,
+            _rejection: ProductionPreServiceRejection,
+            _context: ProductionRequestContext,
+        ) -> Result<(), ProductionProcessorError> {
+            self.pre_service_invocations.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1142,6 +1420,8 @@ mod tests {
         let processor = Arc::new(DelayedProcessor {
             started: Mutex::new(Some(started_tx)),
             release: Mutex::new(release_rx),
+            invocations: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
         });
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let server = tokio::spawn(serve_production_http1(
@@ -1150,6 +1430,7 @@ mod tests {
                 max_concurrent_connections: 1,
                 request_timeout: Duration::from_secs(1),
                 processor_timeout: Duration::from_millis(10),
+                shutdown_grace: Duration::from_secs(1),
             },
             processor,
             async move {
@@ -1213,6 +1494,367 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_drains_accepted_response_before_returning() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("production listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("production listener should have an address");
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let processor = Arc::new(DelayedProcessor {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+            invocations: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let mut server = tokio::spawn(serve_production_http1(
+            listener,
+            ProductionRuntimeConfig {
+                max_concurrent_connections: 1,
+                request_timeout: Duration::from_secs(1),
+                processor_timeout: Duration::from_secs(1),
+                shutdown_grace: Duration::from_secs(1),
+            },
+            processor.clone(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("client should connect");
+        client
+            .write_all(b"GET /normal HTTP/1.1\r\nHost: proxy.local\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("client should write");
+        started_rx
+            .await
+            .expect("processor should start before shutdown");
+        shutdown_tx
+            .send(())
+            .expect("test should start graceful shutdown");
+        assert!(
+            timeout(Duration::from_millis(100), &mut server)
+                .await
+                .is_err(),
+            "shutdown must wait for an accepted request to complete"
+        );
+
+        release_tx
+            .send(())
+            .expect("test should release the accepted request");
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("accepted response should complete during drain")
+            .expect("accepted response should read");
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "graceful drain must preserve the accepted response"
+        );
+        server
+            .await
+            .expect("production server should join")
+            .expect("production server should drain cleanly");
+        assert_eq!(
+            processor.invocations.load(Ordering::SeqCst),
+            1,
+            "graceful shutdown must not re-run accepted work"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_closes_idle_keep_alive_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("production listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("production listener should have an address");
+        let processor = Arc::new(CountingProcessor::default());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_production_http1(
+            listener,
+            ProductionRuntimeConfig {
+                max_concurrent_connections: 1,
+                request_timeout: Duration::from_secs(1),
+                processor_timeout: Duration::from_secs(1),
+                shutdown_grace: Duration::from_secs(1),
+            },
+            processor.clone(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("client should connect");
+        client
+            .write_all(
+                b"GET /normal HTTP/1.1\r\nHost: proxy.local\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .expect("client should write");
+        let mut first_response = [0_u8; 256];
+        let received = timeout(Duration::from_secs(1), client.read(&mut first_response))
+            .await
+            .expect("keep-alive response should arrive")
+            .expect("keep-alive response should read");
+        assert!(
+            first_response[..received].starts_with(b"HTTP/1.1 200"),
+            "first keep-alive response should succeed"
+        );
+
+        shutdown_tx
+            .send(())
+            .expect("test should start graceful shutdown");
+        let mut remaining = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut remaining))
+            .await
+            .expect("graceful shutdown should close idle keep-alive")
+            .expect("idle keep-alive should close cleanly");
+        server
+            .await
+            .expect("production server should join")
+            .expect("production server should drain idle connection");
+        assert_eq!(processor.invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_admission_denies_pipelined_service_without_processor_work() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("production listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("production listener should have an address");
+        let admission_gate = Arc::new(AdmissionGate::default());
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let processor = Arc::new(DelayedProcessor {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+            invocations: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+        });
+        let (_drain_sender, drain) = watch::channel(false);
+        let server = tokio::spawn({
+            let admission_gate = Arc::clone(&admission_gate);
+            let processor = Arc::clone(&processor);
+            async move {
+                let (stream, peer_addr) = listener
+                    .accept()
+                    .await
+                    .expect("production listener should accept");
+                serve_connection(
+                    stream,
+                    peer_addr,
+                    ProductionRuntimeConfig::default(),
+                    processor,
+                    Arc::new(Semaphore::new(1)),
+                    admission_gate,
+                    ConnectionDrain {
+                        receiver: drain,
+                        body_collection_started: None,
+                    },
+                )
+                .await;
+            }
+        });
+
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("client should connect");
+        client
+            .write_all(
+                b"GET /accepted-before-close HTTP/1.1\r\nHost: proxy.local\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .expect("client should write accepted request");
+        started_rx
+            .await
+            .expect("first request should enter the processor");
+        admission_gate.close();
+        client
+            .write_all(
+                b"GET /pipelined-after-close HTTP/1.1\r\nHost: proxy.local\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("client should write pipelined request after admission closes");
+        release_tx
+            .send(())
+            .expect("test should release the accepted request");
+
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("closed admission should finish the connection")
+            .expect("closed admission response should read");
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "the admitted request must complete first"
+        );
+        assert!(
+            response
+                .windows(b"HTTP/1.1 503".len())
+                .any(|status| status == b"HTTP/1.1 503"),
+            "the pipelined request after admission closes must receive the fixed rejection"
+        );
+        server.await.expect("connection task should join");
+        assert_eq!(
+            processor.invocations.load(Ordering::SeqCst),
+            1,
+            "only the request admitted before closure may reach the processor"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pre_service_rejection_skips_processor_after_admission_closes() {
+        let processor = Arc::new(CountingProcessor::default());
+        let processor_permits = Arc::new(Semaphore::new(1));
+        let admission_gate = Arc::new(AdmissionGate::default());
+        let peer_addr = "127.0.0.1:8080".parse().expect("peer address should parse");
+
+        reject_pre_service_transport(
+            processor.clone(),
+            Arc::clone(&processor_permits),
+            Arc::clone(&admission_gate),
+            ProductionPreServiceRejection::MalformedTransport,
+            peer_addr,
+        )
+        .await;
+        assert_eq!(
+            processor.pre_service_invocations.load(Ordering::SeqCst),
+            1,
+            "the open admission control path must invoke the pre-service hook"
+        );
+
+        admission_gate.close();
+        reject_pre_service_transport(
+            processor.clone(),
+            processor_permits,
+            admission_gate,
+            ProductionPreServiceRejection::HeadersTooLarge,
+            peer_addr,
+        )
+        .await;
+        assert_eq!(
+            processor.pre_service_invocations.load(Ordering::SeqCst),
+            1,
+            "a post-close transport rejection must not invoke the processor hook"
+        );
+        assert_eq!(processor.invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_deadline_aborts_observed_cancellable_body_collection_then_waits_for_side_effect_quiescence(
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("production listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("production listener should have an address");
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let processor = Arc::new(DelayedProcessor {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+            invocations: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (body_collection_started_tx, body_collection_started_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_production_http1_with_body_collection_signal(
+            listener,
+            ProductionRuntimeConfig {
+                max_concurrent_connections: 2,
+                request_timeout: Duration::from_secs(5),
+                processor_timeout: Duration::from_secs(1),
+                shutdown_grace: Duration::from_millis(100),
+            },
+            processor.clone(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            body_collection_started_tx,
+        ));
+
+        let mut pending_client = TcpStream::connect(address)
+            .await
+            .expect("pending client should connect");
+        pending_client
+            .write_all(
+                b"POST /pending HTTP/1.1\r\nHost: proxy.local\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("pending client should start an incomplete accepted request");
+        timeout(Duration::from_secs(1), body_collection_started_rx)
+            .await
+            .expect("server should enter the incomplete request body collection before shutdown")
+            .expect("body collection signal should be delivered");
+
+        let mut client = TcpStream::connect(address)
+            .await
+            .expect("client should connect");
+        client
+            .write_all(b"GET /normal HTTP/1.1\r\nHost: proxy.local\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("client should write");
+        started_rx
+            .await
+            .expect("processor should start before shutdown");
+        shutdown_tx
+            .send(())
+            .expect("test should start graceful shutdown");
+
+        let mut pending_buffer = [0_u8; 1];
+        let pending_connection_terminated = matches!(
+            timeout(
+                Duration::from_millis(500),
+                pending_client.read(&mut pending_buffer),
+            )
+            .await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        let server_still_draining = !server.is_finished();
+        let completed_before_release = processor.completed.load(Ordering::SeqCst);
+        release_tx
+            .send(())
+            .expect("test should release the delayed side effect");
+        assert!(
+            pending_connection_terminated,
+            "deadline abort must terminate the observed accepted connection"
+        );
+        assert!(
+            server_still_draining,
+            "deadline failure must wait for non-cancellable accepted work to quiesce"
+        );
+        assert_eq!(
+            completed_before_release, 0,
+            "the accepted synchronous side effect must still be active before release"
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(1), server)
+                .await
+                .expect("quiesced deadline failure should resolve")
+                .expect("production server should join"),
+            Err(ProductionRuntimeError::DrainDeadlineExceeded)
+        );
+        assert_eq!(
+            processor.completed.load(Ordering::SeqCst),
+            1,
+            "deadline failure must not return before accepted side effects complete"
+        );
+        assert_eq!(processor.invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handler_does_not_connect_upstream_after_pre_dispatch_budget_expires() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1254,6 +1896,7 @@ mod tests {
                 max_concurrent_connections: 1,
                 request_timeout: Duration::from_secs(1),
                 processor_timeout: Duration::from_millis(20),
+                shutdown_grace: Duration::from_secs(1),
             },
             processor,
             async move {
