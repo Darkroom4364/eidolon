@@ -123,8 +123,11 @@ artifact must provide the evidence for every checked item.
 - Fuzz or differential tests cover request parsing and canonicalization.
 - `SIGTERM` stops new production admission, uses HTTP/1 graceful shutdown to
   drain accepted connections, and syncs final audit output before a successful exit.
-  The production-only `--shutdown-grace-secs` is bounded to 1–300 seconds
-  (default 60); deadline expiry fails shutdown rather than reporting success.
+  The production-only `--shutdown-grace-secs` is a 1–300 second (default 60)
+  successful-drain grace period. Deadline expiry establishes a nonzero failure,
+  waits for non-cancellable accepted work to quiesce, then returns that failure;
+  it is not a hard
+  process-exit deadline.
 
 ### Gate 3: Safety And Causal Correctness
 
@@ -197,7 +200,8 @@ artifact must provide the evidence for every checked item.
   semantics and do not report ready while the safety boundary is unavailable.
 - `SIGTERM` stops admission before listener teardown, drains accepted work through
   HTTP/1 graceful shutdown, persists final audit output, and exits successfully
-  only within the documented bounded grace period.
+  only within the documented successful-drain grace period. On expiry it reports
+  failure and waits for non-cancellable accepted work to quiesce before returning.
 
 ### Gate 7: Operator Evidence, Privacy, And Observability
 

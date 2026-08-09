@@ -2199,16 +2199,29 @@ fn production_sigterm_shutdown() -> io::Result<Pin<Box<dyn Future<Output = ()> +
 }
 
 fn finalize_production_drain(runtime: &ProxyRuntime) -> io::Result<()> {
-    runtime
+    finalize_production_drain_with_log_syncs(
+        runtime,
+        FileEventLogWriter::sync_all,
+        FileDebugLogWriter::sync_all,
+    )
+}
+
+fn finalize_production_drain_with_log_syncs(
+    runtime: &ProxyRuntime,
+    sync_event_log: impl FnOnce(&mut FileEventLogWriter) -> io::Result<()>,
+    sync_debug_log: impl FnOnce(&mut FileDebugLogWriter) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut event_log = runtime
         .event_log
         .lock()
-        .map_err(|_| io::Error::other("event log lock poisoned"))?
-        .sync_all()?;
+        .map_err(|_| io::Error::other("event log lock poisoned"))?;
+    sync_event_log(&mut event_log)?;
+    drop(event_log);
     if let Some(debug_log) = &runtime.debug_log {
-        debug_log
+        let mut debug_log = debug_log
             .lock()
-            .map_err(|_| io::Error::other("debug log lock poisoned"))?
-            .sync_all()?;
+            .map_err(|_| io::Error::other("debug log lock poisoned"))?;
+        sync_debug_log(&mut debug_log)?;
     }
     Ok(())
 }
@@ -8085,7 +8098,8 @@ Options:
                          Hyper HTTP/1.1 listener and requires explicit durable
                          session, ingress, state, debug-log, and remote renderer inputs
   --shutdown-grace-secs <SECONDS>
-                         Production-only bounded drain grace period
+                         Production-only successful-drain grace; failure waits
+                         for non-cancellable accepted work to quiesce
                          [default: {default_shutdown_grace_secs}; max: {max_shutdown_grace_secs}]
   --print-effective-config
                          Print a versioned redacted JSON configuration projection and exit
@@ -9997,6 +10011,95 @@ mod tests {
     }
 
     #[test]
+    fn production_finalization_invokes_optional_debug_sync() {
+        let event_log_path = unique_temp_path("production-finalization-events.jsonl");
+        let debug_log_path = unique_temp_path("production-finalization-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("production-finalization-control.txt"),
+        );
+        let sync_calls = AtomicUsize::new(0);
+
+        finalize_production_drain_with_log_syncs(
+            &runtime,
+            FileEventLogWriter::sync_all,
+            |debug_log| {
+                sync_calls.fetch_add(1, Ordering::SeqCst);
+                debug_log.sync_all()
+            },
+        )
+        .expect("production finalization should sync logs");
+
+        assert_eq!(
+            sync_calls.load(Ordering::SeqCst),
+            1,
+            "production finalization must invoke the optional debug log sync"
+        );
+    }
+
+    #[test]
+    fn production_finalization_syncs_results_before_propagating_debug_sync_failure() {
+        let event_log_path = unique_temp_path("production-finalization-order-events.jsonl");
+        let debug_log_path = unique_temp_path("production-finalization-order-debug.jsonl");
+        let runtime = test_runtime_with_m1_controller_and_debug_log(
+            closed_upstream(),
+            &event_log_path,
+            &debug_log_path,
+            unique_temp_path("production-finalization-order-control.txt"),
+        );
+        runtime
+            .event_log
+            .lock()
+            .expect("event log should lock")
+            .write_event(&Event::new(
+                SessionId::new(),
+                EventSource::Proxy,
+                PolicyState::Observe,
+                EventKind::ResponseServed {
+                    status: 200,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                    controlled_reality: None,
+                },
+            ))
+            .expect("recorded result should buffer");
+        let event_sync_calls = AtomicUsize::new(0);
+        let event_sync_complete = std::sync::atomic::AtomicBool::new(false);
+        let debug_sync_calls = AtomicUsize::new(0);
+
+        let error = finalize_production_drain_with_log_syncs(
+            &runtime,
+            |event_log| {
+                event_sync_calls.fetch_add(1, Ordering::SeqCst);
+                event_log.sync_all()?;
+                event_sync_complete.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            |_| {
+                debug_sync_calls.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    event_sync_complete.load(Ordering::SeqCst),
+                    "event results must sync before debug finalization starts"
+                );
+                Err(io::Error::other("injected debug log sync failure"))
+            },
+        )
+        .expect_err("debug sync failure must fail production shutdown");
+        assert_eq!(error.to_string(), "injected debug log sync failure");
+        assert_eq!(
+            event_sync_calls.load(Ordering::SeqCst),
+            1,
+            "production finalization must sync recorded results"
+        );
+        assert_eq!(
+            debug_sync_calls.load(Ordering::SeqCst),
+            1,
+            "production finalization must attempt the optional debug log sync"
+        );
+    }
+
+    #[test]
     fn production_shutdown_grace_is_bounded_and_production_only() {
         for (args, expected) in [
             (
@@ -10030,13 +10133,13 @@ mod tests {
         );
         let mut args = fixture.args.clone();
         args.extend(
-            ["--shutdown-grace-secs", "17"]
+            ["--shutdown-grace-secs", "300"]
                 .into_iter()
                 .map(str::to_string),
         );
         let args = args.iter().map(String::as_str).collect::<Vec<_>>();
         let config = run_config(&args).expect("valid production shutdown grace should parse");
-        assert_eq!(config.production_shutdown_grace, Duration::from_secs(17));
+        assert_eq!(config.production_shutdown_grace, Duration::from_secs(300));
         fixture.stop();
     }
 
