@@ -31,9 +31,12 @@ the vendor lockfile is the unmodified released test/development lockfile.
 The runtime enables only client,http1,server. Scoped upstream library tests
 also need http2 for their shared harness; this adds no production protocol.
 
-Invariant: an HTTP/1 head exceeding 65,536 raw bytes must terminate at Hyper
-with HTTP 431 / HeadersTooLarge before validated processor dispatch, policy
-rejection, or protected upstream work. Raw bytes include the request line,
+Raw-head cap invariant: an otherwise valid HTTP/1 head whose completion
+requires more than 65,536 raw bytes must terminate at Hyper with HTTP 431 /
+HeadersTooLarge before validated processor dispatch, policy rejection, or
+protected upstream work. Malformed input can be rejected earlier by another
+transport check; the size limit does not override that rejection. Raw bytes
+include the request line,
 leading empty lines, OWS, and the terminating CRLFCRLF; normalized headers
 cannot recover that size. An exact-cap valid GET remains eligible for HTTP
 200 and one upstream probe connection. The pre-service rejection audit hook
