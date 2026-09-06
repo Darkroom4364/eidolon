@@ -1,0 +1,3 @@
+# Preserve the released manifest despite the repository's *.orig rule.
+!/Cargo.toml.orig
+/target/

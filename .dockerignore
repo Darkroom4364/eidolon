@@ -1,6 +1,11 @@
 **
 !Cargo.toml
 !Cargo.lock
+!vendor
+!vendor/hyper
+!vendor/hyper/**
+vendor/hyper/target
+vendor/hyper/target/**
 !crates
 !crates/**
 !examples

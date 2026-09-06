@@ -444,6 +444,8 @@ async fn serve_connection(
     });
     let mut builder = server_http1::Builder::new();
     builder.max_headers(MAX_PRODUCTION_HEADER_COUNT);
+    // The pinned Hyper read-budget repair enforces this on raw head bytes,
+    // including leading empty lines and OWS removed before policy validation.
     builder.max_buf_size(MAX_PRODUCTION_HEADER_BYTES);
     builder.timer(TokioTimer::new());
     builder.header_read_timeout(config.request_timeout);
@@ -1012,6 +1014,10 @@ fn sanitize_response_headers(headers: &mut HeaderMap) {
     }
     headers.remove("keep-alive");
 }
+
+#[cfg(test)]
+#[path = "production_runtime_boundary_tests.rs"]
+mod boundary_tests;
 
 #[cfg(test)]
 mod tests {

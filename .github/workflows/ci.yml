@@ -62,11 +62,17 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --locked
 
+      - name: Test vendored Hyper HTTP/1 buffer regressions
+        # HTTP/2 is needed by upstream's shared unit-test harness only.
+        run: cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.1 --locked
 
       - name: Audit dependencies
-        run: cargo audit --file Cargo.lock --deny warnings
+        run: |
+          cargo audit --file Cargo.lock --deny warnings
+          cargo audit --file vendor/hyper/Cargo.lock --deny warnings
 
   lab-fixtures:
     name: Lab fixtures

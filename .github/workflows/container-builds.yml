@@ -1,0 +1,42 @@
+name: Container packaging
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  containers:
+    name: Linux x86_64 container builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build all repository container entry points
+        # In particular, the allowlisted context must include patched Hyper.
+        # These are build/smoke checks, not deployment or isolation proof.
+        run: |
+          for component in eidolon-proxy controlled-reality-backend demo-target; do
+            image="eidolon-ci-${component}:${GITHUB_SHA}"
+            docker build --platform linux/amd64 \
+              --file "examples/shield-lab/Dockerfile.${component}" \
+              --tag "$image" .
+            test "$(docker image inspect --format '{{.Architecture}}/{{.Config.User}}' "$image")" = 'amd64/65532:65532'
+          done
+
+      - name: Smoke-test proxy and renderer entry points without networking
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            "eidolon-ci-eidolon-proxy:${GITHUB_SHA}" --help > /dev/null
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            "eidolon-ci-controlled-reality-backend:${GITHUB_SHA}" --help > /dev/null
