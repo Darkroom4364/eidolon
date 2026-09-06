@@ -230,6 +230,8 @@ where
         shutdown,
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -251,6 +253,7 @@ where
         processor,
         shutdown,
         Some(Arc::new(Mutex::new(Some(body_collection_started)))),
+        None,
     )
     .await
 }
@@ -261,6 +264,7 @@ async fn serve_production_http1_inner<F>(
     processor: Arc<dyn ProductionRequestProcessor>,
     shutdown: F,
     #[cfg(test)] body_collection_started: Option<BodyCollectionStarted>,
+    #[cfg(test)] connection_task_count: Option<watch::Sender<usize>>,
 ) -> Result<(), ProductionRuntimeError>
 where
     F: Future<Output = ()> + Send,
@@ -282,9 +286,18 @@ where
     let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
     loop {
+        // Observe the actual set, including completed but unjoined tasks.
+        #[cfg(test)]
+        if let Some(count) = &connection_task_count {
+            count.send_replace(connections.len());
+        }
         tokio::select! {
             biased;
             _ = &mut shutdown => break,
+            // Completed tasks retain allocations until joined. Reap before
+            // accepting more; each reap shrinks the set, with shutdown first.
+            // The guard prevents an empty set from spinning and blocking accepts.
+            _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 let (stream, peer_addr) = accepted.map_err(|_| ProductionRuntimeError::AcceptFailed)?;
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
@@ -1026,7 +1039,7 @@ mod tests {
     use super::{
         acquire_processor_permit, dispatch_production_upstream,
         dispatch_production_upstream_within_deadline, reject_pre_service_transport,
-        serve_connection, serve_production_http1,
+        serve_connection, serve_production_http1, serve_production_http1_inner,
         serve_production_http1_with_body_collection_signal, AdmissionGate, ConnectionDrain,
         ProductionPreServiceRejection, ProductionProcessorError, ProductionRejectedRequest,
         ProductionRequestContext, ProductionRequestProcessor, ProductionResponse,
@@ -1357,6 +1370,87 @@ mod tests {
             self.pre_service_invocations.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_connection_tasks_are_reaped_while_listener_is_running() {
+        const CONNECTIONS: usize = 128;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("production listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("production listener should have an address");
+        let processor = Arc::new(CountingProcessor::default());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (task_count_tx, mut task_count_rx) = watch::channel(0);
+        let server = tokio::spawn(serve_production_http1_inner(
+            listener,
+            ProductionRuntimeConfig {
+                max_concurrent_connections: 1,
+                shutdown_grace: Duration::from_secs(1),
+                ..ProductionRuntimeConfig::default()
+            },
+            processor.clone(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            None,
+            Some(task_count_tx),
+        ));
+
+        // Use real loopback connections and observe JoinSet retention directly,
+        // without allocator/RSS thresholds or sleeps that depend on the platform.
+        timeout(Duration::from_secs(15), async {
+            for completed in 1..=CONNECTIONS {
+                let mut client = TcpStream::connect(address)
+                    .await
+                    .expect("client should connect after the previous task was reaped");
+                task_count_rx
+                    .wait_for(|count| *count == 1)
+                    .await
+                    .expect("listener should track the admitted connection");
+                client
+                    .write_all(
+                        b"GET /normal HTTP/1.1\r\nHost: proxy.local\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("client should write");
+                let mut response = Vec::new();
+                client
+                    .read_to_end(&mut response)
+                    .await
+                    .expect("completed connection should close cleanly");
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+
+                // EOF alone does not prove the task allocation was reclaimed.
+                // Require the set to empty before any new accept or shutdown.
+                let reaped = timeout(
+                    Duration::from_secs(2),
+                    task_count_rx.wait_for(|count| *count == 0),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok());
+                assert!(
+                    reaped,
+                    "after {completed} closed connections, listener still retains {} task(s) before shutdown",
+                    *task_count_rx.borrow()
+                );
+            }
+        })
+        .await
+        .expect("sequential connection churn must make bounded progress");
+
+        assert!(!server.is_finished(), "listener must still be serving");
+        assert_eq!(processor.invocations.load(Ordering::SeqCst), CONNECTIONS);
+        shutdown_tx
+            .send(())
+            .expect("test should stop the production listener");
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("shutdown should finish with an empty connection set")
+            .expect("production server should join")
+            .expect("production server should stop cleanly");
     }
 
     struct DeadlineExpiredBeforeDispatchProcessor {
