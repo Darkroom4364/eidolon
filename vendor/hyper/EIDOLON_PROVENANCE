@@ -1,0 +1,67 @@
+Eidolon local provenance (#287)
+
+Source: the released crates.io hyper 1.11.1 package, published 2026-08-28.
+Archive: https://static.crates.io/crates/hyper/hyper-1.11.1.crate
+Archive SHA-256:
+27b501faa50e7a26c3d3560ca625132f4078a17771f4810baf70475ae48cbe43
+Packaged source revision (.cargo_vcs_info.json, preserved byte-for-byte):
+6371cd425017155f7fbecef0e57b218edbe6a93a
+
+All 70 packaged files were compared byte-for-byte with the cached release
+archive before patching. Preserve upstream LICENSE, notices, Cargo.toml.orig,
+Cargo.lock, and VCS metadata. The Cargo extraction marker .cargo-ok is omitted;
+it is not part of the release archive. No upstream source is reformatted.
+
+Upstream-to-vendor delta:
+- src/proto/h1/io.rs: limit ReadBuf to Hyper's positive computed next budget.
+  Retain the original full spare slice when next == 0, because the public
+  client read_buf_exact_size(Some(0)) must still consume available input,
+  never report a false EOF. Two read_buffer_regression tests from reviewed
+  predecessor 6c8d7e57c4a5dc01d1330d6051076236989f7d44 cover deterministic
+  excess spare capacity and exact-zero client progress.
+- Cargo.toml: an empty [workspace] isolates the upstream unit-test workspace.
+  It does not add Hyper to Eidolon's members or change production features.
+- .gitignore: keep the packaged Cargo.toml.orig despite the root *.orig rule
+  and exclude build output from the standalone test workspace.
+- This provenance file.
+
+The root manifest exact-pins hyper = "=1.11.1" and patches crates.io to this
+directory. The root lockfile changes only Hyper's version and local source;
+the vendor lockfile is the unmodified released test/development lockfile.
+The runtime enables only client,http1,server. Scoped upstream library tests
+also need http2 for their shared harness; this adds no production protocol.
+
+Raw-head cap invariant: an otherwise valid HTTP/1 head whose completion
+requires more than 65,536 raw bytes must terminate at Hyper with HTTP 431 /
+HeadersTooLarge before validated processor dispatch, policy rejection, or
+protected upstream work. Malformed input can be rejected earlier by another
+transport check; the size limit does not override that rejection. Raw bytes
+include the request line,
+leading empty lines, OWS, and the terminating CRLFCRLF; normalized headers
+cannot recover that size. An exact-cap valid GET remains eligible for HTTP
+200 and one upstream probe connection. The pre-service rejection audit hook
+still runs and receives only the existing bounded transport classification.
+
+The repair caps bytes exposed to each positive-budget read; it does not
+promise an allocator-capacity bound. Hyper's existing parse loop rejects an
+incomplete head at its maximum before another read. Body collection, header
+count/deadline limits, processor admission, connection reaping (#286), and
+successful/expired graceful drain (#274) retain their existing contracts.
+There is no new parser, state, identity logic, or telemetry schema.
+
+Validation commands (Rust 1.95.0, from repository root):
+  cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
+  cargo +1.95.0 test -p eidolon-proxy --locked --target-dir target --lib production_runtime::
+  cargo audit --file Cargo.lock --deny warnings
+  cargo audit --file vendor/hyper/Cargo.lock --deny warnings
+Use --offline where dependencies are cached. CI audits both lockfiles.
+All three production/demo Dockerfiles use the repository-root context and
+COPY . .; .dockerignore includes this dependency and excludes its target/.
+
+Retirement: replace this local patch and exact pin only when a released Hyper
+version contains the positive-budget fix and preserves exact-zero client
+reads. Verify both buffer regressions and the complete/fragmented production
+raw-wire cap matrix on that release, preserve the shutdown/reaping controls,
+and rerun workspace build/lint/tests and all Docker build surfaces. Then
+remove this vendor package, its CI test/audit entries, and context exception
+together. A stock-version lockfile bump alone does not retire this repair.
