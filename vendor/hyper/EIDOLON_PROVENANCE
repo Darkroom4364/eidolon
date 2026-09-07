@@ -1,4 +1,4 @@
-Eidolon local provenance (#287)
+Eidolon local provenance (#287, #289)
 
 Source: the released crates.io hyper 1.11.1 package, published 2026-08-28.
 Archive: https://static.crates.io/crates/hyper/hyper-1.11.1.crate
@@ -19,6 +19,14 @@ Upstream-to-vendor delta:
   never report a false EOF. Two read_buffer_regression tests from reviewed
   predecessor 6c8d7e57c4a5dc01d1330d6051076236989f7d44 cover deterministic
   excess spare capacity and exact-zero client progress.
+- src/proto/h1/role.rs (#289): preserve each numerically identical request
+  Content-Length field in the parsed HeaderMap so the existing strict
+  MultipleContentLengths application policy can reject it. Decoder length
+  selection is unchanged; conflicting/invalid lengths still fail at Hyper.
+  Transfer-Encoding precedence, Content-Length removal with TE, and disabled
+  connection reuse for CL+TE are unchanged. Three content_length_regression
+  tests check field preservation, invalid/conflicting lengths and TE precedence;
+  CI also retains upstream test_decoder_request. No client/response parser change.
 - Cargo.toml: an empty [workspace] isolates the upstream unit-test workspace.
   It does not add Hyper to Eidolon's members or change production features.
 - .gitignore: keep the packaged Cargo.toml.orig despite the root *.orig rule
@@ -49,8 +57,21 @@ count/deadline limits, processor admission, connection reaping (#286), and
 successful/expired graceful drain (#274) retain their existing contracts.
 There is no new parser, state, identity logic, or telemetry schema.
 
+Ingress multiplicity invariant (#289): raw duplicate Content-Length fields must
+remain visible to the typed policy even when numerically equal. The deterministic
+regression fails before the role.rs repair (two zero-length fields become one)
+and passes afterward. Actual production-listener/HTTP-recorder matrices live in
+crates/eidolon-proxy/src/production_runtime_ingress_tests.rs. All 148 exchanges
+passed in root's socket-enabled native workspace run. An independent public
+listener / production-client probe also confirms the baseline forwarded equal
+duplicate CL while this repair rejects it with no validated/upstream work.
+The delegated sandbox's earlier bind EPERM was not protocol evidence. See the
+exact-test inventory and limits in plans/2026-09-07-production-ingress-equivalence.md.
+
 Validation commands (Rust 1.95.0, from repository root):
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
+  cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib content_length_regression
+  cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::test_decoder_request -- --exact
   cargo +1.95.0 test -p eidolon-proxy --locked --target-dir target --lib production_runtime::
   cargo audit --file Cargo.lock --deny warnings
   cargo audit --file vendor/hyper/Cargo.lock --deny warnings
@@ -59,9 +80,11 @@ All three production/demo Dockerfiles use the repository-root context and
 COPY . .; .dockerignore includes this dependency and excludes its target/.
 
 Retirement: replace this local patch and exact pin only when a released Hyper
-version contains the positive-budget fix and preserves exact-zero client
-reads. Verify both buffer regressions and the complete/fragmented production
-raw-wire cap matrix on that release, preserve the shutdown/reaping controls,
+version contains the positive-budget fix, preserves exact-zero client reads,
+and exposes duplicate request Content-Length fields to the strict policy.
+Verify both buffer regressions, the Content-Length regressions, and the
+complete/fragmented production raw-wire cap and ingress/forwarding matrices
+on that release, preserve the shutdown/reaping controls,
 and rerun workspace build/lint/tests and all Docker build surfaces. Then
 remove this vendor package, its CI test/audit entries, and context exception
 together. A stock-version lockfile bump alone does not retire this repair.

@@ -66,6 +66,12 @@ jobs:
         # HTTP/2 is needed by upstream's shared unit-test harness only.
         run: cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
 
+      - name: Test vendored Hyper HTTP/1 Content-Length preservation
+        # Retain upstream framing/decoding controls alongside the C1 regressions.
+        run: |
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib content_length_regression
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::test_decoder_request -- --exact
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.1 --locked
 
