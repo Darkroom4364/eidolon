@@ -1028,6 +1028,10 @@ mod boundary_tests;
 mod ingress_tests;
 
 #[cfg(test)]
+#[path = "production_runtime_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
 #[path = "production_runtime_upstream_tests.rs"]
 mod upstream_tests;
 
