@@ -1,12 +1,18 @@
 # Production resource lifecycle matrix — #291 / #251 C3
 
-Status: **C3a locally complete and independently reviewed; C3b and C3c
-remain**.
-Starting head: `742b29e8b0e3b815e51c5ce017b166e10dcc1fb7`, the reviewed local
+Status: **C3a locally complete and independently reviewed; C3b implemented
+and locally verified on owned loopback, with independent review pending; C3c
+remains**.
+C3a starting head: `742b29e8b0e3b815e51c5ce017b166e10dcc1fb7`, the reviewed local
 C2-on-C1 stack. The worktree was clean at that exact head before this slice.
-Final reviewed implementation head:
+Final reviewed C3a implementation head:
 `9cabb4d48aafd2bda7065ee7a9166145a05c7324`, tree
 `df793fdd647395b1887900087c38d83ae0e3767b`.
+
+C3b starting head: `a4dd236cdf92c81b4457190f3910c4e26a54ad0a`, tree
+`d673137e628d27bcba9c6679637b9e18060a9e94`. The dedicated worktree was clean
+at those exact values before editing. This C3b slice has not yet been
+independently reviewed.
 
 This is finite production-listener regression evidence. It is not Linux/image
 CI, Gate 2 completion, Gate 9 load/latency/RSS/soak evidence, publication,
@@ -40,6 +46,19 @@ particular:
   successful processing;
 - head parsing and body collection retain separate stage timers. C3a asserts a
   generous composed upper bound, not one accept-to-body absolute deadline.
+
+C3b extends the test-only listener harness with a separate `c3b` submodule.
+Its invariant is serial, exactly-once processing and complete upstream work
+across three requests on one connection, followed by terminal close, task reap,
+and fresh-connection recovery. Unsupported raw versions must release the task
+through the exact typed request or pre-service rejection hook, produce no
+normal/upstream work, and leave the same listener usable. The four new tests
+compile. Their first restricted-sandbox run stopped at the recorder bind before
+reaching production code; the subsequent owned-loopback run passed all four
+cases and observed the exact version hooks, response ordering, counters, task
+reaping, and recovery described below. **No production defect was
+demonstrated.** Production behavior and all C3a/C1/C2 assertions remain
+unchanged.
 
 ## Evidence layers
 
@@ -114,8 +133,8 @@ those exchanges.
 | Exact capacity and recovery | Lab exact-cap, production cap-one block, and 128 sequential reaps. | **C3a implemented locally:** simultaneous cap two, terminal cap+1, zero excess work, one-slot/full recovery, peak and task quiescence through real dispatch. |
 | Slow head/body | #287 held-open listener cases and Lab-only header drip. | **C3a implemented locally:** idle, paced incomplete head, paced incomplete body, exact hook/status/task/upstream outcomes, same-listener recovery. |
 | Partial-body EOF | C1 wire/no-work and full-profile durable no-audit tests. | **C3a implemented locally:** extends only task release and same-listener real-upstream recovery; retains both earlier oracles unchanged. |
-| Keep-alive/pipeline | Shutdown of one idle keep-alive and direct closed-gate pipeline denial. | **C3b remaining:** sequential reuse and successful bounded ordinary pipeline; do not duplicate C1 framing. |
-| Unsupported versions | Typed HTTP/1.0/2/3 policy and raw HTTP/2 rejection. | **C3b remaining:** raw HTTP/1.0 and post-rejection recovery/reaping; no HTTP/2 support. |
+| Keep-alive/pipeline | Shutdown of one idle keep-alive and direct closed-gate pipeline denial. | **C3b implemented and locally passed:** sequential reuse and successful bounded ordinary pipeline, with fresh recovery; no C1 framing or direct closed-gate denial duplication. |
+| Unsupported versions | Typed HTTP/1.0/2/3 policy and raw HTTP/2 rejection. | **C3b implemented and locally passed:** raw HTTP/1.0 and raw HTTP/2 rejection, task reap, and same-listener recovery; no HTTP/2 support. |
 | Shutdown phases | Accepted drain, idle drain, direct admission closure, and coupled expiry/quiescence. | **C3c remaining:** public-listener accepted/idle/late, queued pipeline, body-within-grace, and body-only expiry isolation. |
 
 ## Ordered C3 contract and case accounting
@@ -123,12 +142,14 @@ those exchanges.
 | Slice | Contract | Test functions / cases | Exchange accounting | Status |
 | --- | --- | ---: | --- | --- |
 | C3a | Exact capacity and one-slot/full recovery; idle/header/body deadline cleanup and recovery; zero/two-byte partial EOF cleanup and recovery. | **4 / 6**, plus one fixture-oracle negative check inside the capacity function. | **14 production-listener downstream TCP exchanges/peers; 8 complete upstream HTTP requests; one isolated fixture-only TCP exchange.** | **Implemented and locally passed.** |
-| C3b | Three sequential requests on one keep-alive connection plus fresh recovery; three-request ordinary pipeline plus fresh recovery; raw HTTP/1.0 and existing raw HTTP/2 rejection recovery. | Planned 4 / 4 | Planned 12 downstream request attempts across at most two peers per case; 10 upstream HTTP requests. | Remaining; no code in this slice. |
+| C3b | Three sequential requests on one keep-alive connection plus fresh recovery; three-request ordinary pipeline plus fresh recovery; raw HTTP/1.0 and existing raw HTTP/2 rejection recovery. | **4 / 4 implemented and passed** | Observed **8 downstream TCP peers / 12 request attempts / 10 complete upstream HTTP requests** after the earlier sandbox-denied run created zero exchanges. | Locally verified; independent review pending. |
 | C3c | Public-listener accepted/idle/late shutdown, queued pipeline isolation, body completion within grace, and body-only grace expiry. | Planned 4 / 4 | Planned at most three downstream peers and one upstream per case; exact final exchange counts await observed safe pipeline/late-peer wire outcomes. | Remaining; no code in this slice. |
 
-Full planned C3 is 12 test functions / 14 cases. This slice implements only the
-first ordered 4 functions / 6 cases. C3b and C3c must begin from this result and
-must not retroactively expand the claims of C3a.
+Full planned C3 is 12 test functions / 14 cases. C3a retains its independently
+reviewed 4 functions / 6 cases and observed exchange accounting. C3b adds only
+the next 4 functions / 4 cases, now locally behavior-verified with independent
+review outstanding; C3c remains unimplemented. C3b and C3c do not
+retroactively expand C3a claims.
 
 ## New C3a fixtures, synchronization, and exact oracles
 
@@ -171,7 +192,7 @@ guard retains each handle across its bounded await, including cancellation by
 the 20-second outer timeout. Drip writes are client application writes, not
 claims about TCP packets or Hyper read boundaries.
 
-## First-run observations
+## Retained C3a first-run observations
 
 1. Before editing, `git rev-parse HEAD` returned
    `742b29e8b0e3b815e51c5ce017b166e10dcc1fb7` and `git status --short` was
@@ -221,7 +242,9 @@ claims about TCP packets or Hyper read boundaries.
    reconcile, and production behavior remains unchanged. Report:
    `/tmp/codex-tasks/eidolon-lifecycle-c3a-finalreview-20260908.last.md`.
 
-## Local verification on this tree
+## Retained C3a local verification
+
+These are the previously recorded C3a results, not new C3b executions.
 
 Platform: Darwin 25.6.0 arm64. Toolchain: `rustc 1.95.0
 (59807616e 2026-04-14)`. All Cargo commands used `--offline --locked` and the
@@ -243,6 +266,119 @@ Verification used only owned loopback sockets and offline local artifacts. It
 did not access external network services, GitHub, Docker/Kubernetes/OrbStack,
 credentials, sensitive files, external targets, or online audits.
 
+## C3b implementation, synchronization, and expected accounting
+
+Source: `crates/eidolon-proxy/src/production_runtime_lifecycle_tests.rs`.
+Exact prefix: `production_runtime::lifecycle_tests::c3b::`.
+The following counts describe one complete matrix invocation of the implemented
+and subsequently observed cases; the earlier blocked run created zero
+exchanges. Each function contains exactly one production-listener case.
+
+| Exact test | Cases / downstream TCP peers / request attempts / complete upstream requests | Synchronization and required oracle |
+| --- | ---: | --- |
+| `three_sequential_keep_alive_requests_and_fresh_connection_recover` | **1 / 2 / 4 / 4** | One capacity-one listener and one reused downstream connection send `/sequential/one`, `/sequential/two`, and `/sequential/three`. Only request three asks to close. Each complete upstream capture is checked and released; its exact `HTTP/1.1 200 OK` and target body are fully parsed before the next write. Held-capture snapshots require normal/upstream counts `1`, `2`, `3`, current processor one, both retained peaks one, and no rejection hooks. After each response current processors must be zero; after the first two, the connection-task watch remains one. After response three, no extra bytes may precede terminal EOF/reset, and the task must reap before a fresh `/recovery/sequential` close exchange. Final exact normal/upstream totals are four, current processors/tasks zero, both peaks one, and the joined recorder set contains exactly all four targets once. |
+| `three_pipelined_requests_are_ordered_once_and_fresh_connection_recovers` | **1 / 2 / 4 / 4** | One bounded application write contains three complete requests for `/pipeline/one`, `/pipeline/two`, and `/pipeline/three`, with only the last asking to close. Complete upstream captures are observed and released in target order, with the same exact held-capture snapshots as the sequential case. Downstream reads begin after all three releases, using one retained per-peer buffer. Exactly three `HTTP/1.1 200 OK` frames must contain the corresponding target bodies in wire order. Both buffered trailing bytes and bytes arriving after frame three fail, including a partial fourth response; EOF/reset must be terminal and a timeout fails. Task reap precedes fresh `/recovery/pipeline`; final exact totals, peaks, and joined target set match the sequential case. The existing direct closed-admission pipeline denial test is unchanged. |
+| `raw_http10_rejection_releases_task_and_listener_recovers` | **1 / 2 / 2 / 1** | A complete raw `GET /version/http10 HTTP/1.0` includes Host and `Connection: close` and reaches the actual listener. Require exactly `[UnsupportedHttpVersion]`, no pre-service hook, zero normal/current/peak processor and upstream counts, task peak one, an empty fixed-length 400, terminal peer, and task zero. Only fresh `/recovery/http10` may enter normal processing and the final joined recorder set; final normal/upstream/processor peak/task peak are each one, current processors/tasks zero, and the rejection vectors remain exact. |
+| `raw_http2_preface_rejection_releases_task_and_listener_recovers` | **1 / 2 / 2 / 1** | A fixed `[u8; 24]` contains the retained `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` shape. Require exactly `[ProductionPreServiceRejection::Http2Preface]`, zero request rejection/normal/current/peak processor/upstream work, task peak one, zero response bytes, terminal EOF/reset, and task zero. Only fresh `/recovery/http2-preface` may enter normal processing and the final joined recorder set; final exact counters and retained hook vector prove same-listener recovery without HTTP/2 support. |
+| **C3b total** | **4 / 8 / 12 / 10** | Exactly four new behavior functions and four cases; the preface counts as one downstream request attempt, not a policy-adapted HTTP request. |
+
+`ResponseFrames` is an incremental fixed-length response reader. It finds one
+complete CRLF-delimited head, requires exactly one nonempty decimal
+`Content-Length` that fits `usize` and the remaining capture budget, rejects
+transfer encoding, and waits for exactly that body length before returning a
+borrowed frame. Every caller checks the exact status line and body. A cursor
+advances through one retained wire buffer, preserving any following response
+bytes; consumed bytes still count toward the aggregate 16 KiB peer limit.
+It never uses `read_to_end`. Final termination first rejects buffered bytes,
+then performs a bounded read that must yield EOF/reset with no bytes. Terminal
+state prevents later reads or frames; timeout never satisfies termination.
+
+All C3b sockets use the existing owned `127.0.0.1:0` fixtures. Each case opens
+exactly two downstream peers, sequentially, and permits at most four upstream
+peers and one production connection task at a time. The request writes are
+finite literal-sized messages; the pipeline also explicitly caps its single
+application write at 16 KiB. Downstream and upstream captures are at most
+16 KiB per peer. Reads, writes, connects, capture releases/waits, and joins
+retain five-second operation bounds, and every test has a 20-second outer
+timeout. Release sends are synchronous one-shot operations. The existing
+`serve_production_http1_inner`, counting/forwarding processor, real
+`dispatch_production_upstream`, complete-capture counter, task watch, atomic
+retained peak, recorder accept-queue drain, and joined final record set are
+reused unchanged. No negative accept timeout is a zero-work oracle.
+
+There are no new spawned tasks or detached handles. Successful finish joins
+the production listener and recorder; existing abort-on-drop owners cover
+assertion unwind and outer-timeout cancellation, including bounded join
+futures, and the recorder's `JoinSet` owns accepted workers. These are source
+ownership/boundedness checks exercised through each passing completion path,
+not hard-kill fault injection. Client writes and response buffering make no TCP
+segmentation claim. C1/C2 matrices, C3a assertions and accounting, runtime
+behavior, `main.rs`, manifests, locks, workflows, and vendor code remain
+unchanged.
+
+## C3b first run, version semantics, and local verification
+
+Platform: Darwin 25.6.0 arm64. Toolchain: `rustc 1.95.0
+(59807616e 2026-04-14)`. Commands ran in the supplied dedicated worktree with
+`CARGO_TARGET_DIR="$PWD/target/c3b"`. Every Cargo compilation/lint/test command
+used `--offline --locked`; formatting used `CARGO_NET_OFFLINE=true`.
+
+The first no-run compile passed without fixture diagnostics. The first focused
+behavior invocation then exited 101: **0 passed, 4 failed, 353 filtered out,
+0.00 seconds**. All four failed at the same initial recorder bind, before the
+production listener existed:
+
+```text
+crates/eidolon-proxy/src/production_runtime_lifecycle_tests.rs:290:14
+owned recorder should bind: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+```
+
+The complete original output is retained at
+`target/c3b/c3b-first-behavior.log` in this worktree. It was captured with
+`set -o pipefail` and `2>&1 | tee target/c3b/c3b-first-behavior.log`, preserving
+the failing Cargo exit status. This is exact sandbox failure evidence, not
+fail-first evidence of a production defect. No production repair or access
+escalation followed it, and no helper-only passing test replaced the cases.
+
+Root then ran the same focused command with owned loopback permitted. It passed
+all four functions in 0.01 seconds, 353 filtered. This confirmed that HTTP/1.0
+reaches `ProductionHttpPolicy::adapt` and exact `UnsupportedHttpVersion`; the
+fixture supplies an empty `HTTP/1.0 400 Bad Request` with one
+`Content-Length: 0`, no connection header, and terminal close by HTTP/1.0
+semantics. The retained 24-byte HTTP/2 preface maps to exact
+`ProductionPreServiceRejection::Http2Preface` before request policy, with no
+response channel or wire bytes. Both version cases reap their task and recover
+on the same listener. Sequential and pipelined cases observed exact ordered
+target bodies, serial processor peak one, no extra response, task reap, and
+fresh-connection recovery. The observed totals were the planned eight
+downstream peers, 12 request attempts, and ten complete upstream requests. No
+production defect was demonstrated.
+
+| Command/check (with the environment above) | Exact local outcome |
+| --- | --- |
+| `cargo +1.95.0 fmt --all -- --check` | Exit 0 after formatting only the changed test file with the pinned rustfmt. |
+| `git diff --check` | Exit 0. |
+| `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime::lifecycle_tests::c3b:: --no-run` | Exit 0; compiled the library test executable in 11.27 seconds, including all four C3b tests. |
+| `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime::lifecycle_tests::c3b:: -- --nocapture` | Exit 101; all four initial owned recorder binds denied as quoted above; 0 passed, 4 failed, 353 filtered, no production exchanges. |
+| `cargo +1.95.0 clippy --offline --locked -p eidolon-proxy --lib --tests -- -D warnings` | Exit 0 in 5.74 seconds; no warnings. |
+| `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime:: -- --list` | Exit 0; inventory only: 42 tests, 0 benchmarks, comprising the 38 retained runtime tests and four C3b additions. No behavior ran. |
+| Root rerun: `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime::lifecycle_tests::c3b:: -- --nocapture` | **4 passed**, 0 failed, 353 filtered in 0.01 seconds; four cases, eight downstream peers, 12 attempts, ten complete upstream requests. |
+| Root rerun: `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime:: -- --nocapture` | **42 passed**, 0 failed, 315 filtered in 30.30 seconds: eight C3a/C3b lifecycle tests and all 34 retained runtime/#287/C1/C2 tests. |
+| `cargo +1.95.0 build --offline --locked --workspace --all-targets` | Passed on the C3b tree. |
+| `cargo +1.95.0 clippy --offline --locked --workspace --all-targets --all-features -- -D warnings` | Passed on the C3b tree. |
+| `cargo +1.95.0 test --offline --locked --workspace --all-targets` | Passed all targets; **816 tests**, four more than the reviewed C3a tree. |
+| Vendored Hyper `regression` filter with `client,http1,http2,server` | **5 passed**. |
+| Vendored Hyper exact `proto::h1::role::tests::test_decoder_request` | **1 passed**. |
+| Direct compiled C3b test-binary filter repeated ten times | **10/10 suite repetitions passed** (40 test executions). This is a stability diagnostic; the matrix table records one invocation's case/exchange counts. |
+
+No unrelated shell fixture/live suites were run for C3b. There was no external
+network, credential/secret access, container or cluster operation, or
+other-worktree mutation. The C3a verification and independent-review results
+above remain separate historical evidence, not substitutes for the C3b passes.
+
+Root's next actions are to freeze the inspected tree in a local commit and
+arrange independent C3b review. This implementation has no such review yet.
+
 ## Remaining gates and limits
 
 - [x] C3a exact capacity, cap+1 zero excess work, one-slot/full recovery, exact
@@ -251,7 +387,11 @@ credentials, sensitive files, external targets, or online audits.
   response, process, task, and upstream outcomes.
 - [x] C3a zero/two-byte partial-body EOF cleanup/recovery while retaining C1 and
   the full-profile durable no-audit test unchanged.
-- [ ] C3b keep-alive, ordinary pipeline, HTTP/1.0, and post-HTTP/2 recovery.
+- [x] C3b four-case test implementation, pinned formatting, offline no-run
+  compile, and scoped Clippy with warnings denied.
+- [x] C3b keep-alive, ordinary pipeline, HTTP/1.0, and post-HTTP/2 local
+  behavior verification and actual exchange accounting.
+- [ ] Independent C3b review arranged by root.
 - [ ] C3c public-listener shutdown phase isolation.
 - [x] Exact implementation-head independent re-review of the corrected C3a
   harness passed with no findings.

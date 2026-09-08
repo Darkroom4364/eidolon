@@ -1,6 +1,7 @@
-//! C3a: bounded capacity and slow/partial-client cleanup through the actual
-//! production listener and production upstream dispatcher. This is finite
-//! lifecycle regression evidence, not load, latency, RSS, or soak evidence.
+//! C3a/C3b: bounded capacity, slow/partial-client cleanup, connection reuse,
+//! and version-rejection recovery through the actual production listener and
+//! production upstream dispatcher. This is finite lifecycle regression
+//! evidence, not load, latency, RSS, or soak evidence.
 
 use std::{
     io::ErrorKind,
@@ -1228,4 +1229,378 @@ async fn partial_body_disconnect_releases_capacity_and_same_listener_recovers() 
     })
     .await
     .expect("partial-body C3a cases exceeded 20 seconds");
+}
+
+mod c3b {
+    use super::*;
+
+    #[derive(Default)]
+    struct ResponseFrames {
+        // Keep the entire peer capture, including consumed frames, under one
+        // aggregate cap. Advancing the cursor never discards following bytes
+        // or resets the byte budget between keep-alive/pipelined responses.
+        wire: Vec<u8>,
+        consumed: usize,
+        terminal: Option<TerminalKind>,
+    }
+
+    struct ResponseFrame<'a> {
+        head: &'a str,
+        body: &'a [u8],
+    }
+
+    impl ResponseFrames {
+        async fn read_more(&mut self, stream: &mut TcpStream) {
+            assert!(
+                self.terminal.is_none(),
+                "EOF/reset is terminal for this peer"
+            );
+            let mut buffer = [0_u8; 1024];
+            match timeout(OPERATION_BUDGET, stream.read(&mut buffer))
+                .await
+                .expect("downstream frame read must finish within five seconds")
+            {
+                Ok(0) => self.terminal = Some(TerminalKind::Eof),
+                Ok(count) => {
+                    assert!(
+                        self.wire.len() + count <= CAPTURE_LIMIT,
+                        "aggregate downstream peer capture exceeded {CAPTURE_LIMIT} bytes"
+                    );
+                    self.wire.extend_from_slice(&buffer[..count]);
+                }
+                Err(error) if terminal_reset(&error) => self.terminal = Some(TerminalKind::Reset),
+                Err(error) => panic!("downstream frame read failed: {error}"),
+            }
+        }
+
+        async fn next_frame(&mut self, stream: &mut TcpStream) -> ResponseFrame<'_> {
+            assert!(
+                self.terminal.is_none(),
+                "cannot parse another frame after EOF/reset"
+            );
+            let start = self.consumed;
+            let (end, frame_end) = timeout(OPERATION_BUDGET, async {
+                let end = loop {
+                    if let Some(relative_end) = head_end(&self.wire[start..]) {
+                        break start + relative_end;
+                    }
+                    self.read_more(stream).await;
+                    assert!(
+                        self.terminal.is_none(),
+                        "peer terminated before a complete response head: {:?}",
+                        self.wire
+                    );
+                };
+                let body_len = {
+                    let head = std::str::from_utf8(&self.wire[start..end - 4])
+                        .expect("response head should be ASCII");
+                    assert!(head.is_ascii(), "response head should be ASCII");
+                    let mut lines = head.split("\r\n");
+                    let status = lines.next().expect("response must have a status line");
+                    assert!(
+                        status.starts_with("HTTP/1.1 ") || status.starts_with("HTTP/1.0 "),
+                        "unexpected response version: {status}"
+                    );
+                    let mut content_length = None;
+                    for line in lines {
+                        let (name, value) = line
+                            .split_once(':')
+                            .expect("response header must contain a separator");
+                        assert!(
+                            !name.eq_ignore_ascii_case("transfer-encoding"),
+                            "fixed-length response must not contain transfer encoding"
+                        );
+                        if name.eq_ignore_ascii_case("content-length") {
+                            assert!(content_length.is_none(), "exactly one content length");
+                            let value = value.trim_matches([' ', '\t']);
+                            assert!(
+                                !value.is_empty()
+                                    && value.bytes().all(|byte| byte.is_ascii_digit()),
+                                "content length must contain only decimal digits"
+                            );
+                            content_length = Some(
+                                value
+                                    .parse::<usize>()
+                                    .expect("content length must not overflow"),
+                            );
+                        }
+                    }
+                    content_length.expect("response must contain one content length")
+                };
+                assert!(
+                    body_len <= CAPTURE_LIMIT - end,
+                    "response body must fit in the remaining aggregate peer budget"
+                );
+                let frame_end = end + body_len;
+                while self.wire.len() < frame_end {
+                    self.read_more(stream).await;
+                    assert!(
+                        self.terminal.is_none(),
+                        "peer terminated before the declared response body was complete"
+                    );
+                }
+                (end, frame_end)
+            })
+            .await
+            .expect("one complete downstream response frame must arrive within five seconds");
+            self.consumed = frame_end;
+            ResponseFrame {
+                head: std::str::from_utf8(&self.wire[start..end - 4])
+                    .expect("validated response head should remain ASCII"),
+                body: &self.wire[end..frame_end],
+            }
+        }
+
+        async fn expect_terminal(&mut self, stream: &mut TcpStream) -> TerminalKind {
+            assert_eq!(
+                self.consumed,
+                self.wire.len(),
+                "extra response bytes were buffered after the final expected frame: {:?}",
+                &self.wire[self.consumed..]
+            );
+            self.read_more(stream).await;
+            assert_eq!(
+                self.consumed,
+                self.wire.len(),
+                "extra response bytes arrived after the final expected frame: {:?}",
+                &self.wire[self.consumed..]
+            );
+            self.terminal
+                .expect("peer must reach terminal EOF/reset, never a timeout")
+        }
+    }
+
+    fn assert_frame(frame: &ResponseFrame<'_>, status_line: &str, body: &[u8]) {
+        assert_eq!(frame.head.split("\r\n").next(), Some(status_line));
+        assert_eq!(
+            frame.body, body,
+            "exact distinguishable downstream response body"
+        );
+    }
+
+    fn reuse_request(target: &str, close: bool) -> Vec<u8> {
+        if close {
+            request(target)
+        } else {
+            format!("GET {target} HTTP/1.1\r\nHost: proxy.owned.test\r\n\r\n").into_bytes()
+        }
+    }
+
+    fn assert_normal_work(harness: &LifecycleHarness, total: usize, current: usize) {
+        assert_eq!(
+            harness.snapshot(),
+            CounterSnapshot {
+                normal_process: total,
+                request_rejections: Vec::new(),
+                pre_service_rejections: Vec::new(),
+                current_processors: current,
+                peak_processors: 1,
+                peak_connection_tasks: 1,
+                upstream_requests: total,
+            },
+            "exactly-once serial processing and complete upstream work"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn three_sequential_keep_alive_requests_and_fresh_connection_recover() {
+        timeout(TEST_BUDGET, async {
+            const TARGETS: [&str; 3] = ["/sequential/one", "/sequential/two", "/sequential/three"];
+            const RECOVERY: &str = "/recovery/sequential";
+            let mut harness = LifecycleHarness::start(1, OPERATION_BUDGET, false).await;
+            let mut client = harness.connect_and_wait_for_tasks(1).await;
+            let mut responses = ResponseFrames::default();
+
+            for (index, target) in TARGETS.iter().enumerate() {
+                let close = index == TARGETS.len() - 1;
+                // Each preceding frame has been fully parsed before this
+                // bounded application write on the same TCP connection.
+                write_all_bounded(&mut client, &reuse_request(target, close)).await;
+                let capture = harness.next_upstream().await;
+                assert_upstream_request(&capture.request, target);
+                harness.wait_for_tasks(1).await;
+                assert_normal_work(&harness, index + 1, 1);
+                capture.release();
+
+                let frame = responses.next_frame(&mut client).await;
+                assert_frame(&frame, "HTTP/1.1 200 OK", target.as_bytes());
+                if close {
+                    assert_eq!(response_header_values(frame.head, "connection"), ["close"]);
+                } else {
+                    assert!(response_header_values(frame.head, "connection").is_empty());
+                    harness.wait_for_tasks(1).await;
+                }
+                assert_normal_work(&harness, index + 1, 0);
+            }
+            responses.expect_terminal(&mut client).await;
+            harness.wait_for_tasks(0).await;
+            assert_normal_work(&harness, 3, 0);
+            drop(client);
+
+            recovery_exchange(&mut harness, RECOVERY).await;
+            assert_normal_work(&harness, 4, 0);
+            let records = harness.finish().await;
+            assert_record_targets(&records, &[TARGETS[0], TARGETS[1], TARGETS[2], RECOVERY]);
+        })
+        .await
+        .expect("sequential keep-alive C3b case exceeded 20 seconds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn three_pipelined_requests_are_ordered_once_and_fresh_connection_recovers() {
+        timeout(TEST_BUDGET, async {
+            const TARGETS: [&str; 3] = ["/pipeline/one", "/pipeline/two", "/pipeline/three"];
+            const RECOVERY: &str = "/recovery/pipeline";
+            let mut harness = LifecycleHarness::start(1, OPERATION_BUDGET, false).await;
+            let mut client = harness.connect_and_wait_for_tasks(1).await;
+            let pipeline = TARGETS
+                .iter()
+                .enumerate()
+                .flat_map(|(index, target)| reuse_request(target, index == TARGETS.len() - 1))
+                .collect::<Vec<_>>();
+            assert!(
+                pipeline.len() <= CAPTURE_LIMIT,
+                "bounded complete pipeline write"
+            );
+            // One application write of three complete requests, with no claim
+            // about TCP segmentation or Hyper's individual reads.
+            write_all_bounded(&mut client, &pipeline).await;
+            for (index, target) in TARGETS.iter().enumerate() {
+                let capture = harness.next_upstream().await;
+                assert_upstream_request(&capture.request, target);
+                harness.wait_for_tasks(1).await;
+                assert_normal_work(&harness, index + 1, 1);
+                capture.release();
+            }
+
+            // Delay downstream reads until all three captures are released;
+            // one peer buffer retains any coalesced following response bytes.
+            let mut responses = ResponseFrames::default();
+            for (index, target) in TARGETS.iter().enumerate() {
+                let frame = responses.next_frame(&mut client).await;
+                assert_frame(&frame, "HTTP/1.1 200 OK", target.as_bytes());
+                if index == TARGETS.len() - 1 {
+                    assert_eq!(response_header_values(frame.head, "connection"), ["close"]);
+                } else {
+                    assert!(response_header_values(frame.head, "connection").is_empty());
+                }
+            }
+            // Check both already-buffered bytes and the next bounded socket
+            // read. Even a partial fourth response fails; timeout cannot pass.
+            responses.expect_terminal(&mut client).await;
+            harness.wait_for_tasks(0).await;
+            assert_normal_work(&harness, 3, 0);
+            drop(client);
+
+            recovery_exchange(&mut harness, RECOVERY).await;
+            assert_normal_work(&harness, 4, 0);
+            let records = harness.finish().await;
+            assert_record_targets(&records, &[TARGETS[0], TARGETS[1], TARGETS[2], RECOVERY]);
+        })
+        .await
+        .expect("ordinary pipeline C3b case exceeded 20 seconds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_http10_rejection_releases_task_and_listener_recovers() {
+        timeout(TEST_BUDGET, async {
+            const RECOVERY: &str = "/recovery/http10";
+            let mut harness = LifecycleHarness::start(1, OPERATION_BUDGET, false).await;
+            let mut client = harness.connect_and_wait_for_tasks(1).await;
+            write_all_bounded(
+                &mut client,
+                b"GET /version/http10 HTTP/1.0\r\nHost: proxy.owned.test\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            let mut responses = ResponseFrames::default();
+            let frame = responses.next_frame(&mut client).await;
+            assert_frame(&frame, "HTTP/1.0 400 Bad Request", b"");
+            // HTTP/1.0 defaults to close; Hyper need not add a close header.
+            assert!(response_header_values(frame.head, "connection").is_empty());
+            responses.expect_terminal(&mut client).await;
+            harness.wait_for_tasks(0).await;
+            assert_eq!(
+                harness.snapshot(),
+                CounterSnapshot {
+                    normal_process: 0,
+                    request_rejections: vec![ProductionRequestRejection::UnsupportedHttpVersion],
+                    pre_service_rejections: Vec::new(),
+                    current_processors: 0,
+                    peak_processors: 0,
+                    peak_connection_tasks: 1,
+                    upstream_requests: 0,
+                },
+                "raw HTTP/1.0 must reach typed policy once and release without normal work"
+            );
+            drop(client);
+
+            recovery_exchange(&mut harness, RECOVERY).await;
+            assert_eq!(
+                harness.snapshot(),
+                CounterSnapshot {
+                    normal_process: 1,
+                    request_rejections: vec![ProductionRequestRejection::UnsupportedHttpVersion],
+                    pre_service_rejections: Vec::new(),
+                    current_processors: 0,
+                    peak_processors: 1,
+                    peak_connection_tasks: 1,
+                    upstream_requests: 1,
+                },
+                "same listener must recover after exact HTTP/1.0 policy rejection"
+            );
+            let records = harness.finish().await;
+            assert_record_targets(&records, &[RECOVERY]);
+        })
+        .await
+        .expect("raw HTTP/1.0 C3b case exceeded 20 seconds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raw_http2_preface_rejection_releases_task_and_listener_recovers() {
+        timeout(TEST_BUDGET, async {
+            const PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+            const RECOVERY: &str = "/recovery/http2-preface";
+            let mut harness = LifecycleHarness::start(1, OPERATION_BUDGET, false).await;
+            let mut client = harness.connect_and_wait_for_tasks(1).await;
+            write_all_bounded(&mut client, PREFACE).await;
+            let mut responses = ResponseFrames::default();
+            // The pre-service hook has no HTTP response channel. Require
+            // zero wire bytes and terminal EOF/reset through the same reader.
+            responses.expect_terminal(&mut client).await;
+            harness.wait_for_tasks(0).await;
+            assert_eq!(
+                harness.snapshot(),
+                CounterSnapshot {
+                    normal_process: 0,
+                    request_rejections: Vec::new(),
+                    pre_service_rejections: vec![ProductionPreServiceRejection::Http2Preface],
+                    current_processors: 0,
+                    peak_processors: 0,
+                    peak_connection_tasks: 1,
+                    upstream_requests: 0,
+                },
+                "raw HTTP/2 preface must reject once before request policy and release the task"
+            );
+            drop(client);
+
+            recovery_exchange(&mut harness, RECOVERY).await;
+            assert_eq!(
+                harness.snapshot(),
+                CounterSnapshot {
+                    normal_process: 1,
+                    request_rejections: Vec::new(),
+                    pre_service_rejections: vec![ProductionPreServiceRejection::Http2Preface],
+                    current_processors: 0,
+                    peak_processors: 1,
+                    peak_connection_tasks: 1,
+                    upstream_requests: 1,
+                },
+                "same listener must recover after exact HTTP/2 pre-service rejection"
+            );
+            let records = harness.finish().await;
+            assert_record_targets(&records, &[RECOVERY]);
+        })
+        .await
+        .expect("raw HTTP/2-preface C3b case exceeded 20 seconds");
+    }
 }
