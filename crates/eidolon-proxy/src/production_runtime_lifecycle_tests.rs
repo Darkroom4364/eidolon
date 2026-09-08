@@ -741,16 +741,70 @@ async fn write_all_bounded(stream: &mut TcpStream, bytes: &[u8]) {
         .expect("downstream write should succeed");
 }
 
-async fn attempt_write_then_terminal(stream: &mut TcpStream, bytes: &[u8]) -> TerminalResponse {
-    match timeout(OPERATION_BUDGET, stream.write_all(bytes)).await {
-        Ok(Ok(())) => read_terminal_response(stream).await,
-        Ok(Err(error)) if terminal_reset(&error) => TerminalResponse {
-            bytes: Vec::new(),
-            terminal: TerminalKind::Reset,
-        },
-        Ok(Err(error)) => panic!("cap+1 write failed unexpectedly: {error}"),
-        Err(_) => panic!("cap+1 write did not terminate within five seconds"),
+async fn observe_terminal_response_after_write(
+    stream: &mut TcpStream,
+    write_result: std::io::Result<()>,
+) -> TerminalResponse {
+    match write_result {
+        Ok(()) => {}
+        Err(error) if terminal_reset(&error) => {}
+        Err(error) => panic!("cap+1 write failed unexpectedly: {error}"),
     }
+    // A terminal write error does not prove that the peer sent no response:
+    // bytes may already be queued on the receive side. Both allowed write
+    // outcomes must therefore traverse the same bounded, capped read oracle.
+    read_terminal_response(stream).await
+}
+
+async fn attempt_write_then_terminal(stream: &mut TcpStream, bytes: &[u8]) -> TerminalResponse {
+    let write_result = timeout(OPERATION_BUDGET, stream.write_all(bytes))
+        .await
+        .expect("cap+1 write did not terminate within five seconds");
+    observe_terminal_response_after_write(stream, write_result).await
+}
+
+async fn write_reset_oracle_preserves_buffered_response_bytes() {
+    const BUFFERED_RESPONSE: &[u8] =
+        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbusy";
+    let listener = timeout(OPERATION_BUDGET, TcpListener::bind("127.0.0.1:0"))
+        .await
+        .expect("oracle listener bind should be bounded")
+        .expect("oracle listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("oracle listener should have an address");
+    let writer = AbortOnDropTask::new(tokio::spawn(async move {
+        let (mut stream, _) = timeout(OPERATION_BUDGET, listener.accept())
+            .await
+            .expect("oracle accept should be bounded")
+            .expect("oracle listener should accept one peer");
+        timeout(OPERATION_BUDGET, stream.write_all(BUFFERED_RESPONSE))
+            .await
+            .expect("buffered oracle response write should be bounded")
+            .expect("buffered oracle response should write");
+        timeout(OPERATION_BUDGET, stream.shutdown())
+            .await
+            .expect("oracle writer shutdown should be bounded")
+            .expect("oracle writer should shut down");
+    }));
+    let mut client = timeout(OPERATION_BUDGET, TcpStream::connect(address))
+        .await
+        .expect("oracle client connect should be bounded")
+        .expect("oracle client should connect");
+    writer.join("buffered-response oracle writer").await;
+
+    let outcome = observe_terminal_response_after_write(
+        &mut client,
+        Err(std::io::Error::new(
+            ErrorKind::ConnectionReset,
+            "synthetic terminal write result",
+        )),
+    )
+    .await;
+    assert_eq!(
+        outcome.bytes, BUFFERED_RESPONSE,
+        "terminal write errors must not fabricate an empty receive result"
+    );
 }
 
 async fn write_one_byte_drip(stream: &mut TcpStream, bytes: &[u8]) -> usize {
@@ -970,9 +1024,12 @@ async fn exact_capacity_case() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_capacity_overload_has_zero_excess_work_and_recovers() {
-    timeout(TEST_BUDGET, exact_capacity_case())
-        .await
-        .expect("exact-capacity C3a case exceeded 20 seconds");
+    timeout(TEST_BUDGET, async {
+        write_reset_oracle_preserves_buffered_response_bytes().await;
+        exact_capacity_case().await;
+    })
+    .await
+    .expect("exact-capacity C3a case exceeded 20 seconds");
 }
 
 #[derive(Clone, Copy, Debug)]
