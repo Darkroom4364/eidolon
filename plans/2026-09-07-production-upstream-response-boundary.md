@@ -4,8 +4,9 @@ Status: local C2 implementation and macOS verification complete for #290 on
 reviewed C1 `4f8b3eb98afee972d00da18100cbd10426f7ff05` (#289). Root independently
 reproduced both response-boundary defects on the unchanged C1 runtime, applied
 the two narrow repairs below, and passed the complete local gate. Independent
-cross-runtime review and Linux CI remain. Neither C1 nor C2 is merged or
-published; C1 publication still needs GitHub workflow permission. This plan
+cross-runtime review of `f0e55a60689571a0b358a589b5682ee25d240893`
+returned `PASS` with no findings; Linux CI remains. Neither C1 nor C2 is merged
+or published; C1 publication still needs GitHub workflow permission. This plan
 does not supersede or edit C1's source/inventory.
 
 ## Contract
@@ -276,7 +277,10 @@ dependency was installed or upgraded.
   now gives A and B distinct status/body/header signatures and asserts the
   expected responder per dispatch; the plan typo is fixed. Pinned fmt, build,
   Clippy, the focused fallback test, all eight C2 tests and all 808 workspace
-  tests passed again. Follow-up exact-head review remains pending.
+  tests passed again. Follow-up review of
+  `f0e55a60689571a0b358a589b5682ee25d240893` returned `PASS` with no blocking
+  or non-blocking findings. Dynamic gates remain root evidence; Linux
+  exact-head CI and full-profile response equivalence remain residual limits.
 
 ## Remaining gates and root handoff
 
@@ -287,7 +291,7 @@ dependency was installed or upgraded.
 - [x] Obtain actual no-replay, safe downstream and connection-quiescence evidence for all error shapes.
 - [x] Execute retained C1/#287 ingress, admission, no-retry, reaping and drain socket regressions.
 - [x] Pass final pinned fmt/build/Clippy/full workspace/vendor tests and applicable fixtures/audits on the final tree.
-- [ ] Follow-up independent exact-head review passes after the corrected fallback oracle.
+- [x] Follow-up independent review passes after the corrected fallback oracle.
 - [ ] Authorized publication, exact-head Linux/image CI, C1 integration and merge.
 
 No Linux CI, PR, merge, release or v1 Gate completion is claimed while
