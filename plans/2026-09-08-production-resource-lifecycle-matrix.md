@@ -1,6 +1,7 @@
 # Production resource lifecycle matrix — #291 / #251 C3
 
-Status: **C3a implemented and locally verified; C3b and C3c remain**.
+Status: **C3a implemented and locally verified; review corrections await
+exact-head re-review; C3b and C3c remain**.
 Starting head: `742b29e8b0e3b815e51c5ce017b166e10dcc1fb7`, the reviewed local
 C2-on-C1 stack. The worktree was clean at that exact head before this slice.
 
@@ -18,10 +19,13 @@ body is complete, must release the connection task without poisoning the still
 running listener. Only a fully validated recovery request may reach the real
 `dispatch_production_upstream` path.
 
-C3a adds test-only evidence and a test-module declaration. Runtime branches,
-`main.rs`, vendor code, manifests, locks, workflows, and existing test bodies
-are unchanged. All agreed C3a cases passed against the unchanged production
-behavior. **No production defect was demonstrated.** In particular:
+C3a adds test-only evidence, a test-module declaration, and an atomic
+test-only connection-task peak hook beside the existing current-task watch.
+The C1 harness passes `None` for that new observation hook; its assertions and
+matrix are unchanged. Production branches, `main.rs`, vendor code, manifests,
+locks, and workflows are unchanged. All agreed C3a cases passed against the
+unchanged production behavior. **No production defect was demonstrated.** In
+particular:
 
 - cap+1 remains the existing terminal close/reset with zero response, not a
   synthetic HTTP overload response;
@@ -129,9 +133,9 @@ Prefix: `production_runtime::lifecycle_tests::`.
 
 | Exact test | Cases and exchanges | Synchronization and exact oracle |
 | --- | ---: | --- |
-| `exact_capacity_overload_has_zero_excess_work_and_recovers` | 1 case; 4 downstream peers, 3 upstream requests. | Capacity two. Each fixture processor calls the real dispatcher and stays held until the recorder has captured its complete method/target/headers/body. Snapshot at full: task/current/peak/normal-process/upstream = `2/2/2/2/2`, request and pre-service rejections zero. Cap+1 must connect and complete its write, then reach EOF/reset with zero bytes; every counter remains unchanged. Releasing only `/capacity/one` yields its exact target-body 200 and tasks/current one. `/capacity/recovered` restores tasks/current two and totals three. Releasing the remaining captures yields all three distinguishable exact responses, tasks/current zero, peak exactly two, then clean listener and recorder joins. No internal semaphore count is inspected. |
-| `idle_and_header_byte_drip_deadlines_release_capacity_and_recover` | 2 cases; 4 downstream peers, 2 upstream requests. | Capacity one and one-second head deadline. Idle sends zero bytes. Drip attempts 12 one-byte client writes at fixed 100 ms intervals (well below the 32-write cap) and never completes a head. Each peer must terminate within 1.7 seconds with zero bytes, task count zero, exactly one `HeaderReadTimedOut`, and zero request-rejection/normal/upstream work. A timer incorrectly restarted by the final write would expire at about 2.1 seconds and fail this bound. A same-listener GET then yields one complete recorder capture and exact target-body 200. |
-| `head_then_body_byte_drip_has_composed_stage_bound_and_recovers` | 1 case; 2 downstream peers, 1 upstream request. | Capacity one. After 400 ms within the independent head stage, send a complete `Content-Length: 16` head, wait for the actual body-collection signal, then attempt at most 12 positive one-byte writes at fixed 100 ms intervals without completing the body. Require exact `RequestTimedOut`, empty 408 with one `Content-Length: 0` and connection close, zero pre-service/normal/upstream work, task zero, and body-stage terminal outcome within 1.7 seconds; a timer restarted by the last byte would expire at about 2.1 seconds. Admission-to-terminal is also bounded by a generous 3 seconds: two one-second stage budgets plus one second scheduler/socket margin, explicitly not one absolute deadline. Same-listener recovery traverses the recorder and returns exact 200. |
+| `exact_capacity_overload_has_zero_excess_work_and_recovers` | 1 case; 4 downstream peers, 3 upstream requests. | Capacity two. Each fixture processor calls the real dispatcher and stays held until the recorder has captured its complete method/target/headers/body. Snapshot at full: current tasks/current processors/peak tasks/peak processors/normal-process/upstream = `2/2/2/2/2/2`, request and pre-service rejections zero. Cap+1 must connect and attempt its bounded write; either the write completes before EOF/reset or the write itself observes a terminal reset, with zero response bytes and every work counter unchanged. Releasing only `/capacity/one` yields its exact target-body 200 and tasks/current one. `/capacity/recovered` restores tasks/current two and totals three. Releasing the remaining captures yields all three distinguishable exact responses, tasks/current zero, both peaks exactly two, then clean listener and recorder joins. No internal semaphore count is inspected. |
+| `idle_and_header_byte_drip_deadlines_release_capacity_and_recover` | 2 cases; 4 downstream peers, 2 upstream requests. | Capacity one and one-second head deadline. Idle sends zero bytes. Drip attempts 12 one-byte client writes at fixed 100 ms intervals (well below the 32-write cap), requires at least eight successes, and invalidates itself if adjacent attempts are more than 250 ms apart. It never completes a head. Each peer must terminate within 1.7 seconds with zero bytes, task count zero, exactly one `HeaderReadTimedOut`, and zero request-rejection/normal/upstream work. A timer incorrectly restarted by the final write would expire at about 2.1 seconds and fail this bound; a scheduler pause long enough to turn the case into idle expiry fails the pacing oracle first. A same-listener GET then yields one complete recorder capture and exact target-body 200. |
+| `head_then_body_byte_drip_has_composed_stage_bound_and_recovers` | 1 case; 2 downstream peers, 1 upstream request. | Capacity one. After 400 ms within the independent head stage, send a complete `Content-Length: 16` head, wait for the actual body-collection signal, then attempt at most 12 one-byte writes at fixed 100 ms intervals without completing the body. Require at least eight successes and no adjacent attempt gap above 250 ms. Require exact `RequestTimedOut`, empty 408 with one `Content-Length: 0` and connection close, zero pre-service/normal/upstream work, task zero, and body-stage terminal outcome within 1.7 seconds; a timer restarted by the last byte would expire at about 2.1 seconds. Admission-to-terminal is also bounded by a generous 3 seconds: two one-second stage budgets plus one second scheduler/socket margin, explicitly not one absolute deadline. Same-listener recovery traverses the recorder and returns exact 200. |
 | `partial_body_disconnect_releases_capacity_and_same_listener_recovers` | 2 cases; 4 downstream peers, 2 upstream requests. | Capacity one; advertise four bytes, wait for actual body collection, send zero or two bytes, then half-close the client write side. Each partial request retains the empty HTTP 200 / one `Content-Length: 0` / connection-close outcome, with zero request/pre-service/normal/upstream work and task zero. A distinct same-listener recovery GET then creates exactly one normal processor and complete upstream request and returns its exact target-body 200. The full-profile test above remains the durable no-audit oracle. |
 
 The shared counting processor records exact normal, request-rejection,
@@ -144,14 +148,21 @@ accept queue after listener quiescence, and joins every accepted worker. Its
 atomic complete-request count is the mid-test zero/exact-work oracle; no negative
 accept timeout is used.
 
+The listener records every post-spawn `JoinSet` length into an atomic maximum,
+so an intermediate task-count transition cannot be lost through the coalescing
+current-count watch. Current task values still provide the synchronized
+`2 -> 1 -> 2 -> 0` checkpoints.
+
 Every target is owned `127.0.0.1:0`. Each operation, response read, and join is
 bounded to five seconds; each test function has a 20-second outer bound. There
 are at most four downstream and four upstream peers per case/test and no more
 than two production connection tasks. Every capture is at most 16 KiB. Expected
 Darwin/Linux-style clean EOF and connection reset/abort/broken-pipe terminal
 variants are normalized; a timeout never satisfies cap+1 termination. Assertion
-unwind aborts the owned listener and recorder task trees. Drip writes are client
-application writes, not claims about TCP packets or Hyper read boundaries.
+unwind aborts the owned listener and recorder task trees. An abort-on-drop join
+guard retains each handle across its bounded await, including cancellation by
+the 20-second outer timeout. Drip writes are client application writes, not
+claims about TCP packets or Hyper read boundaries.
 
 ## First-run observations
 
@@ -178,6 +189,15 @@ application writes, not claims about TCP packets or Hyper read boundaries.
    and a 1.7-second terminal bound; a restart on the last write would expire at
    about 2.1 seconds. This is a test-only oracle correction, not a runtime
    behavior change.
+6. Independent review of checkpoint
+   `90a5b653057ee8c988f4a4643f94e42aa6b913c4` blocked three test-evidence
+   weaknesses and identified one portability risk: a coalescing watch could
+   miss an intermediate task peak; an interrupted drip schedule could turn into
+   idle expiry; finish-time or outer cancellation could detach moved join
+   handles; and cap+1 could reset during the write. The follow-up adds a
+   sender-side atomic task maximum, measured pacing gaps/minimum progress, an
+   abort-on-drop join owner, and write-side terminal normalization. None changes
+   production behavior.
 
 ## Local verification on this tree
 
@@ -187,13 +207,13 @@ worktree-local `$PWD/target/c3a`.
 
 | Command/check | Result |
 | --- | --- |
-| `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime::lifecycle_tests:: -- --nocapture` | Initial socket-enabled behavior run: **4 passed** in 1.08 seconds. After root strengthened the non-reset timing oracle: **4 passed** in 2.14 seconds, 0 failed, 349 filtered; six cases, 14 downstream exchanges, eight complete upstream requests. |
+| `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime::lifecycle_tests:: -- --nocapture` | Initial socket-enabled behavior run: **4 passed** in 1.08 seconds. After root strengthened the non-reset timing oracle and then corrected all initial-review findings: **4 passed** in 2.14 seconds, 0 failed, 349 filtered; six cases, 14 downstream exchanges, eight complete upstream requests. |
 | `cargo +1.95.0 fmt --all -- --check` | Passed after mechanical formatting. |
 | `git diff --check` | Passed. |
-| `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime:: -- --nocapture` | **38 passed**, 0 failed, 315 filtered in 30.29 seconds: four new and all 34 retained runtime/#287/C1/C2 tests. |
-| `cargo +1.95.0 build --offline --locked --workspace --all-targets` | Passed. |
-| `cargo +1.95.0 clippy --offline --locked --workspace --all-targets --all-features -- -D warnings` | Passed. |
-| `cargo +1.95.0 test --offline --locked --workspace --all-targets` | Passed all targets; **812 tests** enumerated, four more than the retained 808-test C2 tree. Includes the unchanged full-profile partial-body no-audit test. |
+| `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime:: -- --nocapture` | Final review-corrected tree: **38 passed**, 0 failed, 315 filtered in 30.30 seconds: four new and all 34 retained runtime/#287/C1/C2 tests. |
+| `cargo +1.95.0 build --offline --locked --workspace --all-targets` | Passed again after review corrections. |
+| `cargo +1.95.0 clippy --offline --locked --workspace --all-targets --all-features -- -D warnings` | Passed again after review corrections. |
+| `cargo +1.95.0 test --offline --locked --workspace --all-targets` | Final review-corrected tree passed all targets; **812 tests**, four more than the retained 808-test C2 tree. Includes the unchanged full-profile partial-body no-audit test. |
 | Vendored Hyper `regression` filter with `client,http1,http2,server` | **5 passed**: both #287 read-buffer and all three C1 content-length regressions. |
 | Vendored Hyper exact `proto::h1::role::tests::test_decoder_request` | **1 passed**. |
 
@@ -210,6 +230,7 @@ file, external target, online audit, or Git mutation was used.
   the full-profile durable no-audit test unchanged.
 - [ ] C3b keep-alive, ordinary pipeline, HTTP/1.0, and post-HTTP/2 recovery.
 - [ ] C3c public-listener shutdown phase isolation.
+- [ ] Exact-head independent re-review of the corrected C3a harness.
 - [ ] Linux/image exact-head CI and full C3 cross-runtime review.
 - [ ] Authorized publication, C1/C2 integration order, PR/merge checks, and
   merged-commit verification.

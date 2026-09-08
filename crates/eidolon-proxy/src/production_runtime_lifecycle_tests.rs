@@ -40,6 +40,8 @@ const DRIP_INTERVAL: Duration = Duration::from_millis(100);
 // restarted by the final write would not expire until about 2.1 seconds, so
 // this bound distinguishes one absolute stage budget with scheduler margin.
 const STAGE_TERMINAL_BOUND: Duration = Duration::from_millis(1_700);
+const MAX_DRIP_ATTEMPT_GAP: Duration = Duration::from_millis(250);
+const MIN_DRIP_WRITES: usize = 8;
 // Header parsing and body collection have separate stage timers. This is a
 // generous composed upper bound (two one-second stages plus one second of
 // scheduler/socket margin), not one accept-to-body absolute deadline.
@@ -83,6 +85,58 @@ fn terminal_reset(error: &std::io::Error) -> bool {
             | ErrorKind::NotConnected
             | ErrorKind::UnexpectedEof
     )
+}
+
+struct AbortOnDropTask<T> {
+    task: Option<JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropTask<T> {
+    fn new(task: JoinHandle<T>) -> Self {
+        Self { task: Some(task) }
+    }
+
+    async fn join(mut self, description: &str) -> T {
+        let result = timeout(
+            OPERATION_BUDGET,
+            self.task
+                .as_mut()
+                .expect("abort-on-drop task should remain owned"),
+        )
+        .await;
+        match result {
+            Ok(result) => {
+                drop(
+                    self.task
+                        .take()
+                        .expect("completed task should remain owned"),
+                );
+                result.unwrap_or_else(|error| panic!("{description} task failed: {error}"))
+            }
+            Err(_) => {
+                self.task
+                    .as_ref()
+                    .expect("timed-out task should remain owned")
+                    .abort();
+                let _ = timeout(
+                    OPERATION_BUDGET,
+                    self.task
+                        .as_mut()
+                        .expect("aborted task should remain owned"),
+                )
+                .await;
+                panic!("{description} task did not join within five seconds");
+            }
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 async fn read_capped_piece(stream: &mut TcpStream, wire: &mut Vec<u8>) -> usize {
@@ -338,13 +392,9 @@ impl UpstreamRecorder {
         // Dropping unconsumed release handles makes even a failing test's
         // already-captured connections recoverable before the bounded join.
         drop(self.ready.take());
-        timeout(
-            OPERATION_BUDGET,
-            self.task.take().expect("recorder should have one task"),
-        )
-        .await
-        .expect("owned recorder task should join within five seconds")
-        .expect("owned recorder task should not panic")
+        AbortOnDropTask::new(self.task.take().expect("recorder should have one task"))
+            .join("owned recorder")
+            .await
     }
 }
 
@@ -363,6 +413,7 @@ struct CounterSnapshot {
     pre_service_rejections: Vec<ProductionPreServiceRejection>,
     current_processors: usize,
     peak_processors: usize,
+    peak_connection_tasks: usize,
     upstream_requests: usize,
 }
 
@@ -459,6 +510,7 @@ struct LifecycleHarness {
     address: SocketAddr,
     observations: Arc<ProcessorObservations>,
     connection_tasks: watch::Receiver<usize>,
+    connection_task_peak: Arc<AtomicUsize>,
     body_collection_started: Option<oneshot::Receiver<()>>,
     shutdown: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<Result<(), ProductionRuntimeError>>>,
@@ -495,6 +547,7 @@ impl LifecycleHarness {
             });
         let (shutdown, stopped) = oneshot::channel();
         let (connection_task_tx, connection_tasks) = watch::channel(0);
+        let connection_task_peak = Arc::new(AtomicUsize::new(0));
         let (body_collection_started, body_collection_receiver) = if observe_body_collection {
             let (started, receiver) = oneshot::channel();
             (Some(Arc::new(Mutex::new(Some(started)))), Some(receiver))
@@ -515,11 +568,13 @@ impl LifecycleHarness {
             },
             body_collection_started,
             Some(connection_task_tx),
+            Some(Arc::clone(&connection_task_peak)),
         ));
         Self {
             address,
             observations,
             connection_tasks,
+            connection_task_peak,
             body_collection_started: body_collection_receiver,
             shutdown: Some(shutdown),
             server: Some(server),
@@ -594,6 +649,7 @@ impl LifecycleHarness {
                 .clone(),
             current_processors: self.observations.current_processors.load(Ordering::SeqCst),
             peak_processors: self.observations.peak_processors.load(Ordering::SeqCst),
+            peak_connection_tasks: self.connection_task_peak.load(Ordering::SeqCst),
             upstream_requests: self
                 .recorder
                 .as_ref()
@@ -608,15 +664,13 @@ impl LifecycleHarness {
             .expect("production listener should have one shutdown signal")
             .send(())
             .expect("production listener should remain live through clean shutdown");
-        timeout(
-            OPERATION_BUDGET,
+        AbortOnDropTask::new(
             self.server
                 .take()
                 .expect("production listener should have one task"),
         )
+        .join("production listener")
         .await
-        .expect("production listener should join within five seconds")
-        .expect("production listener task should not panic")
         .expect("production listener should drain cleanly");
         self.recorder
             .take()
@@ -687,10 +741,32 @@ async fn write_all_bounded(stream: &mut TcpStream, bytes: &[u8]) {
         .expect("downstream write should succeed");
 }
 
+async fn attempt_write_then_terminal(stream: &mut TcpStream, bytes: &[u8]) -> TerminalResponse {
+    match timeout(OPERATION_BUDGET, stream.write_all(bytes)).await {
+        Ok(Ok(())) => read_terminal_response(stream).await,
+        Ok(Err(error)) if terminal_reset(&error) => TerminalResponse {
+            bytes: Vec::new(),
+            terminal: TerminalKind::Reset,
+        },
+        Ok(Err(error)) => panic!("cap+1 write failed unexpectedly: {error}"),
+        Err(_) => panic!("cap+1 write did not terminate within five seconds"),
+    }
+}
+
 async fn write_one_byte_drip(stream: &mut TcpStream, bytes: &[u8]) -> usize {
     assert!(bytes.len() <= 32, "drip fixture is capped at 32 writes");
     let mut completed = 0;
-    for byte in bytes {
+    let started = Instant::now();
+    let mut previous_attempt = started;
+    for (index, byte) in bytes.iter().enumerate() {
+        let attempt = Instant::now();
+        if index > 0 {
+            assert!(
+                attempt.duration_since(previous_attempt) <= MAX_DRIP_ATTEMPT_GAP,
+                "drip scheduling gap exceeded 250 ms and invalidated paced-progress evidence"
+            );
+        }
+        previous_attempt = attempt;
         match timeout(
             OPERATION_BUDGET,
             stream.write_all(std::slice::from_ref(byte)),
@@ -707,8 +783,12 @@ async fn write_one_byte_drip(stream: &mut TcpStream, bytes: &[u8]) -> usize {
         sleep(DRIP_INTERVAL).await;
     }
     assert!(
-        completed >= 2,
-        "drip case must make positive paced progress"
+        completed >= MIN_DRIP_WRITES,
+        "drip case must sustain at least {MIN_DRIP_WRITES} paced writes"
+    );
+    assert!(
+        started.elapsed() >= DRIP_INTERVAL * (MIN_DRIP_WRITES as u32 - 1),
+        "drip fixture did not span its required paced-progress window"
     );
     completed
 }
@@ -809,6 +889,7 @@ async fn exact_capacity_case() {
             pre_service_rejections: Vec::new(),
             current_processors: 2,
             peak_processors: 2,
+            peak_connection_tasks: 2,
             upstream_requests: 2,
         },
         "both permits are owned only after two complete upstream captures"
@@ -818,8 +899,8 @@ async fn exact_capacity_case() {
         .await
         .expect("cap+1 connect should terminate within five seconds")
         .expect("cap+1 downstream peer must successfully connect");
-    write_all_bounded(&mut excess, &request("/capacity/excess")).await;
-    let excess_outcome = read_terminal_response(&mut excess).await;
+    let excess_outcome =
+        attempt_write_then_terminal(&mut excess, &request("/capacity/excess")).await;
     assert!(
         excess_outcome.bytes.is_empty(),
         "cap+1 must close/reset without response bytes: {excess_outcome:?}"
@@ -833,6 +914,7 @@ async fn exact_capacity_case() {
             pre_service_rejections: Vec::new(),
             current_processors: 2,
             peak_processors: 2,
+            peak_connection_tasks: 2,
             upstream_requests: 2,
         },
         "terminal cap+1 handling must create zero excess work"
@@ -856,6 +938,7 @@ async fn exact_capacity_case() {
             pre_service_rejections: Vec::new(),
             current_processors: 2,
             peak_processors: 2,
+            peak_connection_tasks: 2,
             upstream_requests: 3,
         },
         "one released slot must admit exactly one replacement request"
@@ -876,6 +959,7 @@ async fn exact_capacity_case() {
             pre_service_rejections: Vec::new(),
             current_processors: 0,
             peak_processors: 2,
+            peak_connection_tasks: 2,
             upstream_requests: 3,
         },
         "all capacity work must quiesce with peak exactly two"
@@ -928,6 +1012,7 @@ async fn slow_head_case(shape: SlowHeadShape) {
             pre_service_rejections: vec![ProductionPreServiceRejection::HeaderReadTimedOut],
             current_processors: 0,
             peak_processors: 0,
+            peak_connection_tasks: 1,
             upstream_requests: 0,
         },
         "slow head must release capacity with one exact pre-service timeout"
@@ -942,6 +1027,7 @@ async fn slow_head_case(shape: SlowHeadShape) {
             pre_service_rejections: vec![ProductionPreServiceRejection::HeaderReadTimedOut],
             current_processors: 0,
             peak_processors: 1,
+            peak_connection_tasks: 1,
             upstream_requests: 1,
         },
         "same listener must recover after the slow-head timeout"
@@ -996,6 +1082,7 @@ async fn body_drip_case() {
             pre_service_rejections: Vec::new(),
             current_processors: 0,
             peak_processors: 0,
+            peak_connection_tasks: 1,
             upstream_requests: 0,
         },
         "body-stage timeout must not become normal or upstream work"
@@ -1010,6 +1097,7 @@ async fn body_drip_case() {
             pre_service_rejections: Vec::new(),
             current_processors: 0,
             peak_processors: 1,
+            peak_connection_tasks: 1,
             upstream_requests: 1,
         },
         "same listener must recover after body-stage timeout"
@@ -1051,6 +1139,7 @@ async fn partial_body_case(body: &[u8], recovery_target: &str) {
             pre_service_rejections: Vec::new(),
             current_processors: 0,
             peak_processors: 0,
+            peak_connection_tasks: 1,
             upstream_requests: 0,
         },
         "partial-body EOF is neither timeout nor successful processing"
@@ -1065,6 +1154,7 @@ async fn partial_body_case(body: &[u8], recovery_target: &str) {
             pre_service_rejections: Vec::new(),
             current_processors: 0,
             peak_processors: 1,
+            peak_connection_tasks: 1,
             upstream_requests: 1,
         },
         "same listener must recover after partial-body EOF"

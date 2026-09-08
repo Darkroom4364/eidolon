@@ -232,6 +232,8 @@ where
         None,
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -254,6 +256,7 @@ where
         shutdown,
         Some(Arc::new(Mutex::new(Some(body_collection_started)))),
         None,
+        None,
     )
     .await
 }
@@ -265,6 +268,7 @@ async fn serve_production_http1_inner<F>(
     shutdown: F,
     #[cfg(test)] body_collection_started: Option<BodyCollectionStarted>,
     #[cfg(test)] connection_task_count: Option<watch::Sender<usize>>,
+    #[cfg(test)] connection_task_peak: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) -> Result<(), ProductionRuntimeError>
 where
     F: Future<Output = ()> + Send,
@@ -325,6 +329,13 @@ where
                     )
                     .await;
                 });
+                #[cfg(test)]
+                if let Some(peak) = &connection_task_peak {
+                    peak.fetch_max(
+                        connections.len(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
             }
         }
     }
@@ -1419,6 +1430,7 @@ mod tests {
             },
             None,
             Some(task_count_tx),
+            None,
         ));
 
         // Use real loopback connections and observe JoinSet retention directly,
