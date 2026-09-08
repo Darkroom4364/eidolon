@@ -1,7 +1,6 @@
 # Production resource lifecycle matrix — #291 / #251 C3
 
-Status: **C3a locally complete and independently reviewed; C3b implemented
-and locally verified on owned loopback, with independent review pending; C3c
+Status: **C3a and C3b locally complete and independently reviewed; C3c
 remains**.
 C3a starting head: `742b29e8b0e3b815e51c5ce017b166e10dcc1fb7`, the reviewed local
 C2-on-C1 stack. The worktree was clean at that exact head before this slice.
@@ -11,8 +10,9 @@ Final reviewed C3a implementation head:
 
 C3b starting head: `a4dd236cdf92c81b4457190f3910c4e26a54ad0a`, tree
 `d673137e628d27bcba9c6679637b9e18060a9e94`. The dedicated worktree was clean
-at those exact values before editing. This C3b slice has not yet been
-independently reviewed.
+at those exact values before editing. Independently reviewed C3b implementation
+head: `a6c1227952127dc15063f2d9820cba614e51d609`, tree
+`7609e2ff7c61863eb796bc4ce22c245cb94213a1`.
 
 This is finite production-listener regression evidence. It is not Linux/image
 CI, Gate 2 completion, Gate 9 load/latency/RSS/soak evidence, publication,
@@ -133,8 +133,8 @@ those exchanges.
 | Exact capacity and recovery | Lab exact-cap, production cap-one block, and 128 sequential reaps. | **C3a implemented locally:** simultaneous cap two, terminal cap+1, zero excess work, one-slot/full recovery, peak and task quiescence through real dispatch. |
 | Slow head/body | #287 held-open listener cases and Lab-only header drip. | **C3a implemented locally:** idle, paced incomplete head, paced incomplete body, exact hook/status/task/upstream outcomes, same-listener recovery. |
 | Partial-body EOF | C1 wire/no-work and full-profile durable no-audit tests. | **C3a implemented locally:** extends only task release and same-listener real-upstream recovery; retains both earlier oracles unchanged. |
-| Keep-alive/pipeline | Shutdown of one idle keep-alive and direct closed-gate pipeline denial. | **C3b implemented and locally passed:** sequential reuse and successful bounded ordinary pipeline, with fresh recovery; no C1 framing or direct closed-gate denial duplication. |
-| Unsupported versions | Typed HTTP/1.0/2/3 policy and raw HTTP/2 rejection. | **C3b implemented and locally passed:** raw HTTP/1.0 and raw HTTP/2 rejection, task reap, and same-listener recovery; no HTTP/2 support. |
+| Keep-alive/pipeline | Shutdown of one idle keep-alive and direct closed-gate pipeline denial. | **C3b locally complete and independently reviewed:** sequential reuse and successful bounded ordinary pipeline, with fresh recovery; no C1 framing or direct closed-gate denial duplication. |
+| Unsupported versions | Typed HTTP/1.0/2/3 policy and raw HTTP/2 rejection. | **C3b locally complete and independently reviewed:** raw HTTP/1.0 and raw HTTP/2 rejection, task reap, and same-listener recovery; no HTTP/2 support. |
 | Shutdown phases | Accepted drain, idle drain, direct admission closure, and coupled expiry/quiescence. | **C3c remaining:** public-listener accepted/idle/late, queued pipeline, body-within-grace, and body-only expiry isolation. |
 
 ## Ordered C3 contract and case accounting
@@ -142,13 +142,13 @@ those exchanges.
 | Slice | Contract | Test functions / cases | Exchange accounting | Status |
 | --- | --- | ---: | --- | --- |
 | C3a | Exact capacity and one-slot/full recovery; idle/header/body deadline cleanup and recovery; zero/two-byte partial EOF cleanup and recovery. | **4 / 6**, plus one fixture-oracle negative check inside the capacity function. | **14 production-listener downstream TCP exchanges/peers; 8 complete upstream HTTP requests; one isolated fixture-only TCP exchange.** | **Implemented and locally passed.** |
-| C3b | Three sequential requests on one keep-alive connection plus fresh recovery; three-request ordinary pipeline plus fresh recovery; raw HTTP/1.0 and existing raw HTTP/2 rejection recovery. | **4 / 4 implemented and passed** | Observed **8 downstream TCP peers / 12 request attempts / 10 complete upstream HTTP requests** after the earlier sandbox-denied run created zero exchanges. | Locally verified; independent review pending. |
+| C3b | Three sequential requests on one keep-alive connection plus fresh recovery; three-request ordinary pipeline plus fresh recovery; raw HTTP/1.0 and existing raw HTTP/2 rejection recovery. | **4 / 4 implemented and passed** | Observed **8 downstream TCP peers / 12 request attempts / 10 complete upstream HTTP requests** after the earlier sandbox-denied run created zero exchanges. | **Locally complete; independent exact-tree review passed with no findings.** |
 | C3c | Public-listener accepted/idle/late shutdown, queued pipeline isolation, body completion within grace, and body-only grace expiry. | Planned 4 / 4 | Planned at most three downstream peers and one upstream per case; exact final exchange counts await observed safe pipeline/late-peer wire outcomes. | Remaining; no code in this slice. |
 
 Full planned C3 is 12 test functions / 14 cases. C3a retains its independently
 reviewed 4 functions / 6 cases and observed exchange accounting. C3b adds only
-the next 4 functions / 4 cases, now locally behavior-verified with independent
-review outstanding; C3c remains unimplemented. C3b and C3c do not
+the next 4 functions / 4 cases, now locally behavior-verified and independently
+reviewed; C3c remains unimplemented. C3b and C3c do not
 retroactively expand C3a claims.
 
 ## New C3a fixtures, synchronization, and exact oracles
@@ -376,8 +376,15 @@ network, credential/secret access, container or cluster operation, or
 other-worktree mutation. The C3a verification and independent-review results
 above remain separate historical evidence, not substitutes for the C3b passes.
 
-Root's next actions are to freeze the inspected tree in a local commit and
-arrange independent C3b review. This implementation has no such review yet.
+Root froze the inspected implementation in local commit
+`a6c1227952127dc15063f2d9820cba614e51d609`, tree
+`7609e2ff7c61863eb796bc4ce22c245cb94213a1`. An independent read-only review
+of that exact clean detached target passed with no findings. It independently
+checked the response parser and no-fourth-response oracle, all four behavior
+oracles, exchange accounting, finite bounds, task/recorder ownership, retained
+C3a content, diff scope, pinned formatting, and final Git cleanliness. The
+fresh review worktree intentionally had no build artifacts, so compilation and
+behavior results above remain root-run evidence rather than reviewer reruns.
 
 ## Remaining gates and limits
 
@@ -391,7 +398,7 @@ arrange independent C3b review. This implementation has no such review yet.
   compile, and scoped Clippy with warnings denied.
 - [x] C3b keep-alive, ordinary pipeline, HTTP/1.0, and post-HTTP/2 local
   behavior verification and actual exchange accounting.
-- [ ] Independent C3b review arranged by root.
+- [x] Independent exact-tree C3b review passed with no findings.
 - [ ] C3c public-listener shutdown phase isolation.
 - [x] Exact implementation-head independent re-review of the corrected C3a
   harness passed with no findings.
