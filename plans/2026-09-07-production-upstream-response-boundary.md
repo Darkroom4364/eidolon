@@ -136,8 +136,8 @@ not define what the production Hyper upstream client accepts:
 All eight new test names have prefix `production_runtime::upstream_tests::`
 in the `eidolon-proxy` library target. Root executed all of them against owned
 loopback responders. The eight functions contain 43 matrix cases x two layers
-= 86 HTTP exchanges, plus six positive
-HTTP exchanges (92 total: 46 direct and 46 listener), and one additional direct
+= 86 HTTP exchanges, plus six positive HTTP exchanges (92 total: 46 direct and
+46 listener), and one additional direct
 pre-send `ConnectFailed` control with no received HTTP request.
 
 | Exact test name | Cases | HTTP exchanges | Observed final result |
@@ -149,7 +149,7 @@ pre-send `ConnectFailed` control with no received HTTP request.
 | `upstream_protocol_switch_is_rejected_without_replay` | 1 | 2 | 101 -> `ResponseFailed`, empty downstream 500, one complete first request and zero second-address access. |
 | `upstream_proxy_connection_is_not_forwarded` | 1 | 2 | Duplicate/mixed-case Proxy-Connection removed; status/body/end-to-end field preserved. |
 | `upstream_stage_and_absolute_deadlines_do_not_replay` | 8 | 16 | Three held shapes x stage/absolute budgets, plus two staged-progress total-budget cases. |
-| `upstream_recorders_and_connect_failure_fallback_are_live` | 3 x two layers, plus port-zero control | 6 | A-first, B-first, port-zero-then-B; endpoint counts A=2 and B=4; standalone port-zero address -> exact `ConnectFailed`. |
+| `upstream_recorders_and_connect_failure_fallback_are_live` | 3 x two layers, plus port-zero control | 6 | A returns 201/`a1`/`X-C2-Recorder: first`; B returns 202/`b2`/`X-C2-Recorder: second`; the expected signature is asserted for A-first, B-first and port-zero-then-B in both layers. Endpoint counts are A=2 and B=4; standalone port zero -> exact `ConnectFailed`. |
 
 There are 26 post-send failure shapes x two layers = 52 exact typed-error
 assertions and 26 corresponding empty-500 listener assertions. No expected
@@ -230,7 +230,7 @@ and public-listener executions.
 | Defect | Unchanged C1 observation | Narrow repair and final observation |
 | --- | --- | --- |
 | Unsupported 101 | Raw `101 Switching Protocols` produced `Ok(ProductionResponse { status: 101, headers: {}, body: b"" })`; the focused fail-first test expected `Err(ResponseFailed)` and failed. | Reject status 101 immediately after `send_request`. Final direct result is exact `ResponseFailed`; listener emits one empty 500; first POST is complete and address two remains untouched. |
-| Proxy-Connection response leak | Mixed-case/duplicate `Proxy-Connection` remained in the typed production response; the focused fail-first test reported `proxy_connection: leaked proxy-connection`. | Remove `Proxy-Connection` beside `Keep-Alive` in the existing sanitizer. Both layers remove it while preserving 201/body/end-to-end fields. |
+| Proxy-Connection response leak | Mixed-case/duplicate `Proxy-Connection` remained in the typed production response; the focused fail-first test reported `proxy_connection: leaked proxy-connection`. | Remove `Proxy-Connection` beside `Keep-Alive` in the existing sanitizer. Both layers remove it while preserving 200/body/end-to-end fields. |
 
 Neither repair changes retry selection. Both occur after the request has been
 sent, and every error execution retains exactly one complete first request and
@@ -269,6 +269,14 @@ dependency was installed or upgraded.
   Replacing that nonportable fixture with loopback port zero made the standalone
   pre-send failure and successful fallback control deterministic; the full
   matrix and full workspace then passed. This did not change runtime behavior.
+- Initial independent review of `a94fff68fc0ba399acc569626bce82af3d57c5ca`
+  returned `BLOCK`: identical A/B positive responses plus aggregate-only counts
+  could false-pass reversed address iteration (medium), and the plan said 201
+  where the Proxy-Connection case preserves 200 (low). The corrected harness
+  now gives A and B distinct status/body/header signatures and asserts the
+  expected responder per dispatch; the plan typo is fixed. Pinned fmt, build,
+  Clippy, the focused fallback test, all eight C2 tests and all 808 workspace
+  tests passed again. Follow-up exact-head review remains pending.
 
 ## Remaining gates and root handoff
 
@@ -279,7 +287,8 @@ dependency was installed or upgraded.
 - [x] Obtain actual no-replay, safe downstream and connection-quiescence evidence for all error shapes.
 - [x] Execute retained C1/#287 ingress, admission, no-retry, reaping and drain socket regressions.
 - [x] Pass final pinned fmt/build/Clippy/full workspace/vendor tests and applicable fixtures/audits on the final tree.
-- [ ] Independent cross-runtime review, authorized publication, exact-head Linux/image CI, C1 integration and merge.
+- [ ] Follow-up independent exact-head review passes after the corrected fallback oracle.
+- [ ] Authorized publication, exact-head Linux/image CI, C1 integration and merge.
 
 No Linux CI, PR, merge, release or v1 Gate completion is claimed while
 publication remains authentication-blocked and C1 is not integrated. C2 is a

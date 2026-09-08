@@ -38,6 +38,10 @@ const REQUEST_TARGET: &str = "/c2/commit?case=owned";
 const REQUEST_BODY: &[u8] = b"commit\0\xff";
 const CONTROL_RESPONSE: &[u8] =
     b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nX-End-To-End: preserved\r\n\r\nok";
+const FIRST_CONTROL_RESPONSE: &[u8] =
+    b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nX-C2-Recorder: first\r\n\r\na1";
+const SECOND_CONTROL_RESPONSE: &[u8] =
+    b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nX-C2-Recorder: second\r\n\r\nb2";
 
 type DispatchResult = Result<ProductionResponse, ProductionUpstreamError>;
 
@@ -814,8 +818,8 @@ async fn upstream_stage_and_absolute_deadlines_do_not_replay() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_recorders_and_connect_failure_fallback_are_live() {
-    let first = Recorder::start(Reply::complete(CONTROL_RESPONSE)).await;
-    let second = Recorder::start(Reply::complete(CONTROL_RESPONSE)).await;
+    let first = Recorder::start(Reply::complete(FIRST_CONTROL_RESPONSE)).await;
+    let second = Recorder::start(Reply::complete(SECOND_CONTROL_RESPONSE)).await;
     // Port zero never denotes a connectable TCP service, so this fails before
     // an HTTP request can be sent without relying on a bind/drop race.
     let refused_address = "127.0.0.1:0".parse().unwrap();
@@ -835,10 +839,25 @@ async fn upstream_recorders_and_connect_failure_fallback_are_live() {
         "the port-zero address must fail before any HTTP send",
     );
     for layer in [Layer::Direct, Layer::Listener] {
-        for addresses in [
-            vec![first.address, second.address],
-            vec![second.address, first.address],
-            vec![refused_address, second.address],
+        for (addresses, expected_status, expected_body, expected_recorder) in [
+            (
+                vec![first.address, second.address],
+                StatusCode::CREATED,
+                b"a1".as_slice(),
+                "first",
+            ),
+            (
+                vec![second.address, first.address],
+                StatusCode::ACCEPTED,
+                b"b2".as_slice(),
+                "second",
+            ),
+            (
+                vec![refused_address, second.address],
+                StatusCode::ACCEPTED,
+                b"b2".as_slice(),
+                "second",
+            ),
         ] {
             let upstream = target(addresses);
             let response = match layer {
@@ -858,13 +877,13 @@ async fn upstream_recorders_and_connect_failure_fallback_are_live() {
                     let (result, wire) =
                         through_listener(upstream, upstream_config(), Duration::from_secs(10))
                             .await;
-                    assert_downstream(&wire, 201, b"ok");
+                    assert_downstream(&wire, expected_status.as_u16(), expected_body);
                     result.expect("positive listener dispatch")
                 }
             };
-            assert_eq!(response.status, StatusCode::CREATED);
-            assert_eq!(&response.body[..], b"ok");
-            assert_eq!(response.headers["x-end-to-end"], "preserved");
+            assert_eq!(response.status, expected_status);
+            assert_eq!(&response.body[..], expected_body);
+            assert_eq!(response.headers["x-c2-recorder"], expected_recorder);
         }
     }
     let first = first.finish().await;
