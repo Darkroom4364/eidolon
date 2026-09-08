@@ -1,9 +1,12 @@
 # Production resource lifecycle matrix — #291 / #251 C3
 
-Status: **C3a implemented and locally verified; the second review correction
-awaits exact-head re-review; C3b and C3c remain**.
+Status: **C3a locally complete and independently reviewed; C3b and C3c
+remain**.
 Starting head: `742b29e8b0e3b815e51c5ce017b166e10dcc1fb7`, the reviewed local
 C2-on-C1 stack. The worktree was clean at that exact head before this slice.
+Final reviewed implementation head:
+`9cabb4d48aafd2bda7065ee7a9166145a05c7324`, tree
+`df793fdd647395b1887900087c38d83ae0e3767b`.
 
 This is finite production-listener regression evidence. It is not Linux/image
 CI, Gate 2 completion, Gate 9 load/latency/RSS/soak evidence, publication,
@@ -210,6 +213,13 @@ claims about TCP packets or Hyper read boundaries.
    capacity test contains a deterministic buffered-503 negative check for that
    branch. This remains test-only oracle repair, not a production behavior
    change.
+8. Final exact-head review of
+   `9cabb4d48aafd2bda7065ee7a9166145a05c7324` / tree
+   `df793fdd647395b1887900087c38d83ae0e3767b` passed with no findings. It
+   independently confirmed both review rounds resolved, the negative check is
+   executed/owned/bounded and separately accounted, all source and test counts
+   reconcile, and production behavior remains unchanged. Report:
+   `/tmp/codex-tasks/eidolon-lifecycle-c3a-finalreview-20260908.last.md`.
 
 ## Local verification on this tree
 
@@ -243,7 +253,8 @@ credentials, sensitive files, external targets, or online audits.
   the full-profile durable no-audit test unchanged.
 - [ ] C3b keep-alive, ordinary pipeline, HTTP/1.0, and post-HTTP/2 recovery.
 - [ ] C3c public-listener shutdown phase isolation.
-- [ ] Exact-head independent re-review of the corrected C3a harness.
+- [x] Exact implementation-head independent re-review of the corrected C3a
+  harness passed with no findings.
 - [ ] Linux/image exact-head CI and full C3 cross-runtime review.
 - [ ] Authorized publication, C1/C2 integration order, PR/merge checks, and
   merged-commit verification.
