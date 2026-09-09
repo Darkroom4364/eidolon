@@ -1,7 +1,7 @@
 # Production resource lifecycle matrix — #291 / #251 C3
 
 Status: **C3a and C3b locally complete and independently reviewed; C3c
-remains**.
+implemented and locally behavior-verified, with independent review pending**.
 C3a starting head: `742b29e8b0e3b815e51c5ce017b166e10dcc1fb7`, the reviewed local
 C2-on-C1 stack. The worktree was clean at that exact head before this slice.
 Final reviewed C3a implementation head:
@@ -13,6 +13,14 @@ C3b starting head: `a4dd236cdf92c81b4457190f3910c4e26a54ad0a`, tree
 at those exact values before editing. Independently reviewed C3b implementation
 head: `a6c1227952127dc15063f2d9820cba614e51d609`, tree
 `7609e2ff7c61863eb796bc4ce22c245cb94213a1`.
+
+C3c starting HEAD: `d8b5cfdbbdef538146142d653151a73b22d0765d`, tree
+`c597e1977d1c3f63354256312aa607bfd2785f91`, branch
+`test/production-resource-lifecycle-c3c`. The dedicated
+`/Users/darkroom/Projects/.worktrees/eidolon-release-lifecycle-c3c-20260908`
+worktree was clean at those exact values before editing. Those values identify
+the base; the exact implementation identity and review result are recorded only
+after root creates the local commit and completes independent review.
 
 This is finite production-listener regression evidence. It is not Linux/image
 CI, Gate 2 completion, Gate 9 load/latency/RSS/soak evidence, publication,
@@ -135,7 +143,7 @@ those exchanges.
 | Partial-body EOF | C1 wire/no-work and full-profile durable no-audit tests. | **C3a implemented locally:** extends only task release and same-listener real-upstream recovery; retains both earlier oracles unchanged. |
 | Keep-alive/pipeline | Shutdown of one idle keep-alive and direct closed-gate pipeline denial. | **C3b locally complete and independently reviewed:** sequential reuse and successful bounded ordinary pipeline, with fresh recovery; no C1 framing or direct closed-gate denial duplication. |
 | Unsupported versions | Typed HTTP/1.0/2/3 policy and raw HTTP/2 rejection. | **C3b locally complete and independently reviewed:** raw HTTP/1.0 and raw HTTP/2 rejection, task reap, and same-listener recovery; no HTTP/2 support. |
-| Shutdown phases | Accepted drain, idle drain, direct admission closure, and coupled expiry/quiescence. | **C3c remaining:** public-listener accepted/idle/late, queued pipeline, body-within-grace, and body-only expiry isolation. |
+| Shutdown phases | Accepted drain, idle drain, direct admission closure, and coupled expiry/quiescence. | **C3c implemented and locally passed:** public-listener accepted/idle/late, queued pipeline, body-within-grace, and body-only expiry isolation; independent review remains. |
 
 ## Ordered C3 contract and case accounting
 
@@ -143,12 +151,12 @@ those exchanges.
 | --- | --- | ---: | --- | --- |
 | C3a | Exact capacity and one-slot/full recovery; idle/header/body deadline cleanup and recovery; zero/two-byte partial EOF cleanup and recovery. | **4 / 6**, plus one fixture-oracle negative check inside the capacity function. | **14 production-listener downstream TCP exchanges/peers; 8 complete upstream HTTP requests; one isolated fixture-only TCP exchange.** | **Implemented and locally passed.** |
 | C3b | Three sequential requests on one keep-alive connection plus fresh recovery; three-request ordinary pipeline plus fresh recovery; raw HTTP/1.0 and existing raw HTTP/2 rejection recovery. | **4 / 4 implemented and passed** | Observed **8 downstream TCP peers / 12 request attempts / 10 complete upstream HTTP requests** after the earlier sandbox-denied run created zero exchanges. | **Locally complete; independent exact-tree review passed with no findings.** |
-| C3c | Public-listener accepted/idle/late shutdown, queued pipeline isolation, body completion within grace, and body-only grace expiry. | Planned 4 / 4 | Planned at most three downstream peers and one upstream per case; exact final exchange counts await observed safe pipeline/late-peer wire outcomes. | Remaining; no code in this slice. |
+| C3c | Public-listener accepted/idle/late shutdown, queued pipeline isolation, body completion within grace, and body-only grace expiry. | **4 / 4 implemented and passed** | Observed per complete invocation: **6 downstream connection attempts, 5 successful TCP connects/accepted production tasks, 5 accepted-peer request attempts (one incomplete), 3 complete upstream requests**. The sixth, post-drop late TCP attempt was refused and wrote no request. | **Locally behavior-verified; independent review pending.** |
 
 Full planned C3 is 12 test functions / 14 cases. C3a retains its independently
 reviewed 4 functions / 6 cases and observed exchange accounting. C3b adds only
 the next 4 functions / 4 cases, now locally behavior-verified and independently
-reviewed; C3c remains unimplemented. C3b and C3c do not
+reviewed; C3c is locally behavior-verified with independent review pending. C3b and C3c do not
 retroactively expand C3a claims.
 
 ## New C3a fixtures, synchronization, and exact oracles
@@ -386,6 +394,155 @@ C3a content, diff scope, pinned formatting, and final Git cleanliness. The
 fresh review worktree intentionally had no build artifacts, so compilation and
 behavior results above remain root-run evidence rather than reviewer reruns.
 
+## C3c implementation and exact local oracles
+
+Source: `crates/eidolon-proxy/src/production_runtime_lifecycle_tests.rs`.
+Exact prefix: `production_runtime::lifecycle_tests::c3c::`.
+Each of the following four functions contains exactly one production-listener
+case through `serve_production_http1_inner` and the owned HTTP recorder. The
+invariant is phase isolation: shutdown closes admission and drops the listener,
+accepted work can finish within grace, queued/late work never reaches request
+or pre-service rejection hooks, normal processing, or upstream, and isolated
+body collection is aborted and joined on grace expiry. The retained coupled
+expiry/non-cancellable-quiescence test and direct closed-gate test are unchanged.
+
+These exact oracles passed on owned Darwin loopback. Linux/image and independent
+review remain open.
+
+| Exact test | Connection attempts / accepted production tasks / accepted-peer request attempts / complete upstream requests | Exact wire and work oracle |
+| --- | ---: | --- |
+| `accepted_idle_and_late_shutdown_drains_only_accepted_work` | **3 / 2 / 1 / 1** | Capacity two. Hold `/shutdown/accepted` only after its complete GET upstream capture, then positively observe two tasks including a second idle peer. After shutdown acknowledgment, the idle peer must reach EOF/reset with zero bytes and reap, leaving one task/current processor. A distinct late connection attempt must resolve within five seconds; refusal/reset is accepted, or a successful TCP connect must attempt one finite request write and then read bounded EOF/reset with zero bytes even if the write reset. The total-spawn counter must remain two, both rejection vectors empty, and normal/upstream/processor peak exactly one. At that fence the server remains pending on the held processor. Release within three-second grace; require exactly one complete target-body `HTTP/1.1 200 OK`, close, no extra bytes, processor/task zero, the one exact joined recorder entry, and `Ok(())`. |
+| `queued_pipeline_shutdown_never_dispatches_second_request` | **1 / 1 / 2 / 1** | One capacity-one peer makes one finite application write of two complete HTTP/1.1 GETs, first keep-alive and second close. Hold the complete capture for `/shutdown/pipeline/first`, acknowledge real shutdown, then release within grace. The observed single wire oracle is its complete exact target-body `HTTP/1.1 200 OK` without a connection header, followed by exact `HTTP/1.1 503 Service Unavailable`, one `Content-Length: 0`, `Connection: close`, and terminal EOF/reset with no partial/trailing/extra bytes. Normal/upstream/processor peak/task peak/total spawned tasks each equal one, both rejection vectors remain empty, current processors/tasks zero, only the first record joins, and the server returns `Ok(())`. The final oracle does not accept both 503 and close-after-200. |
+| `body_completed_after_shutdown_within_grace_is_processed_once` | **1 / 1 / 1 / 1** | Capacity one. Write the complete POST `/shutdown/body` head with `Content-Length: 1` and close. Wait for the actual body-collection signal with zero work, acknowledge shutdown, then write exactly `x` within grace. Require exactly one complete upstream POST with that target/body, hold and release it within grace, one complete exact target-body 200 and terminal close, zero rejection hooks, exact normal/upstream/processor peak/task peak/total spawned tasks one, current processor/task zero, one byte-exact joined recorder entry, and `Ok(())`. |
+| `body_only_grace_expiry_aborts_without_processor_or_upstream_work` | **1 / 1 / 1 incomplete / 0** | Same POST head and actual body signal, capacity one, 200 ms shutdown grace versus independent five-second request/body timeout. Acknowledge shutdown and withhold the byte without half-closing early. Require terminal EOF/reset with zero response bytes, zero normal/current/peak processor and upstream work, empty request/pre-service rejection vectors, task peak/total one then joined task zero, an empty joined recorder, and exact `Err(DrainDeadlineExceeded)`. No synchronous processor is added to this isolated case. |
+
+One successful invocation observed four cases, six downstream connection
+attempts, five successful TCP connects/accepted production peers/tasks, five
+accepted-peer request attempts (four complete requests and one incomplete POST),
+and three complete upstream requests. The sixth connection attempt occurred
+after the listener-drop acknowledgment and was refused, so it wrote no request
+and created no task. A connected late-peer terminal path remains an explicitly
+bounded portable oracle, but it was not the observed Darwin outcome. Each
+passing case emits its accounting. The earlier sandbox-denied run remains
+separate and observed no production exchanges.
+
+`ShutdownObservation` and its new inner-function argument are `cfg(test)` only.
+The one-shot is sent after admission closes, drain is sent, the listener is
+dropped, and the existing grace deadline is established. It does not wait on or
+steer the runtime. A cumulative atomic post-spawn counter supplements the
+retained peak: a late task cannot hide below the earlier peak of two. The
+existing task-count watch now publishes the actual `JoinSet` length after clean
+drain joins and publishes zero on deadline failure only after abort and all
+joins complete. No sleep, quiet accept, or negative-timeout-only assertion
+establishes admission closure, zero work, or task quiescence.
+
+Owned loopback confirmed the source-derived pipeline outcome: `block_in_place`
+holds the current Hyper connection poll, so sending drain does not itself poll
+that connection's drain branch. On release, the queued second head reaches the
+already-closed admission gate during that Hyper poll and receives the fixed
+empty 503 after the first exact 200. The test retains only that observed wire
+outcome, not a dual 503-or-close oracle. No unsafe behavior or production defect
+was demonstrated.
+
+The shared harness retains the sole shutdown sender and consumes it exactly
+once, waits for the positive acknowledgment, and owns the server through the
+bounded join using `AbortOnDropTask`. Clean and deadline results are compared
+exactly. The recorder is stopped, its concrete accept queue drained, and every
+worker joined only after production listener quiescence and server join.
+Assertion unwind and outer cancellation abort the owned server/recorder task
+trees; no new spawned task is detached. The recorder's existing four-peer bound
+is configurable test-only and is reduced to one for C3c; C3a/C3b retain four.
+
+Each C3c case has a 20-second outer timeout. All connects, writes, reads,
+signal/capture waits, and joins have at most five-second operation bounds;
+releases are synchronous one-shot sends. Clean grace is three seconds and
+release-time checks conservatively measure from the shutdown request, before
+the runtime establishes its grace deadline. Every downstream peer and upstream
+capture retains the 16 KiB aggregate cap, including consumed response frames.
+The C3b framed reader is reused with only visibility changes, preserving exact
+fixed-length framing and extra-data rejection. There are at most three
+downstream TCP attempts, two accepted production tasks, and one complete
+upstream request per case. Timeout never counts as peer termination. All
+sockets are owned `127.0.0.1:0`; there is no external target or TCP segmentation
+claim.
+
+Changed runtime code is limited to `cfg(test)` signals/counts and a test-only
+Clippy argument-count allowance; the non-test/public signature and behavior
+are unchanged. Direct test call sites pass `None` when not observing shutdown.
+C1/C2/C3a/C3b behavioral assertions, production contracts, `main.rs`, manifests,
+lockfiles, workflows, and vendor sources are unchanged. Compilation, formatting,
+lint, sandbox, and behavior outcomes are recorded separately below when run.
+
+## C3c local verification
+
+Platform: Darwin 25.6.0 arm64, `rustc 1.95.0 (59807616e 2026-04-14)`.
+All commands ran only in the dedicated C3c worktree. Cargo compile/lint/test
+commands used `CARGO_TARGET_DIR="$PWD/target/c3c"` and `--offline --locked`;
+formatting also used `CARGO_NET_OFFLINE=true`. Source edits, including the
+mechanical formatting correction, used `apply_patch`.
+
+The first focused no-run compilation passed without compiler/fixture errors.
+The single focused behavior invocation exited 101: **0 passed, 4 failed,
+357 filtered out, 0.00 seconds**. All four functions stopped at their initial
+owned recorder bind, before a production listener or recorder task existed:
+
+```text
+crates/eidolon-proxy/src/production_runtime_lifecycle_tests.rs:292:14
+owned recorder should bind: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+```
+
+The exact output is retained at `target/c3c/c3c-first-behavior.log`. Capture
+used `set -o pipefail` and `2>&1 | tee target/c3c/c3c-first-behavior.log`,
+preserving Cargo's exit 101. Actual execution accounting is **four denied
+recorder bind attempts, zero production listeners, zero downstream connection
+attempts/accepted tasks/request attempts, and zero upstream exchanges**. No
+pipeline or late-peer wire outcome was observed. This is sandbox environment
+evidence, not a production behavior failure or pass. No repair followed the
+bind denial.
+
+Root then ran the exact dirty tree with owned loopback permitted. The first real
+behavior invocation passed all four functions in 0.21 seconds, 357 filtered.
+The late post-drop connection was refused, so the complete invocation observed
+six connection attempts, five successful connects/accepted tasks, five
+accepted-peer request attempts, no late request write, and three complete
+upstream requests. The pipeline emitted exactly the first target-body 200,
+fixed empty 503, then EOF/reset. The body-within-grace case completed its exact
+POST once and returned `Ok(())`; the isolated withheld-body case emitted zero
+bytes/work and returned exact `DrainDeadlineExceeded`. No production defect was
+demonstrated and production behavior was not changed.
+
+| Command/check (with the environment above) | Exact outcome |
+| --- | --- |
+| `pwd`; `git rev-parse HEAD HEAD^{tree}`; `git branch --show-current`; `git status --short` | Exit 0 each; exact starting worktree/HEAD/tree/branch quoted above and empty status before edits. |
+| `rustc +1.95.0 --version`; `uname -srm` | Exit 0 each; exact toolchain/platform quoted above. |
+| `cargo +1.95.0 fmt --all -- --check` | Initial exit 1: line wrapping in the new test helper/import only. Corrected with `apply_patch`; next check exit 0. |
+| `git diff --check` | Exit 0. |
+| `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime::lifecycle_tests::c3c:: --no-run` | Exit 0 in 12.50 seconds; all four C3c functions compile in `target/c3c/debug/deps/eidolon_proxy-c35ef2b7a542e571`. Compilation evidence only. |
+| `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime::lifecycle_tests::c3c:: -- --nocapture` | Exit 101; 0 passed, 4 failed, 357 filtered, 0.00 seconds; all recorder binds denied as above. Executed exactly once; no behavior evidence. |
+| `cargo +1.95.0 clippy --offline --locked -p eidolon-proxy --lib --tests -- -D warnings` | Exit 0 in 6.06 seconds; no warnings. |
+| `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime:: -- --list` | Exit 0; 46 tests, 0 benchmarks: all 42 retained runtime tests plus exactly four C3c additions. Listing only; no unrelated test executed. |
+| Read-only Python comparison against `git show HEAD:crates/eidolon-proxy/src/production_runtime_lifecycle_tests.rs` | Exit 0; C3a case/helper bodies byte-identical, C3b module identical except helper visibility, exactly four C3c test functions and four outer timeouts. |
+| Root loopback rerun of the focused C3c filter with `--nocapture` | **4 passed**, 0 failed, 357 filtered in 0.21 seconds; exact accounting and wire outcomes are recorded above. |
+| Focused C3c filter repeated ten additional times | **10/10 suite repetitions passed** (40 test executions, 0 failures; 0.20–0.24 seconds per suite). Repetition is a stability diagnostic; accounting above records one invocation only. |
+| Root loopback rerun: `cargo +1.95.0 test --offline --locked -p eidolon-proxy --lib production_runtime:: -- --nocapture` | **46 passed**, 0 failed, 315 filtered in 30.36 seconds: all 12 C3 functions plus 34 retained runtime/#287/C1/C2 tests. |
+| `cargo +1.95.0 build --offline --locked --workspace --all-targets` | Passed on the C3c tree in 6.47 seconds. |
+| `cargo +1.95.0 clippy --offline --locked --workspace --all-targets --all-features -- -D warnings` | Passed on the C3c tree in 1.21 seconds. |
+| `cargo +1.95.0 test --offline --locked --workspace --all-targets` | Passed all targets; **820 tests** (30 + 22 + 17 + 361 + 14 + 260 + 1 + 110 + 5), four more than C3b. |
+| Vendored Hyper `regression` filter with `client,http1,http2,server` | **5 passed**. |
+| Vendored Hyper exact `proto::h1::role::tests::test_decoder_request` | **1 passed**. |
+
+The only tracked edits are the lifecycle test file, runtime test-only
+instrumentation, one `None` at the direct C1 test call site, and this plan. No
+unrelated fixture/live suite, network service, credential/secret,
+container/OrbStack/cluster, or other worktree was used. Root alone owns the
+pending local commit. The retained C3a/C3b results remain separate historical
+evidence; the 46-test runtime and 820-test workspace passes explicitly reran
+their code on the C3c tree.
+
+Next root actions are to freeze this inspected tree in a local commit and obtain
+independent exact-tree review. Linux/image CI, publication/integration/merge,
+Gate 2/Gate 9, and release qualification remain open.
+
 ## Remaining gates and limits
 
 - [x] C3a exact capacity, cap+1 zero excess work, one-slot/full recovery, exact
@@ -399,7 +556,10 @@ behavior results above remain root-run evidence rather than reviewer reruns.
 - [x] C3b keep-alive, ordinary pipeline, HTTP/1.0, and post-HTTP/2 local
   behavior verification and actual exchange accounting.
 - [x] Independent exact-tree C3b review passed with no findings.
-- [ ] C3c public-listener shutdown phase isolation.
+- [x] C3c four-case test-only implementation, pinned formatting, offline
+  no-run compilation, scoped Clippy, and static inventory.
+- [x] C3c public-listener shutdown phase isolation locally passed with exact
+  accepted/idle/late, queued-pipeline, within-grace, and expiry outcomes.
 - [x] Exact implementation-head independent re-review of the corrected C3a
   harness passed with no findings.
 - [ ] Linux/image exact-head CI and full C3 cross-runtime review.

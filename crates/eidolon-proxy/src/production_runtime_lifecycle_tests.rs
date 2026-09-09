@@ -1,5 +1,5 @@
-//! C3a/C3b: bounded capacity, slow/partial-client cleanup, connection reuse,
-//! and version-rejection recovery through the actual production listener and
+//! C3a/C3b/C3c: bounded capacity, slow/partial-client cleanup, connection reuse,
+//! version-rejection recovery, and isolated shutdown through the production listener and
 //! production upstream dispatcher. This is finite lifecycle regression
 //! evidence, not load, latency, RSS, or soak evidence.
 
@@ -29,6 +29,7 @@ use super::{
     ProductionProcessorError, ProductionRejectedRequest, ProductionRequestContext,
     ProductionRequestProcessor, ProductionResponse, ProductionRuntimeConfig,
     ProductionRuntimeError, ProductionUpstreamConfig, ProductionUpstreamTarget,
+    ShutdownObservation,
 };
 use crate::production_http::{ProductionHttpRequest, ProductionRequestRejection};
 
@@ -283,7 +284,8 @@ struct UpstreamRecorder {
 }
 
 impl UpstreamRecorder {
-    async fn start() -> Self {
+    async fn start(peer_limit: usize) -> Self {
+        assert!((1..=4).contains(&peer_limit), "bounded upstream peer limit");
         let listener = timeout(OPERATION_BUDGET, TcpListener::bind("127.0.0.1:0"))
             .await
             .expect("owned recorder bind should be bounded")
@@ -311,7 +313,7 @@ impl UpstreamRecorder {
                     }
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.expect("owned recorder should accept");
-                        assert!(records.len() + connections.len() < 4, "at most four upstream peers");
+                        assert!(records.len() + connections.len() < peer_limit, "upstream peer limit exceeded");
                         connections.spawn(capture_upstream_connection(
                             stream,
                             ready_tx.clone(),
@@ -331,8 +333,8 @@ impl UpstreamRecorder {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         assert!(
-                            records.len() + connections.len() < 4,
-                            "at most four upstream peers"
+                            records.len() + connections.len() < peer_limit,
+                            "upstream peer limit exceeded"
                         );
                         stream
                             .set_nonblocking(true)
@@ -512,8 +514,10 @@ struct LifecycleHarness {
     observations: Arc<ProcessorObservations>,
     connection_tasks: watch::Receiver<usize>,
     connection_task_peak: Arc<AtomicUsize>,
+    connection_tasks_started: Arc<AtomicUsize>,
     body_collection_started: Option<oneshot::Receiver<()>>,
     shutdown: Option<oneshot::Sender<()>>,
+    shutdown_started: Option<oneshot::Receiver<()>>,
     server: Option<JoinHandle<Result<(), ProductionRuntimeError>>>,
     recorder: Option<UpstreamRecorder>,
 }
@@ -524,8 +528,25 @@ impl LifecycleHarness {
         request_timeout: Duration,
         observe_body_collection: bool,
     ) -> Self {
+        Self::start_with_shutdown_grace(
+            capacity,
+            request_timeout,
+            observe_body_collection,
+            Duration::from_secs(2),
+            4,
+        )
+        .await
+    }
+
+    async fn start_with_shutdown_grace(
+        capacity: usize,
+        request_timeout: Duration,
+        observe_body_collection: bool,
+        shutdown_grace: Duration,
+        upstream_peer_limit: usize,
+    ) -> Self {
         assert!((1..=2).contains(&capacity), "C3a task bound is one or two");
-        let recorder = UpstreamRecorder::start().await;
+        let recorder = UpstreamRecorder::start(upstream_peer_limit).await;
         let listener = timeout(OPERATION_BUDGET, TcpListener::bind("127.0.0.1:0"))
             .await
             .expect("production listener bind should be bounded")
@@ -547,8 +568,10 @@ impl LifecycleHarness {
                 observations: Arc::clone(&observations),
             });
         let (shutdown, stopped) = oneshot::channel();
+        let (shutdown_observed, shutdown_started) = oneshot::channel();
         let (connection_task_tx, connection_tasks) = watch::channel(0);
         let connection_task_peak = Arc::new(AtomicUsize::new(0));
+        let connection_tasks_started = Arc::new(AtomicUsize::new(0));
         let (body_collection_started, body_collection_receiver) = if observe_body_collection {
             let (started, receiver) = oneshot::channel();
             (Some(Arc::new(Mutex::new(Some(started)))), Some(receiver))
@@ -561,7 +584,7 @@ impl LifecycleHarness {
                 max_concurrent_connections: capacity,
                 request_timeout,
                 processor_timeout: OPERATION_BUDGET,
-                shutdown_grace: Duration::from_secs(2),
+                shutdown_grace,
             },
             processor,
             async move {
@@ -570,14 +593,20 @@ impl LifecycleHarness {
             body_collection_started,
             Some(connection_task_tx),
             Some(Arc::clone(&connection_task_peak)),
+            Some(ShutdownObservation {
+                started: shutdown_observed,
+                connection_tasks_started: Arc::clone(&connection_tasks_started),
+            }),
         ));
         Self {
             address,
             observations,
             connection_tasks,
             connection_task_peak,
+            connection_tasks_started,
             body_collection_started: body_collection_receiver,
             shutdown: Some(shutdown),
+            shutdown_started: Some(shutdown_started),
             server: Some(server),
             recorder: Some(recorder),
         }
@@ -659,25 +688,58 @@ impl LifecycleHarness {
         }
     }
 
-    async fn finish(mut self) -> Vec<RecordedUpstreamRequest> {
+    async fn begin_shutdown(&mut self) -> Instant {
+        let requested = Instant::now();
         self.shutdown
             .take()
             .expect("production listener should have one shutdown signal")
             .send(())
             .expect("production listener should remain live through clean shutdown");
-        AbortOnDropTask::new(
+        timeout(
+            OPERATION_BUDGET,
+            self.shutdown_started
+                .take()
+                .expect("production listener should have one shutdown-started signal"),
+        )
+        .await
+        .expect("production admission closure should be bounded")
+        .expect("admission must close, drain must be sent, and listener dropped");
+        requested
+    }
+
+    async fn finish_shutdown(
+        mut self,
+        expected: Result<(), ProductionRuntimeError>,
+    ) -> Vec<RecordedUpstreamRequest> {
+        assert!(self.shutdown.is_none(), "shutdown sender must be consumed");
+        assert!(
+            self.shutdown_started.is_none(),
+            "actual shutdown start must be observed before joining"
+        );
+        self.wait_for_tasks(0).await;
+        // Keep abort-on-drop ownership across the bounded join and any outer
+        // cancellation. A drained task count alone is not the server result.
+        let result = AbortOnDropTask::new(
             self.server
                 .take()
                 .expect("production listener should have one task"),
         )
         .join("production listener")
-        .await
-        .expect("production listener should drain cleanly");
+        .await;
+        assert_eq!(result, expected, "exact production shutdown result");
+        assert_eq!(*self.connection_tasks.borrow(), 0, "joined connection set");
         self.recorder
             .take()
             .expect("harness should own one upstream recorder")
             .finish()
             .await
+    }
+
+    async fn finish(mut self) -> Vec<RecordedUpstreamRequest> {
+        self.begin_shutdown().await;
+        // C3a/C3b retain their clean-result oracle and finish the recorder
+        // only after the production listener has joined.
+        self.finish_shutdown(Ok(())).await
     }
 }
 
@@ -1235,7 +1297,7 @@ mod c3b {
     use super::*;
 
     #[derive(Default)]
-    struct ResponseFrames {
+    pub(super) struct ResponseFrames {
         // Keep the entire peer capture, including consumed frames, under one
         // aggregate cap. Advancing the cursor never discards following bytes
         // or resets the byte budget between keep-alive/pipelined responses.
@@ -1244,8 +1306,8 @@ mod c3b {
         terminal: Option<TerminalKind>,
     }
 
-    struct ResponseFrame<'a> {
-        head: &'a str,
+    pub(super) struct ResponseFrame<'a> {
+        pub(super) head: &'a str,
         body: &'a [u8],
     }
 
@@ -1273,7 +1335,7 @@ mod c3b {
             }
         }
 
-        async fn next_frame(&mut self, stream: &mut TcpStream) -> ResponseFrame<'_> {
+        pub(super) async fn next_frame(&mut self, stream: &mut TcpStream) -> ResponseFrame<'_> {
             assert!(
                 self.terminal.is_none(),
                 "cannot parse another frame after EOF/reset"
@@ -1351,7 +1413,7 @@ mod c3b {
             }
         }
 
-        async fn expect_terminal(&mut self, stream: &mut TcpStream) -> TerminalKind {
+        pub(super) async fn expect_terminal(&mut self, stream: &mut TcpStream) -> TerminalKind {
             assert_eq!(
                 self.consumed,
                 self.wire.len(),
@@ -1370,7 +1432,7 @@ mod c3b {
         }
     }
 
-    fn assert_frame(frame: &ResponseFrame<'_>, status_line: &str, body: &[u8]) {
+    pub(super) fn assert_frame(frame: &ResponseFrame<'_>, status_line: &str, body: &[u8]) {
         assert_eq!(frame.head.split("\r\n").next(), Some(status_line));
         assert_eq!(
             frame.body, body,
@@ -1602,5 +1664,260 @@ mod c3b {
         })
         .await
         .expect("raw HTTP/2-preface C3b case exceeded 20 seconds");
+    }
+}
+
+mod c3c {
+    use super::{c3b::assert_frame, c3b::ResponseFrames, *};
+
+    const CLEAN_GRACE: Duration = Duration::from_secs(3);
+    const BODY_ONLY_GRACE: Duration = Duration::from_millis(200);
+    const POST_TARGET: &str = "/shutdown/body";
+    const POST_HEAD: &[u8] = b"POST /shutdown/body HTTP/1.1\r\nHost: proxy.owned.test\r\nContent-Length: 1\r\nConnection: close\r\n\r\n";
+
+    async fn start(capacity: usize, body: bool, grace: Duration) -> LifecycleHarness {
+        LifecycleHarness::start_with_shutdown_grace(capacity, OPERATION_BUDGET, body, grace, 1)
+            .await
+    }
+
+    fn assert_work(harness: &LifecycleHarness, total: usize, current: usize, tasks: usize) {
+        assert!(
+            total <= 1,
+            "at most one complete upstream request per C3c case"
+        );
+        assert_eq!(
+            harness.snapshot(),
+            CounterSnapshot {
+                normal_process: total,
+                request_rejections: Vec::new(),
+                pre_service_rejections: Vec::new(),
+                current_processors: current,
+                peak_processors: total,
+                peak_connection_tasks: tasks,
+                upstream_requests: total,
+            },
+            "exact C3c work and zero rejection hooks"
+        );
+        assert_eq!(
+            harness.connection_tasks_started.load(Ordering::SeqCst),
+            tasks,
+            "total spawned tasks must not hide a late task below the retained peak"
+        );
+    }
+
+    fn assert_held_shutdown(harness: &LifecycleHarness, started: Instant) {
+        assert!(harness.shutdown.is_none() && harness.shutdown_started.is_none());
+        assert_eq!(*harness.connection_tasks.borrow(), 1);
+        assert_eq!(harness.snapshot().current_processors, 1);
+        // Admission/listener closure, the joined idle task (when present),
+        // and the held complete capture are positive checkpoints. This is a
+        // pending-state check at that fence, not a negative timeout oracle.
+        assert!(
+            !harness.server.as_ref().expect("owned server").is_finished(),
+            "shutdown must remain pending on the held synchronous processor"
+        );
+        assert!(
+            started.elapsed() < CLEAN_GRACE,
+            "release must be within grace"
+        );
+    }
+
+    async fn exact_response_then_terminal(client: &mut TcpStream, target: &str) {
+        let mut responses = ResponseFrames::default();
+        let frame = responses.next_frame(client).await;
+        assert_frame(&frame, "HTTP/1.1 200 OK", target.as_bytes());
+        assert_eq!(response_header_values(frame.head, "connection"), ["close"]);
+        responses.expect_terminal(client).await;
+    }
+
+    async fn late_connection_attempt(address: SocketAddr) -> bool {
+        match timeout(OPERATION_BUDGET, TcpStream::connect(address))
+            .await
+            .expect("late connect must resolve without timeout")
+        {
+            Err(error)
+                if error.kind() == ErrorKind::ConnectionRefused || terminal_reset(&error) =>
+            {
+                eprintln!("C3c late TCP attempt: {:?}; request writes=0", error.kind());
+                false
+            }
+            Err(error) => panic!("late connect failed unexpectedly: {error}"),
+            Ok(mut client) => {
+                let bytes = request("/shutdown/late");
+                assert!(bytes.len() <= CAPTURE_LIMIT);
+                let write_result = timeout(OPERATION_BUDGET, client.write_all(&bytes))
+                    .await
+                    .expect("late request write must be bounded");
+                let write_completed = write_result.is_ok();
+                // Even a write reset must read any buffered response bytes.
+                let response =
+                    observe_terminal_response_after_write(&mut client, write_result).await;
+                assert!(
+                    response.bytes.is_empty(),
+                    "late peer response: {response:?}"
+                );
+                eprintln!(
+                    "C3c late TCP attempt: connected; request writes=1, complete writes={write_completed}, terminal={:?}, response bytes=0",
+                    response.terminal
+                );
+                true
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_idle_and_late_shutdown_drains_only_accepted_work() {
+        timeout(TEST_BUDGET, async {
+            const TARGET: &str = "/shutdown/accepted";
+            let mut harness = start(2, false, CLEAN_GRACE).await;
+            let mut accepted = harness.connect_and_wait_for_tasks(1).await;
+            write_all_bounded(&mut accepted, &request(TARGET)).await;
+            let capture = harness.next_upstream().await;
+            assert_upstream_request(&capture.request, TARGET);
+            let expected_record = capture.request.clone();
+
+            let mut idle = harness.connect_and_wait_for_tasks(2).await;
+            assert_work(&harness, 1, 1, 2);
+            let started = harness.begin_shutdown().await;
+            let idle_response = read_terminal_response(&mut idle).await;
+            assert!(idle_response.bytes.is_empty(), "idle peer: {idle_response:?}");
+            harness.wait_for_tasks(1).await;
+            assert_work(&harness, 1, 1, 2);
+
+            // The third TCP attempt is after the shutdown acknowledgment. It
+            // is never counted as an accepted production peer or request.
+            let late_connected = late_connection_attempt(harness.address).await;
+            harness.wait_for_tasks(1).await;
+            assert_work(&harness, 1, 1, 2);
+            assert_held_shutdown(&harness, started);
+            capture.release();
+
+            exact_response_then_terminal(&mut accepted, TARGET).await;
+            harness.wait_for_tasks(0).await;
+            assert_work(&harness, 1, 0, 2);
+            let records = harness.finish_shutdown(Ok(())).await;
+            assert_eq!(records, [expected_record], "only the accepted target upstream");
+            eprintln!(
+                "C3c accepted/idle/late: connection attempts=3, successful TCP connects={}, accepted tasks=2, accepted-peer request attempts=1, late request writes={}, complete upstream requests={}",
+                2 + usize::from(late_connected),
+                usize::from(late_connected),
+                records.len()
+            );
+        })
+        .await
+        .expect("accepted/idle/late C3c case exceeded 20 seconds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_pipeline_shutdown_never_dispatches_second_request() {
+        timeout(TEST_BUDGET, async {
+            const FIRST: &str = "/shutdown/pipeline/first";
+            const PIPELINE: &[u8] = b"GET /shutdown/pipeline/first HTTP/1.1\r\nHost: proxy.owned.test\r\nConnection: keep-alive\r\n\r\nGET /shutdown/pipeline/second HTTP/1.1\r\nHost: proxy.owned.test\r\nConnection: close\r\n\r\n";
+            let mut harness = start(1, false, CLEAN_GRACE).await;
+            let mut client = harness.connect_and_wait_for_tasks(1).await;
+            assert!(PIPELINE.len() <= CAPTURE_LIMIT);
+            // Exactly one finite application write, not a TCP segmentation claim.
+            write_all_bounded(&mut client, PIPELINE).await;
+            let capture = harness.next_upstream().await;
+            assert_upstream_request(&capture.request, FIRST);
+            let expected_record = capture.request.clone();
+            assert_work(&harness, 1, 1, 1);
+            let started = harness.begin_shutdown().await;
+            harness.wait_for_tasks(1).await;
+            assert_work(&harness, 1, 1, 1);
+            assert_held_shutdown(&harness, started);
+            capture.release();
+
+            let mut responses = ResponseFrames::default();
+            let first = responses.next_frame(&mut client).await;
+            assert_frame(&first, "HTTP/1.1 200 OK", FIRST.as_bytes());
+            assert!(response_header_values(first.head, "connection").is_empty());
+            // Source-derived single oracle: block_in_place holds the current
+            // Hyper poll until release. It can consume the queued head before
+            // this connection polls drain; the already-closed admission gate
+            // supplies the fixed empty 503 without request/pre-service hooks.
+            // Root must verify this wire result on loopback, not accept both
+            // a close-after-200 and a 503 merely for portability.
+            let second = responses.next_frame(&mut client).await;
+            assert_frame(&second, "HTTP/1.1 503 Service Unavailable", b"");
+            assert_eq!(response_header_values(second.head, "content-length"), ["0"]);
+            assert_eq!(response_header_values(second.head, "connection"), ["close"]);
+            responses.expect_terminal(&mut client).await;
+            harness.wait_for_tasks(0).await;
+            assert_work(&harness, 1, 0, 1);
+            let records = harness.finish_shutdown(Ok(())).await;
+            assert_eq!(records, [expected_record], "queued second target must never forward");
+            eprintln!(
+                "C3c pipeline: connection attempts=1, accepted tasks=1, request attempts=2 in one write, complete upstream requests={}, wire=200 then empty 503 then EOF/reset",
+                records.len()
+            );
+        })
+        .await
+        .expect("queued pipeline shutdown C3c case exceeded 20 seconds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_completed_after_shutdown_within_grace_is_processed_once() {
+        timeout(TEST_BUDGET, async {
+            let mut harness = start(1, true, CLEAN_GRACE).await;
+            let mut client = harness.connect_and_wait_for_tasks(1).await;
+            write_all_bounded(&mut client, POST_HEAD).await;
+            harness.wait_for_body_collection().await;
+            assert_work(&harness, 0, 0, 1);
+            let started = harness.begin_shutdown().await;
+            harness.wait_for_tasks(1).await;
+            assert_work(&harness, 0, 0, 1);
+
+            write_all_bounded(&mut client, b"x").await;
+            assert!(started.elapsed() < CLEAN_GRACE, "body byte must complete within grace");
+            let capture = harness.next_upstream().await;
+            assert_eq!(capture.request.method, "POST");
+            assert_eq!(capture.request.target, POST_TARGET);
+            assert_eq!(capture.request.body, b"x");
+            let expected_record = capture.request.clone();
+            assert_work(&harness, 1, 1, 1);
+            assert_held_shutdown(&harness, started);
+            capture.release();
+
+            exact_response_then_terminal(&mut client, POST_TARGET).await;
+            harness.wait_for_tasks(0).await;
+            assert_work(&harness, 1, 0, 1);
+            let records = harness.finish_shutdown(Ok(())).await;
+            assert_eq!(records, [expected_record], "one exact POST target and body");
+            eprintln!(
+                "C3c body within grace: connection attempts=1, accepted tasks=1, request attempts=1, head writes=1, body writes=1, complete upstream requests={}",
+                records.len()
+            );
+        })
+        .await
+        .expect("body completion within grace C3c case exceeded 20 seconds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_only_grace_expiry_aborts_without_processor_or_upstream_work() {
+        timeout(TEST_BUDGET, async {
+            let mut harness = start(1, true, BODY_ONLY_GRACE).await;
+            let mut client = harness.connect_and_wait_for_tasks(1).await;
+            write_all_bounded(&mut client, POST_HEAD).await;
+            harness.wait_for_body_collection().await;
+            assert_work(&harness, 0, 0, 1);
+            harness.begin_shutdown().await;
+            // Keep the write side open and withhold the sole declared byte.
+            // The 200 ms drain grace is separate from the five-second body
+            // timer. No early half-close or coupled synchronous work is used.
+            let response = read_terminal_response(&mut client).await;
+            assert!(response.bytes.is_empty(), "body-only expiry response: {response:?}");
+            harness.wait_for_tasks(0).await;
+            assert_work(&harness, 0, 0, 1);
+            let records = harness
+                .finish_shutdown(Err(ProductionRuntimeError::DrainDeadlineExceeded))
+                .await;
+            assert!(records.is_empty(), "body-only expiry must have an empty joined recorder");
+            eprintln!(
+                "C3c body-only expiry: connection attempts=1, accepted tasks=1, incomplete request attempts=1, head writes=1, body writes=0, complete upstream requests=0, result=DrainDeadlineExceeded"
+            );
+        })
+        .await
+        .expect("body-only grace expiry C3c case exceeded 20 seconds");
     }
 }

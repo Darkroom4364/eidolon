@@ -286,6 +286,7 @@ impl IngressHarness {
             Some(Arc::new(Mutex::new(Some(body_signal)))),
             Some(connection_count_tx),
             None,
+            None,
         ));
         let (stop_recorder, stopped) = oneshot::channel();
         let recorder = tokio::spawn(run_recorder(upstream, stopped));

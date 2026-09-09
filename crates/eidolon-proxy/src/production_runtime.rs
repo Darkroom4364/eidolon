@@ -211,6 +211,12 @@ impl Error for ProductionRuntimeError {}
 #[cfg(test)]
 type BodyCollectionStarted = Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
 
+#[cfg(test)]
+struct ShutdownObservation {
+    started: tokio::sync::oneshot::Sender<()>,
+    connection_tasks_started: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 /// Serve the Hyper HTTP/1.1 production ingress until `shutdown` resolves.
 /// This API requires Tokio's multi-thread runtime because synchronous
 /// processor calls use a non-detachable `block_in_place` boundary.
@@ -228,6 +234,8 @@ where
         config,
         processor,
         shutdown,
+        #[cfg(test)]
+        None,
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -257,10 +265,13 @@ where
         Some(Arc::new(Mutex::new(Some(body_collection_started)))),
         None,
         None,
+        None,
     )
     .await
 }
 
+// The additional observation arguments exist only in the library test build.
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 async fn serve_production_http1_inner<F>(
     listener: TcpListener,
     config: ProductionRuntimeConfig,
@@ -269,6 +280,7 @@ async fn serve_production_http1_inner<F>(
     #[cfg(test)] body_collection_started: Option<BodyCollectionStarted>,
     #[cfg(test)] connection_task_count: Option<watch::Sender<usize>>,
     #[cfg(test)] connection_task_peak: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)] shutdown_observation: Option<ShutdownObservation>,
 ) -> Result<(), ProductionRuntimeError>
 where
     F: Future<Output = ()> + Send,
@@ -336,6 +348,13 @@ where
                         std::sync::atomic::Ordering::SeqCst,
                     );
                 }
+                #[cfg(test)]
+                if let Some(observation) = &shutdown_observation {
+                    observation.connection_tasks_started.fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
             }
         }
     }
@@ -344,14 +363,28 @@ where
     let _ = drain_sender.send(true);
     drop(listener);
     let deadline = tokio::time::Instant::now() + config.shutdown_grace;
+    #[cfg(test)]
+    if let Some(observation) = shutdown_observation {
+        // This acknowledges all three actions, never merely the shutdown request.
+        let _ = observation.started.send(());
+    }
     while !connections.is_empty() {
         tokio::select! {
-            _ = connections.join_next() => {}
+            _ = connections.join_next() => {
+                #[cfg(test)]
+                if let Some(count) = &connection_task_count {
+                    count.send_replace(connections.len());
+                }
+            }
             _ = tokio::time::sleep_until(deadline) => {
                 connections.abort_all();
                 // `block_in_place` work cannot be canceled. Report the missed
                 // deadline only after every accepted connection has quiesced.
                 while connections.join_next().await.is_some() {}
+                #[cfg(test)]
+                if let Some(count) = &connection_task_count {
+                    count.send_replace(connections.len());
+                }
                 return Err(ProductionRuntimeError::DrainDeadlineExceeded);
             }
         }
@@ -1430,6 +1463,7 @@ mod tests {
             },
             None,
             Some(task_count_tx),
+            None,
             None,
         ));
 
