@@ -75,6 +75,7 @@ jobs:
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_reparses_fragmented_malformed_partial_head_at_eof -- --exact
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_eof_during_partial_head -- --exact
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_prefixed_h2_preface_as_http1_parse_error -- --exact
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_recognizes_fragmented_position_zero_h2_preface -- --exact
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::request_target_fragment_regression_rejects_before_uri_normalization -- --exact
 
       - name: Test vendored Hyper HTTP/1 Content-Length preservation

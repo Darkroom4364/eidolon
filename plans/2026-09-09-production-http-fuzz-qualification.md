@@ -8,9 +8,12 @@ after its offline probe exposed three further gaps; all three are reproduced,
 corrected. A completed review of
 `954c2a0457723ae1e1af28d3fe5a6dff67709c2b` then blocked on one P1 and two P2
 findings; all three have minimum local corrections and regressions, and
-correction-focused, full-workspace, vendor, Clippy, and ASan gates pass. Exact
-fresh rereview, publication, Linux/image CI, and the final C4c campaign remain
-open**.
+correction-focused, full-workspace, vendor, Clippy, and ASan gates pass. A
+completed corrective review of `feda8f2f0c8e483bb10f17d5ccf8bded9a8c8861`
+closed all thirteen known findings but blocked on one new P2: stable CI omitted
+the new fragmented exact-preface regression. That existing passing test is now
+added to the focused vendor CI block locally. Exact fresh rereview, publication,
+Linux/image CI, and the final C4c campaign remain open**.
 
 Starting head: `264cea2bab8b275eb78709eb3e43a9f7fc855ab9`, the reviewed
 C3 documentation head. The dedicated
@@ -228,6 +231,23 @@ vendor, and 5 manifest tests before blocking.
 All three corrections remain local until a new exact commit passes fresh
 independent review.
 
+### Completed corrective-rereview finding
+
+A fresh read-only review completed against exact corrective implementation
+`feda8f2f0c8e483bb10f17d5ccf8bded9a8c8861` (tree
+`5eebc0f266eb79cf59979b3f720bc7b7d9beb2cb`) and returned **BLOCK** with one new
+P2. Report: `/tmp/codex-tasks/eidolon-c4-rereview-feda8f2.last.md`. It marked
+all thirteen prior findings **CLOSED** and independently passed 13 driver, 12
+policy, 10 manifest/lock, 124 vendor, strict Clippy/formatting, and the pinned
+ASan checked-in replay.
+
+| Finding | Evidence | Minimum disposition |
+| --- | --- | --- |
+| P2 fragmented exact-preface behavior was not enforced by CI | The focused Hyper regression passed and was listed in this validation contract, but the stable CI vendor block did not invoke it; vendored Hyper is an isolated workspace, and no other CI test asserted the exact unprefixed fragmented-preface outcome. | Stable CI now invokes the existing `conn_recognizes_fragmented_position_zero_h2_preface` test by exact name alongside the prefixed-position regression. |
+
+This CI-only correction remains local until a new exact commit passes fresh
+independent review.
+
 ## Local behavior evidence to date
 
 Focused driver, manifest, vendor repair, ASan build, checked-in corpus replay,
@@ -322,12 +342,15 @@ listed:
 - [x] Completed independent review of exact `954c2a0...` returned one P1 and
       two P2 findings; all three have local minimum corrections and retained
       fail-closed coverage.
+- [x] Completed independent review of exact `feda8f2...` closed all thirteen
+      prior findings and returned one new P2; the missing exact-preface CI
+      invocation is corrected locally.
 - [x] Checked-in ASan replay and repaired 30-second deterministic mutation smoke
       pass locally.
 - [x] Formatting, root/fuzz Clippy, full workspace, full vendor, audit, and
       retained fixture gates pass on the current correction tree.
 - [ ] Fresh independent cross-runtime review passes against the exact corrective
-      commit and explicitly disposes all thirteen known findings.
+      commit and explicitly disposes all fourteen known findings.
 - [ ] #292 issue state and roadmap comments match the reviewed local evidence.
 - [ ] Branch is published and exact-head Linux/image CI passes.
 - [ ] C4c final campaign runs for at least 3,600 seconds against the exact
