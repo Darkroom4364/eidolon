@@ -1,7 +1,8 @@
 # Production resource lifecycle matrix — #291 / #251 C3
 
-Status: **C3a and C3b locally complete and independently reviewed; C3c
-implemented and locally behavior-verified, with independent review pending**.
+Status: **C3a, C3b, and C3c locally complete and independently reviewed; full
+C3 Linux/image CI, cross-runtime integration review, and publication remain
+open**.
 C3a starting head: `742b29e8b0e3b815e51c5ce017b166e10dcc1fb7`, the reviewed local
 C2-on-C1 stack. The worktree was clean at that exact head before this slice.
 Final reviewed C3a implementation head:
@@ -22,13 +23,15 @@ worktree was clean at those exact values before editing. Those values identify
 the base. Initial implementation head
 `0cdfc70bb57f18f72d5bcacfe0aa91b6285c358e`, tree
 `e2d27361d8cadeb9e3df23352f02bb70a31c2bdf`, was independently reviewed and
-blocked on the portability of one pipeline wire assertion. The phase-aware
-correction and fresh exact-tree review are pending; their identities and result
-will be recorded only after root freezes and reviews that corrected tree.
+blocked on the portability of one pipeline wire assertion. Final reviewed C3c
+implementation head: `63a18804ed663c71628d55e794eee3c1173b7ffb`, tree
+`d48e30481c9de8d35b2199899e9bc811f2c95932`. Its fresh bounded independent
+read-only correction review returned **PASS, no findings** and explicitly
+disposed the initial P2 as fixed.
 
 This is finite production-listener regression evidence. It is not Linux/image
-CI, Gate 2 completion, Gate 9 load/latency/RSS/soak evidence, publication,
-merge, release qualification, or full C3 completion.
+CI or full C3 cross-runtime integration review, Gate 2 completion, Gate 9
+load/latency/RSS/soak evidence, publication, merge, or release qualification.
 
 ## Invariant, scope, and observed production result
 
@@ -567,14 +570,25 @@ build, lint, and vendored-Hyper gates also passed as recorded below.
 The only tracked edits are the lifecycle test file, runtime test-only
 instrumentation, one `None` at the direct C1 test call site, and this plan. No
 unrelated fixture/live suite, network service, credential/secret,
-container/OrbStack/cluster, or other worktree was used. Root alone owns the
-pending local commit. The retained C3a/C3b results remain separate historical
-evidence; the 46-test runtime and 820-test workspace passes explicitly reran
-their code on the C3c tree.
+container/OrbStack/cluster, or other worktree was used. Root owns the local
+commits; none is published or merged. The retained C3a/C3b results remain
+separate historical evidence; the 46-test runtime and 820-test workspace passes
+explicitly reran their code on the C3c tree.
 
-Next root actions are to freeze this inspected tree in a local commit and obtain
-independent exact-tree review. Linux/image CI, publication/integration/merge,
-Gate 2/Gate 9, and release qualification remain open.
+Independent read-only review verified exact commit
+`63a18804ed663c71628d55e794eee3c1173b7ffb`, tree
+`d48e30481c9de8d35b2199899e9bc811f2c95932`, detached clean status, and returned
+**PASS with no findings**. It confirmed the counter is observation-only and
+race-free after task join, the optional-frame reader preserves complete framing
+and the 16 KiB aggregate bound, the two call/wire pairs are exactly the
+source-permitted outcomes, ownership remains bounded, and executable runtime
+changes are test-only. The reviewer ran no tests and relied on the separately
+recorded root execution gates. One earlier review process completed substantive
+source reads but stalled without a report; it is not counted as review evidence.
+
+C3c is locally complete. The next local implementation slice is C4. Linux/image
+CI, full C3 cross-runtime integration review, publication/merge, Gate 2/Gate 9,
+and release qualification remain open.
 
 ## Remaining gates and limits
 
@@ -593,6 +607,8 @@ Gate 2/Gate 9, and release qualification remain open.
   no-run compilation, scoped Clippy, and static inventory.
 - [x] C3c public-listener shutdown phase isolation locally passed with exact
   accepted/idle/late, queued-pipeline, within-grace, and expiry outcomes.
+- [x] Independent exact-tree C3c correction review passed with no findings and
+  confirmed the initial scheduler-sensitive P2 is fixed.
 - [x] Exact implementation-head independent re-review of the corrected C3a
   harness passed with no findings.
 - [ ] Linux/image exact-head CI and full C3 cross-runtime review.
