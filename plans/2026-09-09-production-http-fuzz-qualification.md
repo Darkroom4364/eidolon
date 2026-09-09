@@ -12,8 +12,11 @@ correction-focused, full-workspace, vendor, Clippy, and ASan gates pass. A
 completed corrective review of `feda8f2f0c8e483bb10f17d5ccf8bded9a8c8861`
 closed all thirteen known findings but blocked on one new P2: stable CI omitted
 the new fragmented exact-preface regression. That existing passing test is now
-added to the focused vendor CI block locally. Exact fresh rereview, publication,
-Linux/image CI, and the final C4c campaign remain open**.
+added to the focused vendor CI block. A final fresh review of exact
+`e6ebb00ffd04ede920674d9ff7b42f394bcd2436` closed all fourteen findings and
+returned **PASS** with no new P0/P1/P2. C4a/C4b are complete locally;
+publication, Linux/image CI, ordered integration, and the final C4c campaign
+remain open**.
 
 Starting head: `264cea2bab8b275eb78709eb3e43a9f7fc855ab9`, the reviewed
 C3 documentation head. The dedicated
@@ -245,8 +248,30 @@ ASan checked-in replay.
 | --- | --- | --- |
 | P2 fragmented exact-preface behavior was not enforced by CI | The focused Hyper regression passed and was listed in this validation contract, but the stable CI vendor block did not invoke it; vendored Hyper is an isolated workspace, and no other CI test asserted the exact unprefixed fragmented-preface outcome. | Stable CI now invokes the existing `conn_recognizes_fragmented_position_zero_h2_preface` test by exact name alongside the prefixed-position regression. |
 
-This CI-only correction remains local until a new exact commit passes fresh
-independent review.
+This CI-only correction remained local pending the exact review below.
+
+### Final exact rereview
+
+The final correction-focused read-only review completed against exact head
+`e6ebb00ffd04ede920674d9ff7b42f394bcd2436` (tree
+`08e37ace93c96470df126970bdd8a88c57b8855e`) and returned **PASS** with all
+fourteen accumulated findings **CLOSED** and no new P0/P1/P2. Report:
+`/tmp/codex-tasks/eidolon-c4-ci-rereview-e6ebb00.last.md`.
+
+The reviewer verified that the final delta is exactly one executable CI line
+plus this qualification-plan update, the test exists and performs two distinct
+reads, vendored Hyper remains an isolated workspace, the exact stable-CI command
+passes, and all 25 embedded workflow shell programs plus YAML parse correctly.
+The first thirteen dispositions are retained from the direct-parent exact review
+because no implementation, test, manifest, lock, corpus, or fuzz-target source
+changed. This is local C4a/C4b source approval, not publication, Linux/image CI,
+integration, C4c, Gate 2, Gate 10, or release approval.
+
+GitHub checkpoints:
+
+- #292: https://github.com/Darkroom4364/eidolon/issues/292#issuecomment-5608284543
+- #251: https://github.com/Darkroom4364/eidolon/issues/251#issuecomment-5608284776
+- #51: https://github.com/Darkroom4364/eidolon/issues/51#issuecomment-5608285034
 
 ## Local behavior evidence to date
 
@@ -349,9 +374,10 @@ listed:
       pass locally.
 - [x] Formatting, root/fuzz Clippy, full workspace, full vendor, audit, and
       retained fixture gates pass on the current correction tree.
-- [ ] Fresh independent cross-runtime review passes against the exact corrective
+- [x] Fresh independent cross-runtime review passes against the exact corrective
       commit and explicitly disposes all fourteen known findings.
-- [ ] #292 issue state and roadmap comments match the reviewed local evidence.
+- [x] #292 issue state and #251/#51 roadmap comments match the reviewed local
+      evidence without closing any unproved gate.
 - [ ] Branch is published and exact-head Linux/image CI passes.
 - [ ] C4c final campaign runs for at least 3,600 seconds against the exact
       candidate and records its complete reproducibility and failure disposition.
