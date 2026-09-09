@@ -62,12 +62,16 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --locked
 
-      - name: Test vendored Hyper HTTP/1 read regressions
+      - name: Test production HTTP fuzz driver
+        run: cargo test -p eidolon-proxy --features fuzzing --lib fuzzing::tests --locked
+
+      - name: Test vendored Hyper HTTP/1 request regressions
         # HTTP/2 is needed by upstream's shared unit-test harness only.
         run: |
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_reparses_fragmented_malformed_partial_head_at_eof -- --exact
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_eof_during_partial_head -- --exact
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::request_target_fragment_regression_rejects_before_uri_normalization -- --exact
 
       - name: Test vendored Hyper HTTP/1 Content-Length preservation
         # Retain upstream framing/decoding controls alongside the C1 regressions.
@@ -127,15 +131,29 @@ jobs:
             -dict=fuzz/dictionaries/production_http1_request.dict
 
       - name: Run deterministic finite mutation smoke
+        env:
+          REPOSITORY_IS_PRIVATE: ${{ github.event.repository.private }}
         run: |
           smoke_corpus="$(mktemp -d)"
+          smoke_log="$(mktemp)"
           cp fuzz/corpus/production_http1_request/*.raw "$smoke_corpus/"
-          cargo fuzz run production_http1_request "$smoke_corpus" --sanitizer address -- \
-            -max_total_time=30 \
-            -max_len=65537 \
-            -timeout=2 \
-            -dict=fuzz/dictionaries/production_http1_request.dict \
-            -seed=292
+          if cargo fuzz run production_http1_request "$smoke_corpus" --sanitizer address -- \
+              -max_total_time=30 \
+              -max_len=65537 \
+              -timeout=2 \
+              -dict=fuzz/dictionaries/production_http1_request.dict \
+              -seed=292 >"$smoke_log" 2>&1; then
+            grep -E '^(INFO: seed corpus:|#[0-9]+[[:space:]]+(INITED|DONE)[[:space:]]|Done [0-9]+ runs)' "$smoke_log" | tail -n 4 || true
+            echo "production HTTP fuzz smoke passed"
+          else
+            fuzz_status="$?"
+            if [[ "$REPOSITORY_IS_PRIVATE" == "true" ]]; then
+              mkdir -p fuzz/artifacts/production_http1_request
+              cp "$smoke_log" fuzz/artifacts/production_http1_request/ci-fuzz-output.log
+            fi
+            echo "::error::production HTTP fuzz smoke failed; raw output is withheld pending disclosure review"
+            exit "$fuzz_status"
+          fi
 
       - name: Verify fuzz lock stayed immutable
         run: git diff --exit-code -- fuzz/Cargo.lock

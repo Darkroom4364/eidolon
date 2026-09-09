@@ -15,7 +15,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -171,12 +171,8 @@ async fn evaluate(input: &[u8], schedule: DeliverySchedule) -> Result<Observatio
     builder.max_buf_size(MAX_PRODUCTION_HEADER_BYTES);
     builder.auto_date_header(false);
     builder.keep_alive(false);
-    let connection = tokio::time::timeout(
-        INPUT_DEADLINE,
-        builder.serve_connection(TokioIo::new(io), service),
-    )
-    .await
-    .map_err(|_| DriverError::InputTimedOut)?;
+    let connection =
+        complete_within_input_deadline(builder.serve_connection(TokioIo::new(io), service)).await?;
     if response_overflow.load(Ordering::SeqCst) {
         return Err(DriverError::ResponseCaptureExceeded);
     }
@@ -210,6 +206,20 @@ async fn evaluate(input: &[u8], schedule: DeliverySchedule) -> Result<Observatio
         connection,
         response_bytes,
     })
+}
+
+async fn complete_within_input_deadline<F>(future: F) -> Result<F::Output, DriverError>
+where
+    F: Future,
+{
+    let started = Instant::now();
+    let output = tokio::time::timeout(INPUT_DEADLINE, future)
+        .await
+        .map_err(|_| DriverError::InputTimedOut)?;
+    if started.elapsed() > INPUT_DEADLINE {
+        return Err(DriverError::InputTimedOut);
+    }
+    Ok(output)
 }
 
 async fn observe_request(request: Request<hyper::body::Incoming>) -> RequestOutcome {
@@ -490,9 +500,12 @@ impl AsyncWrite for ScriptedIo {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        delivery_chunks, evaluate_both, ConnectionOutcome, DeliverySchedule, RequestOutcome,
-        MAX_FRAGMENTED_CHUNKS, MAX_FUZZ_INPUT_BYTES,
+        complete_within_input_deadline, delivery_chunks, evaluate_both, ConnectionOutcome,
+        DeliverySchedule, RequestOutcome, INPUT_DEADLINE, MAX_FRAGMENTED_CHUNKS,
+        MAX_FUZZ_INPUT_BYTES,
     };
     use crate::{
         production_http::ProductionRequestRejection,
@@ -552,6 +565,57 @@ mod tests {
             )
         );
         assert!(observed.response_bytes.starts_with(b"HTTP/1.1 400 "));
+    }
+
+    #[test]
+    fn malformed_partial_head_is_segmentation_invariant_at_raw_head_limit() {
+        let mut input = b".\n".to_vec();
+        input.resize(MAX_FUZZ_INPUT_BYTES - 1, b'a');
+        let observed = assert_equivalent(&input);
+        assert_eq!(observed.request, RequestOutcome::NoCompleteRequest);
+        assert_eq!(
+            observed.connection,
+            ConnectionOutcome::PreServiceRejected(
+                ProductionPreServiceRejection::MalformedTransport
+            )
+        );
+        assert!(observed.response_bytes.starts_with(b"HTTP/1.1 400 "));
+    }
+
+    #[test]
+    fn valid_partial_head_at_raw_limit_remains_too_large() {
+        let mut input = b"GET /".to_vec();
+        input.resize(MAX_FUZZ_INPUT_BYTES - 1, b'a');
+        let observed = assert_equivalent(&input);
+        assert_eq!(observed.request, RequestOutcome::NoCompleteRequest);
+        assert_eq!(
+            observed.connection,
+            ConnectionOutcome::PreServiceRejected(ProductionPreServiceRejection::HeadersTooLarge)
+        );
+        assert!(observed.response_bytes.starts_with(b"HTTP/1.1 431 "));
+    }
+
+    #[test]
+    fn raw_fragment_is_rejected_before_uri_normalization() {
+        let observed = assert_equivalent(
+            b"GET /qualification/raw#fragment HTTP/1.1\r\nHost: proxy.fuzz.test\r\n\r\n",
+        );
+        assert_eq!(observed.request, RequestOutcome::NoCompleteRequest);
+        assert_eq!(
+            observed.connection,
+            ConnectionOutcome::PreServiceRejected(
+                ProductionPreServiceRejection::MalformedTransport
+            )
+        );
+        assert!(observed.response_bytes.starts_with(b"HTTP/1.1 400 "));
+    }
+
+    #[test]
+    fn non_yielding_completion_after_deadline_fails() {
+        let result = super::block_on(complete_within_input_deadline(async {
+            std::thread::sleep(INPUT_DEADLINE + Duration::from_millis(50));
+        }));
+        assert_eq!(result, Err(super::DriverError::InputTimedOut));
     }
 
     #[test]

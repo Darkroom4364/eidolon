@@ -20,11 +20,18 @@ Upstream-to-vendor delta:
   predecessor 6c8d7e57c4a5dc01d1330d6051076236989f7d44 cover deterministic
   excess spare capacity and exact-zero client progress.
 - src/proto/h1/io.rs and src/proto/h1/conn.rs (#292): after Hyper's
-  partial-read terminator fast path has deferred parsing, an actual EOF gets
-  one full bounded parse before `IncompleteMessage` classification. This makes
-  malformed partial heads reject consistently across whole and fragmented
-  reads while well-formed incomplete heads retain their existing incomplete
-  result. The focused connection regression uses deterministic in-memory I/O.
+  partial-read terminator fast path has deferred parsing, an actual EOF or the
+  raw-head byte limit gets one full bounded parse before terminal
+  classification. This makes earlier malformed bytes reject consistently
+  across whole and fragmented reads, keeps a genuinely incomplete maximum-size
+  head at `TooLarge`, and keeps a smaller well-formed incomplete head at
+  `IncompleteMessage`. The EOF reparse does not poll the transport again. The
+  focused connection regression uses deterministic in-memory I/O and counts
+  exact EOF polls.
+- src/proto/h1/role.rs (#292): reject a raw request-target `#` before conversion
+  to `http::Uri`, which otherwise omits the fragment from the value presented
+  to strict policy. The server-only regression retains this parser rejection;
+  response/client parsing is unchanged.
 - src/proto/h1/role.rs (#289): preserve each numerically identical request
   Content-Length field in the parsed HeaderMap so the existing strict
   MultipleContentLengths application policy can reject it. Decoder length
@@ -74,22 +81,35 @@ duplicate CL while this repair rejects it with no validated/upstream work.
 The delegated sandbox's earlier bind EPERM was not protocol evidence. See the
 exact-test inventory and limits in plans/2026-09-07-production-ingress-equivalence.md.
 
-Partial-head EOF invariant (#292): malformed bytes already buffered behind
+Partial-head terminal invariant (#292): malformed bytes already buffered behind
 Hyper's partial-read fast path must receive the same parse rejection under
 whole and fragmented delivery. The fail-first two-byte `".\n"` input produced
 400/`MalformedTransport` as one read but an unaudited incomplete close when
-fragmented. One EOF-only full parse corrects that upstream-Hyper inconsistency;
-it starts no request or service work, adds no unbounded read, and leaves a
-syntactically valid but incomplete head as `IncompleteMessage`. The normal C4
-driver regression and scoped Hyper connection regression retain both sides of
-that disposition. This is parser behavior evidence, not release qualification.
+fragmented. Independent review then found the same prefix padded to the 65,536
+byte head limit produced 400 whole versus 431 fragmented. One full parse before
+either terminal classification corrects both inconsistencies; it starts no
+request or service work, adds no unbounded loop, and does not poll I/O again
+after EOF. A syntactically valid smaller partial head remains
+`IncompleteMessage`; a genuinely incomplete maximum-size head remains
+`TooLarge`. Normal C4 driver regressions and the scoped Hyper connection
+regression retain these outcomes.
+
+Raw-fragment invariant (#292): a request-target containing a literal `#` must
+not become accepted after URI normalization drops its fragment. Independent
+review produced `GET /ok#fragment`; the exact pre-repair driver accepted `/ok`
+under both schedules. The parser now returns its existing URI error before
+conversion, so no complete request, policy, service, or upstream work begins.
+The normal driver and server-parser regressions retain the 400 transport
+rejection. These are parser behavior facts, not release qualification.
 
 Validation commands (Rust 1.95.0, from repository root):
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_reparses_fragmented_malformed_partial_head_at_eof -- --exact
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_eof_during_partial_head -- --exact
+  cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::request_target_fragment_regression_rejects_before_uri_normalization -- --exact
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib content_length_regression
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::test_decoder_request -- --exact
+  cargo +1.95.0 test -p eidolon-proxy --features fuzzing --locked --target-dir target --lib fuzzing::tests
   cargo +1.95.0 test -p eidolon-proxy --locked --target-dir target --lib production_runtime::
   cargo audit --file Cargo.lock --deny warnings
   cargo audit --file vendor/hyper/Cargo.lock --deny warnings
@@ -99,11 +119,12 @@ All three production/demo Dockerfiles use the repository-root context and
 COPY . .; .dockerignore includes this dependency and excludes its target/.
 
 Retirement: replace this local patch and exact pin only when a released Hyper
-version contains the positive-budget and partial-head EOF fixes, preserves
-exact-zero client reads, and exposes duplicate request Content-Length fields
-to the strict policy. Verify both buffer regressions, the partial-head EOF
-regression, the Content-Length regressions, and the complete/fragmented
-production raw-wire cap and ingress/forwarding matrices on that release,
+version contains the positive-budget, partial-head terminal, and raw-fragment
+fixes, preserves exact-zero client reads, and exposes duplicate request
+Content-Length fields to the strict policy. Verify both buffer regressions, the
+partial-head terminal and raw-fragment regressions, the Content-Length
+regressions, and the complete/fragmented production raw-wire cap and
+ingress/forwarding matrices on that release,
 preserve the shutdown/reaping controls,
 and rerun workspace build/lint/tests and all Docker build surfaces. Then
 remove this vendor package, its CI test/audit entries, and context exception

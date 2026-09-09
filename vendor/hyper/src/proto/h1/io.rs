@@ -179,7 +179,13 @@ where
     where
         S: Http1Transaction,
     {
-        let mut reparsed_partial_at_eof = false;
+        #[derive(Clone, Copy)]
+        enum DeferredTerminal {
+            Eof,
+            TooLarge,
+        }
+
+        let mut deferred_terminal = None;
         loop {
             if let Some(msg) = super::role::parse_headers::<S>(
                 &mut self.read_buf,
@@ -201,9 +207,28 @@ where
                 self.partial_len = None;
                 return Poll::Ready(Ok(msg));
             } else {
+                if let Some(terminal) = deferred_terminal {
+                    return Poll::Ready(Err(match terminal {
+                        DeferredTerminal::Eof => {
+                            trace!("parse eof after full partial-head reparse");
+                            crate::Error::new_incomplete()
+                        }
+                        DeferredTerminal::TooLarge => {
+                            debug!("max_buf_size reached after full partial-head reparse");
+                            crate::Error::new_too_large()
+                        }
+                    }));
+                }
                 let max = self.read_buf_strategy.max();
                 let curr_len = self.read_buf.len();
                 if curr_len >= max {
+                    // The terminator fast path may have skipped parsing every
+                    // byte after the first partial read. Parse once without
+                    // that shortcut before choosing the terminal size error.
+                    if self.partial_len.take().is_some() {
+                        deferred_terminal = Some(DeferredTerminal::TooLarge);
+                        continue;
+                    }
                     debug!("max_buf_size ({}) reached, closing", max);
                     return Poll::Ready(Err(crate::Error::new_too_large()));
                 }
@@ -217,12 +242,11 @@ where
             }
             if ready!(self.poll_read_from_io(cx)).map_err(crate::Error::new_io)? == 0 {
                 // The partial-read fast path deliberately skips full parsing
-                // until it sees a head terminator. Before classifying EOF as
-                // incomplete, parse the buffered bytes once without that
-                // shortcut so malformed input has the same result regardless
-                // of read segmentation.
-                if !reparsed_partial_at_eof && self.partial_len.take().is_some() {
-                    reparsed_partial_at_eof = true;
+                // until it sees a head terminator. Reparse exactly once before
+                // classifying EOF, then return incomplete immediately if the
+                // full parse remains partial instead of reading past EOF.
+                if self.partial_len.take().is_some() {
+                    deferred_terminal = Some(DeferredTerminal::Eof);
                     continue;
                 }
                 trace!("parse eof");

@@ -220,6 +220,12 @@ impl Http1Transaction for Server {
         let slice = buf.split_to(len).freeze();
         let uri = {
             let uri_bytes = slice.slice_ref(&slice[path_range]);
+            // Fragments are not part of an HTTP request-target. `http::Uri`
+            // otherwise accepts this shape while omitting the fragment from
+            // its rendered value, which would hide raw ambiguity from policy.
+            if uri_bytes.contains(&b'#') {
+                return Err(Parse::Uri);
+            }
             // TODO(lucab): switch to `Uri::from_shared()` once public.
             http::Uri::from_maybe_shared(uri_bytes)?
         };
@@ -1753,6 +1759,26 @@ mod tests {
             on_informational: &mut None,
         };
         Server::parse(&mut raw, ctx).unwrap_err();
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn request_target_fragment_regression_rejects_before_uri_normalization() {
+        let mut raw = BytesMut::from("GET /ok#fragment HTTP/1.1\r\nHost: hyper.rs\r\n\r\n");
+        let ctx = ParseContext {
+            cached_headers: &mut None,
+            req_method: &mut None,
+            h1_parser_config: Default::default(),
+            h1_max_headers: None,
+            preserve_header_case: false,
+            #[cfg(feature = "ffi")]
+            preserve_header_order: false,
+            h09_responses: false,
+            #[cfg(feature = "client")]
+            on_informational: &mut None,
+        };
+        let error = Server::parse(&mut raw, ctx).expect_err("raw fragment must be rejected");
+        assert!(matches!(error, Parse::Uri));
     }
 
     const H09_RESPONSE: &str = "Baguettes are super delicious, don't you agree?";

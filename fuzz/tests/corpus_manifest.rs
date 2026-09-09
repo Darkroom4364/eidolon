@@ -2,7 +2,6 @@ use std::{
     collections::BTreeSet,
     fs, io,
     path::{Component, Path},
-    process::Command,
 };
 
 use eidolon_proxy::production_runtime::fuzzing::{
@@ -315,37 +314,30 @@ fn checked_corpus_files() -> Result<BTreeSet<String>, VerificationError> {
     Ok(files)
 }
 
-fn registry_packages(manifest: &Path) -> BTreeSet<(String, String)> {
-    let output = Command::new(env!("CARGO"))
-        .args(["metadata", "--locked", "--offline", "--format-version=1"])
-        .arg("--manifest-path")
-        .arg(manifest)
-        .output()
-        .expect("cargo metadata should start");
-    assert!(
-        output.status.success(),
-        "cargo metadata failed for {}: {}",
-        manifest.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("cargo metadata should be JSON");
-    metadata["packages"]
-        .as_array()
-        .expect("cargo metadata packages should be an array")
-        .iter()
-        .filter(|package| package["source"].is_string())
-        .map(|package| {
-            (
-                package["name"]
-                    .as_str()
-                    .expect("package name should be a string")
-                    .to_string(),
-                package["version"]
-                    .as_str()
-                    .expect("package version should be a string")
-                    .to_string(),
-            )
+fn lock_value(block: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key} = \"");
+    block.lines().find_map(|line| {
+        line.strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix('"'))
+            .map(str::to_string)
+    })
+}
+
+fn registry_packages(lockfile: &Path) -> BTreeSet<(String, String, String)> {
+    let lockfile = fs::read_to_string(lockfile).expect("candidate lockfile should be readable");
+    lockfile
+        .split("[[package]]")
+        .skip(1)
+        .filter_map(|block| {
+            let source = lock_value(block, "source")?;
+            if !source.starts_with("registry+") {
+                return None;
+            }
+            Some((
+                lock_value(block, "name").expect("registry package should have a name"),
+                lock_value(block, "version").expect("registry package should have a version"),
+                source,
+            ))
         })
         .collect()
 }
@@ -362,18 +354,27 @@ fn corpus_manifest_digests_and_dual_schedule_outcomes_match() {
 #[test]
 fn fuzz_lock_matches_candidate_registry_versions_plus_exact_fuzz_runtime() {
     let fuzz_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let candidate_manifest = fuzz_root
+    let candidate_lock = fuzz_root
         .parent()
         .expect("fuzz workspace should have a repository parent")
-        .join("Cargo.toml");
-    let mut expected = registry_packages(&candidate_manifest);
+        .join("Cargo.lock");
+    let registry = "registry+https://github.com/rust-lang/crates.io-index".to_string();
+    let mut expected = registry_packages(&candidate_lock);
     expected.extend([
-        ("arbitrary".to_string(), "1.4.2".to_string()),
-        ("jobserver".to_string(), "0.1.35".to_string()),
-        ("libfuzzer-sys".to_string(), "0.4.13".to_string()),
+        (
+            "arbitrary".to_string(),
+            "1.4.2".to_string(),
+            registry.clone(),
+        ),
+        (
+            "jobserver".to_string(),
+            "0.1.35".to_string(),
+            registry.clone(),
+        ),
+        ("libfuzzer-sys".to_string(), "0.4.13".to_string(), registry),
     ]);
     assert_eq!(
-        registry_packages(&fuzz_root.join("Cargo.toml")),
+        registry_packages(&fuzz_root.join("Cargo.lock")),
         expected,
         "fuzz/Cargo.lock must preserve every candidate registry version and add only the exact fuzz runtime"
     );

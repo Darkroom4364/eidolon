@@ -1350,6 +1350,7 @@ mod tests {
         struct FragmentedEof {
             chunks: std::collections::VecDeque<Vec<u8>>,
             pending_before_read: bool,
+            eof_polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         }
 
         impl tokio::io::AsyncRead for FragmentedEof {
@@ -1364,6 +1365,8 @@ mod tests {
                     return std::task::Poll::Pending;
                 }
                 let Some(chunk) = self.chunks.pop_front() else {
+                    self.eof_polls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     return std::task::Poll::Ready(Ok(()));
                 };
                 buffer.put_slice(&chunk);
@@ -1396,9 +1399,11 @@ mod tests {
             }
         }
 
+        let eof_polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let io = FragmentedEof {
             chunks: std::collections::VecDeque::from([b".".to_vec(), b"\n".to_vec()]),
             pending_before_read: true,
+            eof_polls: std::sync::Arc::clone(&eof_polls),
         };
         let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
         conn.state.idle::<ServerTransaction>();
@@ -1414,6 +1419,11 @@ mod tests {
                 .headers_buf()
                 .starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
             "fragmented malformed EOF must be classified like whole delivery"
+        );
+        assert_eq!(
+            eof_polls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the full EOF reparse must not poll the transport again"
         );
     }
 

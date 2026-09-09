@@ -10,8 +10,8 @@ fuzz_target!(|input: &[u8]| {
 
     let (whole, fragmented) = evaluate_both(input)
         .unwrap_or_else(|error| panic!("bounded production HTTP driver failed: {error:?}"));
-    assert_eq!(
-        whole, fragmented,
+    assert!(
+        whole == fragmented,
         "whole and fragmented production HTTP observations differ"
     );
 });
