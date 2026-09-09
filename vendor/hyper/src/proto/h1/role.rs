@@ -301,11 +301,12 @@ impl Http1Transaction for Server {
                             );
                             return Err(Parse::content_length_invalid());
                         }
-                        // we don't need to append this secondary length
-                        continue;
+                        // Preserve equal fields for application multiplicity policy.
+                        // Conflicting lengths still fail before decoder selection.
+                    } else {
+                        decoder = DecodedLength::checked_new(len)?;
+                        con_len = Some(len);
                     }
-                    decoder = DecodedLength::checked_new(len)?;
-                    con_len = Some(len);
                 }
                 header::CONNECTION => {
                     // keep_alive was previously set to default for Version
@@ -1939,6 +1940,113 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![&Bytes::from("X-BREAD")]
         );
+    }
+
+    #[cfg(feature = "server")]
+    fn parse_content_length_regression(
+        fields: &str,
+    ) -> Result<ParsedMessage<RequestLine>, crate::error::Parse> {
+        let input = format!("POST / HTTP/1.1\r\nHost: owned.test\r\n{fields}\r\nbody");
+        let mut bytes = BytesMut::from(input.as_str());
+        let parsed = Server::parse(
+            &mut bytes,
+            ParseContext {
+                cached_headers: &mut None,
+                req_method: &mut None,
+                h1_parser_config: Default::default(),
+                h1_max_headers: None,
+                preserve_header_case: false,
+                #[cfg(feature = "ffi")]
+                preserve_header_order: false,
+                h09_responses: false,
+                #[cfg(feature = "client")]
+                on_informational: &mut None,
+            },
+        )?;
+        assert_eq!(
+            &bytes[..],
+            b"body",
+            "head parsing must not consume body bytes"
+        );
+        Ok(parsed.expect("complete request head"))
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn content_length_regression_preserves_duplicate_fields() {
+        for (fields, values, length) in [
+            ("Content-Length: 4\r\n", vec!["4"], 4),
+            (
+                "Content-Length: 0\r\ncontent-length: 0\r\n",
+                vec!["0", "0"],
+                0,
+            ),
+            (
+                "Content-Length: 4\r\ncOnTeNt-LeNgTh: 4\r\n",
+                vec!["4", "4"],
+                4,
+            ),
+            (
+                "Content-Length: 04\r\ncontent-length: 4\r\nContent-Length: 004\r\n",
+                vec!["04", "4", "004"],
+                4,
+            ),
+        ] {
+            let msg = parse_content_length_regression(fields).expect("equal lengths decode safely");
+            assert_eq!(msg.decode, DecodedLength::new(length));
+            assert_eq!(
+                msg.head
+                    .headers
+                    .get_all(header::CONTENT_LENGTH)
+                    .iter()
+                    .map(|value| value.to_str().unwrap())
+                    .collect::<Vec<_>>(),
+                values,
+                "application policy must see every Content-Length field: {fields:?}",
+            );
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn content_length_regression_rejects_invalid_or_conflicting_fields() {
+        for fields in [
+            "Content-Length: 4\r\nContent-Length: 5\r\n",
+            "Content-Length: 5\r\nContent-Length: 4\r\n",
+            "Content-Length: 4\r\nContent-Length: 4\r\nContent-Length: 5\r\n",
+            "Content-Length: 4, 4\r\n",
+            "Content-Length: 4, 5\r\n",
+            "Content-Length: invalid\r\n",
+            "Content-Length: \r\n",
+            "Content-Length: -1\r\n",
+            "Content-Length: +4\r\n",
+            "Content-Length: 18446744073709551616\r\n",
+            "Content-Length: 4\r\nContent-Length: invalid\r\n",
+        ] {
+            assert!(
+                parse_content_length_regression(fields).is_err(),
+                "{fields:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn content_length_regression_keeps_transfer_encoding_precedence() {
+        for fields in [
+            "Content-Length: 4\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n",
+            "Transfer-Encoding: chunked\r\nContent-Length: 4\r\nContent-Length: 4\r\n",
+            "Content-Length: 4\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n",
+        ] {
+            let msg = parse_content_length_regression(fields).expect("chunked framing wins");
+            assert_eq!(msg.decode, DecodedLength::CHUNKED);
+            assert!(!msg.head.headers.contains_key(header::CONTENT_LENGTH));
+            assert_eq!(msg.head.headers[header::TRANSFER_ENCODING], "chunked");
+            assert!(
+                !msg.keep_alive,
+                "CL + TE must still disable connection reuse"
+            );
+        }
     }
 
     #[cfg(feature = "server")]

@@ -1020,6 +1020,10 @@ fn sanitize_response_headers(headers: &mut HeaderMap) {
 mod boundary_tests;
 
 #[cfg(test)]
+#[path = "production_runtime_ingress_tests.rs"]
+mod ingress_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         sync::{
