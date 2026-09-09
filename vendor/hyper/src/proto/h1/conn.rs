@@ -336,7 +336,10 @@ where
         // the connection closing gracefully.
         let must_error = self.should_error_on_eof();
         self.close_read();
-        self.io.consume_leading_lines();
+        // The HTTP/2 prior-knowledge preface is a raw, position-zero byte
+        // sequence. Stripping leading CR/LF here could recognize a prefixed
+        // preface only when it arrived in the same read; fragmented delivery
+        // had already failed on the leading byte.
         let was_mid_parse = e.is_parse() || !self.io.read_buf().is_empty();
         if was_mid_parse || must_error {
             // We check if the buf contains the h2 Preface
@@ -1319,6 +1322,26 @@ mod tests {
             handle.read(b"/1.1\r\nHost: foo.bar\r\n\r\n");
             assert!(conn.poll_read_head(cx).is_ready());
         });
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn conn_rejects_prefixed_h2_preface_as_http1_parse_error() {
+        let io = tokio_test::io::Builder::new()
+            .read(b"\nPRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .build();
+        let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
+        conn.state.idle::<ServerTransaction>();
+        assert!(
+            poll_head(&mut conn).is_pending(),
+            "the malformed input should queue Hyper's HTTP/1 parse response"
+        );
+        assert!(
+            conn.io
+                .headers_buf()
+                .starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+            "a prefixed preface must remain a malformed HTTP/1 request"
+        );
     }
 
     #[cfg(feature = "server")]

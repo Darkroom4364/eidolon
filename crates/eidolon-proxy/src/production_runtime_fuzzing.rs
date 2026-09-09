@@ -611,6 +611,32 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_http2_preface_is_segmentation_invariant() {
+        let observed = assert_equivalent(b"\nPRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        assert_eq!(observed.request, RequestOutcome::NoCompleteRequest);
+        assert_eq!(
+            observed.connection,
+            ConnectionOutcome::PreServiceRejected(
+                ProductionPreServiceRejection::MalformedTransport
+            )
+        );
+        assert!(observed.response_bytes.starts_with(b"HTTP/1.1 400 "));
+    }
+
+    #[test]
+    fn connect_spelling_is_rejected_case_insensitively() {
+        for method in ["connect", "Connect"] {
+            let input = format!("{method} / HTTP/1.1\r\nHost: proxy.fuzz.test\r\n\r\n");
+            let observed = assert_equivalent(input.as_bytes());
+            assert_eq!(
+                observed.request,
+                RequestOutcome::PolicyRejected(ProductionRequestRejection::UnsupportedConnect)
+            );
+            assert_eq!(observed.connection, ConnectionOutcome::Clean);
+        }
+    }
+
+    #[test]
     fn non_yielding_completion_after_deadline_fails() {
         let result = super::block_on(complete_within_input_deadline(async {
             std::thread::sleep(INPUT_DEADLINE + Duration::from_millis(50));

@@ -2,9 +2,12 @@
 
 Status: **C4a and C4b are locally implemented. Initial independent review of
 implementation `0c9d84af3b38b5be7ad87c861bd5f39cbd0ceb4` blocked on three
-P1 and four P2 findings; all seven are corrected locally and correction-focused,
-full-workspace, vendor, and ASan gates pass. Exact corrective re-review,
-publication, Linux/image CI, and the final C4c campaign remain open**.
+P1 and four P2 findings; all seven are corrected. A corrective review of
+`2def55b4b7722ec907d3fffda8e6b1d9f5357353` was interrupted without a verdict
+after its offline probe exposed three further gaps; all three are reproduced,
+corrected locally, and correction-focused, full-workspace, vendor, and ASan
+gates pass. Exact fresh review, publication, Linux/image CI, and the final C4c
+campaign remain open**.
 
 Starting head: `264cea2bab8b275eb78709eb3e43a9f7fc855ab9`, the reviewed
 C3 documentation head. The dedicated
@@ -34,7 +37,7 @@ The slices are deliberately ordered:
 | Slice | Contract | Current status |
 | --- | --- | --- |
 | C4a | Add a socket-free, feature-gated driver around the exact vendored Hyper HTTP/1 builder, production body collector and transport classifier, public strict policy adapter, and shared canonicalizer. Compare whole and deterministic fragmented delivery exactly. | Locally implemented and focused tests pass. |
-| C4b | Add the pinned `cargo-fuzz` package, strict named corpus/manifest, dictionary, ASan replay, finite mutation smoke, lock parity check, and private-only failure artifacts in CI. | Locally implemented; corpus replay and fresh 30-second mutation smoke pass after the fail-first and review repairs below. Corrective review remains. |
+| C4b | Add the pinned `cargo-fuzz` package, strict named corpus/manifest, dictionary, ASan replay, finite mutation smoke, lock parity check, and private-only failure artifacts in CI. | Locally implemented; corpus replay and a fresh 30-second mutation smoke pass after the fail-first and review repairs below. Fresh review remains. |
 | C4c | Run and preserve the separately authorized final candidate campaign for at least 3,600 seconds with exact commit, toolchain, sanitizer, corpus, command, statistics, and failure disposition. | Not run. A short smoke cannot satisfy this slice. |
 
 ## Exact layer inventory and non-claims
@@ -115,12 +118,13 @@ Pinned fuzz identity:
 - exact candidate path dependencies and the same vendored Hyper patch;
 - ASan build/replay and deterministic seed `292` finite mutation smoke in CI.
 
-CI captures mutation stdout/stderr because libFuzzer prints crashing inputs as
-hex, ASCII, and Base64. A successful run emits only selected aggregate lines. A
-failure emits one fixed redacted notice and preserves the detailed log plus raw
-artifact only while the repository is private; that upload is retained for
-seven days and ignored when absent. Public jobs never print or upload the raw
-failure. The fuzz target's own differential panic also omits both observations.
+CI captures stdout/stderr from both ASan execution steps because libFuzzer
+prints crashing inputs as hex, ASCII, and Base64. A successful run emits only
+selected aggregate lines. A failure emits one fixed redacted notice and
+preserves the detailed log plus raw artifact only while the repository is
+private; that upload is retained for seven days and ignored when absent. Public
+jobs never print or upload the raw failure. The fuzz target's own differential
+panic also omits both observations.
 
 ## Fail-first findings and dispositions
 
@@ -178,6 +182,29 @@ report as behavior evidence.
 All dispositions are local until an exact corrective commit passes fresh
 independent review. None weakens the equality or accepted-request invariant.
 
+### Interrupted corrective-review probe findings
+
+A fresh read-only review started against exact correction
+`2def55b4b7722ec907d3fffda8e6b1d9f5357353` (tree
+`b76bfd1fdb1f6eae561796b5ff7185177b3a3f1c`). Its generated raw-HTTP probe
+triggered a platform content classifier before the reviewer could return a
+report or verdict, so this attempt is **not** release approval. Preserved
+transcript: `/tmp/codex-tasks/eidolon-c4-correction-review.log.jsonl`.
+
+Before interruption, the probe exercised 1,631 bounded inputs and reported
+seven failures in three families. Root reproduced both behavioral families with
+fail-first unit tests, then reran the same matrix after minimum correction with
+`RESULT total=1631 failures=0`.
+
+| Gap | Fail-first result | Minimum disposition |
+| --- | --- | --- |
+| Prefixed HTTP/2 preface classification depended on delivery | A 25-byte LF-prefixed preface (SHA-256 `587e728d1f1009ddd36f7d117a78f0a4b20e51793b44eef16312bd8da50982f8`) was silent `Http2Preface` whole versus 400/`MalformedTransport` fragmented; four other CR/LF prefixes had the same mismatch. | Vendored Hyper now recognizes the prior-knowledge preface only as the exact raw position-zero sequence. Prefixed forms remain malformed HTTP/1 under either schedule; exact preface behavior remains retained. |
+| ASCII-case CONNECT spellings crossed policy | The 45-byte lowercase and mixed-case requests (SHA-256 `3e0742b376507f5855992481142345d1f625799b60cce9c01c0e66f14a0e73f2` and `d6ce672b9cc9ac009f90ac84451735b7bd4a2a9e21c2452b0f4b2d5f7e8d9cef`) reached the driver's non-CONNECT accepted invariant. | Production policy rejects every ASCII-case spelling before target handling. Direct policy and whole/fragmented raw-wire regressions retain the result. |
+| ASan corpus replay retained a public crash-log channel | The initial disclosure repair captured mutation output but left the preceding libFuzzer replay attached directly to CI logs. | Both ASan execution steps now capture stdout/stderr, emit only selected aggregate success lines or fixed redacted failures, and preserve raw output/artifacts only for a private repository. |
+
+These dispositions also require a new exact commit and an independent review
+that completes without relying on the interrupted attempt.
+
 ## Local behavior evidence to date
 
 Focused driver, manifest, vendor repair, ASan build, checked-in corpus replay,
@@ -194,6 +221,12 @@ reported corpus `1375/131Kb`, input-limit progress to 321 bytes, and peak RSS
 458 MiB. Its temporary corpus contained 1,375 files / 135,232 bytes, minimum 1
 and maximum 311 bytes. It is likewise local smoke evidence only.
 
+After the interrupted-review corrections, another fresh seed-292 ASan smoke
+completed **157,243 runs in 32 seconds** with no failure, final `cov: 3938` /
+`ft: 7754`, reported corpus `993/84Kb`, input-limit progress to 173 bytes, and
+peak RSS 452 MiB. Its temporary corpus contained 993 files / 86,313 bytes,
+minimum 1 and maximum 171 bytes. This is local smoke evidence, not C4c.
+
 ## Exact validation contract
 
 Run from the repository root unless a manifest path says otherwise:
@@ -208,6 +241,7 @@ cargo +1.95.0 test -p eidolon-proxy --features fuzzing --lib fuzzing::tests --lo
 cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
 cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_reparses_fragmented_malformed_partial_head_at_eof -- --exact
 cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_eof_during_partial_head -- --exact
+cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_prefixed_h2_preface_as_http1_parse_error -- --exact
 cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::request_target_fragment_regression_rejects_before_uri_normalization -- --exact
 cargo +1.95.0 test --manifest-path fuzz/Cargo.toml --locked
 cargo +nightly-2026-04-22 fuzz build production_http1_request --sanitizer address
@@ -231,9 +265,9 @@ listed:
 | Workspace build, `--workspace --all-targets` | Passed. |
 | Workspace Clippy, `--workspace --all-targets --all-features -- -D warnings` | Passed, including the feature-gated driver. |
 | Workspace tests, `--workspace --all-targets` | **820 passed**, no failures or ignores. The first restricted run passed every socket-free path and reported 47 owned-loopback bind `EPERM` failures; the authorized owned-loopback rerun passed all 820. |
-| Focused driver tests | **9 passed**, including both fail-first parser counterexamples, valid EOF/size controls, no-post-deadline success, and driver bounds. |
+| Focused driver tests | **11 passed**, including both initial-review parser counterexamples, prefixed-preface and CONNECT-spelling findings, valid EOF/size controls, no-post-deadline success, and driver bounds. |
 | Fuzz manifest/lock tests | **5 passed**, including expected-outcome, seed-byte, and unmanifested-file fail-closed controls. |
-| Full vendored Hyper library suite | **122 passed / 6 upstream ignores**, including EOF/size terminal behavior, raw-fragment rejection, both read-buffer repairs, all three Content-Length regressions, and the upstream request-decoder control. |
+| Full vendored Hyper library suite | **123 passed / 6 upstream ignores**, including EOF/size terminal behavior, exact/prefixed HTTP/2 behavior, raw-fragment rejection, both read-buffer repairs, all three Content-Length regressions, and the upstream request-decoder control. |
 | Pinned-nightly ASan build and checked-in corpus replay | Passed; 12 files / 1,077 bytes loaded, no failure. |
 | Root, vendor, and fuzz lock audits | Passed against a refreshed **1,243-advisory** RustSec database; 110 / 73 / 112 dependencies scanned. |
 | M3 JSON, every tracked shell syntax check, all M3 and Shield Lab `test-*.sh`, and archived M3 SHA-256 inventories | Passed. These are stubbed/rendered fixture checks, not live cluster qualification. |
@@ -249,6 +283,9 @@ listed:
       retained as normal regressions.
 - [x] Initial independent review ran against exact `0c9d84a...`; all three P1
       and four P2 findings have local minimum corrections and regressions.
+- [x] Interrupted corrective review probed exact `2def55b...`; all three
+      additional gap families were reproduced, corrected, and retained. The
+      interrupted attempt is not counted as approval.
 - [x] Checked-in ASan replay and repaired 30-second deterministic mutation smoke
       pass locally.
 - [x] Formatting, full workspace, full vendor, audit, and retained fixture gates

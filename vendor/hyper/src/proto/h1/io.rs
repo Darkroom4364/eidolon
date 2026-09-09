@@ -158,19 +158,6 @@ where
         self.flush_pipeline || self.write_buf.can_buffer()
     }
 
-    pub(crate) fn consume_leading_lines(&mut self) {
-        if !self.read_buf.is_empty() {
-            let mut i = 0;
-            while i < self.read_buf.len() {
-                match self.read_buf[i] {
-                    b'\r' | b'\n' => i += 1,
-                    _ => break,
-                }
-            }
-            self.read_buf.advance(i);
-        }
-    }
-
     pub(super) fn parse<S>(
         &mut self,
         cx: &mut Context<'_>,

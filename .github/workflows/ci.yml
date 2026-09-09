@@ -71,6 +71,7 @@ jobs:
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_reparses_fragmented_malformed_partial_head_at_eof -- --exact
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_eof_during_partial_head -- --exact
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_prefixed_h2_preface_as_http1_parse_error -- --exact
           cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::request_target_fragment_regression_rejects_before_uri_normalization -- --exact
 
       - name: Test vendored Hyper HTTP/1 Content-Length preservation
@@ -123,12 +124,26 @@ jobs:
         run: cargo fuzz build production_http1_request --sanitizer address
 
       - name: Replay checked-in corpus under ASan
+        env:
+          REPOSITORY_IS_PRIVATE: ${{ github.event.repository.private }}
         run: |
-          cargo fuzz run production_http1_request fuzz/corpus/production_http1_request --sanitizer address -- \
-            -runs=12 \
-            -max_len=65537 \
-            -timeout=2 \
-            -dict=fuzz/dictionaries/production_http1_request.dict
+          replay_log="$(mktemp)"
+          if cargo fuzz run production_http1_request fuzz/corpus/production_http1_request --sanitizer address -- \
+              -runs=12 \
+              -max_len=65537 \
+              -timeout=2 \
+              -dict=fuzz/dictionaries/production_http1_request.dict >"$replay_log" 2>&1; then
+            grep -E '^(INFO: seed corpus:|#[0-9]+[[:space:]]+(INITED|DONE)[[:space:]]|Done [0-9]+ runs)' "$replay_log" | tail -n 4 || true
+            echo "production HTTP checked-in corpus replay passed"
+          else
+            fuzz_status="$?"
+            if [[ "$REPOSITORY_IS_PRIVATE" == "true" ]]; then
+              mkdir -p fuzz/artifacts/production_http1_request
+              cp "$replay_log" fuzz/artifacts/production_http1_request/ci-corpus-replay-output.log
+            fi
+            echo "::error::production HTTP checked-in corpus replay failed; raw output is withheld pending disclosure review"
+            exit "$fuzz_status"
+          fi
 
       - name: Run deterministic finite mutation smoke
         env:
