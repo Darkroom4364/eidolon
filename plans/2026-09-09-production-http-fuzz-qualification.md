@@ -5,9 +5,12 @@ implementation `0c9d84af3b38b5be7ad87c861bd5f39cbd0ceb4` blocked on three
 P1 and four P2 findings; all seven are corrected. A corrective review of
 `2def55b4b7722ec907d3fffda8e6b1d9f5357353` was interrupted without a verdict
 after its offline probe exposed three further gaps; all three are reproduced,
-corrected locally, and correction-focused, full-workspace, vendor, and ASan
-gates pass. Exact fresh review, publication, Linux/image CI, and the final C4c
-campaign remain open**.
+corrected. A completed review of
+`954c2a0457723ae1e1af28d3fe5a6dff67709c2b` then blocked on one P1 and two P2
+findings; all three have minimum local corrections and regressions, and
+correction-focused, full-workspace, vendor, Clippy, and ASan gates pass. Exact
+fresh rereview, publication, Linux/image CI, and the final C4c campaign remain
+open**.
 
 Starting head: `264cea2bab8b275eb78709eb3e43a9f7fc855ab9`, the reviewed
 C3 documentation head. The dedicated
@@ -102,9 +105,10 @@ drift, oversized bytes, differential results, or outcome drift.
 | `reject_http10` | 61 | Policy `unsupported_http_version`. |
 | `incomplete_head` | 63 | Incomplete connection; no request or response. |
 
-Manifest total: **12 seeds / 1,077 bytes**. A direct cache-independent parse of
-both checked-in lockfiles also proves that the fuzz lock contains every exact
-registry package version/source from the candidate root lock and adds only
+Manifest total: **12 seeds / 1,077 bytes**. A strict cache-independent parse of
+both checked-in Cargo.lock-v4 files also proves that the fuzz lock contains
+every exact registry package name/version/source/checksum identity from the
+candidate root lock and adds only
 `arbitrary 1.4.2`, `jobserver 0.1.35`, and
 `libfuzzer-sys 0.4.13`. Root attributes mark `*.raw` corpus inputs as binary so
 Git never normalizes their byte-exact CRLF framing.
@@ -205,6 +209,25 @@ fail-first unit tests, then reran the same matrix after minimum correction with
 These dispositions also require a new exact commit and an independent review
 that completes without relying on the interrupted attempt.
 
+### Completed final-review findings
+
+The next read-only review completed against exact implementation
+`954c2a0457723ae1e1af28d3fe5a6dff67709c2b` (tree
+`9192126684e3537f73bc5888a50b48d4602c0ada`) and returned **BLOCK** with one P1
+and two P2 findings. Report:
+`/tmp/codex-tasks/eidolon-c4-final-review.last.md`. It explicitly closed the
+other seven known items and independently reran 11 driver, 12 policy, 123
+vendor, and 5 manifest tests before blocking.
+
+| Finding | Evidence | Minimum disposition |
+| --- | --- | --- |
+| P1 fragment rejection could promote buffered bytes into a position-zero preface | The 91-byte fragment-rejected head followed by an exact preface (SHA-256 `8169ed3b78d418f044304d394e430ec61a385118175e3f972b04c1b56b3e6422`) reproduced `Http2Preface` whole versus 400/`MalformedTransport` fragmented. A second 104-byte conflicting-Content-Length head (SHA-256 `0616d849966de44ddda0a33f3716df278ae531e9ca26f8972196ba399695dee7`) proved the same promotion was possible after other post-head validation failures. | Literal-fragment rejection now occurs before `split_to`, preserving the original buffer position. More generally, prior-knowledge recognition now occurs before HTTP/1 parsing, waits on an exact partial preface, and never examines a post-parse advanced buffer. Combined whole/fragmented regressions require 400/`MalformedTransport` for both rejected-head interactions; a focused Hyper regression retains exact position-zero recognition across fragmented delivery. |
+| P2 hand-rolled lock extraction could silently omit an unrecognized field | Valid TOML indentation made the previous exact-prefix extractor treat a registry dependency as source-less and drop it from both compared sets. | A strict Cargo-generated lock-v4 state parser rejects unsupported syntax, duplicate/missing identity fields, unterminated dependency arrays, and duplicate registry identities. Parity compares checksums as well as name/version/source. Negative tests retain unsupported formatting, duplicate fields/identities, omitted packages, and identity drift. |
+| P2 valid-incomplete EOF path lacked no-reread proof | The malformed EOF counter exited through a parser error; the valid-incomplete control's mock tolerated repeated EOF polls. | The valid-incomplete regression now supplies bytes, one EOF, then `Pending` on any later read. It requires immediate `IncompleteMessage` and exactly one terminal transport poll. |
+
+All three corrections remain local until a new exact commit passes fresh
+independent review.
+
 ## Local behavior evidence to date
 
 Focused driver, manifest, vendor repair, ASan build, checked-in corpus replay,
@@ -227,6 +250,13 @@ completed **157,243 runs in 32 seconds** with no failure, final `cov: 3938` /
 peak RSS 452 MiB. Its temporary corpus contained 993 files / 86,313 bytes,
 minimum 1 and maximum 171 bytes. This is local smoke evidence, not C4c.
 
+After the completed-review corrections and generalized raw-boundary preface
+repair, a fresh seed-292 ASan smoke completed **587,928 runs in 31 seconds**
+with no failure, final `cov: 4253` / `ft: 9688`, reported corpus `1523/155Kb`,
+input-limit progress to 497 bytes, and peak RSS 461 MiB. Its temporary corpus
+contained 1,516 files / 158,507 bytes, minimum 1 and maximum 494 bytes. This is
+local smoke evidence, not C4c.
+
 ## Exact validation contract
 
 Run from the repository root unless a manifest path says otherwise:
@@ -242,8 +272,10 @@ cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,htt
 cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_reparses_fragmented_malformed_partial_head_at_eof -- --exact
 cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_eof_during_partial_head -- --exact
 cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_prefixed_h2_preface_as_http1_parse_error -- --exact
+cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_recognizes_fragmented_position_zero_h2_preface -- --exact
 cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::request_target_fragment_regression_rejects_before_uri_normalization -- --exact
 cargo +1.95.0 test --manifest-path fuzz/Cargo.toml --locked
+cargo +1.95.0 clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
 cargo +nightly-2026-04-22 fuzz build production_http1_request --sanitizer address
 cargo +nightly-2026-04-22 fuzz run production_http1_request fuzz/corpus/production_http1_request --sanitizer address -- -runs=12 -max_len=65537 -timeout=2 -dict=fuzz/dictionaries/production_http1_request.dict
 cargo audit --file Cargo.lock --deny warnings
@@ -265,9 +297,10 @@ listed:
 | Workspace build, `--workspace --all-targets` | Passed. |
 | Workspace Clippy, `--workspace --all-targets --all-features -- -D warnings` | Passed, including the feature-gated driver. |
 | Workspace tests, `--workspace --all-targets` | **820 passed**, no failures or ignores. The first restricted run passed every socket-free path and reported 47 owned-loopback bind `EPERM` failures; the authorized owned-loopback rerun passed all 820. |
-| Focused driver tests | **11 passed**, including both initial-review parser counterexamples, prefixed-preface and CONNECT-spelling findings, valid EOF/size controls, no-post-deadline success, and driver bounds. |
-| Fuzz manifest/lock tests | **5 passed**, including expected-outcome, seed-byte, and unmanifested-file fail-closed controls. |
-| Full vendored Hyper library suite | **123 passed / 6 upstream ignores**, including EOF/size terminal behavior, exact/prefixed HTTP/2 behavior, raw-fragment rejection, both read-buffer repairs, all three Content-Length regressions, and the upstream request-decoder control. |
+| Focused driver tests | **13 passed**, including both initial-review parser counterexamples, fragment/preface and framing/preface interactions, prefixed-preface and CONNECT-spelling findings, valid EOF/size controls, no-post-deadline success, and driver bounds. |
+| Fuzz manifest/lock tests | **10 passed**, including expected-outcome, seed-byte, unmanifested-file, unsupported lock formatting, duplicate field/identity, omitted package, and identity-drift fail-closed controls. |
+| Fuzz-package Clippy, `--all-targets -- -D warnings` | Passed on Rust 1.95.0; enforced in stable CI. |
+| Full vendored Hyper library suite | **124 passed / 6 upstream ignores**, including EOF/size terminal behavior, fragmented exact/prefixed HTTP/2 behavior, raw-fragment rejection, both read-buffer repairs, all three Content-Length regressions, and the upstream request-decoder control. |
 | Pinned-nightly ASan build and checked-in corpus replay | Passed; 12 files / 1,077 bytes loaded, no failure. |
 | Root, vendor, and fuzz lock audits | Passed against a refreshed **1,243-advisory** RustSec database; 110 / 73 / 112 dependencies scanned. |
 | M3 JSON, every tracked shell syntax check, all M3 and Shield Lab `test-*.sh`, and archived M3 SHA-256 inventories | Passed. These are stubbed/rendered fixture checks, not live cluster qualification. |
@@ -286,12 +319,15 @@ listed:
 - [x] Interrupted corrective review probed exact `2def55b...`; all three
       additional gap families were reproduced, corrected, and retained. The
       interrupted attempt is not counted as approval.
+- [x] Completed independent review of exact `954c2a0...` returned one P1 and
+      two P2 findings; all three have local minimum corrections and retained
+      fail-closed coverage.
 - [x] Checked-in ASan replay and repaired 30-second deterministic mutation smoke
       pass locally.
-- [x] Formatting, full workspace, full vendor, audit, and retained fixture gates
-      pass on the pre-review tree.
+- [x] Formatting, root/fuzz Clippy, full workspace, full vendor, audit, and
+      retained fixture gates pass on the current correction tree.
 - [ ] Fresh independent cross-runtime review passes against the exact corrective
-      commit and explicitly disposes all seven initial findings.
+      commit and explicitly disposes all thirteen known findings.
 - [ ] #292 issue state and roadmap comments match the reviewed local evidence.
 - [ ] Branch is published and exact-head Linux/image CI passes.
 - [ ] C4c final campaign runs for at least 3,600 seconds against the exact

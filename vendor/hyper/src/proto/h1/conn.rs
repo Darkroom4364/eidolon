@@ -26,8 +26,6 @@ use crate::proto::{BodyLength, MessageHead};
 #[cfg(feature = "server")]
 use crate::rt::Sleep;
 
-const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-
 /// This handles a connection, which will have been established over an
 /// `Read + Write` (like a socket), and will likely include multiple
 /// `Transaction`s over HTTP.
@@ -203,11 +201,6 @@ where
         T::should_error_on_parse_eof() && !self.state.is_idle()
     }
 
-    fn has_h2_prefix(&self) -> bool {
-        let read_buf = self.io.read_buf();
-        read_buf.len() >= 24 && read_buf[..24] == *H2_PREFACE
-    }
-
     pub(super) fn poll_read_head(
         &mut self,
         cx: &mut Context<'_>,
@@ -336,13 +329,8 @@ where
         // the connection closing gracefully.
         let must_error = self.should_error_on_eof();
         self.close_read();
-        // The HTTP/2 prior-knowledge preface is a raw, position-zero byte
-        // sequence. Stripping leading CR/LF here could recognize a prefixed
-        // preface only when it arrived in the same read; fragmented delivery
-        // had already failed on the leading byte.
         let was_mid_parse = e.is_parse() || !self.io.read_buf().is_empty();
         if was_mid_parse || must_error {
-            // We check if the buf contains the h2 Preface
             debug!(
                 "parse error ({}) with {} bytes",
                 e,
@@ -821,9 +809,6 @@ where
     // - Server: if Response hasn't been written yet, we can send a 4xx response
     fn on_parse_error(&mut self, err: crate::Error) -> crate::Result<()> {
         if let Writing::Init = self.state.writing {
-            if self.has_h2_prefix() {
-                return Err(crate::Error::new_version_h2());
-            }
             if let Some(msg) = T::on_error(&err) {
                 // Drop the cached headers so as to not trigger a debug
                 // assert in `write_head`...
@@ -1346,6 +1331,21 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[test]
+    fn conn_recognizes_fragmented_position_zero_h2_preface() {
+        let io = tokio_test::io::Builder::new()
+            .read(b"PRI * HTTP/2.0\r\n\r\n")
+            .read(b"SM\r\n\r\n")
+            .build();
+        let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
+        conn.state.idle::<ServerTransaction>();
+        let err = ready(poll_head(&mut conn))
+            .expect("HTTP/2 preface error")
+            .expect_err("an exact HTTP/2 preface must not parse as HTTP/1");
+        assert!(err.is_parse_version_h2(), "unexpected error: {err:?}");
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
     fn conn_accepts_eof_when_idle() {
         let io = tokio_test::io::Builder::new().build();
         let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
@@ -1356,15 +1356,73 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn conn_rejects_eof_during_partial_head() {
-        let io = tokio_test::io::Builder::new()
-            .read(b"GET / HTTP/1.1")
-            .build();
+        struct OneEofIncomplete {
+            bytes: Option<Vec<u8>>,
+            eof_or_later_polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl tokio::io::AsyncRead for OneEofIncomplete {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if let Some(bytes) = self.bytes.take() {
+                    buffer.put_slice(&bytes);
+                    return std::task::Poll::Ready(Ok(()));
+                }
+                let terminal_poll = self
+                    .eof_or_later_polls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if terminal_poll == 0 {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }
+        }
+
+        impl tokio::io::AsyncWrite for OneEofIncomplete {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Ok(bytes.len()))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let eof_or_later_polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let io = OneEofIncomplete {
+            bytes: Some(b"GET / HTTP/1.1".to_vec()),
+            eof_or_later_polls: std::sync::Arc::clone(&eof_or_later_polls),
+        };
         let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
         conn.state.idle::<ServerTransaction>();
         let err = ready(poll_head(&mut conn))
             .expect("error result")
             .expect_err("partial head must fail");
         assert!(err.is_incomplete_message(), "unexpected error: {err:?}");
+        assert_eq!(
+            eof_or_later_polls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "valid incomplete EOF must return immediately without another transport poll"
+        );
     }
 
     #[cfg(feature = "server")]

@@ -187,7 +187,15 @@ impl Http1Transaction for Server {
                     }
                     method =
                         Method::from_bytes(req.method.expect("httparse completed").as_bytes())?;
-                    path_range = Server::record_path_range(bytes, uri);
+                    let recorded_path_range = Server::record_path_range(bytes, uri);
+                    // Fragments are not part of an HTTP request-target.
+                    // Reject before advancing `buf`: error classification must
+                    // retain the original raw position and must not interpret
+                    // later pipelined bytes as a connection preface.
+                    if bytes[recorded_path_range.clone()].contains(&b'#') {
+                        return Err(Parse::Uri);
+                    }
+                    path_range = recorded_path_range;
                     version = if req.version.expect("httparse completed") == 1 {
                         keep_alive = true;
                         is_http_11 = true;
@@ -220,12 +228,6 @@ impl Http1Transaction for Server {
         let slice = buf.split_to(len).freeze();
         let uri = {
             let uri_bytes = slice.slice_ref(&slice[path_range]);
-            // Fragments are not part of an HTTP request-target. `http::Uri`
-            // otherwise accepts this shape while omitting the fragment from
-            // its rendered value, which would hide raw ambiguity from policy.
-            if uri_bytes.contains(&b'#') {
-                return Err(Parse::Uri);
-            }
             // TODO(lucab): switch to `Uri::from_shared()` once public.
             http::Uri::from_maybe_shared(uri_bytes)?
         };
@@ -1765,6 +1767,7 @@ mod tests {
     #[test]
     fn request_target_fragment_regression_rejects_before_uri_normalization() {
         let mut raw = BytesMut::from("GET /ok#fragment HTTP/1.1\r\nHost: hyper.rs\r\n\r\n");
+        let original = raw.clone();
         let ctx = ParseContext {
             cached_headers: &mut None,
             req_method: &mut None,
@@ -1779,6 +1782,10 @@ mod tests {
         };
         let error = Server::parse(&mut raw, ctx).expect_err("raw fragment must be rejected");
         assert!(matches!(error, Parse::Uri));
+        assert_eq!(
+            raw, original,
+            "fragment rejection must preserve the original buffer position"
+        );
     }
 
     const H09_RESPONSE: &str = "Baguettes are super delicious, don't you agree?";

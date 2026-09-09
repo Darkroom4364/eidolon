@@ -611,6 +611,36 @@ mod tests {
     }
 
     #[test]
+    fn fragment_rejection_preserves_original_position_for_preface_classification() {
+        let observed = assert_equivalent(
+            b"GET /qualification/raw#fragment HTTP/1.1\r\nHost: proxy.fuzz.test\r\n\r\nPRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        );
+        assert_eq!(observed.request, RequestOutcome::NoCompleteRequest);
+        assert_eq!(
+            observed.connection,
+            ConnectionOutcome::PreServiceRejected(
+                ProductionPreServiceRejection::MalformedTransport
+            )
+        );
+        assert!(observed.response_bytes.starts_with(b"HTTP/1.1 400 "));
+    }
+
+    #[test]
+    fn framing_rejection_cannot_promote_buffered_preface() {
+        let observed = assert_equivalent(
+            b"POST / HTTP/1.1\r\nHost: proxy.fuzz.test\r\nContent-Length: 0\r\nContent-Length: 1\r\n\r\nPRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+        );
+        assert_eq!(observed.request, RequestOutcome::NoCompleteRequest);
+        assert_eq!(
+            observed.connection,
+            ConnectionOutcome::PreServiceRejected(
+                ProductionPreServiceRejection::MalformedTransport
+            )
+        );
+        assert!(observed.response_bytes.starts_with(b"HTTP/1.1 400 "));
+    }
+
+    #[test]
     fn prefixed_http2_preface_is_segmentation_invariant() {
         let observed = assert_equivalent(b"\nPRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
         assert_eq!(observed.request, RequestOutcome::NoCompleteRequest);

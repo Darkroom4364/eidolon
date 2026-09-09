@@ -65,6 +65,9 @@ jobs:
       - name: Test production HTTP fuzz driver
         run: cargo test -p eidolon-proxy --features fuzzing --lib fuzzing::tests --locked
 
+      - name: Lint fuzz support
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+
       - name: Test vendored Hyper HTTP/1 request regressions
         # HTTP/2 is needed by upstream's shared unit-test harness only.
         run: |

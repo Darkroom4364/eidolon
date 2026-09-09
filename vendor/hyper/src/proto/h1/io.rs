@@ -29,6 +29,8 @@ pub(crate) const DEFAULT_MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
 /// forces a flush if the queue gets this big.
 const MAX_BUF_LIST_BUFFERS: usize = 16;
 
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
 pub(crate) struct Buffered<T, B> {
     flush_pipeline: bool,
     io: T,
@@ -174,22 +176,38 @@ where
 
         let mut deferred_terminal = None;
         loop {
-            if let Some(msg) = super::role::parse_headers::<S>(
-                &mut self.read_buf,
-                self.partial_len,
-                ParseContext {
-                    cached_headers: parse_ctx.cached_headers,
-                    req_method: parse_ctx.req_method,
-                    h1_parser_config: parse_ctx.h1_parser_config.clone(),
-                    h1_max_headers: parse_ctx.h1_max_headers,
-                    preserve_header_case: parse_ctx.preserve_header_case,
-                    #[cfg(feature = "ffi")]
-                    preserve_header_order: parse_ctx.preserve_header_order,
-                    h09_responses: parse_ctx.h09_responses,
-                    #[cfg(feature = "client")]
-                    on_informational: parse_ctx.on_informational,
-                },
-            )? {
+            // Recognize prior-knowledge HTTP/2 only from the raw bytes at the
+            // current head boundary. Waiting while those bytes are an exact
+            // prefix makes the result independent of transport segmentation;
+            // doing this before HTTP/1 parsing prevents a rejected head from
+            // advancing the buffer and promoting later pipelined bytes.
+            if S::is_server() && self.read_buf.starts_with(H2_PREFACE) {
+                return Poll::Ready(Err(crate::Error::new_version_h2()));
+            }
+            let partial_h2_preface = S::is_server()
+                && !self.read_buf.is_empty()
+                && H2_PREFACE.starts_with(self.read_buf.as_ref());
+            let parsed = if partial_h2_preface {
+                None
+            } else {
+                super::role::parse_headers::<S>(
+                    &mut self.read_buf,
+                    self.partial_len,
+                    ParseContext {
+                        cached_headers: parse_ctx.cached_headers,
+                        req_method: parse_ctx.req_method,
+                        h1_parser_config: parse_ctx.h1_parser_config.clone(),
+                        h1_max_headers: parse_ctx.h1_max_headers,
+                        preserve_header_case: parse_ctx.preserve_header_case,
+                        #[cfg(feature = "ffi")]
+                        preserve_header_order: parse_ctx.preserve_header_order,
+                        h09_responses: parse_ctx.h09_responses,
+                        #[cfg(feature = "client")]
+                        on_informational: parse_ctx.on_informational,
+                    },
+                )?
+            };
+            if let Some(msg) = parsed {
                 debug!("parsed {} headers", msg.head.headers.len());
                 self.partial_len = None;
                 return Poll::Ready(Ok(msg));

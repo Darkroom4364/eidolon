@@ -25,19 +25,28 @@ Upstream-to-vendor delta:
   classification. This makes earlier malformed bytes reject consistently
   across whole and fragmented reads, keeps a genuinely incomplete maximum-size
   head at `TooLarge`, and keeps a smaller well-formed incomplete head at
-  `IncompleteMessage`. The EOF reparse does not poll the transport again. The
-  focused connection regression uses deterministic in-memory I/O and counts
-  exact EOF polls.
+  `IncompleteMessage`. The EOF reparse does not poll the transport again.
+  Focused deterministic in-memory regressions count exactly one EOF poll for
+  both malformed and valid-incomplete paths; the valid control returns
+  `Pending` if any later read is attempted.
 - src/proto/h1/io.rs and src/proto/h1/conn.rs (#292): HTTP/2 prior-knowledge
-  recognition requires the exact raw position-zero preface. The old parse-error
-  path discarded leading CR/LF before checking the preface, so a prefixed input
-  could be classified as HTTP/2 when read whole but malformed HTTP/1 when the
-  leading byte arrived separately. The focused connection regression retains
-  the raw-position rule; exact position-zero preface behavior is unchanged.
+  recognition now occurs at the raw head boundary before HTTP/1 parsing and
+  requires the exact position-zero preface. The old parse-error path discarded
+  leading CR/LF before checking the preface, so a prefixed input could be
+  classified as HTTP/2 when read whole but malformed HTTP/1 when the leading
+  byte arrived separately. It could also inspect an advanced buffer after a
+  framing rejection and promote later pipelined bytes into position zero. The
+  parser now waits while raw bytes are an exact partial preface, recognizes
+  only the full exact prefix, and never reclassifies a post-parse buffer.
+  Focused connection and normal-driver regressions retain fragmented exact-
+  preface behavior, the raw-position rule, and framing-error isolation.
 - src/proto/h1/role.rs (#292): reject a raw request-target `#` before conversion
-  to `http::Uri`, which otherwise omits the fragment from the value presented
-  to strict policy. The server-only regression retains this parser rejection;
-  response/client parsing is unchanged.
+  to `http::Uri` or advancement of the raw input buffer, which otherwise omits
+  the fragment from the value presented to strict policy and could expose later
+  buffered bytes to position-zero error classification. The server-only
+  regression retains the parser rejection and unchanged buffer; the normal
+  driver retains the fragment-plus-preface interaction. Response/client parsing
+  is unchanged.
 - src/proto/h1/role.rs (#289): preserve each numerically identical request
   Content-Length field in the parsed HeaderMap so the existing strict
   MultipleContentLengths application policy can reject it. Decoder length
@@ -103,25 +112,33 @@ regression retain these outcomes.
 Raw-fragment invariant (#292): a request-target containing a literal `#` must
 not become accepted after URI normalization drops its fragment. Independent
 review produced `GET /ok#fragment`; the exact pre-repair driver accepted `/ok`
-under both schedules. The parser now returns its existing URI error before
-conversion, so no complete request, policy, service, or upstream work begins.
-The normal driver and server-parser regressions retain the 400 transport
-rejection. These are parser behavior facts, not release qualification.
+under both schedules. A later review found that returning after consuming that
+head could promote an immediately buffered HTTP/2 preface into raw position
+zero and restore schedule-dependent classification. The parser now returns its
+existing URI error before conversion or buffer advancement, so no complete
+request, policy, service, or upstream work begins and later bytes retain their
+original position. Normal driver and server-parser regressions retain the 400
+transport rejection, unchanged raw buffer, and combined interaction. These are
+parser behavior facts, not release qualification.
 
 Raw-position HTTP/2 preface invariant (#292): prior-knowledge recognition must
 not depend on whether leading invalid CR/LF bytes arrive with the remaining
 input. A fail-first LF-prefixed preface was silent `VersionH2` when delivered
-whole but a 400 parse error when fragmented. The parser error path no longer
-strips leading lines before its exact-prefix check, so every prefixed form is a
-malformed HTTP/1 request and only the exact position-zero preface receives the
-special classification. This narrows special handling and begins no service or
-upstream work.
+whole but a 400 parse error when fragmented. A later conflicting
+Content-Length head followed by a buffered exact preface exposed the converse:
+post-parse buffer advancement could promote the later bytes only under whole
+delivery. Recognition now runs before HTTP/1 parsing and waits for an exact
+partial preface, so every prefixed form remains malformed, rejected heads
+cannot promote later bytes, and only the exact raw boundary receives the
+special classification under any segmentation. This narrows special handling
+and begins no service or upstream work.
 
 Validation commands (Rust 1.95.0, from repository root):
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_reparses_fragmented_malformed_partial_head_at_eof -- --exact
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_eof_during_partial_head -- --exact
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_prefixed_h2_preface_as_http1_parse_error -- --exact
+  cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_recognizes_fragmented_position_zero_h2_preface -- --exact
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::request_target_fragment_regression_rejects_before_uri_normalization -- --exact
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib content_length_regression
   cargo +1.95.0 test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::test_decoder_request -- --exact
