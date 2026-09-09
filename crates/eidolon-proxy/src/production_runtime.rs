@@ -215,6 +215,7 @@ type BodyCollectionStarted = Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>
 struct ShutdownObservation {
     started: tokio::sync::oneshot::Sender<()>,
     connection_tasks_started: Arc<std::sync::atomic::AtomicUsize>,
+    closed_admission_service_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Serve the Hyper HTTP/1.1 production ingress until `shutdown` resolves.
@@ -327,6 +328,10 @@ where
                     receiver: drain_sender.subscribe(),
                     #[cfg(test)]
                     body_collection_started: body_collection_started.clone(),
+                    #[cfg(test)]
+                    closed_admission_service_calls: shutdown_observation.as_ref().map(
+                        |observation| Arc::clone(&observation.closed_admission_service_calls),
+                    ),
                 };
                 connections.spawn(async move {
                     let _permit = permit;
@@ -446,6 +451,8 @@ struct ConnectionDrain {
     receiver: watch::Receiver<bool>,
     #[cfg(test)]
     body_collection_started: Option<BodyCollectionStarted>,
+    #[cfg(test)]
+    closed_admission_service_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 async fn serve_connection(
@@ -462,8 +469,16 @@ async fn serve_connection(
     let rejected_admission_gate = Arc::clone(&admission_gate);
     #[cfg(test)]
     let body_collection_started = drain.body_collection_started.clone();
+    #[cfg(test)]
+    let closed_admission_service_calls = drain.closed_admission_service_calls.clone();
     let service = service_fn(move |request| {
         let admission = admission_gate.try_acquire();
+        #[cfg(test)]
+        if admission.is_none() {
+            if let Some(count) = &closed_admission_service_calls {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
         let processor = Arc::clone(&processor);
         let processor_permits = Arc::clone(&processor_permits);
         #[cfg(test)]
@@ -1823,6 +1838,7 @@ mod tests {
                     ConnectionDrain {
                         receiver: drain,
                         body_collection_started: None,
+                        closed_admission_service_calls: None,
                     },
                 )
                 .await;

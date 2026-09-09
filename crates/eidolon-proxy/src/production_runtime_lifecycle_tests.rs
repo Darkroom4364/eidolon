@@ -515,6 +515,7 @@ struct LifecycleHarness {
     connection_tasks: watch::Receiver<usize>,
     connection_task_peak: Arc<AtomicUsize>,
     connection_tasks_started: Arc<AtomicUsize>,
+    closed_admission_service_calls: Arc<AtomicUsize>,
     body_collection_started: Option<oneshot::Receiver<()>>,
     shutdown: Option<oneshot::Sender<()>>,
     shutdown_started: Option<oneshot::Receiver<()>>,
@@ -572,6 +573,7 @@ impl LifecycleHarness {
         let (connection_task_tx, connection_tasks) = watch::channel(0);
         let connection_task_peak = Arc::new(AtomicUsize::new(0));
         let connection_tasks_started = Arc::new(AtomicUsize::new(0));
+        let closed_admission_service_calls = Arc::new(AtomicUsize::new(0));
         let (body_collection_started, body_collection_receiver) = if observe_body_collection {
             let (started, receiver) = oneshot::channel();
             (Some(Arc::new(Mutex::new(Some(started)))), Some(receiver))
@@ -596,6 +598,7 @@ impl LifecycleHarness {
             Some(ShutdownObservation {
                 started: shutdown_observed,
                 connection_tasks_started: Arc::clone(&connection_tasks_started),
+                closed_admission_service_calls: Arc::clone(&closed_admission_service_calls),
             }),
         ));
         Self {
@@ -604,6 +607,7 @@ impl LifecycleHarness {
             connection_tasks,
             connection_task_peak,
             connection_tasks_started,
+            closed_admission_service_calls,
             body_collection_started: body_collection_receiver,
             shutdown: Some(shutdown),
             shutdown_started: Some(shutdown_started),
@@ -1413,6 +1417,28 @@ mod c3b {
             }
         }
 
+        pub(super) async fn next_frame_or_terminal(
+            &mut self,
+            stream: &mut TcpStream,
+        ) -> Option<ResponseFrame<'_>> {
+            assert!(
+                self.terminal.is_none(),
+                "optional frame check must start before EOF/reset"
+            );
+            if self.consumed == self.wire.len() {
+                self.read_more(stream).await;
+                if self.terminal.is_some() {
+                    assert_eq!(
+                        self.consumed,
+                        self.wire.len(),
+                        "terminal close cannot hide buffered response bytes"
+                    );
+                    return None;
+                }
+            }
+            Some(self.next_frame(stream).await)
+        }
+
         pub(super) async fn expect_terminal(&mut self, stream: &mut TcpStream) -> TerminalKind {
             assert_eq!(
                 self.consumed,
@@ -1795,6 +1821,13 @@ mod c3c {
             exact_response_then_terminal(&mut accepted, TARGET).await;
             harness.wait_for_tasks(0).await;
             assert_work(&harness, 1, 0, 2);
+            assert_eq!(
+                harness
+                    .closed_admission_service_calls
+                    .load(Ordering::SeqCst),
+                0,
+                "idle and late peers must not reach closed-admission service"
+            );
             let records = harness.finish_shutdown(Ok(())).await;
             assert_eq!(records, [expected_record], "only the accepted target upstream");
             eprintln!(
@@ -1825,6 +1858,13 @@ mod c3c {
             let started = harness.begin_shutdown().await;
             harness.wait_for_tasks(1).await;
             assert_work(&harness, 1, 1, 1);
+            assert_eq!(
+                harness
+                    .closed_admission_service_calls
+                    .load(Ordering::SeqCst),
+                0,
+                "queued request must not reach closed admission before release"
+            );
             assert_held_shutdown(&harness, started);
             capture.release();
 
@@ -1832,24 +1872,48 @@ mod c3c {
             let first = responses.next_frame(&mut client).await;
             assert_frame(&first, "HTTP/1.1 200 OK", FIRST.as_bytes());
             assert!(response_header_values(first.head, "connection").is_empty());
-            // Source-derived single oracle: block_in_place holds the current
-            // Hyper poll until release. It can consume the queued head before
-            // this connection polls drain; the already-closed admission gate
-            // supplies the fixed empty 503 without request/pre-service hooks.
-            // Root must verify this wire result on loopback, not accept both
-            // a close-after-200 and a 503 merely for portability.
-            let second = responses.next_frame(&mut client).await;
-            assert_frame(&second, "HTTP/1.1 503 Service Unavailable", b"");
-            assert_eq!(response_header_values(second.head, "content-length"), ["0"]);
-            assert_eq!(response_header_values(second.head, "connection"), ["close"]);
-            responses.expect_terminal(&mut client).await;
+            // Hyper may either dispatch the already-buffered second head to
+            // the closed gate in the same poll or yield first and observe
+            // drain. Correlate the complete wire with the observed phase;
+            // neither branch accepts partial/trailing bytes or hidden work.
+            let second_response = match responses.next_frame_or_terminal(&mut client).await {
+                None => false,
+                Some(second) => {
+                    assert_frame(&second, "HTTP/1.1 503 Service Unavailable", b"");
+                    assert_eq!(
+                        response_header_values(second.head, "content-length"),
+                        ["0"]
+                    );
+                    assert_eq!(
+                        response_header_values(second.head, "connection"),
+                        ["close"]
+                    );
+                    responses.expect_terminal(&mut client).await;
+                    true
+                }
+            };
             harness.wait_for_tasks(0).await;
             assert_work(&harness, 1, 0, 1);
+            let closed_admission_calls = harness
+                .closed_admission_service_calls
+                .load(Ordering::SeqCst);
+            assert!(
+                matches!(
+                    (closed_admission_calls, second_response),
+                    (0, false) | (1, true)
+                ),
+                "wire outcome must match the exact closed-admission service phase: calls={closed_admission_calls}, second_response={second_response}"
+            );
             let records = harness.finish_shutdown(Ok(())).await;
             assert_eq!(records, [expected_record], "queued second target must never forward");
             eprintln!(
-                "C3c pipeline: connection attempts=1, accepted tasks=1, request attempts=2 in one write, complete upstream requests={}, wire=200 then empty 503 then EOF/reset",
-                records.len()
+                "C3c pipeline: connection attempts=1, accepted tasks=1, request attempts=2 in one write, complete upstream requests={}, closed-admission service calls={closed_admission_calls}, wire={}",
+                records.len(),
+                if second_response {
+                    "200 then empty 503 then EOF/reset"
+                } else {
+                    "200 then EOF/reset"
+                }
             );
         })
         .await
@@ -1882,6 +1946,13 @@ mod c3c {
             exact_response_then_terminal(&mut client, POST_TARGET).await;
             harness.wait_for_tasks(0).await;
             assert_work(&harness, 1, 0, 1);
+            assert_eq!(
+                harness
+                    .closed_admission_service_calls
+                    .load(Ordering::SeqCst),
+                0,
+                "completed body request must not reach closed admission"
+            );
             let records = harness.finish_shutdown(Ok(())).await;
             assert_eq!(records, [expected_record], "one exact POST target and body");
             eprintln!(
@@ -1909,6 +1980,13 @@ mod c3c {
             assert!(response.bytes.is_empty(), "body-only expiry response: {response:?}");
             harness.wait_for_tasks(0).await;
             assert_work(&harness, 0, 0, 1);
+            assert_eq!(
+                harness
+                    .closed_admission_service_calls
+                    .load(Ordering::SeqCst),
+                0,
+                "withheld body must not create a closed-admission service call"
+            );
             let records = harness
                 .finish_shutdown(Err(ProductionRuntimeError::DrainDeadlineExceeded))
                 .await;
