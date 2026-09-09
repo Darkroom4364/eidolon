@@ -1,0 +1,2 @@
+# Raw HTTP fuzz seeds are byte-exact binary inputs; never normalize CRLF.
+/fuzz/corpus/**/*.raw binary

@@ -179,6 +179,7 @@ where
     where
         S: Http1Transaction,
     {
+        let mut reparsed_partial_at_eof = false;
         loop {
             if let Some(msg) = super::role::parse_headers::<S>(
                 &mut self.read_buf,
@@ -215,6 +216,15 @@ where
                 }
             }
             if ready!(self.poll_read_from_io(cx)).map_err(crate::Error::new_io)? == 0 {
+                // The partial-read fast path deliberately skips full parsing
+                // until it sees a head terminator. Before classifying EOF as
+                // incomplete, parse the buffered bytes once without that
+                // shortcut so malformed input has the same result regardless
+                // of read segmentation.
+                if !reparsed_partial_at_eof && self.partial_len.take().is_some() {
+                    reparsed_partial_at_eof = true;
+                    continue;
+                }
                 trace!("parse eof");
                 return Poll::Ready(Err(crate::Error::new_incomplete()));
             }

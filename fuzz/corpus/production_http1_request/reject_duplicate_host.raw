@@ -1,0 +1,4 @@
+GET /qualification/duplicate-host HTTP/1.1
+Host: proxy.fuzz.test
+hOsT: other.fuzz.test
+

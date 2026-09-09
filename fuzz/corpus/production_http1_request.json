@@ -1,0 +1,169 @@
+{
+  "schema": "eidolon.production-http1-corpus/v1",
+  "target": "production_http1_request",
+  "max_input_bytes": 65537,
+  "seeds": [
+    {
+      "name": "positive_origin_canonical",
+      "file": "corpus/production_http1_request/positive_origin_canonical.raw",
+      "sha256": "9004219f12aec781f9e9e7bf2afa4e5efdaa916232bd369107b95e1b592979ea",
+      "expected": {
+        "request_kind": "accepted",
+        "accepted": {
+          "method": "POST",
+          "canonical_target": "/qualification/reconcile/~?slash=%2F",
+          "version": "HTTP/1.1",
+          "headers": [
+            ["host", "proxy.fuzz.test"],
+            ["content-length", "6"],
+            ["x-corpus-seed", "positive-origin"]
+          ],
+          "body_hex": "736565640d0a"
+        },
+        "connection_kind": "clean",
+        "response_sha256": "aced1bf35165e5bf93d4550c99cb506cbe302ba017ea2961361383185e65ec12",
+        "response_length": 46
+      }
+    },
+    {
+      "name": "positive_options_asterisk",
+      "file": "corpus/production_http1_request/positive_options_asterisk.raw",
+      "sha256": "ef7164dd18f85f7ee0a0d0827a90a2de44bb4ee7263c2985bf055750c78e92db",
+      "expected": {
+        "request_kind": "accepted",
+        "accepted": {
+          "method": "OPTIONS",
+          "canonical_target": "*",
+          "version": "HTTP/1.1",
+          "headers": [
+            ["host", "proxy.fuzz.test"],
+            ["x-corpus-seed", "options-asterisk"]
+          ],
+          "body_hex": ""
+        },
+        "connection_kind": "clean",
+        "response_sha256": "aced1bf35165e5bf93d4550c99cb506cbe302ba017ea2961361383185e65ec12",
+        "response_length": 46
+      }
+    },
+    {
+      "name": "reject_absolute_target",
+      "file": "corpus/production_http1_request/reject_absolute_target.raw",
+      "sha256": "c690bc5b130fedfc5e95f53ed2f5d96e8e3abdb7537eb12d5f76a438c4abadbe",
+      "expected": {
+        "request_kind": "policy_rejected",
+        "policy_rejection": "invalid_target_form",
+        "connection_kind": "clean",
+        "response_sha256": "aced1bf35165e5bf93d4550c99cb506cbe302ba017ea2961361383185e65ec12",
+        "response_length": 46
+      }
+    },
+    {
+      "name": "reject_invalid_percent",
+      "file": "corpus/production_http1_request/reject_invalid_percent.raw",
+      "sha256": "b533bdd253aa4620b4960a6504f55e1c3af984c03e0f382a187baeda88d58fa7",
+      "expected": {
+        "request_kind": "policy_rejected",
+        "policy_rejection": "invalid_target_form",
+        "connection_kind": "clean",
+        "response_sha256": "aced1bf35165e5bf93d4550c99cb506cbe302ba017ea2961361383185e65ec12",
+        "response_length": 46
+      }
+    },
+    {
+      "name": "reject_missing_host",
+      "file": "corpus/production_http1_request/reject_missing_host.raw",
+      "sha256": "486f39f6d9a5011b6ec2ffb082f45ddfdcbabf324fa8994ae874a1efc4c26714",
+      "expected": {
+        "request_kind": "policy_rejected",
+        "policy_rejection": "missing_host",
+        "connection_kind": "clean",
+        "response_sha256": "aced1bf35165e5bf93d4550c99cb506cbe302ba017ea2961361383185e65ec12",
+        "response_length": 46
+      }
+    },
+    {
+      "name": "reject_duplicate_host",
+      "file": "corpus/production_http1_request/reject_duplicate_host.raw",
+      "sha256": "3afe99689b4be53f4b94e2cf630e5367b4952252c14450ca79668bfa97d821b1",
+      "expected": {
+        "request_kind": "policy_rejected",
+        "policy_rejection": "multiple_host_headers",
+        "connection_kind": "clean",
+        "response_sha256": "aced1bf35165e5bf93d4550c99cb506cbe302ba017ea2961361383185e65ec12",
+        "response_length": 46
+      }
+    },
+    {
+      "name": "reject_duplicate_content_length",
+      "file": "corpus/production_http1_request/reject_duplicate_content_length.raw",
+      "sha256": "8a4f23fa2c300fa7b8405c4139c94711d04052257d81c3895ad65ef92e4c1803",
+      "expected": {
+        "request_kind": "policy_rejected",
+        "policy_rejection": "multiple_content_lengths",
+        "connection_kind": "clean",
+        "response_sha256": "aced1bf35165e5bf93d4550c99cb506cbe302ba017ea2961361383185e65ec12",
+        "response_length": 46
+      }
+    },
+    {
+      "name": "reject_conflicting_content_length",
+      "file": "corpus/production_http1_request/reject_conflicting_content_length.raw",
+      "sha256": "ecdd1a2432d2c8f376e0eb5f0714b2518b2d9cd8b16d2689625d9d501e8db126",
+      "expected": {
+        "request_kind": "no_complete_request",
+        "connection_kind": "pre_service_rejected",
+        "transport_rejection": "malformed_transport",
+        "response_sha256": "103904dab41592474386c54ed61db086bc22b3e504174a0829e9860cb78d5bae",
+        "response_length": 66
+      }
+    },
+    {
+      "name": "reject_cl_te",
+      "file": "corpus/production_http1_request/reject_cl_te.raw",
+      "sha256": "c5e804713eb275ce757e7009112266ef919f3a6004969e57f33b0734582d27f4",
+      "expected": {
+        "request_kind": "policy_rejected",
+        "policy_rejection": "unsupported_transfer_encoding",
+        "connection_kind": "clean",
+        "response_sha256": "aced1bf35165e5bf93d4550c99cb506cbe302ba017ea2961361383185e65ec12",
+        "response_length": 46
+      }
+    },
+    {
+      "name": "reject_upgrade",
+      "file": "corpus/production_http1_request/reject_upgrade.raw",
+      "sha256": "60263b65a08020e3f29c1457e2f27bed83ffe57ef4d0f85f6bc4fbb82cc8ca12",
+      "expected": {
+        "request_kind": "policy_rejected",
+        "policy_rejection": "unsupported_upgrade",
+        "connection_kind": "clean",
+        "response_sha256": "aced1bf35165e5bf93d4550c99cb506cbe302ba017ea2961361383185e65ec12",
+        "response_length": 46
+      }
+    },
+    {
+      "name": "reject_http10",
+      "file": "corpus/production_http1_request/reject_http10.raw",
+      "sha256": "fccf6fe658848c7d1c3865a3a6d1434e8705119c83114cf407f4a887a24ba626",
+      "expected": {
+        "request_kind": "policy_rejected",
+        "policy_rejection": "unsupported_http_version",
+        "connection_kind": "clean",
+        "response_sha256": "367da59ee76519e70852d6421142c45988ad3dd686e0a01a0705f195cf9abc8a",
+        "response_length": 46
+      }
+    },
+    {
+      "name": "incomplete_head",
+      "file": "corpus/production_http1_request/incomplete_head.raw",
+      "sha256": "af3a0e114429c6a770d53ab9a270a96781b46dcbe2ba17167bbef8ca8178fe63",
+      "expected": {
+        "request_kind": "no_complete_request",
+        "connection_kind": "incomplete",
+        "response_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "response_length": 0
+      }
+    }
+  ]
+}

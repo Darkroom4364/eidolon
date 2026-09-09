@@ -1344,6 +1344,79 @@ mod tests {
         assert!(err.is_incomplete_message(), "unexpected error: {err:?}");
     }
 
+    #[cfg(feature = "server")]
+    #[test]
+    fn conn_reparses_fragmented_malformed_partial_head_at_eof() {
+        struct FragmentedEof {
+            chunks: std::collections::VecDeque<Vec<u8>>,
+            pending_before_read: bool,
+        }
+
+        impl tokio::io::AsyncRead for FragmentedEof {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.pending_before_read {
+                    self.pending_before_read = false;
+                    cx.waker().wake_by_ref();
+                    return std::task::Poll::Pending;
+                }
+                let Some(chunk) = self.chunks.pop_front() else {
+                    return std::task::Poll::Ready(Ok(()));
+                };
+                buffer.put_slice(&chunk);
+                self.pending_before_read = true;
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        impl tokio::io::AsyncWrite for FragmentedEof {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Ok(bytes.len()))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let io = FragmentedEof {
+            chunks: std::collections::VecDeque::from([b".".to_vec(), b"\n".to_vec()]),
+            pending_before_read: true,
+        };
+        let mut conn = Conn::<_, Bytes, ServerTransaction>::new(Compat::new(io));
+        conn.state.idle::<ServerTransaction>();
+        assert!(poll_head(&mut conn).is_pending());
+        assert!(poll_head(&mut conn).is_pending());
+        assert!(poll_head(&mut conn).is_pending());
+        assert!(
+            poll_head(&mut conn).is_pending(),
+            "a malformed request should queue Hyper's parse response"
+        );
+        assert!(
+            conn.io
+                .headers_buf()
+                .starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+            "fragmented malformed EOF must be classified like whole delivery"
+        );
+    }
+
     #[cfg(feature = "client")]
     #[test]
     fn client_rejects_eof_while_busy() {

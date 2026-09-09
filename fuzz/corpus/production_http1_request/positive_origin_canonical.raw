@@ -1,0 +1,6 @@
+POST /qualification/recon%63ile/%7e?slash=%2f HTTP/1.1
+Host: proxy.fuzz.test
+Content-Length: 6
+X-Corpus-Seed: positive-origin
+
+seed

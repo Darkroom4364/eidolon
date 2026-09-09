@@ -1078,6 +1078,10 @@ fn sanitize_response_headers(headers: &mut HeaderMap) {
     headers.remove("proxy-connection");
 }
 
+#[cfg(feature = "fuzzing")]
+#[path = "production_runtime_fuzzing.rs"]
+pub mod fuzzing;
+
 #[cfg(test)]
 #[path = "production_runtime_boundary_tests.rs"]
 mod boundary_tests;
