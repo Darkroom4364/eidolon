@@ -62,9 +62,21 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --locked
 
-      - name: Test vendored Hyper HTTP/1 buffer regressions
+      - name: Test production HTTP fuzz driver
+        run: cargo test -p eidolon-proxy --features fuzzing --lib fuzzing::tests --locked
+
+      - name: Lint fuzz support
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Test vendored Hyper HTTP/1 request regressions
         # HTTP/2 is needed by upstream's shared unit-test harness only.
-        run: cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
+        run: |
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib read_buffer_regression
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_reparses_fragmented_malformed_partial_head_at_eof -- --exact
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_eof_during_partial_head -- --exact
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_rejects_prefixed_h2_preface_as_http1_parse_error -- --exact
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::conn::tests::conn_recognizes_fragmented_position_zero_h2_preface -- --exact
+          cargo test --manifest-path vendor/hyper/Cargo.toml --features client,http1,http2,server --locked --target-dir target --lib proto::h1::role::tests::request_target_fragment_regression_rejects_before_uri_normalization -- --exact
 
       - name: Test vendored Hyper HTTP/1 Content-Length preservation
         # Retain upstream framing/decoding controls alongside the C1 regressions.
@@ -79,6 +91,100 @@ jobs:
         run: |
           cargo audit --file Cargo.lock --deny warnings
           cargo audit --file vendor/hyper/Cargo.lock --deny warnings
+          cargo audit --file fuzz/Cargo.lock --deny warnings
+
+  production-http-fuzz:
+    name: Production HTTP fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned nightly
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: nightly-2026-04-22
+          components: rustfmt
+
+      - name: Verify nightly identity
+        run: |
+          rustc -Vv
+          rustc -Vv | grep -Fx 'commit-hash: 9ec5d5f32e19d250c7fbeaa90978c79105b39dee'
+
+      - name: Install pinned cargo-fuzz
+        run: |
+          cargo install cargo-fuzz --version 0.13.2 --locked
+          test "$(cargo fuzz --version)" = 'cargo-fuzz 0.13.2'
+
+      - name: Check fuzz formatting
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+
+      - name: Verify corpus manifest and candidate lock parity
+        run: cargo test --manifest-path fuzz/Cargo.toml --locked
+
+      - name: Build ASan fuzz target
+        run: cargo fuzz build production_http1_request --sanitizer address
+
+      - name: Replay checked-in corpus under ASan
+        env:
+          REPOSITORY_IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          replay_log="$(mktemp)"
+          if cargo fuzz run production_http1_request fuzz/corpus/production_http1_request --sanitizer address -- \
+              -runs=12 \
+              -max_len=65537 \
+              -timeout=2 \
+              -dict=fuzz/dictionaries/production_http1_request.dict >"$replay_log" 2>&1; then
+            grep -E '^(INFO: seed corpus:|#[0-9]+[[:space:]]+(INITED|DONE)[[:space:]]|Done [0-9]+ runs)' "$replay_log" | tail -n 4 || true
+            echo "production HTTP checked-in corpus replay passed"
+          else
+            fuzz_status="$?"
+            if [[ "$REPOSITORY_IS_PRIVATE" == "true" ]]; then
+              mkdir -p fuzz/artifacts/production_http1_request
+              cp "$replay_log" fuzz/artifacts/production_http1_request/ci-corpus-replay-output.log
+            fi
+            echo "::error::production HTTP checked-in corpus replay failed; raw output is withheld pending disclosure review"
+            exit "$fuzz_status"
+          fi
+
+      - name: Run deterministic finite mutation smoke
+        env:
+          REPOSITORY_IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          smoke_corpus="$(mktemp -d)"
+          smoke_log="$(mktemp)"
+          cp fuzz/corpus/production_http1_request/*.raw "$smoke_corpus/"
+          if cargo fuzz run production_http1_request "$smoke_corpus" --sanitizer address -- \
+              -max_total_time=30 \
+              -max_len=65537 \
+              -timeout=2 \
+              -dict=fuzz/dictionaries/production_http1_request.dict \
+              -seed=292 >"$smoke_log" 2>&1; then
+            grep -E '^(INFO: seed corpus:|#[0-9]+[[:space:]]+(INITED|DONE)[[:space:]]|Done [0-9]+ runs)' "$smoke_log" | tail -n 4 || true
+            echo "production HTTP fuzz smoke passed"
+          else
+            fuzz_status="$?"
+            if [[ "$REPOSITORY_IS_PRIVATE" == "true" ]]; then
+              mkdir -p fuzz/artifacts/production_http1_request
+              cp "$smoke_log" fuzz/artifacts/production_http1_request/ci-fuzz-output.log
+            fi
+            echo "::error::production HTTP fuzz smoke failed; raw output is withheld pending disclosure review"
+            exit "$fuzz_status"
+          fi
+
+      - name: Verify fuzz lock stayed immutable
+        run: git diff --exit-code -- fuzz/Cargo.lock
+
+      - name: Upload private fuzz failure artifacts
+        if: failure() && github.event.repository.private
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: production-http1-request-fuzz-failures-${{ github.sha }}
+          path: fuzz/artifacts/production_http1_request/
+          if-no-files-found: ignore
+          retention-days: 7
 
   lab-fixtures:
     name: Lab fixtures

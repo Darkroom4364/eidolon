@@ -29,6 +29,8 @@ pub(crate) const DEFAULT_MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
 /// forces a flush if the queue gets this big.
 const MAX_BUF_LIST_BUFFERS: usize = 16;
 
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
 pub(crate) struct Buffered<T, B> {
     flush_pipeline: bool,
     io: T,
@@ -158,19 +160,6 @@ where
         self.flush_pipeline || self.write_buf.can_buffer()
     }
 
-    pub(crate) fn consume_leading_lines(&mut self) {
-        if !self.read_buf.is_empty() {
-            let mut i = 0;
-            while i < self.read_buf.len() {
-                match self.read_buf[i] {
-                    b'\r' | b'\n' => i += 1,
-                    _ => break,
-                }
-            }
-            self.read_buf.advance(i);
-        }
-    }
-
     pub(super) fn parse<S>(
         &mut self,
         cx: &mut Context<'_>,
@@ -179,30 +168,72 @@ where
     where
         S: Http1Transaction,
     {
+        #[derive(Clone, Copy)]
+        enum DeferredTerminal {
+            Eof,
+            TooLarge,
+        }
+
+        let mut deferred_terminal = None;
         loop {
-            if let Some(msg) = super::role::parse_headers::<S>(
-                &mut self.read_buf,
-                self.partial_len,
-                ParseContext {
-                    cached_headers: parse_ctx.cached_headers,
-                    req_method: parse_ctx.req_method,
-                    h1_parser_config: parse_ctx.h1_parser_config.clone(),
-                    h1_max_headers: parse_ctx.h1_max_headers,
-                    preserve_header_case: parse_ctx.preserve_header_case,
-                    #[cfg(feature = "ffi")]
-                    preserve_header_order: parse_ctx.preserve_header_order,
-                    h09_responses: parse_ctx.h09_responses,
-                    #[cfg(feature = "client")]
-                    on_informational: parse_ctx.on_informational,
-                },
-            )? {
+            // Recognize prior-knowledge HTTP/2 only from the raw bytes at the
+            // current head boundary. Waiting while those bytes are an exact
+            // prefix makes the result independent of transport segmentation;
+            // doing this before HTTP/1 parsing prevents a rejected head from
+            // advancing the buffer and promoting later pipelined bytes.
+            if S::is_server() && self.read_buf.starts_with(H2_PREFACE) {
+                return Poll::Ready(Err(crate::Error::new_version_h2()));
+            }
+            let partial_h2_preface = S::is_server()
+                && !self.read_buf.is_empty()
+                && H2_PREFACE.starts_with(self.read_buf.as_ref());
+            let parsed = if partial_h2_preface {
+                None
+            } else {
+                super::role::parse_headers::<S>(
+                    &mut self.read_buf,
+                    self.partial_len,
+                    ParseContext {
+                        cached_headers: parse_ctx.cached_headers,
+                        req_method: parse_ctx.req_method,
+                        h1_parser_config: parse_ctx.h1_parser_config.clone(),
+                        h1_max_headers: parse_ctx.h1_max_headers,
+                        preserve_header_case: parse_ctx.preserve_header_case,
+                        #[cfg(feature = "ffi")]
+                        preserve_header_order: parse_ctx.preserve_header_order,
+                        h09_responses: parse_ctx.h09_responses,
+                        #[cfg(feature = "client")]
+                        on_informational: parse_ctx.on_informational,
+                    },
+                )?
+            };
+            if let Some(msg) = parsed {
                 debug!("parsed {} headers", msg.head.headers.len());
                 self.partial_len = None;
                 return Poll::Ready(Ok(msg));
             } else {
+                if let Some(terminal) = deferred_terminal {
+                    return Poll::Ready(Err(match terminal {
+                        DeferredTerminal::Eof => {
+                            trace!("parse eof after full partial-head reparse");
+                            crate::Error::new_incomplete()
+                        }
+                        DeferredTerminal::TooLarge => {
+                            debug!("max_buf_size reached after full partial-head reparse");
+                            crate::Error::new_too_large()
+                        }
+                    }));
+                }
                 let max = self.read_buf_strategy.max();
                 let curr_len = self.read_buf.len();
                 if curr_len >= max {
+                    // The terminator fast path may have skipped parsing every
+                    // byte after the first partial read. Parse once without
+                    // that shortcut before choosing the terminal size error.
+                    if self.partial_len.take().is_some() {
+                        deferred_terminal = Some(DeferredTerminal::TooLarge);
+                        continue;
+                    }
                     debug!("max_buf_size ({}) reached, closing", max);
                     return Poll::Ready(Err(crate::Error::new_too_large()));
                 }
@@ -215,6 +246,14 @@ where
                 }
             }
             if ready!(self.poll_read_from_io(cx)).map_err(crate::Error::new_io)? == 0 {
+                // The partial-read fast path deliberately skips full parsing
+                // until it sees a head terminator. Reparse exactly once before
+                // classifying EOF, then return incomplete immediately if the
+                // full parse remains partial instead of reading past EOF.
+                if self.partial_len.take().is_some() {
+                    deferred_terminal = Some(DeferredTerminal::Eof);
+                    continue;
+                }
                 trace!("parse eof");
                 return Poll::Ready(Err(crate::Error::new_incomplete()));
             }

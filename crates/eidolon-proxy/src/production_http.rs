@@ -3,7 +3,7 @@ use std::{error::Error, fmt};
 use bytes::Bytes;
 use hyper::{
     header::{CONNECTION, CONTENT_LENGTH, EXPECT, HOST, TRAILER, TRANSFER_ENCODING, UPGRADE},
-    Method, Request, Version,
+    Request, Version,
 };
 
 use crate::http_request::{
@@ -212,7 +212,11 @@ impl ProductionHttpPolicy {
         if request.version() != Version::HTTP_11 {
             return Err(ProductionRequestRejection::UnsupportedHttpVersion);
         }
-        if request.method() == Method::CONNECT {
+        // Method tokens are case-sensitive, so `http::Method` treats lowercase
+        // spellings as extensions. Reject every ASCII spelling here: downstream
+        // HTTP implementations can disagree about CONNECT normalization, and
+        // production deliberately has no tunnel path.
+        if request.method().as_str().eq_ignore_ascii_case("CONNECT") {
             return Err(ProductionRequestRejection::UnsupportedConnect);
         }
         if request.body().trailers_observed {
@@ -450,6 +454,14 @@ mod tests {
     fn rejects_connect_upgrades_expectations_and_unsupported_framing() {
         let connect = request(Method::CONNECT, "proxy.local:443", Vec::new());
         assert_rejected_before_dispatch(connect, ProductionRequestRejection::UnsupportedConnect);
+        for spelling in [b"connect".as_slice(), b"Connect"] {
+            let method = Method::from_bytes(spelling).expect("extension method should parse");
+            let connect = request(method, "/", Vec::new());
+            assert_rejected_before_dispatch(
+                connect,
+                ProductionRequestRejection::UnsupportedConnect,
+            );
+        }
 
         for (name, value, expected) in [
             (

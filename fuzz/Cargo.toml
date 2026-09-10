@@ -1,0 +1,33 @@
+[package]
+name = "eidolon-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.95"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+eidolon-proxy = { path = "../crates/eidolon-proxy", features = ["fuzzing"] }
+libfuzzer-sys = "=0.4.13"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+
+[[bin]]
+name = "production_http1_request"
+path = "fuzz_targets/production_http1_request.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+
+# The fuzz workspace must exercise the same exact Hyper source as production.
+[patch.crates-io]
+hyper = { path = "../vendor/hyper" }

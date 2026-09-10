@@ -1,0 +1,3 @@
+GET /qualification/legacy HTTP/1.0
+Host: proxy.fuzz.test
+
