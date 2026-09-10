@@ -154,11 +154,12 @@ Session identity on this deployment:
 - if that sidecar is missing while prior state exists, unknown authenticated
   identities fail closed for a bounded migration quarantine; corrupt or
   continuity-key-mismatched sidecar state prevents startup
-- planned `Recreate` transport-auth rotation preserves continuity when
-  `continuity-key.txt` stays fixed; overlap-window automation,
-  continuity-key rotation, and live lifecycle proof remain tracked by issue
-  `#254`; old-key state is never trusted merely because its unverified
-  timestamps appear expired
+- the source runtime supports one bounded previous transport credential when
+  `continuity-key.txt` stays fixed, but these manifests do not yet wire that
+  second file; Kubernetes Secret rollout, a live `Recreate` lifecycle proof,
+  and continuity-key rotation remain tracked by issues `#253` and `#254`;
+  old-key state is never trusted merely because its unverified timestamps
+  appear expired
 - the explicit-cookie smoke scripts mint their session cookies from the live
   edge instead of generating raw UUIDs; cookie-jar smokes are unaffected
 
