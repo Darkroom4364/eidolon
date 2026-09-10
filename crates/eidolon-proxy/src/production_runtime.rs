@@ -897,6 +897,9 @@ async fn dispatch_production_upstream_to_address(
             Ok(Err(_)) => return Err(ProductionUpstreamError::ResponseFailed),
             Err(_) => return Err(ProductionUpstreamError::ResponseTimedOut),
         };
+        if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            return Err(ProductionUpstreamError::ResponseFailed);
+        }
         drop(sender);
         let (parts, body) = response.into_parts();
         let body = match timeout(
@@ -1013,6 +1016,7 @@ fn sanitize_response_headers(headers: &mut HeaderMap) {
         headers.remove(name);
     }
     headers.remove("keep-alive");
+    headers.remove("proxy-connection");
 }
 
 #[cfg(test)]
@@ -1022,6 +1026,10 @@ mod boundary_tests;
 #[cfg(test)]
 #[path = "production_runtime_ingress_tests.rs"]
 mod ingress_tests;
+
+#[cfg(test)]
+#[path = "production_runtime_upstream_tests.rs"]
+mod upstream_tests;
 
 #[cfg(test)]
 mod tests {
