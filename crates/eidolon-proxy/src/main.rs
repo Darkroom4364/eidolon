@@ -9656,6 +9656,7 @@ mod tests {
             serde_json::from_str(&output).expect("effective config should be JSON");
         assert_eq!(effective["profile"], "production");
         assert_eq!(effective["session"]["signing_key"], "configured");
+        assert_eq!(effective["session"]["cookie_policy"], "production");
         assert_eq!(effective["controlled_reality_renderer"], "remote");
         for sensitive in [
             path_str(&session_key, "session key path should be UTF-8"),
@@ -9676,13 +9677,54 @@ mod tests {
             );
         }
 
-        let mut missing_debug = args.clone();
-        let debug_flag_index = missing_debug
+        fn without_value_option<'a>(args: &[&'a str], flag: &str) -> Vec<&'a str> {
+            let mut missing = args.to_vec();
+            let flag_index = missing
+                .iter()
+                .position(|value| *value == flag)
+                .unwrap_or_else(|| panic!("complete production config should include {flag}"));
+            missing.drain(flag_index..=flag_index + 1);
+            missing
+        }
+
+        for (flag, expected) in [
+            (
+                "--session-signing-key-file",
+                "requires `--session-signing-key-file`",
+            ),
+            (
+                "--ingress-transport-auth-secret-file",
+                "requires `--ingress-transport-auth-secret-file`",
+            ),
+            (
+                "--ingress-continuity-key-file",
+                "requires `--ingress-continuity-key-file`",
+            ),
+            ("--event-log", "requires an explicit `--event-log`"),
+            ("--policy-state", "requires an explicit `--policy-state`"),
+            ("--debug-log", "requires an explicit `--debug-log`"),
+        ] {
+            assert_error_contains(&without_value_option(&args, flag), expected);
+        }
+
+        let mut missing_strict_continuity = args.clone();
+        let strict_continuity_index = missing_strict_continuity
             .iter()
-            .position(|value| *value == "--debug-log")
-            .expect("complete production config should include debug log");
-        missing_debug.drain(debug_flag_index..=debug_flag_index + 1);
-        assert_error_contains(&missing_debug, "requires an explicit `--debug-log`");
+            .position(|value| *value == "--require-authenticated-ingress-continuity")
+            .expect("complete production config should require authenticated continuity");
+        missing_strict_continuity.remove(strict_continuity_index);
+        assert_error_contains(
+            &missing_strict_continuity,
+            "requires `--require-authenticated-ingress-continuity`",
+        );
+
+        let without_renderer_address =
+            without_value_option(&args, "--controlled-reality-backend-addr");
+        let without_renderer = without_value_option(
+            &without_renderer_address,
+            "--controlled-reality-backend-auth-secret-file",
+        );
+        assert_error_contains(&without_renderer, "in-process rendering is not allowed");
 
         let action = CliAction::from_args(["--profile", "lab", "--print-effective-config"])
             .expect("effective config should parse");
