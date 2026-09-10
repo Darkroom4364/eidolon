@@ -9122,7 +9122,7 @@ mod tests {
             let continuity_key = write_ingress_continuity_key("continuity-key");
             let renderer_secret = write_controlled_reality_backend_secret();
             let event_log_path = unique_temp_path("production-profile-events.jsonl");
-            let policy_state_path = unique_temp_path("production-profile-policy.json");
+            let policy_state_path = unique_temp_path("production-profile-policy-state");
             let debug_log_path = unique_temp_path("production-profile-debug.jsonl");
             let intervention_control_path = unique_temp_path("production-profile-control.txt");
             let args = vec![
@@ -9221,13 +9221,17 @@ mod tests {
     }
 
     impl ProductionProfileServer {
-        fn stop(self) {
+        fn stop_for_restart(self) -> CompleteProductionProfileFixture {
             self.shutdown
                 .send(())
                 .expect("production profile server should accept shutdown");
             must_join(self.handle.join(), "production profile server should join")
                 .expect("production profile server should stop cleanly");
-            self.fixture.stop();
+            self.fixture
+        }
+
+        fn stop(self) {
+            self.stop_for_restart().stop();
         }
     }
 
@@ -9310,6 +9314,46 @@ mod tests {
         ];
         headers.extend_from_slice(extra_headers);
         request_with_cookie(method, path, &cookie, &headers)
+    }
+
+    fn authenticated_production_request_without_cookie(
+        method: &str,
+        path: &str,
+        continuity_id: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut request = format!("{method} {path} HTTP/1.1\r\nHost: proxy.local\r\n");
+        for (name, value) in [
+            (
+                session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                "transport-secret",
+            ),
+            (session::INGRESS_CONTINUITY_HEADER_NAME, continuity_id),
+        ]
+        .into_iter()
+        .chain(extra_headers.iter().copied())
+        {
+            request.push_str(name);
+            request.push_str(": ");
+            request.push_str(value);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        request.into_bytes()
+    }
+
+    fn response_session_id(response: &HttpResponse) -> SessionId {
+        let set_cookies = header_values(response, "set-cookie");
+        assert_eq!(
+            set_cookies.len(),
+            1,
+            "cookie-free authenticated continuity should mint exactly one session cookie"
+        );
+        let cookie = set_cookies[0]
+            .split(';')
+            .next()
+            .expect("set-cookie should contain a cookie pair");
+        session_id_from_cookie(cookie).expect("set-cookie should contain a valid session ID")
     }
 
     fn parse_downstream_response(response: &[u8]) -> HttpResponse {
@@ -12696,6 +12740,382 @@ mod tests {
         assert_eq!(
             upstream_request_lines(&upstream_requests),
             vec!["GET /normal HTTP/1.1"]
+        );
+    }
+
+    #[test]
+    fn production_profile_shared_ingress_clients_survive_two_restarts_without_state_merge() {
+        const CLIENT_A_CONTINUITY: &str = "client_A_0123456789abcdef";
+        const CLIENT_B_CONTINUITY: &str = "client_B_0123456789abcdef";
+        const MIN_PROOF_VALIDITY_SECS: u64 = 5 * 60;
+
+        let proof_issued_at = current_unix_secs();
+        let proof_window_seconds = (MIN_PROOF_VALIDITY_SECS..=MAX_BAIT_PROOF_TTL_SECS)
+            .rev()
+            .find(|window| {
+                (proof_issued_at / window)
+                    .checked_add(1)
+                    .and_then(|bucket| bucket.checked_mul(*window))
+                    .is_some_and(|expires_at| {
+                        expires_at.saturating_sub(proof_issued_at) >= MIN_PROOF_VALIDITY_SECS
+                    })
+            })
+            .expect("test should select a proof window with a bounded validity margin");
+        let proof_expires_at = (proof_issued_at / proof_window_seconds + 1)
+            .checked_mul(proof_window_seconds)
+            .expect("test proof expiry should not overflow");
+        let window_marker = "\"proof_window_seconds\": 60";
+        assert_eq!(
+            session_minted_profile_json().matches(window_marker).count(),
+            1
+        );
+        let profile_json = session_minted_profile_json().replacen(
+            window_marker,
+            &format!("\"proof_window_seconds\": {proof_window_seconds}"),
+            1,
+        );
+        let profile_path = write_bait_profile(&profile_json);
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let loaded = load_bait_profile(&profile_path).expect("profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait should exist")
+            .clone();
+        let client_a = SessionId::new();
+        let client_b = SessionId::new();
+        assert_ne!(client_a, client_b);
+        let client_a_cookie = format!("eidolon_session={}", minted_cookie_value(client_a));
+        let client_b_cookie = format!("eidolon_session={}", minted_cookie_value(client_b));
+        let client_a_rendered = eidolon_bait::render_bait_for_session_at(
+            &bait,
+            client_a,
+            Some("mint-secret"),
+            proof_issued_at,
+        )
+        .expect("client A bait should render")
+        .into_owned();
+        let proof_header_name = client_a_rendered
+            .expected_action
+            .header_name
+            .expect("minted bait should have a proof header");
+        let client_a_proof = client_a_rendered
+            .expected_action
+            .header_value
+            .expect("minted bait should have a proof value");
+        let client_a_proof_headers = [(proof_header_name.as_str(), client_a_proof.as_str())];
+        let client_b_rendered = eidolon_bait::render_bait_for_session_at(
+            &bait,
+            client_b,
+            Some("mint-secret"),
+            proof_issued_at,
+        )
+        .expect("client B bait should render")
+        .into_owned();
+        let client_b_proof = client_b_rendered
+            .expected_action
+            .header_value
+            .expect("client B bait should have a proof value");
+        let client_b_proof_headers = [(proof_header_name.as_str(), client_b_proof.as_str())];
+        assert_ne!(client_a_proof, client_b_proof);
+        assert_eq!(
+            proof_expiry_epoch_seconds(&bait, &client_a_proof)
+                .expect("client A proof expiry should parse"),
+            proof_expires_at
+        );
+        assert_eq!(
+            proof_expiry_epoch_seconds(&bait, &client_b_proof)
+                .expect("client B proof expiry should parse"),
+            proof_expires_at
+        );
+        let (upstream, recorder) = spawn_recording_upstream([
+            json_response(r#"{"client":"b-initial"}"#),
+            json_response(r#"{"client":"b-after-first-restart"}"#),
+            json_response(r#"{"client":"b-after-second-restart"}"#),
+        ]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_log_path = fixture.event_log_path.clone();
+        let debug_log_path = fixture.debug_log_path.clone();
+
+        let server = start_production_profile_server(fixture);
+        let exposure = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request(
+                "GET",
+                &bait.surface,
+                client_a,
+                CLIENT_A_CONTINUITY,
+                &[],
+            ),
+        ));
+        assert_eq!(exposure.status, 200);
+        let spoofed_client_a = parse_downstream_response(&production_profile_request(
+            server.address,
+            &request_with_cookie(
+                "GET",
+                "/normal",
+                &client_b_cookie,
+                &[
+                    (
+                        session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        "wrong-transport-secret",
+                    ),
+                    (session::INGRESS_CONTINUITY_HEADER_NAME, CLIENT_A_CONTINUITY),
+                ],
+            ),
+        ));
+        assert_eq!(spoofed_client_a.status, 400);
+        assert!(header_values(&spoofed_client_a, "set-cookie").is_empty());
+
+        let client_a_action = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request(
+                "POST",
+                &bait.expected_action.path,
+                client_a,
+                CLIENT_A_CONTINUITY,
+                &client_a_proof_headers,
+            ),
+        ));
+        assert_eq!(client_a_action.status, 202);
+        let client_b_consumed_proof = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request(
+                "POST",
+                &bait.expected_action.path,
+                client_b,
+                CLIENT_B_CONTINUITY,
+                &client_b_proof_headers,
+            ),
+        ));
+        assert_eq!(client_b_consumed_proof.status, 202);
+        let client_b_initial = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request("GET", "/normal", client_b, CLIENT_B_CONTINUITY, &[]),
+        ));
+        assert_eq!(client_b_initial.status, 200);
+        assert_eq!(client_b_initial.body, br#"{"client":"b-initial"}"#);
+        let fixture = server.stop_for_restart();
+
+        let server = start_production_profile_server(fixture);
+        let client_a_first_restart = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie(
+                "GET",
+                "/normal",
+                CLIENT_A_CONTINUITY,
+                &[],
+            ),
+        ));
+        assert_eq!(client_a_first_restart.status, 404);
+        assert_eq!(response_session_id(&client_a_first_restart), client_a);
+        let client_b_replay = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie(
+                "POST",
+                &bait.expected_action.path,
+                CLIENT_B_CONTINUITY,
+                &client_b_proof_headers,
+            ),
+        ));
+        assert_eq!(client_b_replay.status, 403);
+        assert_eq!(response_session_id(&client_b_replay), client_b);
+        let client_b_first_restart = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request("GET", "/normal", client_b, CLIENT_B_CONTINUITY, &[]),
+        ));
+        assert_eq!(client_b_first_restart.status, 200);
+        assert_eq!(
+            client_b_first_restart.body,
+            br#"{"client":"b-after-first-restart"}"#
+        );
+        let fixture = server.stop_for_restart();
+
+        let server = start_production_profile_server(fixture);
+        let client_a_contained = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie(
+                "GET",
+                "/normal",
+                CLIENT_A_CONTINUITY,
+                &[],
+            ),
+        ));
+        assert_eq!(client_a_contained.status, 403);
+        assert_eq!(response_session_id(&client_a_contained), client_a);
+        let client_b_second_replay = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie(
+                "POST",
+                &bait.expected_action.path,
+                CLIENT_B_CONTINUITY,
+                &client_b_proof_headers,
+            ),
+        ));
+        assert_eq!(client_b_second_replay.status, 403);
+        assert_eq!(response_session_id(&client_b_second_replay), client_b);
+        let client_b_second_restart = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie(
+                "GET",
+                "/normal",
+                CLIENT_B_CONTINUITY,
+                &[],
+            ),
+        ));
+        assert_eq!(client_b_second_restart.status, 200);
+        assert_eq!(
+            client_b_second_restart.body,
+            br#"{"client":"b-after-second-restart"}"#
+        );
+        assert_eq!(response_session_id(&client_b_second_restart), client_b);
+        server.stop();
+
+        let upstream_requests = recorder.finish();
+        assert_eq!(
+            upstream_request_lines(&upstream_requests),
+            vec![
+                "GET /normal HTTP/1.1",
+                "GET /normal HTTP/1.1",
+                "GET /normal HTTP/1.1",
+            ],
+            "only client B ordinary traffic may reach protected upstream"
+        );
+
+        let event_log = fs::read_to_string(&event_log_path).expect("event log should read");
+        for sensitive in [
+            CLIENT_A_CONTINUITY,
+            CLIENT_B_CONTINUITY,
+            "transport-secret",
+            "continuity-key",
+            "mint-secret",
+            client_a_proof.as_str(),
+            client_b_proof.as_str(),
+        ] {
+            assert!(!event_log.contains(sensitive));
+        }
+        let events = event_values(&event_log_path);
+        let client_a_actions = events
+            .iter()
+            .filter(|event| {
+                event["session_id"] == client_a.0.to_string()
+                    && event["kind"]["type"] == "bait_action_observed"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(client_a_actions.len(), 1);
+        assert_eq!(
+            client_a_actions[0]["kind"]["header_value_mint_status"],
+            "matched_session_value"
+        );
+        let client_b_actions = events
+            .iter()
+            .filter(|event| {
+                event["session_id"] == client_b.0.to_string()
+                    && event["kind"]["type"] == "bait_action_observed"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(client_b_actions.len(), 3);
+        assert_eq!(
+            client_b_actions[0]["kind"]["header_value_mint_status"],
+            "matched_session_value"
+        );
+        assert_eq!(
+            client_b_actions[1]["kind"]["header_value_mint_status"],
+            "replay_seen"
+        );
+        assert_eq!(
+            client_b_actions[2]["kind"]["header_value_mint_status"],
+            "replay_seen"
+        );
+        assert!(events.iter().any(|event| {
+            event["session_id"] == client_a.0.to_string()
+                && event["kind"]["type"] == "policy_changed"
+                && event["kind"]["from"] == "observe"
+                && event["kind"]["to"] == "controlled_reality"
+        }));
+        assert!(events.iter().any(|event| {
+            event["session_id"] == client_a.0.to_string()
+                && event["kind"]["type"] == "policy_changed"
+                && event["kind"]["from"] == "controlled_reality"
+                && event["kind"]["to"] == "blocked"
+        }));
+        assert!(!events.iter().any(|event| {
+            event["session_id"] == client_b.0.to_string()
+                && event["kind"]["type"] == "policy_changed"
+        }));
+        let client_a_final_request = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event["session_id"] == client_a.0.to_string()
+                    && event["kind"]["type"] == "request_seen"
+            })
+            .expect("client A final contained request should be audited");
+        assert_eq!(client_a_final_request["policy_state"], "controlled_reality");
+        assert_eq!(
+            client_a_final_request["kind"]["routing_decision"],
+            "controlled_reality"
+        );
+        let client_b_requests = events
+            .iter()
+            .filter(|event| {
+                event["session_id"] == client_b.0.to_string()
+                    && event["kind"]["type"] == "request_seen"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(client_b_requests.len(), 6);
+        assert!(client_b_requests
+            .iter()
+            .all(|event| event["policy_state"] == "observe"));
+        assert_eq!(
+            client_b_requests
+                .iter()
+                .filter(|event| event["kind"]["routing_decision"] == "protected_upstream")
+                .count(),
+            3
+        );
+
+        let debug = fs::read_to_string(&debug_log_path).expect("debug log should read");
+        assert!(!debug.contains(CLIENT_A_CONTINUITY));
+        assert!(!debug.contains(CLIENT_B_CONTINUITY));
+        assert!(!debug.contains("transport-secret"));
+        assert!(!debug.contains("continuity-key"));
+        assert!(!debug.contains("mint-secret"));
+        assert!(!debug.contains(&client_a_proof));
+        assert!(!debug.contains(&client_b_proof));
+        let recovered_resolutions = debug
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("debug record should parse"))
+            .filter(|record| {
+                record["event"] == "session_resolved"
+                    && record["fields"]["continuity_outcome"] == "recovered"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovered_resolutions
+                .iter()
+                .filter(|record| record["session_id"] == client_a.0.to_string())
+                .count(),
+            2
+        );
+        assert_eq!(
+            recovered_resolutions
+                .iter()
+                .filter(|record| record["session_id"] == client_b.0.to_string())
+                .count(),
+            2
+        );
+
+        assert_ne!(client_a, client_b);
+        assert_ne!(client_a_cookie, client_b_cookie);
+        assert!(
+            current_unix_secs() < proof_expires_at,
+            "bounded restart scenario exceeded its selected proof-validity window"
         );
     }
 
