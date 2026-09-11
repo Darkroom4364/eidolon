@@ -7446,7 +7446,7 @@ fn effective_session_context(
         &surface_request.path,
         request_host.as_deref(),
         client_peer_ip,
-        headers.iter().copied(),
+        trusted_ingress_headers.iter().copied(),
     );
     session.local_ingress_trust_scope_rejection = local_trust_evaluation.scope_rejection;
     let local_trust = local_trust_evaluation.resolved;
@@ -12822,13 +12822,44 @@ mod tests {
         runtime.ingress_transport_auth_secret = Some(Arc::from("active-transport-secret"));
         runtime.previous_ingress_transport_auth_secret =
             Some(Arc::from("previous-transport-secret"));
-        runtime.ingress_continuity_key = Some(Arc::from("continuity-key"));
+        runtime.ingress_continuity_key = Some(Arc::from("active-continuity-key"));
+        runtime.previous_ingress_continuity_key = Some(Arc::from("previous-continuity-key"));
         runtime.trusted_ingress_source_cidrs = vec!["10.0.0.0/8".parse().unwrap()];
         runtime.require_authenticated_ingress_continuity = true;
-        let session_authority_before = format!(
-            "{:?}",
-            *runtime.session_authority.lock().expect("session authority")
-        );
+        let seeded_session = SessionId::new();
+        let seeded_cookie = format!("eidolon_session={}", minted_cookie_value(seeded_session));
+        {
+            let mut authority = runtime.session_authority.lock().expect("session authority");
+            let seeded = session::derive_session_from_headers_with_trusted_ingress_continuity_key(
+                &mut authority,
+                [
+                    (session::COOKIE_HEADER_NAME, seeded_cookie.as_str()),
+                    (
+                        session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        "active-transport-secret",
+                    ),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
+                ],
+                Some("127.0.0.1".parse().unwrap()),
+                now_unix_secs(),
+                Some(session::TrustedIngressContinuityKeys::new(
+                    "active-transport-secret",
+                    "previous-continuity-key",
+                )),
+                true,
+                false,
+            )
+            .expect("previous-key authority fixture should seed");
+            assert_eq!(seeded.session_id, seeded_session);
+        }
+        let session_authority_before = runtime
+            .session_authority
+            .lock()
+            .expect("session authority")
+            .clone();
         let policy_records_before = runtime.policy_store.lock().expect("policy store").len();
         let exposure_records_before = runtime.bait_exposures.lock().expect("exposure store").len();
         let consumed_records_before = runtime
@@ -12862,7 +12893,7 @@ mod tests {
                         session::INGRESS_CONTINUITY_HEADER_NAME,
                         TEST_INGRESS_CONTINUITY_ID,
                     ),
-                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "verified_bot"),
+                    ("x-EiDoLoN-InGrEsS-Identity-Source", "verified_bot"),
                     (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
                     ("X-Forwarded-For", "10.23.45.67"),
                 ],
@@ -12943,12 +12974,13 @@ mod tests {
                 .len(),
             consumed_records_before
         );
+        let session_authority_after = runtime
+            .session_authority
+            .lock()
+            .expect("session authority")
+            .clone();
         assert_eq!(
-            format!(
-                "{:?}",
-                *runtime.session_authority.lock().expect("session authority")
-            ),
-            session_authority_before,
+            session_authority_after, session_authority_before,
             "source rejection mutated in-memory session authority"
         );
         assert!(event_values(&event_log).is_empty());
@@ -13025,6 +13057,7 @@ mod tests {
     fn lab_source_cidr_gates_all_trusted_ingress_inputs_and_preserves_peer_mode() {
         let event_log = unique_temp_path("lab-untrusted-ingress-source-events.jsonl");
         let (upstream, recorder) = spawn_recording_upstream([
+            json_response(r#"{"mode":"seed_peer"}"#),
             json_response(r#"{"mode":"disallowed_active"}"#),
             json_response(r#"{"mode":"disallowed_previous"}"#),
             json_response(r#"{"mode":"allowed_active"}"#),
@@ -13040,20 +13073,61 @@ mod tests {
         runtime.previous_ingress_transport_auth_secret =
             Some(Arc::from("previous-transport-secret"));
         runtime.trusted_ingress_source_cidrs = vec!["10.0.0.0/8".parse().unwrap()];
-        let cookie = cookie_header();
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "reserved-header-local-rule",
+                  "source": "verified_bot",
+                  "trust_tier": "edge_verified",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/ordinary"],
+                  "required_headers": [
+                    {
+                      "name": "X-Eidolon-Ingress-Identity-Source",
+                      "value": "verified_bot"
+                    }
+                  ]
+                }
+              ]
+            }"#,
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "reserved-header local trust fixture should load",
+        ));
+        let peer_session = SessionId::new();
+        let peer_cookie = format!("eidolon_session={}", minted_cookie_value(peer_session));
+        let seed_peer_request = request_with_cookie_exact("GET", "/ordinary", &peer_cookie, &[]);
+        let seed_peer_request = read_http_request(&mut seed_peer_request.as_slice())
+            .expect("peer seed request should parse")
+            .expect("peer seed request should exist");
+        let seed_peer_response = process_request(
+            &runtime,
+            seed_peer_request,
+            Some("127.0.0.1:41005".parse().unwrap()),
+            UpstreamTransport::Lab,
+        )
+        .expect("peer seed request should be processed");
+        assert_eq!(seed_peer_response.status, 200);
+        assert!(header_values(&seed_peer_response, "set-cookie").is_empty());
 
-        for (transport_secret, request_cookie, peer, expect_cookie) in [
+        let cookie_session = SessionId::new();
+        let cookie = format!("eidolon_session={}", minted_cookie_value(cookie_session));
+
+        for (transport_secret, request_cookie, peer, recovered_session) in [
             (
                 "active-transport-secret",
                 "eidolon_session=malformed",
                 "127.0.0.1:41005",
-                true,
+                Some(peer_session),
             ),
             (
                 "previous-transport-secret",
                 cookie.as_str(),
                 "127.0.0.1:41007",
-                false,
+                None,
             ),
         ] {
             let raw_request = request_with_cookie_exact(
@@ -13069,7 +13143,7 @@ mod tests {
                         session::INGRESS_CONTINUITY_HEADER_NAME,
                         TEST_INGRESS_CONTINUITY_ID,
                     ),
-                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "verified_bot"),
+                    ("x-EiDoLoN-InGrEsS-Identity-Source", "verified_bot"),
                     (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
                     (
                         session::INGRESS_VERIFICATION_STRENGTH_HEADER_NAME,
@@ -13092,18 +13166,20 @@ mod tests {
             )
             .expect("disallowed Lab ingress input should preserve peer mode");
             assert_eq!(response.status, 200);
-            assert_eq!(
-                !header_values(&response, "set-cookie").is_empty(),
-                expect_cookie
-            );
+            match recovered_session {
+                Some(expected) => assert_eq!(response_session_id(&response), expected),
+                None => assert!(header_values(&response, "set-cookie").is_empty()),
+            }
         }
 
         runtime.trusted_ingress_source_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
+        let allowed_session = SessionId::new();
+        let allowed_cookie = format!("eidolon_session={}", minted_cookie_value(allowed_session));
         for transport_secret in ["active-transport-secret", "previous-transport-secret"] {
             let raw_request = request_with_cookie_exact(
                 "GET",
                 "/ordinary",
-                &cookie,
+                &allowed_cookie,
                 &[
                     (
                         session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
@@ -13141,15 +13217,26 @@ mod tests {
             .into_iter()
             .filter(|event| event["kind"]["type"] == "request_seen")
             .collect::<Vec<_>>();
-        assert_eq!(request_events.len(), 4);
-        for request_seen in &request_events[..2] {
+        assert_eq!(request_events.len(), 5);
+        assert_eq!(request_events[0]["session_id"], peer_session.0.to_string());
+        assert_eq!(request_events[1]["session_id"], peer_session.0.to_string());
+        assert_eq!(
+            request_events[2]["session_id"],
+            cookie_session.0.to_string()
+        );
+        for request_seen in &request_events[..3] {
             assert_eq!(request_seen["kind"]["ingress_identity"]["source"], "none");
             assert!(request_seen["kind"]["ingress_signals"].is_null());
         }
-        for allowed in &request_events[2..] {
+        for allowed in &request_events[3..] {
+            assert_eq!(allowed["session_id"], allowed_session.0.to_string());
             assert_eq!(
                 allowed["kind"]["ingress_identity"]["source"],
                 "verified_bot"
+            );
+            assert_eq!(
+                allowed["kind"]["ingress_identity"]["label"],
+                "reserved-header-local-rule"
             );
             assert_eq!(
                 allowed["kind"]["ingress_signals"]["verification_strength"],
@@ -13162,7 +13249,7 @@ mod tests {
             assert_eq!(allowed["kind"]["ingress_signals"]["vendor_score"], 12);
             assert_eq!(allowed["kind"]["ingress_signals"]["edge_action"], "allow");
         }
-        assert_eq!(recorder.finish().len(), 4);
+        assert_eq!(recorder.finish().len(), 5);
     }
 
     #[test]
