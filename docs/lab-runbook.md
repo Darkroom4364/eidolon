@@ -138,6 +138,19 @@ Session cookies are authenticated. The value has the form `v1.<key-version>.<iss
 
 Signing keys come from `--session-signing-key-file <PATH>` with JSON shape `{"active_key_version": 2, "keys": [{"version": 1, "key_hex": "<64 hex>"}, {"version": 2, "key_hex": "<64 hex>"}]}`. Every listed version verifies cookies; only the active version mints. Rotate by adding the new version, marking it active, and dropping retired versions once cookies older than the 7-day server-side lifetime have aged out. Cookies signed by a retired-but-listed version are accepted and transparently re-minted under the active version on the response. The Kubernetes lab manifests require this file from Secret `eidolon-session-signing`, key `key-ring.json`, mounted read-only at `/var/run/secrets/eidolon-session-signing/key-ring.json`. The Secret must exist before the proxy pod starts and must be backed up with the PVC as one recovery set. Update it with overlapping key versions and restart the `Recreate` Deployment to load a new active version; remove a retired version only after its cookie lifetime has elapsed and another controlled restart can load the reduced ring. Losing or replacing the ring invalidates outstanding cookies even if PVC state survives. Outside this manifest path, omitting the flag still creates an ephemeral process key and loses cookie validity at restart. Authenticated-ingress mappings are HMAC-minimized and persisted beside policy state at `<policy-state-path>.continuity.json`; raw continuity identities and Lab peer keys are excluded. The HMAC-authenticated sidecar writes schema v2 and reads schema versions 1 through 2, and new durable mappings are limited to 64 per rolling 60-second window. `--ingress-continuity-key-file <PATH>` separates continuity minimization and sidecar integrity from request transport authentication. Existing deployments must initially provision it with the current transport-secret bytes so existing sidecar state remains readable. The continuity key is backup-critical and must remain stable while transport credentials rotate. All key files are secrets and must stay outside the event and debug logs.
 
+The production profile also requires one or more repeatable
+`--trusted-ingress-source-cidr <CIDR>` options (maximum 32). These authorize
+the direct socket peers that may use transport-authenticated continuity and
+explicit `X-Eidolon-Ingress-*` identity/advisory claims. Configure the named
+ingress-to-proxy pod/network CIDRs, never a forwarded client address and never
+`0.0.0.0/0` or `::/0`. IPv4-mapped IPv6 peers are matched as IPv4. A missing or
+nonmatching peer receives the fixed no-store ingress rejection before state,
+renderer, or upstream effects even if it has a valid active or previous
+transport credential. Effective/startup diagnostics expose only counts and IP
+family presence. Issue `#253` owns wiring the exact supported ingress CIDRs
+and proving the corresponding NetworkPolicy/topology; this source boundary
+does not replace that live isolation proof.
+
 If the authenticated-continuity sidecar is missing while prior state exists,
 unknown authenticated identities fail closed for a bounded migration
 quarantine. Corrupt state or state bound to a different continuity key prevents
