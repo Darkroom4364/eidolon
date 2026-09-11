@@ -136,7 +136,7 @@ The proxy assigns a first-party `eidolon_session` cookie when no valid session c
 
 Session cookies are authenticated. The value has the form `v1.<key-version>.<issued-at>.<session-uuid>.<hmac-sha256-hex>`; the proxy verifies the proof, key version, and server-side age before accepting a cookie. A missing, malformed, forged, unknown-key, or expired cookie never supplies the session identity: the request receives a proxy-minted session instead, and the deterministic outcome (`absent`, `valid`, `malformed`, `unknown_key_version`, `bad_signature`, `expired`) is recorded in the server-side debug log as a `session_resolved` audit event together with the continuity outcome. Cookie discard or rapid rotation from one direct peer is absorbed by a bounded continuity map (24h TTL, 4096 peers, one recovery per 60s cooldown): the peer is re-bound to its existing session with its enforcement floor intact, and excess rotation mints fresh sessions that still inherit that floor, so rotation cannot reset policy or evidence state. The floor ranks `blocked` highest and never downgrades an already-loaded state.
 
-Signing keys come from `--session-signing-key-file <PATH>` with JSON shape `{"active_key_version": 2, "keys": [{"version": 1, "key_hex": "<64 hex>"}, {"version": 2, "key_hex": "<64 hex>"}]}`. Every listed version verifies cookies; only the active version mints. Rotate by adding the new version, marking it active, and dropping retired versions once cookies older than the 7-day server-side lifetime have aged out. Cookies signed by a retired-but-listed version are accepted and transparently re-minted under the active version on the response. The Kubernetes lab manifests require this file from Secret `eidolon-session-signing`, key `key-ring.json`, mounted read-only at `/var/run/secrets/eidolon-session-signing/key-ring.json`. The Secret must exist before the proxy pod starts and must be backed up with the PVC as one recovery set. Update it with overlapping key versions and restart the `Recreate` Deployment to load a new active version; remove a retired version only after its cookie lifetime has elapsed and another controlled restart can load the reduced ring. Losing or replacing the ring invalidates outstanding cookies even if PVC state survives. Outside this manifest path, omitting the flag still creates an ephemeral process key and loses cookie validity at restart. Authenticated-ingress mappings are HMAC-minimized and persisted beside policy state at `<policy-state-path>.continuity.json`; raw continuity identities and Lab peer keys are excluded. The sidecar is HMAC-authenticated, and new durable mappings are limited to 64 per rolling 60-second window. `--ingress-continuity-key-file <PATH>` separates continuity minimization and sidecar integrity from request transport authentication. Existing deployments must initially provision it with the current transport-secret bytes so existing sidecar state remains readable. The continuity key is backup-critical and must remain stable while transport credentials rotate. All key files are secrets and must stay outside the event and debug logs.
+Signing keys come from `--session-signing-key-file <PATH>` with JSON shape `{"active_key_version": 2, "keys": [{"version": 1, "key_hex": "<64 hex>"}, {"version": 2, "key_hex": "<64 hex>"}]}`. Every listed version verifies cookies; only the active version mints. Rotate by adding the new version, marking it active, and dropping retired versions once cookies older than the 7-day server-side lifetime have aged out. Cookies signed by a retired-but-listed version are accepted and transparently re-minted under the active version on the response. The Kubernetes lab manifests require this file from Secret `eidolon-session-signing`, key `key-ring.json`, mounted read-only at `/var/run/secrets/eidolon-session-signing/key-ring.json`. The Secret must exist before the proxy pod starts and must be backed up with the PVC as one recovery set. Update it with overlapping key versions and restart the `Recreate` Deployment to load a new active version; remove a retired version only after its cookie lifetime has elapsed and another controlled restart can load the reduced ring. Losing or replacing the ring invalidates outstanding cookies even if PVC state survives. Outside this manifest path, omitting the flag still creates an ephemeral process key and loses cookie validity at restart. Authenticated-ingress mappings are HMAC-minimized and persisted beside policy state at `<policy-state-path>.continuity.json`; raw continuity identities and Lab peer keys are excluded. The HMAC-authenticated sidecar writes schema v2 and reads schema versions 1 through 2, and new durable mappings are limited to 64 per rolling 60-second window. `--ingress-continuity-key-file <PATH>` separates continuity minimization and sidecar integrity from request transport authentication. Existing deployments must initially provision it with the current transport-secret bytes so existing sidecar state remains readable. The continuity key is backup-critical and must remain stable while transport credentials rotate. All key files are secrets and must stay outside the event and debug logs.
 
 If the authenticated-continuity sidecar is missing while prior state exists,
 unknown authenticated identities fail closed for a bounded migration
@@ -149,15 +149,34 @@ adapters to the new credential, then remove the previous flag and restart
 again. Every request still carries exactly one transport-auth header, and the
 continuity key stays unchanged throughout. Premature removal rejects old-edge
 traffic before session adoption or upstream access but does not weaken
-persisted containment. The session-signing key-rotation live check is
-documented below; deployment wiring, live transport rotation, upgrade,
-rollback, and continuity-key rotation remain tracked by issues `#253` and
-`#254`. The kind
+persisted containment.
+
+For a planned source-runtime continuity-key rotation, restart with the new key
+at `--ingress-continuity-key-file` and the old key at
+`--previous-ingress-continuity-key-file`. Valid returning identities are
+durably re-keyed before request effects; new identities use the active key.
+The `proxy_started` record reports redacted active/previous binding counts.
+After returning traffic has migrated, restart once more with the overlap still
+configured and require `previous_key_record_count: 0` before removing the
+previous flag; new-only startup otherwise fails closed. A dormant binding that
+passes the 24-hour continuity TTL is deliberately expired and will receive a
+new active-key session when it next returns. Rollback swaps active and previous
+paths and uses the same bounded procedure. Missing, wrong, or duplicate
+transport authentication cannot cause migration, and a write failure returns
+`503` without a cookie or protected upstream access. If startup reissue or a
+request migration is interrupted, retain both key files, repair storage, and
+retry the same overlap: the sidecar may validly be under either configured
+signer, while removing the previous key is never the recovery step.
+
+The session-signing key-rotation live check is documented below; Kubernetes
+wiring and live transport/continuity rotation, upgrade, rollback, and
+retirement evidence remain tracked by issues `#253` and `#254`. The kind
 backup/restore proof is documented below. Reusing the old
 transport-secret bytes for migration compatibility also means transport
 rotation does not remediate compromise of those bytes. Old-key state is never
-trusted based on unverified timestamps. This slice does not complete issue
-`#254` or support a production-readiness claim.
+trusted based on unverified timestamps: the sidecar must first authenticate
+under the exact active or previous key candidate. This source-only slice does
+not complete issue `#254` or support a production-readiness claim.
 
 The event log is JSONL. Request events record method, path, policy state, routing decision, session ID, and selected safe header presence. They do not log request bodies or header values.
 

@@ -16,7 +16,8 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-pub const SESSION_CONTINUITY_SCHEMA_VERSION: u16 = 1;
+pub const SESSION_CONTINUITY_SCHEMA_VERSION: u16 = 2;
+pub const MIN_SUPPORTED_SESSION_CONTINUITY_SCHEMA_VERSION: u16 = 1;
 pub const MAX_CONTINUITY_RECORDS: usize = 4096;
 pub const MAX_CONTINUITY_STORE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -74,6 +75,10 @@ pub struct State {
 pub struct Record {
     /// Lowercase SHA-256/HMAC digest. Never a raw ingress identity.
     pub key_digest_hex: String,
+    /// Domain-separated identifier for the key that derived this binding.
+    /// Schema v1 records omit it and inherit the state-level key identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity_key_id_hex: Option<String>,
     pub session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enforcement_floor: Option<PolicyState>,
@@ -99,6 +104,18 @@ pub fn load(
     path: impl AsRef<Path>,
     integrity_key: &IntegrityKey,
     expected_transport_key_id_hex: &str,
+) -> io::Result<Option<State>> {
+    load_with_key_candidates(path, &[(expected_transport_key_id_hex, integrity_key)])
+}
+
+/// Read one snapshot and verify it with the exactly matching configured key.
+///
+/// The state-level identifier selects the candidate before MAC verification;
+/// the loader never treats a failed MAC under one key as permission to try an
+/// unrelated key.
+pub fn load_with_key_candidates(
+    path: impl AsRef<Path>,
+    key_candidates: &[(&str, &IntegrityKey)],
 ) -> io::Result<Option<State>> {
     let path = path.as_ref();
     let file = match File::open(path) {
@@ -132,9 +149,24 @@ pub fn load(
     })?;
     validate_signed(&state)?;
 
-    if state.transport_key_id_hex != expected_transport_key_id_hex {
+    if key_candidates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "at least one continuity state integrity key is required",
+        ));
+    }
+    let mut matching = key_candidates
+        .iter()
+        .filter(|(key_id_hex, _)| *key_id_hex == state.transport_key_id_hex);
+    let Some((_, integrity_key)) = matching.next() else {
         return Err(invalid_data(
             "continuity state key identifier does not match the configured continuity key",
+        ));
+    };
+    if matching.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configured continuity state key identifiers must be unique",
         ));
     }
     verify_integrity(&state, integrity_key)?;
@@ -172,10 +204,14 @@ pub fn persist_state(
 }
 
 fn validate_semantics(state: &State) -> io::Result<()> {
-    if state.schema_version != SESSION_CONTINUITY_SCHEMA_VERSION {
+    if !(MIN_SUPPORTED_SESSION_CONTINUITY_SCHEMA_VERSION..=SESSION_CONTINUITY_SCHEMA_VERSION)
+        .contains(&state.schema_version)
+    {
         return Err(invalid_data(format!(
-            "unsupported session continuity schema version {}; expected {}",
-            state.schema_version, SESSION_CONTINUITY_SCHEMA_VERSION
+            "unsupported session continuity schema version {}; expected {}..={}",
+            state.schema_version,
+            MIN_SUPPORTED_SESSION_CONTINUITY_SCHEMA_VERSION,
+            SESSION_CONTINUITY_SCHEMA_VERSION
         )));
     }
     validate_lower_hex(&state.transport_key_id_hex, "transport_key_id_hex")?;
@@ -196,6 +232,25 @@ fn validate_semantics(state: &State) -> io::Result<()> {
     let mut sessions = HashSet::with_capacity(state.records.len());
     for record in &state.records {
         validate_lower_hex(&record.key_digest_hex, "key_digest_hex")?;
+        match (
+            state.schema_version,
+            record.continuity_key_id_hex.as_deref(),
+        ) {
+            (1, None) => {}
+            (1, Some(_)) => {
+                return Err(invalid_data(
+                    "schema-v1 continuity records must not contain a key identifier",
+                ));
+            }
+            (_, Some(key_id_hex)) => {
+                validate_lower_hex(key_id_hex, "continuity_key_id_hex")?;
+            }
+            (_, None) => {
+                return Err(invalid_data(
+                    "schema-v2 continuity records require a key identifier",
+                ));
+            }
+        }
         if !digests.insert(record.key_digest_hex.as_str()) {
             return Err(invalid_data("duplicate continuity digest"));
         }
@@ -458,6 +513,7 @@ mod tests {
     fn record(byte: u8, session: u128) -> Record {
         Record {
             key_digest_hex: format!("{byte:02x}").repeat(32),
+            continuity_key_id_hex: Some("ab".repeat(32)),
             session_id: SessionId(Uuid::from_u128(session)),
             enforcement_floor: Some(PolicyState::Blocked),
             last_seen: 200,
@@ -474,6 +530,15 @@ mod tests {
             records: vec![record(1, 1), record(2, 2)],
             integrity_mac_hex: String::new(),
         }
+    }
+
+    fn v1_state() -> State {
+        let mut state = state();
+        state.schema_version = 1;
+        for record in &mut state.records {
+            record.continuity_key_id_hex = None;
+        }
+        state
     }
 
     fn integrity_key() -> IntegrityKey {
@@ -559,6 +624,81 @@ mod tests {
     }
 
     #[test]
+    fn schema_v1_is_readable_but_record_key_provenance_is_v2_only() {
+        let dir = TestDir::new();
+        let path = dir.path("continuity-v1.json");
+        persist_test(&path, &v1_state()).expect("schema-v1 state should persist");
+        let loaded = verified_state(&path);
+        assert_eq!(loaded.schema_version, 1);
+        assert!(loaded
+            .records
+            .iter()
+            .all(|record| record.continuity_key_id_hex.is_none()));
+
+        let mut invalid_v1 = v1_state();
+        invalid_v1.records[0].continuity_key_id_hex = Some("ab".repeat(32));
+        assert!(validate_semantics(&invalid_v1).is_err());
+
+        let mut invalid_v2 = state();
+        invalid_v2.records[0].continuity_key_id_hex = None;
+        assert!(validate_semantics(&invalid_v2).is_err());
+
+        for unsupported in [0, SESSION_CONTINUITY_SCHEMA_VERSION + 1] {
+            let mut invalid = state();
+            invalid.schema_version = unsupported;
+            assert!(validate_semantics(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn key_candidates_select_exactly_one_state_signer_before_verification() {
+        let dir = TestDir::new();
+        let path = dir.path("continuity-overlap.json");
+        let active_key = IntegrityKey::derive("active-continuity-key").expect("active key");
+        let previous_key = IntegrityKey::derive("previous-continuity-key").expect("previous key");
+        let active_id = "ab".repeat(32);
+        let previous_id = "cd".repeat(32);
+        let mut previous_state = state();
+        previous_state.transport_key_id_hex = previous_id.clone();
+        for record in &mut previous_state.records {
+            record.continuity_key_id_hex = Some(previous_id.clone());
+        }
+        persist(&path, &previous_state, &previous_key).expect("previous state should persist");
+
+        let loaded = load_with_key_candidates(
+            &path,
+            &[
+                (active_id.as_str(), &active_key),
+                (previous_id.as_str(), &previous_key),
+            ],
+        )
+        .expect("the exact previous candidate should verify")
+        .expect("state should exist");
+        assert_eq!(loaded.transport_key_id_hex, previous_id);
+
+        let error = load_with_key_candidates(
+            &path,
+            &[
+                (previous_id.as_str(), &active_key),
+                (active_id.as_str(), &previous_key),
+            ],
+        )
+        .expect_err("a matching identifier with the wrong key must not fall back");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("integrity verification failed"));
+
+        let error = load_with_key_candidates(
+            &path,
+            &[
+                (previous_id.as_str(), &previous_key),
+                (previous_id.as_str(), &active_key),
+            ],
+        )
+        .expect_err("duplicate candidate identifiers must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn rejects_oversized_state_before_parsing() {
         let dir = TestDir::new();
         let path = dir.path("continuity.json");
@@ -594,6 +734,7 @@ mod tests {
         let records = (0..=MAX_CONTINUITY_RECORDS)
             .map(|index| Record {
                 key_digest_hex: format!("{index:064x}"),
+                continuity_key_id_hex: Some("ab".repeat(32)),
                 session_id: SessionId(Uuid::from_u128(index as u128 + 1)),
                 enforcement_floor: None,
                 last_seen: 1,
@@ -621,6 +762,9 @@ mod tests {
         });
         assert_tamper_rejected(|state| {
             state.records[0].enforcement_floor = Some(PolicyState::Observe);
+        });
+        assert_tamper_rejected(|state| {
+            state.records[0].continuity_key_id_hex = Some("cd".repeat(32));
         });
         assert_tamper_rejected(|state| {
             state.records[0].last_seen += 1;

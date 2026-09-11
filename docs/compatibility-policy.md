@@ -31,7 +31,7 @@ Eidolon releases use semantic versioning. Within a major release line:
 | Event log (`events.jsonl`) | `schema_version` per record | `2` | Readers reject any other version with an actionable error (`eidolon-trace` reader enforces; tested). |
 | Debug log (`debug.jsonl`) | `schema_version` + `run_kind` envelope | `1` (`eidolon_proxy_debug`) | Server-side diagnostic only; no supported reader today. A validating reader is tracked by issue #252. |
 | Policy state (`policy-state.json`) | `schema_version` | `3` (reads `1..=3`) | Unsupported versions fail startup; no downgrade guessing (`policy_store.rs`). |
-| Session continuity sidecar (`<policy-state>.continuity.json`) | `schema_version` | `1` | Unsupported versions or a continuity-key mismatch prevent startup (`session_continuity_store.rs`). |
+| Session continuity sidecar (`<policy-state>.continuity.json`) | `schema_version` | `2` (reads `1..=2`) | Unsupported versions, an unverifiable signer, or a live record whose continuity key is unavailable prevent startup (`session_continuity_store.rs`). |
 | Bait exposure sidecar (`<event-log>.exposures.json`) | `schema_version` | `1` | Unsupported versions fail closed; missing sidecar with prior history enters the documented migration quarantine. |
 | Consumed proof sidecar (`<event-log>.consumed-proofs.json`) | `schema_version` | `1` | Same rule as the exposure sidecar. |
 | Bait profile config | `schema_version` | `1` | Any other version rejected at load (`main.rs`). |
@@ -78,6 +78,18 @@ listener, retains the complete ordered address set for typed dispatch, and
 fails startup on its explicit resolution timeout or lookup error. Failure uses
 the runtime's bounded shutdown path; it does not claim to cancel a system
 resolver operation that has already outlived the lookup future.
+
+Continuity sidecar schema v2 adds a domain-separated continuity-key identifier
+to each minimized record. Schema-v1 records omit that field and inherit the
+identifier of the exactly matched state signer. A successful v1 or v2 startup
+always rewrites the complete validated snapshot as v2 under the active key.
+During the bounded `--previous-ingress-continuity-key-file` overlap, live
+previous-key records remain explicitly identified until an authenticated
+return durably re-keys them; removing the previous key while any such record is
+live fails startup. Expired records may be discarded before that check.
+Unknown signers are never tried speculatively, and unverified timestamps never
+authorize retirement. A v1-era binary presented with v2 state fails closed as
+required by the downgrade rule below.
 
 ## Compatibility rules
 

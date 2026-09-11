@@ -16,6 +16,8 @@ Initial research-alpha source release.
   controlled-reality renderer
 - fail-closed unsafe-action routing, request-linked causality,
   integrity-protected session identity, and bounded recoverable state
+- continuity sidecar schema v2 with schema-v1 migration and a bounded,
+  fail-closed active/previous continuity-key rotation path
 
 ### Limitations
 

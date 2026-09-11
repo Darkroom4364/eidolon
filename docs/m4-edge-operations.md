@@ -154,12 +154,16 @@ Session identity on this deployment:
 - if that sidecar is missing while prior state exists, unknown authenticated
   identities fail closed for a bounded migration quarantine; corrupt or
   continuity-key-mismatched sidecar state prevents startup
-- the source runtime supports one bounded previous transport credential when
-  `continuity-key.txt` stays fixed, but these manifests do not yet wire that
-  second file; Kubernetes Secret rollout, a live `Recreate` lifecycle proof,
-  and continuity-key rotation remain tracked by issues `#253` and `#254`;
-  old-key state is never trusted merely because its unverified timestamps
-  appear expired
+- the source runtime supports one bounded previous transport credential and
+  one bounded previous continuity key. `--previous-ingress-continuity-key-file`
+  lazily and durably moves returning bindings to the active key before request
+  effects; sidecar schema v2 records redacted key provenance and new-only
+  startup rejects any live prior-key binding
+- these manifests do not yet mount or pass either previous-key file;
+  Kubernetes Secret rollout and a live `Recreate` upgrade/rollback/retirement
+  proof remain tracked by issues `#253` and `#254`. Old-key state is accepted
+  only after exact-key integrity verification, never because unverified
+  timestamps appear expired
 - the explicit-cookie smoke scripts mint their session cookies from the live
   edge instead of generating raw UUIDs; cookie-jar smokes are unaffected
 
