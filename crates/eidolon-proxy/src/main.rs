@@ -14345,10 +14345,11 @@ mod tests {
             "--previous-ingress-continuity-key-file".to_string(),
             path_str(&old_continuity_path, "old continuity path should be UTF-8").to_string(),
         ]);
-        fixture.supplied_paths.push(new_continuity_path);
+        fixture.supplied_paths.push(new_continuity_path.clone());
         fixture
             .supplied_secrets
             .push(NEW_CONTINUITY_KEY.to_string());
+        let overlap_effective_config = fixture.print_effective_config();
 
         // Startup overlap authenticates the old snapshot once and atomically
         // rewrites schema v2 under the active signer before serving traffic.
@@ -14575,62 +14576,110 @@ mod tests {
             CLIENT_B_CONTINUITY,
             "mint-secret",
             client_a_proof.as_str(),
+            path_str(&old_continuity_path, "old continuity path should be UTF-8"),
+            path_str(&new_continuity_path, "new continuity path should be UTF-8"),
         ] {
             assert!(!event_log.contains(sensitive));
             assert!(!debug.contains(sensitive));
+            assert!(!overlap_effective_config.contains(sensitive));
             assert!(!sidecar.contains(sensitive));
         }
-        assert!(!event_log.contains(&state_after_migration.transport_key_id_hex));
-        assert!(!debug.contains(&state_after_migration.transport_key_id_hex));
-        for record in &state_after_migration.records {
-            assert!(!event_log.contains(&record.key_digest_hex));
-            assert!(!debug.contains(&record.key_digest_hex));
-            let key_id = record
-                .continuity_key_id_hex
-                .as_deref()
-                .expect("schema-v2 record should carry key provenance");
-            assert!(!event_log.contains(key_id));
-            assert!(!debug.contains(key_id));
+        for state in [
+            &state_before_migration,
+            &state_after_client_a,
+            &state_after_migration,
+        ] {
+            assert!(!event_log.contains(&state.transport_key_id_hex));
+            assert!(!debug.contains(&state.transport_key_id_hex));
+            assert!(!overlap_effective_config.contains(&state.transport_key_id_hex));
+            for record in &state.records {
+                assert!(!event_log.contains(&record.key_digest_hex));
+                assert!(!debug.contains(&record.key_digest_hex));
+                assert!(!overlap_effective_config.contains(&record.key_digest_hex));
+                let key_id = record
+                    .continuity_key_id_hex
+                    .as_deref()
+                    .expect("schema-v2 record should carry key provenance");
+                assert!(!event_log.contains(key_id));
+                assert!(!debug.contains(key_id));
+                assert!(!overlap_effective_config.contains(key_id));
+            }
         }
 
         let events = event_values(&event_log_path);
-        assert!(events.iter().any(|event| {
-            event["session_id"] == client_a.0.to_string()
-                && event["kind"]["type"] == "policy_changed"
-                && event["kind"]["from"] == "observe"
-                && event["kind"]["to"] == "controlled_reality"
-        }));
-        assert!(events.iter().any(|event| {
-            event["session_id"] == client_a.0.to_string()
-                && event["kind"]["type"] == "policy_changed"
-                && event["kind"]["from"] == "controlled_reality"
-                && event["kind"]["to"] == "blocked"
-        }));
+        let client_a_actions = events
+            .iter()
+            .filter(|event| {
+                event["session_id"] == client_a.0.to_string()
+                    && event["kind"]["type"] == "bait_action_observed"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(client_a_actions.len(), 1);
+        let action_request_id = client_a_actions[0]["request_id"]
+            .as_str()
+            .expect("client A bait action should carry its request id");
+        let client_a_transitions = events
+            .iter()
+            .filter(|event| {
+                event["session_id"] == client_a.0.to_string()
+                    && event["kind"]["type"] == "policy_changed"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(client_a_transitions.len(), 2);
+        let to_controlled = client_a_transitions
+            .iter()
+            .find(|event| {
+                event["kind"]["from"] == "observe" && event["kind"]["to"] == "controlled_reality"
+            })
+            .expect("client A action should enter controlled reality");
+        let to_blocked = client_a_transitions
+            .iter()
+            .find(|event| {
+                event["kind"]["from"] == "controlled_reality" && event["kind"]["to"] == "blocked"
+            })
+            .expect("client A repeated escape should become blocked");
+        let controlled_request_id = to_controlled["request_id"]
+            .as_str()
+            .expect("controlled transition should carry its request id");
+        let blocked_request_id = to_blocked["request_id"]
+            .as_str()
+            .expect("blocked transition should carry its request id");
+        assert_eq!(controlled_request_id, action_request_id);
+        assert_ne!(controlled_request_id, blocked_request_id);
+
+        let assert_exact_request_lifecycle =
+            |request_id: &str, method: &str, response_status: u64| {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| {
+                            event["session_id"] == client_a.0.to_string()
+                                && event["request_id"] == request_id
+                                && event["kind"]["type"] == "request_seen"
+                                && event["kind"]["method"] == method
+                        })
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| {
+                            event["session_id"] == client_a.0.to_string()
+                                && event["request_id"] == request_id
+                                && event["kind"]["type"] == "response_served"
+                                && event["kind"]["status"] == response_status
+                        })
+                        .count(),
+                    1
+                );
+            };
+        assert_exact_request_lifecycle(controlled_request_id, "POST", 202);
+        assert_exact_request_lifecycle(blocked_request_id, "GET", 403);
         assert!(!events.iter().any(|event| {
             event["session_id"] == client_b.0.to_string()
                 && event["kind"]["type"] == "policy_changed"
         }));
-        for linked_event in events.iter().filter(|event| {
-            event["session_id"] == client_a.0.to_string()
-                && matches!(
-                    event["kind"]["type"].as_str(),
-                    Some("bait_action_observed" | "policy_changed")
-                )
-        }) {
-            let request_id = linked_event["request_id"]
-                .as_str()
-                .expect("causal client A event should carry a request id");
-            assert!(events.iter().any(|event| {
-                event["session_id"] == client_a.0.to_string()
-                    && event["request_id"] == request_id
-                    && event["kind"]["type"] == "request_seen"
-            }));
-            assert!(events.iter().any(|event| {
-                event["session_id"] == client_a.0.to_string()
-                    && event["request_id"] == request_id
-                    && event["kind"]["type"] == "response_served"
-            }));
-        }
 
         let now = current_unix_secs();
         let mut restored_replay_state = ConsumedBaitProofStore::open_or_rebuild(
