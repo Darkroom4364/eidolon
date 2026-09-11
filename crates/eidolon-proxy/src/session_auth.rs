@@ -435,7 +435,7 @@ enum ContinuityInsertOutcome {
 }
 
 /// Issues, verifies, and recovers session identities.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionAuthority {
     keys: Vec<SessionKeyVersion>,
     active_key_version: u32,

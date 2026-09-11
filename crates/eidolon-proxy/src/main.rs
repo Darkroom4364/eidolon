@@ -70,6 +70,7 @@ use hyper::{
     http::uri::Authority,
     StatusCode,
 };
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -97,6 +98,7 @@ const MAX_BAIT_PROOF_TTL_SECS: u64 = 24 * 60 * 60;
 const BAIT_EXPOSURE_STATE_SCHEMA_VERSION: u16 = 1;
 const CONSUMED_PROOF_STATE_SCHEMA_VERSION: u16 = 1;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+const MAX_TRUSTED_INGRESS_SOURCE_CIDRS: usize = 32;
 const CONTROLLED_REALITY_WORKFLOW_LOCK_SHARDS: usize = 64;
 const CONTROLLED_REALITY_BACKEND_ENCODED_SECRET_BYTES: usize = 64;
 const CONTROLLED_REALITY_BACKEND_MAX_SECRET_FILE_BYTES: usize =
@@ -194,6 +196,20 @@ fn main() -> ExitCode {
                 }
             );
             println!(
+                "trusted_ingress_source_networks: count={}, ipv4={}, ipv6={}",
+                config.trusted_ingress_source_cidrs.len(),
+                config
+                    .trusted_ingress_source_cidrs
+                    .iter()
+                    .filter(|network| network.addr().is_ipv4())
+                    .count(),
+                config
+                    .trusted_ingress_source_cidrs
+                    .iter()
+                    .filter(|network| network.addr().is_ipv6())
+                    .count(),
+            );
+            println!(
                 "authenticated_ingress_continuity: {}",
                 if config.require_authenticated_ingress_continuity {
                     "required"
@@ -261,6 +277,7 @@ struct ProxyConfig {
     previous_ingress_transport_auth_secret_path: Option<PathBuf>,
     ingress_continuity_key_path: Option<PathBuf>,
     previous_ingress_continuity_key_path: Option<PathBuf>,
+    trusted_ingress_source_cidrs: Vec<IpNet>,
     require_authenticated_ingress_continuity: bool,
     trusted_bait_soften_path_prefixes: Vec<String>,
     intervention_control_path: PathBuf,
@@ -575,6 +592,20 @@ impl CliAction {
                         parse_previous_ingress_continuity_key_path(&value)?,
                     )?;
                 }
+                "--trusted-ingress-source-cidr" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    push_unique(
+                        &mut builder.trusted_ingress_source_cidrs,
+                        flag,
+                        parse_trusted_ingress_source_cidr(&value)?,
+                    )?;
+                    if builder.trusted_ingress_source_cidrs.len() > MAX_TRUSTED_INGRESS_SOURCE_CIDRS
+                    {
+                        return Err(ConfigError::new(format!(
+                            "`{flag}` accepts at most {MAX_TRUSTED_INGRESS_SOURCE_CIDRS} entries"
+                        )));
+                    }
+                }
                 "--require-authenticated-ingress-continuity" => {
                     if builder.require_authenticated_ingress_continuity {
                         return Err(ConfigError::new(format!("duplicate option `{flag}`")));
@@ -683,6 +714,7 @@ struct ConfigBuilder {
     previous_ingress_transport_auth_secret_path: Option<PathBuf>,
     ingress_continuity_key_path: Option<PathBuf>,
     previous_ingress_continuity_key_path: Option<PathBuf>,
+    trusted_ingress_source_cidrs: Vec<IpNet>,
     require_authenticated_ingress_continuity: bool,
     trusted_bait_soften_path_prefixes: Vec<String>,
     intervention_control_path: Option<PathBuf>,
@@ -729,6 +761,11 @@ impl ConfigBuilder {
             if self.ingress_continuity_key_path.is_none() {
                 return Err(ConfigError::new(
                     "`--profile production` requires `--ingress-continuity-key-file`; legacy transport-auth fallback is not allowed",
+                ));
+            }
+            if self.trusted_ingress_source_cidrs.is_empty() {
+                return Err(ConfigError::new(
+                    "`--profile production` requires at least one `--trusted-ingress-source-cidr`",
                 ));
             }
             // Both secrets are startup inputs. Their canonical/inode separation
@@ -949,6 +986,7 @@ impl ConfigBuilder {
                 .previous_ingress_transport_auth_secret_path,
             ingress_continuity_key_path: self.ingress_continuity_key_path,
             previous_ingress_continuity_key_path: self.previous_ingress_continuity_key_path,
+            trusted_ingress_source_cidrs: self.trusted_ingress_source_cidrs,
             require_authenticated_ingress_continuity: self.require_authenticated_ingress_continuity,
             trusted_bait_soften_path_prefixes: if self.trusted_bait_soften_path_prefixes.is_empty()
             {
@@ -1017,6 +1055,17 @@ fn effective_config_projection(config: &ProxyConfig) -> Value {
             "transport_auth_overlap": config.previous_ingress_transport_auth_secret_path.is_some(),
             "continuity_key": config.ingress_continuity_key_path.is_some(),
             "continuity_key_overlap": config.previous_ingress_continuity_key_path.is_some(),
+            "trusted_source_networks": {
+                "count": config.trusted_ingress_source_cidrs.len(),
+                "ipv4": config
+                    .trusted_ingress_source_cidrs
+                    .iter()
+                    .any(|network| network.addr().is_ipv4()),
+                "ipv6": config
+                    .trusted_ingress_source_cidrs
+                    .iter()
+                    .any(|network| network.addr().is_ipv6()),
+            },
             "authenticated_continuity_required": config.require_authenticated_ingress_continuity,
         },
         "state": {
@@ -1416,6 +1465,38 @@ fn parse_ingress_continuity_key_path(raw: &str) -> Result<PathBuf, ConfigError> 
 
 fn parse_previous_ingress_continuity_key_path(raw: &str) -> Result<PathBuf, ConfigError> {
     parse_ingress_continuity_key_path_with_label(raw, "previous ingress continuity key")
+}
+
+fn parse_trusted_ingress_source_cidr(raw: &str) -> Result<IpNet, ConfigError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(ConfigError::new(
+            "trusted ingress source CIDR must not be empty",
+        ));
+    }
+    if !raw.contains('/') {
+        return Err(ConfigError::new(
+            "trusted ingress source CIDR requires an explicit prefix length",
+        ));
+    }
+    let network = raw.parse::<IpNet>().map_err(|error| {
+        ConfigError::new(format!("trusted ingress source CIDR is invalid: {error}"))
+    })?;
+    if matches!(
+        network.addr(),
+        IpAddr::V6(address) if address.to_ipv4_mapped().is_some()
+    ) {
+        return Err(ConfigError::new(
+            "trusted ingress source CIDR must use the equivalent IPv4 network instead of IPv4-mapped IPv6",
+        ));
+    }
+    let network = network.trunc();
+    if network.prefix_len() == 0 {
+        return Err(ConfigError::new(
+            "trusted ingress source CIDR must not trust a universal /0 network",
+        ));
+    }
+    Ok(network)
 }
 
 fn parse_ingress_continuity_key_path_with_label(
@@ -2234,6 +2315,7 @@ fn run_proxy_with_shutdown(
         previous_ingress_transport_auth_secret,
         ingress_continuity_key,
         previous_ingress_continuity_key,
+        trusted_ingress_source_cidrs: config.trusted_ingress_source_cidrs.clone(),
         require_authenticated_ingress_continuity: config.require_authenticated_ingress_continuity,
         bait_signing_secret: bait_signing_secret.clone(),
         trusted_bait_soften_path_prefixes: config.trusted_bait_soften_path_prefixes,
@@ -2279,6 +2361,17 @@ fn run_proxy_with_shutdown(
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
             "ingress_continuity_key_mode": ingress_continuity_key_mode,
             "ingress_continuity_key_overlap": runtime.previous_ingress_continuity_key.is_some(),
+            "trusted_ingress_source_networks": {
+                "count": runtime.trusted_ingress_source_cidrs.len(),
+                "ipv4": runtime
+                    .trusted_ingress_source_cidrs
+                    .iter()
+                    .any(|network| network.addr().is_ipv4()),
+                "ipv6": runtime
+                    .trusted_ingress_source_cidrs
+                    .iter()
+                    .any(|network| network.addr().is_ipv6()),
+            },
             "continuity_mode": if runtime.require_authenticated_ingress_continuity {
                 "authenticated_ingress_required"
             } else {
@@ -2627,6 +2720,7 @@ struct ProxyRuntime {
     previous_ingress_transport_auth_secret: Option<Arc<str>>,
     ingress_continuity_key: Option<Arc<str>>,
     previous_ingress_continuity_key: Option<Arc<str>>,
+    trusted_ingress_source_cidrs: Vec<IpNet>,
     require_authenticated_ingress_continuity: bool,
     bait_signing_secret: Option<Arc<str>>,
     trusted_bait_soften_path_prefixes: Vec<String>,
@@ -5665,6 +5759,8 @@ fn maybe_transition_to_blocked_from_reality_escape_attempt(
 fn session_continuity_rejection() -> HttpResponse {
     let mut response =
         surface_response_to_http(surface_text_response(400, "invalid ingress continuity\n"));
+    response.set_header("Cache-Control", "no-store");
+    response.set_header("Pragma", "no-cache");
     response.set_header("Connection", "close");
     response.set_header("Content-Length", response.body.len().to_string());
     response
@@ -7197,6 +7293,31 @@ fn controlled_reality_semantics_sha256(
     Ok(Sha256::digest(serialized).into())
 }
 
+fn normalized_trusted_ingress_peer_ip(peer_ip: IpAddr) -> IpAddr {
+    match peer_ip {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        address => address,
+    }
+}
+
+fn trusted_ingress_source_allowed(
+    trusted_source_cidrs: &[IpNet],
+    client_peer_ip: Option<IpAddr>,
+) -> bool {
+    if trusted_source_cidrs.is_empty() {
+        return true;
+    }
+    let Some(client_peer_ip) = client_peer_ip.map(normalized_trusted_ingress_peer_ip) else {
+        return false;
+    };
+    trusted_source_cidrs
+        .iter()
+        .any(|network| network.contains(&client_peer_ip))
+}
+
 fn effective_session_context(
     runtime: &ProxyRuntime,
     request: &HttpRequest,
@@ -7210,7 +7331,34 @@ fn effective_session_context(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
-    let trusted_ingress_keys =
+    let trusted_ingress_source_allowed =
+        trusted_ingress_source_allowed(&runtime.trusted_ingress_source_cidrs, client_peer_ip);
+    if runtime.require_authenticated_ingress_continuity && !trusted_ingress_source_allowed {
+        write_debug(
+            runtime,
+            "session_continuity_rejected",
+            None,
+            json!({
+                "request_id": request_id.0,
+                "reason": "untrusted_ingress_source",
+                "trusted_source_network_count": runtime.trusted_ingress_source_cidrs.len(),
+            }),
+        )?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "trusted ingress continuity rejected: untrusted_ingress_source",
+        ));
+    }
+    let trusted_ingress_headers = if trusted_ingress_source_allowed {
+        headers.clone()
+    } else {
+        headers
+            .iter()
+            .copied()
+            .filter(|(name, _)| !name.to_ascii_lowercase().starts_with("x-eidolon-ingress-"))
+            .collect()
+    };
+    let trusted_ingress_keys = if trusted_ingress_source_allowed {
         runtime
             .ingress_transport_auth_secret
             .as_deref()
@@ -7224,7 +7372,10 @@ fn effective_session_context(
                         .unwrap_or(active_transport_auth_secret),
                     runtime.previous_ingress_continuity_key.as_deref(),
                 )
-            });
+            })
+    } else {
+        None
+    };
     let session_resolution = {
         let mut authority = runtime
             .session_authority
@@ -7232,7 +7383,7 @@ fn effective_session_context(
             .map_err(|_| io::Error::other("session authority lock poisoned"))?;
         session::derive_session_from_headers_with_trusted_ingress_continuity_key(
             &mut authority,
-            headers.iter().copied(),
+            trusted_ingress_headers.iter().copied(),
             client_peer_ip,
             now_unix_secs,
             trusted_ingress_keys,
@@ -7282,12 +7433,12 @@ fn effective_session_context(
     )?;
     session.ingress_identity =
         session::authenticated_ingress_identity_from_headers_with_trusted_keys(
-            headers.iter().copied(),
+            trusted_ingress_headers.iter().copied(),
             trusted_ingress_keys,
         );
     session.ingress_signals =
         session::authenticated_ingress_advisory_signals_from_headers_with_trusted_keys(
-            headers.iter().copied(),
+            trusted_ingress_headers.iter().copied(),
             trusted_ingress_keys,
         );
     let local_trust_evaluation = runtime.ingress_identity_resolver.evaluate(
@@ -7295,7 +7446,7 @@ fn effective_session_context(
         &surface_request.path,
         request_host.as_deref(),
         client_peer_ip,
-        headers.iter().copied(),
+        trusted_ingress_headers.iter().copied(),
     );
     session.local_ingress_trust_scope_rejection = local_trust_evaluation.scope_rejection;
     let local_trust = local_trust_evaluation.resolved;
@@ -8398,6 +8549,11 @@ Options:
                          Optional one-key migration overlap for durable ingress
                          continuity. Returning prior-key bindings are durably
                          re-keyed before use; requires the active continuity key
+  --trusted-ingress-source-cidr <CIDR>
+                         Repeatable direct TCP peer network authorized to supply
+                         trusted ingress transport, continuity, identity, and
+                         advisory headers [max: {MAX_TRUSTED_INGRESS_SOURCE_CIDRS}].
+                         Production requires at least one non-universal network
   --require-authenticated-ingress-continuity
                          Require one valid transport-auth and continuity header
                          pair on every request. Requires the transport secret
@@ -8683,6 +8839,7 @@ mod tests {
             previous_ingress_transport_auth_secret: None,
             ingress_continuity_key: None,
             previous_ingress_continuity_key: None,
+            trusted_ingress_source_cidrs: Vec::new(),
             require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
@@ -8742,6 +8899,7 @@ mod tests {
             previous_ingress_transport_auth_secret: None,
             ingress_continuity_key: None,
             previous_ingress_continuity_key: None,
+            trusted_ingress_source_cidrs: Vec::new(),
             require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
@@ -8784,6 +8942,7 @@ mod tests {
             previous_ingress_transport_auth_secret: None,
             ingress_continuity_key: None,
             previous_ingress_continuity_key: None,
+            trusted_ingress_source_cidrs: Vec::new(),
             require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
@@ -8828,6 +8987,7 @@ mod tests {
             previous_ingress_transport_auth_secret: None,
             ingress_continuity_key: None,
             previous_ingress_continuity_key: None,
+            trusted_ingress_source_cidrs: Vec::new(),
             require_authenticated_ingress_continuity: false,
             bait_signing_secret,
             trusted_bait_soften_path_prefixes: default_trusted_bait_soften_path_prefixes(),
@@ -9266,6 +9426,14 @@ mod tests {
 
     fn run_production_runtime_request(runtime: ProxyRuntime, request: &[u8]) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").expect("production proxy should bind");
+        run_production_runtime_request_with_listener(runtime, request, listener)
+    }
+
+    fn run_production_runtime_request_with_listener(
+        runtime: ProxyRuntime,
+        request: &[u8],
+        listener: TcpListener,
+    ) -> Vec<u8> {
         let addr = listener
             .local_addr()
             .expect("production proxy should have address");
@@ -9327,6 +9495,7 @@ mod tests {
 
     struct BoundedControlledRealityBackend {
         address: SocketAddr,
+        accepted_connections: Arc<AtomicUsize>,
         shutdown: mpsc::Sender<()>,
         handle: JoinHandle<()>,
     }
@@ -9341,11 +9510,14 @@ mod tests {
                 .local_addr()
                 .expect("renderer listener should have an address");
             let (shutdown, shutdown_received) = mpsc::channel();
+            let accepted_connections = Arc::new(AtomicUsize::new(0));
+            let thread_accepted_connections = Arc::clone(&accepted_connections);
             let handle = thread::spawn(move || {
                 let replay_cache = ControlledRealityBackendReplayCache::new();
                 loop {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            thread_accepted_connections.fetch_add(1, Ordering::SeqCst);
                             let _ = serve_render_connection(
                                 stream,
                                 &test_controlled_reality_backend_secret(),
@@ -9366,9 +9538,14 @@ mod tests {
             });
             Self {
                 address,
+                accepted_connections,
                 shutdown,
                 handle,
             }
+        }
+
+        fn accepted_connection_count(&self) -> usize {
+            self.accepted_connections.load(Ordering::SeqCst)
         }
 
         fn stop(self) {
@@ -9433,6 +9610,8 @@ mod tests {
                 path_str(&transport_secret, "transport secret path should be UTF-8").to_string(),
                 "--ingress-continuity-key-file".to_string(),
                 path_str(&continuity_key, "continuity key path should be UTF-8").to_string(),
+                "--trusted-ingress-source-cidr".to_string(),
+                "127.0.0.1/32".to_string(),
                 "--require-authenticated-ingress-continuity".to_string(),
                 "--controlled-reality-backend-addr".to_string(),
                 renderer.address.to_string(),
@@ -9939,6 +10118,7 @@ mod tests {
         assert_eq!(config.previous_ingress_transport_auth_secret_path, None);
         assert_eq!(config.ingress_continuity_key_path, None);
         assert_eq!(config.previous_ingress_continuity_key_path, None);
+        assert!(config.trusted_ingress_source_cidrs.is_empty());
         assert!(!config.require_authenticated_ingress_continuity);
         assert_eq!(
             config.trusted_bait_soften_path_prefixes,
@@ -9972,6 +10152,96 @@ mod tests {
     }
 
     #[test]
+    fn trusted_ingress_source_cidrs_are_normalized_bounded_and_non_universal() {
+        assert_eq!(
+            parse_trusted_ingress_source_cidr(" 10.23.45.67/8 ")
+                .expect("IPv4 CIDR should parse")
+                .to_string(),
+            "10.0.0.0/8"
+        );
+        assert_eq!(
+            parse_trusted_ingress_source_cidr("2001:db8:1::1234/32")
+                .expect("IPv6 CIDR should parse")
+                .to_string(),
+            "2001:db8::/32"
+        );
+        for (raw, expected) in [
+            ("", "must not be empty"),
+            ("127.0.0.1", "explicit prefix length"),
+            ("not-a-network/24", "is invalid"),
+            ("0.0.0.0/0", "universal /0"),
+            ("::/0", "universal /0"),
+            ("::ffff:127.0.0.1/128", "equivalent IPv4 network"),
+        ] {
+            let error = parse_trusted_ingress_source_cidr(raw)
+                .expect_err("invalid trusted ingress source CIDR must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error for {raw:?}: {error}"
+            );
+        }
+
+        assert_error_contains(
+            &[
+                "--trusted-ingress-source-cidr",
+                "10.0.0.1/8",
+                "--trusted-ingress-source-cidr",
+                "10.255.255.255/8",
+            ],
+            "duplicate option",
+        );
+
+        let mut at_limit = Vec::new();
+        for suffix in 1..=MAX_TRUSTED_INGRESS_SOURCE_CIDRS {
+            at_limit.push("--trusted-ingress-source-cidr".to_string());
+            at_limit.push(format!("192.0.2.{suffix}/32"));
+        }
+        let at_limit = at_limit.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            run_config(&at_limit)
+                .expect("the documented maximum source-network count should parse")
+                .trusted_ingress_source_cidrs
+                .len(),
+            MAX_TRUSTED_INGRESS_SOURCE_CIDRS
+        );
+
+        let mut over_limit = at_limit
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        over_limit.push("--trusted-ingress-source-cidr".to_string());
+        over_limit.push("192.0.2.33/32".to_string());
+        let over_limit = over_limit.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_error_contains(&over_limit, "accepts at most 32 entries");
+    }
+
+    #[test]
+    fn trusted_ingress_source_matching_uses_only_normalized_direct_peer() {
+        let networks = vec![
+            "127.0.0.0/8".parse::<IpNet>().unwrap(),
+            "2001:db8::/32".parse::<IpNet>().unwrap(),
+        ];
+        assert!(trusted_ingress_source_allowed(
+            &networks,
+            Some("127.1.2.3".parse().unwrap())
+        ));
+        assert!(trusted_ingress_source_allowed(
+            &networks,
+            Some("::ffff:127.1.2.3".parse().unwrap())
+        ));
+        assert!(trusted_ingress_source_allowed(
+            &networks,
+            Some("2001:db8::42".parse().unwrap())
+        ));
+        assert!(!trusted_ingress_source_allowed(
+            &networks,
+            Some("192.0.2.10".parse().unwrap())
+        ));
+        assert!(!trusted_ingress_source_allowed(&networks, None));
+        assert!(trusted_ingress_source_allowed(&[], None));
+    }
+
+    #[test]
     fn production_profile_requires_explicit_fail_closed_dependencies_and_prints_redacted_config() {
         let session_key = write_session_signing_key();
         let transport_secret = write_ingress_transport_auth_secret("transport-secret");
@@ -9994,6 +10264,8 @@ mod tests {
             path_str(&transport_secret, "transport secret path should be UTF-8"),
             "--ingress-continuity-key-file",
             path_str(&continuity_key, "continuity key path should be UTF-8"),
+            "--trusted-ingress-source-cidr",
+            "127.0.0.1/32",
             "--require-authenticated-ingress-continuity",
             "--event-log",
             path_str(&event_log, "event path should be UTF-8"),
@@ -10011,6 +10283,10 @@ mod tests {
         let config = run_config(&args).expect("complete production config should parse");
         assert_eq!(config.profile, RuntimeProfile::Production);
         assert!(config.require_authenticated_ingress_continuity);
+        assert_eq!(
+            config.trusted_ingress_source_cidrs,
+            vec!["127.0.0.1/32".parse::<IpNet>().unwrap()]
+        );
         assert!(config.debug_log_path.is_some());
         assert!(config.controlled_reality_backend.is_some());
 
@@ -10028,6 +10304,7 @@ mod tests {
         assert_eq!(effective["session"]["signing_key"], "configured");
         assert_eq!(effective["session"]["cookie_policy"], "production");
         assert_eq!(effective["ingress"]["transport_auth_overlap"], false);
+        assert_eq!(effective["ingress"]["trusted_source_networks"]["count"], 1);
         assert_eq!(effective["controlled_reality_renderer"], "remote");
         for sensitive in [
             path_str(&session_key, "session key path should be UTF-8"),
@@ -10040,6 +10317,7 @@ mod tests {
             path_str(&intervention_control, "control path should be UTF-8"),
             "transport-secret",
             "continuity-key",
+            "127.0.0.1/32",
             "3031323334353637",
         ] {
             assert!(
@@ -10047,6 +10325,27 @@ mod tests {
                 "effective config leaked `{sensitive}`"
             );
         }
+
+        let mut ipv6_print_args = args.clone();
+        let source_cidr_index = ipv6_print_args
+            .iter()
+            .position(|value| *value == "--trusted-ingress-source-cidr")
+            .expect("production config should contain a trusted source CIDR");
+        ipv6_print_args[source_cidr_index + 1] = "2001:db8::/32";
+        ipv6_print_args.push("--print-effective-config");
+        let action = CliAction::from_args(ipv6_print_args)
+            .expect("IPv6 production effective config should parse");
+        let CliAction::PrintEffectiveConfig(config) = action else {
+            panic!("IPv6 effective config should not start the runtime");
+        };
+        let ipv6_output = effective_config_output(&config);
+        let ipv6_effective: Value =
+            serde_json::from_str(&ipv6_output).expect("IPv6 effective config should be JSON");
+        assert_eq!(
+            ipv6_effective["ingress"]["trusted_source_networks"],
+            json!({"count": 1, "ipv4": false, "ipv6": true})
+        );
+        assert!(!ipv6_output.contains("2001:db8::/32"));
 
         fn without_value_option<'a>(args: &[&'a str], flag: &str) -> Vec<&'a str> {
             let mut missing = args.to_vec();
@@ -10070,6 +10369,10 @@ mod tests {
             (
                 "--ingress-continuity-key-file",
                 "requires `--ingress-continuity-key-file`",
+            ),
+            (
+                "--trusted-ingress-source-cidr",
+                "requires at least one `--trusted-ingress-source-cidr`",
             ),
             ("--event-log", "requires an explicit `--event-log`"),
             ("--policy-state", "requires an explicit `--policy-state`"),
@@ -10753,6 +11056,11 @@ mod tests {
                     "transport_auth_overlap": false,
                     "continuity_key": true,
                     "continuity_key_overlap": false,
+                    "trusted_source_networks": {
+                        "count": 1,
+                        "ipv4": true,
+                        "ipv6": false,
+                    },
                     "authenticated_continuity_required": true,
                 },
                 "state": {
@@ -10778,6 +11086,10 @@ mod tests {
                 "effective config leaked a supplied filesystem path"
             );
         }
+        assert!(
+            !output.contains("127.0.0.1/32"),
+            "effective config leaked the trusted ingress CIDR"
+        );
 
         fixture.stop();
     }
@@ -11337,6 +11649,10 @@ mod tests {
             CliAction::from_args(["--help", "--listen-addr", "0.0.0.0:8080"]),
             Ok(CliAction::Help)
         );
+        let help = usage();
+        assert!(help.contains("--trusted-ingress-source-cidr <CIDR>"));
+        assert!(help.contains("[max: 32]"));
+        assert!(help.contains("Production requires at least one non-universal network"));
         assert_eq!(
             CliAction::from_args(["-h", "--listen-addr", "0.0.0.0:8080"]),
             Ok(CliAction::Help)
@@ -12506,6 +12822,452 @@ mod tests {
     }
 
     #[test]
+    fn runtime_rejects_valid_ingress_credentials_from_untrusted_direct_peers_before_effects() {
+        let event_log = unique_temp_path("untrusted-ingress-source-events.jsonl");
+        let debug_log = unique_temp_path("untrusted-ingress-source-debug.jsonl");
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let mut runtime = test_runtime_with_m1_controller_and_debug_log(
+            upstream,
+            &event_log,
+            &debug_log,
+            unique_temp_path("untrusted-ingress-source-control.txt"),
+        );
+        runtime.audit_projection = AuditProjection::Production;
+        runtime.ingress_transport_auth_secret = Some(Arc::from("active-transport-secret"));
+        runtime.previous_ingress_transport_auth_secret =
+            Some(Arc::from("previous-transport-secret"));
+        runtime.ingress_continuity_key = Some(Arc::from("active-continuity-key"));
+        runtime.previous_ingress_continuity_key = Some(Arc::from("previous-continuity-key"));
+        runtime.trusted_ingress_source_cidrs = vec!["10.0.0.0/8".parse().unwrap()];
+        runtime.require_authenticated_ingress_continuity = true;
+        let seeded_session = SessionId::new();
+        let seeded_cookie = format!("eidolon_session={}", minted_cookie_value(seeded_session));
+        {
+            let mut authority = runtime.session_authority.lock().expect("session authority");
+            let seeded = session::derive_session_from_headers_with_trusted_ingress_continuity_key(
+                &mut authority,
+                [
+                    (session::COOKIE_HEADER_NAME, seeded_cookie.as_str()),
+                    (
+                        session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        "active-transport-secret",
+                    ),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
+                ],
+                Some("127.0.0.1".parse().unwrap()),
+                now_unix_secs(),
+                Some(session::TrustedIngressContinuityKeys::new(
+                    "active-transport-secret",
+                    "previous-continuity-key",
+                )),
+                true,
+                false,
+            )
+            .expect("previous-key authority fixture should seed");
+            assert_eq!(seeded.session_id, seeded_session);
+        }
+        let session_authority_before = runtime
+            .session_authority
+            .lock()
+            .expect("session authority")
+            .clone();
+        let policy_records_before = runtime.policy_store.lock().expect("policy store").len();
+        let exposure_records_before = runtime.bait_exposures.lock().expect("exposure store").len();
+        let consumed_records_before = runtime
+            .consumed_bait_proofs
+            .lock()
+            .expect("proof store")
+            .consumed
+            .len();
+
+        for (transport_secret, peer) in [
+            (
+                "active-transport-secret",
+                Some("127.0.0.1:41001".parse::<SocketAddr>().unwrap()),
+            ),
+            (
+                "previous-transport-secret",
+                Some("127.0.0.1:41002".parse::<SocketAddr>().unwrap()),
+            ),
+            ("active-transport-secret", None),
+        ] {
+            let raw_request = request_with_cookie_exact(
+                "GET",
+                "/ordinary",
+                &cookie_header(),
+                &[
+                    (
+                        session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        transport_secret,
+                    ),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
+                    ("x-EiDoLoN-InGrEsS-Identity-Source", "verified_bot"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
+                    ("X-Forwarded-For", "10.23.45.67"),
+                ],
+            );
+            let request = read_http_request(&mut raw_request.as_slice())
+                .expect("request should parse")
+                .expect("request should exist");
+            let response = process_request(&runtime, request, peer, UpstreamTransport::Lab)
+                .expect("source rejection should produce a response");
+
+            assert_eq!(response.status, 400);
+            assert_eq!(response.body, b"invalid ingress continuity\n");
+            assert_eq!(header_values(&response, "cache-control"), vec!["no-store"]);
+            assert_eq!(header_values(&response, "pragma"), vec!["no-cache"]);
+            assert!(header_values(&response, "set-cookie").is_empty());
+        }
+
+        let header_controls = [
+            vec![
+                (session::INGRESS_TRANSPORT_AUTH_HEADER_NAME, "wrong-secret"),
+                (
+                    session::INGRESS_CONTINUITY_HEADER_NAME,
+                    TEST_INGRESS_CONTINUITY_ID,
+                ),
+                ("X-Forwarded-For", "10.23.45.67"),
+            ],
+            vec![
+                (
+                    session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                    "active-transport-secret",
+                ),
+                (
+                    session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                    "previous-transport-secret",
+                ),
+                (
+                    session::INGRESS_CONTINUITY_HEADER_NAME,
+                    TEST_INGRESS_CONTINUITY_ID,
+                ),
+                (
+                    session::INGRESS_CONTINUITY_HEADER_NAME,
+                    "other_client_0123456789abcdef",
+                ),
+                ("X-Forwarded-For", "10.23.45.67"),
+            ],
+        ];
+        for headers in &header_controls {
+            let raw_request =
+                request_with_cookie_exact("GET", "/ordinary", &cookie_header(), headers);
+            let request = read_http_request(&mut raw_request.as_slice())
+                .expect("request should parse")
+                .expect("request should exist");
+            let response = process_request(
+                &runtime,
+                request,
+                Some("127.0.0.1:41004".parse().unwrap()),
+                UpstreamTransport::Lab,
+            )
+            .expect("source rejection should precede ingress header parsing");
+            assert_eq!(response.status, 400);
+            assert!(header_values(&response, "set-cookie").is_empty());
+        }
+
+        assert_eq!(
+            runtime.policy_store.lock().expect("policy store").len(),
+            policy_records_before
+        );
+        assert_eq!(
+            runtime.bait_exposures.lock().expect("exposure store").len(),
+            exposure_records_before
+        );
+        assert_eq!(
+            runtime
+                .consumed_bait_proofs
+                .lock()
+                .expect("proof store")
+                .consumed
+                .len(),
+            consumed_records_before
+        );
+        let session_authority_after = runtime
+            .session_authority
+            .lock()
+            .expect("session authority")
+            .clone();
+        assert_eq!(
+            session_authority_after, session_authority_before,
+            "source rejection mutated in-memory session authority"
+        );
+        assert!(event_values(&event_log).is_empty());
+        assert!(
+            recorder.finish().is_empty(),
+            "untrusted direct peer reached protected upstream"
+        );
+        let debug = debug_values(&debug_log);
+        assert_eq!(debug.len(), 5);
+        assert!(debug.iter().all(|entry| {
+            entry["event"] == "session_continuity_rejected"
+                && entry["fields"]["reason"] == "untrusted_ingress_source"
+                && entry["fields"]["trusted_source_network_count"] == 1
+        }));
+        let durable_debug = debug.iter().map(Value::to_string).collect::<String>();
+        for sensitive in [
+            "127.0.0.1",
+            "10.0.0.0/8",
+            "10.23.45.67",
+            "active-transport-secret",
+            "previous-transport-secret",
+            "wrong-secret",
+            "test_client_0123456789abcdef",
+            "other_client_0123456789abcdef",
+            "verified_bot",
+        ] {
+            assert!(
+                !durable_debug.contains(sensitive),
+                "source rejection debug leaked {sensitive}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_allows_trusted_ingress_credentials_from_matching_direct_peer() {
+        let event_log = unique_temp_path("allowed-ingress-source-events.jsonl");
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"ordinary_upstream"}"#)]);
+        let mut runtime = test_runtime(
+            upstream,
+            &event_log,
+            unique_temp_path("allowed-ingress-source-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::from("transport-secret"));
+        runtime.ingress_continuity_key = Some(Arc::from("continuity-key"));
+        runtime.trusted_ingress_source_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
+        runtime.require_authenticated_ingress_continuity = true;
+        let raw_request = authenticated_production_request_without_cookie(
+            "GET",
+            "/ordinary",
+            TEST_INGRESS_CONTINUITY_ID,
+            &[],
+        );
+        let request = read_http_request(&mut raw_request.as_slice())
+            .expect("request should parse")
+            .expect("request should exist");
+
+        let response = process_request(
+            &runtime,
+            request,
+            Some("127.0.0.1:41003".parse().unwrap()),
+            UpstreamTransport::Lab,
+        )
+        .expect("allowed source should be processed");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, br#"{"mode":"ordinary_upstream"}"#);
+        assert_eq!(header_values(&response, "set-cookie").len(), 1);
+        assert_eq!(recorder.finish().len(), 1);
+    }
+
+    #[test]
+    fn lab_source_cidr_gates_all_trusted_ingress_inputs_and_preserves_peer_mode() {
+        let event_log = unique_temp_path("lab-untrusted-ingress-source-events.jsonl");
+        let (upstream, recorder) = spawn_recording_upstream([
+            json_response(r#"{"mode":"seed_peer"}"#),
+            json_response(r#"{"mode":"disallowed_active"}"#),
+            json_response(r#"{"mode":"disallowed_previous"}"#),
+            json_response(r#"{"mode":"allowed_active"}"#),
+            json_response(r#"{"mode":"allowed_previous"}"#),
+        ]);
+        let mut runtime = test_runtime(
+            upstream,
+            &event_log,
+            unique_temp_path("lab-untrusted-ingress-source-control.txt"),
+            SurfaceAction::ProtectedUpstream,
+        );
+        runtime.ingress_transport_auth_secret = Some(Arc::from("active-transport-secret"));
+        runtime.previous_ingress_transport_auth_secret =
+            Some(Arc::from("previous-transport-secret"));
+        runtime.trusted_ingress_source_cidrs = vec!["10.0.0.0/8".parse().unwrap()];
+        let config_path = write_ingress_trust_config(
+            r#"{
+              "schema_version": 1,
+              "entries": [
+                {
+                  "label": "reserved-header-local-rule",
+                  "source": "verified_bot",
+                  "trust_tier": "edge_verified",
+                  "methods": ["GET"],
+                  "path_prefixes": ["/ordinary"],
+                  "required_headers": [
+                    {
+                      "name": "X-Eidolon-Ingress-Identity-Source",
+                      "value": "verified_bot"
+                    }
+                  ]
+                }
+              ]
+            }"#,
+        );
+        runtime.ingress_identity_resolver = Arc::new(must_ok(
+            ingress_identity::load_ingress_identity_resolver(&config_path),
+            "reserved-header local trust fixture should load",
+        ));
+        let peer_session = SessionId::new();
+        let peer_cookie = format!("eidolon_session={}", minted_cookie_value(peer_session));
+        let seed_peer_request = request_with_cookie_exact("GET", "/ordinary", &peer_cookie, &[]);
+        let seed_peer_request = read_http_request(&mut seed_peer_request.as_slice())
+            .expect("peer seed request should parse")
+            .expect("peer seed request should exist");
+        let seed_peer_response = process_request(
+            &runtime,
+            seed_peer_request,
+            Some("127.0.0.1:41005".parse().unwrap()),
+            UpstreamTransport::Lab,
+        )
+        .expect("peer seed request should be processed");
+        assert_eq!(seed_peer_response.status, 200);
+        assert!(header_values(&seed_peer_response, "set-cookie").is_empty());
+
+        let cookie_session = SessionId::new();
+        let cookie = format!("eidolon_session={}", minted_cookie_value(cookie_session));
+
+        for (transport_secret, request_cookie, peer, recovered_session) in [
+            (
+                "active-transport-secret",
+                "eidolon_session=malformed",
+                "127.0.0.1:41005",
+                Some(peer_session),
+            ),
+            (
+                "previous-transport-secret",
+                cookie.as_str(),
+                "127.0.0.1:41007",
+                None,
+            ),
+        ] {
+            let raw_request = request_with_cookie_exact(
+                "GET",
+                "/ordinary",
+                request_cookie,
+                &[
+                    (
+                        session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        transport_secret,
+                    ),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
+                    ("x-EiDoLoN-InGrEsS-Identity-Source", "verified_bot"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
+                    (
+                        session::INGRESS_VERIFICATION_STRENGTH_HEADER_NAME,
+                        "cryptographic",
+                    ),
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
+                    (session::INGRESS_EDGE_ACTION_HEADER_NAME, "allow"),
+                    ("X-Forwarded-For", "10.23.45.67"),
+                ],
+            );
+            let request = read_http_request(&mut raw_request.as_slice())
+                .expect("request should parse")
+                .expect("request should exist");
+            let response = process_request(
+                &runtime,
+                request,
+                Some(peer.parse().unwrap()),
+                UpstreamTransport::Lab,
+            )
+            .expect("disallowed Lab ingress input should preserve peer mode");
+            assert_eq!(response.status, 200);
+            match recovered_session {
+                Some(expected) => assert_eq!(response_session_id(&response), expected),
+                None => assert!(header_values(&response, "set-cookie").is_empty()),
+            }
+        }
+
+        runtime.trusted_ingress_source_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
+        let allowed_session = SessionId::new();
+        let allowed_cookie = format!("eidolon_session={}", minted_cookie_value(allowed_session));
+        for transport_secret in ["active-transport-secret", "previous-transport-secret"] {
+            let raw_request = request_with_cookie_exact(
+                "GET",
+                "/ordinary",
+                &allowed_cookie,
+                &[
+                    (
+                        session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        transport_secret,
+                    ),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        "allowed_client_0123456789abcdef",
+                    ),
+                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "verified_bot"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
+                    (
+                        session::INGRESS_VERIFICATION_STRENGTH_HEADER_NAME,
+                        "cryptographic",
+                    ),
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
+                    (session::INGRESS_EDGE_ACTION_HEADER_NAME, "allow"),
+                ],
+            );
+            let request = read_http_request(&mut raw_request.as_slice())
+                .expect("allowed request should parse")
+                .expect("allowed request should exist");
+            let response = process_request(
+                &runtime,
+                request,
+                Some("127.0.0.1:41006".parse().unwrap()),
+                UpstreamTransport::Lab,
+            )
+            .expect("allowed Lab ingress input should be processed");
+            assert_eq!(response.status, 200);
+        }
+
+        let request_events = event_values(&event_log)
+            .into_iter()
+            .filter(|event| event["kind"]["type"] == "request_seen")
+            .collect::<Vec<_>>();
+        assert_eq!(request_events.len(), 5);
+        assert_eq!(request_events[0]["session_id"], peer_session.0.to_string());
+        assert_eq!(request_events[1]["session_id"], peer_session.0.to_string());
+        assert_eq!(
+            request_events[2]["session_id"],
+            cookie_session.0.to_string()
+        );
+        for request_seen in &request_events[..3] {
+            assert_eq!(request_seen["kind"]["ingress_identity"]["source"], "none");
+            assert!(request_seen["kind"]["ingress_signals"].is_null());
+        }
+        for allowed in &request_events[3..] {
+            assert_eq!(allowed["session_id"], allowed_session.0.to_string());
+            assert_eq!(
+                allowed["kind"]["ingress_identity"]["source"],
+                "verified_bot"
+            );
+            assert_eq!(
+                allowed["kind"]["ingress_identity"]["label"],
+                "reserved-header-local-rule"
+            );
+            assert_eq!(
+                allowed["kind"]["ingress_signals"]["verification_strength"],
+                "cryptographic"
+            );
+            assert_eq!(
+                allowed["kind"]["ingress_signals"]["actor_kind"],
+                "agentic_browser"
+            );
+            assert_eq!(allowed["kind"]["ingress_signals"]["vendor_score"], 12);
+            assert_eq!(allowed["kind"]["ingress_signals"]["edge_action"], "allow");
+        }
+        assert_eq!(recorder.finish().len(), 5);
+    }
+
+    #[test]
     fn runtime_rejects_retired_transport_secret_with_stable_continuity_key() {
         let event_log = unique_temp_path("retired-transport-events.jsonl");
         let (upstream, recorder) =
@@ -13441,6 +14203,176 @@ mod tests {
     }
 
     #[test]
+    fn production_listener_rejects_valid_ingress_credentials_from_disallowed_peer_network() {
+        let bait_profile = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, recorder) =
+            spawn_recording_upstream([json_response(r#"{"mode":"unexpected_upstream"}"#)]);
+        let mut fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &bait_profile,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let source_cidr_index = fixture
+            .args
+            .iter()
+            .position(|value| value == "--trusted-ingress-source-cidr")
+            .expect("production fixture should configure a trusted ingress source");
+        fixture.args[source_cidr_index + 1] = "10.0.0.0/8".to_string();
+        let previous_transport = write_ingress_transport_auth_secret("previous-transport-secret");
+        fixture.args.extend([
+            "--previous-ingress-transport-auth-secret-file".to_string(),
+            path_str(
+                &previous_transport,
+                "previous transport path should be UTF-8",
+            )
+            .to_string(),
+        ]);
+        fixture.supplied_paths.push(previous_transport);
+        fixture
+            .supplied_secrets
+            .push("previous-transport-secret".to_string());
+
+        let durable_paths = [
+            fixture.event_log_path.clone(),
+            sidecar_state_path(&fixture.event_log_path, ".exposures.json"),
+            sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json"),
+            fixture.policy_state_path.clone(),
+            sidecar_state_path(&fixture.policy_state_path, ".continuity.json"),
+        ];
+        let server = start_production_profile_server(fixture);
+        let read_optional = |state_path: &Path| match fs::read(state_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => panic!("durable state snapshot should read: {error}"),
+        };
+        let state_before = durable_paths
+            .iter()
+            .map(|state_path| read_optional(state_path))
+            .collect::<Vec<_>>();
+
+        for transport_secret in ["transport-secret", "previous-transport-secret"] {
+            let response = parse_downstream_response(&production_profile_request(
+                server.address,
+                &authenticated_production_request_without_cookie_with_transport_secret(
+                    "GET",
+                    "/ordinary",
+                    TEST_INGRESS_CONTINUITY_ID,
+                    transport_secret,
+                    &[
+                        (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "verified_bot"),
+                        (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
+                        ("X-Forwarded-For", "10.23.45.67"),
+                    ],
+                ),
+            ));
+            assert_eq!(response.status, 400);
+            assert_eq!(response.body, b"invalid ingress continuity\n");
+            assert_eq!(header_values(&response, "cache-control"), vec!["no-store"]);
+            assert_eq!(header_values(&response, "pragma"), vec!["no-cache"]);
+            assert!(header_values(&response, "set-cookie").is_empty());
+        }
+
+        let state_after = durable_paths
+            .iter()
+            .map(|state_path| read_optional(state_path))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state_after, state_before,
+            "disallowed ingress peers must not mutate durable state"
+        );
+        let all_debug = debug_values(&server.debug_log_path);
+        let startup = all_debug
+            .iter()
+            .find(|entry| entry["event"] == "proxy_started")
+            .expect("production startup should be audited");
+        assert_eq!(
+            startup["fields"]["trusted_ingress_source_networks"],
+            json!({"count": 1, "ipv4": true, "ipv6": false})
+        );
+        let durable_debug = all_debug.iter().map(Value::to_string).collect::<String>();
+        assert!(
+            !durable_debug.contains("10.0.0.0/8"),
+            "production debug output leaked the configured trusted ingress CIDR"
+        );
+        let rejection_debug = all_debug
+            .into_iter()
+            .filter(|entry| entry["event"] == "session_continuity_rejected")
+            .collect::<Vec<_>>();
+        assert_eq!(rejection_debug.len(), 2);
+        assert!(rejection_debug.iter().all(|entry| {
+            entry["fields"]["reason"] == "untrusted_ingress_source"
+                && entry["fields"]["trusted_source_network_count"] == 1
+        }));
+        let rejection_debug = rejection_debug
+            .iter()
+            .map(Value::to_string)
+            .collect::<String>();
+        for sensitive in [
+            "10.0.0.0/8",
+            "10.23.45.67",
+            "transport-secret",
+            "previous-transport-secret",
+            TEST_INGRESS_CONTINUITY_ID,
+            "verified_bot",
+        ] {
+            assert!(
+                !rejection_debug.contains(sensitive),
+                "source rejection debug leaked {sensitive}"
+            );
+        }
+
+        server.stop();
+        assert!(
+            recorder.finish().is_empty(),
+            "disallowed ingress peer reached protected upstream"
+        );
+    }
+
+    #[test]
+    fn production_listener_accepts_configured_ipv6_ingress_peer_when_available() {
+        let listener = match TcpListener::bind("[::1]:0") {
+            Ok(listener) => listener,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+                ) =>
+            {
+                eprintln!("IPv6 loopback is unavailable; IPv6 listener coverage was skipped");
+                return;
+            }
+            Err(error) => panic!("IPv6 production listener should bind: {error}"),
+        };
+        let mut runtime = test_runtime(
+            closed_upstream(),
+            &unique_temp_path("ipv6-ingress-source-events.jsonl"),
+            unique_temp_path("ipv6-ingress-source-control.txt"),
+            SurfaceAction::EidolonOwned {
+                response: surface_text_response(200, "trusted IPv6 ingress\n"),
+            },
+        );
+        runtime.audit_projection = AuditProjection::Production;
+        runtime.ingress_transport_auth_secret = Some(Arc::from("transport-secret"));
+        runtime.ingress_continuity_key = Some(Arc::from("continuity-key"));
+        runtime.trusted_ingress_source_cidrs = vec!["::1/128".parse().unwrap()];
+        runtime.require_authenticated_ingress_continuity = true;
+        let request = authenticated_production_request_without_cookie(
+            "GET",
+            "/docs",
+            TEST_INGRESS_CONTINUITY_ID,
+            &[],
+        );
+        let response = parse_downstream_response(&run_production_runtime_request_with_listener(
+            runtime, &request, listener,
+        ));
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"trusted IPv6 ingress\n");
+        assert_eq!(header_values(&response, "set-cookie").len(), 1);
+    }
+
+    #[test]
     fn production_profile_shared_ingress_clients_survive_two_restarts_without_state_merge() {
         const CLIENT_A_CONTINUITY: &str = "client_A_0123456789abcdef";
         const CLIENT_B_CONTINUITY: &str = "client_B_0123456789abcdef";
@@ -14232,6 +15164,7 @@ mod tests {
         const NEW_CONTINUITY_KEY: &str = "rotated-continuity-key";
         const CLIENT_A_CONTINUITY: &str = "key_overlap_client_A_0123456789abcdef";
         const CLIENT_B_CONTINUITY: &str = "key_overlap_client_B_0123456789abcdef";
+        const CLIENT_C_CONTINUITY: &str = "key_overlap_client_C_0123456789abcdef";
         const MIN_PROOF_VALIDITY_SECS: u64 = 5 * 60;
 
         let proof_issued_at = current_unix_secs();
@@ -14269,6 +15202,7 @@ mod tests {
             .clone();
         let client_a = SessionId::new();
         let client_b = SessionId::new();
+        let client_c = SessionId::new();
         let client_a_cookie = format!("eidolon_session={}", minted_cookie_value(client_a));
         let client_a_rendered = eidolon_bait::render_bait_for_session_at(
             &bait,
@@ -14287,9 +15221,36 @@ mod tests {
             .header_value
             .expect("minted bait should have a proof value");
         let client_a_proof_headers = [(proof_header_name.as_str(), client_a_proof.as_str())];
+        let client_c_rendered = eidolon_bait::render_bait_for_session_at(
+            &bait,
+            client_c,
+            Some("mint-secret"),
+            proof_issued_at,
+        )
+        .expect("client C bait should render")
+        .into_owned();
+        let client_c_proof = client_c_rendered
+            .expected_action
+            .header_value
+            .expect("client C bait should have a proof value");
+        let client_c_action_headers = [
+            (proof_header_name.as_str(), client_c_proof.as_str()),
+            (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "verified_bot"),
+            (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
+            (
+                session::INGRESS_VERIFICATION_STRENGTH_HEADER_NAME,
+                "cryptographic",
+            ),
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+        ];
         assert_eq!(
             proof_expiry_epoch_seconds(&bait, &client_a_proof)
                 .expect("client A proof expiry should parse"),
+            proof_expires_at
+        );
+        assert_eq!(
+            proof_expiry_epoch_seconds(&bait, &client_c_proof)
+                .expect("client C proof expiry should parse"),
             proof_expires_at
         );
 
@@ -14334,6 +15295,18 @@ mod tests {
             ),
         ));
         assert_eq!(client_a_action.status, 202);
+        let client_c_exposure = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_with_transport_secret(
+                "GET",
+                &bait.surface,
+                client_c,
+                CLIENT_C_CONTINUITY,
+                TRANSPORT_SECRET,
+                &[],
+            ),
+        ));
+        assert_eq!(client_c_exposure.status, 200);
         let client_b_old_active = parse_downstream_response(&production_profile_request(
             server.address,
             &authenticated_production_request_with_transport_secret(
@@ -14439,11 +15412,109 @@ mod tests {
             )
             .expect("continuity sidecar should parse before migration");
         assert_eq!(state_before_migration.schema_version, 2);
-        assert_eq!(state_before_migration.records.len(), 2);
+        assert_eq!(state_before_migration.records.len(), 3);
         assert!(state_before_migration.records.iter().all(|record| {
             record.continuity_key_id_hex.as_deref()
                 != Some(state_before_migration.transport_key_id_hex.as_str())
         }));
+
+        let mut fixture = server.stop_for_restart();
+        let source_cidr_index = fixture
+            .args
+            .iter()
+            .position(|value| value == "--trusted-ingress-source-cidr")
+            .expect("overlap fixture should configure a trusted ingress source");
+        let allowed_source_cidr = fixture.args[source_cidr_index + 1].clone();
+        fixture.args[source_cidr_index + 1] = "10.0.0.0/8".to_string();
+        let server = start_production_profile_server(fixture);
+        let durable_paths = [
+            server.event_log_path.clone(),
+            sidecar_state_path(&server.event_log_path, ".exposures.json"),
+            sidecar_state_path(&server.event_log_path, ".consumed-proofs.json"),
+            server.fixture.policy_state_path.clone(),
+            continuity_state_path.clone(),
+        ];
+        let read_optional = |state_path: &Path| match fs::read(state_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => panic!("populated state snapshot should read: {error}"),
+        };
+        let state_before_source_rejection = durable_paths
+            .iter()
+            .map(|state_path| read_optional(state_path))
+            .collect::<Vec<_>>();
+        assert!(state_before_source_rejection.iter().all(Option::is_some));
+        let renderer_connections_before = server.fixture.renderer.accepted_connection_count();
+        let client_c_disallowed = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_with_transport_secret(
+                "POST",
+                &bait.expected_action.path,
+                client_c,
+                CLIENT_C_CONTINUITY,
+                TRANSPORT_SECRET,
+                &client_c_action_headers,
+            ),
+        ));
+        assert_eq!(client_c_disallowed.status, 400);
+        assert_eq!(client_c_disallowed.body, b"invalid ingress continuity\n");
+        assert_eq!(
+            header_values(&client_c_disallowed, "cache-control"),
+            vec!["no-store"]
+        );
+        assert!(header_values(&client_c_disallowed, "set-cookie").is_empty());
+        assert_eq!(
+            server.fixture.renderer.accepted_connection_count(),
+            renderer_connections_before,
+            "disallowed previous-key client reached the renderer"
+        );
+        let state_after_source_rejection = durable_paths
+            .iter()
+            .map(|state_path| read_optional(state_path))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state_after_source_rejection, state_before_source_rejection,
+            "disallowed previous-key client mutated populated durable state"
+        );
+
+        let mut fixture = server.stop_for_restart();
+        fixture.args[source_cidr_index + 1] = allowed_source_cidr;
+        let server = start_production_profile_server(fixture);
+        let renderer_connections_before = server.fixture.renderer.accepted_connection_count();
+        let client_c_allowed = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie_with_transport_secret(
+                "POST",
+                &bait.expected_action.path,
+                CLIENT_C_CONTINUITY,
+                TRANSPORT_SECRET,
+                &client_c_action_headers,
+            ),
+        ));
+        assert_eq!(client_c_allowed.status, 202);
+        assert_eq!(response_session_id(&client_c_allowed), client_c);
+        assert_eq!(
+            server.fixture.renderer.accepted_connection_count(),
+            renderer_connections_before + 1,
+            "allowed previous-key client should exercise the remote renderer"
+        );
+        let state_after_client_c: eidolon_proxy::session_continuity_store::StoredContinuityState =
+            serde_json::from_str(
+                &fs::read_to_string(&continuity_state_path)
+                    .expect("continuity sidecar should read after client C migration"),
+            )
+            .expect("continuity sidecar should parse after client C migration");
+        assert_eq!(
+            state_after_client_c
+                .records
+                .iter()
+                .filter(|record| {
+                    record.continuity_key_id_hex.as_deref()
+                        == Some(state_after_client_c.transport_key_id_hex.as_str())
+                })
+                .count(),
+            1
+        );
 
         let client_a_overlap = parse_downstream_response(&production_profile_request(
             server.address,
@@ -14489,7 +15560,7 @@ mod tests {
                         == Some(state_after_client_a.transport_key_id_hex.as_str())
                 })
                 .count(),
-            1
+            2
         );
 
         let client_b_overlap = parse_downstream_response(&production_profile_request(
@@ -14591,8 +15662,10 @@ mod tests {
             NEW_CONTINUITY_KEY,
             CLIENT_A_CONTINUITY,
             CLIENT_B_CONTINUITY,
+            CLIENT_C_CONTINUITY,
             "mint-secret",
             client_a_proof.as_str(),
+            client_c_proof.as_str(),
             path_str(&old_continuity_path, "old continuity path should be UTF-8"),
             path_str(&new_continuity_path, "new continuity path should be UTF-8"),
         ] {
@@ -14603,6 +15676,7 @@ mod tests {
         }
         for state in [
             &state_before_migration,
+            &state_after_client_c,
             &state_after_client_a,
             &state_after_migration,
         ] {
@@ -14706,7 +15780,17 @@ mod tests {
             now,
         )
         .expect("consumed proof state should reopen after retirement");
-        assert_eq!(restored_replay_state.consumed.len(), 1);
+        assert_eq!(restored_replay_state.consumed.len(), 2);
+        assert_eq!(
+            restored_replay_state.check_and_mark(
+                client_c,
+                bait.id.clone(),
+                client_c_proof,
+                proof_expires_at,
+                now,
+            ),
+            ConsumeProofOutcome::Replay
+        );
         assert_eq!(
             restored_replay_state.check_and_mark(
                 client_a,
@@ -14723,7 +15807,7 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).expect("debug record should parse"))
             .filter(|record| record["event"] == "proxy_started")
             .collect::<Vec<_>>();
-        assert_eq!(debug_records.len(), 5);
+        assert_eq!(debug_records.len(), 7);
         assert_eq!(
             debug_records
                 .iter()
@@ -14731,7 +15815,7 @@ mod tests {
                     .as_bool()
                     .expect("overlap status should be boolean"))
                 .collect::<Vec<_>>(),
-            vec![false, true, true, true, false]
+            vec![false, true, true, true, true, true, false]
         );
         assert_eq!(
             debug_records
@@ -14743,9 +15827,11 @@ mod tests {
                         .expect("previous-key count should be numeric")
                 })
                 .collect::<Vec<_>>(),
-            vec![0, 2, 2, 0, 0]
+            vec![0, 3, 3, 3, 3, 0, 0]
         );
         assert_ne!(client_a, client_b);
+        assert_ne!(client_a, client_c);
+        assert_ne!(client_b, client_c);
         assert!(
             current_unix_secs() < proof_expires_at,
             "bounded key-overlap scenario exceeded its selected proof-validity window"

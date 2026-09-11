@@ -29,12 +29,13 @@ This contract covers:
 This contract does not require Eidolon to implement every field immediately.
 The current runtime enforces only the normalized ingress identity subset plus
 local trust config, and it accepts explicit edge-provided identity only when a
-trusted adapter also supplies the configured transport-auth secret. It now also
-captures authenticated advisory ingress signal fields into request audit events,
-includes them in outbound edge-decision export when present, but those fields
-remain advisory rather than direct enforcement inputs. Richer score and
-attestation fields are specified here so future adapters do not fork the
-schema.
+trusted adapter supplies the configured transport-auth secret **and** the
+request's direct TCP peer is inside a configured trusted-ingress source CIDR.
+It now also captures authenticated advisory ingress signal fields into request
+audit events, includes them in outbound edge-decision export when present, but
+those fields remain advisory rather than direct enforcement inputs. Richer
+score and attestation fields are specified here so future adapters do not fork
+the schema.
 
 ## Design Principles
 
@@ -167,7 +168,9 @@ The current proxy already consumes this subset through reserved headers:
 The first four fields map directly to the runtime `IngressIdentity`. The
 transport-auth header is not part of the identity model; it is a transport-only
 attestation check that must match the proxy's configured shared secret before
-the explicit identity is trusted. The continuity header is an opaque,
+the explicit identity is trusted. In production that check is necessary but
+not sufficient: the direct TCP peer must also match one of the explicit
+`--trusted-ingress-source-cidr` networks. The continuity header is an opaque,
 adapter-minted identity used only for session continuity. Eidolon immediately
 reduces it to an HMAC-SHA256 key under the configured continuity key; when no
 separate continuity key is configured, the transport secret is used as a
@@ -198,14 +201,29 @@ Reserved and now captured in authenticated request audit events:
   active credential or that one previous credential authenticates the same
   identity, advisory signals, and stable continuity mapping; multiple header
   values are rejected even when every value is valid.
+- Production requires 1-32 repeatable `--trusted-ingress-source-cidr <CIDR>`
+  entries. Entries are normalized, duplicate normalized networks and universal
+  IPv4/IPv6 `/0` networks are rejected, and matching uses only the direct TCP
+  peer. An IPv4-mapped IPv6 peer is normalized to IPv4 before matching; supply
+  the corresponding IPv4 CIDR rather than a mapped IPv6 CIDR. Forwarded,
+  `X-Forwarded-For`, `X-Real-IP`, identity, and advisory header values never
+  influence this decision.
+- A missing or nonmatching direct peer in production receives the same fixed
+  no-store `400` as other invalid ingress-continuity input before session
+  adoption or minting, continuity lookup/re-key, policy/evidence/state mutation,
+  renderer dispatch, or protected-upstream access. Production diagnostics emit
+  only `untrusted_ingress_source` and configured count/family metadata, never
+  the peer address or configured CIDR values.
 - Adapters must attach exactly one `X-Eidolon-Ingress-Continuity` value of
   16-256 ASCII alphanumeric, `-`, or `_` characters. It must distinguish
   clients sharing one ingress peer and must not contain an email, account ID,
   IP address, or other direct identifier.
 - `--require-authenticated-ingress-continuity` makes the pair mandatory on
-  every request; missing, duplicate, malformed, or unauthenticated continuity
-  then returns `400` before protected-upstream access. Merely configuring the
-  transport secret keeps existing Lab peer continuity compatible.
+  every request; a missing/disallowed peer or missing, duplicate, malformed,
+  or unauthenticated continuity then returns `400` before protected-upstream
+  access. Merely configuring the transport secret keeps existing Lab peer
+  continuity compatible. If source CIDRs are explicitly configured in Lab,
+  they gate trusted-ingress input there too.
 - Authenticated continuity remains bound to one stable session through cookie
   loss, malformed cookies, and conflicting valid cookies. One valid cookie
   cannot bind multiple authenticated continuity identities.
@@ -273,8 +291,18 @@ Reserved and now captured in authenticated request audit events:
 - Large raw payloads belong in sidecar logs or webhooks, not inline request
   headers.
 - Bare NodePort, port-forward, or direct-origin traffic is not a trusted edge
-  adapter boundary. In those paths, explicit `X-Eidolon-Ingress-*` identity
-  headers must be ignored by the proxy.
+  adapter boundary. Outside strict production, explicit
+  `X-Eidolon-Ingress-*` claims from a nonmatching peer, including a presented
+  transport/continuity pair, are ignored and existing cookie/Lab direct-peer
+  continuity remains in effect. Strict production rejects the nonmatching peer
+  because every request requires the authenticated pair. Possession of a
+  transport credential never overrides the direct-peer network boundary.
+
+Issue `#253` must populate the CIDRs from the named ingress-to-proxy hop and
+also enforce the corresponding NetworkPolicy/topology. Source CIDRs are an
+application boundary, not a replacement for cluster isolation; the live
+deployment proof must demonstrate both and record the exact configured
+networks without placing them in production request diagnostics.
 
 ## Local Trust Config
 

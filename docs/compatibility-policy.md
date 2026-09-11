@@ -69,8 +69,9 @@ normal Event, trace, or export data; their rejection codes are fixed v1
 values. They are diagnostic audit records, not additions to the Event schema.
 
 The effective-config v1 projection contains only the selected profile,
-session-signing/cookie mode, ingress dependency booleans, required-sink
-configuration state, and renderer mode. It omits supplied secrets and
+session-signing/cookie mode, ingress dependency booleans, trusted-ingress
+source-network count/IP-family presence, required-sink configuration state,
+and renderer mode. It omits supplied CIDR values, secrets, peer addresses, and
 filesystem paths and exits without starting the runtime.
 
 Production resolves its upstream once through Tokio before binding the

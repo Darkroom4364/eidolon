@@ -51,7 +51,9 @@ boundary below.
 The supported v1 deployment assumes:
 
 - the named ingress terminates TLS and is the only trusted source of forwarded
-  or trusted-ingress headers
+  or trusted-ingress headers; the production proxy enforces both the shared
+  transport credential and an explicit bounded direct-peer CIDR list, while
+  the deployment independently constrains the hop with NetworkPolicy
 - clients control all request data, can forge cookies, and can replay observed
   requests
 - storage can become unavailable, stale, or corrupt; Eidolon must fail closed
