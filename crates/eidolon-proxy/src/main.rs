@@ -10191,11 +10191,26 @@ mod tests {
             "duplicate option",
         );
 
-        let mut over_limit = Vec::new();
-        for suffix in 1..=(MAX_TRUSTED_INGRESS_SOURCE_CIDRS + 1) {
-            over_limit.push("--trusted-ingress-source-cidr".to_string());
-            over_limit.push(format!("192.0.2.{suffix}/32"));
+        let mut at_limit = Vec::new();
+        for suffix in 1..=MAX_TRUSTED_INGRESS_SOURCE_CIDRS {
+            at_limit.push("--trusted-ingress-source-cidr".to_string());
+            at_limit.push(format!("192.0.2.{suffix}/32"));
         }
+        let at_limit = at_limit.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            run_config(&at_limit)
+                .expect("the documented maximum source-network count should parse")
+                .trusted_ingress_source_cidrs
+                .len(),
+            MAX_TRUSTED_INGRESS_SOURCE_CIDRS
+        );
+
+        let mut over_limit = at_limit
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        over_limit.push("--trusted-ingress-source-cidr".to_string());
+        over_limit.push("192.0.2.33/32".to_string());
         let over_limit = over_limit.iter().map(String::as_str).collect::<Vec<_>>();
         assert_error_contains(&over_limit, "accepts at most 32 entries");
     }
