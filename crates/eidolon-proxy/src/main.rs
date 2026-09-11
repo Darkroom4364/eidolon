@@ -2050,6 +2050,19 @@ where
     )
 }
 
+fn ingress_continuity_key_mode(
+    configured_continuity_key: bool,
+    transport_auth_enabled: bool,
+) -> &'static str {
+    if configured_continuity_key {
+        "configured"
+    } else if transport_auth_enabled {
+        "legacy_transport_auth_fallback"
+    } else {
+        "disabled"
+    }
+}
+
 fn run_proxy_with_shutdown(
     config: ProxyConfig,
     production_shutdown: ProductionShutdown,
@@ -2065,25 +2078,18 @@ fn run_proxy_with_shutdown(
                 .previous_ingress_transport_auth_secret_path
                 .as_deref(),
         )?;
-    let (ingress_continuity_key, previous_ingress_continuity_key, ingress_continuity_key_mode) =
+    let (ingress_continuity_key, previous_ingress_continuity_key) =
         match &config.ingress_continuity_key_path {
-            Some(path) => {
-                let (active, previous) = load_ingress_continuity_keys(
-                    Some(path),
-                    config.previous_ingress_continuity_key_path.as_deref(),
-                )?;
-                (active, previous, "configured")
-            }
-            None => (
-                ingress_transport_auth_secret.clone(),
-                None,
-                if ingress_transport_auth_secret.is_some() {
-                    "legacy_transport_auth_fallback"
-                } else {
-                    "disabled"
-                },
-            ),
+            Some(path) => load_ingress_continuity_keys(
+                Some(path),
+                config.previous_ingress_continuity_key_path.as_deref(),
+            )?,
+            None => (ingress_transport_auth_secret.clone(), None),
         };
+    let ingress_continuity_key_mode = ingress_continuity_key_mode(
+        config.ingress_continuity_key_path.is_some(),
+        ingress_transport_auth_secret.is_some(),
+    );
     let state_lease = DurableStateLease::acquire_for_policy_state(&config.policy_state_path)?;
     let loaded_bait_profile = match &config.bait_profile_path {
         Some(path) => load_bait_profile(path).map_err(|error| invalid_data(error.to_string()))?,
@@ -9952,6 +9958,17 @@ mod tests {
         );
         assert_eq!(config.controlled_reality_backend, None);
         assert!(!config.owned_cluster_lab);
+    }
+
+    #[test]
+    fn continuity_key_mode_distinguishes_configured_fallback_and_disabled() {
+        assert_eq!(ingress_continuity_key_mode(true, true), "configured");
+        assert_eq!(ingress_continuity_key_mode(true, false), "configured");
+        assert_eq!(
+            ingress_continuity_key_mode(false, true),
+            "legacy_transport_auth_fallback"
+        );
+        assert_eq!(ingress_continuity_key_mode(false, false), "disabled");
     }
 
     #[test]
