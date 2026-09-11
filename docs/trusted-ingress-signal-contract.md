@@ -292,11 +292,11 @@ Reserved and now captured in authenticated request audit events:
   headers.
 - Bare NodePort, port-forward, or direct-origin traffic is not a trusted edge
   adapter boundary. Outside strict production, explicit
-  `X-Eidolon-Ingress-*` claims from a nonmatching peer are ignored unless a
-  continuity pair is presented, in which case the pair is rejected. Strict
-  production rejects the nonmatching peer because every request requires the
-  authenticated pair. Possession of a transport credential never overrides
-  the direct-peer network boundary.
+  `X-Eidolon-Ingress-*` claims from a nonmatching peer, including a presented
+  transport/continuity pair, are ignored and existing cookie/Lab direct-peer
+  continuity remains in effect. Strict production rejects the nonmatching peer
+  because every request requires the authenticated pair. Possession of a
+  transport credential never overrides the direct-peer network boundary.
 
 Issue `#253` must populate the CIDRs from the named ingress-to-proxy hop and
 also enforce the corresponding NetworkPolicy/topology. Source CIDRs are an

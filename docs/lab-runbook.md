@@ -151,6 +151,11 @@ family presence. Issue `#253` owns wiring the exact supported ingress CIDRs
 and proving the corresponding NetworkPolicy/topology; this source boundary
 does not replace that live isolation proof.
 
+Lab remains unchanged when no source CIDR is configured. If a Lab operator
+does configure the list, a nonmatching peer's entire
+`X-Eidolon-Ingress-*` set—including an otherwise valid transport/continuity
+pair—is ignored, and existing cookie/direct-peer continuity remains active.
+
 If the authenticated-continuity sidecar is missing while prior state exists,
 unknown authenticated identities fail closed for a bounded migration
 quarantine. Corrupt state or state bound to a different continuity key prevents

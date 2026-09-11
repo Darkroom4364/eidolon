@@ -7349,6 +7349,15 @@ fn effective_session_context(
             "trusted ingress continuity rejected: untrusted_ingress_source",
         ));
     }
+    let trusted_ingress_headers = if trusted_ingress_source_allowed {
+        headers.clone()
+    } else {
+        headers
+            .iter()
+            .copied()
+            .filter(|(name, _)| !name.to_ascii_lowercase().starts_with("x-eidolon-ingress-"))
+            .collect()
+    };
     let trusted_ingress_keys = if trusted_ingress_source_allowed {
         runtime
             .ingress_transport_auth_secret
@@ -7374,7 +7383,7 @@ fn effective_session_context(
             .map_err(|_| io::Error::other("session authority lock poisoned"))?;
         session::derive_session_from_headers_with_trusted_ingress_continuity_key(
             &mut authority,
-            headers.iter().copied(),
+            trusted_ingress_headers.iter().copied(),
             client_peer_ip,
             now_unix_secs,
             trusted_ingress_keys,
@@ -7424,12 +7433,12 @@ fn effective_session_context(
     )?;
     session.ingress_identity =
         session::authenticated_ingress_identity_from_headers_with_trusted_keys(
-            headers.iter().copied(),
+            trusted_ingress_headers.iter().copied(),
             trusted_ingress_keys,
         );
     session.ingress_signals =
         session::authenticated_ingress_advisory_signals_from_headers_with_trusted_keys(
-            headers.iter().copied(),
+            trusted_ingress_headers.iter().copied(),
             trusted_ingress_keys,
         );
     let local_trust_evaluation = runtime.ingress_identity_resolver.evaluate(
@@ -9417,6 +9426,14 @@ mod tests {
 
     fn run_production_runtime_request(runtime: ProxyRuntime, request: &[u8]) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").expect("production proxy should bind");
+        run_production_runtime_request_with_listener(runtime, request, listener)
+    }
+
+    fn run_production_runtime_request_with_listener(
+        runtime: ProxyRuntime,
+        request: &[u8],
+        listener: TcpListener,
+    ) -> Vec<u8> {
         let addr = listener
             .local_addr()
             .expect("production proxy should have address");
@@ -10293,6 +10310,27 @@ mod tests {
                 "effective config leaked `{sensitive}`"
             );
         }
+
+        let mut ipv6_print_args = args.clone();
+        let source_cidr_index = ipv6_print_args
+            .iter()
+            .position(|value| *value == "--trusted-ingress-source-cidr")
+            .expect("production config should contain a trusted source CIDR");
+        ipv6_print_args[source_cidr_index + 1] = "2001:db8::/32";
+        ipv6_print_args.push("--print-effective-config");
+        let action = CliAction::from_args(ipv6_print_args)
+            .expect("IPv6 production effective config should parse");
+        let CliAction::PrintEffectiveConfig(config) = action else {
+            panic!("IPv6 effective config should not start the runtime");
+        };
+        let ipv6_output = effective_config_output(&config);
+        let ipv6_effective: Value =
+            serde_json::from_str(&ipv6_output).expect("IPv6 effective config should be JSON");
+        assert_eq!(
+            ipv6_effective["ingress"]["trusted_source_networks"],
+            json!({"count": 1, "ipv4": false, "ipv6": true})
+        );
+        assert!(!ipv6_output.contains("2001:db8::/32"));
 
         fn without_value_option<'a>(args: &[&'a str], flag: &str) -> Vec<&'a str> {
             let mut missing = args.to_vec();
@@ -12787,6 +12825,10 @@ mod tests {
         runtime.ingress_continuity_key = Some(Arc::from("continuity-key"));
         runtime.trusted_ingress_source_cidrs = vec!["10.0.0.0/8".parse().unwrap()];
         runtime.require_authenticated_ingress_continuity = true;
+        let session_authority_before = format!(
+            "{:?}",
+            *runtime.session_authority.lock().expect("session authority")
+        );
         let policy_records_before = runtime.policy_store.lock().expect("policy store").len();
         let exposure_records_before = runtime.bait_exposures.lock().expect("exposure store").len();
         let consumed_records_before = runtime
@@ -12901,6 +12943,14 @@ mod tests {
                 .len(),
             consumed_records_before
         );
+        assert_eq!(
+            format!(
+                "{:?}",
+                *runtime.session_authority.lock().expect("session authority")
+            ),
+            session_authority_before,
+            "source rejection mutated in-memory session authority"
+        );
         assert!(event_values(&event_log).is_empty());
         assert!(
             recorder.finish().is_empty(),
@@ -12972,49 +13022,147 @@ mod tests {
     }
 
     #[test]
-    fn lab_source_cidr_ignores_untrusted_explicit_claims_and_preserves_peer_mode() {
+    fn lab_source_cidr_gates_all_trusted_ingress_inputs_and_preserves_peer_mode() {
         let event_log = unique_temp_path("lab-untrusted-ingress-source-events.jsonl");
-        let (upstream, recorder) =
-            spawn_recording_upstream([json_response(r#"{"mode":"ordinary_upstream"}"#)]);
+        let (upstream, recorder) = spawn_recording_upstream([
+            json_response(r#"{"mode":"disallowed_active"}"#),
+            json_response(r#"{"mode":"disallowed_previous"}"#),
+            json_response(r#"{"mode":"allowed_active"}"#),
+            json_response(r#"{"mode":"allowed_previous"}"#),
+        ]);
         let mut runtime = test_runtime(
             upstream,
             &event_log,
             unique_temp_path("lab-untrusted-ingress-source-control.txt"),
             SurfaceAction::ProtectedUpstream,
         );
-        runtime.ingress_transport_auth_secret = Some(Arc::from("transport-secret"));
+        runtime.ingress_transport_auth_secret = Some(Arc::from("active-transport-secret"));
+        runtime.previous_ingress_transport_auth_secret =
+            Some(Arc::from("previous-transport-secret"));
         runtime.trusted_ingress_source_cidrs = vec!["10.0.0.0/8".parse().unwrap()];
-        let raw_request = request_with_cookie_exact(
-            "GET",
-            "/ordinary",
-            &cookie_header(),
-            &[
-                (
-                    session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
-                    "transport-secret",
-                ),
-                (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "verified_bot"),
-                (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
-                ("X-Forwarded-For", "10.23.45.67"),
-            ],
-        );
-        let request = read_http_request(&mut raw_request.as_slice())
-            .expect("request should parse")
-            .expect("request should exist");
+        let cookie = cookie_header();
 
-        let response = process_request(
-            &runtime,
-            request,
-            Some("127.0.0.1:41005".parse().unwrap()),
-            UpstreamTransport::Lab,
-        )
-        .expect("Lab peer mode should remain available");
+        for (transport_secret, request_cookie, peer, expect_cookie) in [
+            (
+                "active-transport-secret",
+                "eidolon_session=malformed",
+                "127.0.0.1:41005",
+                true,
+            ),
+            (
+                "previous-transport-secret",
+                cookie.as_str(),
+                "127.0.0.1:41007",
+                false,
+            ),
+        ] {
+            let raw_request = request_with_cookie_exact(
+                "GET",
+                "/ordinary",
+                request_cookie,
+                &[
+                    (
+                        session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        transport_secret,
+                    ),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        TEST_INGRESS_CONTINUITY_ID,
+                    ),
+                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "verified_bot"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
+                    (
+                        session::INGRESS_VERIFICATION_STRENGTH_HEADER_NAME,
+                        "cryptographic",
+                    ),
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
+                    (session::INGRESS_EDGE_ACTION_HEADER_NAME, "allow"),
+                    ("X-Forwarded-For", "10.23.45.67"),
+                ],
+            );
+            let request = read_http_request(&mut raw_request.as_slice())
+                .expect("request should parse")
+                .expect("request should exist");
+            let response = process_request(
+                &runtime,
+                request,
+                Some(peer.parse().unwrap()),
+                UpstreamTransport::Lab,
+            )
+            .expect("disallowed Lab ingress input should preserve peer mode");
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                !header_values(&response, "set-cookie").is_empty(),
+                expect_cookie
+            );
+        }
 
-        assert_eq!(response.status, 200);
-        assert_eq!(recorder.finish().len(), 1);
-        let request_seen = first_event_of_type(&event_log, "request_seen");
-        assert_eq!(request_seen["kind"]["ingress_identity"]["source"], "none");
-        assert!(request_seen["kind"]["ingress_signals"].is_null());
+        runtime.trusted_ingress_source_cidrs = vec!["127.0.0.0/8".parse().unwrap()];
+        for transport_secret in ["active-transport-secret", "previous-transport-secret"] {
+            let raw_request = request_with_cookie_exact(
+                "GET",
+                "/ordinary",
+                &cookie,
+                &[
+                    (
+                        session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        transport_secret,
+                    ),
+                    (
+                        session::INGRESS_CONTINUITY_HEADER_NAME,
+                        "allowed_client_0123456789abcdef",
+                    ),
+                    (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "verified_bot"),
+                    (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
+                    (
+                        session::INGRESS_VERIFICATION_STRENGTH_HEADER_NAME,
+                        "cryptographic",
+                    ),
+                    (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+                    (session::INGRESS_VENDOR_SCORE_HEADER_NAME, "12"),
+                    (session::INGRESS_EDGE_ACTION_HEADER_NAME, "allow"),
+                ],
+            );
+            let request = read_http_request(&mut raw_request.as_slice())
+                .expect("allowed request should parse")
+                .expect("allowed request should exist");
+            let response = process_request(
+                &runtime,
+                request,
+                Some("127.0.0.1:41006".parse().unwrap()),
+                UpstreamTransport::Lab,
+            )
+            .expect("allowed Lab ingress input should be processed");
+            assert_eq!(response.status, 200);
+        }
+
+        let request_events = event_values(&event_log)
+            .into_iter()
+            .filter(|event| event["kind"]["type"] == "request_seen")
+            .collect::<Vec<_>>();
+        assert_eq!(request_events.len(), 4);
+        for request_seen in &request_events[..2] {
+            assert_eq!(request_seen["kind"]["ingress_identity"]["source"], "none");
+            assert!(request_seen["kind"]["ingress_signals"].is_null());
+        }
+        for allowed in &request_events[2..] {
+            assert_eq!(
+                allowed["kind"]["ingress_identity"]["source"],
+                "verified_bot"
+            );
+            assert_eq!(
+                allowed["kind"]["ingress_signals"]["verification_strength"],
+                "cryptographic"
+            );
+            assert_eq!(
+                allowed["kind"]["ingress_signals"]["actor_kind"],
+                "agentic_browser"
+            );
+            assert_eq!(allowed["kind"]["ingress_signals"]["vendor_score"], 12);
+            assert_eq!(allowed["kind"]["ingress_signals"]["edge_action"], "allow");
+        }
+        assert_eq!(recorder.finish().len(), 4);
     }
 
     #[test]
@@ -14073,93 +14221,53 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            server.fixture.renderer.accepted_connection_count(),
-            0,
-            "disallowed ingress peer reached the controlled-reality renderer"
-        );
-
         server.stop();
         assert!(
             recorder.finish().is_empty(),
             "disallowed ingress peer reached protected upstream"
         );
-        assert_production_listener_accepts_configured_ipv6_ingress_peer_when_available();
     }
 
-    fn assert_production_listener_accepts_configured_ipv6_ingress_peer_when_available() {
-        let Ok(ipv6_probe) = TcpListener::bind("[::1]:0") else {
-            return;
+    #[test]
+    fn production_listener_accepts_configured_ipv6_ingress_peer_when_available() {
+        let listener = match TcpListener::bind("[::1]:0") {
+            Ok(listener) => listener,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+                ) =>
+            {
+                eprintln!("IPv6 loopback is unavailable; IPv6 listener coverage was skipped");
+                return;
+            }
+            Err(error) => panic!("IPv6 production listener should bind: {error}"),
         };
-        drop(ipv6_probe);
-
-        let bait_profile = write_bait_profile(session_minted_profile_json());
-        let bait_signing_secret = write_bait_signing_secret("mint-secret");
-        let (upstream, recorder) =
-            spawn_recording_upstream([json_response(r#"{"mode":"ordinary_upstream"}"#)]);
-        let mut fixture = CompleteProductionProfileFixture::new(
-            &upstream,
-            &bait_profile,
-            &bait_signing_secret,
-            "mint-secret",
+        let mut runtime = test_runtime(
+            closed_upstream(),
+            &unique_temp_path("ipv6-ingress-source-events.jsonl"),
+            unique_temp_path("ipv6-ingress-source-control.txt"),
+            SurfaceAction::EidolonOwned {
+                response: surface_text_response(200, "trusted IPv6 ingress\n"),
+            },
         );
-        let listen_index = fixture
-            .args
-            .iter()
-            .position(|value| value == "--listen-addr")
-            .expect("production fixture should configure a listener");
-        fixture.args[listen_index + 1] = "[::1]:0".to_string();
-        let source_cidr_index = fixture
-            .args
-            .iter()
-            .position(|value| value == "--trusted-ingress-source-cidr")
-            .expect("production fixture should configure a trusted ingress source");
-        fixture.args[source_cidr_index + 1] = "::1/128".to_string();
-
-        let output = fixture.print_effective_config();
-        let effective: Value =
-            serde_json::from_str(&output).expect("IPv6 effective config should be JSON");
-        assert_eq!(effective["ingress"]["trusted_source_networks"]["count"], 1);
-        assert_eq!(
-            effective["ingress"]["trusted_source_networks"]["ipv4"],
-            false
+        runtime.audit_projection = AuditProjection::Production;
+        runtime.ingress_transport_auth_secret = Some(Arc::from("transport-secret"));
+        runtime.ingress_continuity_key = Some(Arc::from("continuity-key"));
+        runtime.trusted_ingress_source_cidrs = vec!["::1/128".parse().unwrap()];
+        runtime.require_authenticated_ingress_continuity = true;
+        let request = authenticated_production_request_without_cookie(
+            "GET",
+            "/docs",
+            TEST_INGRESS_CONTINUITY_ID,
+            &[],
         );
-        assert_eq!(
-            effective["ingress"]["trusted_source_networks"]["ipv6"],
-            true
-        );
-        assert!(!output.contains("::1/128"));
-
-        let server = start_production_profile_server(fixture);
-        let response = parse_downstream_response(&production_profile_request(
-            server.address,
-            &authenticated_production_request_without_cookie(
-                "GET",
-                "/ordinary",
-                TEST_INGRESS_CONTINUITY_ID,
-                &[],
-            ),
+        let response = parse_downstream_response(&run_production_runtime_request_with_listener(
+            runtime, &request, listener,
         ));
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, br#"{"mode":"ordinary_upstream"}"#);
+        assert_eq!(response.body, b"trusted IPv6 ingress\n");
         assert_eq!(header_values(&response, "set-cookie").len(), 1);
-        let startup = debug_values(&server.debug_log_path)
-            .into_iter()
-            .find(|entry| entry["event"] == "proxy_started")
-            .expect("IPv6 production startup should be audited");
-        assert_eq!(
-            startup["fields"]["trusted_ingress_source_networks"],
-            json!({"count": 1, "ipv4": false, "ipv6": true})
-        );
-        assert!(!startup.to_string().contains("::1/128"));
-
-        server.stop();
-        let upstream_requests = recorder.finish();
-        assert_eq!(upstream_requests.len(), 1);
-        assert_eq!(
-            upstream_request_lines(&upstream_requests),
-            vec!["GET /ordinary HTTP/1.1"]
-        );
     }
 
     #[test]
@@ -14954,6 +15062,7 @@ mod tests {
         const NEW_CONTINUITY_KEY: &str = "rotated-continuity-key";
         const CLIENT_A_CONTINUITY: &str = "key_overlap_client_A_0123456789abcdef";
         const CLIENT_B_CONTINUITY: &str = "key_overlap_client_B_0123456789abcdef";
+        const CLIENT_C_CONTINUITY: &str = "key_overlap_client_C_0123456789abcdef";
         const MIN_PROOF_VALIDITY_SECS: u64 = 5 * 60;
 
         let proof_issued_at = current_unix_secs();
@@ -14991,6 +15100,7 @@ mod tests {
             .clone();
         let client_a = SessionId::new();
         let client_b = SessionId::new();
+        let client_c = SessionId::new();
         let client_a_cookie = format!("eidolon_session={}", minted_cookie_value(client_a));
         let client_a_rendered = eidolon_bait::render_bait_for_session_at(
             &bait,
@@ -15009,9 +15119,36 @@ mod tests {
             .header_value
             .expect("minted bait should have a proof value");
         let client_a_proof_headers = [(proof_header_name.as_str(), client_a_proof.as_str())];
+        let client_c_rendered = eidolon_bait::render_bait_for_session_at(
+            &bait,
+            client_c,
+            Some("mint-secret"),
+            proof_issued_at,
+        )
+        .expect("client C bait should render")
+        .into_owned();
+        let client_c_proof = client_c_rendered
+            .expected_action
+            .header_value
+            .expect("client C bait should have a proof value");
+        let client_c_action_headers = [
+            (proof_header_name.as_str(), client_c_proof.as_str()),
+            (session::INGRESS_IDENTITY_SOURCE_HEADER_NAME, "verified_bot"),
+            (session::INGRESS_TRUST_TIER_HEADER_NAME, "edge_verified"),
+            (
+                session::INGRESS_VERIFICATION_STRENGTH_HEADER_NAME,
+                "cryptographic",
+            ),
+            (session::INGRESS_ACTOR_KIND_HEADER_NAME, "agentic_browser"),
+        ];
         assert_eq!(
             proof_expiry_epoch_seconds(&bait, &client_a_proof)
                 .expect("client A proof expiry should parse"),
+            proof_expires_at
+        );
+        assert_eq!(
+            proof_expiry_epoch_seconds(&bait, &client_c_proof)
+                .expect("client C proof expiry should parse"),
             proof_expires_at
         );
 
@@ -15056,6 +15193,18 @@ mod tests {
             ),
         ));
         assert_eq!(client_a_action.status, 202);
+        let client_c_exposure = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_with_transport_secret(
+                "GET",
+                &bait.surface,
+                client_c,
+                CLIENT_C_CONTINUITY,
+                TRANSPORT_SECRET,
+                &[],
+            ),
+        ));
+        assert_eq!(client_c_exposure.status, 200);
         let client_b_old_active = parse_downstream_response(&production_profile_request(
             server.address,
             &authenticated_production_request_with_transport_secret(
@@ -15161,11 +15310,109 @@ mod tests {
             )
             .expect("continuity sidecar should parse before migration");
         assert_eq!(state_before_migration.schema_version, 2);
-        assert_eq!(state_before_migration.records.len(), 2);
+        assert_eq!(state_before_migration.records.len(), 3);
         assert!(state_before_migration.records.iter().all(|record| {
             record.continuity_key_id_hex.as_deref()
                 != Some(state_before_migration.transport_key_id_hex.as_str())
         }));
+
+        let mut fixture = server.stop_for_restart();
+        let source_cidr_index = fixture
+            .args
+            .iter()
+            .position(|value| value == "--trusted-ingress-source-cidr")
+            .expect("overlap fixture should configure a trusted ingress source");
+        let allowed_source_cidr = fixture.args[source_cidr_index + 1].clone();
+        fixture.args[source_cidr_index + 1] = "10.0.0.0/8".to_string();
+        let server = start_production_profile_server(fixture);
+        let durable_paths = [
+            server.event_log_path.clone(),
+            sidecar_state_path(&server.event_log_path, ".exposures.json"),
+            sidecar_state_path(&server.event_log_path, ".consumed-proofs.json"),
+            server.fixture.policy_state_path.clone(),
+            continuity_state_path.clone(),
+        ];
+        let read_optional = |state_path: &Path| match fs::read(state_path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => panic!("populated state snapshot should read: {error}"),
+        };
+        let state_before_source_rejection = durable_paths
+            .iter()
+            .map(|state_path| read_optional(state_path))
+            .collect::<Vec<_>>();
+        assert!(state_before_source_rejection.iter().all(Option::is_some));
+        let renderer_connections_before = server.fixture.renderer.accepted_connection_count();
+        let client_c_disallowed = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_with_transport_secret(
+                "POST",
+                &bait.expected_action.path,
+                client_c,
+                CLIENT_C_CONTINUITY,
+                TRANSPORT_SECRET,
+                &client_c_action_headers,
+            ),
+        ));
+        assert_eq!(client_c_disallowed.status, 400);
+        assert_eq!(client_c_disallowed.body, b"invalid ingress continuity\n");
+        assert_eq!(
+            header_values(&client_c_disallowed, "cache-control"),
+            vec!["no-store"]
+        );
+        assert!(header_values(&client_c_disallowed, "set-cookie").is_empty());
+        assert_eq!(
+            server.fixture.renderer.accepted_connection_count(),
+            renderer_connections_before,
+            "disallowed previous-key client reached the renderer"
+        );
+        let state_after_source_rejection = durable_paths
+            .iter()
+            .map(|state_path| read_optional(state_path))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            state_after_source_rejection, state_before_source_rejection,
+            "disallowed previous-key client mutated populated durable state"
+        );
+
+        let mut fixture = server.stop_for_restart();
+        fixture.args[source_cidr_index + 1] = allowed_source_cidr;
+        let server = start_production_profile_server(fixture);
+        let renderer_connections_before = server.fixture.renderer.accepted_connection_count();
+        let client_c_allowed = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie_with_transport_secret(
+                "POST",
+                &bait.expected_action.path,
+                CLIENT_C_CONTINUITY,
+                TRANSPORT_SECRET,
+                &client_c_action_headers,
+            ),
+        ));
+        assert_eq!(client_c_allowed.status, 202);
+        assert_eq!(response_session_id(&client_c_allowed), client_c);
+        assert_eq!(
+            server.fixture.renderer.accepted_connection_count(),
+            renderer_connections_before + 1,
+            "allowed previous-key client should exercise the remote renderer"
+        );
+        let state_after_client_c: eidolon_proxy::session_continuity_store::StoredContinuityState =
+            serde_json::from_str(
+                &fs::read_to_string(&continuity_state_path)
+                    .expect("continuity sidecar should read after client C migration"),
+            )
+            .expect("continuity sidecar should parse after client C migration");
+        assert_eq!(
+            state_after_client_c
+                .records
+                .iter()
+                .filter(|record| {
+                    record.continuity_key_id_hex.as_deref()
+                        == Some(state_after_client_c.transport_key_id_hex.as_str())
+                })
+                .count(),
+            1
+        );
 
         let client_a_overlap = parse_downstream_response(&production_profile_request(
             server.address,
@@ -15211,7 +15458,7 @@ mod tests {
                         == Some(state_after_client_a.transport_key_id_hex.as_str())
                 })
                 .count(),
-            1
+            2
         );
 
         let client_b_overlap = parse_downstream_response(&production_profile_request(
@@ -15313,8 +15560,10 @@ mod tests {
             NEW_CONTINUITY_KEY,
             CLIENT_A_CONTINUITY,
             CLIENT_B_CONTINUITY,
+            CLIENT_C_CONTINUITY,
             "mint-secret",
             client_a_proof.as_str(),
+            client_c_proof.as_str(),
             path_str(&old_continuity_path, "old continuity path should be UTF-8"),
             path_str(&new_continuity_path, "new continuity path should be UTF-8"),
         ] {
@@ -15325,6 +15574,7 @@ mod tests {
         }
         for state in [
             &state_before_migration,
+            &state_after_client_c,
             &state_after_client_a,
             &state_after_migration,
         ] {
@@ -15428,7 +15678,17 @@ mod tests {
             now,
         )
         .expect("consumed proof state should reopen after retirement");
-        assert_eq!(restored_replay_state.consumed.len(), 1);
+        assert_eq!(restored_replay_state.consumed.len(), 2);
+        assert_eq!(
+            restored_replay_state.check_and_mark(
+                client_c,
+                bait.id.clone(),
+                client_c_proof,
+                proof_expires_at,
+                now,
+            ),
+            ConsumeProofOutcome::Replay
+        );
         assert_eq!(
             restored_replay_state.check_and_mark(
                 client_a,
@@ -15445,7 +15705,7 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).expect("debug record should parse"))
             .filter(|record| record["event"] == "proxy_started")
             .collect::<Vec<_>>();
-        assert_eq!(debug_records.len(), 5);
+        assert_eq!(debug_records.len(), 7);
         assert_eq!(
             debug_records
                 .iter()
@@ -15453,7 +15713,7 @@ mod tests {
                     .as_bool()
                     .expect("overlap status should be boolean"))
                 .collect::<Vec<_>>(),
-            vec![false, true, true, true, false]
+            vec![false, true, true, true, true, true, false]
         );
         assert_eq!(
             debug_records
@@ -15465,9 +15725,11 @@ mod tests {
                         .expect("previous-key count should be numeric")
                 })
                 .collect::<Vec<_>>(),
-            vec![0, 2, 2, 0, 0]
+            vec![0, 3, 3, 3, 3, 0, 0]
         );
         assert_ne!(client_a, client_b);
+        assert_ne!(client_a, client_c);
+        assert_ne!(client_b, client_c);
         assert!(
             current_unix_secs() < proof_expires_at,
             "bounded key-overlap scenario exceeded its selected proof-validity window"
