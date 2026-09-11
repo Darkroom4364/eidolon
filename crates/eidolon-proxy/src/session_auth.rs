@@ -106,6 +106,7 @@ impl ContinuitySource {
 pub struct ContinuityKey {
     source: ContinuitySource,
     digest: [u8; 32],
+    key_id: Option<[u8; 32]>,
 }
 
 impl ContinuityKey {
@@ -117,6 +118,7 @@ impl ContinuityKey {
         Self {
             source: ContinuitySource::AuthenticatedIngress,
             digest: mac.finalize().into_bytes().into(),
+            key_id: Some(continuity_state_key_id(continuity_key)),
         }
     }
 
@@ -132,10 +134,11 @@ impl ContinuityKey {
         self.source
     }
 
-    fn authenticated_from_digest(digest: [u8; 32]) -> Self {
+    fn authenticated_from_digest(digest: [u8; 32], key_id: [u8; 32]) -> Self {
         Self {
             source: ContinuitySource::AuthenticatedIngress,
             digest,
+            key_id: Some(key_id),
         }
     }
 
@@ -150,7 +153,12 @@ impl ContinuityKey {
         Self {
             source,
             digest: digest.finalize().into(),
+            key_id: None,
         }
+    }
+
+    fn key_id(self) -> Option<[u8; 32]> {
+        self.key_id
     }
 }
 
@@ -160,6 +168,40 @@ impl fmt::Debug for ContinuityKey {
             .debug_struct("ContinuityKey")
             .field("source", &self.source)
             .field("digest", &"<redacted>")
+            .field("key_id", &self.key_id.map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Active and optional previous minimized continuity identities for one
+/// authenticated request. New bindings always use `active`; `previous` exists
+/// only to find and durably migrate an older binding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContinuityKeyCandidates {
+    active: ContinuityKey,
+    previous: Option<ContinuityKey>,
+}
+
+impl ContinuityKeyCandidates {
+    pub(crate) fn new(active: ContinuityKey, previous: Option<ContinuityKey>) -> Self {
+        Self { active, previous }
+    }
+
+    pub(crate) fn single(active: ContinuityKey) -> Self {
+        Self::new(active, None)
+    }
+
+    pub(crate) fn active(self) -> ContinuityKey {
+        self.active
+    }
+}
+
+impl fmt::Debug for ContinuityKeyCandidates {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContinuityKeyCandidates")
+            .field("active", &self.active)
+            .field("previous", &self.previous)
             .finish()
     }
 }
@@ -243,6 +285,9 @@ pub enum ContinuityOutcome {
     /// Historical state exists but no continuity sidecar was available to
     /// recover an unauthenticated session binding.
     MigrationQuarantineFailClosed,
+    /// Active and previous continuity candidates resolved inconsistently.
+    /// No session is adopted from ambiguous durable identity state.
+    KeyMigrationConflictFailClosed,
     /// A continuity mutation could not be durably committed before routing.
     StorageUnavailable,
     /// New durable mappings exceeded the bounded synchronous-write budget.
@@ -261,6 +306,7 @@ impl ContinuityOutcome {
             Self::CooldownLimited => "cooldown_limited",
             Self::CapacityFailClosed => "capacity_fail_closed",
             Self::MigrationQuarantineFailClosed => "migration_quarantine_fail_closed",
+            Self::KeyMigrationConflictFailClosed => "key_migration_conflict_fail_closed",
             Self::StorageUnavailable => "storage_unavailable",
             Self::AdmissionRateFailClosed => "admission_rate_fail_closed",
         }
@@ -271,6 +317,7 @@ impl ContinuityOutcome {
             self,
             Self::CapacityFailClosed
                 | Self::MigrationQuarantineFailClosed
+                | Self::KeyMigrationConflictFailClosed
                 | Self::StorageUnavailable
                 | Self::AdmissionRateFailClosed
         )
@@ -400,6 +447,7 @@ pub struct SessionAuthority {
     continuity_order: VecDeque<ContinuityKey>,
     continuity_state_path: Option<PathBuf>,
     continuity_state_key_id_hex: Option<String>,
+    previous_continuity_state_key_id_hex: Option<String>,
     continuity_integrity_key: Option<IntegrityKey>,
     continuity_migration_quarantine_until: Option<u64>,
     continuity_last_checkpoint_at: u64,
@@ -428,6 +476,13 @@ impl fmt::Debug for SessionAuthority {
                     .as_ref()
                     .map(|_| "<redacted>"),
             )
+            .field(
+                "previous_continuity_state_key_id_hex",
+                &self
+                    .previous_continuity_state_key_id_hex
+                    .as_ref()
+                    .map(|_| "<redacted>"),
+            )
             .field("continuity_integrity_key", &self.continuity_integrity_key)
             .field(
                 "continuity_migration_quarantine_until",
@@ -453,7 +508,10 @@ impl fmt::Debug for SessionAuthority {
 pub struct DurableContinuityStartup {
     pub path: PathBuf,
     pub restored_record_count: usize,
+    pub active_key_record_count: usize,
+    pub previous_key_record_count: usize,
     pub ttl_evicted_record_count: usize,
+    pub loaded_schema_version: Option<u16>,
     pub migration_quarantine_until: Option<u64>,
 }
 
@@ -487,6 +545,7 @@ impl SessionAuthority {
             continuity_order: VecDeque::new(),
             continuity_state_path: None,
             continuity_state_key_id_hex: None,
+            previous_continuity_state_key_id_hex: None,
             continuity_integrity_key: None,
             continuity_migration_quarantine_until: None,
             continuity_last_checkpoint_at: 0,
@@ -577,6 +636,27 @@ impl SessionAuthority {
         history_exists: bool,
         now: u64,
     ) -> io::Result<DurableContinuityStartup> {
+        self.enable_durable_continuity_with_previous(
+            path,
+            continuity_key,
+            None,
+            history_exists,
+            now,
+        )
+    }
+
+    /// Load continuity state under one active and at most one previous key.
+    /// Existing schema-v1 records inherit their snapshot's signing key;
+    /// every successful startup rewrites the validated snapshot as schema v2
+    /// under the active integrity key before traffic is served.
+    pub fn enable_durable_continuity_with_previous(
+        &mut self,
+        path: &Path,
+        active_continuity_key: &str,
+        previous_continuity_key: Option<&str>,
+        history_exists: bool,
+        now: u64,
+    ) -> io::Result<DurableContinuityStartup> {
         if self.continuity_state_path.is_some()
             || !self.continuity.is_empty()
             || !self.continuity_order.is_empty()
@@ -586,22 +666,61 @@ impl SessionAuthority {
                 "durable continuity must be enabled before continuity records exist",
             ));
         }
-        let continuity_key = continuity_key.trim();
-        if continuity_key.is_empty() {
+        let active_continuity_key = active_continuity_key.trim();
+        if active_continuity_key.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "durable continuity requires a non-empty continuity key",
             ));
         }
+        let previous_continuity_key = previous_continuity_key
+            .map(str::trim)
+            .map(|key| {
+                if key.is_empty() {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "previous durable continuity key must be non-empty",
+                    ))
+                } else if key == active_continuity_key {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "previous durable continuity key must differ from the active key",
+                    ))
+                } else {
+                    Ok(key)
+                }
+            })
+            .transpose()?;
 
-        let expected_key_id = continuity_state_key_id_hex(continuity_key);
-        let integrity_key = IntegrityKey::derive(continuity_key)?;
-        let loaded = session_continuity_store::load_state(path, &integrity_key, &expected_key_id)?;
+        let active_key_id = continuity_state_key_id_hex(active_continuity_key);
+        let previous_key_id = previous_continuity_key.map(continuity_state_key_id_hex);
+        if previous_key_id.as_ref() == Some(&active_key_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "active and previous durable continuity key identifiers must differ",
+            ));
+        }
+        let active_integrity_key = IntegrityKey::derive(active_continuity_key)?;
+        let previous_integrity_key = previous_continuity_key
+            .map(IntegrityKey::derive)
+            .transpose()?;
+        let mut key_candidates = vec![(active_key_id.as_str(), &active_integrity_key)];
+        if let (Some(previous_key_id), Some(previous_integrity_key)) =
+            (previous_key_id.as_deref(), previous_integrity_key.as_ref())
+        {
+            key_candidates.push((previous_key_id, previous_integrity_key));
+        }
+        let loaded = session_continuity_store::load_with_key_candidates(path, &key_candidates)?;
         let mut ttl_evicted_record_count = 0;
         let mut restored_record_count = 0;
+        let mut active_key_record_count = 0;
+        let mut previous_key_record_count = 0;
+        let mut loaded_schema_version = None;
         let mut migration_quarantine_until = None;
+        let mut restored_records = Vec::new();
 
         if let Some(stored) = loaded {
+            loaded_schema_version = Some(stored.schema_version);
             let active_quarantine = stored
                 .migration_quarantine_until
                 .filter(|until| *until > now);
@@ -623,6 +742,8 @@ impl SessionAuthority {
             }
             migration_quarantine_until = active_quarantine;
 
+            let schema_version = stored.schema_version;
+            let schema_v1_key_id = stored.transport_key_id_hex.clone();
             for record in stored.records {
                 if record.last_seen.saturating_add(self.continuity_ttl_secs) <= now {
                     ttl_evicted_record_count += 1;
@@ -633,13 +754,33 @@ impl SessionAuthority {
                         "active continuity state exceeds configured capacity",
                     ));
                 }
+                let record_key_id_hex = match schema_version {
+                    1 => schema_v1_key_id.as_str(),
+                    _ => record.continuity_key_id_hex.as_deref().ok_or_else(|| {
+                        invalid_data("continuity state record key identifier is missing")
+                    })?,
+                };
+                if record_key_id_hex == active_key_id {
+                    active_key_record_count += 1;
+                } else if previous_key_id.as_deref() == Some(record_key_id_hex) {
+                    previous_key_record_count += 1;
+                } else {
+                    return Err(invalid_data(
+                        "live continuity binding requires an unavailable previous continuity key",
+                    ));
+                }
                 let digest = decode_key_hex(&record.key_digest_hex).ok_or_else(|| {
                     invalid_data(
                         "continuity state key digest must contain exactly 64 hexadecimal characters",
                     )
                 })?;
-                let key = ContinuityKey::authenticated_from_digest(digest);
-                self.continuity.insert(
+                let key_id = decode_key_hex(record_key_id_hex).ok_or_else(|| {
+                    invalid_data(
+                        "continuity state record key identifier must contain exactly 64 hexadecimal characters",
+                    )
+                })?;
+                let key = ContinuityKey::authenticated_from_digest(digest, key_id);
+                restored_records.push((
                     key,
                     ContinuityRecord {
                         session_id: record.session_id,
@@ -648,17 +789,22 @@ impl SessionAuthority {
                         last_recovery_at: record.last_recovery_at,
                         recovery_count: record.recovery_count,
                     },
-                );
-                self.continuity_order.push_back(key);
+                ));
                 restored_record_count += 1;
             }
         } else if history_exists {
             migration_quarantine_until = Some(now.saturating_add(self.continuity_ttl_secs));
         }
 
+        for (key, record) in restored_records {
+            self.continuity.insert(key, record);
+            self.continuity_order.push_back(key);
+        }
+
         self.continuity_state_path = Some(path.to_path_buf());
-        self.continuity_state_key_id_hex = Some(expected_key_id);
-        self.continuity_integrity_key = Some(integrity_key);
+        self.continuity_state_key_id_hex = Some(active_key_id);
+        self.previous_continuity_state_key_id_hex = previous_key_id;
+        self.continuity_integrity_key = Some(active_integrity_key);
         self.continuity_migration_quarantine_until = migration_quarantine_until;
         self.continuity_last_checkpoint_at = now;
         self.continuity_dirty = true;
@@ -668,7 +814,10 @@ impl SessionAuthority {
         Ok(DurableContinuityStartup {
             path: path.to_path_buf(),
             restored_record_count,
+            active_key_record_count,
+            previous_key_record_count,
             ttl_evicted_record_count,
+            loaded_schema_version,
             migration_quarantine_until,
         })
     }
@@ -758,7 +907,48 @@ impl SessionAuthority {
         N: AsRef<str>,
         V: AsRef<str>,
     {
+        self.resolve_with_continuity_candidates(
+            headers,
+            continuity_key.map(ContinuityKeyCandidates::single),
+            now,
+        )
+    }
+
+    /// Resolve with an active and optional previous minimized continuity key.
+    /// A previous-key binding is durably moved to the active key before the
+    /// returned session can cause downstream effects.
+    pub(crate) fn resolve_with_continuity_candidates<I, N, V>(
+        &mut self,
+        headers: I,
+        continuity_keys: Option<ContinuityKeyCandidates>,
+        now: u64,
+    ) -> SessionResolution
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let headers = headers
+            .into_iter()
+            .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
+            .collect::<Vec<_>>();
         self.evict_expired_continuity(now);
+        let continuity_key = match continuity_keys {
+            Some(keys) => match self.prepare_continuity_key(keys, now) {
+                Ok(key) => Some(key),
+                Err(outcome) => {
+                    return self.continuity_key_migration_fail_closed(
+                        headers
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_str())),
+                        keys.active(),
+                        outcome,
+                        now,
+                    );
+                }
+            },
+            None => None,
+        };
 
         let previous_quarantine = self.continuity_migration_quarantine_until;
         let previous_dirty = self.continuity_dirty;
@@ -780,7 +970,13 @@ impl SessionAuthority {
             self.mark_authenticated_security_change();
         }
 
-        let resolution = self.resolve_with_continuity_in_memory(headers, continuity_key, now);
+        let resolution = self.resolve_with_continuity_in_memory(
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+            continuity_key,
+            now,
+        );
         if self.continuity_state_path.is_none() {
             return resolution;
         }
@@ -839,6 +1035,143 @@ impl SessionAuthority {
                 eprintln!("eidolon persistence failure: session continuity state: {error}");
                 self.storage_unavailable_resolution(resolution)
             }
+        }
+    }
+
+    fn prepare_continuity_key(
+        &mut self,
+        keys: ContinuityKeyCandidates,
+        now: u64,
+    ) -> Result<ContinuityKey, ContinuityOutcome> {
+        let active = keys.active;
+        let Some(previous) = keys.previous else {
+            return Ok(active);
+        };
+        if active.source() != ContinuitySource::AuthenticatedIngress
+            || previous.source() != ContinuitySource::AuthenticatedIngress
+            || active == previous
+        {
+            return Err(ContinuityOutcome::KeyMigrationConflictFailClosed);
+        }
+
+        match (
+            self.continuity.contains_key(&active),
+            self.continuity.contains_key(&previous),
+        ) {
+            (true, true) => Err(ContinuityOutcome::KeyMigrationConflictFailClosed),
+            (true, false) | (false, false) => Ok(active),
+            (false, true) => {
+                self.migrate_previous_continuity_binding(previous, active, now)?;
+                Ok(active)
+            }
+        }
+    }
+
+    fn migrate_previous_continuity_binding(
+        &mut self,
+        previous: ContinuityKey,
+        active: ContinuityKey,
+        now: u64,
+    ) -> Result<(), ContinuityOutcome> {
+        self.migrate_previous_continuity_binding_with_persist(
+            previous,
+            active,
+            now,
+            SessionAuthority::persist_continuity_state,
+        )
+    }
+
+    fn migrate_previous_continuity_binding_with_persist(
+        &mut self,
+        previous: ContinuityKey,
+        active: ContinuityKey,
+        now: u64,
+        persist: impl FnOnce(&SessionAuthority) -> io::Result<StateCommitOutcome>,
+    ) -> Result<(), ContinuityOutcome> {
+        let Some(order_index) = self
+            .continuity_order
+            .iter()
+            .position(|candidate| *candidate == previous)
+        else {
+            return Err(ContinuityOutcome::KeyMigrationConflictFailClosed);
+        };
+        let Some(previous_record) = self.continuity.remove(&previous) else {
+            return Err(ContinuityOutcome::KeyMigrationConflictFailClosed);
+        };
+        if let Some(active_record) = self.continuity.insert(active, previous_record) {
+            self.continuity.insert(active, active_record);
+            self.continuity.insert(previous, previous_record);
+            return Err(ContinuityOutcome::KeyMigrationConflictFailClosed);
+        }
+        self.continuity_order[order_index] = active;
+
+        let previous_dirty = self.continuity_dirty;
+        let previous_checkpoint_dirty = self.continuity_checkpoint_dirty;
+        let previous_checkpoint = self.continuity_last_checkpoint_at;
+        let previous_security_revision = self.continuity_security_revision;
+        let previous_metadata_revision = self.continuity_metadata_revision;
+        self.mark_authenticated_security_change();
+
+        if self.continuity_state_path.is_none() {
+            return Ok(());
+        }
+        match persist(self) {
+            Ok(StateCommitOutcome::Durable) => {
+                self.continuity_dirty = false;
+                self.continuity_checkpoint_dirty = false;
+                self.continuity_last_checkpoint_at = now;
+                Ok(())
+            }
+            Ok(StateCommitOutcome::CommittedDurabilityUncertain) => {
+                self.continuity_dirty = true;
+                self.continuity_checkpoint_dirty = true;
+                Err(ContinuityOutcome::StorageUnavailable)
+            }
+            Err(error) => {
+                self.continuity.remove(&active);
+                self.continuity.insert(previous, previous_record);
+                self.continuity_order[order_index] = previous;
+                self.continuity_dirty = previous_dirty;
+                self.continuity_checkpoint_dirty = previous_checkpoint_dirty;
+                self.continuity_last_checkpoint_at = previous_checkpoint;
+                self.continuity_security_revision = previous_security_revision;
+                self.continuity_metadata_revision = previous_metadata_revision;
+                eprintln!("eidolon persistence failure: session continuity key migration: {error}");
+                Err(ContinuityOutcome::StorageUnavailable)
+            }
+        }
+    }
+
+    fn continuity_key_migration_fail_closed<I, N, V>(
+        &self,
+        headers: I,
+        continuity_key: ContinuityKey,
+        outcome: ContinuityOutcome,
+        now: u64,
+    ) -> SessionResolution
+    where
+        I: IntoIterator<Item = (N, V)>,
+        N: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let raw_cookie = session_cookie_value(headers);
+        let (cookie_outcome, presented_key_version) = match raw_cookie.as_deref() {
+            Some(raw_cookie) => match self.verify(raw_cookie, now) {
+                Ok(verified) => (CookieOutcome::Valid, Some(verified.key_version)),
+                Err(result) => result,
+            },
+            None => (CookieOutcome::Absent, None),
+        };
+        SessionResolution {
+            session_id: SessionId::new(),
+            cookie_outcome,
+            key_status: None,
+            presented_key_version,
+            active_key_version: self.active_key_version,
+            continuity_outcome: outcome,
+            continuity_source: Some(continuity_key.source()),
+            enforcement_floor: Some(PolicyState::Blocked),
+            set_cookie_value: None,
         }
     }
 
@@ -1492,8 +1825,15 @@ impl SessionAuthority {
             let Some(record) = self.continuity.get(key) else {
                 continue;
             };
+            let continuity_key_id_hex =
+                key.key_id()
+                    .map(|key_id| encode_hex(&key_id))
+                    .ok_or_else(|| {
+                        invalid_data("authenticated continuity record key identifier is missing")
+                    })?;
             records.push(StoredContinuityRecord {
                 key_digest_hex: encode_hex(&key.digest()),
+                continuity_key_id_hex: Some(continuity_key_id_hex),
                 session_id: record.session_id,
                 enforcement_floor: record.floor,
                 last_seen: record.last_seen,
@@ -1502,7 +1842,7 @@ impl SessionAuthority {
             });
         }
         Ok(StoredContinuityState {
-            schema_version: 1,
+            schema_version: session_continuity_store::SESSION_CONTINUITY_SCHEMA_VERSION,
             transport_key_id_hex,
             migration_quarantine_until: self.continuity_migration_quarantine_until,
             records,
@@ -1605,10 +1945,14 @@ pub fn enforcement_rank(state: PolicyState) -> u8 {
 }
 
 fn continuity_state_key_id_hex(continuity_key: &str) -> String {
+    encode_hex(&continuity_state_key_id(continuity_key))
+}
+
+fn continuity_state_key_id(continuity_key: &str) -> [u8; 32] {
     let mut mac = <SessionMac as KeyInit>::new_from_slice(continuity_key.as_bytes())
         .expect("HMAC-SHA256 accepts any continuity key length");
     mac.update(CONTINUITY_STATE_KEY_ID_DOMAIN);
-    encode_hex(&mac.finalize().into_bytes())
+    mac.finalize().into_bytes().into()
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -1727,6 +2071,21 @@ mod tests {
 
     fn ingress_key(raw: &str) -> ContinuityKey {
         ContinuityKey::authenticated_ingress(raw, "edge-secret")
+    }
+
+    fn ingress_key_with_secret(raw: &str, continuity_key: &str) -> ContinuityKey {
+        ContinuityKey::authenticated_ingress(raw, continuity_key)
+    }
+
+    fn ingress_key_candidates(
+        raw: &str,
+        active_continuity_key: &str,
+        previous_continuity_key: &str,
+    ) -> ContinuityKeyCandidates {
+        ContinuityKeyCandidates::new(
+            ingress_key_with_secret(raw, active_continuity_key),
+            Some(ingress_key_with_secret(raw, previous_continuity_key)),
+        )
     }
 
     fn cookie_header(value: &str) -> [(&'static str, String); 1] {
@@ -2885,6 +3244,491 @@ mod tests {
             after_restart.enforcement_floor,
             Some(PolicyState::ControlledReality)
         );
+    }
+
+    #[test]
+    fn continuity_key_overlap_upgrades_v1_and_durably_rekeys_before_retirement() {
+        const RAW_IDENTITY: &str = "continuity-migration-client";
+        const OLD_KEY: &str = "old-continuity-key";
+        const NEW_KEY: &str = "new-continuity-key";
+
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let old_binding = ingress_key_with_secret(RAW_IDENTITY, OLD_KEY);
+        let mut old = test_authority();
+        old.enable_durable_continuity(&state_path, OLD_KEY, false, NOW)
+            .expect("old-key state should initialize");
+        let first =
+            old.resolve_with_continuity([("Host", "proxy.local")], Some(old_binding), NOW + 1);
+        let recovered_before_rotation =
+            old.resolve_with_continuity([("Host", "proxy.local")], Some(old_binding), NOW + 2);
+        assert_eq!(recovered_before_rotation.session_id, first.session_id);
+        assert_eq!(
+            recovered_before_rotation.continuity_outcome,
+            ContinuityOutcome::Recovered
+        );
+        old.note_enforcement_with_continuity(
+            Some(old_binding),
+            first.session_id,
+            PolicyState::ControlledReality,
+            NOW + 3,
+        );
+        old.persist_continuity_state_durably()
+            .expect("old-key enforcement floor should persist");
+
+        let mut v1 = old
+            .stored_continuity_state()
+            .expect("old-key state should serialize");
+        v1.schema_version = 1;
+        for record in &mut v1.records {
+            record.continuity_key_id_hex = None;
+        }
+        session_continuity_store::persist_state(
+            &state_path,
+            &v1,
+            &IntegrityKey::derive(OLD_KEY).expect("old integrity key"),
+        )
+        .expect("schema-v1 fixture should persist");
+        drop(old);
+
+        let mut overlap = test_authority();
+        let startup = overlap
+            .enable_durable_continuity_with_previous(
+                &state_path,
+                NEW_KEY,
+                Some(OLD_KEY),
+                true,
+                NOW + 4,
+            )
+            .expect("overlap should restore schema-v1 state");
+        assert_eq!(startup.loaded_schema_version, Some(1));
+        assert_eq!(startup.restored_record_count, 1);
+        assert_eq!(startup.active_key_record_count, 0);
+        assert_eq!(startup.previous_key_record_count, 1);
+
+        let active_key_id = continuity_state_key_id_hex(NEW_KEY);
+        let previous_key_id = continuity_state_key_id_hex(OLD_KEY);
+        let upgraded = session_continuity_store::load_state(
+            &state_path,
+            &IntegrityKey::derive(NEW_KEY).expect("new integrity key"),
+            &active_key_id,
+        )
+        .expect("upgraded state should verify under the active key")
+        .expect("upgraded state should exist");
+        assert_eq!(upgraded.schema_version, 2);
+        assert_eq!(
+            upgraded.records[0].continuity_key_id_hex.as_deref(),
+            Some(previous_key_id.as_str())
+        );
+
+        let mut premature = test_authority();
+        let error = premature
+            .enable_durable_continuity(&state_path, NEW_KEY, true, NOW + 5)
+            .expect_err("live previous-key state must block premature retirement");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("unavailable previous continuity key"));
+
+        let candidates = ingress_key_candidates(RAW_IDENTITY, NEW_KEY, OLD_KEY);
+        let previous_candidate = candidates.previous.expect("previous candidate");
+        let previous_order_index = overlap
+            .continuity_order
+            .iter()
+            .position(|candidate| *candidate == previous_candidate)
+            .expect("previous binding should retain an eviction-order slot");
+        let migrated = overlap.resolve_with_continuity_candidates(
+            [("Host", "proxy.local")],
+            Some(candidates),
+            NOW + 5,
+        );
+        assert_eq!(migrated.session_id, first.session_id);
+        assert_eq!(
+            migrated.continuity_outcome,
+            ContinuityOutcome::CooldownSessionPreserved
+        );
+        assert_eq!(
+            migrated.enforcement_floor,
+            Some(PolicyState::ControlledReality)
+        );
+        assert!(migrated.set_cookie_value.is_some());
+        assert!(overlap.continuity.contains_key(&candidates.active));
+        assert!(!overlap.continuity.contains_key(&previous_candidate));
+        assert_eq!(
+            overlap
+                .continuity_order
+                .iter()
+                .position(|candidate| *candidate == candidates.active),
+            Some(previous_order_index)
+        );
+        let migrated_record = overlap.continuity[&candidates.active];
+        assert_eq!(migrated_record.last_recovery_at, Some(NOW + 2));
+        assert_eq!(migrated_record.recovery_count, 1);
+        assert_eq!(migrated_record.last_seen, NOW + 5);
+
+        let migrated_state = session_continuity_store::load_state(
+            &state_path,
+            &IntegrityKey::derive(NEW_KEY).expect("new integrity key"),
+            &active_key_id,
+        )
+        .expect("migrated state should verify")
+        .expect("migrated state should exist");
+        assert_eq!(
+            migrated_state.records[0].continuity_key_id_hex.as_deref(),
+            Some(active_key_id.as_str())
+        );
+        let serialized = fs::read_to_string(&state_path).expect("state should be readable");
+        for sensitive in [RAW_IDENTITY, OLD_KEY, NEW_KEY] {
+            assert!(!serialized.contains(sensitive));
+        }
+
+        let mut retired = test_authority();
+        let retired_startup = retired
+            .enable_durable_continuity(&state_path, NEW_KEY, true, NOW + 6)
+            .expect("new-only startup should succeed after migration");
+        assert_eq!(retired_startup.active_key_record_count, 1);
+        assert_eq!(retired_startup.previous_key_record_count, 0);
+        let recovered = retired.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(ingress_key_with_secret(RAW_IDENTITY, NEW_KEY)),
+            NOW + 7,
+        );
+        assert_eq!(recovered.session_id, first.session_id);
+        assert_eq!(
+            recovered.enforcement_floor,
+            Some(PolicyState::ControlledReality)
+        );
+    }
+
+    #[test]
+    fn continuity_key_overlap_supports_bounded_role_rollback() {
+        const RAW_IDENTITY: &str = "continuity-rollback-client";
+        const OLD_KEY: &str = "rollback-old-key";
+        const NEW_KEY: &str = "rollback-new-key";
+
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let mut old = test_authority();
+        old.enable_durable_continuity(&state_path, OLD_KEY, false, NOW)
+            .expect("old-key state should initialize");
+        let first = old.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(ingress_key_with_secret(RAW_IDENTITY, OLD_KEY)),
+            NOW + 1,
+        );
+        drop(old);
+
+        let mut forward = test_authority();
+        forward
+            .enable_durable_continuity_with_previous(
+                &state_path,
+                NEW_KEY,
+                Some(OLD_KEY),
+                true,
+                NOW + 2,
+            )
+            .expect("forward overlap should start");
+        let forward_candidates = ingress_key_candidates(RAW_IDENTITY, NEW_KEY, OLD_KEY);
+        let forward_resolution = forward.resolve_with_continuity_candidates(
+            [("Host", "proxy.local")],
+            Some(forward_candidates),
+            NOW + 3,
+        );
+        assert_eq!(forward_resolution.session_id, first.session_id);
+        drop(forward);
+
+        let mut rollback = test_authority();
+        let rollback_startup = rollback
+            .enable_durable_continuity_with_previous(
+                &state_path,
+                OLD_KEY,
+                Some(NEW_KEY),
+                true,
+                NOW + 4,
+            )
+            .expect("swapped overlap should authenticate the active-signed state");
+        assert_eq!(rollback_startup.active_key_record_count, 0);
+        assert_eq!(rollback_startup.previous_key_record_count, 1);
+        let rollback_candidates = ingress_key_candidates(RAW_IDENTITY, OLD_KEY, NEW_KEY);
+        let rolled_back = rollback.resolve_with_continuity_candidates(
+            [("Host", "proxy.local")],
+            Some(rollback_candidates),
+            NOW + 5,
+        );
+        assert_eq!(rolled_back.session_id, first.session_id);
+        drop(rollback);
+
+        let mut old_only = test_authority();
+        old_only
+            .enable_durable_continuity(&state_path, OLD_KEY, true, NOW + 6)
+            .expect("old-only startup should succeed after rollback migration");
+        let recovered = old_only.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(ingress_key_with_secret(RAW_IDENTITY, OLD_KEY)),
+            NOW + 7,
+        );
+        assert_eq!(recovered.session_id, first.session_id);
+    }
+
+    #[test]
+    fn expired_previous_key_binding_does_not_block_retirement() {
+        const RAW_IDENTITY: &str = "expired-previous-client";
+        const OLD_KEY: &str = "expired-old-key";
+        const NEW_KEY: &str = "expired-new-key";
+
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let mut old = test_authority();
+        old.continuity_ttl_secs = 10;
+        old.enable_durable_continuity(&state_path, OLD_KEY, false, NOW)
+            .expect("old-key state should initialize");
+        old.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(ingress_key_with_secret(RAW_IDENTITY, OLD_KEY)),
+            NOW + 1,
+        );
+        drop(old);
+
+        let mut overlap = test_authority();
+        overlap.continuity_ttl_secs = 10;
+        overlap
+            .enable_durable_continuity_with_previous(
+                &state_path,
+                NEW_KEY,
+                Some(OLD_KEY),
+                true,
+                NOW + 2,
+            )
+            .expect("overlap should rewrite state under the active key");
+        drop(overlap);
+
+        let mut retired = test_authority();
+        retired.continuity_ttl_secs = 10;
+        let startup = retired
+            .enable_durable_continuity(&state_path, NEW_KEY, true, NOW + 11)
+            .expect("expired previous-key state should not block retirement");
+        assert_eq!(startup.restored_record_count, 0);
+        assert_eq!(startup.ttl_evicted_record_count, 1);
+        assert_eq!(startup.active_key_record_count, 0);
+        assert_eq!(startup.previous_key_record_count, 0);
+    }
+
+    #[test]
+    fn startup_validates_every_record_before_populating_the_authority() {
+        const ACTIVE_KEY: &str = "record-validation-active-key";
+        const PREVIOUS_KEY: &str = "record-validation-previous-key";
+
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let mut writer = test_authority();
+        writer
+            .enable_durable_continuity(&state_path, ACTIVE_KEY, false, NOW)
+            .expect("active-key state should initialize");
+        for identity in ["valid-record-client", "unknown-record-client"] {
+            writer.resolve_with_continuity(
+                [("Host", "proxy.local")],
+                Some(ingress_key_with_secret(identity, ACTIVE_KEY)),
+                NOW + 1,
+            );
+        }
+        let mut state = writer
+            .stored_continuity_state()
+            .expect("continuity state should serialize");
+        state.records[1].continuity_key_id_hex =
+            Some(continuity_state_key_id_hex("unconfigured-third-key"));
+        session_continuity_store::persist_state(
+            &state_path,
+            &state,
+            &IntegrityKey::derive(ACTIVE_KEY).expect("active integrity key"),
+        )
+        .expect("validly signed unknown-provenance fixture should persist");
+        drop(writer);
+
+        let mut reader = test_authority();
+        let error = reader
+            .enable_durable_continuity_with_previous(
+                &state_path,
+                ACTIVE_KEY,
+                Some(PREVIOUS_KEY),
+                true,
+                NOW + 2,
+            )
+            .expect_err("unknown live record provenance must fail startup");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("unavailable previous continuity key"));
+        assert!(reader.continuity.is_empty());
+        assert!(reader.continuity_order.is_empty());
+        assert!(reader.continuity_state_path.is_none());
+    }
+
+    #[test]
+    fn conflicting_active_and_previous_bindings_fail_closed_without_mutation() {
+        const RAW_IDENTITY: &str = "conflicting-migration-client";
+        const OLD_KEY: &str = "conflict-old-key";
+        const NEW_KEY: &str = "conflict-new-key";
+
+        let mut authority = test_authority();
+        let candidates = ingress_key_candidates(RAW_IDENTITY, NEW_KEY, OLD_KEY);
+        let active = authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(candidates.active),
+            NOW,
+        );
+        let previous = authority.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            candidates.previous,
+            NOW + 1,
+        );
+        let active_record = authority.continuity[&candidates.active];
+        let previous_key = candidates.previous.expect("previous candidate");
+        let previous_record = authority.continuity[&previous_key];
+
+        let valid_cookie = authority.mint_cookie_value(active.session_id, NOW + 1);
+        let conflict = authority.resolve_with_continuity_candidates(
+            cookie_header(&valid_cookie),
+            Some(candidates),
+            NOW + 2,
+        );
+        assert_eq!(conflict.cookie_outcome, CookieOutcome::Valid);
+        assert_eq!(
+            conflict.continuity_outcome,
+            ContinuityOutcome::KeyMigrationConflictFailClosed
+        );
+        assert_eq!(conflict.enforcement_floor, Some(PolicyState::Blocked));
+        assert_eq!(conflict.set_cookie_value, None);
+        assert_ne!(conflict.session_id, active.session_id);
+        assert_ne!(active.session_id, previous.session_id);
+        assert_eq!(authority.continuity[&candidates.active], active_record);
+        assert_eq!(authority.continuity[&previous_key], previous_record);
+    }
+
+    #[test]
+    fn failed_migration_persist_restores_previous_binding_and_suppresses_cookie() {
+        const RAW_IDENTITY: &str = "migration-write-failure-client";
+        const OLD_KEY: &str = "write-failure-old-key";
+        const NEW_KEY: &str = "write-failure-new-key";
+
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let mut old = test_authority();
+        old.enable_durable_continuity(&state_path, OLD_KEY, false, NOW)
+            .expect("old-key state should initialize");
+        let first = old.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(ingress_key_with_secret(RAW_IDENTITY, OLD_KEY)),
+            NOW + 1,
+        );
+        drop(old);
+
+        let mut overlap = test_authority();
+        overlap
+            .enable_durable_continuity_with_previous(
+                &state_path,
+                NEW_KEY,
+                Some(OLD_KEY),
+                true,
+                NOW + 2,
+            )
+            .expect("overlap should start");
+        let candidates = ingress_key_candidates(RAW_IDENTITY, NEW_KEY, OLD_KEY);
+        let previous_key = candidates.previous.expect("previous candidate");
+        let previous_record = overlap.continuity[&previous_key];
+
+        let mut temp_path = state_path.as_os_str().to_os_string();
+        temp_path.push(".tmp");
+        let temp_path = PathBuf::from(temp_path);
+        fs::create_dir(&temp_path).expect("blocking temp directory should be created");
+
+        let valid_cookie = overlap.mint_cookie_value(first.session_id, NOW + 2);
+        let failed = overlap.resolve_with_continuity_candidates(
+            cookie_header(&valid_cookie),
+            Some(candidates),
+            NOW + 3,
+        );
+        assert_eq!(failed.cookie_outcome, CookieOutcome::Valid);
+        assert_eq!(
+            failed.continuity_outcome,
+            ContinuityOutcome::StorageUnavailable
+        );
+        assert_eq!(failed.enforcement_floor, Some(PolicyState::Blocked));
+        assert_eq!(failed.set_cookie_value, None);
+        assert!(!overlap.continuity.contains_key(&candidates.active));
+        assert_eq!(overlap.continuity[&previous_key], previous_record);
+
+        fs::remove_dir(&temp_path).expect("blocking temp directory should be removed");
+        let retried = overlap.resolve_with_continuity_candidates(
+            [("Host", "proxy.local")],
+            Some(candidates),
+            NOW + 4,
+        );
+        assert_eq!(retried.session_id, first.session_id);
+        assert_eq!(retried.continuity_outcome, ContinuityOutcome::Recovered);
+        assert!(overlap.continuity.contains_key(&candidates.active));
+        assert!(!overlap.continuity.contains_key(&previous_key));
+    }
+
+    #[test]
+    fn committed_migration_sync_uncertainty_retains_the_active_binding() {
+        const RAW_IDENTITY: &str = "migration-sync-uncertainty-client";
+        const OLD_KEY: &str = "sync-uncertainty-old-key";
+        const NEW_KEY: &str = "sync-uncertainty-new-key";
+
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let mut old = test_authority();
+        old.enable_durable_continuity(&state_path, OLD_KEY, false, NOW)
+            .expect("old-key state should initialize");
+        let first = old.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(ingress_key_with_secret(RAW_IDENTITY, OLD_KEY)),
+            NOW + 1,
+        );
+        drop(old);
+
+        let mut overlap = test_authority();
+        overlap
+            .enable_durable_continuity_with_previous(
+                &state_path,
+                NEW_KEY,
+                Some(OLD_KEY),
+                true,
+                NOW + 2,
+            )
+            .expect("overlap should start");
+        let candidates = ingress_key_candidates(RAW_IDENTITY, NEW_KEY, OLD_KEY);
+        let previous_key = candidates.previous.expect("previous candidate");
+
+        let outcome = overlap.migrate_previous_continuity_binding_with_persist(
+            previous_key,
+            candidates.active,
+            NOW + 3,
+            |authority| {
+                assert_eq!(
+                    authority.persist_continuity_state()?,
+                    StateCommitOutcome::Durable
+                );
+                Ok(StateCommitOutcome::CommittedDurabilityUncertain)
+            },
+        );
+        assert_eq!(outcome, Err(ContinuityOutcome::StorageUnavailable));
+        assert!(overlap.continuity.contains_key(&candidates.active));
+        assert!(!overlap.continuity.contains_key(&previous_key));
+        assert!(overlap.continuity_dirty);
+        assert!(overlap.continuity_checkpoint_dirty);
+        drop(overlap);
+
+        let mut restarted = test_authority();
+        restarted
+            .enable_durable_continuity(&state_path, NEW_KEY, true, NOW + 4)
+            .expect("committed active-key state should be restart-readable");
+        let recovered = restarted.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(ingress_key_with_secret(RAW_IDENTITY, NEW_KEY)),
+            NOW + 5,
+        );
+        assert_eq!(recovered.session_id, first.session_id);
     }
 
     #[test]

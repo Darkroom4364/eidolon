@@ -9,8 +9,8 @@ use eidolon_core::{
 };
 
 use crate::session_auth::{
-    ContinuityKey, ContinuityOutcome, ContinuitySource, CookieOutcome, KeyStatus, SessionAuthority,
-    SessionResolution,
+    ContinuityKey, ContinuityKeyCandidates, ContinuityOutcome, ContinuitySource, CookieOutcome,
+    KeyStatus, SessionAuthority, SessionResolution,
 };
 
 /// Request header carrying first-party cookies.
@@ -132,7 +132,7 @@ pub struct SessionContext {
     pub ingress_signals: IngressAdvisorySignals,
     pub trusted_ingress_soften_match: Option<TrustedIngressSoftenMatch>,
     pub trusted_bait_soften_path_prefixes: Option<Vec<String>>,
-    continuity_key: Option<ContinuityKey>,
+    continuity_keys: Option<ContinuityKeyCandidates>,
     set_cookie_value: Option<String>,
 }
 
@@ -140,7 +140,8 @@ pub struct SessionContext {
 pub struct TrustedIngressContinuityKeys<'a> {
     active_transport_auth_secret: &'a str,
     previous_transport_auth_secret: Option<&'a str>,
-    continuity_key: &'a str,
+    active_continuity_key: &'a str,
+    previous_continuity_key: Option<&'a str>,
 }
 
 impl<'a> TrustedIngressContinuityKeys<'a> {
@@ -148,7 +149,8 @@ impl<'a> TrustedIngressContinuityKeys<'a> {
         Self {
             active_transport_auth_secret: transport_auth_secret,
             previous_transport_auth_secret: None,
-            continuity_key,
+            active_continuity_key: continuity_key,
+            previous_continuity_key: None,
         }
     }
 
@@ -160,7 +162,22 @@ impl<'a> TrustedIngressContinuityKeys<'a> {
         Self {
             active_transport_auth_secret,
             previous_transport_auth_secret,
-            continuity_key,
+            active_continuity_key: continuity_key,
+            previous_continuity_key: None,
+        }
+    }
+
+    pub fn with_previous_continuity(
+        active_transport_auth_secret: &'a str,
+        previous_transport_auth_secret: Option<&'a str>,
+        active_continuity_key: &'a str,
+        previous_continuity_key: Option<&'a str>,
+    ) -> Self {
+        Self {
+            active_transport_auth_secret,
+            previous_transport_auth_secret,
+            active_continuity_key,
+            previous_continuity_key,
         }
     }
 
@@ -187,7 +204,7 @@ impl SessionContext {
     }
 
     pub fn continuity_key(&self) -> Option<ContinuityKey> {
-        self.continuity_key
+        self.continuity_keys.map(ContinuityKeyCandidates::active)
     }
 }
 
@@ -273,12 +290,12 @@ where
     let continuity_header_present = headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case(INGRESS_CONTINUITY_HEADER_NAME));
-    let continuity_key = match (
+    let continuity_keys = match (
         trusted_ingress_keys,
         require_authenticated_ingress_continuity || continuity_header_present,
     ) {
         (Some(keys), true) => Some(
-            authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+            authenticated_ingress_continuity_keys_from_headers_with_trusted_keys(
                 headers
                     .iter()
                     .map(|(name, value)| (name.as_str(), value.as_str())),
@@ -288,22 +305,24 @@ where
         (None, true) => {
             return Err(ContinuityInputRejection::MissingTransportAuth);
         }
-        (_, false) if allow_lab_peer_fallback => peer_ip.map(ContinuityKey::lab_peer),
+        (_, false) if allow_lab_peer_fallback => peer_ip
+            .map(ContinuityKey::lab_peer)
+            .map(ContinuityKeyCandidates::single),
         (_, false) => None,
     };
 
-    let resolution = authority.resolve_with_continuity(
+    let resolution = authority.resolve_with_continuity_candidates(
         headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
-        continuity_key,
+        continuity_keys,
         now,
     );
     Ok(context_from_resolution(
         resolution,
         ingress_identity,
         ingress_signals,
-        continuity_key,
+        continuity_keys,
     ))
 }
 
@@ -311,7 +330,7 @@ fn context_from_resolution(
     resolution: SessionResolution,
     ingress_identity: IngressIdentity,
     ingress_signals: IngressAdvisorySignals,
-    continuity_key: Option<ContinuityKey>,
+    continuity_keys: Option<ContinuityKeyCandidates>,
 ) -> SessionContext {
     SessionContext {
         session_id: resolution.session_id,
@@ -333,7 +352,7 @@ fn context_from_resolution(
         ingress_signals,
         trusted_ingress_soften_match: None,
         trusted_bait_soften_path_prefixes: None,
-        continuity_key,
+        continuity_keys,
         set_cookie_value: resolution.set_cookie_value,
     }
 }
@@ -373,6 +392,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn authenticated_ingress_continuity_key_from_headers_with_trusted_keys<I, N, V>(
     headers: I,
     keys: TrustedIngressContinuityKeys<'_>,
@@ -382,13 +402,31 @@ where
     N: AsRef<str>,
     V: AsRef<str>,
 {
-    let continuity_key = keys.continuity_key.trim();
+    authenticated_ingress_continuity_keys_from_headers_with_trusted_keys(headers, keys)
+        .map(ContinuityKeyCandidates::active)
+}
+
+fn authenticated_ingress_continuity_keys_from_headers_with_trusted_keys<I, N, V>(
+    headers: I,
+    keys: TrustedIngressContinuityKeys<'_>,
+) -> Result<ContinuityKeyCandidates, ContinuityInputRejection>
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
+    let active_continuity_key = keys.active_continuity_key.trim();
+    let previous_continuity_key = keys.previous_continuity_key.map(str::trim);
     let headers: Vec<(String, String)> = headers
         .into_iter()
         .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
         .collect();
     let presented_auth = transport_auth_header(&headers)?;
-    if continuity_key.is_empty() || !keys.authenticates_transport_auth(presented_auth) {
+    if active_continuity_key.is_empty()
+        || previous_continuity_key.is_some_and(str::is_empty)
+        || previous_continuity_key == Some(active_continuity_key)
+        || !keys.authenticates_transport_auth(presented_auth)
+    {
         return Err(ContinuityInputRejection::InvalidTransportAuth);
     }
 
@@ -406,7 +444,10 @@ where
         return Err(ContinuityInputRejection::InvalidContinuity);
     }
 
-    Ok(ContinuityKey::authenticated_ingress(raw, continuity_key))
+    Ok(ContinuityKeyCandidates::new(
+        ContinuityKey::authenticated_ingress(raw, active_continuity_key),
+        previous_continuity_key.map(|previous| ContinuityKey::authenticated_ingress(raw, previous)),
+    ))
 }
 
 fn transport_auth_header(headers: &[(String, String)]) -> Result<&str, ContinuityInputRejection> {
@@ -1369,6 +1410,24 @@ mod tests {
             ),
             Err(ContinuityInputRejection::DuplicateTransportAuth)
         );
+
+        for invalid_previous_continuity_key in ["", "   ", stable_continuity_key] {
+            assert_eq!(
+                authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+                    [
+                        (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "new-transport-secret",),
+                        (INGRESS_CONTINUITY_HEADER_NAME, continuity),
+                    ],
+                    TrustedIngressContinuityKeys::with_previous_continuity(
+                        "new-transport-secret",
+                        Some("old-transport-secret"),
+                        stable_continuity_key,
+                        Some(invalid_previous_continuity_key),
+                    ),
+                ),
+                Err(ContinuityInputRejection::InvalidTransportAuth)
+            );
+        }
 
         let previous_claim_headers = [
             (INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),

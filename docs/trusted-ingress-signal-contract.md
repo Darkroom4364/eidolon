@@ -222,11 +222,10 @@ Reserved and now captured in authenticated request audit events:
   identities fail closed for a bounded migration quarantine. Corrupt state or
   state bound to a different continuity key prevents startup.
 - The active transport credential, optional previous transport credential,
-  and continuity key have separate roles. The active credential is the value
-  new adapter requests should present. The previous credential provides only
-  a bounded one-key authentication overlap. The continuity key remains the
-  sole key for minimizing identities and authenticating continuity state; do
-  not rotate it as part of a transport-credential rollout.
+  active continuity key, and optional previous continuity key have separate
+  roles. Transport credentials authenticate the adapter request. Continuity
+  keys minimize its opaque identity and authenticate durable continuity state.
+  Do not change the continuity key as part of a transport-credential rollout.
 - Use this order for a planned source-runtime rotation: start with the old
   credential active; restart with the new credential active and the old one
   configured as previous; move every adapter to the new credential while each
@@ -240,10 +239,33 @@ Reserved and now captured in authenticated request audit events:
   mutation, or protected-upstream access. It does not erase or weaken the
   contained session or replay state; presenting the new credential with the
   unchanged continuity key recovers that state.
-- This source-runtime overlap does not add Kubernetes Secret wiring or prove a
-  live deployment rotation. Deployment automation, live upgrade/rollback,
-  and continuity-key rotation remain part of issues `#253` and `#254`; old-key
-  state is never trusted based on unverified timestamps.
+- A continuity-key rotation uses
+  `--previous-ingress-continuity-key-file <PATH>`, with the new key active and
+  exactly one old key previous. After transport authentication succeeds,
+  Eidolon derives both minimized candidates. An existing previous-key binding
+  is atomically persisted under the active key before its session, enforcement
+  floor, or recovery metadata can affect the request. New identities use only
+  the active key. If both candidates exist, or migration persistence fails,
+  the request receives a `503` Eidolon-owned response with no cookie or
+  protected-upstream access.
+- Continuity sidecar schema v2 records each binding's domain-separated key
+  provenance. Schema-v1 snapshots remain readable under their exactly matched
+  signer and are rewritten as v2 under the active key before traffic. Startup
+  exposes only redacted active/previous record counts. After migration traffic,
+  restart with the overlap and require a zero previous count before removing
+  the old key; otherwise new-only startup fails closed. A dormant binding that
+  exceeds the continuity TTL is deliberately expired and returns as a new
+  active-key session. If reissue or migration is interrupted, retain both
+  candidates, repair storage, and retry the overlap because the last durable
+  snapshot may be signed by either configured key. A bounded rollback swaps
+  active and previous roles and follows the same migration rule. Active and
+  previous contents must be non-empty and different, and all transport and
+  continuity key files must be distinct production startup inputs.
+- These source-runtime overlaps do not add Kubernetes Secret wiring or prove a
+  live deployment rotation. Deployment automation and live
+  upgrade/rollback/retirement evidence remain part of issues `#253` and
+  `#254`; old-key state is accepted only after the snapshot authenticates
+  under the exact configured candidate, never based on unverified timestamps.
 - This source-runtime overlap slice does not complete issue `#254` or establish
   production readiness.
 - Adapters must only emit normalized values, never secrets or raw signatures.
