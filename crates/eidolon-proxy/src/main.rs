@@ -250,6 +250,7 @@ struct ProxyConfig {
     session_signing_key_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
+    previous_ingress_transport_auth_secret_path: Option<PathBuf>,
     ingress_continuity_key_path: Option<PathBuf>,
     require_authenticated_ingress_continuity: bool,
     trusted_bait_soften_path_prefixes: Vec<String>,
@@ -532,7 +533,21 @@ impl CliAction {
                     set_once(
                         &mut builder.ingress_transport_auth_secret_path,
                         flag,
-                        parse_ingress_transport_auth_secret_path(&value)?,
+                        parse_ingress_transport_auth_secret_path(
+                            &value,
+                            "ingress transport auth secret",
+                        )?,
+                    )?;
+                }
+                "--previous-ingress-transport-auth-secret-file" => {
+                    let value = option_value(flag, inline_value, &mut args)?;
+                    set_once(
+                        &mut builder.previous_ingress_transport_auth_secret_path,
+                        flag,
+                        parse_ingress_transport_auth_secret_path(
+                            &value,
+                            "previous ingress transport auth secret",
+                        )?,
                     )?;
                 }
                 "--ingress-continuity-key-file" => {
@@ -648,6 +663,7 @@ struct ConfigBuilder {
     session_signing_key_path: Option<PathBuf>,
     ingress_trust_config_path: Option<PathBuf>,
     ingress_transport_auth_secret_path: Option<PathBuf>,
+    previous_ingress_transport_auth_secret_path: Option<PathBuf>,
     ingress_continuity_key_path: Option<PathBuf>,
     require_authenticated_ingress_continuity: bool,
     trusted_bait_soften_path_prefixes: Vec<String>,
@@ -725,6 +741,14 @@ impl ConfigBuilder {
         {
             return Err(ConfigError::new(
                 "`--require-authenticated-ingress-continuity` requires \
+                 `--ingress-transport-auth-secret-file`",
+            ));
+        }
+        if self.previous_ingress_transport_auth_secret_path.is_some()
+            && self.ingress_transport_auth_secret_path.is_none()
+        {
+            return Err(ConfigError::new(
+                "`--previous-ingress-transport-auth-secret-file` requires \
                  `--ingress-transport-auth-secret-file`",
             ));
         }
@@ -824,6 +848,10 @@ impl ConfigBuilder {
                     self.ingress_transport_auth_secret_path.as_deref(),
                 ),
                 (
+                    "previous-ingress-transport-auth-secret",
+                    self.previous_ingress_transport_auth_secret_path.as_deref(),
+                ),
+                (
                     "ingress-continuity-key",
                     self.ingress_continuity_key_path.as_deref(),
                 ),
@@ -846,9 +874,14 @@ impl ConfigBuilder {
                 self.ingress_transport_auth_secret_path
                     .as_deref()
                     .expect("validated above"),
+                self.previous_ingress_transport_auth_secret_path.as_deref(),
                 self.ingress_continuity_key_path
                     .as_deref()
                     .expect("validated above"),
+            )?;
+            ensure_production_previous_transport_auth_secret_is_isolated(
+                self.previous_ingress_transport_auth_secret_path.as_deref(),
+                &read_only_inputs,
             )?;
         }
 
@@ -877,6 +910,8 @@ impl ConfigBuilder {
             session_signing_key_path: self.session_signing_key_path,
             ingress_trust_config_path: self.ingress_trust_config_path,
             ingress_transport_auth_secret_path: self.ingress_transport_auth_secret_path,
+            previous_ingress_transport_auth_secret_path: self
+                .previous_ingress_transport_auth_secret_path,
             ingress_continuity_key_path: self.ingress_continuity_key_path,
             require_authenticated_ingress_continuity: self.require_authenticated_ingress_continuity,
             trusted_bait_soften_path_prefixes: if self.trusted_bait_soften_path_prefixes.is_empty()
@@ -943,6 +978,7 @@ fn effective_config_projection(config: &ProxyConfig) -> Value {
         },
         "ingress": {
             "transport_auth": config.ingress_transport_auth_secret_path.is_some(),
+            "transport_auth_overlap": config.previous_ingress_transport_auth_secret_path.is_some(),
             "continuity_key": config.ingress_continuity_key_path.is_some(),
             "authenticated_continuity_required": config.require_authenticated_ingress_continuity,
         },
@@ -1322,11 +1358,14 @@ fn parse_ingress_trust_config_path(raw: &str) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
-fn parse_ingress_transport_auth_secret_path(raw: &str) -> Result<PathBuf, ConfigError> {
-    let path = parse_file_path(raw, "ingress transport auth secret")?;
+fn parse_ingress_transport_auth_secret_path(
+    raw: &str,
+    label: &str,
+) -> Result<PathBuf, ConfigError> {
+    let path = parse_file_path(raw, label)?;
     if !path.is_file() {
         return Err(ConfigError::new(format!(
-            "ingress transport auth secret path must be an existing file: `{}`",
+            "{label} path must be an existing file: `{}`",
             path.display()
         )));
     }
@@ -1366,8 +1405,36 @@ fn parse_controlled_reality_backend_auth_secret_path(raw: &str) -> Result<PathBu
     Ok(path)
 }
 
-fn load_ingress_transport_auth_secret(path: &Path) -> io::Result<Arc<str>> {
-    load_non_empty_secret(path, "ingress transport auth secret")
+fn load_ingress_transport_auth_secret(path: &Path, label: &str) -> io::Result<Arc<str>> {
+    load_non_empty_secret(path, label)
+}
+
+type IngressTransportAuthSecrets = (Option<Arc<str>>, Option<Arc<str>>);
+
+fn load_ingress_transport_auth_secrets(
+    active_path: Option<&Path>,
+    previous_path: Option<&Path>,
+) -> io::Result<IngressTransportAuthSecrets> {
+    let active = active_path
+        .map(|path| load_ingress_transport_auth_secret(path, "ingress transport auth secret"))
+        .transpose()?;
+    let previous = previous_path
+        .map(|path| {
+            load_ingress_transport_auth_secret(path, "previous ingress transport auth secret")
+        })
+        .transpose()?;
+    if previous.is_some() && active.is_none() {
+        return Err(invalid_data(
+            "previous ingress transport auth secret requires an active ingress transport auth secret",
+        ));
+    }
+    if active.as_deref() == previous.as_deref() && previous.is_some() {
+        return Err(invalid_data(
+            "previous ingress transport auth secret must differ from the active ingress transport auth secret",
+        ));
+    }
+
+    Ok((active, previous))
 }
 
 fn load_ingress_continuity_key(path: &Path) -> io::Result<Arc<str>> {
@@ -1550,13 +1617,54 @@ fn ensure_production_writable_paths_do_not_alias_inputs(
 }
 
 fn ensure_production_transport_and_continuity_keys_are_distinct(
-    transport_auth_secret_path: &Path,
+    active_transport_auth_secret_path: &Path,
+    previous_transport_auth_secret_path: Option<&Path>,
     continuity_key_path: &Path,
 ) -> Result<(), ConfigError> {
-    if durable_paths_alias(transport_auth_secret_path, continuity_key_path)? {
+    if durable_paths_alias(active_transport_auth_secret_path, continuity_key_path)? {
         return Err(ConfigError::new(
             "`--profile production` requires distinct transport authentication and continuity key files",
         ));
+    }
+    let Some(previous_transport_auth_secret_path) = previous_transport_auth_secret_path else {
+        return Ok(());
+    };
+    if durable_paths_alias(
+        active_transport_auth_secret_path,
+        previous_transport_auth_secret_path,
+    )? {
+        return Err(ConfigError::new(
+            "`--profile production` requires distinct active and previous transport authentication secret files",
+        ));
+    }
+    if durable_paths_alias(previous_transport_auth_secret_path, continuity_key_path)? {
+        return Err(ConfigError::new(
+            "`--profile production` requires distinct previous transport authentication and continuity key files",
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_production_previous_transport_auth_secret_is_isolated(
+    previous_transport_auth_secret_path: Option<&Path>,
+    read_only_inputs: &[(&str, Option<&Path>)],
+) -> Result<(), ConfigError> {
+    let Some(previous_transport_auth_secret_path) = previous_transport_auth_secret_path else {
+        return Ok(());
+    };
+    for (input_label, input_path) in read_only_inputs {
+        if *input_label == "previous-ingress-transport-auth-secret" {
+            continue;
+        }
+        let Some(input_path) = input_path else {
+            continue;
+        };
+        if durable_paths_alias(previous_transport_auth_secret_path, input_path)? {
+            return Err(ConfigError::new(format!(
+                "`--profile production` requires distinct startup input paths: previous-ingress-transport-auth-secret and {input_label} resolve to the same target"
+            )));
+        }
     }
 
     Ok(())
@@ -1852,10 +1960,13 @@ fn run_proxy_with_shutdown(
             .map_err(|error| invalid_data(error.to_string()))?,
         None => IngressIdentityResolver::default(),
     };
-    let ingress_transport_auth_secret = match &config.ingress_transport_auth_secret_path {
-        Some(path) => Some(load_ingress_transport_auth_secret(path)?),
-        None => None,
-    };
+    let (ingress_transport_auth_secret, previous_ingress_transport_auth_secret) =
+        load_ingress_transport_auth_secrets(
+            config.ingress_transport_auth_secret_path.as_deref(),
+            config
+                .previous_ingress_transport_auth_secret_path
+                .as_deref(),
+        )?;
     let (ingress_continuity_key, ingress_continuity_key_mode) =
         match &config.ingress_continuity_key_path {
             Some(path) => (Some(load_ingress_continuity_key(path)?), "configured"),
@@ -1983,6 +2094,7 @@ fn run_proxy_with_shutdown(
         )),
         ingress_identity_resolver: Arc::new(ingress_identity_resolver),
         ingress_transport_auth_secret,
+        previous_ingress_transport_auth_secret,
         ingress_continuity_key,
         require_authenticated_ingress_continuity: config.require_authenticated_ingress_continuity,
         bait_signing_secret: bait_signing_secret.clone(),
@@ -2373,6 +2485,7 @@ struct ProxyRuntime {
     surface_controller: Arc<dyn SurfaceController + Send + Sync>,
     ingress_identity_resolver: Arc<IngressIdentityResolver>,
     ingress_transport_auth_secret: Option<Arc<str>>,
+    previous_ingress_transport_auth_secret: Option<Arc<str>>,
     ingress_continuity_key: Option<Arc<str>>,
     require_authenticated_ingress_continuity: bool,
     bait_signing_secret: Option<Arc<str>>,
@@ -6953,6 +7066,20 @@ fn effective_session_context(
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
+    let trusted_ingress_keys =
+        runtime
+            .ingress_transport_auth_secret
+            .as_deref()
+            .map(|active_transport_auth_secret| {
+                session::TrustedIngressContinuityKeys::with_previous(
+                    active_transport_auth_secret,
+                    runtime.previous_ingress_transport_auth_secret.as_deref(),
+                    runtime
+                        .ingress_continuity_key
+                        .as_deref()
+                        .unwrap_or(active_transport_auth_secret),
+                )
+            });
     let session_resolution = {
         let mut authority = runtime
             .session_authority
@@ -6963,18 +7090,7 @@ fn effective_session_context(
             headers.iter().copied(),
             client_peer_ip,
             now_unix_secs,
-            runtime
-                .ingress_transport_auth_secret
-                .as_deref()
-                .map(|transport_auth_secret| {
-                    session::TrustedIngressContinuityKeys::new(
-                        transport_auth_secret,
-                        runtime
-                            .ingress_continuity_key
-                            .as_deref()
-                            .unwrap_or(transport_auth_secret),
-                    )
-                }),
+            trusted_ingress_keys,
             runtime.require_authenticated_ingress_continuity,
             !runtime.require_authenticated_ingress_continuity,
         )
@@ -7019,14 +7135,16 @@ fn effective_session_context(
             "enforcement_floor": session.enforcement_floor,
         }),
     )?;
-    session.ingress_identity = session::authenticated_ingress_identity_from_headers(
-        headers.iter().copied(),
-        runtime.ingress_transport_auth_secret.as_deref(),
-    );
-    session.ingress_signals = session::authenticated_ingress_advisory_signals_from_headers(
-        headers.iter().copied(),
-        runtime.ingress_transport_auth_secret.as_deref(),
-    );
+    session.ingress_identity =
+        session::authenticated_ingress_identity_from_headers_with_trusted_keys(
+            headers.iter().copied(),
+            trusted_ingress_keys,
+        );
+    session.ingress_signals =
+        session::authenticated_ingress_advisory_signals_from_headers_with_trusted_keys(
+            headers.iter().copied(),
+            trusted_ingress_keys,
+        );
     let local_trust_evaluation = runtime.ingress_identity_resolver.evaluate(
         &request.method,
         &surface_request.path,
@@ -8122,6 +8240,10 @@ Options:
   --ingress-transport-auth-secret-file <PATH>
                          Shared-secret file required before explicit
                          X-Eidolon-Ingress-* identity headers are trusted
+  --previous-ingress-transport-auth-secret-file <PATH>
+                         Optional one-credential overlap for trusted ingress.
+                         Requires the active transport secret; never expose either
+                         credential in logs or configuration output
   --ingress-continuity-key-file <PATH>
                          Persistent key used only to minimize ingress continuity
                          identities and authenticate continuity state. Requires
@@ -8409,6 +8531,7 @@ mod tests {
             surface_controller,
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            previous_ingress_transport_auth_secret: None,
             ingress_continuity_key: None,
             require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
@@ -8466,6 +8589,7 @@ mod tests {
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            previous_ingress_transport_auth_secret: None,
             ingress_continuity_key: None,
             require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
@@ -8506,6 +8630,7 @@ mod tests {
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            previous_ingress_transport_auth_secret: None,
             ingress_continuity_key: None,
             require_authenticated_ingress_continuity: false,
             bait_signing_secret: None,
@@ -8548,6 +8673,7 @@ mod tests {
             )),
             ingress_identity_resolver: Arc::new(IngressIdentityResolver::default()),
             ingress_transport_auth_secret: None,
+            previous_ingress_transport_auth_secret: None,
             ingress_continuity_key: None,
             require_authenticated_ingress_continuity: false,
             bait_signing_secret,
@@ -9304,11 +9430,29 @@ mod tests {
         continuity_id: &str,
         extra_headers: &[(&str, &str)],
     ) -> Vec<u8> {
+        authenticated_production_request_with_transport_secret(
+            method,
+            path,
+            session_id,
+            continuity_id,
+            "transport-secret",
+            extra_headers,
+        )
+    }
+
+    fn authenticated_production_request_with_transport_secret(
+        method: &str,
+        path: &str,
+        session_id: SessionId,
+        continuity_id: &str,
+        transport_secret: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Vec<u8> {
         let cookie = format!("eidolon_session={}", minted_cookie_value(session_id));
         let mut headers = vec![
             (
                 session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
-                "transport-secret",
+                transport_secret,
             ),
             (session::INGRESS_CONTINUITY_HEADER_NAME, continuity_id),
         ];
@@ -9322,11 +9466,27 @@ mod tests {
         continuity_id: &str,
         extra_headers: &[(&str, &str)],
     ) -> Vec<u8> {
+        authenticated_production_request_without_cookie_with_transport_secret(
+            method,
+            path,
+            continuity_id,
+            "transport-secret",
+            extra_headers,
+        )
+    }
+
+    fn authenticated_production_request_without_cookie_with_transport_secret(
+        method: &str,
+        path: &str,
+        continuity_id: &str,
+        transport_secret: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Vec<u8> {
         let mut request = format!("{method} {path} HTTP/1.1\r\nHost: proxy.local\r\n");
         for (name, value) in [
             (
                 session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
-                "transport-secret",
+                transport_secret,
             ),
             (session::INGRESS_CONTINUITY_HEADER_NAME, continuity_id),
         ]
@@ -9623,6 +9783,7 @@ mod tests {
         assert_eq!(config.bait_signing_secret_path, None);
         assert_eq!(config.ingress_trust_config_path, None);
         assert_eq!(config.ingress_transport_auth_secret_path, None);
+        assert_eq!(config.previous_ingress_transport_auth_secret_path, None);
         assert_eq!(config.ingress_continuity_key_path, None);
         assert!(!config.require_authenticated_ingress_continuity);
         assert_eq!(
@@ -9701,6 +9862,7 @@ mod tests {
         assert_eq!(effective["profile"], "production");
         assert_eq!(effective["session"]["signing_key"], "configured");
         assert_eq!(effective["session"]["cookie_policy"], "production");
+        assert_eq!(effective["ingress"]["transport_auth_overlap"], false);
         assert_eq!(effective["controlled_reality_renderer"], "remote");
         for sensitive in [
             path_str(&session_key, "session key path should be UTF-8"),
@@ -9779,6 +9941,135 @@ mod tests {
             serde_json::from_str(&effective_config_output(&config)).expect("effective config JSON");
         assert_eq!(effective["profile"], "lab");
         assert_eq!(effective["session"]["cookie_policy"], "lab");
+    }
+
+    #[test]
+    fn transport_auth_overlap_configuration_is_bounded_distinct_and_redacted() {
+        let previous_only = write_ingress_transport_auth_secret("old-transport-secret");
+        assert_error_contains(
+            &[
+                "--previous-ingress-transport-auth-secret-file",
+                path_str(&previous_only, "previous transport path should be UTF-8"),
+            ],
+            "requires `--ingress-transport-auth-secret-file`",
+        );
+        let error = load_ingress_transport_auth_secrets(None, Some(&previous_only))
+            .expect_err("the loader must reject a previous credential without an active one");
+        assert!(error.to_string().contains("requires an active"));
+
+        let active = write_ingress_transport_auth_secret("new-transport-secret");
+        let previous_same_contents = write_ingress_transport_auth_secret("new-transport-secret");
+        let error =
+            load_ingress_transport_auth_secrets(Some(&active), Some(&previous_same_contents))
+                .expect_err("equal active and previous credentials must fail");
+        assert!(error.to_string().contains("must differ"));
+
+        let empty_previous = write_ingress_transport_auth_secret(" \n");
+        let error = load_ingress_transport_auth_secrets(Some(&active), Some(&empty_previous))
+            .expect_err("empty previous credential must fail");
+        assert!(error.to_string().contains("must not be empty"));
+
+        let bait_profile = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let upstream = must_ok(
+            parse_upstream("http://127.0.0.1:9101", false),
+            "production upstream should parse",
+        );
+        let mut fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &bait_profile,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let active_index = fixture
+            .args
+            .iter()
+            .position(|value| value == "--ingress-transport-auth-secret-file")
+            .expect("fixture should configure active transport authentication");
+        let fixture_active = fixture.args[active_index + 1].clone();
+        let continuity_index = fixture
+            .args
+            .iter()
+            .position(|value| value == "--ingress-continuity-key-file")
+            .expect("fixture should configure a continuity key");
+        let fixture_continuity = fixture.args[continuity_index + 1].clone();
+
+        for (alias, expected) in [
+            (
+                fixture_active,
+                "distinct active and previous transport authentication secret files",
+            ),
+            (
+                fixture_continuity,
+                "distinct previous transport authentication and continuity key files",
+            ),
+        ] {
+            let mut args = fixture.args.clone();
+            args.extend([
+                "--previous-ingress-transport-auth-secret-file".to_string(),
+                alias,
+            ]);
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            assert_error_contains(&args, expected);
+        }
+
+        must_ok(
+            fs::write(&fixture.intervention_control_path, "enabled\n"),
+            "intervention control input should exist",
+        );
+        for input_flag in [
+            "--bait-profile",
+            "--bait-signing-secret-file",
+            "--session-signing-key-file",
+            "--controlled-reality-backend-auth-secret-file",
+            "--intervention-control",
+        ] {
+            let input_index = fixture
+                .args
+                .iter()
+                .position(|value| value == input_flag)
+                .unwrap_or_else(|| panic!("fixture should configure {input_flag}"));
+            let mut args = fixture.args.clone();
+            args.extend([
+                "--previous-ingress-transport-auth-secret-file".to_string(),
+                fixture.args[input_index + 1].clone(),
+            ]);
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            assert_error_contains(&args, "requires distinct startup input paths");
+        }
+        let trust_config = write_ingress_trust_config(r#"{"schema_version":1,"entries":[]}"#);
+        let mut trust_alias_args = fixture.args.clone();
+        trust_alias_args.extend([
+            "--ingress-trust-config".to_string(),
+            path_str(&trust_config, "trust config path should be UTF-8").to_string(),
+            "--previous-ingress-transport-auth-secret-file".to_string(),
+            path_str(&trust_config, "trust config path should be UTF-8").to_string(),
+        ]);
+        let trust_alias_args = trust_alias_args
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_error_contains(&trust_alias_args, "requires distinct startup input paths");
+
+        let previous = write_ingress_transport_auth_secret("old-transport-secret");
+        fixture.args.extend([
+            "--previous-ingress-transport-auth-secret-file".to_string(),
+            path_str(&previous, "previous transport path should be UTF-8").to_string(),
+        ]);
+        fixture.supplied_paths.push(previous.clone());
+        fixture
+            .supplied_secrets
+            .push("old-transport-secret".to_string());
+        let output = fixture.print_effective_config();
+        let effective: Value =
+            serde_json::from_str(&output).expect("effective config should be JSON");
+        assert_eq!(effective["ingress"]["transport_auth_overlap"], true);
+        assert!(!output.contains("old-transport-secret"));
+        assert!(!output.contains(path_str(
+            &previous,
+            "previous transport path should be UTF-8"
+        )));
+        fixture.stop();
     }
 
     #[test]
@@ -9877,6 +10168,10 @@ mod tests {
                 sidecar_state_path(&event_consumed_proofs, ".tmp"),
             ),
             (
+                "--previous-ingress-transport-auth-secret-file",
+                sidecar_state_path(&continuity, ".tmp"),
+            ),
+            (
                 "--ingress-continuity-key-file",
                 fixture.policy_state_path.clone(),
             ),
@@ -9884,10 +10179,7 @@ mod tests {
                 "--controlled-reality-backend-auth-secret-file",
                 fixture.policy_state_path.with_extension("tmp"),
             ),
-            (
-                "--intervention-control",
-                sidecar_state_path(&continuity, ".tmp"),
-            ),
+            ("--intervention-control", fixture.debug_log_path.clone()),
         ];
         for (_, alias) in &writable_input_aliases {
             must_ok(
@@ -10066,6 +10358,7 @@ mod tests {
                 },
                 "ingress": {
                     "transport_auth": true,
+                    "transport_auth_overlap": false,
                     "continuity_key": true,
                     "authenticated_continuity_required": true,
                 },
@@ -13116,6 +13409,415 @@ mod tests {
         assert!(
             current_unix_secs() < proof_expires_at,
             "bounded restart scenario exceeded its selected proof-validity window"
+        );
+    }
+
+    #[test]
+    fn production_transport_auth_overlap_preserves_state_and_retires_the_old_credential() {
+        const OLD_TRANSPORT_SECRET: &str = "transport-secret";
+        const NEW_TRANSPORT_SECRET: &str = "rotated-transport-secret";
+        const CLIENT_A_CONTINUITY: &str = "overlap_client_A_0123456789abcdef";
+        const CLIENT_B_CONTINUITY: &str = "overlap_client_B_0123456789abcdef";
+        const MIN_PROOF_VALIDITY_SECS: u64 = 5 * 60;
+
+        let proof_issued_at = current_unix_secs();
+        let proof_window_seconds = (MIN_PROOF_VALIDITY_SECS..=MAX_BAIT_PROOF_TTL_SECS)
+            .rev()
+            .find(|window| {
+                (proof_issued_at / window)
+                    .checked_add(1)
+                    .and_then(|bucket| bucket.checked_mul(*window))
+                    .is_some_and(|expires_at| {
+                        expires_at.saturating_sub(proof_issued_at) >= MIN_PROOF_VALIDITY_SECS
+                    })
+            })
+            .expect("test should select a proof window with a bounded validity margin");
+        let proof_expires_at = (proof_issued_at / proof_window_seconds + 1)
+            .checked_mul(proof_window_seconds)
+            .expect("test proof expiry should not overflow");
+        let window_marker = "\"proof_window_seconds\": 60";
+        assert_eq!(
+            session_minted_profile_json().matches(window_marker).count(),
+            1
+        );
+        let profile_json = session_minted_profile_json().replacen(
+            window_marker,
+            &format!("\"proof_window_seconds\": {proof_window_seconds}"),
+            1,
+        );
+        let profile_path = write_bait_profile(&profile_json);
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let loaded = load_bait_profile(&profile_path).expect("profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait should exist")
+            .clone();
+        let client_a = SessionId::new();
+        let client_b = SessionId::new();
+        let client_a_cookie = format!("eidolon_session={}", minted_cookie_value(client_a));
+        let client_b_cookie = format!("eidolon_session={}", minted_cookie_value(client_b));
+        let client_a_rendered = eidolon_bait::render_bait_for_session_at(
+            &bait,
+            client_a,
+            Some("mint-secret"),
+            proof_issued_at,
+        )
+        .expect("client A bait should render")
+        .into_owned();
+        let proof_header_name = client_a_rendered
+            .expected_action
+            .header_name
+            .expect("minted bait should have a proof header");
+        let client_a_proof = client_a_rendered
+            .expected_action
+            .header_value
+            .expect("minted bait should have a proof value");
+        let client_a_proof_headers = [(proof_header_name.as_str(), client_a_proof.as_str())];
+        assert_eq!(
+            proof_expiry_epoch_seconds(&bait, &client_a_proof)
+                .expect("client A proof expiry should parse"),
+            proof_expires_at
+        );
+
+        let (upstream, recorder) = spawn_recording_upstream([
+            json_response(r#"{"phase":"old-active"}"#),
+            json_response(r#"{"phase":"overlap"}"#),
+            json_response(r#"{"phase":"new-only"}"#),
+        ]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_log_path = fixture.event_log_path.clone();
+        let debug_log_path = fixture.debug_log_path.clone();
+
+        let server = start_production_profile_server(fixture);
+        let client_a_exposure = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_with_transport_secret(
+                "GET",
+                &bait.surface,
+                client_a,
+                CLIENT_A_CONTINUITY,
+                OLD_TRANSPORT_SECRET,
+                &[],
+            ),
+        ));
+        assert_eq!(client_a_exposure.status, 200);
+        let client_a_action = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_with_transport_secret(
+                "POST",
+                &bait.expected_action.path,
+                client_a,
+                CLIENT_A_CONTINUITY,
+                OLD_TRANSPORT_SECRET,
+                &client_a_proof_headers,
+            ),
+        ));
+        assert_eq!(client_a_action.status, 202);
+        let client_b_old_active = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_with_transport_secret(
+                "GET",
+                "/normal",
+                client_b,
+                CLIENT_B_CONTINUITY,
+                OLD_TRANSPORT_SECRET,
+                &[],
+            ),
+        ));
+        assert_eq!(client_b_old_active.status, 200);
+        assert_eq!(client_b_old_active.body, br#"{"phase":"old-active"}"#);
+        let mut fixture = server.stop_for_restart();
+
+        let active_index = fixture
+            .args
+            .iter()
+            .position(|value| value == "--ingress-transport-auth-secret-file")
+            .expect("fixture should configure active transport authentication");
+        let old_transport_path = PathBuf::from(&fixture.args[active_index + 1]);
+        let new_transport_path = write_ingress_transport_auth_secret(NEW_TRANSPORT_SECRET);
+        fixture.args[active_index + 1] =
+            path_str(&new_transport_path, "new transport path should be UTF-8").to_string();
+        fixture.args.extend([
+            "--previous-ingress-transport-auth-secret-file".to_string(),
+            path_str(&old_transport_path, "old transport path should be UTF-8").to_string(),
+        ]);
+        fixture.supplied_paths.push(new_transport_path);
+        fixture
+            .supplied_secrets
+            .push(NEW_TRANSPORT_SECRET.to_string());
+
+        let server = start_production_profile_server(fixture);
+        let client_a_overlap = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie_with_transport_secret(
+                "GET",
+                "/normal",
+                CLIENT_A_CONTINUITY,
+                OLD_TRANSPORT_SECRET,
+                &[],
+            ),
+        ));
+        assert_eq!(response_session_id(&client_a_overlap), client_a);
+        let client_a_overlap_status = if client_a_overlap.status == 503 {
+            parse_downstream_response(&production_profile_request(
+                server.address,
+                &authenticated_production_request_with_transport_secret(
+                    "GET",
+                    "/normal",
+                    client_a,
+                    CLIENT_A_CONTINUITY,
+                    OLD_TRANSPORT_SECRET,
+                    &[],
+                ),
+            ))
+            .status
+        } else {
+            client_a_overlap.status
+        };
+        assert_eq!(client_a_overlap_status, 404);
+        let client_b_overlap = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie_with_transport_secret(
+                "GET",
+                "/normal",
+                CLIENT_B_CONTINUITY,
+                NEW_TRANSPORT_SECRET,
+                &[],
+            ),
+        ));
+        assert_eq!(client_b_overlap.status, 200);
+        assert_eq!(client_b_overlap.body, br#"{"phase":"overlap"}"#);
+        assert_eq!(response_session_id(&client_b_overlap), client_b);
+        let duplicate_auth = parse_downstream_response(&production_profile_request(
+            server.address,
+            &request_with_cookie(
+                "GET",
+                "/normal",
+                &client_b_cookie,
+                &[
+                    (
+                        session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        NEW_TRANSPORT_SECRET,
+                    ),
+                    (
+                        session::INGRESS_TRANSPORT_AUTH_HEADER_NAME,
+                        OLD_TRANSPORT_SECRET,
+                    ),
+                    (session::INGRESS_CONTINUITY_HEADER_NAME, CLIENT_B_CONTINUITY),
+                ],
+            ),
+        ));
+        assert_eq!(duplicate_auth.status, 400);
+        assert!(header_values(&duplicate_auth, "set-cookie").is_empty());
+        let mut fixture = server.stop_for_restart();
+
+        let previous_index = fixture
+            .args
+            .iter()
+            .position(|value| value == "--previous-ingress-transport-auth-secret-file")
+            .expect("overlap phase should configure the previous credential");
+        fixture.args.drain(previous_index..=previous_index + 1);
+        let server = start_production_profile_server(fixture);
+        let retired_old = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_with_transport_secret(
+                "GET",
+                "/normal",
+                client_b,
+                CLIENT_B_CONTINUITY,
+                OLD_TRANSPORT_SECRET,
+                &[],
+            ),
+        ));
+        assert_eq!(retired_old.status, 400);
+        assert!(header_values(&retired_old, "set-cookie").is_empty());
+        let client_a_new_only = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie_with_transport_secret(
+                "GET",
+                "/normal",
+                CLIENT_A_CONTINUITY,
+                NEW_TRANSPORT_SECRET,
+                &[],
+            ),
+        ));
+        assert_eq!(response_session_id(&client_a_new_only), client_a);
+        let client_a_new_only_status = if client_a_new_only.status == 503 {
+            parse_downstream_response(&production_profile_request(
+                server.address,
+                &authenticated_production_request_with_transport_secret(
+                    "GET",
+                    "/normal",
+                    client_a,
+                    CLIENT_A_CONTINUITY,
+                    NEW_TRANSPORT_SECRET,
+                    &[],
+                ),
+            ))
+            .status
+        } else {
+            client_a_new_only.status
+        };
+        assert_eq!(client_a_new_only_status, 403);
+        let client_b_new_only = parse_downstream_response(&production_profile_request(
+            server.address,
+            &authenticated_production_request_without_cookie_with_transport_secret(
+                "GET",
+                "/normal",
+                CLIENT_B_CONTINUITY,
+                NEW_TRANSPORT_SECRET,
+                &[],
+            ),
+        ));
+        assert_eq!(client_b_new_only.status, 200);
+        assert_eq!(client_b_new_only.body, br#"{"phase":"new-only"}"#);
+        assert_eq!(response_session_id(&client_b_new_only), client_b);
+        server.stop();
+
+        assert_eq!(
+            upstream_request_lines(&recorder.finish()),
+            vec![
+                "GET /normal HTTP/1.1",
+                "GET /normal HTTP/1.1",
+                "GET /normal HTTP/1.1",
+            ],
+            "only client B ordinary traffic may reach protected upstream"
+        );
+        let event_log = fs::read_to_string(&event_log_path).expect("event log should read");
+        let debug = fs::read_to_string(&debug_log_path).expect("debug log should read");
+        for sensitive in [
+            OLD_TRANSPORT_SECRET,
+            NEW_TRANSPORT_SECRET,
+            CLIENT_A_CONTINUITY,
+            CLIENT_B_CONTINUITY,
+            "continuity-key",
+            "mint-secret",
+            client_a_proof.as_str(),
+        ] {
+            assert!(!event_log.contains(sensitive));
+            assert!(!debug.contains(sensitive));
+        }
+        let events = event_values(&event_log_path);
+        let client_a_actions = events
+            .iter()
+            .filter(|event| {
+                event["session_id"] == client_a.0.to_string()
+                    && event["kind"]["type"] == "bait_action_observed"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(client_a_actions.len(), 1);
+        assert_eq!(
+            client_a_actions[0]["kind"]["header_value_mint_status"],
+            "matched_session_value"
+        );
+        assert!(events.iter().any(|event| {
+            event["session_id"] == client_a.0.to_string()
+                && event["kind"]["type"] == "policy_changed"
+                && event["kind"]["from"] == "observe"
+                && event["kind"]["to"] == "controlled_reality"
+        }));
+        assert!(events.iter().any(|event| {
+            event["session_id"] == client_a.0.to_string()
+                && event["kind"]["type"] == "policy_changed"
+                && event["kind"]["from"] == "controlled_reality"
+                && event["kind"]["to"] == "blocked"
+        }));
+        assert!(!events.iter().any(|event| {
+            event["session_id"] == client_b.0.to_string()
+                && event["kind"]["type"] == "policy_changed"
+        }));
+        let client_b_requests = events
+            .iter()
+            .filter(|event| {
+                event["session_id"] == client_b.0.to_string()
+                    && event["kind"]["type"] == "request_seen"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(client_b_requests.len(), 3);
+        assert!(client_b_requests
+            .iter()
+            .all(|event| event["policy_state"] == "observe"));
+        assert!(client_b_requests
+            .iter()
+            .all(|event| { event["kind"]["routing_decision"] == "protected_upstream" }));
+
+        let now = current_unix_secs();
+        let mut restored_replay_state = ConsumedBaitProofStore::open_or_rebuild(
+            &event_log_path,
+            &loaded.registry,
+            Some("mint-secret"),
+            now,
+        )
+        .expect("consumed proof state should reopen after retirement");
+        assert_eq!(restored_replay_state.consumed.len(), 1);
+        assert!(restored_replay_state.consumed.contains_key(&(
+            client_a,
+            bait.id.clone(),
+            proof_digest(&client_a_proof),
+        )));
+        assert_eq!(
+            restored_replay_state.check_and_mark(
+                client_a,
+                bait.id.clone(),
+                client_a_proof.clone(),
+                proof_expires_at,
+                now,
+            ),
+            ConsumeProofOutcome::Replay,
+            "client A's consumed proof must remain replay state after both restarts"
+        );
+
+        let debug_records = debug
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("debug record should parse"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            debug_records
+                .iter()
+                .filter(|record| record["event"] == "proxy_started")
+                .map(
+                    |record| record["fields"]["restored_consumed_bait_proof_count"]
+                        .as_u64()
+                        .expect("startup replay count should be numeric")
+                )
+                .collect::<Vec<_>>(),
+            vec![0, 1, 1]
+        );
+        for session_id in [client_a, client_b] {
+            assert_eq!(
+                debug_records
+                    .iter()
+                    .filter(|record| {
+                        record["event"] == "session_resolved"
+                            && matches!(
+                                record["fields"]["continuity_outcome"].as_str(),
+                                Some("recovered" | "cooldown_session_preserved")
+                            )
+                            && record["session_id"] == session_id.0.to_string()
+                    })
+                    .count(),
+                2
+            );
+        }
+        assert!(debug_records.iter().any(|record| {
+            record["event"] == "session_continuity_rejected"
+                && record["fields"]["reason"] == "duplicate_transport_auth"
+        }));
+        assert!(debug_records.iter().any(|record| {
+            record["event"] == "session_continuity_rejected"
+                && record["fields"]["reason"] == "invalid_transport_auth"
+        }));
+        assert_ne!(client_a, client_b);
+        assert_ne!(client_a_cookie, client_b_cookie);
+        assert!(
+            current_unix_secs() < proof_expires_at,
+            "bounded overlap scenario exceeded its selected proof-validity window"
         );
     }
 

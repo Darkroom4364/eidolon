@@ -142,9 +142,17 @@ If the authenticated-continuity sidecar is missing while prior state exists,
 unknown authenticated identities fail closed for a bounded migration
 quarantine. Corrupt state or state bound to a different continuity key prevents
 startup. Planned transport-auth rotation can preserve continuity when the
-continuity key stays fixed. The session-signing key-rotation live check is
-documented below; upgrade, rollback, transport overlap windows, and
-continuity-key rotation remain tracked by issue `#254`. The kind
+continuity key stays fixed. The source runtime accepts one bounded previous
+credential through `--previous-ingress-transport-auth-secret-file`: restart
+first with the new credential active and the old credential previous, move
+adapters to the new credential, then remove the previous flag and restart
+again. Every request still carries exactly one transport-auth header, and the
+continuity key stays unchanged throughout. Premature removal rejects old-edge
+traffic before session adoption or upstream access but does not weaken
+persisted containment. The session-signing key-rotation live check is
+documented below; deployment wiring, live transport rotation, upgrade,
+rollback, and continuity-key rotation remain tracked by issues `#253` and
+`#254`. The kind
 backup/restore proof is documented below. Reusing the old
 transport-secret bytes for migration compatibility also means transport
 rotation does not remediate compromise of those bytes. Old-key state is never

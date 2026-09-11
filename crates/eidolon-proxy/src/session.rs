@@ -138,16 +138,40 @@ pub struct SessionContext {
 
 #[derive(Clone, Copy)]
 pub struct TrustedIngressContinuityKeys<'a> {
-    transport_auth_secret: &'a str,
+    active_transport_auth_secret: &'a str,
+    previous_transport_auth_secret: Option<&'a str>,
     continuity_key: &'a str,
 }
 
 impl<'a> TrustedIngressContinuityKeys<'a> {
     pub fn new(transport_auth_secret: &'a str, continuity_key: &'a str) -> Self {
         Self {
-            transport_auth_secret,
+            active_transport_auth_secret: transport_auth_secret,
+            previous_transport_auth_secret: None,
             continuity_key,
         }
+    }
+
+    pub fn with_previous(
+        active_transport_auth_secret: &'a str,
+        previous_transport_auth_secret: Option<&'a str>,
+        continuity_key: &'a str,
+    ) -> Self {
+        Self {
+            active_transport_auth_secret,
+            previous_transport_auth_secret,
+            continuity_key,
+        }
+    }
+
+    fn authenticates_transport_auth(self, presented_auth: &str) -> bool {
+        let active = self.active_transport_auth_secret.trim();
+        let previous = self
+            .previous_transport_auth_secret
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty());
+        !active.is_empty()
+            && (presented_auth == active || previous.is_some_and(|secret| presented_auth == secret))
     }
 }
 
@@ -253,13 +277,14 @@ where
         trusted_ingress_keys,
         require_authenticated_ingress_continuity || continuity_header_present,
     ) {
-        (Some(keys), true) => Some(authenticated_ingress_continuity_key_from_headers_with_key(
-            headers
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
-            keys.transport_auth_secret,
-            keys.continuity_key,
-        )?),
+        (Some(keys), true) => Some(
+            authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+                headers
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+                keys,
+            )?,
+        ),
         (None, true) => {
             return Err(ContinuityInputRejection::MissingTransportAuth);
         }
@@ -331,6 +356,7 @@ where
     )
 }
 
+#[cfg(test)]
 pub(crate) fn authenticated_ingress_continuity_key_from_headers_with_key<I, N, V>(
     headers: I,
     shared_secret: &str,
@@ -341,24 +367,28 @@ where
     N: AsRef<str>,
     V: AsRef<str>,
 {
-    let shared_secret = shared_secret.trim();
-    let continuity_key = continuity_key.trim();
+    authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+        headers,
+        TrustedIngressContinuityKeys::new(shared_secret, continuity_key),
+    )
+}
+
+fn authenticated_ingress_continuity_key_from_headers_with_trusted_keys<I, N, V>(
+    headers: I,
+    keys: TrustedIngressContinuityKeys<'_>,
+) -> Result<ContinuityKey, ContinuityInputRejection>
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
+    let continuity_key = keys.continuity_key.trim();
     let headers: Vec<(String, String)> = headers
         .into_iter()
         .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
         .collect();
-
-    let transport_auth: Vec<&str> = headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case(INGRESS_TRANSPORT_AUTH_HEADER_NAME))
-        .map(|(_, value)| value.as_str())
-        .collect();
-    let presented_auth = match transport_auth.as_slice() {
-        [] => return Err(ContinuityInputRejection::MissingTransportAuth),
-        [value] => *value,
-        _ => return Err(ContinuityInputRejection::DuplicateTransportAuth),
-    };
-    if shared_secret.is_empty() || continuity_key.is_empty() || presented_auth != shared_secret {
+    let presented_auth = transport_auth_header(&headers)?;
+    if continuity_key.is_empty() || !keys.authenticates_transport_auth(presented_auth) {
         return Err(ContinuityInputRejection::InvalidTransportAuth);
     }
 
@@ -377,6 +407,28 @@ where
     }
 
     Ok(ContinuityKey::authenticated_ingress(raw, continuity_key))
+}
+
+fn transport_auth_header(headers: &[(String, String)]) -> Result<&str, ContinuityInputRejection> {
+    let mut transport_auth = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(INGRESS_TRANSPORT_AUTH_HEADER_NAME))
+        .map(|(_, value)| value.as_str());
+    match (transport_auth.next(), transport_auth.next()) {
+        (None, _) => Err(ContinuityInputRejection::MissingTransportAuth),
+        (Some(value), None) => Ok(value),
+        (Some(_), Some(_)) => Err(ContinuityInputRejection::DuplicateTransportAuth),
+    }
+}
+
+fn authenticated_transport_auth_header(
+    headers: &[(String, String)],
+    keys: TrustedIngressContinuityKeys<'_>,
+) -> bool {
+    matches!(
+        transport_auth_header(headers),
+        Ok(value) if keys.authenticates_transport_auth(value)
+    )
 }
 
 fn valid_ingress_continuity_value(raw: &str) -> bool {
@@ -490,21 +542,29 @@ where
     N: AsRef<str>,
     V: AsRef<str>,
 {
-    let Some(shared_secret) = shared_secret
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    authenticated_ingress_identity_from_headers_with_trusted_keys(
+        headers,
+        shared_secret.map(|secret| TrustedIngressContinuityKeys::new(secret, secret)),
+    )
+}
+
+pub fn authenticated_ingress_identity_from_headers_with_trusted_keys<I, N, V>(
+    headers: I,
+    trusted_ingress_keys: Option<TrustedIngressContinuityKeys<'_>>,
+) -> IngressIdentity
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
+    let Some(keys) = trusted_ingress_keys else {
         return IngressIdentity::default();
     };
-
     let headers: Vec<(String, String)> = headers
         .into_iter()
         .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
         .collect();
-    let authenticated = headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case(INGRESS_TRANSPORT_AUTH_HEADER_NAME) && value == shared_secret
-    });
-    if !authenticated {
+    if !authenticated_transport_auth_header(&headers, keys) {
         return IngressIdentity::default();
     }
 
@@ -526,21 +586,29 @@ where
     N: AsRef<str>,
     V: AsRef<str>,
 {
-    let Some(shared_secret) = shared_secret
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    authenticated_ingress_advisory_signals_from_headers_with_trusted_keys(
+        headers,
+        shared_secret.map(|secret| TrustedIngressContinuityKeys::new(secret, secret)),
+    )
+}
+
+pub fn authenticated_ingress_advisory_signals_from_headers_with_trusted_keys<I, N, V>(
+    headers: I,
+    trusted_ingress_keys: Option<TrustedIngressContinuityKeys<'_>>,
+) -> IngressAdvisorySignals
+where
+    I: IntoIterator<Item = (N, V)>,
+    N: AsRef<str>,
+    V: AsRef<str>,
+{
+    let Some(keys) = trusted_ingress_keys else {
         return IngressAdvisorySignals::default();
     };
-
     let headers: Vec<(String, String)> = headers
         .into_iter()
         .map(|(name, value)| (name.as_ref().to_string(), value.as_ref().to_string()))
         .collect();
-    let authenticated = headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case(INGRESS_TRANSPORT_AUTH_HEADER_NAME) && value == shared_secret
-    });
-    if !authenticated {
+    if !authenticated_transport_auth_header(&headers, keys) {
         return IngressAdvisorySignals::default();
     }
 
@@ -1217,6 +1285,170 @@ mod tests {
                 ],
                 "new-transport-secret",
                 stable_continuity_key,
+            ),
+            Err(ContinuityInputRejection::InvalidTransportAuth)
+        );
+    }
+
+    #[test]
+    fn transport_auth_overlap_accepts_exactly_one_active_or_previous_credential() {
+        let continuity = "client_A_0123456789abcdef";
+        let stable_continuity_key = "stable-continuity-key";
+        let overlap = TrustedIngressContinuityKeys::with_previous(
+            "new-transport-secret",
+            Some("old-transport-secret"),
+            stable_continuity_key,
+        );
+        let active = authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "new-transport-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, continuity),
+            ],
+            overlap,
+        )
+        .expect("active transport credential should authenticate");
+        let previous = authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+            [
+                (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "old-transport-secret"),
+                (INGRESS_CONTINUITY_HEADER_NAME, continuity),
+            ],
+            overlap,
+        )
+        .expect("previous transport credential should authenticate during overlap");
+        assert_eq!(active, previous);
+        assert_eq!(
+            authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+                [
+                    (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "wrong-transport-secret"),
+                    (INGRESS_CONTINUITY_HEADER_NAME, continuity),
+                ],
+                overlap,
+            ),
+            Err(ContinuityInputRejection::InvalidTransportAuth)
+        );
+        for invalid_secret in ["", " new-transport-secret"] {
+            assert_eq!(
+                authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+                    [
+                        (INGRESS_TRANSPORT_AUTH_HEADER_NAME, invalid_secret),
+                        (INGRESS_CONTINUITY_HEADER_NAME, continuity),
+                    ],
+                    overlap,
+                ),
+                Err(ContinuityInputRejection::InvalidTransportAuth)
+            );
+        }
+        assert_eq!(
+            authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+                [(INGRESS_CONTINUITY_HEADER_NAME, continuity)],
+                overlap,
+            ),
+            Err(ContinuityInputRejection::MissingTransportAuth)
+        );
+        for duplicated_secret in ["new-transport-secret", "old-transport-secret"] {
+            assert_eq!(
+                authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+                    [
+                        (INGRESS_TRANSPORT_AUTH_HEADER_NAME, duplicated_secret),
+                        ("x-eidolon-ingress-transport-auth", duplicated_secret),
+                        (INGRESS_CONTINUITY_HEADER_NAME, continuity),
+                    ],
+                    overlap,
+                ),
+                Err(ContinuityInputRejection::DuplicateTransportAuth)
+            );
+        }
+        assert_eq!(
+            authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+                [
+                    (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "new-transport-secret"),
+                    (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "old-transport-secret"),
+                    (INGRESS_CONTINUITY_HEADER_NAME, continuity),
+                ],
+                overlap,
+            ),
+            Err(ContinuityInputRejection::DuplicateTransportAuth)
+        );
+
+        let previous_claim_headers = [
+            (INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+            (INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+            (INGRESS_VERIFICATION_STRENGTH_HEADER_NAME, "high"),
+            (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "old-transport-secret"),
+        ];
+        let active_claim_headers = [
+            (INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+            (INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+            (INGRESS_VERIFICATION_STRENGTH_HEADER_NAME, "high"),
+            (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "new-transport-secret"),
+        ];
+        assert_eq!(
+            authenticated_ingress_identity_from_headers_with_trusted_keys(
+                active_claim_headers,
+                Some(overlap),
+            ),
+            authenticated_ingress_identity_from_headers_with_trusted_keys(
+                previous_claim_headers,
+                Some(overlap),
+            )
+        );
+        assert_eq!(
+            authenticated_ingress_advisory_signals_from_headers_with_trusted_keys(
+                active_claim_headers,
+                Some(overlap),
+            ),
+            authenticated_ingress_advisory_signals_from_headers_with_trusted_keys(
+                previous_claim_headers,
+                Some(overlap),
+            )
+        );
+        assert_eq!(
+            authenticated_ingress_identity_from_headers_with_trusted_keys(
+                previous_claim_headers,
+                Some(overlap),
+            )
+            .trust_tier,
+            IngressTrustTier::SignedAttested
+        );
+        assert_eq!(
+            authenticated_ingress_advisory_signals_from_headers_with_trusted_keys(
+                previous_claim_headers,
+                Some(overlap),
+            )
+            .verification_strength,
+            IngressVerificationStrength::High
+        );
+        let duplicate_claim_headers = [
+            (INGRESS_IDENTITY_SOURCE_HEADER_NAME, "signed_agent"),
+            (INGRESS_TRUST_TIER_HEADER_NAME, "signed_attested"),
+            (INGRESS_VERIFICATION_STRENGTH_HEADER_NAME, "high"),
+            (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "new-transport-secret"),
+            (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "old-transport-secret"),
+        ];
+        assert_eq!(
+            authenticated_ingress_identity_from_headers_with_trusted_keys(
+                duplicate_claim_headers,
+                Some(overlap),
+            ),
+            IngressIdentity::default()
+        );
+        assert_eq!(
+            authenticated_ingress_advisory_signals_from_headers_with_trusted_keys(
+                duplicate_claim_headers,
+                Some(overlap),
+            ),
+            IngressAdvisorySignals::default()
+        );
+
+        let retired =
+            TrustedIngressContinuityKeys::new("new-transport-secret", stable_continuity_key);
+        assert_eq!(
+            authenticated_ingress_continuity_key_from_headers_with_trusted_keys(
+                [
+                    (INGRESS_TRANSPORT_AUTH_HEADER_NAME, "old-transport-secret"),
+                    (INGRESS_CONTINUITY_HEADER_NAME, continuity),
+                ],
+                retired,
             ),
             Err(ContinuityInputRejection::InvalidTransportAuth)
         );
