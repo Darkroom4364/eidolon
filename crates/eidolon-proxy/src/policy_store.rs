@@ -1,24 +1,35 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
 use eidolon_core::{
+    ControlledRealityInteraction, ControlledRealityInteractionAction,
     ControlledRealityWorkflowState, Event, EventKind, EventSource, PolicyState, RequestId,
-    RoutingDecision, SessionId,
+    RoutingDecision, SessionId, EVENT_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::controlled_reality::ControlledRealityResponder;
+
 pub const POLICY_STORE_SCHEMA_VERSION: u16 = 3;
-const MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION: u16 = 1;
+pub const MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION: u16 = 1;
 
 /// Maximum retained session policy records. If enforcement-only churn reaches
 /// this bound, the store becomes fail-closed for unknown sessions before any
 /// protected record is removed.
 pub const MAX_POLICY_SESSIONS: usize = 8192;
+
+/// Maximum serialized policy-state snapshot size. This leaves explicit
+/// headroom above 8,192 fully populated production records while bounding
+/// both startup reads and every replacement write.
+pub const MAX_POLICY_STORE_BYTES: usize = 32 * 1024 * 1024;
+
+const POLICY_STORE_READ_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Time after which a session record that never rose above `Suspicious` may
 /// be evicted. Enforcement states are never TTL-evicted either (safety note:
@@ -39,6 +50,143 @@ fn current_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+fn oversized_policy_store_error(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "policy state store `{}` exceeds the fixed {} byte limit",
+            path.display(),
+            MAX_POLICY_STORE_BYTES
+        ),
+    )
+}
+
+fn oversized_serialized_policy_store_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "serialized policy state store exceeds the fixed {} byte limit",
+            MAX_POLICY_STORE_BYTES
+        ),
+    )
+}
+
+fn invalid_pending_contract_error(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "policy state store `{}` contains an invalid pending controlled-reality contract",
+            path.display()
+        ),
+    )
+}
+
+fn no_controlled_reality_interaction_sha256() -> [u8; 32] {
+    // `None::<ControlledRealityInteraction>` has the fixed JSON encoding
+    // `null`; use those canonical bytes without retaining response content.
+    Sha256::digest(b"null").into()
+}
+
+fn controlled_reality_interaction_sha256(
+    interaction: &Option<ControlledRealityInteraction>,
+) -> Option<[u8; 32]> {
+    serde_json::to_vec(interaction)
+        .ok()
+        .map(|serialized| Sha256::digest(serialized).into())
+}
+
+fn pending_interaction_kind(
+    interaction: Option<&ControlledRealityInteraction>,
+) -> Option<ControlledRealityPendingInteractionKind> {
+    interaction.map(|interaction| match &interaction.action {
+        ControlledRealityInteractionAction::JobSubmitted => {
+            ControlledRealityPendingInteractionKind::JobSubmitted
+        }
+        ControlledRealityInteractionAction::StatusRead => {
+            ControlledRealityPendingInteractionKind::StatusRead
+        }
+        ControlledRealityInteractionAction::ArtifactRead { .. } => {
+            ControlledRealityPendingInteractionKind::ArtifactRead
+        }
+    })
+}
+
+fn read_policy_store_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let advertised_len = file.metadata()?.len();
+    read_policy_store_bytes_from_reader(file, path, advertised_len)
+}
+
+/// Read through a fixed-size stack buffer so both the bytes retained and each
+/// allocation request stay at or below `MAX_POLICY_STORE_BYTES + 1`. The
+/// metadata length is only an early rejection: the bounded read remains the
+/// authority if a file grows after the metadata call.
+fn read_policy_store_bytes_from_reader(
+    mut reader: impl Read,
+    path: &Path,
+    advertised_len: u64,
+) -> io::Result<Vec<u8>> {
+    if advertised_len > MAX_POLICY_STORE_BYTES as u64 {
+        return Err(oversized_policy_store_error(path));
+    }
+
+    let allocation_bound = MAX_POLICY_STORE_BYTES + 1;
+    let initial_capacity = usize::try_from(advertised_len)
+        .unwrap_or(allocation_bound)
+        .saturating_add(1)
+        .min(allocation_bound);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    let mut chunk = [0_u8; POLICY_STORE_READ_CHUNK_BYTES];
+
+    loop {
+        let remaining = allocation_bound - bytes.len();
+        if remaining == 0 {
+            return Err(oversized_policy_store_error(path));
+        }
+        let requested = remaining.min(POLICY_STORE_READ_CHUNK_BYTES);
+        let read = loop {
+            match reader.read(&mut chunk[..requested]) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        if read > requested {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "policy state reader returned an invalid byte count",
+            ));
+        }
+        if read == 0 {
+            break;
+        }
+
+        let required = bytes.len() + read;
+        if bytes.capacity() < required {
+            let target_capacity = bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(POLICY_STORE_READ_CHUNK_BYTES)
+                .max(required)
+                .min(allocation_bound);
+            bytes.reserve_exact(target_capacity - bytes.len());
+            if bytes.capacity() < required {
+                return Err(io::Error::other(
+                    "policy state buffer did not satisfy its bounded reservation",
+                ));
+            }
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+
+    if bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("policy state store `{}` is empty", path.display()),
+        ));
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +297,51 @@ enum PolicyPersistOutcome {
     CommittedDurabilityUncertain,
 }
 
+/// Serialization sink that retains at most the fixed limit plus one sentinel
+/// byte. Once full it keeps accepting and discarding serializer output so a
+/// large in-memory field cannot make the replacement buffer grow unbounded.
+struct BoundedPolicyStoreSerialization {
+    bytes: Vec<u8>,
+}
+
+impl BoundedPolicyStoreSerialization {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(POLICY_STORE_READ_CHUNK_BYTES),
+        }
+    }
+
+    fn finish(self) -> io::Result<Vec<u8>> {
+        if self.bytes.len() > MAX_POLICY_STORE_BYTES {
+            return Err(oversized_serialized_policy_store_error());
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl Write for BoundedPolicyStoreSerialization {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let allocation_bound = MAX_POLICY_STORE_BYTES + 1;
+        let retained = buffer.len().min(allocation_bound - self.bytes.len());
+        let required = self.bytes.len() + retained;
+        if self.bytes.capacity() < required {
+            let target_capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(allocation_bound);
+            self.bytes.reserve_exact(target_capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(&buffer[..retained]);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl EvictionStats {
     pub fn is_clean(&self) -> bool {
         self.ttl_evicted == 0
@@ -243,17 +436,23 @@ impl PolicyStateStore {
         Self::open_at(path, current_unix_secs())
     }
 
+    /// Perform the bounded parse, snapshot-local validation, startup
+    /// migration/eviction, and any required serialization without filesystem
+    /// mutation. Production uses this before touching its lease file, then
+    /// calls `open` again under the lease so the second read remains
+    /// authoritative against path races.
+    pub fn validate_without_mutation(path: impl AsRef<Path>) -> io::Result<()> {
+        Self::load_at(path.as_ref().to_path_buf(), current_unix_secs(), false).map(drop)
+    }
+
     /// Open the store with an explicit "now" (test hook for eviction runs).
     pub fn open_at(path: impl AsRef<Path>, now: u64) -> io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
+        Self::load_at(path.as_ref().to_path_buf(), now, true)
+    }
+
+    fn load_at(path: PathBuf, now: u64, persist_changes: bool) -> io::Result<Self> {
         let (records, fail_closed_for_unknown_sessions, needs_schema_migration) =
-            match fs::read(&path) {
-                Ok(bytes) if bytes.is_empty() => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("policy state store `{}` is empty", path.display()),
-                    ));
-                }
+            match read_policy_store_bytes(&path) {
                 Ok(bytes) => deserialize_records(&bytes, &path)?,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     (HashMap::new(), false, false)
@@ -279,7 +478,11 @@ impl PolicyStateStore {
         let stats = store.evict(now);
         store.last_eviction = stats;
         if !stats.is_clean() || needs_schema_migration {
-            store.persist()?;
+            if persist_changes {
+                store.persist()?;
+            } else {
+                store.serialize_current_state()?;
+            }
         }
 
         Ok(store)
@@ -714,6 +917,7 @@ impl PolicyStateStore {
             || expected_policy_changed.request_id != Some(request_id)
             || expected_policy_changed.source != EventSource::PolicyRouter
             || expected_policy_changed.policy_state != policy_state
+            || !persistence_matches_controlled_reality_block_transition(&expected_policy_changed)
             || !matches!(
                 &expected_policy_changed.kind,
                 EventKind::PolicyChanged {
@@ -944,6 +1148,39 @@ impl PolicyStateStore {
             return Ok(PolicyPersistOutcome::Durable);
         };
 
+        let serialized = self.serialize_current_state()?;
+        let temp_path = path.with_extension("tmp");
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+
+        file.write_all(&serialized)?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(temp_path, path)?;
+        match sync_parent(path) {
+            Ok(()) => Ok(PolicyPersistOutcome::Durable),
+            Err(error) => {
+                eprintln!(
+                    "eidolon persistence failure: policy state rename committed but parent directory sync failed for `{}`: {error}",
+                    path.display()
+                );
+                Ok(PolicyPersistOutcome::CommittedDurabilityUncertain)
+            }
+        }
+    }
+
+    fn serialize_current_state(&self) -> io::Result<Vec<u8>> {
         let mut sessions: Vec<StoredSessionPolicy> = self
             .records
             .iter()
@@ -974,41 +1211,14 @@ impl PolicyStateStore {
             fail_closed_for_unknown_sessions: self.fail_closed_for_unknown_sessions,
             sessions,
         };
-        let serialized = serde_json::to_vec_pretty(&stored).map_err(|error| {
+        let mut serialized = BoundedPolicyStoreSerialization::new();
+        serde_json::to_writer_pretty(&mut serialized, &stored).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("failed to serialize policy state store: {error}"),
             )
         })?;
-        let temp_path = path.with_extension("tmp");
-
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temp_path)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-
-        file.write_all(&serialized)?;
-        file.flush()?;
-        file.sync_all()?;
-        fs::rename(temp_path, path)?;
-        match sync_parent(path) {
-            Ok(()) => Ok(PolicyPersistOutcome::Durable),
-            Err(error) => {
-                eprintln!(
-                    "eidolon persistence failure: policy state rename committed but parent directory sync failed for `{}`: {error}",
-                    path.display()
-                );
-                Ok(PolicyPersistOutcome::CommittedDurabilityUncertain)
-            }
-        }
+        serialized.finish()
     }
 }
 
@@ -1042,16 +1252,215 @@ fn discovery_recon_state(record: &SessionPolicyRecord) -> crate::policy::Discove
     }
 }
 
+fn workflow_snapshot_is_valid(
+    depth: u32,
+    state: ControlledRealityWorkflowState,
+    origin_request_id: Option<RequestId>,
+) -> bool {
+    match state {
+        ControlledRealityWorkflowState::Ready => origin_request_id.is_none(),
+        ControlledRealityWorkflowState::Queued => depth >= 1 && origin_request_id.is_some(),
+        ControlledRealityWorkflowState::Completed => depth >= 2 && origin_request_id.is_some(),
+    }
+}
+
+fn persistence_matches_controlled_reality_block_transition(event: &Event) -> bool {
+    let is_controlled_reality_block = matches!(
+        &event.kind,
+        EventKind::PolicyChanged {
+            from: PolicyState::ControlledReality,
+            to: PolicyState::Blocked,
+            ..
+        }
+    );
+    let persistence_matches_transition = event.persistence.is_empty()
+        || (event
+            .persistence
+            .is_compatible_with_policy_state(PolicyState::Blocked)
+            && event.persistence.post_containment_kind().is_some());
+
+    is_controlled_reality_block && persistence_matches_transition
+}
+
+fn expected_unlimited_pending_response(
+    session: &StoredSessionPolicy,
+    pending: &ControlledRealityPendingUpdate,
+) -> Option<(
+    u16,
+    RoutingDecision,
+    Option<ControlledRealityPendingInteractionKind>,
+    [u8; 32],
+)> {
+    let expected = ControlledRealityResponder.expected_response(
+        session.session_id,
+        ControlledRealityProgress {
+            depth: session.controlled_reality_depth,
+            from_state: pending.previous_state,
+            to_state: session.controlled_reality_workflow_state,
+            origin_request_id: session.controlled_reality_origin_request_id,
+        },
+        pending.request_action,
+        u32::MAX,
+    );
+    let interaction_kind = pending_interaction_kind(expected.interaction.as_ref());
+    let interaction_sha256 = controlled_reality_interaction_sha256(&expected.interaction)?;
+    Some((
+        expected.status,
+        expected.routing_decision,
+        interaction_kind,
+        interaction_sha256,
+    ))
+}
+
+fn validate_stored_pending_contract(session: &StoredSessionPolicy, path: &Path) -> io::Result<()> {
+    let Some(pending) = session.controlled_reality_pending_update.as_ref() else {
+        return Ok(());
+    };
+
+    let depth_is_valid =
+        session.controlled_reality_depth == pending.previous_depth.saturating_add(1);
+    let current_workflow_is_valid = workflow_snapshot_is_valid(
+        session.controlled_reality_depth,
+        session.controlled_reality_workflow_state,
+        session.controlled_reality_origin_request_id,
+    );
+    let previous_workflow_is_valid = workflow_snapshot_is_valid(
+        pending.previous_depth,
+        pending.previous_state,
+        pending.previous_origin_request_id,
+    );
+    let workflow_unchanged = session.controlled_reality_workflow_state == pending.previous_state
+        && session.controlled_reality_origin_request_id == pending.previous_origin_request_id;
+    let workflow_normally_advances = matches!(
+        (pending.previous_state, pending.request_action),
+        (
+            ControlledRealityWorkflowState::Ready,
+            ControlledRealityRequestAction::JobSubmitted
+        )
+    ) || matches!(
+        (pending.previous_state, pending.request_action),
+        (
+            ControlledRealityWorkflowState::Queued,
+            ControlledRealityRequestAction::StatusRead
+        )
+    ) && pending.previous_origin_request_id.is_some();
+    let workflow_advanced = match (pending.previous_state, pending.request_action) {
+        (ControlledRealityWorkflowState::Ready, ControlledRealityRequestAction::JobSubmitted) => {
+            session.controlled_reality_workflow_state == ControlledRealityWorkflowState::Queued
+                && session.controlled_reality_origin_request_id == Some(pending.request_id)
+        }
+        (ControlledRealityWorkflowState::Queued, ControlledRealityRequestAction::StatusRead)
+            if pending.previous_origin_request_id.is_some() =>
+        {
+            session.controlled_reality_workflow_state == ControlledRealityWorkflowState::Completed
+                && session.controlled_reality_origin_request_id
+                    == pending.previous_origin_request_id
+        }
+        _ => false,
+    };
+    let unlimited_workflow_is_valid = if workflow_normally_advances {
+        workflow_advanced
+    } else {
+        workflow_unchanged
+    };
+    let transition_is_valid = match (
+        pending.commit_policy_state,
+        pending.expected_policy_changed.as_ref(),
+    ) {
+        (None, None) => true,
+        (Some(PolicyState::Blocked), Some(event)) => {
+            session.policy_state == PolicyState::ControlledReality
+                && event.schema_version == EVENT_SCHEMA_VERSION
+                && event.session_id == session.session_id
+                && event.request_id == Some(pending.request_id)
+                && event.source == EventSource::PolicyRouter
+                && event.policy_state == PolicyState::Blocked
+                && persistence_matches_controlled_reality_block_transition(event)
+                && matches!(
+                    &event.kind,
+                    EventKind::PolicyChanged {
+                        from: PolicyState::ControlledReality,
+                        to: PolicyState::Blocked,
+                        ..
+                    }
+                )
+        }
+        _ => false,
+    };
+    let transition_workflow_is_valid =
+        pending.commit_policy_state != Some(PolicyState::Blocked) || workflow_unchanged;
+    let expected_response_state = pending.commit_policy_state.unwrap_or(session.policy_state);
+    let response_is_valid = match pending.expected_response {
+        None => true,
+        Some(response) if response.policy_state != expected_response_state => false,
+        Some(response) if pending.commit_policy_state == Some(PolicyState::Blocked) => {
+            response.status == 403
+                && response.routing_decision == RoutingDecision::EidolonOwned
+                && response.interaction_kind.is_none()
+                && response.controlled_reality_sha256 == no_controlled_reality_interaction_sha256()
+        }
+        Some(response) if pending.commit_policy_state.is_none() => {
+            let unlimited_response_is_valid = expected_unlimited_pending_response(session, pending)
+                .is_some_and(
+                    |(status, routing_decision, interaction_kind, interaction_sha256)| {
+                        unlimited_workflow_is_valid
+                            && response.status == status
+                            && response.routing_decision == routing_decision
+                            && response.interaction_kind == interaction_kind
+                            && response.controlled_reality_sha256 == interaction_sha256
+                    },
+                );
+            let rate_limited_response_is_valid = workflow_unchanged
+                && response.status == 429
+                && response.routing_decision == RoutingDecision::RateLimited
+                && response.interaction_kind.is_none()
+                && response.controlled_reality_sha256 == no_controlled_reality_interaction_sha256();
+            unlimited_response_is_valid || rate_limited_response_is_valid
+        }
+        Some(_) => false,
+    };
+    let event_ids_are_distinct = match (
+        pending.expected_policy_changed.as_ref(),
+        pending.expected_response,
+    ) {
+        (Some(policy_event), Some(response)) => policy_event.id != response.event_id,
+        _ => true,
+    };
+
+    if session.policy_state == PolicyState::ControlledReality
+        && depth_is_valid
+        && current_workflow_is_valid
+        && previous_workflow_is_valid
+        && (workflow_unchanged || workflow_advanced)
+        && transition_is_valid
+        && transition_workflow_is_valid
+        && response_is_valid
+        && event_ids_are_distinct
+    {
+        Ok(())
+    } else {
+        Err(invalid_pending_contract_error(path))
+    }
+}
+
 fn deserialize_records(
     bytes: &[u8],
     path: &Path,
 ) -> io::Result<(HashMap<SessionId, SessionPolicyRecord>, bool, bool)> {
     let stored: StoredPolicyState = serde_json::from_slice(bytes).map_err(|error| {
+        let classification = match error.classify() {
+            serde_json::error::Category::Io => "policy-state JSON I/O failure",
+            serde_json::error::Category::Syntax => "invalid JSON syntax",
+            serde_json::error::Category::Data => "invalid policy-state data",
+            serde_json::error::Category::Eof => "truncated JSON",
+        };
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "failed to parse policy state store `{}`: {error}",
-                path.display()
+                "failed to parse policy state store `{}`: {classification} at line {}, column {}",
+                path.display(),
+                error.line(),
+                error.column()
             ),
         )
     })?;
@@ -1061,9 +1470,10 @@ fn deserialize_records(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "unsupported policy state store schema version {} in `{}`",
-                stored.schema_version,
-                path.display()
+                "unsupported policy state store schema in `{}`; supported versions are {} through {}",
+                path.display(),
+                MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+                POLICY_STORE_SCHEMA_VERSION
             ),
         ));
     }
@@ -1074,6 +1484,21 @@ fn deserialize_records(
     } else {
         stored.fail_closed_for_unknown_sessions
     };
+    let mut session_ids = HashSet::with_capacity(stored.sessions.len());
+    for session in &stored.sessions {
+        if !session_ids.insert(session.session_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "policy state store `{}` contains duplicate session_id entries",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    for session in &stored.sessions {
+        validate_stored_pending_contract(session, path)?;
+    }
     let records = stored
         .sessions
         .into_iter()
@@ -1141,10 +1566,11 @@ fn deserialize_records(
 mod tests {
     use std::{
         env, fs,
+        io::{Cursor, Read},
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use eidolon_core::PolicyState;
+    use eidolon_core::{PersistenceMetadata, PolicyState, PreContainmentPersistenceClass};
 
     use super::*;
     #[cfg(unix)]
@@ -1169,6 +1595,240 @@ mod tests {
         ))
     }
 
+    struct ShortReader {
+        bytes: Cursor<Vec<u8>>,
+        max_read: usize,
+    }
+
+    impl Read for ShortReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let limit = buffer.len().min(self.max_read);
+            self.bytes.read(&mut buffer[..limit])
+        }
+    }
+
+    struct InterruptedReader {
+        bytes: Cursor<Vec<u8>>,
+        interrupted_before_data: bool,
+        interrupted_between_chunks: bool,
+        interrupted_before_eof: bool,
+    }
+
+    impl Read for InterruptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted_before_data {
+                self.interrupted_before_data = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected interruption before data",
+                ));
+            }
+            if self.bytes.position() > 0
+                && self.bytes.position() < self.bytes.get_ref().len() as u64
+                && !self.interrupted_between_chunks
+            {
+                self.interrupted_between_chunks = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected interruption between chunks",
+                ));
+            }
+            if self.bytes.position() == self.bytes.get_ref().len() as u64
+                && !self.interrupted_before_eof
+            {
+                self.interrupted_before_eof = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected interruption before EOF",
+                ));
+            }
+            let limit = buffer.len().min(2);
+            self.bytes.read(&mut buffer[..limit])
+        }
+    }
+
+    struct ReadThenFail {
+        served_prefix: bool,
+    }
+
+    impl Read for ReadThenFail {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.served_prefix {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected bounded-reader failure",
+                ));
+            }
+            self.served_prefix = true;
+            buffer[0] = b'{';
+            Ok(1)
+        }
+    }
+
+    struct OverreportingReader;
+
+    impl Read for OverreportingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(buffer.len() + 1)
+        }
+    }
+
+    struct FailsIfRead;
+
+    impl Read for FailsIfRead {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other(
+                "metadata precheck unexpectedly touched the reader",
+            ))
+        }
+    }
+
+    struct RepeatingByteReader {
+        remaining: usize,
+        byte: u8,
+    }
+
+    impl Read for RepeatingByteReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = buffer.len().min(self.remaining);
+            buffer[..read].fill(self.byte);
+            self.remaining -= read;
+            Ok(read)
+        }
+    }
+
+    fn empty_current_store_bytes() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty current store should serialize")
+    }
+
+    /// Populate the widest valid staged-block production shape. Fields fixed
+    /// by the blocked-response contract use their required values. Arbitrary
+    /// loaded event strings remain governed by the total byte limit; this
+    /// fixture proves headroom for state generated by production.
+    fn widest_production_record(
+        session_id: SessionId,
+        request_id: RequestId,
+        policy_event_id: Uuid,
+        response_event_id: Uuid,
+    ) -> SessionPolicyRecord {
+        let depth_transition =
+            crate::policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+                PolicyState::ControlledReality,
+                "route:controlled_follow_up",
+                u32::MAX,
+                u32::MAX - 2,
+            )
+            .expect("maximum production depth should block");
+        let escape_transition =
+            crate::policy::transition_to_blocked_from_repeated_reality_escape_attempt(
+                PolicyState::ControlledReality,
+                "route:controlled_follow_up",
+                u32::MAX,
+            )
+            .expect("maximum production escape count should block");
+        let mut depth_event =
+            crate::policy::policy_changed_event(session_id, request_id, &depth_transition);
+        let mut escape_event =
+            crate::policy::policy_changed_event(session_id, request_id, &escape_transition);
+        for event in [&mut depth_event, &mut escape_event] {
+            event.observed_at = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+        }
+        let mut expected_policy_changed = [depth_event, escape_event]
+            .into_iter()
+            .max_by_key(|event| {
+                serde_json::to_vec(event)
+                    .expect("production policy event should serialize")
+                    .len()
+            })
+            .expect("production policy event candidates should not be empty");
+        expected_policy_changed.id = policy_event_id;
+
+        SessionPolicyRecord {
+            policy_state: PolicyState::ControlledReality,
+            controlled_reality_depth: u32::MAX,
+            controlled_reality_workflow_state: ControlledRealityWorkflowState::Completed,
+            controlled_reality_origin_request_id: Some(request_id),
+            controlled_reality_pending_update: Some(ControlledRealityPendingUpdate {
+                request_id,
+                request_action: ControlledRealityRequestAction::UnknownResource,
+                previous_depth: u32::MAX,
+                previous_state: ControlledRealityWorkflowState::Completed,
+                previous_origin_request_id: Some(request_id),
+                commit_policy_state: Some(PolicyState::Blocked),
+                expected_policy_changed: Some(expected_policy_changed),
+                expected_response: Some(ControlledRealityPendingResponse {
+                    event_id: response_event_id,
+                    policy_state: PolicyState::Blocked,
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                    interaction_kind: None,
+                    controlled_reality_sha256: no_controlled_reality_interaction_sha256(),
+                }),
+            }),
+            last_seen_unix_secs: u64::MAX,
+            reality_escape_attempt_count: u32::MAX,
+            discovery_surface_fanout: crate::policy::DiscoverySurfaceFanout {
+                docs_seen: false,
+                openapi_seen: false,
+            },
+            discovery_request_count: u32::MAX,
+            discovery_query_seen: false,
+            discovery_legacy_openapi_query_seen: false,
+            discovery_linked_bait_surface_fanout: crate::policy::LinkedBaitSurfaceFanout {
+                docs_seen: false,
+                assets_seen: false,
+                other_seen: false,
+            },
+            discovery_decoy_write_probe_count:
+                crate::policy::discovery_recon_decoy_write_probe_count_cap(),
+            discovery_decoy_write_probe_fanout: crate::policy::DecoyWriteProbeFanout {
+                reconcile_seen: false,
+                other_seen: false,
+            },
+        }
+    }
+
+    fn test_response_contract(
+        store: &PolicyStateStore,
+        session_id: SessionId,
+        request_id: RequestId,
+        event_id: Uuid,
+        depth_limit: u32,
+    ) -> ControlledRealityPendingResponse {
+        let record = store.record(session_id);
+        let pending = record
+            .controlled_reality_pending_update
+            .as_ref()
+            .expect("test response should have pending workflow state");
+        assert_eq!(pending.request_id, request_id);
+        let expected = ControlledRealityResponder.expected_response(
+            session_id,
+            ControlledRealityProgress {
+                depth: record.controlled_reality_depth,
+                from_state: pending.previous_state,
+                to_state: record.controlled_reality_workflow_state,
+                origin_request_id: record.controlled_reality_origin_request_id,
+            },
+            pending.request_action,
+            depth_limit,
+        );
+        let controlled_reality_sha256 =
+            controlled_reality_interaction_sha256(&expected.interaction)
+                .expect("test interaction semantics should serialize");
+        ControlledRealityPendingResponse {
+            event_id,
+            policy_state: pending.commit_policy_state.unwrap_or(record.policy_state),
+            status: expected.status,
+            routing_decision: expected.routing_decision,
+            interaction_kind: pending_interaction_kind(expected.interaction.as_ref()),
+            controlled_reality_sha256,
+        }
+    }
+
     fn set_test_response_contract(
         store: &mut PolicyStateStore,
         session_id: SessionId,
@@ -1176,19 +1836,12 @@ mod tests {
         status: u16,
         interaction_kind: ControlledRealityPendingInteractionKind,
     ) {
+        let response =
+            test_response_contract(store, session_id, request_id, Uuid::new_v4(), u32::MAX);
+        assert_eq!(response.status, status);
+        assert_eq!(response.interaction_kind, Some(interaction_kind));
         store
-            .set_pending_controlled_reality_response(
-                session_id,
-                request_id,
-                ControlledRealityPendingResponse {
-                    event_id: Uuid::new_v4(),
-                    policy_state: PolicyState::ControlledReality,
-                    status,
-                    routing_decision: RoutingDecision::ControlledReality,
-                    interaction_kind: Some(interaction_kind),
-                    controlled_reality_sha256: [0; 32],
-                },
-            )
+            .set_pending_controlled_reality_response(session_id, request_id, response)
             .expect("response contract should persist");
     }
 
@@ -1209,6 +1862,147 @@ mod tests {
     #[test]
     fn policy_store_schema_version_matches_current_contract() {
         assert_eq!(POLICY_STORE_SCHEMA_VERSION, 3);
+        assert_eq!(MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION, 1);
+        assert_eq!(MAX_POLICY_STORE_BYTES, 32 * 1024 * 1024);
+        let no_interaction =
+            serde_json::to_vec(&Option::<eidolon_core::ControlledRealityInteraction>::None)
+                .expect("absent controlled-reality semantics should serialize");
+        assert_eq!(no_interaction, b"null");
+        let expected_digest: [u8; 32] = Sha256::digest(no_interaction).into();
+        assert_eq!(no_controlled_reality_interaction_sha256(), expected_digest);
+    }
+
+    #[test]
+    fn controlled_reality_block_persistence_accepts_only_legacy_or_post_containment_metadata() {
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let transition =
+            crate::policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+                PolicyState::ControlledReality,
+                "route:controlled_follow_up",
+                3,
+                1,
+            )
+            .expect("repeated controlled-reality depth should block");
+        let post_containment_event =
+            crate::policy::policy_changed_event(session_id, request_id, &transition);
+        assert!(persistence_matches_controlled_reality_block_transition(
+            &post_containment_event
+        ));
+
+        let mut legacy_event = post_containment_event.clone();
+        legacy_event.persistence = PersistenceMetadata::default();
+        assert!(persistence_matches_controlled_reality_block_transition(
+            &legacy_event
+        ));
+
+        let mut rate_limited_event = post_containment_event.clone();
+        rate_limited_event.persistence =
+            PersistenceMetadata::pre_containment(PreContainmentPersistenceClass::DiscoveryRecon);
+        assert!(!persistence_matches_controlled_reality_block_transition(
+            &rate_limited_event
+        ));
+
+        let mut pre_containment_retry_event = post_containment_event;
+        pre_containment_retry_event.persistence = PersistenceMetadata::pre_containment_retry(
+            PreContainmentPersistenceClass::DiscoveryRecon,
+        );
+        assert!(!persistence_matches_controlled_reality_block_transition(
+            &pre_containment_retry_event
+        ));
+    }
+
+    #[test]
+    fn validation_preflight_is_read_only_for_missing_and_legacy_state() {
+        let path = unique_temp_path("read-only-validation-preflight");
+
+        PolicyStateStore::validate_without_mutation(&path)
+            .expect("missing state should pass read-only validation");
+        assert!(!path.exists());
+        assert!(!path.with_extension("tmp").exists());
+
+        let session_id = SessionId::new();
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "schema_version": MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [{
+                "session_id": session_id.0,
+                "policy_state": "blocked",
+            }],
+        }))
+        .expect("legacy preflight fixture should serialize");
+        fs::write(&path, &legacy).expect("legacy preflight fixture should write");
+
+        PolicyStateStore::validate_without_mutation(&path)
+            .expect("valid legacy state should pass read-only validation");
+        assert_eq!(
+            fs::read(&path).expect("validated legacy state should remain readable"),
+            legacy
+        );
+        assert!(!path.with_extension("tmp").exists());
+
+        let raced_invalid_state = b"{";
+        fs::write(&path, raced_invalid_state)
+            .expect("state should be replaceable after the preflight");
+        let error = PolicyStateStore::open(&path)
+            .expect_err("the authoritative open must reject a post-preflight change");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(&path).expect("raced invalid state should remain readable"),
+            raced_invalid_state
+        );
+        assert!(!path.with_extension("tmp").exists());
+
+        fs::remove_file(path).expect("legacy preflight fixture should remove");
+    }
+
+    #[test]
+    fn maximum_widest_production_store_has_explicit_byte_headroom() {
+        const REQUIRED_HEADROOM_BYTES: usize = 8 * 1024 * 1024;
+
+        let records: HashMap<SessionId, SessionPolicyRecord> = (0..MAX_POLICY_SESSIONS)
+            .map(|index| {
+                let session_id = SessionId(Uuid::from_u128(index as u128 + 1));
+                let request_id = RequestId(Uuid::from_u128(
+                    MAX_POLICY_SESSIONS as u128 + index as u128 + 1,
+                ));
+                let event_id =
+                    Uuid::from_u128((MAX_POLICY_SESSIONS * 2) as u128 + index as u128 + 1);
+                let response_event_id =
+                    Uuid::from_u128((MAX_POLICY_SESSIONS * 3) as u128 + index as u128 + 1);
+                (
+                    session_id,
+                    widest_production_record(session_id, request_id, event_id, response_event_id),
+                )
+            })
+            .collect();
+        let widest_event = records
+            .values()
+            .next()
+            .and_then(|record| record.controlled_reality_pending_update.as_ref())
+            .and_then(|pending| pending.expected_policy_changed.as_ref())
+            .expect("widest records should retain their policy-change event");
+        assert_eq!(
+            widest_event.observed_at,
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            "the headroom fixture must not depend on wall-clock timestamp width"
+        );
+        let store = PolicyStateStore {
+            path: None,
+            records,
+            fail_closed_for_unknown_sessions: false,
+            last_eviction: EvictionStats::default(),
+        };
+
+        let serialized = store
+            .serialize_current_state()
+            .expect("maximum supported populated store should remain serializable");
+        let headroom = MAX_POLICY_STORE_BYTES - serialized.len();
+
+        assert!(
+            headroom >= REQUIRED_HEADROOM_BYTES,
+            "widest production store used {} bytes and left only {headroom} bytes",
+            serialized.len()
+        );
     }
 
     fn store_with(records: Vec<(SessionId, PolicyState, u64)>) -> PolicyStateStore {
@@ -1530,9 +2324,14 @@ mod tests {
 
     #[test]
     fn missing_store_defaults_sessions_to_observe() {
-        let store = PolicyStateStore::open(unique_temp_path("missing")).expect("store should open");
+        let path = unique_temp_path("missing");
+        let store = PolicyStateStore::open(&path).expect("store should open");
 
         assert_eq!(store.policy_state(SessionId::new()), PolicyState::Observe);
+        assert!(
+            !path.exists(),
+            "opening missing state must not create a file"
+        );
     }
 
     #[test]
@@ -1569,6 +2368,58 @@ mod tests {
         assert!(store.is_empty());
         assert_eq!(store.policy_state(session_id), PolicyState::Observe);
         assert!(!store.fail_closed_for_unknown_sessions());
+    }
+
+    #[test]
+    fn oversized_serialization_preserves_disk_and_rolls_back_memory() {
+        let path = unique_temp_path("oversized-write-rollback");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("controlled state should persist");
+        store
+            .note_controlled_reality_interaction(
+                session_id,
+                request_id,
+                ControlledRealityRequestAction::BranchRead,
+                4,
+            )
+            .expect("pending interaction should persist");
+        let baseline = fs::read(&path).expect("baseline store should read");
+        let mut oversized_event = test_blocked_policy_event(session_id, request_id);
+        let EventKind::PolicyChanged { reason, .. } = &mut oversized_event.kind else {
+            panic!("test event should be policy_changed");
+        };
+        *reason = "x".repeat(MAX_POLICY_STORE_BYTES);
+
+        let error = store
+            .stage_controlled_reality_policy_state(
+                session_id,
+                request_id,
+                PolicyState::Blocked,
+                oversized_event,
+            )
+            .expect_err("oversized current state must not persist");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds the fixed"));
+        assert_eq!(
+            fs::read(&path).expect("last good state should remain readable"),
+            baseline
+        );
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "size rejection must happen before a temp file is opened"
+        );
+        let pending = store
+            .record(session_id)
+            .controlled_reality_pending_update
+            .expect("pre-mutation pending state should be restored");
+        assert_eq!(pending.commit_policy_state, None);
+        assert_eq!(pending.expected_policy_changed, None);
+        fs::remove_file(path).expect("store should remove");
     }
 
     #[test]
@@ -1618,6 +2469,351 @@ mod tests {
     }
 
     #[test]
+    fn bounded_reader_handles_short_reads_and_propagates_io_failures() {
+        let bytes = empty_current_store_bytes();
+        let path = Path::new("synthetic-policy-state.json");
+        let short = read_policy_store_bytes_from_reader(
+            ShortReader {
+                bytes: Cursor::new(bytes.clone()),
+                max_read: 1,
+            },
+            path,
+            bytes.len() as u64,
+        )
+        .expect("short reads should be reassembled");
+        assert_eq!(short, bytes);
+
+        let error = read_policy_store_bytes_from_reader(
+            ReadThenFail {
+                served_prefix: false,
+            },
+            path,
+            1,
+        )
+        .expect_err("ordinary reader failures must propagate");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "injected bounded-reader failure");
+    }
+
+    #[test]
+    fn bounded_reader_retries_interruptions_before_between_and_after_chunks() {
+        let bytes = empty_current_store_bytes();
+        let path = Path::new("synthetic-interrupted-policy-state.json");
+
+        let read = read_policy_store_bytes_from_reader(
+            InterruptedReader {
+                bytes: Cursor::new(bytes.clone()),
+                interrupted_before_data: false,
+                interrupted_between_chunks: false,
+                interrupted_before_eof: false,
+            },
+            path,
+            bytes.len() as u64,
+        )
+        .expect("interrupted reads should retry without losing retained bytes");
+
+        assert_eq!(read, bytes);
+    }
+
+    #[test]
+    fn bounded_reader_rejects_an_invalid_reported_byte_count_without_panicking() {
+        let error = read_policy_store_bytes_from_reader(
+            OverreportingReader,
+            Path::new("synthetic-overreporting-policy-state.json"),
+            0,
+        )
+        .expect_err("an invalid Read implementation must fail deterministically");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "policy state reader returned an invalid byte count"
+        );
+    }
+
+    #[test]
+    fn metadata_precheck_rejects_oversized_state_without_touching_the_reader() {
+        let path = Path::new("synthetic-advertised-oversized-policy-state.json");
+        let error = read_policy_store_bytes_from_reader(
+            FailsIfRead,
+            path,
+            (MAX_POLICY_STORE_BYTES + 1) as u64,
+        )
+        .expect_err("oversized metadata should reject before a read attempt");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "policy state store `{}` exceeds the fixed {} byte limit",
+                path.display(),
+                MAX_POLICY_STORE_BYTES
+            )
+        );
+    }
+
+    #[test]
+    fn bounded_reader_growth_uses_an_explicit_capped_reservation() {
+        let expected_len = POLICY_STORE_READ_CHUNK_BYTES + 1;
+        let bytes = read_policy_store_bytes_from_reader(
+            RepeatingByteReader {
+                remaining: expected_len,
+                byte: b'x',
+            },
+            Path::new("synthetic-growing-within-limit-policy-state.json"),
+            0,
+        )
+        .expect("bounded growth should reserve before extending");
+
+        assert_eq!(bytes.len(), expected_len);
+        assert!(bytes.capacity() <= MAX_POLICY_STORE_BYTES + 1);
+    }
+
+    #[test]
+    fn bounded_read_catches_growth_after_a_small_metadata_result() {
+        let path = Path::new("synthetic-growing-policy-state.json");
+        let error = read_policy_store_bytes_from_reader(
+            RepeatingByteReader {
+                remaining: MAX_POLICY_STORE_BYTES + 1,
+                byte: b' ',
+            },
+            path,
+            0,
+        )
+        .expect_err("the bounded read must remain authoritative after metadata");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "policy state store `{}` exceeds the fixed {} byte limit",
+                path.display(),
+                MAX_POLICY_STORE_BYTES
+            )
+        );
+    }
+
+    #[test]
+    fn widest_production_record_has_a_distinct_valid_recovery_contract() {
+        let path = unique_temp_path("widest-valid-recovery");
+        let session_id = SessionId(Uuid::from_u128(1));
+        let request_id = RequestId(Uuid::from_u128(2));
+        let policy_event_id = Uuid::from_u128(3);
+        let response_event_id = Uuid::from_u128(4);
+        let record =
+            widest_production_record(session_id, request_id, policy_event_id, response_event_id);
+        let pending = record
+            .controlled_reality_pending_update
+            .as_ref()
+            .expect("widest record should have a recovery contract");
+        let expected_policy_changed = pending
+            .expected_policy_changed
+            .as_ref()
+            .expect("widest record should stage its policy event");
+        assert_eq!(expected_policy_changed.id, policy_event_id);
+        assert!(!expected_policy_changed.persistence.is_empty());
+        assert!(expected_policy_changed
+            .persistence
+            .post_containment_kind()
+            .is_some());
+        assert_eq!(
+            pending
+                .expected_response
+                .expect("widest record should stage its response")
+                .event_id,
+            response_event_id
+        );
+        assert_ne!(policy_event_id, response_event_id);
+
+        let store = PolicyStateStore {
+            path: None,
+            records: HashMap::from([(session_id, record)]),
+            fail_closed_for_unknown_sessions: false,
+            last_eviction: EvictionStats::default(),
+        };
+        fs::write(
+            &path,
+            store
+                .serialize_current_state()
+                .expect("widest recovery contract should serialize"),
+        )
+        .expect("widest recovery contract should write");
+
+        let mut reopened =
+            PolicyStateStore::open(&path).expect("widest recovery contract should validate");
+        assert!(reopened
+            .reconcile_pending_controlled_reality(session_id, request_id, true)
+            .expect("widest recovery contract should roll forward"));
+        let recovered = reopened.record(session_id);
+        assert_eq!(recovered.policy_state, PolicyState::Blocked);
+        assert_eq!(recovered.controlled_reality_depth, 0);
+        assert_eq!(recovered.controlled_reality_pending_update, None);
+
+        fs::remove_file(path).expect("widest recovery fixture should remove");
+    }
+
+    #[test]
+    fn legacy_omitted_persistence_block_contract_recovers_after_reopen() {
+        let path = unique_temp_path("legacy-omitted-persistence-recovery");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let mut store = PolicyStateStore::open(&path).expect("store should open");
+        store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("state should persist");
+        store
+            .note_controlled_reality_interaction(
+                session_id,
+                request_id,
+                ControlledRealityRequestAction::BranchRead,
+                u32::MAX,
+            )
+            .expect("branch read should stage");
+        let legacy_event = test_blocked_policy_event(session_id, request_id);
+        assert!(legacy_event.persistence.is_empty());
+        store
+            .stage_controlled_reality_policy_state(
+                session_id,
+                request_id,
+                PolicyState::Blocked,
+                legacy_event,
+            )
+            .expect("legacy block event should stage");
+        store
+            .set_pending_controlled_reality_response(
+                session_id,
+                request_id,
+                ControlledRealityPendingResponse {
+                    event_id: Uuid::new_v4(),
+                    policy_state: PolicyState::Blocked,
+                    status: 403,
+                    routing_decision: RoutingDecision::EidolonOwned,
+                    interaction_kind: None,
+                    controlled_reality_sha256: no_controlled_reality_interaction_sha256(),
+                },
+            )
+            .expect("legacy response contract should stage");
+        drop(store);
+
+        let mut reopened = PolicyStateStore::open(&path)
+            .expect("legacy omitted persistence should remain supported");
+        assert!(reopened
+            .reconcile_pending_controlled_reality(session_id, request_id, true)
+            .expect("durable legacy response should roll the block forward"));
+        let recovered = reopened.record(session_id);
+        assert_eq!(recovered.policy_state, PolicyState::Blocked);
+        assert_eq!(recovered.controlled_reality_pending_update, None);
+
+        fs::remove_file(path).expect("legacy recovery fixture should remove");
+    }
+
+    #[test]
+    fn current_schema_with_trailing_whitespace_opens_at_limit_but_one_byte_over_fails() {
+        let exact_path = unique_temp_path("exact-byte-limit");
+        let mut exact = empty_current_store_bytes();
+        exact.resize(MAX_POLICY_STORE_BYTES, b' ');
+        fs::write(&exact_path, &exact).expect("exact-limit state should write");
+
+        let store = PolicyStateStore::open(&exact_path)
+            .expect("valid JSON exactly at the byte limit should open");
+        assert!(store.is_empty());
+        assert_eq!(
+            fs::metadata(&exact_path)
+                .expect("exact-limit metadata should read")
+                .len(),
+            MAX_POLICY_STORE_BYTES as u64
+        );
+
+        let oversized_path = unique_temp_path("max-plus-one");
+        let oversized =
+            fs::File::create(&oversized_path).expect("max-plus-one state should create");
+        oversized
+            .set_len((MAX_POLICY_STORE_BYTES + 1) as u64)
+            .expect("max-plus-one state should resize");
+        drop(oversized);
+        let error = PolicyStateStore::open(&oversized_path)
+            .expect_err("one byte over the fixed limit must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds the fixed"));
+
+        fs::remove_file(exact_path).expect("exact-limit state should remove");
+        fs::remove_file(oversized_path).expect("oversized state should remove");
+    }
+
+    #[test]
+    fn legacy_exact_limit_that_expands_during_migration_fails_before_temp_write() {
+        let path = unique_temp_path("legacy-migration-expands-over-limit");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let mut event = test_blocked_policy_event(session_id, request_id);
+        let EventKind::PolicyChanged { reason, .. } = &mut event.kind else {
+            panic!("test event should be policy_changed");
+        };
+        reason.clear();
+        let serialize_legacy = |event: &Event| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "sessions": [{
+                    "session_id": session_id.0,
+                    "policy_state": "controlled_reality",
+                    "controlled_reality_depth": 1,
+                    "controlled_reality_pending_update": {
+                        "request_id": request_id.0,
+                        "request_action": "unknown_resource",
+                        "previous_depth": 0,
+                        "previous_state": "ready",
+                        "previous_origin_request_id": null,
+                        "commit_policy_state": "blocked",
+                        "expected_policy_changed": event,
+                        "expected_response": null,
+                    },
+                }],
+            }))
+            .expect("legacy migration fixture should serialize")
+        };
+        let empty_reason_len = serialize_legacy(&event).len();
+        let reason_len = MAX_POLICY_STORE_BYTES
+            .checked_sub(empty_reason_len)
+            .expect("legacy fixture envelope should fit below the byte limit");
+        let EventKind::PolicyChanged { reason, .. } = &mut event.kind else {
+            panic!("test event should remain policy_changed");
+        };
+        *reason = "x".repeat(reason_len);
+        let exact = serialize_legacy(&event);
+        assert_eq!(exact.len(), MAX_POLICY_STORE_BYTES);
+        fs::write(&path, &exact).expect("exact-limit legacy state should write");
+        let expected_error = format!(
+            "serialized policy state store exceeds the fixed {} byte limit",
+            MAX_POLICY_STORE_BYTES
+        );
+
+        let preflight_error = PolicyStateStore::validate_without_mutation(&path)
+            .expect_err("read-only validation must simulate migration size");
+        assert_eq!(preflight_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(preflight_error.to_string(), expected_error);
+        assert_eq!(
+            fs::read(&path).expect("preflight-rejected legacy state should remain readable"),
+            exact
+        );
+        assert!(!path.with_extension("tmp").exists());
+
+        let error = PolicyStateStore::open(&path)
+            .expect_err("a migration that cannot fit its current form must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), expected_error);
+        assert_eq!(
+            fs::read(&path).expect("rejected legacy state should remain readable"),
+            exact
+        );
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "migration size rejection must happen before opening the temp file"
+        );
+        fs::remove_file(path).expect("legacy migration fixture should remove");
+    }
+
+    #[test]
     fn malformed_store_fails_closed() {
         let path = unique_temp_path("malformed");
         fs::write(&path, b"not-json").expect("malformed store should write");
@@ -1626,20 +2822,498 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("failed to parse"));
+        assert!(!path.with_extension("tmp").exists());
+        fs::remove_file(path).expect("malformed store should remove");
+    }
+
+    #[test]
+    fn malformed_field_diagnostics_never_disclose_values_or_durable_ids() {
+        const PRIVATE_VALUE: &str = "private-policy-state-value";
+
+        let path = unique_temp_path("malformed-private-value");
+        let session_id = SessionId::new();
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": POLICY_STORE_SCHEMA_VERSION,
+                "sessions": [{
+                    "session_id": session_id.0,
+                    "policy_state": PRIVATE_VALUE,
+                }],
+            }))
+            .expect("private malformed fixture should serialize"),
+        )
+        .expect("private malformed fixture should write");
+
+        let error = PolicyStateStore::open(&path).expect_err("invalid policy value should fail");
+        let diagnostic = error.to_string();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(diagnostic.contains("invalid policy-state data at line"));
+        assert!(!diagnostic.contains(PRIVATE_VALUE));
+        assert!(!diagnostic.contains(&session_id.0.to_string()));
+        fs::remove_file(path).expect("private malformed fixture should remove");
+    }
+
+    #[test]
+    fn truncated_store_fails_without_rewriting_or_creating_a_temp_file() {
+        let path = unique_temp_path("truncated");
+        let mut truncated = empty_current_store_bytes();
+        truncated.pop();
+        fs::write(&path, &truncated).expect("truncated store should write");
+
+        let error = PolicyStateStore::open(&path).expect_err("truncated store should fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("failed to parse"));
+        assert_eq!(
+            fs::read(&path).expect("truncated state should remain readable"),
+            truncated
+        );
+        assert!(!path.with_extension("tmp").exists());
+        fs::remove_file(path).expect("truncated store should remove");
+    }
+
+    #[test]
+    fn duplicate_sessions_fail_with_one_order_independent_non_sensitive_error() {
+        let path = unique_temp_path("duplicates");
+        let session_id = SessionId::new();
+        let expected_error = format!(
+            "policy state store `{}` contains duplicate session_id entries",
+            path.display()
+        );
+
+        for schema_version in
+            MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION..=POLICY_STORE_SCHEMA_VERSION
+        {
+            for (first, second) in [
+                (PolicyState::Blocked, PolicyState::Blocked),
+                (PolicyState::Observe, PolicyState::Blocked),
+                (PolicyState::Blocked, PolicyState::Observe),
+            ] {
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "schema_version": schema_version,
+                    "sessions": [
+                        {"session_id": session_id.0, "policy_state": first},
+                        {"session_id": session_id.0, "policy_state": second},
+                    ],
+                }))
+                .expect("duplicate fixture should serialize");
+                fs::write(&path, &bytes).expect("duplicate fixture should write");
+
+                let error = PolicyStateStore::open(&path)
+                    .expect_err("duplicate sessions must never select one policy by order");
+
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(error.to_string(), expected_error);
+                assert!(!error.to_string().contains(&session_id.0.to_string()));
+                assert_eq!(
+                    fs::read(&path).expect("rejected fixture should remain readable"),
+                    bytes
+                );
+                assert!(!path.with_extension("tmp").exists());
+            }
+        }
+
+        fs::remove_file(path).expect("duplicate fixture should remove");
+    }
+
+    #[test]
+    fn invalid_pending_contracts_fail_before_schema_migration_or_rewrite() {
+        let path = unique_temp_path("invalid-pending-contract");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let event_id = Uuid::from_u128(1);
+        let response_event_id = Uuid::from_u128(2);
+        let other_session_id = SessionId::new();
+        let other_request_id = RequestId::new();
+        let template_store = PolicyStateStore {
+            path: None,
+            records: HashMap::from([(
+                session_id,
+                widest_production_record(session_id, request_id, event_id, response_event_id),
+            )]),
+            fail_closed_for_unknown_sessions: false,
+            last_eviction: EvictionStats::default(),
+        };
+        let template: serde_json::Value = serde_json::from_slice(
+            &template_store
+                .serialize_current_state()
+                .expect("valid pending-contract template should serialize"),
+        )
+        .expect("valid pending-contract template should parse as JSON");
+        let normal_request_id = RequestId::new();
+        let mut normal_template_store = PolicyStateStore::in_memory();
+        normal_template_store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("normal template should enter controlled reality");
+        normal_template_store
+            .note_controlled_reality_interaction(
+                session_id,
+                normal_request_id,
+                ControlledRealityRequestAction::JobSubmitted,
+                u32::MAX,
+            )
+            .expect("normal template should stage a submission");
+        let normal_response = test_response_contract(
+            &normal_template_store,
+            session_id,
+            normal_request_id,
+            Uuid::new_v4(),
+            u32::MAX,
+        );
+        normal_template_store
+            .set_pending_controlled_reality_response(session_id, normal_request_id, normal_response)
+            .expect("normal template should stage its response");
+        let normal_template: serde_json::Value = serde_json::from_slice(
+            &normal_template_store
+                .serialize_current_state()
+                .expect("normal pending-contract template should serialize"),
+        )
+        .expect("normal pending-contract template should parse as JSON");
+
+        let rate_limited_request_id = RequestId::new();
+        let mut rate_limited_template_store = PolicyStateStore::in_memory();
+        rate_limited_template_store
+            .set_policy_state(session_id, PolicyState::ControlledReality)
+            .expect("rate-limited template should enter controlled reality");
+        rate_limited_template_store
+            .note_controlled_reality_interaction(
+                session_id,
+                rate_limited_request_id,
+                ControlledRealityRequestAction::JobSubmitted,
+                0,
+            )
+            .expect("rate-limited template should stage an over-depth submission");
+        let rate_limited_response = test_response_contract(
+            &rate_limited_template_store,
+            session_id,
+            rate_limited_request_id,
+            Uuid::new_v4(),
+            0,
+        );
+        assert_eq!(rate_limited_response.status, 429);
+        assert_eq!(
+            rate_limited_response.routing_decision,
+            RoutingDecision::RateLimited
+        );
+        assert_eq!(rate_limited_response.interaction_kind, None);
+        rate_limited_template_store
+            .set_pending_controlled_reality_response(
+                session_id,
+                rate_limited_request_id,
+                rate_limited_response,
+            )
+            .expect("rate-limited template should stage its response");
+        let rate_limited_template: serde_json::Value = serde_json::from_slice(
+            &rate_limited_template_store
+                .serialize_current_state()
+                .expect("rate-limited pending-contract template should serialize"),
+        )
+        .expect("rate-limited pending-contract template should parse as JSON");
+        let mut legacy_omitted_persistence_template = template.clone();
+        legacy_omitted_persistence_template["sessions"][0]["controlled_reality_pending_update"]
+            ["expected_policy_changed"]
+            .as_object_mut()
+            .expect("legacy policy event should be an object")
+            .remove("persistence");
+        let expected_error = format!(
+            "policy state store `{}` contains an invalid pending controlled-reality contract",
+            path.display()
+        );
+
+        for schema_version in
+            MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION..=POLICY_STORE_SCHEMA_VERSION
+        {
+            for (label, mut valid_fixture) in [
+                ("blocked", template.clone()),
+                (
+                    "blocked with legacy omitted persistence",
+                    legacy_omitted_persistence_template.clone(),
+                ),
+                ("normal", normal_template.clone()),
+                ("rate limited", rate_limited_template.clone()),
+            ] {
+                valid_fixture["schema_version"] = serde_json::json!(schema_version);
+                let valid_bytes = serde_json::to_vec(&valid_fixture)
+                    .expect("valid pending-contract fixture should serialize");
+                deserialize_records(&valid_bytes, &path).unwrap_or_else(|error| {
+                    panic!("valid {label} schema {schema_version} failed: {error}")
+                });
+            }
+
+            let mut wrong_current_depth = template.clone();
+            wrong_current_depth["sessions"][0]["controlled_reality_depth"] = serde_json::json!(0);
+
+            let mut wrong_current_workflow = template.clone();
+            wrong_current_workflow["sessions"][0]["controlled_reality_workflow_state"] =
+                serde_json::json!("ready");
+
+            let mut wrong_current_origin = template.clone();
+            wrong_current_origin["sessions"][0]["controlled_reality_origin_request_id"] =
+                serde_json::json!(other_request_id.0);
+
+            let mut impossible_rollback_workflow = normal_template.clone();
+            impossible_rollback_workflow["sessions"][0]["controlled_reality_depth"] =
+                serde_json::json!(1);
+            impossible_rollback_workflow["sessions"][0]["controlled_reality_workflow_state"] =
+                serde_json::json!("queued");
+            impossible_rollback_workflow["sessions"][0]["controlled_reality_origin_request_id"] =
+                serde_json::Value::Null;
+            impossible_rollback_workflow["sessions"][0]["controlled_reality_pending_update"]
+                ["request_action"] = serde_json::json!("branch_read");
+            impossible_rollback_workflow["sessions"][0]["controlled_reality_pending_update"]
+                ["previous_depth"] = serde_json::json!(0);
+            impossible_rollback_workflow["sessions"][0]["controlled_reality_pending_update"]
+                ["previous_state"] = serde_json::json!("queued");
+            impossible_rollback_workflow["sessions"][0]["controlled_reality_pending_update"]
+                ["previous_origin_request_id"] = serde_json::Value::Null;
+            impossible_rollback_workflow["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"] = serde_json::Value::Null;
+
+            let mut completed_too_early = normal_template.clone();
+            completed_too_early["sessions"][0]["controlled_reality_depth"] = serde_json::json!(1);
+            completed_too_early["sessions"][0]["controlled_reality_workflow_state"] =
+                serde_json::json!("completed");
+            completed_too_early["sessions"][0]["controlled_reality_pending_update"]
+                ["previous_depth"] = serde_json::json!(0);
+            completed_too_early["sessions"][0]["controlled_reality_pending_update"]
+                ["previous_state"] = serde_json::json!("completed");
+            completed_too_early["sessions"][0]["controlled_reality_pending_update"]
+                ["previous_origin_request_id"] = serde_json::json!(normal_request_id.0);
+            completed_too_early["sessions"][0]["controlled_reality_pending_update"]
+                ["request_action"] = serde_json::json!("branch_read");
+            completed_too_early["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"] = serde_json::Value::Null;
+
+            let mut incomplete_transition = template.clone();
+            incomplete_transition["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_policy_changed"] = serde_json::Value::Null;
+
+            let mut missing_commit_state = template.clone();
+            missing_commit_state["sessions"][0]["controlled_reality_pending_update"]
+                ["commit_policy_state"] = serde_json::Value::Null;
+
+            let mut wrong_record_state = template.clone();
+            wrong_record_state["sessions"][0]["policy_state"] = serde_json::json!("blocked");
+
+            let mut wrong_event_session = template.clone();
+            wrong_event_session["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_policy_changed"]["session_id"] = serde_json::json!(other_session_id.0);
+
+            let mut wrong_event_request = template.clone();
+            wrong_event_request["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_policy_changed"]["request_id"] = serde_json::json!(other_request_id.0);
+
+            let mut wrong_event_source = template.clone();
+            wrong_event_source["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_policy_changed"]["source"] = serde_json::json!("proxy");
+
+            let mut wrong_event_schema = template.clone();
+            wrong_event_schema["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_policy_changed"]["schema_version"] =
+                serde_json::json!(EVENT_SCHEMA_VERSION + 1);
+
+            let mut wrong_event_policy_state = template.clone();
+            wrong_event_policy_state["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_policy_changed"]["policy_state"] =
+                serde_json::json!("controlled_reality");
+
+            let mut wrong_event_transition = template.clone();
+            wrong_event_transition["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_policy_changed"]["kind"]["from"] = serde_json::json!("observe");
+
+            let mut wrong_event_persistence_destination = template.clone();
+            wrong_event_persistence_destination["sessions"][0]
+                ["controlled_reality_pending_update"]["expected_policy_changed"]["persistence"] = serde_json::json!({
+                "pre_containment_persistence_class": "discovery_recon",
+            });
+
+            let mut wrong_event_persistence_transition = template.clone();
+            wrong_event_persistence_transition["sessions"][0]
+                ["controlled_reality_pending_update"]["expected_policy_changed"]["persistence"] = serde_json::json!({
+                "pre_containment_persistence_class": "discovery_recon",
+                "pre_containment_persistence_kind": "discovery_recon_retry",
+            });
+
+            let mut non_blocking_transition = template.clone();
+            non_blocking_transition["sessions"][0]["controlled_reality_pending_update"]
+                ["commit_policy_state"] = serde_json::json!("observe");
+
+            let mut mismatched_response = template.clone();
+            mismatched_response["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["policy_state"] = serde_json::json!("controlled_reality");
+
+            let mut wrong_blocked_status = template.clone();
+            wrong_blocked_status["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["status"] = serde_json::json!(u16::MAX);
+
+            let mut wrong_blocked_routing = template.clone();
+            wrong_blocked_routing["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["routing_decision"] = serde_json::json!("controlled_reality");
+
+            let mut wrong_blocked_interaction = template.clone();
+            wrong_blocked_interaction["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["interaction_kind"] = serde_json::json!("job_submitted");
+
+            let mut wrong_blocked_semantics = template.clone();
+            wrong_blocked_semantics["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["controlled_reality_sha256"] =
+                serde_json::json!(vec![u8::MAX; 32]);
+
+            let mut colliding_event_ids = template.clone();
+            colliding_event_ids["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["event_id"] = serde_json::json!(event_id);
+
+            let mut advanced_block_transition = normal_template.clone();
+            advanced_block_transition["sessions"][0]["controlled_reality_pending_update"]
+                ["commit_policy_state"] = serde_json::json!("blocked");
+            let mut advanced_block_event = template["sessions"][0]
+                ["controlled_reality_pending_update"]["expected_policy_changed"]
+                .clone();
+            advanced_block_event["request_id"] = serde_json::json!(normal_request_id.0);
+            advanced_block_transition["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_policy_changed"] = advanced_block_event;
+            advanced_block_transition["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"] = serde_json::Value::Null;
+
+            let mut wrong_unstaged_status = normal_template.clone();
+            wrong_unstaged_status["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["status"] = serde_json::json!(u16::MAX);
+
+            let mut wrong_unstaged_routing = normal_template.clone();
+            wrong_unstaged_routing["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["routing_decision"] = serde_json::json!("protected_upstream");
+
+            let mut wrong_unstaged_interaction = normal_template.clone();
+            wrong_unstaged_interaction["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["interaction_kind"] = serde_json::Value::Null;
+
+            let mut wrong_unstaged_semantics = normal_template.clone();
+            wrong_unstaged_semantics["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["controlled_reality_sha256"] =
+                serde_json::json!(vec![u8::MAX; 32]);
+
+            let mut normal_response_without_advance = normal_template.clone();
+            normal_response_without_advance["sessions"][0]["controlled_reality_workflow_state"] =
+                serde_json::json!("ready");
+            normal_response_without_advance["sessions"][0]
+                ["controlled_reality_origin_request_id"] = serde_json::Value::Null;
+            normal_response_without_advance["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["status"] = serde_json::json!(409);
+            normal_response_without_advance["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["interaction_kind"] = serde_json::Value::Null;
+            normal_response_without_advance["sessions"][0]["controlled_reality_pending_update"]
+                ["expected_response"]["controlled_reality_sha256"] =
+                serde_json::json!(no_controlled_reality_interaction_sha256());
+
+            let mut rate_limit_after_advance = rate_limited_template.clone();
+            rate_limit_after_advance["sessions"][0]["controlled_reality_workflow_state"] =
+                serde_json::json!("queued");
+            rate_limit_after_advance["sessions"][0]["controlled_reality_origin_request_id"] =
+                serde_json::json!(rate_limited_request_id.0);
+
+            for (label, mut fixture) in [
+                ("wrong current depth", wrong_current_depth),
+                ("wrong current workflow", wrong_current_workflow),
+                ("wrong current origin", wrong_current_origin),
+                ("impossible rollback workflow", impossible_rollback_workflow),
+                ("completed too early", completed_too_early),
+                ("incomplete transition", incomplete_transition),
+                ("missing commit state", missing_commit_state),
+                ("wrong record state", wrong_record_state),
+                ("wrong event session", wrong_event_session),
+                ("wrong event request", wrong_event_request),
+                ("wrong event source", wrong_event_source),
+                ("wrong event schema", wrong_event_schema),
+                ("wrong event policy state", wrong_event_policy_state),
+                ("wrong event transition", wrong_event_transition),
+                (
+                    "wrong event persistence destination",
+                    wrong_event_persistence_destination,
+                ),
+                (
+                    "wrong event persistence transition",
+                    wrong_event_persistence_transition,
+                ),
+                ("non-blocking transition", non_blocking_transition),
+                ("mismatched response", mismatched_response),
+                ("wrong blocked status", wrong_blocked_status),
+                ("wrong blocked routing", wrong_blocked_routing),
+                ("wrong blocked interaction", wrong_blocked_interaction),
+                ("wrong blocked semantics", wrong_blocked_semantics),
+                ("colliding event ids", colliding_event_ids),
+                ("advanced block transition", advanced_block_transition),
+                ("wrong unstaged status", wrong_unstaged_status),
+                ("wrong unstaged routing", wrong_unstaged_routing),
+                ("wrong unstaged interaction", wrong_unstaged_interaction),
+                ("wrong unstaged semantics", wrong_unstaged_semantics),
+                (
+                    "normal response without workflow advance",
+                    normal_response_without_advance,
+                ),
+                (
+                    "rate limit after workflow advance",
+                    rate_limit_after_advance,
+                ),
+            ] {
+                fixture["schema_version"] = serde_json::json!(schema_version);
+                let bytes = serde_json::to_vec(&fixture)
+                    .unwrap_or_else(|error| panic!("{label} fixture should serialize: {error}"));
+                fs::write(&path, &bytes)
+                    .unwrap_or_else(|error| panic!("{label} fixture should write: {error}"));
+
+                let error = match PolicyStateStore::open(&path) {
+                    Ok(_) => panic!("{label} schema {schema_version} should fail"),
+                    Err(error) => error,
+                };
+
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+                assert_eq!(error.to_string(), expected_error, "{label}");
+                assert!(!error.to_string().contains(&session_id.0.to_string()));
+                assert!(!error.to_string().contains(&request_id.0.to_string()));
+                assert!(!error.to_string().contains(&event_id.to_string()));
+                assert!(!error.to_string().contains(&response_event_id.to_string()));
+                assert_eq!(
+                    fs::read(&path).expect("invalid pending state should remain readable"),
+                    bytes,
+                    "{label} schema {schema_version} was rewritten"
+                );
+                assert!(
+                    !path.with_extension("tmp").exists(),
+                    "{label} schema {schema_version} created a temp file"
+                );
+            }
+        }
+
+        fs::remove_file(path).expect("invalid pending fixture should remove");
     }
 
     #[test]
     fn unsupported_store_schema_fails_closed() {
         let path = unique_temp_path("unsupported");
-        fs::write(&path, br#"{"schema_version":999,"sessions":[]}"#)
-            .expect("unsupported store should write");
+        let unsupported = br#"{"schema_version":999,"sessions":[]}"#;
+        fs::write(&path, unsupported).expect("unsupported store should write");
 
         let error = PolicyStateStore::open(&path).expect_err("unsupported store should fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error
-            .to_string()
-            .contains("unsupported policy state store schema version"));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "unsupported policy state store schema in `{}`; supported versions are {} through {}",
+                path.display(),
+                MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+                POLICY_STORE_SCHEMA_VERSION
+            )
+        );
+        assert!(!error.to_string().contains("999"));
+        assert_eq!(
+            fs::read(&path).expect("unsupported state should remain readable"),
+            unsupported
+        );
+        assert!(!path.with_extension("tmp").exists());
+        fs::remove_file(path).expect("unsupported store should remove");
     }
 
     #[test]
@@ -1651,6 +3325,8 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("is empty"));
+        assert!(!path.with_extension("tmp").exists());
+        fs::remove_file(path).expect("empty store should remove");
     }
 
     #[test]
@@ -1796,7 +3472,7 @@ mod tests {
                     status: 403,
                     routing_decision: RoutingDecision::EidolonOwned,
                     interaction_kind: None,
-                    controlled_reality_sha256: [0; 32],
+                    controlled_reality_sha256: no_controlled_reality_interaction_sha256(),
                 },
             )
             .expect("blocked response contract should persist");
@@ -1862,20 +3538,13 @@ mod tests {
                 4,
             )
             .expect("pending submission should persist");
-        store
-            .set_pending_controlled_reality_response(
-                session_id,
-                request_id,
-                ControlledRealityPendingResponse {
-                    event_id: Uuid::new_v4(),
-                    policy_state: PolicyState::ControlledReality,
-                    status: 202,
-                    routing_decision: RoutingDecision::ControlledReality,
-                    interaction_kind: Some(ControlledRealityPendingInteractionKind::JobSubmitted),
-                    controlled_reality_sha256: [0; 32],
-                },
-            )
-            .expect("response contract should persist");
+        set_test_response_contract(
+            &mut store,
+            session_id,
+            request_id,
+            202,
+            ControlledRealityPendingInteractionKind::JobSubmitted,
+        );
 
         let mut reopened = PolicyStateStore::open(&path).expect("store should reopen");
         assert_eq!(
@@ -1917,20 +3586,13 @@ mod tests {
                 4,
             )
             .expect("pending submission should persist");
-        store
-            .set_pending_controlled_reality_response(
-                session_id,
-                request_id,
-                ControlledRealityPendingResponse {
-                    event_id: Uuid::new_v4(),
-                    policy_state: PolicyState::ControlledReality,
-                    status: 202,
-                    routing_decision: RoutingDecision::ControlledReality,
-                    interaction_kind: Some(ControlledRealityPendingInteractionKind::JobSubmitted),
-                    controlled_reality_sha256: [0; 32],
-                },
-            )
-            .expect("response contract should persist");
+        set_test_response_contract(
+            &mut store,
+            session_id,
+            request_id,
+            202,
+            ControlledRealityPendingInteractionKind::JobSubmitted,
+        );
 
         let mut reopened = PolicyStateStore::open(&path).expect("store should reopen");
         assert!(reopened

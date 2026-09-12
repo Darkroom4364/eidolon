@@ -30,7 +30,7 @@ Eidolon releases use semantic versioning. Within a major release line:
 | --- | --- | --- | --- |
 | Event log (`events.jsonl`) | `schema_version` per record | `2` | Readers reject any other version with an actionable error (`eidolon-trace` reader enforces; tested). |
 | Debug log (`debug.jsonl`) | `schema_version` + `run_kind` envelope | `1` (`eidolon_proxy_debug`) | Server-side diagnostic only; no supported reader today. A validating reader is tracked by issue #252. |
-| Policy state (`policy-state.json`) | `schema_version` | `3` (reads `1..=3`) | Unsupported versions fail startup; no downgrade guessing (`policy_store.rs`). |
+| Policy state (`policy-state.json`) | `schema_version` | `3` (reads `1..=3`; maximum 33,554,432 bytes and 8,192 retained records) | Missing state initializes empty. Existing empty, malformed, truncated, oversized, unsupported-version, duplicate-session, or internally inconsistent pending-workflow state fails startup before migration or listener bind. A staged controlled-reality-to-blocked event accepts its legacy omitted persistence metadata or coherent post-containment metadata; rate-limit and pre-containment retry metadata is rejected for that transition. Writers reject an oversized current-schema snapshot before opening the temp file (`policy_store.rs`). |
 | Session continuity sidecar (`<policy-state>.continuity.json`) | `schema_version` | `2` (reads `1..=2`) | Unsupported versions, an unverifiable signer, or a live record whose continuity key is unavailable prevent startup (`session_continuity_store.rs`). |
 | Bait exposure sidecar (`<event-log>.exposures.json`) | `schema_version` | `1` | Unsupported versions fail closed; missing sidecar with prior history enters the documented migration quarantine. |
 | Consumed proof sidecar (`<event-log>.consumed-proofs.json`) | `schema_version` | `1` | Same rule as the exposure sidecar. |
@@ -43,6 +43,32 @@ Eidolon releases use semantic versioning. Within a major release line:
 | Metrics summary (lab) | `schema_version` | `0` | Lab artifact, not part of the supported envelope. |
 | Proxy effective configuration (`--print-effective-config`) | `schema_version` | `1` | Redacted output projection only; it never starts the runtime. Unknown CLI flags and invalid profile inputs are rejected before startup (`main.rs`). |
 
+The policy-state reader accepts an otherwise valid current-schema snapshot at
+exactly 33,554,432 bytes, including one padded with trailing JSON whitespace,
+and reads at most one byte beyond that limit to distinguish an oversized file.
+File metadata is only an early rejection; the bounded read remains authoritative
+if the file changes. Read acceptance does not bypass the same write bound: if a
+schema migration or startup compaction would expand the current-schema snapshot
+beyond the limit, startup fails before opening the temp file and leaves the
+source snapshot unchanged. A duplicate `session_id` is invalid regardless of
+record contents, schema 1--3, or input order, so ordering can never select an
+enforcement state. Snapshot-local pending depth/workflow/origin, transition,
+event-association, and response-state invariants are also validated for schema
+1--3 before map construction, eviction, or migration persistence. A staged
+blocked response must retain status 403, `eidolon_owned` routing, no controlled
+interaction, and the canonical absent-interaction digest, with a response event
+ID distinct from its staged policy event. Ready workflow state has no origin;
+queued state requires an origin and depth of at least one; completed state
+requires an origin and depth of at least two. Non-blocked pending responses must
+match either the deterministic controlled-reality action/progress semantics or
+the config-independent 429 rate-limit form, so a later depth-configuration
+change does not invalidate a legitimate crash snapshot. Production
+performs this bounded validation without mutation before acquiring the writer
+lease, including a dry-run serialization for any startup migration or
+eviction, then re-reads and revalidates under the lease before persistence.
+Invalid state therefore neither creates nor rewrites lease metadata, while a
+path change in the preflight-to-lock window is still rejected by the
+authoritative read.
 
 ### Lab and production audit projections
 
@@ -101,8 +127,11 @@ required by the downgrade rule below.
 2. **No partial application.** A config, profile, or state document that fails
    validation is never partially applied; startup or load fails closed.
 3. **Unknown future versions are operator-visible.** Every rejection names the
-   artifact, the found version, and the supported versions, and is auditable
-   in the debug log where a debug log exists.
+   artifact, found version, and supported versions and is auditable in the
+   debug log where a debug log exists, except policy-state rejection. Its
+   fixed-output contract names the artifact and supported range but
+   deliberately does not echo the untrusted found version, keeping its
+   diagnostic independent of snapshot contents.
 4. **Export and evidence contracts are redaction-preserving.** A version bump
    may add fields but must not weaken the default omission of secrets, bodies,
    cookies, query values, sensitive path segments, or incidental personal data
