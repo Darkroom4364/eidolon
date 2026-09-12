@@ -241,8 +241,11 @@ limit-plus-one buffer and must contain strict schema-v1 JSON with unique logical
 keys; empty, malformed, oversized, over-capacity, unknown-field, empty-ID,
 future-timestamp, or overlong-lifetime state blocks production startup. All
 rows validate before TTL pruning, so duplicate live/expired rows cannot use
-file order to choose correlation or replay state. A valid file padded with JSON
-whitespace is accepted exactly at the byte limit. Missing sidecars retain the
+file order to choose correlation or replay state. Production preflight also
+dry-runs the canonical pretty-printed rewrite, so a compact file that fits the
+read limit but would expand beyond the write limit fails before the writer
+lease. A valid file padded with JSON whitespace is accepted exactly at the byte
+limit when its canonical rewrite also fits. Missing sidecars retain the
 existing rebuild/quarantine behavior; the JSONL reconstruction input is a
 separate bound and is not covered by these sidecar limits.
 
@@ -255,7 +258,11 @@ older deployment.
 Policy-state writes verify the same 33,554,432-byte limit before opening the
 temp file, then use fsync and rename. Bait-security sidecar writes likewise
 verify their respective 4,194,304-byte limit before creating an owner-only,
-collision-safe same-directory temp, then sync, rename, and sync the parent. A
+same-directory `<sidecar>.tmp` with `create_new`, then sync, rename, and sync the
+parent. During authoritative open under the single-writer lease, one regular
+crash-left temp is removed only after the committed sidecar validates; a
+symlink or non-regular object at the reserved path fails closed. This fixed
+name bounds crash residue and matches the Kubernetes recovery allowlist. A
 would-exceed or other pre-rename failure leaves the last durable file unchanged
 and rolls back exposure state or makes proof acceptance unavailable according
 to the existing fail-closed contract.

@@ -32,8 +32,8 @@ Eidolon releases use semantic versioning. Within a major release line:
 | Debug log (`debug.jsonl`) | `schema_version` + `run_kind` envelope | `1` (`eidolon_proxy_debug`) | Server-side diagnostic only; no supported reader today. A validating reader is tracked by issue #252. |
 | Policy state (`policy-state.json`) | `schema_version` | `3` (reads `1..=3`; maximum 33,554,432 bytes and 8,192 retained records) | Missing state initializes empty. Existing empty, malformed, truncated, oversized, unsupported-version, duplicate-session, or internally inconsistent pending-workflow state fails startup before migration or listener bind. A staged controlled-reality-to-blocked event accepts its legacy omitted persistence metadata or coherent post-containment metadata; rate-limit and pre-containment retry metadata is rejected for that transition. Writers reject an oversized current-schema snapshot before opening the temp file (`policy_store.rs`). |
 | Session continuity sidecar (`<policy-state>.continuity.json`) | `schema_version` | `2` (reads `1..=2`) | Unsupported versions, an unverifiable signer, or a live record whose continuity key is unavailable prevent startup (`session_continuity_store.rs`). |
-| Bait exposure sidecar (`<event-log>.exposures.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour TTL) | Missing state rebuilds from the current event log. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, empty-identifier, future-timestamp, or duplicate-key state fails production preflight before the writer lease or durable-file mutation. Writers enforce the same byte ceiling before creating a temp file. |
-| Consumed proof sidecar (`<event-log>.consumed-proofs.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour maximum proof/quarantine lifetime) | Missing state rebuilds from the current event log and prior history activates the bounded migration quarantine. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, invalid-digest/identifier/lifetime, or duplicate-key state fails production preflight. Writers enforce the same byte ceiling before creating a temp file. |
+| Bait exposure sidecar (`<event-log>.exposures.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour TTL) | Missing state rebuilds from the current event log. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, empty-identifier, future-timestamp, duplicate-key, or canonical-rewrite-over-limit state fails production preflight before the writer lease or durable-file mutation. Writers enforce the same byte ceiling before creating the reserved temp file. |
+| Consumed proof sidecar (`<event-log>.consumed-proofs.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour maximum proof/quarantine lifetime) | Missing state rebuilds from the current event log and prior history activates the bounded migration quarantine. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, invalid-digest/identifier/lifetime, duplicate-key, or canonical-rewrite-over-limit state fails production preflight. Writers enforce the same byte ceiling before creating the reserved temp file. |
 | Bait profile config | `schema_version` | `1` | Any other version rejected at load (`main.rs`). |
 | Ingress trust config | `schema_version` | `1` | Any other version rejected at load (`ingress_identity.rs`). |
 | Session signing key ring (`key-ring.json`) | key `version` integers + `active_key_version` | shape v1 (unversioned shape) | The JSON shape is validated strictly (unique u32 versions, active present, 64-hex keys); unknown key *versions* in cookies fail closed to a fresh mint. A shape version field may be added in a future minor release and will follow this policy. |
@@ -125,9 +125,14 @@ bypass the bound. The 4,096-record and byte ceilings apply jointly. All rows
 validate before TTL pruning or map construction, and duplicate logical keys
 fail even when identical or expired, so file order never chooses correlation or
 replay state. Production validates existing sidecars without mutation before
-the writer lease, then repeats the bounded validation during authoritative
-open. Successful rewrites use an owner-only, collision-safe `create_new` temp
-in the same directory, file sync, atomic rename, and parent-directory sync.
+the writer lease, including a dry run of the canonical pretty-printed rewrite,
+then repeats the bounded validation during authoritative open. Successful
+rewrites use the fixed reserved `<sidecar>.tmp` path with owner-only
+`create_new` creation in the same directory, file sync, atomic rename, and
+parent-directory sync. After validating the committed file, authoritative open
+under the single-writer lease removes one regular crash-left temp; a symlink or
+non-regular object at the reserved path fails closed. The fixed name bounds
+crash residue and is part of the deployment recovery-file allowlist.
 Bounding the missing-sidecar event-log reconstruction path is separate #254
 follow-on work and is not implied by these sidecar-file bounds.
 
