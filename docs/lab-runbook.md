@@ -198,7 +198,42 @@ not complete issue `#254` or support a production-readiness claim.
 
 The event log is JSONL. Request events record method, path, policy state, routing decision, session ID, and selected safe header presence. They do not log request bodies or header values.
 
-Runtime state and logs are bounded. The policy store retains at most 8192 session records and evicts `Normal`/`Observe`/`Suspicious` records older than 7 days. If protected enforcement records alone fill that bound, a sticky persisted fallback makes every unknown session `blocked` before older protected metadata is removed, so capacity pressure cannot turn containment into an unqualified benign state. Exposure state retains at most 4096 records for 24 hours. Replay state retains at most 4096 proof digests until their configured expiry, and proof windows cannot exceed 24 hours; raw proof values are not persisted. On an upgrade where prior event history exists but the replay index does not, minted proof acceptance remains unavailable for one maximum proof window rather than risking replay-state loss.
+Runtime state and logs are bounded. The policy store accepts at most 33,554,432
+bytes, reads at most one byte beyond that limit, retains at most 8192 session
+records, and evicts `Normal`/`Observe`/`Suspicious` records older than 7 days.
+An otherwise valid current-schema snapshot, including trailing-whitespace
+padding, is accepted exactly at the byte limit. An existing empty, malformed,
+truncated, oversized, unsupported-schema, duplicate-session, or internally
+inconsistent pending-workflow file blocks startup; missing state alone
+initializes empty. A legacy snapshot that fits the read limit but whose
+migrated current-schema form would exceed the same limit also fails before
+temp-file creation and remains unchanged for operator repair.
+Staged blocked responses are valid only with status 403, `eidolon_owned`
+routing, no controlled interaction, and the canonical absent-interaction
+digest; their response and staged policy events must have distinct IDs. Ready
+workflow state has no origin, while queued/completed state requires an origin
+and minimum depth one/two respectively. Non-blocked response contracts must
+match either deterministic controlled-reality action/progress semantics or the
+429 rate-limit form retained across depth-configuration changes.
+Unsupported policy-schema diagnostics identify the configured path and the
+supported versions 1 through 3 without echoing the supplied schema value.
+Production validates the bounded snapshot without mutation before touching
+`<policy-state-path>.lock`, including dry-run serialization of a required
+migration or eviction, then re-reads it under the acquired lease; invalid state
+leaves absent or existing lease metadata unchanged, while a file changed
+between those reads must pass the authoritative second validation.
+Duplicate session IDs never use file order to select a policy. If protected
+enforcement records alone fill the record bound, a sticky persisted fallback
+makes every unknown session `blocked` before older protected metadata is
+removed, so capacity pressure cannot turn containment into an unqualified
+benign state.
+
+Exposure state retains at most 4096 records for 24 hours. Replay state retains
+at most 4096 proof digests until their configured expiry, and proof windows
+cannot exceed 24 hours; raw proof values are not persisted. On an upgrade
+where prior event history exists but the replay index does not, minted proof
+acceptance remains unavailable for one maximum proof window rather than
+risking replay-state loss.
 
 Generated session-proof responses carry `Cache-Control: private, no-store` and
 `Vary: Cookie`. Eidolon strips validators, range metadata, and CDN-specific
@@ -206,7 +241,24 @@ cache controls from rewritten proof responses. Existing caches are not purged
 by `no-store`, so operators must invalidate any proof-bearing URL cached by an
 older deployment.
 
-State writes go through a temp file, fsync, and rename, and failed writes roll back the corresponding in-memory mutation or fail the proof unavailable. The JSONL event and debug logs rotate at 32 MiB to collision-safe timestamped archives, keeping exactly 3 archives plus the active segment per log. Together those logs consume at most about 256 MiB before filesystem overhead, below the lab's 1 GiB PVC. Startup restores a missing newline or truncates only an invalid final fragment before appending, while corruption anywhere earlier still fails with the exact line number. The `proxy_started` debug record reports state counts, eviction/fallback outcomes, replay migration quarantine, and tail-repair details. Persistence failures use the exact `eidolon persistence failure:` marker.
+Policy-state writes verify the same 33,554,432-byte limit before opening the
+temp file, then use fsync and rename. A would-exceed mutation leaves the last
+durable file unchanged and rolls back its in-memory policy mutation. Other
+failed state writes follow the existing rollback or proof-unavailable path.
+The JSONL event and debug logs rotate at 32 MiB to collision-safe timestamped
+archives, keeping exactly 3 archives plus the active segment per log. Together
+those logs consume at most about 256 MiB before filesystem overhead, below the
+lab's 1 GiB PVC. Startup restores a missing newline or truncates only an
+invalid final fragment before appending, while corruption anywhere earlier
+still fails with the exact line number. The `state.policy_store` effective
+configuration and `proxy_started.fields.policy_store` debug projection report
+only byte/record/TTL/schema bounds and aggregate startup outcomes; they never
+include file contents or durable session/request identifiers. Persistence
+failures use the exact `eidolon persistence failure:` marker.
+
+These source controls do not prove behavior when a mounted persistent volume
+becomes corrupt or unavailable while the pod is running. Issue `#253` owns
+that live deployment fault proof and its storage-driver-specific evidence.
 
 The Kubernetes manifests include a narrow `normalize-eidolon-state` init
 container for legacy PVCs whose state files were created as `root:root 0600`.

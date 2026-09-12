@@ -1035,6 +1035,23 @@ impl fmt::Display for ConfigError {
     }
 }
 
+fn policy_store_schema_projection() -> Value {
+    json!({
+        "current": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+        "minimum_supported": eidolon_proxy::policy_store::MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+        "maximum_supported": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+    })
+}
+
+fn policy_store_contract_projection() -> Value {
+    json!({
+        "max_bytes": eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES,
+        "max_sessions": eidolon_proxy::policy_store::MAX_POLICY_SESSIONS,
+        "session_ttl_secs": eidolon_proxy::policy_store::POLICY_SESSION_TTL_SECS,
+        "schema": policy_store_schema_projection(),
+    })
+}
+
 fn effective_config_projection(config: &ProxyConfig) -> Value {
     json!({
         "schema_version": 1,
@@ -1072,6 +1089,7 @@ fn effective_config_projection(config: &ProxyConfig) -> Value {
             "event_log": "configured",
             "policy_state": "configured",
             "debug_log": config.debug_log_path.is_some(),
+            "policy_store": policy_store_contract_projection(),
         },
         "shutdown": {
             "grace_secs": if config.profile == RuntimeProfile::Production {
@@ -2152,6 +2170,9 @@ fn run_proxy_with_shutdown(
     let production_shutdown_grace = config.production_shutdown_grace;
     let profile = config.profile;
     let listen_addr = config.listen_addr;
+    if profile == RuntimeProfile::Production {
+        PolicyStateStore::validate_without_mutation(&config.policy_state_path)?;
+    }
     let (ingress_transport_auth_secret, previous_ingress_transport_auth_secret) =
         load_ingress_transport_auth_secrets(
             config.ingress_transport_auth_secret_path.as_deref(),
@@ -2193,14 +2214,6 @@ fn run_proxy_with_shutdown(
             .map_err(|error| invalid_data(error.to_string()))?,
         None => IngressIdentityResolver::default(),
     };
-    let (debug_log, debug_log_tail_repair) = match &config.debug_log_path {
-        Some(path) => {
-            let writer = FileDebugLogWriter::open(path)?;
-            let repair = writer.startup_tail_repair();
-            (Some(Arc::new(Mutex::new(writer))), Some(repair))
-        }
-        None => (None, None),
-    };
     let (mut session_authority, session_signing_mode) = match &config.session_signing_key_path {
         Some(path) => (
             SessionAuthority::from_key_file_json(&fs::read(path)?)?,
@@ -2215,6 +2228,21 @@ fn run_proxy_with_shutdown(
         "key_version_count": session_authority.key_version_count(),
     });
     let now = current_unix_secs();
+    let continuity_history_exists = event_log_history_exists(&config.event_log_path)?
+        || path_has_nonempty_file(&config.policy_state_path)?;
+    let policy_store = PolicyStateStore::open(&config.policy_state_path)?;
+    let policy_store_eviction = policy_store.last_eviction_stats();
+    let policy_store_session_count = policy_store.len();
+    let policy_store_fail_closed_for_unknown_sessions =
+        policy_store.fail_closed_for_unknown_sessions();
+    let (debug_log, debug_log_tail_repair) = match &config.debug_log_path {
+        Some(path) => {
+            let writer = FileDebugLogWriter::open(path)?;
+            let repair = writer.startup_tail_repair();
+            (Some(Arc::new(Mutex::new(writer))), Some(repair))
+        }
+        None => (None, None),
+    };
     let bait_exposures = BaitExposureStore::open_or_rebuild(&config.event_log_path, now)?;
     let restored_bait_exposure_count = bait_exposures.len();
     let restored_bait_exposure_ttl_evicted = bait_exposures.ttl_evicted;
@@ -2230,13 +2258,6 @@ fn run_proxy_with_shutdown(
     let restored_consumed_bait_proof_torn_tail_line = consumed_bait_proofs.torn_tail_line;
     let consumed_proof_state_path = consumed_bait_proofs.path.clone();
     let consumed_proof_migration_quarantine_until = consumed_bait_proofs.migration_quarantine_until;
-    let continuity_history_exists = event_log_history_exists(&config.event_log_path)?
-        || path_has_nonempty_file(&config.policy_state_path)?;
-    let policy_store = PolicyStateStore::open(&config.policy_state_path)?;
-    let policy_store_eviction = policy_store.last_eviction_stats();
-    let policy_store_session_count = policy_store.len();
-    let policy_store_fail_closed_for_unknown_sessions =
-        policy_store.fail_closed_for_unknown_sessions();
     let durable_continuity_startup = if let Some(continuity_key) = ingress_continuity_key.as_deref()
     {
         let continuity_state_path =
@@ -2325,6 +2346,22 @@ fn run_proxy_with_shutdown(
         consumed_bait_proofs: Arc::new(Mutex::new(consumed_bait_proofs)),
     };
     reconcile_all_pending_controlled_reality_interactions(&runtime)?;
+    let policy_store_bytes = std::fs::metadata(&config.policy_state_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let policy_store_debug = json!({
+        "bytes": policy_store_bytes,
+        "session_count": policy_store_session_count,
+        "ttl_evicted": policy_store_eviction.ttl_evicted,
+        "lru_evicted": policy_store_eviction.lru_evicted,
+        "protected_fail_closed_evicted": policy_store_eviction.protected_fail_closed_evicted,
+        "fail_closed_activated": policy_store_eviction.fail_closed_activated,
+        "fail_closed_for_unknown_sessions": policy_store_fail_closed_for_unknown_sessions,
+        "max_bytes": eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES,
+        "max_sessions": eidolon_proxy::policy_store::MAX_POLICY_SESSIONS,
+        "session_ttl_secs": eidolon_proxy::policy_store::POLICY_SESSION_TTL_SECS,
+        "schema": policy_store_schema_projection(),
+    });
     write_debug(
         &runtime,
         "proxy_started",
@@ -2354,9 +2391,7 @@ fn run_proxy_with_shutdown(
             "event_log_bytes": std::fs::metadata(&config.event_log_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0),
-            "policy_state_bytes": std::fs::metadata(&config.policy_state_path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0),
+            "policy_state_bytes": policy_store_bytes,
             "ingress_identity_rule_count": runtime.ingress_identity_resolver.len(),
             "ingress_transport_auth_enabled": runtime.ingress_transport_auth_secret.is_some(),
             "ingress_continuity_key_mode": ingress_continuity_key_mode,
@@ -2393,16 +2428,7 @@ fn run_proxy_with_shutdown(
                 "max_records": MAX_BAIT_EXPOSURES,
                 "ttl_secs": BAIT_EXPOSURE_TTL_SECS,
             },
-            "policy_store": {
-                "session_count": policy_store_session_count,
-                "ttl_evicted": policy_store_eviction.ttl_evicted,
-                "lru_evicted": policy_store_eviction.lru_evicted,
-                "protected_fail_closed_evicted": policy_store_eviction.protected_fail_closed_evicted,
-                "fail_closed_activated": policy_store_eviction.fail_closed_activated,
-                "fail_closed_for_unknown_sessions": policy_store_fail_closed_for_unknown_sessions,
-                "max_sessions": eidolon_proxy::policy_store::MAX_POLICY_SESSIONS,
-                "session_ttl_secs": eidolon_proxy::policy_store::POLICY_SESSION_TTL_SECS,
-            },
+            "policy_store": policy_store_debug,
             "durable_state_writer": {
                 "mode": "single_writer",
                 "lease_path": state_lease.path(),
@@ -9493,10 +9519,25 @@ mod tests {
         response
     }
 
+    enum RendererControl {
+        Barrier {
+            armed: mpsc::Sender<()>,
+            drained: mpsc::Sender<()>,
+        },
+        ReleaseBarrier(SocketAddr),
+        Shutdown,
+    }
+
+    struct PendingRendererBarrier {
+        marker_peer: Option<SocketAddr>,
+        marker_accepted: bool,
+        drained: mpsc::Sender<()>,
+    }
+
     struct BoundedControlledRealityBackend {
         address: SocketAddr,
         accepted_connections: Arc<AtomicUsize>,
-        shutdown: mpsc::Sender<()>,
+        control: mpsc::Sender<RendererControl>,
         handle: JoinHandle<()>,
     }
 
@@ -9509,14 +9550,40 @@ mod tests {
             let address = listener
                 .local_addr()
                 .expect("renderer listener should have an address");
-            let (shutdown, shutdown_received) = mpsc::channel();
+            let (control, control_received) = mpsc::channel();
             let accepted_connections = Arc::new(AtomicUsize::new(0));
             let thread_accepted_connections = Arc::clone(&accepted_connections);
             let handle = thread::spawn(move || {
                 let replay_cache = ControlledRealityBackendReplayCache::new();
+                let mut pending_barrier: Option<PendingRendererBarrier> = None;
                 loop {
+                    if pending_barrier
+                        .as_ref()
+                        .is_some_and(|pending| pending.marker_peer.is_none())
+                    {
+                        match control_received.recv_timeout(Duration::from_millis(10)) {
+                            Ok(RendererControl::ReleaseBarrier(marker_peer)) => {
+                                pending_barrier
+                                    .as_mut()
+                                    .expect("armed barrier should remain pending")
+                                    .marker_peer = Some(marker_peer);
+                            }
+                            Ok(RendererControl::Shutdown)
+                            | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                            Ok(RendererControl::Barrier { .. })
+                            | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                        continue;
+                    }
                     match listener.accept() {
-                        Ok((stream, _)) => {
+                        Ok((stream, peer)) => {
+                            if let Some(pending) = pending_barrier.as_mut() {
+                                if pending.marker_peer == Some(peer) {
+                                    pending.marker_accepted = true;
+                                    drop(stream);
+                                    continue;
+                                }
+                            }
                             thread_accepted_connections.fetch_add(1, Ordering::SeqCst);
                             let _ = serve_render_connection(
                                 stream,
@@ -9525,11 +9592,33 @@ mod tests {
                             );
                         }
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            if shutdown_received
-                                .recv_timeout(Duration::from_millis(10))
-                                .is_ok()
+                            if pending_barrier
+                                .as_ref()
+                                .is_some_and(|pending| pending.marker_accepted)
                             {
-                                return;
+                                let pending = pending_barrier
+                                    .take()
+                                    .expect("accepted barrier marker should remain pending");
+                                let _ = pending.drained.send(());
+                                continue;
+                            }
+                            if pending_barrier.is_some() {
+                                thread::sleep(Duration::from_millis(1));
+                                continue;
+                            }
+                            match control_received.recv_timeout(Duration::from_millis(10)) {
+                                Ok(RendererControl::Barrier { armed, drained }) => {
+                                    pending_barrier = Some(PendingRendererBarrier {
+                                        marker_peer: None,
+                                        marker_accepted: false,
+                                        drained,
+                                    });
+                                    let _ = armed.send(());
+                                }
+                                Ok(RendererControl::ReleaseBarrier(_)) => {}
+                                Ok(RendererControl::Shutdown)
+                                | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {}
                             }
                         }
                         Err(_) => return,
@@ -9539,9 +9628,35 @@ mod tests {
             Self {
                 address,
                 accepted_connections,
-                shutdown,
+                control,
                 handle,
             }
+        }
+
+        /// Wait until the accept loop has drained every connection that could
+        /// have completed before this call, then sample the accepted count.
+        fn synchronized_accepted_connection_count(&self) -> usize {
+            let (armed, armed_received) = mpsc::channel();
+            let (drained, drained_received) = mpsc::channel();
+            self.control
+                .send(RendererControl::Barrier { armed, drained })
+                .expect("renderer listener should accept a barrier");
+            armed_received
+                .recv_timeout(Duration::from_secs(3))
+                .expect("renderer listener should arm the drain barrier");
+            let marker = TcpStream::connect(self.address)
+                .expect("renderer drain barrier marker should connect");
+            let marker_peer = marker
+                .local_addr()
+                .expect("renderer drain barrier marker should have a local address");
+            self.control
+                .send(RendererControl::ReleaseBarrier(marker_peer))
+                .expect("renderer listener should release the armed barrier");
+            drained_received
+                .recv_timeout(Duration::from_secs(3))
+                .expect("renderer listener should drain pending connections");
+            drop(marker);
+            self.accepted_connections.load(Ordering::SeqCst)
         }
 
         fn accepted_connection_count(&self) -> usize {
@@ -9549,9 +9664,20 @@ mod tests {
         }
 
         fn stop(self) {
-            let _ = self.shutdown.send(());
+            let _ = self.control.send(RendererControl::Shutdown);
             must_join(self.handle.join(), "renderer listener should join");
         }
+    }
+
+    #[test]
+    fn controlled_reality_backend_barrier_drains_pending_connections() {
+        let renderer = BoundedControlledRealityBackend::start();
+        let connection =
+            TcpStream::connect(renderer.address).expect("renderer probe should connect");
+        drop(connection);
+
+        assert_eq!(renderer.synchronized_accepted_connection_count(), 1);
+        renderer.stop();
     }
 
     struct CompleteProductionProfileFixture {
@@ -10305,6 +10431,10 @@ mod tests {
         assert_eq!(effective["session"]["cookie_policy"], "production");
         assert_eq!(effective["ingress"]["transport_auth_overlap"], false);
         assert_eq!(effective["ingress"]["trusted_source_networks"]["count"], 1);
+        assert_eq!(
+            effective["state"]["policy_store"],
+            policy_store_contract_projection()
+        );
         assert_eq!(effective["controlled_reality_renderer"], "remote");
         for sensitive in [
             path_str(&session_key, "session key path should be UTF-8"),
@@ -10409,6 +10539,661 @@ mod tests {
             serde_json::from_str(&effective_config_output(&config)).expect("effective config JSON");
         assert_eq!(effective["profile"], "lab");
         assert_eq!(effective["session"]["cookie_policy"], "lab");
+    }
+
+    #[test]
+    fn invalid_policy_state_blocks_production_startup_releases_lease_and_allows_correction() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let duplicate_session = SessionId::new();
+        let malformed_session = SessionId::new();
+        let incomplete_pending_session = SessionId::new();
+        let incomplete_pending_request = RequestId::new();
+        let impossible_rollback_session = SessionId::new();
+        let impossible_rollback_request = RequestId::new();
+        let unstaged_response_session = SessionId::new();
+        let unstaged_response_request = RequestId::new();
+        let unstaged_response_event_id = uuid::Uuid::new_v4();
+        let colliding_event_session = SessionId::new();
+        let colliding_event_request = RequestId::new();
+        let invalid_persistence_session = SessionId::new();
+        let invalid_persistence_request = RequestId::new();
+        let unstaged_expected = ControlledRealityResponder.expected_response(
+            unstaged_response_session,
+            ControlledRealityProgress {
+                depth: 1,
+                from_state: eidolon_core::ControlledRealityWorkflowState::Ready,
+                to_state: eidolon_core::ControlledRealityWorkflowState::Queued,
+                origin_request_id: Some(unstaged_response_request),
+            },
+            eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+            u32::MAX,
+        );
+        let unstaged_response_sha256 =
+            controlled_reality_semantics_sha256(&unstaged_expected.interaction)
+                .expect("unstaged response semantics should serialize");
+        assert_eq!(unstaged_expected.status, 202);
+        assert_eq!(
+            unstaged_expected.routing_decision,
+            RoutingDecision::ControlledReality
+        );
+        assert!(matches!(
+            unstaged_expected
+                .interaction
+                .as_ref()
+                .map(|interaction| &interaction.action),
+            Some(eidolon_core::ControlledRealityInteractionAction::JobSubmitted)
+        ));
+        let collision_transition =
+            policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+                PolicyState::ControlledReality,
+                "route:controlled_follow_up",
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+            )
+            .expect("collision fixture should have a blocked transition");
+        let collision_event = policy::policy_changed_event(
+            colliding_event_session,
+            colliding_event_request,
+            &collision_transition,
+        );
+        let collision_event_id = collision_event.id;
+        let invalid_persistence_event = policy::policy_changed_event(
+            invalid_persistence_session,
+            invalid_persistence_request,
+            &collision_transition,
+        );
+        let invalid_persistence_event_id = invalid_persistence_event.id;
+        let mut invalid_persistence_event = serde_json::to_value(invalid_persistence_event)
+            .expect("invalid persistence event should serialize");
+        invalid_persistence_event["persistence"] = json!({
+            "pre_containment_persistence_class": "discovery_recon",
+        });
+        let migration_expanding_session = SessionId::new();
+        let migration_expanding_request = RequestId::new();
+        let mut migration_expanding_event = Event::new(
+            migration_expanding_session,
+            EventSource::PolicyRouter,
+            PolicyState::Blocked,
+            EventKind::PolicyChanged {
+                from: PolicyState::ControlledReality,
+                to: PolicyState::Blocked,
+                reason: String::new(),
+            },
+        )
+        .with_request_id(migration_expanding_request);
+        let serialize_migration_expanding_state = |event: &Event| {
+            serde_json::to_vec(&json!({
+                "schema_version": eidolon_proxy::policy_store::MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+                "sessions": [{
+                    "session_id": migration_expanding_session.0,
+                    "policy_state": "controlled_reality",
+                    "controlled_reality_depth": 1,
+                    "controlled_reality_pending_update": {
+                        "request_id": migration_expanding_request.0,
+                        "request_action": "unknown_resource",
+                        "previous_depth": 0,
+                        "previous_state": "ready",
+                        "previous_origin_request_id": null,
+                        "commit_policy_state": "blocked",
+                        "expected_policy_changed": event,
+                        "expected_response": null,
+                    },
+                }],
+            }))
+            .expect("migration-expanding policy state should serialize")
+        };
+        let migration_envelope_len =
+            serialize_migration_expanding_state(&migration_expanding_event).len();
+        let EventKind::PolicyChanged { reason, .. } = &mut migration_expanding_event.kind else {
+            panic!("migration-expanding event should be a policy transition");
+        };
+        *reason = "x".repeat(
+            eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES
+                .checked_sub(migration_envelope_len)
+                .expect("migration-expanding envelope should fit"),
+        );
+        let migration_expanding_state =
+            serialize_migration_expanding_state(&migration_expanding_event);
+        assert_eq!(
+            migration_expanding_state.len(),
+            eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES
+        );
+        const PRIVATE_VALUE: &str = "private-invalid-policy-state-value";
+        let invalid_states = [
+            ("empty", Vec::new()),
+            ("malformed", b"{not-json".to_vec()),
+            ("truncated", br#"{"schema_version":3,"sessions":["#.to_vec()),
+            (
+                "invalid-data",
+                serde_json::to_vec(&json!({
+                    "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+                    "sessions": [{
+                        "session_id": malformed_session.0,
+                        "policy_state": PRIVATE_VALUE,
+                    }],
+                }))
+                .expect("invalid-data policy state should serialize"),
+            ),
+            (
+                "future-schema",
+                br#"{"schema_version":65535,"sessions":[]}"#.to_vec(),
+            ),
+            (
+                "duplicate-session",
+                serde_json::to_vec(&json!({
+                    "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+                    "sessions": [
+                        {"session_id": duplicate_session.0, "policy_state": "observe"},
+                        {"session_id": duplicate_session.0, "policy_state": "blocked"},
+                    ],
+                }))
+                .expect("duplicate policy state should serialize"),
+            ),
+            (
+                "incomplete-pending-contract",
+                serde_json::to_vec(&json!({
+                    "schema_version": eidolon_proxy::policy_store::MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+                    "sessions": [{
+                        "session_id": incomplete_pending_session.0,
+                        "policy_state": "controlled_reality",
+                        "controlled_reality_pending_update": {
+                            "request_id": incomplete_pending_request.0,
+                            "request_action": "unknown_resource",
+                            "previous_depth": 0,
+                            "previous_state": "ready",
+                            "previous_origin_request_id": null,
+                            "commit_policy_state": "blocked",
+                        },
+                    }],
+                }))
+                .expect("incomplete pending policy state should serialize"),
+            ),
+            (
+                "impossible-rollback-contract",
+                serde_json::to_vec(&json!({
+                    "schema_version": eidolon_proxy::policy_store::MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+                    "sessions": [{
+                        "session_id": impossible_rollback_session.0,
+                        "policy_state": "controlled_reality",
+                        "controlled_reality_depth": 1,
+                        "controlled_reality_workflow_state": "queued",
+                        "controlled_reality_origin_request_id": null,
+                        "controlled_reality_pending_update": {
+                            "request_id": impossible_rollback_request.0,
+                            "request_action": "branch_read",
+                            "previous_depth": 0,
+                            "previous_state": "queued",
+                            "previous_origin_request_id": null,
+                            "commit_policy_state": null,
+                            "expected_policy_changed": null,
+                            "expected_response": null,
+                        },
+                    }],
+                }))
+                .expect("impossible rollback policy state should serialize"),
+            ),
+            (
+                "invalid-unstaged-response-contract",
+                serde_json::to_vec(&json!({
+                    "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+                    "sessions": [{
+                        "session_id": unstaged_response_session.0,
+                        "policy_state": "controlled_reality",
+                        "controlled_reality_depth": 1,
+                        "controlled_reality_workflow_state": "queued",
+                        "controlled_reality_origin_request_id": unstaged_response_request.0,
+                        "controlled_reality_pending_update": {
+                            "request_id": unstaged_response_request.0,
+                            "request_action": "job_submitted",
+                            "previous_depth": 0,
+                            "previous_state": "ready",
+                            "previous_origin_request_id": null,
+                            "commit_policy_state": null,
+                            "expected_policy_changed": null,
+                            "expected_response": {
+                                "event_id": unstaged_response_event_id,
+                                "policy_state": "controlled_reality",
+                                "status": unstaged_expected.status,
+                                "routing_decision": "protected_upstream",
+                                "interaction_kind": "job_submitted",
+                                "controlled_reality_sha256": unstaged_response_sha256,
+                            },
+                        },
+                    }],
+                }))
+                .expect("invalid unstaged response policy state should serialize"),
+            ),
+            (
+                "colliding-event-contract",
+                serde_json::to_vec(&json!({
+                    "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+                    "sessions": [{
+                        "session_id": colliding_event_session.0,
+                        "policy_state": "controlled_reality",
+                        "controlled_reality_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                        "controlled_reality_workflow_state": "ready",
+                        "controlled_reality_origin_request_id": null,
+                        "controlled_reality_pending_update": {
+                            "request_id": colliding_event_request.0,
+                            "request_action": "branch_read",
+                            "previous_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 1,
+                            "previous_state": "ready",
+                            "previous_origin_request_id": null,
+                            "commit_policy_state": "blocked",
+                            "expected_policy_changed": collision_event,
+                            "expected_response": {
+                                "event_id": collision_event.id,
+                                "policy_state": "blocked",
+                                "status": 403,
+                                "routing_decision": "eidolon_owned",
+                                "interaction_kind": null,
+                                "controlled_reality_sha256":
+                                    controlled_reality_semantics_sha256(&None)
+                                        .expect("absent response semantics should serialize"),
+                            },
+                        },
+                    }],
+                }))
+                .expect("colliding event policy state should serialize"),
+            ),
+            (
+                "invalid-event-persistence-contract",
+                serde_json::to_vec(&json!({
+                    "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+                    "sessions": [{
+                        "session_id": invalid_persistence_session.0,
+                        "policy_state": "controlled_reality",
+                        "controlled_reality_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                        "controlled_reality_workflow_state": "ready",
+                        "controlled_reality_origin_request_id": null,
+                        "controlled_reality_pending_update": {
+                            "request_id": invalid_persistence_request.0,
+                            "request_action": "branch_read",
+                            "previous_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 1,
+                            "previous_state": "ready",
+                            "previous_origin_request_id": null,
+                            "commit_policy_state": "blocked",
+                            "expected_policy_changed": invalid_persistence_event,
+                            "expected_response": null,
+                        },
+                    }],
+                }))
+                .expect("invalid event persistence policy state should serialize"),
+            ),
+            ("legacy-migration-expansion", migration_expanding_state),
+            (
+                "oversized",
+                vec![b' '; eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES + 1],
+            ),
+        ];
+        let exposure_state_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_state_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let continuity_state_path =
+            sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let other_durable_paths = [
+            fixture.event_log_path.clone(),
+            fixture.debug_log_path.clone(),
+            exposure_state_path.clone(),
+            sidecar_state_path(&exposure_state_path, ".tmp"),
+            proof_state_path.clone(),
+            sidecar_state_path(&proof_state_path, ".tmp"),
+            continuity_state_path.clone(),
+            sidecar_state_path(&continuity_state_path, ".tmp"),
+        ];
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert!(!lease_path.exists());
+
+        for (case_index, (label, invalid_state)) in invalid_states.into_iter().enumerate() {
+            if case_index > 0 {
+                fs::write(&lease_path, format!("preexisting-{label}-lease-metadata"))
+                    .unwrap_or_else(|error| panic!("{label} lease sentinel should write: {error}"));
+            }
+            let lease_before = match fs::read(&lease_path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => panic!("{label} lease metadata should read: {error}"),
+            };
+            fs::write(&fixture.policy_state_path, &invalid_state)
+                .unwrap_or_else(|error| panic!("{label} policy state should write: {error}"));
+            let (started, started_received) = mpsc::channel();
+
+            let error = match run_proxy_with_production_shutdown(
+                fixture.parse(),
+                async {},
+                Some(started),
+            ) {
+                Ok(()) => panic!("{label} policy state unexpectedly started"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            let diagnostic = error.to_string();
+            if label == "future-schema" {
+                assert_eq!(
+                    diagnostic,
+                    format!(
+                        "unsupported policy state store schema in `{}`; supported versions are {} through {}",
+                        fixture.policy_state_path.display(),
+                        eidolon_proxy::policy_store::MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+                        eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION
+                    )
+                );
+            }
+            if matches!(
+                label,
+                "incomplete-pending-contract"
+                    | "impossible-rollback-contract"
+                    | "invalid-unstaged-response-contract"
+                    | "colliding-event-contract"
+                    | "invalid-event-persistence-contract"
+            ) {
+                assert_eq!(
+                    diagnostic,
+                    format!(
+                        "policy state store `{}` contains an invalid pending controlled-reality contract",
+                        fixture.policy_state_path.display()
+                    )
+                );
+            }
+            if label == "legacy-migration-expansion" {
+                assert_eq!(
+                    diagnostic,
+                    format!(
+                        "serialized policy state store exceeds the fixed {} byte limit",
+                        eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES
+                    )
+                );
+            }
+            assert!(!diagnostic.contains(PRIVATE_VALUE), "{label}: {diagnostic}");
+            assert!(
+                !diagnostic.contains(&duplicate_session.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&malformed_session.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&incomplete_pending_session.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&incomplete_pending_request.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&impossible_rollback_session.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&impossible_rollback_request.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&unstaged_response_session.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&unstaged_response_request.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&colliding_event_session.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&colliding_event_request.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&invalid_persistence_session.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&invalid_persistence_request.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&unstaged_response_event_id.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&collision_event_id.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&invalid_persistence_event_id.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&migration_expanding_session.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(&migration_expanding_request.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                started_received.try_recv().is_err(),
+                "{label} durable state must fail before listener bind"
+            );
+            assert_eq!(
+                fixture.renderer.synchronized_accepted_connection_count(),
+                0,
+                "{label} durable state must fail before renderer access"
+            );
+            assert_eq!(
+                fs::read(&fixture.policy_state_path).unwrap_or_else(|error| panic!(
+                    "{label} state should remain readable: {error}"
+                )),
+                invalid_state,
+                "{label} state changed during rejected startup"
+            );
+            assert!(
+                !fixture.policy_state_path.with_extension("tmp").exists(),
+                "{label} rejection created a policy temp file"
+            );
+            for path in &other_durable_paths {
+                assert!(
+                    !path.exists(),
+                    "{label} policy rejection mutated `{}` first",
+                    path.display()
+                );
+            }
+            match lease_before {
+                Some(bytes) => assert_eq!(
+                    fs::read(&lease_path)
+                        .unwrap_or_else(|error| panic!("{label} lease should read: {error}")),
+                    bytes,
+                    "{label} policy rejection rewrote the existing lease metadata"
+                ),
+                None => assert!(
+                    !lease_path.exists(),
+                    "{label} policy rejection created the lease file"
+                ),
+            }
+
+            let released = DurableStateLease::acquire_for_policy_state(&fixture.policy_state_path)
+                .unwrap_or_else(|error| {
+                    panic!("{label} startup failure must release the process lease: {error}")
+                });
+            drop(released);
+        }
+
+        assert_eq!(
+            fixture.renderer.synchronized_accepted_connection_count(),
+            0,
+            "the complete invalid-state series must finish without renderer access"
+        );
+
+        let corrected_session = SessionId::new();
+        let corrected_state = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [
+                {"session_id": corrected_session.0, "policy_state": "blocked"},
+            ],
+        }))
+        .expect("corrected policy state should serialize");
+        fs::write(&fixture.policy_state_path, &corrected_state)
+            .expect("corrected policy state should replace invalid state");
+        let debug_log_path = fixture.debug_log_path.clone();
+
+        let server = start_production_profile_server(fixture);
+        assert!(server.address.ip().is_loopback());
+        server.stop();
+
+        let upstream_requests = upstream_recorder.finish();
+        assert!(
+            upstream_requests.is_empty(),
+            "startup validation and correction must not reach upstream"
+        );
+        let debug = debug_values(&debug_log_path);
+        let startup = debug
+            .iter()
+            .find(|entry| entry["event"] == "proxy_started")
+            .expect("corrected production startup should emit its bounded projection");
+        assert_eq!(
+            startup["fields"]["policy_state_bytes"],
+            corrected_state.len()
+        );
+        assert_eq!(
+            startup["fields"]["policy_store"]["bytes"],
+            corrected_state.len()
+        );
+        assert_eq!(startup["fields"]["policy_store"]["session_count"], 1);
+        assert_eq!(
+            startup["fields"]["policy_store"]["max_bytes"],
+            eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES
+        );
+        assert_eq!(
+            startup["fields"]["policy_store"]["max_sessions"],
+            eidolon_proxy::policy_store::MAX_POLICY_SESSIONS
+        );
+        assert_eq!(
+            startup["fields"]["policy_store"]["schema"],
+            policy_store_schema_projection()
+        );
+        let startup_debug = startup.to_string();
+        assert!(!startup_debug.contains(&duplicate_session.0.to_string()));
+        assert!(!startup_debug.contains(&malformed_session.0.to_string()));
+        assert!(!startup_debug.contains(PRIVATE_VALUE));
+        assert!(!startup_debug.contains(&corrected_session.0.to_string()));
+    }
+
+    #[test]
+    fn production_startup_reports_zero_policy_bytes_when_state_is_missing() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let policy_state_path = fixture.policy_state_path.clone();
+        let debug_log_path = fixture.debug_log_path.clone();
+        assert!(!policy_state_path.exists());
+
+        let server = start_production_profile_server(fixture);
+        assert!(server.address.ip().is_loopback());
+        server.stop();
+
+        assert!(
+            upstream_recorder.finish().is_empty(),
+            "missing-state startup must not reach upstream"
+        );
+        assert!(
+            !policy_state_path.exists(),
+            "an unused missing policy store should remain absent"
+        );
+        let debug = debug_values(&debug_log_path);
+        let startup = debug
+            .iter()
+            .find(|entry| entry["event"] == "proxy_started")
+            .expect("missing-state startup should emit its bounded projection");
+        assert_eq!(startup["fields"]["policy_state_bytes"], 0);
+        assert_eq!(startup["fields"]["policy_store"]["bytes"], 0);
+        assert_eq!(startup["fields"]["policy_store"]["session_count"], 0);
+    }
+
+    #[test]
+    fn production_startup_reports_policy_bytes_after_pending_recovery() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let settled_bytes = {
+            let mut store = PolicyStateStore::open(&fixture.policy_state_path)
+                .expect("policy store should open for recovery setup");
+            store
+                .set_policy_state(session_id, PolicyState::ControlledReality)
+                .expect("controlled policy state should persist");
+            fs::metadata(&fixture.policy_state_path)
+                .expect("settled policy state should have metadata")
+                .len()
+        };
+        {
+            let mut store = PolicyStateStore::open(&fixture.policy_state_path)
+                .expect("settled policy store should reopen");
+            store
+                .note_controlled_reality_interaction(
+                    session_id,
+                    request_id,
+                    eidolon_proxy::policy_store::ControlledRealityRequestAction::UnknownResource,
+                    u32::MAX,
+                )
+                .expect("pending interaction should persist");
+        }
+        let pending_bytes = fs::metadata(&fixture.policy_state_path)
+            .expect("pending policy state should have metadata")
+            .len();
+        assert!(
+            pending_bytes > settled_bytes,
+            "pending policy state should be larger than its recovered form"
+        );
+        let debug_log_path = fixture.debug_log_path.clone();
+        let policy_state_path = fixture.policy_state_path.clone();
+
+        let server = start_production_profile_server(fixture);
+        assert!(server.address.ip().is_loopback());
+        server.stop();
+
+        assert!(
+            upstream_recorder.finish().is_empty(),
+            "startup recovery must not reach upstream"
+        );
+        let recovered_bytes = fs::metadata(&policy_state_path)
+            .expect("recovered policy state should have metadata")
+            .len();
+        assert_eq!(recovered_bytes, settled_bytes);
+        assert_ne!(recovered_bytes, pending_bytes);
+        let debug = debug_values(&debug_log_path);
+        let startup = debug
+            .iter()
+            .find(|entry| entry["event"] == "proxy_started")
+            .expect("startup should report its post-recovery policy projection");
+        assert_eq!(startup["fields"]["policy_state_bytes"], recovered_bytes);
+        assert_eq!(startup["fields"]["policy_store"]["bytes"], recovered_bytes);
     }
 
     #[test]
@@ -11067,6 +11852,7 @@ mod tests {
                     "event_log": "configured",
                     "policy_state": "configured",
                     "debug_log": true,
+                    "policy_store": policy_store_contract_projection(),
                 },
                 "shutdown": {
                     "grace_secs": 60,

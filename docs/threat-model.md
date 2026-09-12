@@ -70,6 +70,21 @@ The supported v1 deployment assumes:
 Release qualification must test the in-scope failures above and document the
 remaining node, cluster, ingress, and storage assumptions.
 
+The source runtime bounds `policy-state.json` at 33,554,432 bytes and 8,192
+retained sessions, reads only one byte past the byte limit, and rejects empty,
+malformed, truncated, unsupported-schema, duplicate-session, or internally
+inconsistent pending-workflow state before migration or serving traffic. The
+production path preflights that validation without touching lease metadata and
+revalidates under the lease, closing the intervening path race. The same byte
+limit is checked before replacement writes, so an oversized mutation cannot
+replace the last good snapshot. These controls bound source startup and fail
+closed on files presented at startup. Pending recovery additionally rejects
+impossible workflow/origin/depth combinations, non-deterministic response
+contracts, and colliding policy/response event IDs before durable side effects;
+issue
+`#253` separately owns live persistent-volume corruption and unavailability
+qualification for the supported deployment.
+
 ## Defensive Boundary
 
 Eidolon may degrade hostile behavior inside the protected boundary.
