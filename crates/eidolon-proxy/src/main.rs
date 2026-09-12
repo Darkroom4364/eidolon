@@ -2282,12 +2282,11 @@ fn run_proxy_with_shutdown(
     let restored_bait_exposure_count = bait_exposures.len();
     let restored_bait_exposure_ttl_evicted = bait_exposures.ttl_evicted;
     let restored_bait_exposure_torn_tail_line = bait_exposures.torn_tail_line;
-    let bait_exposure_state_path = bait_exposures.path.clone();
-    let bait_exposure_state_bytes = bait_exposure_state_path
-        .as_deref()
-        .and_then(|path| fs::metadata(path).ok())
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    let bait_exposure_state_path = bait_exposures
+        .path
+        .clone()
+        .ok_or_else(|| io::Error::other("bait exposure store opened without a state path"))?;
+    let bait_exposure_state_bytes = fs::metadata(&bait_exposure_state_path)?.len();
     let consumed_bait_proofs = ConsumedBaitProofStore::open_or_rebuild(
         &config.event_log_path,
         &bait_registry,
@@ -2296,12 +2295,11 @@ fn run_proxy_with_shutdown(
     )?;
     let restored_consumed_bait_proof_count = consumed_bait_proofs.consumed.len();
     let restored_consumed_bait_proof_torn_tail_line = consumed_bait_proofs.torn_tail_line;
-    let consumed_proof_state_path = consumed_bait_proofs.path.clone();
-    let consumed_proof_state_bytes = consumed_proof_state_path
-        .as_deref()
-        .and_then(|path| fs::metadata(path).ok())
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+    let consumed_proof_state_path = consumed_bait_proofs
+        .path
+        .clone()
+        .ok_or_else(|| io::Error::other("consumed proof store opened without a state path"))?;
+    let consumed_proof_state_bytes = fs::metadata(&consumed_proof_state_path)?.len();
     let consumed_proof_migration_quarantine_until = consumed_bait_proofs.migration_quarantine_until;
     let durable_continuity_startup = if let Some(continuity_key) = ingress_continuity_key.as_deref()
     {
@@ -3004,7 +3002,7 @@ fn read_auxiliary_state_from_reader(
         }
 
         let required = bytes.len() + read;
-        if bytes.capacity() < required {
+        if matches!(required.cmp(&bytes.capacity()), std::cmp::Ordering::Greater) {
             let target_capacity = bytes
                 .capacity()
                 .saturating_mul(2)
@@ -3182,14 +3180,12 @@ where
     } = steps;
     let serialized = serialize_auxiliary_state(value, max_bytes, label)?;
     let (temp, mut file) = create_auxiliary_state_temp(path)?;
-    let mut renamed = false;
     let result = (|| {
         write_payload(&mut file, &serialized)?;
         file.flush()?;
         sync_file(&file)?;
         drop(file);
         rename(&temp, path)?;
-        renamed = true;
         match sync_parent(path) {
             Ok(()) => Ok(AtomicStateWriteOutcome::Durable),
             Err(error) => {
@@ -3201,9 +3197,7 @@ where
             }
         }
     })();
-    if !renamed {
-        let _ = fs::remove_file(&temp);
-    }
+    let _ = fs::remove_file(&temp);
     result
 }
 
@@ -3229,9 +3223,9 @@ fn auxiliary_state_temp_path(path: &Path) -> PathBuf {
 fn remove_stale_auxiliary_state_temp(path: &Path) -> io::Result<()> {
     let temp = auxiliary_state_temp_path(path);
     match fs::symlink_metadata(&temp) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
-            invalid_data("auxiliary state temporary path is not a regular file"),
-        ),
+        Ok(metadata) if !metadata.is_file() => Err(invalid_data(
+            "auxiliary state temporary path is not a regular file",
+        )),
         Ok(_) => fs::remove_file(temp),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -19505,6 +19499,16 @@ mod tests {
     }
 
     #[test]
+    fn bait_security_sidecar_limits_match_the_documented_contract() {
+        assert_eq!(MAX_BAIT_EXPOSURE_STORE_BYTES, 4_194_304);
+        assert_eq!(MAX_CONSUMED_PROOF_STORE_BYTES, 4_194_304);
+        assert_eq!(MAX_BAIT_EXPOSURES, 4_096);
+        assert_eq!(MAX_CONSUMED_BAIT_PROOFS, 4_096);
+        assert_eq!(BAIT_EXPOSURE_TTL_SECS, 86_400);
+        assert_eq!(MAX_BAIT_PROOF_TTL_SECS, 86_400);
+    }
+
+    #[test]
     fn maximum_canonical_auxiliary_state_shapes_have_explicit_headroom() {
         let longest_builtin_bait = BaitRegistry::m3_catalog()
             .baits()
@@ -20112,6 +20116,38 @@ mod tests {
         fs::remove_file(temp).expect("temp symlink should remove");
         fs::remove_file(exposure_path).expect("exposure state should remove");
         fs::remove_file(outside).expect("outside sentinel should remove");
+    }
+
+    #[test]
+    fn authoritative_sidecar_open_rejects_non_regular_stale_temp() {
+        let event_log_path = unique_temp_path("directory-sidecar-temp.jsonl");
+        let exposure_path = sidecar_state_path(&event_log_path, ".exposures.json");
+        let original = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure state should serialize");
+        fs::write(&exposure_path, &original).expect("exposure state should write");
+        let temp = auxiliary_state_temp_path(&exposure_path);
+        fs::create_dir(&temp).expect("stale temp directory should create");
+
+        let error = BaitExposureStore::open_or_rebuild(&event_log_path, 1_000)
+            .expect_err("non-regular stale temp must fail authoritative open");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "auxiliary state temporary path is not a regular file"
+        );
+        assert_eq!(
+            fs::read(&exposure_path).expect("last-good exposure should remain"),
+            original
+        );
+        assert!(fs::metadata(&temp)
+            .expect("rejected temp directory should remain")
+            .is_dir());
+        fs::remove_dir(temp).expect("temp directory should remove");
+        fs::remove_file(exposure_path).expect("exposure state should remove");
     }
 
     #[test]
