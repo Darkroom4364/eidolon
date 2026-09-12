@@ -19889,6 +19889,9 @@ mod tests {
                 }}]
             }}"#
         );
+        let exposure_position =
+            serde_json::from_slice::<StoredBaitExposureState>(invalid_exposure_session.as_bytes())
+                .expect_err("invalid exposure session should have a serde position");
         let session_error = BaitExposureStore::from_state_bytes(
             PathBuf::from("invalid-exposure-session.json"),
             invalid_exposure_session.as_bytes(),
@@ -19896,9 +19899,14 @@ mod tests {
         )
         .expect_err("invalid exposure session must fail");
         assert_eq!(session_error.kind(), io::ErrorKind::InvalidData);
-        assert!(session_error
-            .to_string()
-            .contains("failed to parse bait exposure state"));
+        assert_eq!(
+            session_error.to_string(),
+            format!(
+                "failed to parse bait exposure state `invalid-exposure-session.json` as strict JSON at line {} column {}",
+                exposure_position.line(),
+                exposure_position.column()
+            )
+        );
         assert!(!session_error.to_string().contains(exposure_session_value));
 
         let proof_unknown_name = "private_proof_unknown_field";
@@ -19944,6 +19952,9 @@ mod tests {
             }}"#,
             "00".repeat(32)
         );
+        let proof_position =
+            serde_json::from_slice::<StoredConsumedProofState>(invalid_proof_session.as_bytes())
+                .expect_err("invalid proof session should have a serde position");
         let proof_session_error = ConsumedBaitProofStore::from_state_bytes(
             PathBuf::from("invalid-proof-session.json"),
             invalid_proof_session.as_bytes(),
@@ -19951,9 +19962,14 @@ mod tests {
         )
         .expect_err("invalid proof session must fail");
         assert_eq!(proof_session_error.kind(), io::ErrorKind::InvalidData);
-        assert!(proof_session_error
-            .to_string()
-            .contains("failed to parse consumed proof state"));
+        assert_eq!(
+            proof_session_error.to_string(),
+            format!(
+                "failed to parse consumed proof state `invalid-proof-session.json` as strict JSON at line {} column {}",
+                proof_position.line(),
+                proof_position.column()
+            )
+        );
         assert!(!proof_session_error
             .to_string()
             .contains(proof_session_value));
