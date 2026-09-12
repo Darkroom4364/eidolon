@@ -22,6 +22,10 @@ Initial research-alpha source release.
   order-independent duplicate-session rejection, and pre-migration pending
   workflow/response/event-contract validation; production preflights invalid
   state before touching lease metadata and revalidates under the lease
+- schema-v1 bait-exposure and consumed-proof sidecars with independent 4 MiB
+  startup/write bounds, strict duplicate-key and lifetime validation, and
+  collision-safe owner-only atomic replacement; production preflights existing
+  sidecars before lease or durable-log effects
 
 ### Limitations
 
