@@ -85,6 +85,23 @@ issue
 `#253` separately owns live persistent-volume corruption and unavailability
 qualification for the supported deployment.
 
+The committed bait-exposure and consumed-proof sidecars are each capped at
+4,194,304 bytes and 4,096 records. Reads retain at most one byte beyond the
+limit, and writes serialize through the same ceiling before any temp file is
+created. Production preflights existing sidecars without acquiring the writer
+lease or mutating policy/log state, including a dry run of the canonical
+pretty-printed rewrite, then repeats the bounded checks during authoritative
+open. Empty, malformed, future-schema, over-capacity,
+future-lifetime, and duplicate logical-key state fails closed; duplicates are
+checked before expiry filtering so an expired row cannot hide ambiguity. Atomic
+replacement uses an owner-only, fixed reserved `<sidecar>.tmp` created with
+`create_new`, file sync, rename, and parent sync, preserving the previous file
+on pre-rename failure. Authoritative open under the single-writer lease removes
+one regular crash-left temp only after validating the committed sidecar and
+rejects a symlink or non-regular temp. Missing sidecars still use the existing
+event-log reconstruction path; bounding that JSONL recovery input is separate
+#254 work, and live PVC proof remains #253.
+
 ## Defensive Boundary
 
 Eidolon may degrade hostile behavior inside the protected boundary.

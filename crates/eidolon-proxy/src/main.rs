@@ -93,8 +93,11 @@ const DEFAULT_HTTP_PORT: u16 = 80;
 const MAX_INFORMATIONAL_RESPONSES: usize = 16;
 const MAX_BAIT_EXPOSURES: usize = 4096;
 const BAIT_EXPOSURE_TTL_SECS: u64 = 24 * 60 * 60;
+const MAX_BAIT_EXPOSURE_STORE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONSUMED_BAIT_PROOFS: usize = 4096;
 const MAX_BAIT_PROOF_TTL_SECS: u64 = 24 * 60 * 60;
+const MAX_CONSUMED_PROOF_STORE_BYTES: usize = 4 * 1024 * 1024;
+const AUXILIARY_STATE_READ_CHUNK_BYTES: usize = 8 * 1024;
 const BAIT_EXPOSURE_STATE_SCHEMA_VERSION: u16 = 1;
 const CONSUMED_PROOF_STATE_SCHEMA_VERSION: u16 = 1;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
@@ -1052,6 +1055,32 @@ fn policy_store_contract_projection() -> Value {
     })
 }
 
+fn bait_exposure_store_contract_projection() -> Value {
+    json!({
+        "max_bytes": MAX_BAIT_EXPOSURE_STORE_BYTES,
+        "max_records": MAX_BAIT_EXPOSURES,
+        "ttl_secs": BAIT_EXPOSURE_TTL_SECS,
+        "schema": {
+            "current": BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            "minimum_supported": BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            "maximum_supported": BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+        },
+    })
+}
+
+fn consumed_proof_store_contract_projection() -> Value {
+    json!({
+        "max_bytes": MAX_CONSUMED_PROOF_STORE_BYTES,
+        "max_records": MAX_CONSUMED_BAIT_PROOFS,
+        "ttl_secs": MAX_BAIT_PROOF_TTL_SECS,
+        "schema": {
+            "current": CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            "minimum_supported": CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            "maximum_supported": CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+        },
+    })
+}
+
 fn effective_config_projection(config: &ProxyConfig) -> Value {
     json!({
         "schema_version": 1,
@@ -1090,6 +1119,8 @@ fn effective_config_projection(config: &ProxyConfig) -> Value {
             "policy_state": "configured",
             "debug_log": config.debug_log_path.is_some(),
             "policy_store": policy_store_contract_projection(),
+            "bait_exposure_store": bait_exposure_store_contract_projection(),
+            "consumed_proof_store": consumed_proof_store_contract_projection(),
         },
         "shutdown": {
             "grace_secs": if config.profile == RuntimeProfile::Production {
@@ -2172,6 +2203,10 @@ fn run_proxy_with_shutdown(
     let listen_addr = config.listen_addr;
     if profile == RuntimeProfile::Production {
         PolicyStateStore::validate_without_mutation(&config.policy_state_path)?;
+        validate_bait_security_sidecars_without_mutation(
+            &config.event_log_path,
+            current_unix_secs(),
+        )?;
     }
     let (ingress_transport_auth_secret, previous_ingress_transport_auth_secret) =
         load_ingress_transport_auth_secrets(
@@ -2247,7 +2282,11 @@ fn run_proxy_with_shutdown(
     let restored_bait_exposure_count = bait_exposures.len();
     let restored_bait_exposure_ttl_evicted = bait_exposures.ttl_evicted;
     let restored_bait_exposure_torn_tail_line = bait_exposures.torn_tail_line;
-    let bait_exposure_state_path = bait_exposures.path.clone();
+    let bait_exposure_state_path = bait_exposures
+        .path
+        .clone()
+        .ok_or_else(|| io::Error::other("bait exposure store opened without a state path"))?;
+    let bait_exposure_state_bytes = fs::metadata(&bait_exposure_state_path)?.len();
     let consumed_bait_proofs = ConsumedBaitProofStore::open_or_rebuild(
         &config.event_log_path,
         &bait_registry,
@@ -2256,7 +2295,11 @@ fn run_proxy_with_shutdown(
     )?;
     let restored_consumed_bait_proof_count = consumed_bait_proofs.consumed.len();
     let restored_consumed_bait_proof_torn_tail_line = consumed_bait_proofs.torn_tail_line;
-    let consumed_proof_state_path = consumed_bait_proofs.path.clone();
+    let consumed_proof_state_path = consumed_bait_proofs
+        .path
+        .clone()
+        .ok_or_else(|| io::Error::other("consumed proof store opened without a state path"))?;
+    let consumed_proof_state_bytes = fs::metadata(&consumed_proof_state_path)?.len();
     let consumed_proof_migration_quarantine_until = consumed_bait_proofs.migration_quarantine_until;
     let durable_continuity_startup = if let Some(continuity_key) = ingress_continuity_key.as_deref()
     {
@@ -2386,6 +2429,17 @@ fn run_proxy_with_shutdown(
             "restored_consumed_bait_proof_torn_tail_line": restored_consumed_bait_proof_torn_tail_line,
             "consumed_proof_state_path": consumed_proof_state_path,
             "consumed_proof_migration_quarantine_until": consumed_proof_migration_quarantine_until,
+            "consumed_proof_store": {
+                "bytes": consumed_proof_state_bytes,
+                "max_bytes": MAX_CONSUMED_PROOF_STORE_BYTES,
+                "max_records": MAX_CONSUMED_BAIT_PROOFS,
+                "ttl_secs": MAX_BAIT_PROOF_TTL_SECS,
+                "schema": {
+                    "current": CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                    "minimum_supported": CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                    "maximum_supported": CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                },
+            },
             "event_log_tail_repair": jsonl_tail_repair_debug(event_log_tail_repair),
             "debug_log_tail_repair": debug_log_tail_repair.map(jsonl_tail_repair_debug),
             "event_log_bytes": std::fs::metadata(&config.event_log_path)
@@ -2425,8 +2479,15 @@ fn run_proxy_with_shutdown(
             "restored_bait_exposure_torn_tail_line": restored_bait_exposure_torn_tail_line,
             "bait_exposure_store": {
                 "state_path": bait_exposure_state_path,
+                "bytes": bait_exposure_state_bytes,
+                "max_bytes": MAX_BAIT_EXPOSURE_STORE_BYTES,
                 "max_records": MAX_BAIT_EXPOSURES,
                 "ttl_secs": BAIT_EXPOSURE_TTL_SECS,
+                "schema": {
+                    "current": BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                    "minimum_supported": BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                    "maximum_supported": BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                },
             },
             "policy_store": policy_store_debug,
             "durable_state_writer": {
@@ -2808,12 +2869,14 @@ enum ConsumeProofOutcome {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredBaitExposureState {
     schema_version: u16,
     exposures: Vec<StoredBaitExposure>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredBaitExposure {
     session_id: SessionId,
     bait_id: BaitId,
@@ -2822,6 +2885,7 @@ struct StoredBaitExposure {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredConsumedProofState {
     schema_version: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2829,12 +2893,29 @@ struct StoredConsumedProofState {
     consumed: Vec<StoredConsumedProof>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredConsumedProof {
     session_id: SessionId,
     bait_id: BaitId,
     proof_digest_hex: String,
     expires_at_unix_secs: u64,
+}
+
+fn compare_stored_bait_exposures(
+    left: &StoredBaitExposure,
+    right: &StoredBaitExposure,
+) -> std::cmp::Ordering {
+    (
+        left.observed_at_unix_secs,
+        left.session_id.0,
+        left.bait_id.0.as_str(),
+    )
+        .cmp(&(
+            right.observed_at_unix_secs,
+            right.session_id.0,
+            right.bait_id.0.as_str(),
+        ))
 }
 
 fn sidecar_state_path(base_path: &Path, suffix: &str) -> PathBuf {
@@ -2843,49 +2924,311 @@ fn sidecar_state_path(base_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn oversized_auxiliary_state_error(path: &Path, label: &str, max_bytes: usize) -> io::Error {
+    invalid_data(format!(
+        "{label} `{}` exceeds the fixed {max_bytes} byte limit",
+        path.display()
+    ))
+}
+
+fn invalid_auxiliary_state_json_error(
+    path: &Path,
+    label: &str,
+    error: &serde_json::Error,
+) -> io::Error {
+    invalid_data(format!(
+        "failed to parse {label} `{}` as strict JSON at line {} column {}",
+        path.display(),
+        error.line(),
+        error.column()
+    ))
+}
+
+fn read_auxiliary_state_file(
+    path: &Path,
+    label: &'static str,
+    max_bytes: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let advertised_len = file.metadata()?.len();
+    read_auxiliary_state_from_reader(file, path, label, max_bytes, advertised_len).map(Some)
+}
+
+/// Retain at most the configured limit plus one sentinel byte. File metadata
+/// is only an early rejection; the bounded read remains authoritative if the
+/// file grows between metadata and the final read.
+fn read_auxiliary_state_from_reader(
+    mut reader: impl Read,
+    path: &Path,
+    label: &'static str,
+    max_bytes: usize,
+    advertised_len: u64,
+) -> io::Result<Vec<u8>> {
+    if advertised_len > max_bytes as u64 {
+        return Err(oversized_auxiliary_state_error(path, label, max_bytes));
+    }
+
+    let allocation_bound = max_bytes + 1;
+    let initial_capacity = usize::try_from(advertised_len)
+        .unwrap_or(allocation_bound)
+        .saturating_add(1)
+        .min(allocation_bound);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    let mut chunk = [0_u8; AUXILIARY_STATE_READ_CHUNK_BYTES];
+
+    loop {
+        let remaining = allocation_bound - bytes.len();
+        if remaining == 0 {
+            return Err(oversized_auxiliary_state_error(path, label, max_bytes));
+        }
+        let requested = remaining.min(AUXILIARY_STATE_READ_CHUNK_BYTES);
+        let read = loop {
+            match reader.read(&mut chunk[..requested]) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        if read > requested {
+            return Err(invalid_data(format!(
+                "{label} reader returned an invalid byte count"
+            )));
+        }
+        if read == 0 {
+            break;
+        }
+
+        let required = bytes.len() + read;
+        if matches!(required.cmp(&bytes.capacity()), std::cmp::Ordering::Greater) {
+            let target_capacity = bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(AUXILIARY_STATE_READ_CHUNK_BYTES)
+                .max(required)
+                .min(allocation_bound);
+            bytes.reserve_exact(target_capacity - bytes.len());
+            if bytes.capacity() < required {
+                return Err(io::Error::other(format!(
+                    "{label} buffer did not satisfy its bounded reservation"
+                )));
+            }
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+
+    if bytes.is_empty() {
+        return Err(invalid_data(format!(
+            "{label} `{}` is empty",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AtomicStateWriteOutcome {
     Durable,
     CommittedDurabilityUncertain,
 }
 
-fn atomic_state_write(path: &Path, value: &impl Serialize) -> io::Result<AtomicStateWriteOutcome> {
-    atomic_state_write_with_parent_sync(path, value, sync_state_parent_directory)
+struct BoundedAuxiliaryStateSerialization {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    label: &'static str,
 }
 
+impl BoundedAuxiliaryStateSerialization {
+    fn new(max_bytes: usize, label: &'static str) -> Self {
+        Self {
+            bytes: Vec::with_capacity(
+                AUXILIARY_STATE_READ_CHUNK_BYTES.min(max_bytes.saturating_add(1)),
+            ),
+            max_bytes,
+            label,
+        }
+    }
+
+    fn finish(self) -> io::Result<Vec<u8>> {
+        if self.bytes.len() > self.max_bytes {
+            return Err(invalid_data(format!(
+                "serialized {} exceeds the fixed {} byte limit",
+                self.label, self.max_bytes
+            )));
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl Write for BoundedAuxiliaryStateSerialization {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let allocation_bound = self.max_bytes + 1;
+        let retained = buffer.len().min(allocation_bound - self.bytes.len());
+        let required = self.bytes.len() + retained;
+        if self.bytes.capacity() < required {
+            let target_capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(allocation_bound);
+            self.bytes.reserve_exact(target_capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(&buffer[..retained]);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_auxiliary_state(
+    value: &impl Serialize,
+    max_bytes: usize,
+    label: &'static str,
+) -> io::Result<Vec<u8>> {
+    let mut serialized = BoundedAuxiliaryStateSerialization::new(max_bytes, label);
+    serde_json::to_writer_pretty(&mut serialized, value)
+        .map_err(|error| invalid_data(format!("failed to serialize {label}: {error}")))?;
+    serialized.finish()
+}
+
+fn atomic_state_write(
+    path: &Path,
+    value: &impl Serialize,
+    max_bytes: usize,
+    label: &'static str,
+) -> io::Result<AtomicStateWriteOutcome> {
+    atomic_state_write_with(
+        path,
+        value,
+        max_bytes,
+        label,
+        |file, bytes| file.write_all(bytes),
+        sync_state_parent_directory,
+    )
+}
+
+#[cfg(test)]
 fn atomic_state_write_with_parent_sync(
     path: &Path,
     value: &impl Serialize,
+    max_bytes: usize,
+    label: &'static str,
     sync_parent: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<AtomicStateWriteOutcome> {
-    let serialized = serde_json::to_vec_pretty(value)
-        .map_err(|error| invalid_data(format!("failed to serialize state: {error}")))?;
-    let mut temp = path.as_os_str().to_os_string();
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp)?;
+    atomic_state_write_with(
+        path,
+        value,
+        max_bytes,
+        label,
+        |file, bytes| file.write_all(bytes),
+        sync_parent,
+    )
+}
+
+fn atomic_state_write_with(
+    path: &Path,
+    value: &impl Serialize,
+    max_bytes: usize,
+    label: &'static str,
+    write_payload: impl FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<AtomicStateWriteOutcome> {
+    atomic_state_write_with_steps(
+        path,
+        value,
+        max_bytes,
+        label,
+        AtomicStateWriteSteps {
+            write_payload,
+            sync_file: fs::File::sync_all,
+            rename: |from: &Path, to: &Path| fs::rename(from, to),
+            sync_parent,
+        },
+    )
+}
+
+struct AtomicStateWriteSteps<WritePayload, SyncFile, Rename, SyncParent> {
+    write_payload: WritePayload,
+    sync_file: SyncFile,
+    rename: Rename,
+    sync_parent: SyncParent,
+}
+
+fn atomic_state_write_with_steps<WritePayload, SyncFile, Rename, SyncParent>(
+    path: &Path,
+    value: &impl Serialize,
+    max_bytes: usize,
+    label: &'static str,
+    steps: AtomicStateWriteSteps<WritePayload, SyncFile, Rename, SyncParent>,
+) -> io::Result<AtomicStateWriteOutcome>
+where
+    WritePayload: FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
+    SyncFile: FnOnce(&fs::File) -> io::Result<()>,
+    Rename: FnOnce(&Path, &Path) -> io::Result<()>,
+    SyncParent: FnOnce(&Path) -> io::Result<()>,
+{
+    let AtomicStateWriteSteps {
+        write_payload,
+        sync_file,
+        rename,
+        sync_parent,
+    } = steps;
+    let serialized = serialize_auxiliary_state(value, max_bytes, label)?;
+    let (temp, mut file) = create_auxiliary_state_temp(path)?;
+    let result = (|| {
+        write_payload(&mut file, &serialized)?;
+        file.flush()?;
+        sync_file(&file)?;
+        drop(file);
+        rename(&temp, path)?;
+        match sync_parent(path) {
+            Ok(()) => Ok(AtomicStateWriteOutcome::Durable),
+            Err(error) => {
+                eprintln!(
+                    "eidolon persistence failure: {label} rename committed but parent directory sync failed for `{}`: {error}",
+                    path.display()
+                );
+                Ok(AtomicStateWriteOutcome::CommittedDurabilityUncertain)
+            }
+        }
+    })();
+    let _ = fs::remove_file(&temp);
+    result
+}
+
+fn create_auxiliary_state_temp(path: &Path) -> io::Result<(PathBuf, fs::File)> {
+    let temp = auxiliary_state_temp_path(path);
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    file.write_all(&serialized)?;
-    file.flush()?;
-    file.sync_all()?;
-    fs::rename(temp, path)?;
-    match sync_parent(path) {
-        Ok(()) => Ok(AtomicStateWriteOutcome::Durable),
-        Err(error) => {
-            eprintln!(
-                "eidolon persistence failure: state rename committed but parent directory sync failed for `{}`: {error}",
-                path.display()
-            );
-            Ok(AtomicStateWriteOutcome::CommittedDurabilityUncertain)
-        }
+    options.open(&temp).map(|file| (temp, file))
+}
+
+fn auxiliary_state_temp_path(path: &Path) -> PathBuf {
+    sidecar_state_path(path, ".tmp")
+}
+
+/// Authoritative store opening runs under the process-wide writer lease. A
+/// fixed reserved name keeps crash residue bounded, while `create_new` still
+/// prevents a collision or symlink from being followed during replacement.
+fn remove_stale_auxiliary_state_temp(path: &Path) -> io::Result<()> {
+    let temp = auxiliary_state_temp_path(path);
+    match fs::symlink_metadata(&temp) {
+        Ok(metadata) if !metadata.is_file() => Err(invalid_data(
+            "auxiliary state temporary path is not a regular file",
+        )),
+        Ok(_) => fs::remove_file(temp),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -2961,6 +3304,32 @@ fn path_has_nonempty_file(path: &Path) -> io::Result<bool> {
     }
 }
 
+fn validate_bait_security_sidecars_without_mutation(
+    event_log_path: &Path,
+    now: u64,
+) -> io::Result<()> {
+    let exposure_path = sidecar_state_path(event_log_path, ".exposures.json");
+    if let Some(bytes) = read_auxiliary_state_file(
+        &exposure_path,
+        "bait exposure state",
+        MAX_BAIT_EXPOSURE_STORE_BYTES,
+    )? {
+        BaitExposureStore::from_state_bytes(exposure_path, &bytes, now)?
+            .validate_canonical_serialization()?;
+    }
+
+    let consumed_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
+    if let Some(bytes) = read_auxiliary_state_file(
+        &consumed_path,
+        "consumed proof state",
+        MAX_CONSUMED_PROOF_STORE_BYTES,
+    )? {
+        ConsumedBaitProofStore::from_state_bytes(consumed_path, &bytes, now)?
+            .validate_canonical_serialization()?;
+    }
+    Ok(())
+}
+
 impl ConsumedBaitProofStore {
     fn open_or_rebuild(
         event_log_path: &Path,
@@ -2969,30 +3338,38 @@ impl ConsumedBaitProofStore {
         now: u64,
     ) -> io::Result<Self> {
         let state_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
-        match fs::read(&state_path) {
-            Ok(bytes) => Self::from_state_bytes(state_path, &bytes, now),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        match read_auxiliary_state_file(
+            &state_path,
+            "consumed proof state",
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+        )? {
+            Some(bytes) => {
+                let store = Self::from_state_bytes(state_path.clone(), &bytes, now)?;
+                store.validate_canonical_serialization()?;
+                remove_stale_auxiliary_state_temp(&state_path)?;
+                store.persist()?;
+                Ok(store)
+            }
+            None => {
                 let history_exists = event_log_history_exists(event_log_path)?;
                 let mut store =
                     Self::from_event_log(event_log_path, registry, signing_secret, now)?;
-                store.path = Some(state_path);
+                store.path = Some(state_path.clone());
                 if history_exists {
                     store.migration_quarantine_until =
                         Some(now.saturating_add(MAX_BAIT_PROOF_TTL_SECS));
                 }
+                store.validate_canonical_serialization()?;
+                remove_stale_auxiliary_state_temp(&state_path)?;
                 store.persist()?;
                 Ok(store)
             }
-            Err(error) => Err(error),
         }
     }
 
     fn from_state_bytes(path: PathBuf, bytes: &[u8], now: u64) -> io::Result<Self> {
         let stored: StoredConsumedProofState = serde_json::from_slice(bytes).map_err(|error| {
-            invalid_data(format!(
-                "failed to parse consumed proof state `{}`: {error}",
-                path.display()
-            ))
+            invalid_auxiliary_state_json_error(&path, "consumed proof state", &error)
         })?;
         if stored.schema_version != CONSUMED_PROOF_STATE_SCHEMA_VERSION {
             return Err(invalid_data(format!(
@@ -3000,8 +3377,37 @@ impl ConsumedBaitProofStore {
                 stored.schema_version
             )));
         }
+        if stored.consumed.len() > MAX_CONSUMED_BAIT_PROOFS {
+            return Err(invalid_data(
+                "active consumed bait proof state exceeds configured capacity",
+            ));
+        }
+        if stored
+            .migration_quarantine_until
+            .is_some_and(|until| until.saturating_sub(now) > MAX_BAIT_PROOF_TTL_SECS)
+        {
+            return Err(invalid_data(
+                "consumed proof migration quarantine exceeds the maximum proof lifetime",
+            ));
+        }
         let mut consumed = HashMap::new();
+        let mut stored_keys = HashSet::with_capacity(stored.consumed.len());
         for record in stored.consumed {
+            if record.bait_id.0.trim().is_empty() {
+                return Err(invalid_data(
+                    "consumed proof state contains an empty bait identifier",
+                ));
+            }
+            let key = (
+                record.session_id,
+                record.bait_id,
+                parse_digest_hex(&record.proof_digest_hex)?,
+            );
+            if !stored_keys.insert(key.clone()) {
+                return Err(invalid_data(
+                    "consumed proof state contains a duplicate logical key",
+                ));
+            }
             if record.expires_at_unix_secs <= now {
                 continue;
             }
@@ -3010,34 +3416,17 @@ impl ConsumedBaitProofStore {
                     "consumed proof state contains an expiry beyond the maximum proof lifetime",
                 ));
             }
-            let key = (
-                record.session_id,
-                record.bait_id,
-                parse_digest_hex(&record.proof_digest_hex)?,
-            );
-            consumed
-                .entry(key)
-                .and_modify(|expiry: &mut u64| {
-                    *expiry = (*expiry).max(record.expires_at_unix_secs);
-                })
-                .or_insert(record.expires_at_unix_secs);
-            if consumed.len() > MAX_CONSUMED_BAIT_PROOFS {
-                return Err(invalid_data(
-                    "active consumed bait proof state exceeds configured capacity",
-                ));
-            }
+            consumed.insert(key, record.expires_at_unix_secs);
         }
         let migration_quarantine_until = stored
             .migration_quarantine_until
             .filter(|until| *until > now);
-        let store = Self {
+        Ok(Self {
             path: Some(path),
             consumed,
             migration_quarantine_until,
             torn_tail_line: None,
-        };
-        store.persist()?;
-        Ok(store)
+        })
     }
 
     fn from_event_log(
@@ -3193,10 +3582,7 @@ impl ConsumedBaitProofStore {
         }
     }
 
-    fn persist(&self) -> io::Result<AtomicStateWriteOutcome> {
-        let Some(path) = &self.path else {
-            return Ok(AtomicStateWriteOutcome::Durable);
-        };
+    fn canonical_state(&self) -> StoredConsumedProofState {
         let mut consumed: Vec<_> = self
             .consumed
             .iter()
@@ -3223,13 +3609,31 @@ impl ConsumedBaitProofStore {
                     right.proof_digest_hex.as_str(),
                 ))
         });
+        StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: self.migration_quarantine_until,
+            consumed,
+        }
+    }
+
+    fn validate_canonical_serialization(&self) -> io::Result<()> {
+        serialize_auxiliary_state(
+            &self.canonical_state(),
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            "consumed proof state",
+        )
+        .map(|_| ())
+    }
+
+    fn persist(&self) -> io::Result<AtomicStateWriteOutcome> {
+        let Some(path) = &self.path else {
+            return Ok(AtomicStateWriteOutcome::Durable);
+        };
         atomic_state_write(
             path,
-            &StoredConsumedProofState {
-                schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
-                migration_quarantine_until: self.migration_quarantine_until,
-                consumed,
-            },
+            &self.canonical_state(),
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            "consumed proof state",
         )
     }
 }
@@ -3258,28 +3662,32 @@ fn proof_expiry_epoch_seconds(bait: &Bait, proof_value: &str) -> io::Result<u64>
 impl BaitExposureStore {
     fn open_or_rebuild(event_log_path: &Path, now: u64) -> io::Result<Self> {
         let state_path = sidecar_state_path(event_log_path, ".exposures.json");
-        match fs::read(&state_path) {
-            Ok(bytes) => {
-                let store = Self::from_state_bytes(state_path, &bytes, now)?;
+        match read_auxiliary_state_file(
+            &state_path,
+            "bait exposure state",
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+        )? {
+            Some(bytes) => {
+                let store = Self::from_state_bytes(state_path.clone(), &bytes, now)?;
+                store.validate_canonical_serialization()?;
+                remove_stale_auxiliary_state_temp(&state_path)?;
                 store.persist()?;
                 Ok(store)
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            None => {
                 let mut store = Self::from_event_log_at(event_log_path, now)?;
-                store.path = Some(state_path);
+                store.path = Some(state_path.clone());
+                store.validate_canonical_serialization()?;
+                remove_stale_auxiliary_state_temp(&state_path)?;
                 store.persist()?;
                 Ok(store)
             }
-            Err(error) => Err(error),
         }
     }
 
     fn from_state_bytes(path: PathBuf, bytes: &[u8], now: u64) -> io::Result<Self> {
         let stored: StoredBaitExposureState = serde_json::from_slice(bytes).map_err(|error| {
-            invalid_data(format!(
-                "failed to parse bait exposure state `{}`: {error}",
-                path.display()
-            ))
+            invalid_auxiliary_state_json_error(&path, "bait exposure state", &error)
         })?;
         if stored.schema_version != BAIT_EXPOSURE_STATE_SCHEMA_VERSION {
             return Err(invalid_data(format!(
@@ -3287,12 +3695,35 @@ impl BaitExposureStore {
                 stored.schema_version
             )));
         }
+        if stored.exposures.len() > MAX_BAIT_EXPOSURES {
+            return Err(invalid_data(
+                "bait exposure state exceeds the fixed record limit",
+            ));
+        }
+        let mut stored_keys = HashSet::with_capacity(stored.exposures.len());
+        for record in &stored.exposures {
+            if record.bait_id.0.trim().is_empty() || record.exposure_id.0.trim().is_empty() {
+                return Err(invalid_data(
+                    "bait exposure state contains an empty identifier",
+                ));
+            }
+            if record.observed_at_unix_secs > now {
+                return Err(invalid_data(
+                    "bait exposure state contains a future-dated timestamp",
+                ));
+            }
+            if !stored_keys.insert((record.session_id, record.bait_id.clone())) {
+                return Err(invalid_data(
+                    "bait exposure state contains a duplicate logical key",
+                ));
+            }
+        }
         let mut store = Self {
             path: None,
             ..Self::default()
         };
         let mut records = stored.exposures;
-        records.sort_by_key(|record| (record.observed_at_unix_secs, record.session_id.0));
+        records.sort_by(compare_stored_bait_exposures);
         for record in records {
             store.apply_record_exposure_at(
                 record.session_id,
@@ -3533,10 +3964,7 @@ impl BaitExposureStore {
             .retain(|key| self.exposures.contains_key(key));
     }
 
-    fn persist(&self) -> io::Result<AtomicStateWriteOutcome> {
-        let Some(path) = &self.path else {
-            return Ok(AtomicStateWriteOutcome::Durable);
-        };
+    fn canonical_state(&self) -> StoredBaitExposureState {
         let mut exposures: Vec<_> = self
             .exposures
             .iter()
@@ -3547,24 +3975,31 @@ impl BaitExposureStore {
                 observed_at_unix_secs: record.observed_at_unix_secs,
             })
             .collect();
-        exposures.sort_by(|left, right| {
-            (
-                left.observed_at_unix_secs,
-                left.session_id.0,
-                left.bait_id.0.as_str(),
-            )
-                .cmp(&(
-                    right.observed_at_unix_secs,
-                    right.session_id.0,
-                    right.bait_id.0.as_str(),
-                ))
-        });
+        exposures.sort_by(compare_stored_bait_exposures);
+        StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures,
+        }
+    }
+
+    fn validate_canonical_serialization(&self) -> io::Result<()> {
+        serialize_auxiliary_state(
+            &self.canonical_state(),
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "bait exposure state",
+        )
+        .map(|_| ())
+    }
+
+    fn persist(&self) -> io::Result<AtomicStateWriteOutcome> {
+        let Some(path) = &self.path else {
+            return Ok(AtomicStateWriteOutcome::Durable);
+        };
         atomic_state_write(
             path,
-            &StoredBaitExposureState {
-                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
-                exposures,
-            },
+            &self.canonical_state(),
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "bait exposure state",
         )
     }
 }
@@ -8646,6 +9081,78 @@ mod tests {
     };
     use serde_json::Value;
 
+    struct ShortReader {
+        bytes: Cursor<Vec<u8>>,
+        max_read: usize,
+    }
+
+    impl Read for ShortReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let limit = buffer.len().min(self.max_read);
+            self.bytes.read(&mut buffer[..limit])
+        }
+    }
+
+    struct InterruptedReader {
+        bytes: Cursor<Vec<u8>>,
+        interrupted: bool,
+    }
+
+    impl Read for InterruptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "injected auxiliary-state interruption",
+                ));
+            }
+            self.bytes.read(buffer)
+        }
+    }
+
+    struct ReadThenFail {
+        served_prefix: bool,
+    }
+
+    impl Read for ReadThenFail {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.served_prefix {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected auxiliary-state read failure",
+                ));
+            }
+            self.served_prefix = true;
+            buffer[0] = b'{';
+            Ok(1)
+        }
+    }
+
+    struct FailsIfRead;
+
+    impl Read for FailsIfRead {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other(
+                "oversized metadata unexpectedly reached the reader",
+            ))
+        }
+    }
+
+    struct RepeatingByteReader {
+        remaining: usize,
+        byte: u8,
+    }
+
+    impl Read for RepeatingByteReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = buffer.len().min(self.remaining);
+            buffer[..read].fill(self.byte);
+            self.remaining -= read;
+            Ok(read)
+        }
+    }
+
     #[derive(Clone)]
     struct StaticSurfaceController {
         action: SurfaceAction,
@@ -8700,6 +9207,33 @@ mod tests {
             Some(value) => value,
             None => panic!("{context}"),
         }
+    }
+
+    fn auxiliary_state_temp_paths(path: &Path) -> Vec<PathBuf> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let prefix = format!(
+            "{}.tmp",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .expect("test state path should have a UTF-8 file name")
+        );
+        let random_prefix = format!("{prefix}.");
+        let mut paths = fs::read_dir(parent)
+            .expect("test state parent should be readable")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name == prefix || name.starts_with(&random_prefix))
+            })
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
     }
 
     fn parse_socket_addr(value: &str, context: &str) -> SocketAddr {
@@ -10435,6 +10969,14 @@ mod tests {
             effective["state"]["policy_store"],
             policy_store_contract_projection()
         );
+        assert_eq!(
+            effective["state"]["bait_exposure_store"],
+            bait_exposure_store_contract_projection()
+        );
+        assert_eq!(
+            effective["state"]["consumed_proof_store"],
+            consumed_proof_store_contract_projection()
+        );
         assert_eq!(effective["controlled_reality_renderer"], "remote");
         for sensitive in [
             path_str(&session_key, "session key path should be UTF-8"),
@@ -11088,6 +11630,354 @@ mod tests {
         assert!(!startup_debug.contains(&malformed_session.0.to_string()));
         assert!(!startup_debug.contains(PRIVATE_VALUE));
         assert!(!startup_debug.contains(&corrected_session.0.to_string()));
+    }
+
+    #[test]
+    fn invalid_bait_security_sidecars_fail_before_production_startup_effects() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let private_session = SessionId(uuid::Uuid::from_u128(0xfeed));
+        const PRIVATE_BAIT: &str = "private-sidecar-bait-identifier";
+        let now = current_unix_secs();
+
+        let duplicate_exposure = StoredBaitExposure {
+            session_id: private_session,
+            bait_id: BaitId(PRIVATE_BAIT.to_string()),
+            exposure_id: ExposureId("private-exposure-one".to_string()),
+            observed_at_unix_secs: now,
+        };
+        let duplicate_proof = StoredConsumedProof {
+            session_id: private_session,
+            bait_id: BaitId(PRIVATE_BAIT.to_string()),
+            proof_digest_hex: digest_hex(&proof_digest("private-proof-value")),
+            expires_at_unix_secs: now + MAX_BAIT_PROOF_TTL_SECS,
+        };
+        let over_capacity_exposures = (0..=MAX_BAIT_EXPOSURES)
+            .map(|index| StoredBaitExposure {
+                session_id: SessionId(uuid::Uuid::from_u128(index as u128 + 1)),
+                bait_id: BaitId(format!("bait-{index}")),
+                exposure_id: ExposureId(format!("exposure-{index}")),
+                observed_at_unix_secs: now,
+            })
+            .collect();
+        let over_capacity_proofs = (0..=MAX_CONSUMED_BAIT_PROOFS)
+            .map(|index| StoredConsumedProof {
+                session_id: SessionId(uuid::Uuid::from_u128(index as u128 + 1)),
+                bait_id: BaitId(format!("bait-{index}")),
+                proof_digest_hex: digest_hex(&Sha256::digest(index.to_le_bytes()).into()),
+                expires_at_unix_secs: now + MAX_BAIT_PROOF_TTL_SECS,
+            })
+            .collect();
+        let invalid_states = vec![
+            ("exposure-empty", true, Vec::new()),
+            ("exposure-malformed", true, b"{not-json".to_vec()),
+            (
+                "exposure-future-schema",
+                true,
+                br#"{"schema_version":2,"exposures":[]}"#.to_vec(),
+            ),
+            (
+                "exposure-over-capacity",
+                true,
+                serde_json::to_vec(&StoredBaitExposureState {
+                    schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                    exposures: over_capacity_exposures,
+                })
+                .expect("over-capacity exposure state should serialize"),
+            ),
+            (
+                "exposure-empty-identifier",
+                true,
+                serde_json::to_vec(&StoredBaitExposureState {
+                    schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                    exposures: vec![StoredBaitExposure {
+                        session_id: private_session,
+                        bait_id: BaitId(PRIVATE_BAIT.to_string()),
+                        exposure_id: ExposureId(" ".to_string()),
+                        observed_at_unix_secs: now,
+                    }],
+                })
+                .expect("empty exposure identifier state should serialize"),
+            ),
+            (
+                "exposure-duplicate",
+                true,
+                serde_json::to_vec(&StoredBaitExposureState {
+                    schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                    exposures: vec![
+                        duplicate_exposure.clone(),
+                        StoredBaitExposure {
+                            exposure_id: ExposureId("private-exposure-two".to_string()),
+                            ..duplicate_exposure
+                        },
+                    ],
+                })
+                .expect("duplicate exposure state should serialize"),
+            ),
+            (
+                "exposure-future-timestamp",
+                true,
+                serde_json::to_vec(&StoredBaitExposureState {
+                    schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                    exposures: vec![StoredBaitExposure {
+                        session_id: private_session,
+                        bait_id: BaitId(PRIVATE_BAIT.to_string()),
+                        exposure_id: ExposureId("private-future-exposure".to_string()),
+                        observed_at_unix_secs: now + 3_600,
+                    }],
+                })
+                .expect("future exposure state should serialize"),
+            ),
+            (
+                "exposure-unknown-field",
+                true,
+                br#"{"schema_version":1,"exposures":[],"unexpected":true}"#.to_vec(),
+            ),
+            (
+                "exposure-oversized",
+                true,
+                vec![b' '; MAX_BAIT_EXPOSURE_STORE_BYTES + 1],
+            ),
+            ("proof-empty", false, Vec::new()),
+            ("proof-malformed", false, b"{not-json".to_vec()),
+            (
+                "proof-future-schema",
+                false,
+                br#"{"schema_version":2,"consumed":[]}"#.to_vec(),
+            ),
+            (
+                "proof-over-capacity",
+                false,
+                serde_json::to_vec(&StoredConsumedProofState {
+                    schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                    migration_quarantine_until: None,
+                    consumed: over_capacity_proofs,
+                })
+                .expect("over-capacity proof state should serialize"),
+            ),
+            (
+                "proof-empty-identifier",
+                false,
+                serde_json::to_vec(&StoredConsumedProofState {
+                    schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                    migration_quarantine_until: None,
+                    consumed: vec![StoredConsumedProof {
+                        session_id: private_session,
+                        bait_id: BaitId(" ".to_string()),
+                        proof_digest_hex: digest_hex(&proof_digest("private-proof-value")),
+                        expires_at_unix_secs: now + 1,
+                    }],
+                })
+                .expect("empty proof identifier state should serialize"),
+            ),
+            (
+                "proof-invalid-digest",
+                false,
+                serde_json::to_vec(&StoredConsumedProofState {
+                    schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                    migration_quarantine_until: None,
+                    consumed: vec![StoredConsumedProof {
+                        session_id: private_session,
+                        bait_id: BaitId(PRIVATE_BAIT.to_string()),
+                        proof_digest_hex: "not-a-digest".to_string(),
+                        expires_at_unix_secs: now + 1,
+                    }],
+                })
+                .expect("invalid proof digest state should serialize"),
+            ),
+            (
+                "proof-duplicate",
+                false,
+                serde_json::to_vec(&StoredConsumedProofState {
+                    schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                    migration_quarantine_until: None,
+                    consumed: vec![
+                        duplicate_proof.clone(),
+                        StoredConsumedProof {
+                            expires_at_unix_secs: now + 1,
+                            ..duplicate_proof
+                        },
+                    ],
+                })
+                .expect("duplicate proof state should serialize"),
+            ),
+            (
+                "proof-overlong-expiry",
+                false,
+                serde_json::to_vec(&StoredConsumedProofState {
+                    schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                    migration_quarantine_until: None,
+                    consumed: vec![StoredConsumedProof {
+                        session_id: private_session,
+                        bait_id: BaitId(PRIVATE_BAIT.to_string()),
+                        proof_digest_hex: digest_hex(&proof_digest("private-proof-value")),
+                        expires_at_unix_secs: now + MAX_BAIT_PROOF_TTL_SECS + 3_600,
+                    }],
+                })
+                .expect("overlong proof state should serialize"),
+            ),
+            (
+                "proof-overlong-quarantine",
+                false,
+                serde_json::to_vec(&StoredConsumedProofState {
+                    schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                    migration_quarantine_until: Some(now + MAX_BAIT_PROOF_TTL_SECS + 3_600),
+                    consumed: Vec::new(),
+                })
+                .expect("overlong proof quarantine should serialize"),
+            ),
+            (
+                "proof-unknown-field",
+                false,
+                serde_json::to_vec(&json!({
+                    "schema_version": CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                    "consumed": [{
+                        "session_id": private_session.0,
+                        "bait_id": PRIVATE_BAIT,
+                        "proof_digest_hex": digest_hex(&proof_digest("private-proof-value")),
+                        "expires_at_unix_secs": now + 1,
+                        "unexpected": true,
+                    }],
+                }))
+                .expect("unknown proof field state should serialize"),
+            ),
+            (
+                "proof-oversized",
+                false,
+                vec![b' '; MAX_CONSUMED_PROOF_STORE_BYTES + 1],
+            ),
+        ];
+
+        assert!(!lease_path.exists());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        for (label, exposure_case, invalid_state) in invalid_states {
+            for path in [&exposure_path, &proof_path] {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("{label} prior sidecar cleanup failed: {error}"),
+                }
+            }
+            let invalid_path = if exposure_case {
+                &exposure_path
+            } else {
+                &proof_path
+            };
+            fs::write(invalid_path, &invalid_state)
+                .unwrap_or_else(|error| panic!("{label} invalid state should write: {error}"));
+            let (started, started_received) = mpsc::channel();
+
+            let error = match run_proxy_with_production_shutdown(
+                fixture.parse(),
+                async {},
+                Some(started),
+            ) {
+                Ok(()) => panic!("{label} sidecar unexpectedly started production"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            let diagnostic = error.to_string();
+            assert!(!diagnostic.contains(PRIVATE_BAIT), "{label}: {diagnostic}");
+            assert!(
+                !diagnostic.contains(&private_session.0.to_string()),
+                "{label}: {diagnostic}"
+            );
+            assert!(
+                started_received.try_recv().is_err(),
+                "{label} sidecar must fail before listener bind"
+            );
+            assert_eq!(
+                fixture.renderer.synchronized_accepted_connection_count(),
+                0,
+                "{label} sidecar must fail before renderer access"
+            );
+            assert_eq!(
+                fs::read(invalid_path)
+                    .unwrap_or_else(|error| panic!("{label} invalid state should read: {error}")),
+                invalid_state,
+                "{label} invalid sidecar changed during rejected startup"
+            );
+            for untouched in [
+                &fixture.event_log_path,
+                &fixture.policy_state_path,
+                &fixture.debug_log_path,
+                &continuity_path,
+                &lease_path,
+            ] {
+                assert!(
+                    !untouched.exists(),
+                    "{label} sidecar rejection mutated `{}` first",
+                    untouched.display()
+                );
+            }
+            assert!(auxiliary_state_temp_paths(invalid_path).is_empty());
+
+            let lease = DurableStateLease::acquire_for_policy_state(&fixture.policy_state_path)
+                .unwrap_or_else(|error| {
+                    panic!("{label} rejected preflight must leave the lease acquirable: {error}")
+                });
+            drop(lease);
+            fs::remove_file(&lease_path)
+                .unwrap_or_else(|error| panic!("{label} test lease should remove: {error}"));
+        }
+
+        fs::write(
+            &exposure_path,
+            serde_json::to_vec(&StoredBaitExposureState {
+                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                exposures: Vec::new(),
+            })
+            .expect("corrected exposure state should serialize"),
+        )
+        .expect("corrected exposure state should write");
+        fs::write(
+            &proof_path,
+            serde_json::to_vec(&StoredConsumedProofState {
+                schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                migration_quarantine_until: None,
+                consumed: Vec::new(),
+            })
+            .expect("corrected proof state should serialize"),
+        )
+        .expect("corrected proof state should write");
+        let debug_log_path = fixture.debug_log_path.clone();
+
+        let server = start_production_profile_server(fixture);
+        assert!(server.address.ip().is_loopback());
+        server.stop();
+
+        assert!(
+            upstream_recorder.finish().is_empty(),
+            "sidecar validation and correction must not reach upstream"
+        );
+        let startup = debug_values(&debug_log_path)
+            .into_iter()
+            .find(|entry| entry["event"] == "proxy_started")
+            .expect("corrected sidecars should produce a startup projection");
+        assert_eq!(
+            startup["fields"]["bait_exposure_store"]["max_bytes"],
+            MAX_BAIT_EXPOSURE_STORE_BYTES
+        );
+        assert_eq!(
+            startup["fields"]["consumed_proof_store"]["max_bytes"],
+            MAX_CONSUMED_PROOF_STORE_BYTES
+        );
+        let startup_debug = startup.to_string();
+        assert!(!startup_debug.contains(PRIVATE_BAIT));
+        assert!(!startup_debug.contains(&private_session.0.to_string()));
     }
 
     #[test]
@@ -11853,6 +12743,8 @@ mod tests {
                     "policy_state": "configured",
                     "debug_log": true,
                     "policy_store": policy_store_contract_projection(),
+                    "bait_exposure_store": bait_exposure_store_contract_projection(),
+                    "consumed_proof_store": consumed_proof_store_contract_projection(),
                 },
                 "shutdown": {
                     "grace_secs": 60,
@@ -18266,12 +19158,1010 @@ mod tests {
     }
 
     #[test]
+    fn consumed_proof_state_rejects_duplicate_keys_before_expiry_filtering() {
+        let session_id = SessionId::new();
+        let bait_id = BaitId("duplicate-proof".to_string());
+        let proof_digest_hex = digest_hex(&proof_digest("duplicate-proof-value"));
+        for (label, expiries) in [
+            ("identical", [1_100, 1_100]),
+            ("expired-then-live", [999, 1_100]),
+            ("live-then-expired", [1_100, 999]),
+        ] {
+            let bytes = serde_json::to_vec(&StoredConsumedProofState {
+                schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                migration_quarantine_until: None,
+                consumed: expiries
+                    .into_iter()
+                    .map(|expires_at_unix_secs| StoredConsumedProof {
+                        session_id,
+                        bait_id: bait_id.clone(),
+                        proof_digest_hex: proof_digest_hex.clone(),
+                        expires_at_unix_secs,
+                    })
+                    .collect(),
+            })
+            .expect("duplicate state should serialize");
+
+            let error = ConsumedBaitProofStore::from_state_bytes(
+                PathBuf::from(format!("duplicate-proof-state-{label}.json")),
+                &bytes,
+                1_000,
+            )
+            .expect_err("duplicate proof keys must fail before expiry filtering");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            assert_eq!(
+                error.to_string(),
+                "consumed proof state contains a duplicate logical key",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn auxiliary_state_bounded_reader_handles_missing_empty_short_and_interrupted_reads() {
+        let missing = unique_temp_path("missing-auxiliary-state.json");
+        assert!(read_auxiliary_state_file(
+            &missing,
+            "bait exposure state",
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+        )
+        .expect("missing state should be distinguishable")
+        .is_none());
+
+        let path = Path::new("synthetic-auxiliary-state.json");
+        let empty = read_auxiliary_state_from_reader(
+            Cursor::new(Vec::new()),
+            path,
+            "bait exposure state",
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            0,
+        )
+        .expect_err("an existing empty sidecar must fail");
+        assert_eq!(empty.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            empty.to_string(),
+            "bait exposure state `synthetic-auxiliary-state.json` is empty"
+        );
+
+        let bytes = br#"{"schema_version":1,"exposures":[]}"#.to_vec();
+        let short = read_auxiliary_state_from_reader(
+            ShortReader {
+                bytes: Cursor::new(bytes.clone()),
+                max_read: 1,
+            },
+            path,
+            "bait exposure state",
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            bytes.len() as u64,
+        )
+        .expect("short reads should be reassembled");
+        assert_eq!(short, bytes);
+
+        let interrupted = read_auxiliary_state_from_reader(
+            InterruptedReader {
+                bytes: Cursor::new(bytes.clone()),
+                interrupted: false,
+            },
+            path,
+            "bait exposure state",
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            bytes.len() as u64,
+        )
+        .expect("interrupted reads should be retried");
+        assert_eq!(interrupted, bytes);
+
+        let failure = read_auxiliary_state_from_reader(
+            ReadThenFail {
+                served_prefix: false,
+            },
+            path,
+            "bait exposure state",
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            1,
+        )
+        .expect_err("ordinary I/O failures must propagate");
+        assert_eq!(failure.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(failure.to_string(), "injected auxiliary-state read failure");
+    }
+
+    #[test]
+    fn auxiliary_state_bounded_reader_enforces_metadata_and_authoritative_limits() {
+        let path = Path::new("synthetic-consumed-proof-state.json");
+        let metadata_error = read_auxiliary_state_from_reader(
+            FailsIfRead,
+            path,
+            "consumed proof state",
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            (MAX_CONSUMED_PROOF_STORE_BYTES + 1) as u64,
+        )
+        .expect_err("oversized metadata should reject before reading");
+        assert_eq!(metadata_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            metadata_error.to_string(),
+            format!(
+                "consumed proof state `{}` exceeds the fixed {} byte limit",
+                path.display(),
+                MAX_CONSUMED_PROOF_STORE_BYTES
+            )
+        );
+
+        let growth_error = read_auxiliary_state_from_reader(
+            RepeatingByteReader {
+                remaining: MAX_CONSUMED_PROOF_STORE_BYTES + 1,
+                byte: b' ',
+            },
+            path,
+            "consumed proof state",
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            0,
+        )
+        .expect_err("the bounded read must remain authoritative after metadata");
+        assert_eq!(growth_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(growth_error.to_string(), metadata_error.to_string());
+
+        let within_limit_len = AUXILIARY_STATE_READ_CHUNK_BYTES + 1;
+        let within_limit = read_auxiliary_state_from_reader(
+            RepeatingByteReader {
+                remaining: within_limit_len,
+                byte: b'x',
+            },
+            path,
+            "consumed proof state",
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            0,
+        )
+        .expect("bounded growth should retain a within-limit file");
+        assert_eq!(within_limit.len(), within_limit_len);
+        assert!(within_limit.capacity() <= MAX_CONSUMED_PROOF_STORE_BYTES + 1);
+    }
+
+    #[test]
+    fn exact_byte_limits_accept_valid_exposure_and_consumed_proof_state() {
+        let exposure_path = PathBuf::from("synthetic-exposure-exact-limit.json");
+        let mut exposure_bytes = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("empty exposure state should serialize");
+        exposure_bytes.resize(MAX_BAIT_EXPOSURE_STORE_BYTES, b' ');
+        let exposure_bytes = read_auxiliary_state_from_reader(
+            Cursor::new(exposure_bytes),
+            &exposure_path,
+            "bait exposure state",
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            MAX_BAIT_EXPOSURE_STORE_BYTES as u64,
+        )
+        .expect("exact-limit exposure state should read");
+        let exposure = BaitExposureStore::from_state_bytes(exposure_path, &exposure_bytes, 1_000)
+            .expect("trailing JSON whitespace at the exact limit should parse");
+        assert_eq!(exposure.len(), 0);
+
+        let consumed_path = unique_temp_path("synthetic-proof-exact-limit.json");
+        let mut consumed_bytes = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("empty consumed-proof state should serialize");
+        consumed_bytes.resize(MAX_CONSUMED_PROOF_STORE_BYTES, b' ');
+        let consumed_bytes = read_auxiliary_state_from_reader(
+            Cursor::new(consumed_bytes),
+            &consumed_path,
+            "consumed proof state",
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            MAX_CONSUMED_PROOF_STORE_BYTES as u64,
+        )
+        .expect("exact-limit consumed-proof state should read");
+        let consumed =
+            ConsumedBaitProofStore::from_state_bytes(consumed_path.clone(), &consumed_bytes, 1_000)
+                .expect("trailing JSON whitespace at the exact limit should parse");
+        assert!(consumed.consumed.is_empty());
+        assert!(
+            !consumed_path.exists(),
+            "pure consumed-proof parsing must not create its target file"
+        );
+        assert!(auxiliary_state_temp_paths(&consumed_path).is_empty());
+    }
+
+    #[test]
+    fn valid_bait_security_sidecar_preflight_is_byte_for_byte_read_only() {
+        let event_log_path = unique_temp_path("valid-sidecar-preflight.jsonl");
+        let exposure_path = sidecar_state_path(&event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&event_log_path, ".consumed-proofs.json");
+        let now = BAIT_EXPOSURE_TTL_SECS + 1_000;
+        let session_id = SessionId::new();
+        let exposure_bytes = serde_json::to_vec_pretty(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: vec![StoredBaitExposure {
+                session_id,
+                bait_id: BaitId("expired-exposure".to_string()),
+                exposure_id: ExposureId("expired-exposure-id".to_string()),
+                observed_at_unix_secs: 1_000,
+            }],
+        })
+        .expect("valid exposure state should serialize");
+        let proof_bytes = serde_json::to_vec_pretty(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: Some(now),
+            consumed: vec![StoredConsumedProof {
+                session_id,
+                bait_id: BaitId("expired-proof".to_string()),
+                proof_digest_hex: digest_hex(&proof_digest("expired-proof-value")),
+                expires_at_unix_secs: now,
+            }],
+        })
+        .expect("valid consumed-proof state should serialize");
+        fs::write(&exposure_path, &exposure_bytes).expect("exposure state should write");
+        fs::write(&proof_path, &proof_bytes).expect("consumed-proof state should write");
+
+        validate_bait_security_sidecars_without_mutation(&event_log_path, now)
+            .expect("valid sidecars should pass read-only preflight");
+
+        assert_eq!(
+            fs::read(&exposure_path).expect("exposure state should read"),
+            exposure_bytes
+        );
+        assert_eq!(
+            fs::read(&proof_path).expect("consumed-proof state should read"),
+            proof_bytes
+        );
+        assert!(auxiliary_state_temp_paths(&exposure_path).is_empty());
+        assert!(auxiliary_state_temp_paths(&proof_path).is_empty());
+        assert!(!event_log_path.exists());
+
+        fs::remove_file(exposure_path).expect("exposure state should remove");
+        fs::remove_file(proof_path).expect("consumed-proof state should remove");
+    }
+
+    #[test]
+    fn sidecar_preflight_rejects_canonical_expansion_before_mutation() {
+        let now = 1_000;
+        {
+            let event_log_path = unique_temp_path("expanding-exposure-preflight.jsonl");
+            let state_path = sidecar_state_path(&event_log_path, ".exposures.json");
+            let build_state = |bait_id: String| StoredBaitExposureState {
+                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                exposures: vec![StoredBaitExposure {
+                    session_id: SessionId::new(),
+                    bait_id: BaitId(bait_id),
+                    exposure_id: ExposureId("canonical-expansion".to_string()),
+                    observed_at_unix_secs: now,
+                }],
+            };
+            let compact_overhead = serde_json::to_vec(&build_state(String::new()))
+                .expect("exposure overhead should serialize")
+                .len();
+            let state = build_state("x".repeat(MAX_BAIT_EXPOSURE_STORE_BYTES - compact_overhead));
+            let compact = serde_json::to_vec(&state).expect("compact exposure should serialize");
+            assert_eq!(compact.len(), MAX_BAIT_EXPOSURE_STORE_BYTES);
+            fs::write(&state_path, &compact).expect("compact exposure state should write");
+
+            let error = validate_bait_security_sidecars_without_mutation(&event_log_path, now)
+                .expect_err("pretty-printed exposure expansion must fail preflight");
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "serialized bait exposure state exceeds the fixed {} byte limit",
+                    MAX_BAIT_EXPOSURE_STORE_BYTES
+                )
+            );
+            assert_eq!(
+                fs::read(&state_path).expect("exposure input should remain"),
+                compact
+            );
+            assert!(auxiliary_state_temp_paths(&state_path).is_empty());
+            assert!(!event_log_path.exists());
+            fs::remove_file(state_path).expect("exposure state should remove");
+        }
+
+        {
+            let event_log_path = unique_temp_path("expanding-proof-preflight.jsonl");
+            let state_path = sidecar_state_path(&event_log_path, ".consumed-proofs.json");
+            let build_state = |bait_id: String| StoredConsumedProofState {
+                schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                migration_quarantine_until: None,
+                consumed: vec![StoredConsumedProof {
+                    session_id: SessionId::new(),
+                    bait_id: BaitId(bait_id),
+                    proof_digest_hex: digest_hex(&proof_digest("canonical-expansion")),
+                    expires_at_unix_secs: now + 1,
+                }],
+            };
+            let compact_overhead = serde_json::to_vec(&build_state(String::new()))
+                .expect("proof overhead should serialize")
+                .len();
+            let state = build_state("x".repeat(MAX_CONSUMED_PROOF_STORE_BYTES - compact_overhead));
+            let compact = serde_json::to_vec(&state).expect("compact proof should serialize");
+            assert_eq!(compact.len(), MAX_CONSUMED_PROOF_STORE_BYTES);
+            fs::write(&state_path, &compact).expect("compact proof state should write");
+
+            let error = validate_bait_security_sidecars_without_mutation(&event_log_path, now)
+                .expect_err("pretty-printed proof expansion must fail preflight");
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "serialized consumed proof state exceeds the fixed {} byte limit",
+                    MAX_CONSUMED_PROOF_STORE_BYTES
+                )
+            );
+            assert_eq!(
+                fs::read(&state_path).expect("proof input should remain"),
+                compact
+            );
+            assert!(auxiliary_state_temp_paths(&state_path).is_empty());
+            assert!(!event_log_path.exists());
+            fs::remove_file(state_path).expect("proof state should remove");
+        }
+    }
+
+    #[test]
+    fn bait_security_sidecar_limits_match_the_documented_contract() {
+        assert_eq!(MAX_BAIT_EXPOSURE_STORE_BYTES, 4_194_304);
+        assert_eq!(MAX_CONSUMED_PROOF_STORE_BYTES, 4_194_304);
+        assert_eq!(MAX_BAIT_EXPOSURES, 4_096);
+        assert_eq!(MAX_CONSUMED_BAIT_PROOFS, 4_096);
+        assert_eq!(BAIT_EXPOSURE_TTL_SECS, 86_400);
+        assert_eq!(MAX_BAIT_PROOF_TTL_SECS, 86_400);
+    }
+
+    #[test]
+    fn maximum_canonical_auxiliary_state_shapes_have_explicit_headroom() {
+        let longest_builtin_bait = BaitRegistry::m3_catalog()
+            .baits()
+            .iter()
+            .max_by_key(|bait| bait.id.0.len())
+            .expect("built-in catalog should not be empty")
+            .id
+            .clone();
+        let exposures = (0..MAX_BAIT_EXPOSURES)
+            .map(|index| {
+                let session_id = SessionId(uuid::Uuid::from_u128(index as u128 + 1));
+                StoredBaitExposure {
+                    session_id,
+                    bait_id: longest_builtin_bait.clone(),
+                    exposure_id: ExposureId(format!("exp-{}", session_id.0)),
+                    observed_at_unix_secs: 4_102_444_800,
+                }
+            })
+            .collect();
+        let exposure_bytes = serialize_auxiliary_state(
+            &StoredBaitExposureState {
+                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                exposures,
+            },
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "bait exposure state",
+        )
+        .expect("maximum canonical exposure state should fit");
+        assert!(
+            exposure_bytes.len() * 2 < MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "maximum canonical exposure state should retain more than 50% byte headroom"
+        );
+
+        let consumed = (0..MAX_CONSUMED_BAIT_PROOFS)
+            .map(|index| StoredConsumedProof {
+                session_id: SessionId(uuid::Uuid::from_u128(index as u128 + 1)),
+                bait_id: longest_builtin_bait.clone(),
+                proof_digest_hex: digest_hex(&Sha256::digest(index.to_le_bytes()).into()),
+                expires_at_unix_secs: 4_102_531_200,
+            })
+            .collect();
+        let consumed_bytes = serialize_auxiliary_state(
+            &StoredConsumedProofState {
+                schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                migration_quarantine_until: Some(4_102_531_200),
+                consumed,
+            },
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            "consumed proof state",
+        )
+        .expect("maximum canonical consumed-proof state should fit");
+        assert!(
+            consumed_bytes.len() * 2 < MAX_CONSUMED_PROOF_STORE_BYTES,
+            "maximum canonical consumed-proof state should retain more than 50% byte headroom"
+        );
+    }
+
+    #[test]
+    fn auxiliary_state_rejects_future_exposure_and_overlong_proof_quarantine() {
+        let future_exposure = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: vec![StoredBaitExposure {
+                session_id: SessionId::new(),
+                bait_id: BaitId("future".to_string()),
+                exposure_id: ExposureId("future".to_string()),
+                observed_at_unix_secs: 1_001,
+            }],
+        })
+        .expect("future exposure should serialize");
+        let exposure_error = BaitExposureStore::from_state_bytes(
+            PathBuf::from("future-exposure-state.json"),
+            &future_exposure,
+            1_000,
+        )
+        .expect_err("future exposure timestamp must fail");
+        assert_eq!(
+            exposure_error.to_string(),
+            "bait exposure state contains a future-dated timestamp"
+        );
+
+        let overlong_quarantine = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: Some(1_000 + MAX_BAIT_PROOF_TTL_SECS + 1),
+            consumed: Vec::new(),
+        })
+        .expect("overlong quarantine should serialize");
+        let proof_error = ConsumedBaitProofStore::from_state_bytes(
+            PathBuf::from("overlong-proof-quarantine.json"),
+            &overlong_quarantine,
+            1_000,
+        )
+        .expect_err("overlong proof quarantine must fail");
+        assert_eq!(
+            proof_error.to_string(),
+            "consumed proof migration quarantine exceeds the maximum proof lifetime"
+        );
+    }
+
+    #[test]
+    fn auxiliary_state_accepts_exact_timestamp_and_lifetime_boundaries() {
+        let now = 1_000;
+        let session_id = SessionId::new();
+        let exposure_bytes = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: vec![StoredBaitExposure {
+                session_id,
+                bait_id: BaitId("boundary-exposure".to_string()),
+                exposure_id: ExposureId("boundary-exposure-id".to_string()),
+                observed_at_unix_secs: now,
+            }],
+        })
+        .expect("boundary exposure state should serialize");
+        let exposure = BaitExposureStore::from_state_bytes(
+            PathBuf::from("boundary-exposure-state.json"),
+            &exposure_bytes,
+            now,
+        )
+        .expect("an exposure observed exactly now should be valid");
+        assert_eq!(exposure.len(), 1);
+
+        let maximum_expiry = now + MAX_BAIT_PROOF_TTL_SECS;
+        let proof_bytes = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: Some(maximum_expiry),
+            consumed: vec![StoredConsumedProof {
+                session_id,
+                bait_id: BaitId("boundary-proof".to_string()),
+                proof_digest_hex: digest_hex(&proof_digest("boundary-proof-value")),
+                expires_at_unix_secs: maximum_expiry,
+            }],
+        })
+        .expect("boundary consumed-proof state should serialize");
+        let proof = ConsumedBaitProofStore::from_state_bytes(
+            PathBuf::from("boundary-consumed-proof-state.json"),
+            &proof_bytes,
+            now,
+        )
+        .expect("exact maximum proof and quarantine lifetimes should be valid");
+        assert_eq!(proof.consumed.len(), 1);
+        assert_eq!(proof.migration_quarantine_until, Some(maximum_expiry));
+    }
+
+    #[test]
+    fn auxiliary_state_oversize_and_partial_writes_preserve_last_good_file() {
+        let path = unique_temp_path("bounded-auxiliary-write.json");
+        let original = b"last-good-state".to_vec();
+        fs::write(&path, &original).expect("last-good state should write");
+        let oversized = json!({"payload": "x".repeat(128)});
+        let oversize_error = atomic_state_write(&path, &oversized, 64, "synthetic auxiliary state")
+            .expect_err("oversized serialization must fail before a temp file is created");
+        assert_eq!(oversize_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            oversize_error.to_string(),
+            "serialized synthetic auxiliary state exceeds the fixed 64 byte limit"
+        );
+        assert_eq!(
+            fs::read(&path).expect("last-good state should read"),
+            original
+        );
+        assert!(auxiliary_state_temp_paths(&path).is_empty());
+
+        let partial_error = atomic_state_write_with(
+            &path,
+            &json!({"replacement": true}),
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "synthetic auxiliary state",
+            |file, bytes| {
+                file.write_all(&bytes[..bytes.len() / 2])?;
+                Err(io::Error::other("injected partial auxiliary-state write"))
+            },
+            sync_state_parent_directory,
+        )
+        .expect_err("partial write must fail before rename");
+        assert_eq!(
+            partial_error.to_string(),
+            "injected partial auxiliary-state write"
+        );
+        assert_eq!(
+            fs::read(&path).expect("last-good state should read"),
+            original
+        );
+        assert!(auxiliary_state_temp_paths(&path).is_empty());
+        fs::remove_file(path).expect("test state should remove");
+    }
+
+    #[test]
+    fn auxiliary_state_file_sync_and_rename_failures_preserve_last_good_file() {
+        let path = unique_temp_path("auxiliary-sync-rename-failure.json");
+        let original = br#"{"last_good":true}"#.to_vec();
+        fs::write(&path, &original).expect("last-good state should write");
+
+        let sync_error = atomic_state_write_with_steps(
+            &path,
+            &json!({"replacement": "file-sync"}),
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "synthetic auxiliary state",
+            AtomicStateWriteSteps {
+                write_payload: |file: &mut fs::File, bytes: &[u8]| file.write_all(bytes),
+                sync_file: |_: &fs::File| {
+                    Err(io::Error::other(
+                        "injected auxiliary-state file sync failure",
+                    ))
+                },
+                rename: |from: &Path, to: &Path| fs::rename(from, to),
+                sync_parent: sync_state_parent_directory,
+            },
+        )
+        .expect_err("file sync failure must stop before rename");
+        assert_eq!(
+            sync_error.to_string(),
+            "injected auxiliary-state file sync failure"
+        );
+        assert_eq!(
+            fs::read(&path).expect("last-good state should read after sync failure"),
+            original
+        );
+        assert!(auxiliary_state_temp_paths(&path).is_empty());
+
+        let rename_error = atomic_state_write_with_steps(
+            &path,
+            &json!({"replacement": "rename"}),
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "synthetic auxiliary state",
+            AtomicStateWriteSteps {
+                write_payload: |file: &mut fs::File, bytes: &[u8]| file.write_all(bytes),
+                sync_file: fs::File::sync_all,
+                rename: |_: &Path, _: &Path| {
+                    Err(io::Error::other("injected auxiliary-state rename failure"))
+                },
+                sync_parent: sync_state_parent_directory,
+            },
+        )
+        .expect_err("rename failure must preserve the prior file");
+        assert_eq!(
+            rename_error.to_string(),
+            "injected auxiliary-state rename failure"
+        );
+        assert_eq!(
+            fs::read(&path).expect("last-good state should read after rename failure"),
+            original
+        );
+        assert!(auxiliary_state_temp_paths(&path).is_empty());
+
+        fs::remove_file(path).expect("test state should remove");
+    }
+
+    #[test]
+    fn sidecar_write_limits_roll_back_security_state_and_preserve_last_good_files() {
+        let exposure_event_log = unique_temp_path("oversized-exposure-write.jsonl");
+        let exposure_path = sidecar_state_path(&exposure_event_log, ".exposures.json");
+        let mut exposures = BaitExposureStore::open_or_rebuild(&exposure_event_log, 1_000)
+            .expect("empty exposure sidecar should initialize");
+        let exposure_before = fs::read(&exposure_path).expect("initial exposure state should read");
+        let private_exposure = "private-exposure-value";
+        let exposure_error = exposures
+            .record_exposure_at(
+                SessionId::new(),
+                BaitId("x".repeat(MAX_BAIT_EXPOSURE_STORE_BYTES + 1)),
+                ExposureId(private_exposure.to_string()),
+                1_000,
+                1_000,
+            )
+            .expect_err("oversized exposure replacement must fail closed");
+        assert_eq!(exposure_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            exposure_error.to_string(),
+            format!(
+                "serialized bait exposure state exceeds the fixed {} byte limit",
+                MAX_BAIT_EXPOSURE_STORE_BYTES
+            )
+        );
+        assert_eq!(exposures.len(), 0);
+        assert_eq!(
+            fs::read(&exposure_path).expect("last-good exposure state should read"),
+            exposure_before
+        );
+        assert!(auxiliary_state_temp_paths(&exposure_path).is_empty());
+        assert!(!exposure_error.to_string().contains(private_exposure));
+
+        let proof_path = unique_temp_path("oversized-consumed-proof-write.json");
+        let mut proofs = ConsumedBaitProofStore {
+            path: Some(proof_path.clone()),
+            ..ConsumedBaitProofStore::default()
+        };
+        proofs
+            .persist()
+            .expect("empty consumed-proof sidecar should initialize");
+        let proof_before = fs::read(&proof_path).expect("initial proof state should read");
+        assert_eq!(
+            proofs.check_and_mark(
+                SessionId::new(),
+                BaitId("x".repeat(MAX_CONSUMED_PROOF_STORE_BYTES + 1)),
+                "private-proof-value".to_string(),
+                1_100,
+                1_000,
+            ),
+            ConsumeProofOutcome::Unavailable
+        );
+        assert!(proofs.consumed.is_empty());
+        assert_eq!(
+            fs::read(&proof_path).expect("last-good proof state should read"),
+            proof_before
+        );
+        assert!(auxiliary_state_temp_paths(&proof_path).is_empty());
+
+        fs::remove_file(exposure_path).expect("exposure state should remove");
+        fs::remove_file(proof_path).expect("proof state should remove");
+    }
+
+    #[test]
+    fn auxiliary_state_rejects_empty_identifiers_and_redacts_strict_json_errors() {
+        let empty_exposure_id = br#"{
+            "schema_version": 1,
+            "exposures": [{
+                "session_id": "00000000-0000-0000-0000-000000000001",
+                "bait_id": "bait",
+                "exposure_id": " ",
+                "observed_at_unix_secs": 1000
+            }]
+        }"#;
+        let exposure_error = BaitExposureStore::from_state_bytes(
+            PathBuf::from("empty-exposure-id.json"),
+            empty_exposure_id,
+            1_000,
+        )
+        .expect_err("empty exposure identifier must fail");
+        assert_eq!(
+            exposure_error.to_string(),
+            "bait exposure state contains an empty identifier"
+        );
+
+        let empty_bait_id = format!(
+            r#"{{
+                "schema_version": 1,
+                "consumed": [{{
+                    "session_id": "00000000-0000-0000-0000-000000000001",
+                    "bait_id": "",
+                    "proof_digest_hex": "{}",
+                    "expires_at_unix_secs": 1100
+                }}]
+            }}"#,
+            "00".repeat(32)
+        );
+        let proof_error = ConsumedBaitProofStore::from_state_bytes(
+            PathBuf::from("empty-proof-bait-id.json"),
+            empty_bait_id.as_bytes(),
+            1_000,
+        )
+        .expect_err("empty proof bait identifier must fail");
+        assert_eq!(
+            proof_error.to_string(),
+            "consumed proof state contains an empty bait identifier"
+        );
+
+        let exposure_unknown_name = "private_exposure_unknown_field";
+        let exposure_unknown_value = "private_exposure_unknown_value";
+        let unknown_field = format!(
+            r#"{{"schema_version":1,"exposures":[],"{exposure_unknown_name}":"{exposure_unknown_value}"}}"#
+        );
+        let unknown_error = BaitExposureStore::from_state_bytes(
+            PathBuf::from("unknown-exposure-field.json"),
+            unknown_field.as_bytes(),
+            1_000,
+        )
+        .expect_err("unknown current-schema fields must fail");
+        assert_eq!(unknown_error.kind(), io::ErrorKind::InvalidData);
+        assert!(unknown_error
+            .to_string()
+            .contains("failed to parse bait exposure state"));
+        assert!(!unknown_error.to_string().contains(exposure_unknown_name));
+        assert!(!unknown_error.to_string().contains(exposure_unknown_value));
+
+        let exposure_session_value = "private-invalid-exposure-session";
+        let invalid_exposure_session = format!(
+            r#"{{
+                "schema_version": 1,
+                "exposures": [{{
+                    "session_id": "{exposure_session_value}",
+                    "bait_id": "bait",
+                    "exposure_id": "exposure",
+                    "observed_at_unix_secs": 1000
+                }}]
+            }}"#
+        );
+        let exposure_position =
+            serde_json::from_slice::<StoredBaitExposureState>(invalid_exposure_session.as_bytes())
+                .expect_err("invalid exposure session should have a serde position");
+        let session_error = BaitExposureStore::from_state_bytes(
+            PathBuf::from("invalid-exposure-session.json"),
+            invalid_exposure_session.as_bytes(),
+            1_000,
+        )
+        .expect_err("invalid exposure session must fail");
+        assert_eq!(session_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            session_error.to_string(),
+            format!(
+                "failed to parse bait exposure state `invalid-exposure-session.json` as strict JSON at line {} column {}",
+                exposure_position.line(),
+                exposure_position.column()
+            )
+        );
+        assert!(!session_error.to_string().contains(exposure_session_value));
+
+        let proof_unknown_name = "private_proof_unknown_field";
+        let proof_unknown_value = "private_proof_unknown_value";
+        let unknown_proof_field = format!(
+            r#"{{
+                "schema_version": 1,
+                "consumed": [{{
+                    "session_id": "00000000-0000-0000-0000-000000000001",
+                    "bait_id": "bait",
+                    "proof_digest_hex": "{}",
+                    "expires_at_unix_secs": 1100,
+                    "{proof_unknown_name}": "{proof_unknown_value}"
+                }}]
+            }}"#,
+            "00".repeat(32)
+        );
+        let unknown_proof_error = ConsumedBaitProofStore::from_state_bytes(
+            PathBuf::from("unknown-proof-field.json"),
+            unknown_proof_field.as_bytes(),
+            1_000,
+        )
+        .expect_err("unknown proof fields must fail");
+        assert_eq!(unknown_proof_error.kind(), io::ErrorKind::InvalidData);
+        assert!(unknown_proof_error
+            .to_string()
+            .contains("failed to parse consumed proof state"));
+        assert!(!unknown_proof_error.to_string().contains(proof_unknown_name));
+        assert!(!unknown_proof_error
+            .to_string()
+            .contains(proof_unknown_value));
+
+        let proof_session_value = "private-invalid-proof-session";
+        let invalid_proof_session = format!(
+            r#"{{
+                "schema_version": 1,
+                "consumed": [{{
+                    "session_id": "{proof_session_value}",
+                    "bait_id": "bait",
+                    "proof_digest_hex": "{}",
+                    "expires_at_unix_secs": 1100
+                }}]
+            }}"#,
+            "00".repeat(32)
+        );
+        let proof_position =
+            serde_json::from_slice::<StoredConsumedProofState>(invalid_proof_session.as_bytes())
+                .expect_err("invalid proof session should have a serde position");
+        let proof_session_error = ConsumedBaitProofStore::from_state_bytes(
+            PathBuf::from("invalid-proof-session.json"),
+            invalid_proof_session.as_bytes(),
+            1_000,
+        )
+        .expect_err("invalid proof session must fail");
+        assert_eq!(proof_session_error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            proof_session_error.to_string(),
+            format!(
+                "failed to parse consumed proof state `invalid-proof-session.json` as strict JSON at line {} column {}",
+                proof_position.line(),
+                proof_position.column()
+            )
+        );
+        assert!(!proof_session_error
+            .to_string()
+            .contains(proof_session_value));
+    }
+
+    #[test]
+    fn auxiliary_state_atomic_write_refuses_temp_collisions_and_sets_owner_only_mode() {
+        let path = unique_temp_path("collision-safe-auxiliary-write.json");
+        let predictable_temp = auxiliary_state_temp_path(&path);
+        fs::write(&predictable_temp, b"unrelated-sentinel")
+            .expect("predictable temp sentinel should write");
+
+        let collision = atomic_state_write(
+            &path,
+            &json!({"committed": true}),
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "synthetic auxiliary state",
+        )
+        .expect_err("create-new temp must reject an existing reserved path");
+
+        assert_eq!(collision.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read(&predictable_temp).expect("predictable sentinel should remain"),
+            b"unrelated-sentinel"
+        );
+        fs::remove_file(&predictable_temp).expect("predictable sentinel should remove");
+
+        atomic_state_write(
+            &path,
+            &json!({"committed": true}),
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "synthetic auxiliary state",
+        )
+        .expect("collision-free create-new temp should commit");
+
+        assert!(auxiliary_state_temp_paths(&path).is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("committed state should have metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        fs::remove_file(path).expect("committed state should remove");
+    }
+
+    #[test]
+    fn authoritative_sidecar_open_removes_bounded_crash_leftovers() {
+        let event_log_path = unique_temp_path("stale-sidecar-temp.jsonl");
+        let exposure_path = sidecar_state_path(&event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&event_log_path, ".consumed-proofs.json");
+        fs::write(
+            &exposure_path,
+            serde_json::to_vec(&StoredBaitExposureState {
+                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                exposures: Vec::new(),
+            })
+            .expect("exposure state should serialize"),
+        )
+        .expect("exposure state should write");
+        fs::write(
+            &proof_path,
+            serde_json::to_vec(&StoredConsumedProofState {
+                schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                migration_quarantine_until: None,
+                consumed: Vec::new(),
+            })
+            .expect("proof state should serialize"),
+        )
+        .expect("proof state should write");
+        let exposure_temp = auxiliary_state_temp_path(&exposure_path);
+        let proof_temp = auxiliary_state_temp_path(&proof_path);
+        fs::write(&exposure_temp, b"crash-left exposure replacement")
+            .expect("stale exposure temp should write");
+        fs::write(&proof_temp, b"crash-left proof replacement")
+            .expect("stale proof temp should write");
+
+        BaitExposureStore::open_or_rebuild(&event_log_path, 1_000)
+            .expect("authoritative exposure open should remove its stale temp");
+        ConsumedBaitProofStore::open_or_rebuild(
+            &event_log_path,
+            &BaitRegistry::m3_catalog(),
+            None,
+            1_000,
+        )
+        .expect("authoritative proof open should remove its stale temp");
+
+        assert!(!exposure_temp.exists());
+        assert!(!proof_temp.exists());
+        assert!(auxiliary_state_temp_paths(&exposure_path).is_empty());
+        assert!(auxiliary_state_temp_paths(&proof_path).is_empty());
+        fs::remove_file(exposure_path).expect("exposure state should remove");
+        fs::remove_file(proof_path).expect("proof state should remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authoritative_sidecar_open_rejects_stale_temp_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let event_log_path = unique_temp_path("symlink-sidecar-temp.jsonl");
+        let exposure_path = sidecar_state_path(&event_log_path, ".exposures.json");
+        let original = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure state should serialize");
+        fs::write(&exposure_path, &original).expect("exposure state should write");
+        let outside = unique_temp_path("outside-sidecar-temp-target");
+        fs::write(&outside, b"outside-sentinel").expect("outside sentinel should write");
+        let temp = auxiliary_state_temp_path(&exposure_path);
+        symlink(&outside, &temp).expect("stale temp symlink should create");
+
+        let error = BaitExposureStore::open_or_rebuild(&event_log_path, 1_000)
+            .expect_err("stale temp symlink must fail authoritative open");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "auxiliary state temporary path is not a regular file"
+        );
+        assert_eq!(
+            fs::read(&exposure_path).expect("last-good exposure should remain"),
+            original
+        );
+        assert_eq!(
+            fs::read(&outside).expect("outside sentinel should remain"),
+            b"outside-sentinel"
+        );
+        assert!(fs::symlink_metadata(&temp)
+            .expect("rejected symlink should remain")
+            .file_type()
+            .is_symlink());
+        fs::remove_file(temp).expect("temp symlink should remove");
+        fs::remove_file(exposure_path).expect("exposure state should remove");
+        fs::remove_file(outside).expect("outside sentinel should remove");
+    }
+
+    #[test]
+    fn authoritative_sidecar_open_rejects_non_regular_stale_temp() {
+        let event_log_path = unique_temp_path("directory-sidecar-temp.jsonl");
+        let exposure_path = sidecar_state_path(&event_log_path, ".exposures.json");
+        let original = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure state should serialize");
+        fs::write(&exposure_path, &original).expect("exposure state should write");
+        let temp = auxiliary_state_temp_path(&exposure_path);
+        fs::create_dir(&temp).expect("stale temp directory should create");
+
+        let error = BaitExposureStore::open_or_rebuild(&event_log_path, 1_000)
+            .expect_err("non-regular stale temp must fail authoritative open");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "auxiliary state temporary path is not a regular file"
+        );
+        assert_eq!(
+            fs::read(&exposure_path).expect("last-good exposure should remain"),
+            original
+        );
+        assert!(fs::metadata(&temp)
+            .expect("rejected temp directory should remain")
+            .is_dir());
+        fs::remove_dir(temp).expect("temp directory should remove");
+        fs::remove_file(exposure_path).expect("exposure state should remove");
+    }
+
+    #[test]
     fn atomic_state_write_supports_relative_paths() {
         let unique = unique_temp_path("relative-state.json");
         let relative = PathBuf::from(unique.file_name().expect("unique file name"));
 
-        atomic_state_write(&relative, &json!({"healthy": true}))
-            .expect("relative state should persist");
+        atomic_state_write(
+            &relative,
+            &json!({"healthy": true}),
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "test state",
+        )
+        .expect("relative state should persist");
 
         let stored: Value = serde_json::from_slice(
             &fs::read(&relative).expect("relative state should be readable"),
@@ -18285,11 +20175,14 @@ mod tests {
     fn atomic_state_write_distinguishes_post_rename_sync_failure() {
         let path = unique_temp_path("post-rename-sync-failure.json");
 
-        let outcome =
-            atomic_state_write_with_parent_sync(&path, &json!({"committed": true}), |_| {
-                Err(io::Error::other("directory sync failed"))
-            })
-            .expect("rename should commit");
+        let outcome = atomic_state_write_with_parent_sync(
+            &path,
+            &json!({"committed": true}),
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+            "test state",
+            |_| Err(io::Error::other("directory sync failed")),
+        )
+        .expect("rename should commit");
 
         assert_eq!(
             outcome,
@@ -18465,7 +20358,7 @@ mod tests {
     }
 
     #[test]
-    fn bait_exposure_state_compacts_over_capacity_on_restart() {
+    fn bait_exposure_state_rejects_over_capacity_before_compaction() {
         let event_log = unique_temp_path("over-capacity-exposure-state.jsonl");
         let state_path = sidecar_state_path(&event_log, ".exposures.json");
         let exposures = (0..MAX_BAIT_EXPOSURES + 3)
@@ -18486,14 +20379,131 @@ mod tests {
         )
         .expect("state should write");
 
-        let store = BaitExposureStore::open_or_rebuild(&event_log, 2_000)
-            .expect("over-capacity state should compact");
+        let original = fs::read(&state_path).expect("over-capacity state should remain readable");
+        let error = BaitExposureStore::open_or_rebuild(&event_log, 2_000)
+            .expect_err("over-capacity state must fail before compaction");
 
-        assert_eq!(store.len(), MAX_BAIT_EXPOSURES);
-        let persisted: StoredBaitExposureState =
-            serde_json::from_slice(&fs::read(&state_path).expect("compacted state should read"))
-                .expect("compacted state should parse");
-        assert_eq!(persisted.exposures.len(), MAX_BAIT_EXPOSURES);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "bait exposure state exceeds the fixed record limit"
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("invalid state must remain untouched"),
+            original
+        );
+    }
+
+    #[test]
+    fn bait_exposure_state_rejects_duplicate_keys_before_ttl_filtering() {
+        let now = BAIT_EXPOSURE_TTL_SECS + 1_000;
+        let expired = now - BAIT_EXPOSURE_TTL_SECS;
+        let live = now;
+        assert!(expired.saturating_add(BAIT_EXPOSURE_TTL_SECS) <= now);
+        assert!(live.saturating_add(BAIT_EXPOSURE_TTL_SECS) > now);
+        let session_id = SessionId::new();
+        let bait_id = BaitId("duplicate-exposure".to_string());
+        for (label, rows) in [
+            ("identical", [("same", live), ("same", live)]),
+            ("expired-then-live", [("expired", expired), ("live", live)]),
+            ("live-then-expired", [("live", live), ("expired", expired)]),
+        ] {
+            let bytes = serde_json::to_vec(&StoredBaitExposureState {
+                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                exposures: rows
+                    .into_iter()
+                    .map(|(exposure_id, observed_at_unix_secs)| StoredBaitExposure {
+                        session_id,
+                        bait_id: bait_id.clone(),
+                        exposure_id: ExposureId(exposure_id.to_string()),
+                        observed_at_unix_secs,
+                    })
+                    .collect(),
+            })
+            .expect("duplicate state should serialize");
+
+            let error = BaitExposureStore::from_state_bytes(
+                PathBuf::from(format!("duplicate-exposure-state-{label}.json")),
+                &bytes,
+                now,
+            )
+            .expect_err("duplicate exposure keys must fail before TTL filtering");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            assert_eq!(
+                error.to_string(),
+                "bait exposure state contains a duplicate logical key",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn bait_exposure_equal_timestamp_load_order_cannot_choose_later_eviction() {
+        let now = BAIT_EXPOSURE_TTL_SECS + 1_000;
+        let session_id = SessionId::new();
+        let records = (0..MAX_BAIT_EXPOSURES)
+            .map(|index| StoredBaitExposure {
+                session_id,
+                bait_id: BaitId(format!("bait-{index:04}")),
+                exposure_id: ExposureId(format!("exposure-{index:04}")),
+                observed_at_unix_secs: now,
+            })
+            .collect::<Vec<_>>();
+        let mut reversed_records = records.clone();
+        reversed_records.reverse();
+        let serialize = |exposures| {
+            serde_json::to_vec(&StoredBaitExposureState {
+                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                exposures,
+            })
+            .expect("exposure state should serialize")
+        };
+
+        let mut forward = BaitExposureStore::from_state_bytes(
+            PathBuf::from("forward-equal-time-exposures.json"),
+            &serialize(records),
+            now,
+        )
+        .expect("forward exposure state should load");
+        let mut reversed = BaitExposureStore::from_state_bytes(
+            PathBuf::from("reversed-equal-time-exposures.json"),
+            &serialize(reversed_records),
+            now,
+        )
+        .expect("reversed exposure state should load");
+
+        assert_eq!(forward.exposure_order, reversed.exposure_order);
+        assert_eq!(
+            forward.exposure_order.front(),
+            Some(&(session_id, BaitId("bait-0000".to_string())))
+        );
+
+        let overflow_bait = BaitId("bait-overflow".to_string());
+        for store in [&mut forward, &mut reversed] {
+            store.apply_record_exposure_at(
+                session_id,
+                overflow_bait.clone(),
+                ExposureId("exposure-overflow".to_string()),
+                now,
+                now,
+            );
+        }
+
+        assert_eq!(forward.exposure_order, reversed.exposure_order);
+        assert_eq!(forward.exposures.len(), MAX_BAIT_EXPOSURES);
+        assert_eq!(reversed.exposures.len(), MAX_BAIT_EXPOSURES);
+        assert!(!forward
+            .exposures
+            .contains_key(&(session_id, BaitId("bait-0000".to_string()))));
+        assert!(!reversed
+            .exposures
+            .contains_key(&(session_id, BaitId("bait-0000".to_string()))));
+        assert!(forward
+            .exposures
+            .contains_key(&(session_id, overflow_bait.clone())));
+        assert!(reversed
+            .exposures
+            .contains_key(&(session_id, overflow_bait)));
     }
 
     #[test]

@@ -235,6 +235,20 @@ where prior event history exists but the replay index does not, minted proof
 acceptance remains unavailable for one maximum proof window rather than
 risking replay-state loss.
 
+The committed exposure and consumed-proof sidecars each have a 4,194,304-byte
+limit in addition to the 4096-record limit. An existing file is read through a
+limit-plus-one buffer and must contain strict schema-v1 JSON with unique logical
+keys; empty, malformed, oversized, over-capacity, unknown-field, empty-ID,
+future-timestamp, or overlong-lifetime state blocks production startup. All
+rows validate before TTL pruning, so duplicate live/expired rows cannot use
+file order to choose correlation or replay state. Production preflight also
+dry-runs the canonical pretty-printed rewrite, so a compact file that fits the
+read limit but would expand beyond the write limit fails before the writer
+lease. A valid file padded with JSON whitespace is accepted exactly at the byte
+limit when its canonical rewrite also fits. Missing sidecars retain the
+existing rebuild/quarantine behavior; the JSONL reconstruction input is a
+separate bound and is not covered by these sidecar limits.
+
 Generated session-proof responses carry `Cache-Control: private, no-store` and
 `Vary: Cookie`. Eidolon strips validators, range metadata, and CDN-specific
 cache controls from rewritten proof responses. Existing caches are not purged
@@ -242,19 +256,28 @@ by `no-store`, so operators must invalidate any proof-bearing URL cached by an
 older deployment.
 
 Policy-state writes verify the same 33,554,432-byte limit before opening the
-temp file, then use fsync and rename. A would-exceed mutation leaves the last
-durable file unchanged and rolls back its in-memory policy mutation. Other
-failed state writes follow the existing rollback or proof-unavailable path.
+temp file, then use fsync and rename. Bait-security sidecar writes likewise
+verify their respective 4,194,304-byte limit before creating an owner-only,
+same-directory `<sidecar>.tmp` with `create_new`, then sync, rename, and sync the
+parent. During authoritative open under the single-writer lease, one regular
+crash-left temp is removed only after the committed sidecar validates; a
+symlink or non-regular object at the reserved path fails closed. This fixed
+name bounds crash residue and matches the Kubernetes recovery allowlist. A
+would-exceed or other pre-rename failure leaves the last durable file unchanged
+and rolls back exposure state or makes proof acceptance unavailable according
+to the existing fail-closed contract.
 The JSONL event and debug logs rotate at 32 MiB to collision-safe timestamped
 archives, keeping exactly 3 archives plus the active segment per log. Together
 those logs consume at most about 256 MiB before filesystem overhead, below the
 lab's 1 GiB PVC. Startup restores a missing newline or truncates only an
 invalid final fragment before appending, while corruption anywhere earlier
-still fails with the exact line number. The `state.policy_store` effective
-configuration and `proxy_started.fields.policy_store` debug projection report
-only byte/record/TTL/schema bounds and aggregate startup outcomes; they never
-include file contents or durable session/request identifiers. Persistence
-failures use the exact `eidolon persistence failure:` marker.
+still fails with the exact line number. The `state.policy_store`,
+`state.bait_exposure_store`, and `state.consumed_proof_store` effective
+configuration projections report only byte/record/TTL/schema bounds. Their
+server-side `proxy_started.fields` counterparts add configured state paths and
+aggregate startup outcomes, but never file contents or durable
+session/request/bait/proof identifiers. Persistence failures use the exact
+`eidolon persistence failure:` marker.
 
 These source controls do not prove behavior when a mounted persistent volume
 becomes corrupt or unavailable while the pod is running. Issue `#253` owns
@@ -277,12 +300,14 @@ traverse that directory before ownership is normalized again.
 This repairs the observed legacy ownership blocker, but by itself does not
 prove live upgrade, rollback, or storage-driver portability.
 
-Before binding its listener or opening durable stores, the proxy takes an
-exclusive operating-system writer lease at `<policy-state-path>.lock`. A
-second process using the same policy-state path fails startup instead of
-overlapping writes. The operating system releases the lease after normal exit
-or a crash; the bounded lock-file metadata is diagnostic only. The storage
-profile must support advisory file locking.
+Production first performs read-only bounded validation of existing policy,
+bait-exposure, and consumed-proof state. It then takes an exclusive
+operating-system writer lease at `<policy-state-path>.lock` before opening
+durable writers or binding its listener. A second process using the same
+policy-state path fails startup instead of overlapping writes. The operating
+system releases the lease after normal exit or a crash; the bounded lock-file
+metadata is diagnostic only. The storage profile must support advisory file
+locking.
 
 ### Kind State Backup/Restore Validation
 
