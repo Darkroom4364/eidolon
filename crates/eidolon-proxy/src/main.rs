@@ -10997,6 +10997,30 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn wait_for_bait_proof_window_headroom(bait: &Bait) {
+        const MINIMUM_HEADROOM_SECS: u64 = 10;
+        let proof_window = bait
+            .expected_action
+            .header_value_mint
+            .as_ref()
+            .and_then(|mint| mint.proof_window_seconds)
+            .expect("minted test bait should use a proof window");
+        assert!(
+            proof_window >= MINIMUM_HEADROOM_SECS,
+            "minted test bait must provide enough proof-window headroom"
+        );
+        let wait_deadline = Instant::now()
+            .checked_add(Duration::from_secs(MINIMUM_HEADROOM_SECS + 2))
+            .expect("proof-window wait deadline should fit");
+        while proof_window.saturating_sub(now_unix_secs() % proof_window) < MINIMUM_HEADROOM_SECS {
+            assert!(
+                Instant::now() < wait_deadline,
+                "system clock did not leave the proof-window boundary"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn minted_cookie_value(session_id: SessionId) -> String {
         test_session_authority().mint_cookie_value(session_id, now_unix_secs())
     }
@@ -15989,6 +16013,7 @@ mod tests {
         let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
         let session_b = SessionId::new();
         let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered_a = render_bait_for_session(&bait, session_a, Some(signing_secret.as_ref()))
             .expect("session A bait should render")
             .into_owned();
@@ -16277,6 +16302,7 @@ mod tests {
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -16917,6 +16943,7 @@ mod tests {
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -16980,6 +17007,7 @@ mod tests {
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -17064,6 +17092,7 @@ mod tests {
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -17191,6 +17220,7 @@ mod tests {
         let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
         let session_b = SessionId::new();
         let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered_a = render_bait_for_session(&bait, session_a, Some(signing_secret.as_ref()))
             .expect("session A bait should render")
             .into_owned();
@@ -17338,15 +17368,7 @@ mod tests {
 
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
-        let proof_window = bait
-            .expected_action
-            .header_value_mint
-            .as_ref()
-            .and_then(|mint| mint.proof_window_seconds)
-            .expect("minted test bait should use a proof window");
-        while proof_window.saturating_sub(now_unix_secs() % proof_window) < 10 {
-            thread::sleep(Duration::from_millis(25));
-        }
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("minted bait should render")
             .into_owned();
@@ -17541,6 +17563,7 @@ mod tests {
         );
 
         let replay_session = SessionId::new();
+        wait_for_bait_proof_window_headroom(&bait);
         let replay_proof = render_bait_for_session(&bait, replay_session, Some("mint-secret"))
             .expect("minted bait should render")
             .into_owned();
@@ -30100,6 +30123,7 @@ mod tests {
 
         let session_id = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session_id));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session_id, Some(signing_secret.as_ref()))
             .expect("session bait should render")
             .into_owned();
