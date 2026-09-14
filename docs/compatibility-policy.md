@@ -28,12 +28,12 @@ Eidolon releases use semantic versioning. Within a major release line:
 
 | Artifact | Version field | Current | Reader fail-closed rule |
 | --- | --- | --- | --- |
-| Event log (`events.jsonl`) | `schema_version` per record | `2` | Readers reject any other version with an actionable error (`eidolon-trace` reader enforces; tested). |
+| Event log (`events.jsonl`) | `schema_version` per record | `2` (one 33,554,432-byte active segment, three 33,554,432-byte archives, 134,217,728-byte family, 1,048,576-byte record excluding newline) | Production recovery accepts only schema-v2 events in the bounded family. Canonical archives are `<event-log>.<39 ASCII digits>`; all-digit noncanonical names, a fourth archive, symlinks, non-regular members, over-limit segments/records, invalid complete records, duplicate event IDs, and conflicting selected workflow evidence fail closed. |
 | Debug log (`debug.jsonl`) | `schema_version` + `run_kind` envelope | `1` (`eidolon_proxy_debug`) | Server-side diagnostic only; no supported reader today. A validating reader is tracked by issue #252. |
 | Policy state (`policy-state.json`) | `schema_version` | `3` (reads `1..=3`; maximum 33,554,432 bytes and 8,192 retained records) | Missing state initializes empty. Existing empty, malformed, truncated, oversized, unsupported-version, duplicate-session, or internally inconsistent pending-workflow state fails startup before migration or listener bind. A staged controlled-reality-to-blocked event accepts its legacy omitted persistence metadata or coherent post-containment metadata; rate-limit and pre-containment retry metadata is rejected for that transition. Writers reject an oversized current-schema snapshot before opening the temp file (`policy_store.rs`). |
 | Session continuity sidecar (`<policy-state>.continuity.json`) | `schema_version` | `2` (reads `1..=2`) | Unsupported versions, an unverifiable signer, or a live record whose continuity key is unavailable prevent startup (`session_continuity_store.rs`). |
-| Bait exposure sidecar (`<event-log>.exposures.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour TTL) | Missing state rebuilds from the current event log. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, empty-identifier, future-timestamp, duplicate-key, or canonical-rewrite-over-limit state fails production preflight before the writer lease or durable-file mutation. Writers enforce the same byte ceiling before creating the reserved temp file. |
-| Consumed proof sidecar (`<event-log>.consumed-proofs.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour maximum proof/quarantine lifetime) | Missing state rebuilds from the current event log and prior history activates the bounded migration quarantine. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, invalid-digest/identifier/lifetime, duplicate-key, or canonical-rewrite-over-limit state fails production preflight. Writers enforce the same byte ceiling before creating the reserved temp file. |
+| Bait exposure sidecar (`<event-log>.exposures.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour TTL) | Missing state rebuilds in canonical archive order followed by the active event-log segment, including the archive-only post-rename crash window. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, empty-identifier, future-timestamp, duplicate-key, or canonical-rewrite-over-limit state fails production preflight before the writer lease or durable-file mutation. Writers enforce the same byte ceiling before creating the reserved temp file. |
+| Consumed proof sidecar (`<event-log>.consumed-proofs.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour maximum proof/quarantine lifetime) | Missing state rebuilds from the complete ordered event-log family, including archive-only history, and prior history activates the bounded migration quarantine. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, invalid-digest/identifier/lifetime, duplicate-key, or canonical-rewrite-over-limit state fails production preflight. Writers enforce the same byte ceiling before creating the reserved temp file. |
 | Bait profile config | `schema_version` | `1` | Any other version rejected at load (`main.rs`). |
 | Ingress trust config | `schema_version` | `1` | Any other version rejected at load (`ingress_identity.rs`). |
 | Session signing key ring (`key-ring.json`) | key `version` integers + `active_key_version` | shape v1 (unversioned shape) | The JSON shape is validated strictly (unique u32 versions, active present, 64-hex keys); unknown key *versions* in cookies fail closed to a fresh mint. A shape version field may be added in a future minor release and will follow this policy. |
@@ -133,8 +133,24 @@ parent-directory sync. After validating the committed file, authoritative open
 under the single-writer lease removes one regular crash-left temp; a symlink or
 non-regular object at the reserved path fails closed. The fixed name bounds
 crash residue and is part of the deployment recovery-file allowlist.
-Bounding the missing-sidecar event-log reconstruction path is separate #254
-follow-on work and is not implied by these sidecar-file bounds.
+Missing-sidecar reconstruction consumes the same already-validated event
+stream used for pending-workflow recovery; it does not reopen or buffer the
+family. Production performs a read-only event-family and repair-plan preflight
+before taking the durable-state lease, then performs the authoritative scan
+under that lease before policy migration/eviction, event/debug writer open,
+sidecar replacement, or listener startup. Only the active segment may repair
+one unterminated valid record by appending a newline or discard one invalid
+final fragment. Archives must end on a delimiter and are never repaired.
+
+The authoritative scanner reads through fixed-size chunks, admits no more
+than the segment limit plus one sentinel and no more than the record limit plus
+one sentinel, and treats metadata only as an early rejection. It orders the
+three fixed-width archive suffixes numerically/lexicographically before the
+active segment, validates every complete record, and rejects duplicate event
+IDs across segments. It simultaneously reconstructs bounded sidecar state and
+indexes only the response/policy evidence needed by at most 8,192 pending
+policy workflows. Durable appends update that in-memory index; lookup no
+longer rescans the family once per pending session.
 
 ## Compatibility rules
 

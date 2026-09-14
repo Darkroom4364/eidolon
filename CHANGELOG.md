@@ -27,6 +27,11 @@ Initial research-alpha source release.
   owner-only atomic replacement through a bounded reserved temp; production
   preflights existing sidecars and their canonical rewrite before lease or
   durable-log effects
+- bounded schema-v2 event-log recovery across one active 32 MiB segment and
+  three canonical numeric archives (128 MiB total), with a 1 MiB record cap,
+  streaming validation, global duplicate-event rejection, active-only tail
+  repair, full-family sidecar reconstruction, and one pending-workflow index
+  built during the authoritative under-lease scan
 
 ### Limitations
 

@@ -246,8 +246,8 @@ dry-runs the canonical pretty-printed rewrite, so a compact file that fits the
 read limit but would expand beyond the write limit fails before the writer
 lease. A valid file padded with JSON whitespace is accepted exactly at the byte
 limit when its canonical rewrite also fits. Missing sidecars retain the
-existing rebuild/quarantine behavior; the JSONL reconstruction input is a
-separate bound and is not covered by these sidecar limits.
+rebuild/quarantine behavior, but reconstruction now uses the bounded ordered
+event-log family described below rather than only the active file.
 
 Generated session-proof responses carry `Cache-Control: private, no-store` and
 `Vary: Cookie`. Eidolon strips validators, range metadata, and CDN-specific
@@ -269,15 +269,37 @@ to the existing fail-closed contract.
 The JSONL event and debug logs rotate at 32 MiB to collision-safe timestamped
 archives, keeping exactly 3 archives plus the active segment per log. Together
 those logs consume at most about 256 MiB before filesystem overhead, below the
-lab's 1 GiB PVC. Startup restores a missing newline or truncates only an
-invalid final fragment before appending, while corruption anywhere earlier
-still fails with the exact line number. The `state.policy_store`,
+lab's 1 GiB PVC. The production event family is therefore exactly bounded to
+134,217,728 bytes: up to three archives named
+`<event-log>.<39 ASCII digits>`, followed by the active segment. Each event
+record is limited to 1,048,576 serialized JSON bytes excluding its newline.
+All-digit suffixes of any other length, a fourth archive, symlinks,
+directories/non-regular members, oversized segments or records, unsupported
+event schemas, duplicate event IDs, invalid complete records, and
+unterminated archive tails block startup. Nonnumeric neighbors are ignored.
+
+Production checks this family read-only before acquiring the writer lease and
+scans it authoritatively again under the lease before durable mutation. The
+under-lease scan is one streaming pass for missing exposure/proof sidecars and
+all pending workflow evidence; it does not read the family once per pending
+session. Missing active state is supported for an empty deployment and for the
+post-rename crash window when canonical archives remain. A new active file is
+created only after the family validates. Only the active segment may append a
+missing newline to one valid final event or truncate one invalid final
+fragment; archives are immutable recovery input. Correct the named file or
+archive set and restart—the same path is accepted once it satisfies the
+contract. Do not delete retained history merely to bypass a validation error;
+preserve a copy for incident analysis and restore from a known-good quiesced
+backup when integrity is uncertain.
+
+The `state.event_log_contract`, `state.policy_store`,
 `state.bait_exposure_store`, and `state.consumed_proof_store` effective
 configuration projections report only byte/record/TTL/schema bounds. Their
 server-side `proxy_started.fields` counterparts add configured state paths and
-aggregate startup outcomes, but never file contents or durable
-session/request/bait/proof identifiers. Persistence failures use the exact
-`eidolon persistence failure:` marker.
+aggregate event-family segment/record/byte counts, selected pending-match
+counts, and startup outcomes, but never file contents or durable
+session/request/event/bait/proof identifiers. Persistence failures use the
+exact `eidolon persistence failure:` marker.
 
 These source controls do not prove behavior when a mounted persistent volume
 becomes corrupt or unavailable while the pod is running. Issue `#253` owns
@@ -301,7 +323,7 @@ This repairs the observed legacy ownership blocker, but by itself does not
 prove live upgrade, rollback, or storage-driver portability.
 
 Production first performs read-only bounded validation of existing policy,
-bait-exposure, and consumed-proof state. It then takes an exclusive
+event-family, bait-exposure, and consumed-proof state. It then takes an exclusive
 operating-system writer lease at `<policy-state-path>.lock` before opening
 durable writers or binding its listener. A second process using the same
 policy-state path fails startup instead of overlapping writes. The operating

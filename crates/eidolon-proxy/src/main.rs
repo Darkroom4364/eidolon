@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fmt, fs,
     future::Future,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -35,7 +35,9 @@ use eidolon_proxy::{
     },
     debug_log::FileDebugLogWriter,
     event_log::{
-        read_jsonl_reconstruction, DurableResponseMatch, FileEventLogWriter, JsonlTailRepairOutcome,
+        scan_event_log_family, validate_event_log_family_without_mutation, DurableResponseMatch,
+        EventLogRecoveryTarget, FileEventLogWriter, JsonlTailRepairOutcome, LOG_ARCHIVES_KEPT,
+        LOG_ROTATE_BYTES, MAX_EVENT_LOG_FAMILY_BYTES, MAX_EVENT_LOG_RECORD_BYTES,
     },
     http_request::{
         canonical_request_target, normalized_request_host, HttpHeader, HttpRequest, HttpVersion,
@@ -1055,6 +1057,20 @@ fn policy_store_contract_projection() -> Value {
     })
 }
 
+fn event_log_contract_projection() -> Value {
+    json!({
+        "max_segment_bytes": LOG_ROTATE_BYTES,
+        "max_archives": LOG_ARCHIVES_KEPT,
+        "max_family_bytes": MAX_EVENT_LOG_FAMILY_BYTES,
+        "max_record_bytes": MAX_EVENT_LOG_RECORD_BYTES,
+        "schema": {
+            "current": EVENT_SCHEMA_VERSION,
+            "minimum_supported": EVENT_SCHEMA_VERSION,
+            "maximum_supported": EVENT_SCHEMA_VERSION,
+        },
+    })
+}
+
 fn bait_exposure_store_contract_projection() -> Value {
     json!({
         "max_bytes": MAX_BAIT_EXPOSURE_STORE_BYTES,
@@ -1116,6 +1132,7 @@ fn effective_config_projection(config: &ProxyConfig) -> Value {
         },
         "state": {
             "event_log": "configured",
+            "event_log_contract": event_log_contract_projection(),
             "policy_state": "configured",
             "debug_log": config.debug_log_path.is_some(),
             "policy_store": policy_store_contract_projection(),
@@ -2203,6 +2220,7 @@ fn run_proxy_with_shutdown(
     let listen_addr = config.listen_addr;
     if profile == RuntimeProfile::Production {
         PolicyStateStore::validate_without_mutation(&config.policy_state_path)?;
+        validate_event_log_family_without_mutation(&config.event_log_path)?;
         validate_bait_security_sidecars_without_mutation(
             &config.event_log_path,
             current_unix_secs(),
@@ -2263,9 +2281,39 @@ fn run_proxy_with_shutdown(
         "key_version_count": session_authority.key_version_count(),
     });
     let now = current_unix_secs();
-    let continuity_history_exists = event_log_history_exists(&config.event_log_path)?
+    let prepared_policy_store = PolicyStateStore::prepare_open(&config.policy_state_path)?;
+    let recovery_targets = prepared_policy_store
+        .pending_event_log_recovery_coordinates()
+        .into_iter()
+        .map(
+            |(session_id, request_id, expected_policy_event_id)| EventLogRecoveryTarget {
+                session_id,
+                request_id,
+                expected_policy_event_id,
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut recovered_bait_exposures = BaitExposureStore::default();
+    let mut recovered_consumed_bait_proofs = ConsumedBaitProofStore::default();
+    let event_log_recovery =
+        scan_event_log_family(&config.event_log_path, &recovery_targets, |event| {
+            recovered_bait_exposures.apply_event_log_event(event, now);
+            recovered_consumed_bait_proofs.apply_event_log_event(
+                event,
+                &bait_registry,
+                bait_signing_secret.as_deref(),
+                now,
+            )
+        })?;
+    recovered_bait_exposures.torn_tail_line = event_log_recovery.active_torn_tail_line;
+    recovered_consumed_bait_proofs.torn_tail_line = event_log_recovery.active_torn_tail_line;
+    let event_log_recovery_stats = event_log_recovery.stats;
+    let continuity_history_exists = event_log_recovery_stats.family_bytes > 0
         || path_has_nonempty_file(&config.policy_state_path)?;
-    let policy_store = PolicyStateStore::open(&config.policy_state_path)?;
+    let event_log_writer =
+        FileEventLogWriter::open_with_recovery(&config.event_log_path, event_log_recovery)?;
+    let event_log_tail_repair = event_log_writer.startup_tail_repair();
+    let policy_store = prepared_policy_store.finish_prepared_startup()?;
     let policy_store_eviction = policy_store.last_eviction_stats();
     let policy_store_session_count = policy_store.len();
     let policy_store_fail_closed_for_unknown_sessions =
@@ -2278,7 +2326,11 @@ fn run_proxy_with_shutdown(
         }
         None => (None, None),
     };
-    let bait_exposures = BaitExposureStore::open_or_rebuild(&config.event_log_path, now)?;
+    let bait_exposures = BaitExposureStore::open_or_rebuild_with_recovery(
+        &config.event_log_path,
+        now,
+        recovered_bait_exposures,
+    )?;
     let restored_bait_exposure_count = bait_exposures.len();
     let restored_bait_exposure_ttl_evicted = bait_exposures.ttl_evicted;
     let restored_bait_exposure_torn_tail_line = bait_exposures.torn_tail_line;
@@ -2287,11 +2339,13 @@ fn run_proxy_with_shutdown(
         .clone()
         .ok_or_else(|| io::Error::other("bait exposure store opened without a state path"))?;
     let bait_exposure_state_bytes = fs::metadata(&bait_exposure_state_path)?.len();
-    let consumed_bait_proofs = ConsumedBaitProofStore::open_or_rebuild(
+    let consumed_bait_proofs = ConsumedBaitProofStore::open_or_rebuild_with_recovery(
         &config.event_log_path,
-        &bait_registry,
-        bait_signing_secret.as_deref(),
         now,
+        (
+            recovered_consumed_bait_proofs,
+            event_log_recovery_stats.family_bytes > 0,
+        ),
     )?;
     let restored_consumed_bait_proof_count = consumed_bait_proofs.consumed.len();
     let restored_consumed_bait_proof_torn_tail_line = consumed_bait_proofs.torn_tail_line;
@@ -2339,8 +2393,6 @@ fn run_proxy_with_shutdown(
                     "reconciled_floor_count": reconciled_floor_count,
                 })
             });
-    let event_log_writer = FileEventLogWriter::open(&config.event_log_path)?;
-    let event_log_tail_repair = event_log_writer.startup_tail_repair();
     let controlled_reality_backend = match &config.controlled_reality_backend {
         Some(backend) => Some(Arc::new(
             ControlledRealityBackendClient::from_target(
@@ -2441,6 +2493,17 @@ fn run_proxy_with_shutdown(
                 },
             },
             "event_log_tail_repair": jsonl_tail_repair_debug(event_log_tail_repair),
+            "event_log_recovery": {
+                "archive_count": event_log_recovery_stats.archive_count,
+                "segment_count": event_log_recovery_stats.segment_count,
+                "record_count": event_log_recovery_stats.record_count,
+                "family_bytes": event_log_recovery_stats.family_bytes,
+                "active_bytes": event_log_recovery_stats.active_bytes,
+                "targeted_pending_workflow_count": recovery_targets.len(),
+                "indexed_durable_response_count": event_log_recovery_stats.indexed_durable_response_count,
+                "indexed_policy_event_count": event_log_recovery_stats.indexed_policy_event_count,
+                "contract": event_log_contract_projection(),
+            },
             "debug_log_tail_repair": debug_log_tail_repair.map(jsonl_tail_repair_debug),
             "event_log_bytes": std::fs::metadata(&config.event_log_path)
                 .map(|metadata| metadata.len())
@@ -3273,6 +3336,7 @@ fn parse_digest_hex(value: &str) -> io::Result<[u8; 32]> {
     Ok(digest)
 }
 
+#[cfg(test)]
 fn event_log_history_exists(path: &Path) -> io::Result<bool> {
     if path_has_nonempty_file(path)? {
         return Ok(true);
@@ -3331,11 +3395,22 @@ fn validate_bait_security_sidecars_without_mutation(
 }
 
 impl ConsumedBaitProofStore {
+    #[cfg(test)]
     fn open_or_rebuild(
         event_log_path: &Path,
         registry: &BaitRegistry,
         signing_secret: Option<&str>,
         now: u64,
+    ) -> io::Result<Self> {
+        let history_exists = event_log_history_exists(event_log_path)?;
+        let recovered = Self::from_event_log(event_log_path, registry, signing_secret, now)?;
+        Self::open_or_rebuild_with_recovery(event_log_path, now, (recovered, history_exists))
+    }
+
+    fn open_or_rebuild_with_recovery(
+        event_log_path: &Path,
+        now: u64,
+        recovered: (Self, bool),
     ) -> io::Result<Self> {
         let state_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
         match read_auxiliary_state_file(
@@ -3351,9 +3426,7 @@ impl ConsumedBaitProofStore {
                 Ok(store)
             }
             None => {
-                let history_exists = event_log_history_exists(event_log_path)?;
-                let mut store =
-                    Self::from_event_log(event_log_path, registry, signing_secret, now)?;
+                let (mut store, history_exists) = recovered;
                 store.path = Some(state_path.clone());
                 if history_exists {
                     store.migration_quarantine_until =
@@ -3429,92 +3502,82 @@ impl ConsumedBaitProofStore {
         })
     }
 
+    #[cfg(test)]
     fn from_event_log(
         path: &Path,
         registry: &BaitRegistry,
         signing_secret: Option<&str>,
         now: u64,
     ) -> io::Result<Self> {
-        let file = match fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(error),
-        };
         let mut store = Self::default();
-        let source = read_jsonl_reconstruction(BufReader::new(file))?;
-        for (line_index, line) in source.lines.iter().enumerate() {
-            let line_number = line_index + 1;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let event: Event = match serde_json::from_str(line) {
-                Ok(event) => event,
-                Err(_error) if source.is_torn_tail(line_index) => {
-                    store.torn_tail_line = Some(line_number);
-                    eprintln!(
-                        "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
-                    );
-                    break;
-                }
-                Err(error) => {
-                    return Err(invalid_data(format!(
-                        "could not rebuild consumed bait proof store from event log line {line_number}: {error}"
-                    )))
-                }
-            };
-            if event.schema_version != EVENT_SCHEMA_VERSION {
-                return Err(invalid_data(format!(
-                    "could not rebuild consumed bait proof store from event log line {}: unsupported schema version {}",
-                    line_index + 1,
-                    event.schema_version
-                )));
-            }
-            let EventKind::BaitActionObserved {
-                bait_id,
-                header_value_mint_status,
-                ..
-            } = event.kind
-            else {
-                continue;
-            };
-            if !matches!(
-                header_value_mint_status,
-                Some(BaitHeaderValueMintStatus::MatchedSessionValue)
-                    | Some(BaitHeaderValueMintStatus::ReplaySeen)
-            ) {
-                continue;
-            }
-            let Some(bait) = registry.baits().iter().find(|bait| bait.id == bait_id) else {
-                continue;
-            };
-            let issued_at = u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
-            let rendered = eidolon_bait::render_bait_for_session_at(
-                bait,
-                event.session_id,
-                signing_secret,
-                issued_at,
-            )
-            .map_err(|error| invalid_data(error.to_string()))?;
-            let Some(proof_value) = rendered.expected_action.header_value.clone() else {
-                continue;
-            };
-            let expires_at = proof_expiry_epoch_seconds(bait, &proof_value)?;
-            if expires_at <= now {
-                continue;
-            }
-            let key = (event.session_id, bait_id, proof_digest(&proof_value));
-            if let Some(existing_expiry) = store.consumed.get_mut(&key) {
-                *existing_expiry = expires_at;
-                continue;
-            }
-            if store.consumed.len() >= MAX_CONSUMED_BAIT_PROOFS {
-                return Err(invalid_data(
-                    "active consumed bait proof state exceeds configured capacity",
-                ));
-            }
-            store.consumed.insert(key, expires_at);
+        let recovery = scan_event_log_family(path, &[], |event| {
+            store.apply_event_log_event(event, registry, signing_secret, now)
+        })?;
+        store.torn_tail_line = recovery.active_torn_tail_line;
+        if let Some(line_number) = store.torn_tail_line {
+            eprintln!(
+                "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
+            );
         }
         Ok(store)
+    }
+
+    fn apply_event_log_event(
+        &mut self,
+        event: &Event,
+        registry: &BaitRegistry,
+        signing_secret: Option<&str>,
+        now: u64,
+    ) -> io::Result<()> {
+        let EventKind::BaitActionObserved {
+            bait_id,
+            header_value_mint_status,
+            ..
+        } = &event.kind
+        else {
+            return Ok(());
+        };
+        if !matches!(
+            header_value_mint_status,
+            Some(BaitHeaderValueMintStatus::MatchedSessionValue)
+                | Some(BaitHeaderValueMintStatus::ReplaySeen)
+        ) {
+            return Ok(());
+        }
+        let Some(bait) = registry.baits().iter().find(|bait| bait.id == *bait_id) else {
+            return Ok(());
+        };
+        let issued_at = u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
+        let rendered = eidolon_bait::render_bait_for_session_at(
+            bait,
+            event.session_id,
+            signing_secret,
+            issued_at,
+        )
+        .map_err(|error| invalid_data(error.to_string()))?;
+        let Some(proof_value) = rendered.expected_action.header_value.clone() else {
+            return Ok(());
+        };
+        let expires_at = proof_expiry_epoch_seconds(bait, &proof_value)?;
+        if expires_at <= now {
+            return Ok(());
+        }
+        let key = (
+            event.session_id,
+            bait_id.clone(),
+            proof_digest(&proof_value),
+        );
+        if let Some(existing_expiry) = self.consumed.get_mut(&key) {
+            *existing_expiry = expires_at;
+            return Ok(());
+        }
+        if self.consumed.len() >= MAX_CONSUMED_BAIT_PROOFS {
+            return Err(invalid_data(
+                "active consumed bait proof state exceeds configured capacity",
+            ));
+        }
+        self.consumed.insert(key, expires_at);
+        Ok(())
     }
 
     fn check_and_mark(
@@ -3660,7 +3723,17 @@ fn proof_expiry_epoch_seconds(bait: &Bait, proof_value: &str) -> io::Result<u64>
 }
 
 impl BaitExposureStore {
+    #[cfg(test)]
     fn open_or_rebuild(event_log_path: &Path, now: u64) -> io::Result<Self> {
+        let recovered = Self::from_event_log_at(event_log_path, now)?;
+        Self::open_or_rebuild_with_recovery(event_log_path, now, recovered)
+    }
+
+    fn open_or_rebuild_with_recovery(
+        event_log_path: &Path,
+        now: u64,
+        recovered: Self,
+    ) -> io::Result<Self> {
         let state_path = sidecar_state_path(event_log_path, ".exposures.json");
         match read_auxiliary_state_file(
             &state_path,
@@ -3675,7 +3748,7 @@ impl BaitExposureStore {
                 Ok(store)
             }
             None => {
-                let mut store = Self::from_event_log_at(event_log_path, now)?;
+                let mut store = recovered;
                 store.path = Some(state_path.clone());
                 store.validate_canonical_serialization()?;
                 remove_stale_auxiliary_state_temp(&state_path)?;
@@ -3742,87 +3815,39 @@ impl BaitExposureStore {
         Self::from_event_log_at(path, current_unix_secs())
     }
 
-    fn from_event_log_at(path: &Path, now: u64) -> io::Result<Self> {
-        let file = match fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(error),
-        };
-
-        Self::from_event_log_reader_at(BufReader::new(file), now)
-    }
-
     #[cfg(test)]
-    fn from_event_log_reader(reader: impl BufRead) -> io::Result<Self> {
-        Self::from_event_log_reader_at(reader, current_unix_secs())
+    fn from_event_log_at(path: &Path, now: u64) -> io::Result<Self> {
+        let mut store = Self::default();
+        let recovery = scan_event_log_family(path, &[], |event| {
+            store.apply_event_log_event(event, now);
+            Ok(())
+        })?;
+        store.torn_tail_line = recovery.active_torn_tail_line;
+        if let Some(line_number) = store.torn_tail_line {
+            eprintln!(
+                "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
+            );
+        }
+        Ok(store)
     }
 
-    fn from_event_log_reader_at(reader: impl BufRead, now: u64) -> io::Result<Self> {
-        let source = read_jsonl_reconstruction(reader)?;
-        let mut store = Self::default();
-        let mut torn_tail_line = None;
-
-        for (line_index, line) in source.lines.iter().enumerate() {
-            let line_number = line_index + 1;
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let value: Value = match serde_json::from_str(line) {
-                Ok(value) => value,
-                Err(_error) if source.is_torn_tail(line_index) => {
-                    torn_tail_line = Some(line_number);
-                    eprintln!(
-                        "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
-                    );
-                    break;
-                }
-                Err(error) => {
-                    return Err(invalid_data(format!(
-                        "could not rebuild bait exposure store from event log line {line_number}: {error}"
-                    )))
-                }
-            };
-            let schema_version = value
-                .get("schema_version")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    invalid_data(format!(
-                        "could not rebuild bait exposure store from event log line {line_number}: missing schema_version"
-                    ))
-                })?;
-            if schema_version != u64::from(EVENT_SCHEMA_VERSION) {
-                return Err(invalid_data(format!(
-                    "could not rebuild bait exposure store from event log line {line_number}: unsupported schema_version {schema_version}; expected {EVENT_SCHEMA_VERSION}"
-                )));
-            }
-
-            let event: Event = serde_json::from_value(value).map_err(|error| {
-                invalid_data(format!(
-                    "could not rebuild bait exposure store from event log line {line_number}: {error}"
-                ))
-            })?;
-
-            if let EventKind::BaitExposed {
-                bait_id,
-                exposure_id,
-                ..
-            } = event.kind
-            {
-                let observed_at_unix_secs =
-                    u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
-                store.apply_record_exposure_at(
-                    event.session_id,
-                    bait_id,
-                    exposure_id,
-                    observed_at_unix_secs,
-                    now,
-                );
-            }
+    fn apply_event_log_event(&mut self, event: &Event, now: u64) {
+        if let EventKind::BaitExposed {
+            bait_id,
+            exposure_id,
+            ..
+        } = &event.kind
+        {
+            let observed_at_unix_secs =
+                u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
+            self.apply_record_exposure_at(
+                event.session_id,
+                bait_id.clone(),
+                exposure_id.clone(),
+                observed_at_unix_secs,
+                now,
+            );
         }
-
-        store.torn_tail_line = torn_tail_line;
-        Ok(store)
     }
 
     fn len(&self) -> usize {
@@ -9260,6 +9285,12 @@ mod tests {
             ))
     }
 
+    fn event_log_archive_path(path: &Path, stamp: u128) -> PathBuf {
+        let mut archive = path.as_os_str().to_os_string();
+        archive.push(format!(".{stamp:039}"));
+        archive.into()
+    }
+
     fn write_bait_profile(contents: &str) -> PathBuf {
         let path = unique_temp_path("bait-profile.json");
         must_ok(fs::write(&path, contents), "bait profile should write");
@@ -10970,6 +11001,10 @@ mod tests {
             policy_store_contract_projection()
         );
         assert_eq!(
+            effective["state"]["event_log_contract"],
+            event_log_contract_projection()
+        );
+        assert_eq!(
             effective["state"]["bait_exposure_store"],
             bait_exposure_store_contract_projection()
         );
@@ -11630,6 +11665,165 @@ mod tests {
         assert!(!startup_debug.contains(&malformed_session.0.to_string()));
         assert!(!startup_debug.contains(PRIVATE_VALUE));
         assert!(!startup_debug.contains(&corrected_session.0.to_string()));
+    }
+
+    #[test]
+    fn invalid_event_family_fails_before_production_effects_and_allows_correction() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let private_session = SessionId(uuid::Uuid::from_u128(0x0fee_d312));
+        let private_request = RequestId(uuid::Uuid::from_u128(0x0caf_e312));
+        const PRIVATE_PATH: &str = "/private-event-family-path";
+        let event = Event::new(
+            private_session,
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::RequestSeen {
+                method: "GET".to_string(),
+                path: PRIVATE_PATH.to_string(),
+                safe_headers: Vec::new(),
+                ingress_identity: Default::default(),
+                authenticated_ingress_rule_rejection: None,
+                local_ingress_trust_scope_rejection: None,
+                trusted_ingress_soften_match: None,
+                ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
+                routing_decision: RoutingDecision::ProtectedUpstream,
+            },
+        )
+        .with_request_id(private_request);
+        let line = serde_json::to_string(&event).expect("private event should serialize");
+        let invalid_family = format!("{line}\n{line}\n").into_bytes();
+        fs::write(&fixture.event_log_path, &invalid_family)
+            .expect("duplicate event family should write");
+
+        let legacy_policy = br#"{"schema_version":1,"sessions":[]}"#.to_vec();
+        fs::write(&fixture.policy_state_path, &legacy_policy)
+            .expect("legacy policy state should write");
+        let debug_sentinel = br#"{"sentinel":true}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_sentinel).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_sentinel = b"preflight-must-not-touch-lease".to_vec();
+        fs::write(&lease_path, &lease_sentinel).expect("lease sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("duplicate event family must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("duplicate event id"));
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            event.id.to_string(),
+            PRIVATE_PATH.to_string(),
+        ] {
+            assert!(
+                !diagnostic.contains(&private),
+                "event preflight diagnostic leaked `{private}`"
+            );
+        }
+        assert!(
+            started_received.try_recv().is_err(),
+            "invalid family must fail before listener bind"
+        );
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(
+            fs::read(&fixture.event_log_path).expect("invalid event family should read"),
+            invalid_family
+        );
+        assert_eq!(
+            fs::read(&fixture.policy_state_path).expect("policy state should read"),
+            legacy_policy,
+            "event rejection must precede policy migration"
+        );
+        assert_eq!(
+            fs::read(&fixture.debug_log_path).expect("debug sentinel should read"),
+            debug_sentinel
+        );
+        assert_eq!(
+            fs::read(&lease_path).expect("lease sentinel should read"),
+            lease_sentinel
+        );
+        for absent in [&exposure_path, &proof_path, &continuity_path] {
+            assert!(
+                !absent.exists(),
+                "event rejection created `{}`",
+                absent.display()
+            );
+        }
+        let lease = DurableStateLease::acquire_for_policy_state(&fixture.policy_state_path)
+            .expect("rejected preflight must leave the lease acquirable");
+        drop(lease);
+
+        let corrected_family = format!("{line}\n").into_bytes();
+        fs::write(&fixture.event_log_path, &corrected_family)
+            .expect("corrected event family should write");
+        let debug_log_path = fixture.debug_log_path.clone();
+        let server = start_production_profile_server(fixture);
+        assert!(server.address.ip().is_loopback());
+        server.stop();
+
+        assert!(
+            upstream_recorder.finish().is_empty(),
+            "preflight and corrected startup must not reach upstream"
+        );
+        let startup = debug_values(&debug_log_path)
+            .into_iter()
+            .find(|entry| entry["event"] == "proxy_started")
+            .expect("corrected startup should emit a recovery projection");
+        assert_eq!(startup["fields"]["event_log_recovery"]["archive_count"], 0);
+        assert_eq!(startup["fields"]["event_log_recovery"]["segment_count"], 1);
+        assert_eq!(startup["fields"]["event_log_recovery"]["record_count"], 1);
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["family_bytes"],
+            corrected_family.len()
+        );
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["active_bytes"],
+            corrected_family.len()
+        );
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["targeted_pending_workflow_count"],
+            0
+        );
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["indexed_durable_response_count"],
+            0
+        );
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["indexed_policy_event_count"],
+            0
+        );
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["contract"],
+            event_log_contract_projection()
+        );
+        let startup_debug = startup.to_string();
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            event.id.to_string(),
+            PRIVATE_PATH.to_string(),
+        ] {
+            assert!(
+                !startup_debug.contains(&private),
+                "startup recovery projection leaked `{private}`"
+            );
+        }
     }
 
     #[test]
@@ -12740,6 +12934,7 @@ mod tests {
                 },
                 "state": {
                     "event_log": "configured",
+                    "event_log_contract": event_log_contract_projection(),
                     "policy_state": "configured",
                     "debug_log": true,
                     "policy_store": policy_store_contract_projection(),
@@ -20222,11 +20417,14 @@ mod tests {
         );
         event.observed_at = chrono::DateTime::from_timestamp(1_200, 0).expect("timestamp");
         let event_log = unique_temp_path("consumed-proof-rebuild.jsonl");
+        let mut second_event = event.clone();
+        second_event.id = uuid::Uuid::new_v4();
         fs::write(
             &event_log,
             format!(
-                "{line}\n{line}\n",
-                line = serde_json::to_string(&event).expect("serialize")
+                "{first}\n{second}\n",
+                first = serde_json::to_string(&event).expect("serialize first event"),
+                second = serde_json::to_string(&second_event).expect("serialize second event"),
             ),
         )
         .expect("write event log");
@@ -20249,6 +20447,71 @@ mod tests {
             store.check_and_mark(session, bait.id, proof, 1_260, 1_259),
             ConsumeProofOutcome::Replay
         );
+    }
+
+    #[test]
+    fn consumed_proof_store_restores_archive_only_proofs_and_replay_state() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&profile_path).expect("profile");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("bait")
+            .clone();
+        let session = SessionId::new();
+        let mut event = Event::new(
+            session,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
+                exposure_id: None,
+                method: "POST".to_string(),
+                path: bait.expected_action.path.clone(),
+                header_value_mint: bait.header_value_mint_audit(),
+                header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            },
+        );
+        event.observed_at = chrono::DateTime::from_timestamp(1_200, 0).expect("timestamp");
+        let event_log = unique_temp_path("archive-only-consumed-proof.jsonl");
+        let archive = event_log_archive_path(&event_log, 1);
+        fs::write(
+            &archive,
+            format!(
+                "{}\n",
+                serde_json::to_string(&event).expect("event should serialize")
+            ),
+        )
+        .expect("archive should write");
+        assert!(
+            !event_log.exists(),
+            "active crash-window path must be absent"
+        );
+        let rendered =
+            eidolon_bait::render_bait_for_session_at(&bait, session, Some("mint-secret"), 1_200)
+                .expect("render")
+                .into_owned();
+        let proof = rendered.expected_action.header_value.expect("proof");
+
+        let mut store = ConsumedBaitProofStore::open_or_rebuild(
+            &event_log,
+            &loaded.registry,
+            Some("mint-secret"),
+            1_259,
+        )
+        .expect("missing proof sidecar should rebuild from archive-only history");
+
+        assert_eq!(store.consumed.len(), 1);
+        assert_eq!(
+            store.check_and_mark(session, bait.id, proof, 1_260, 1_259),
+            ConsumeProofOutcome::Replay
+        );
+        assert!(
+            !event_log.exists(),
+            "sidecar recovery alone must not create an active event log"
+        );
+        assert!(sidecar_state_path(&event_log, ".consumed-proofs.json").is_file());
     }
 
     #[test]
@@ -20320,8 +20583,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let store = BaitExposureStore::from_event_log_reader(Cursor::new(format!("{jsonl}\n")))
-            .expect("event log should rebuild");
+        let event_log = unique_temp_path("exposure-full-family-rebuild.jsonl");
+        fs::write(&event_log, format!("{jsonl}\n")).expect("event log should write");
+        let store = BaitExposureStore::from_event_log(&event_log)
+            .expect("event log should rebuild through the bounded scanner");
 
         assert_eq!(store.len(), 2);
         assert_eq!(
@@ -20331,6 +20596,69 @@ mod tests {
         assert_eq!(
             store.exposure_for_action(session_id, &other_bait_id),
             Some(other_exposure_id)
+        );
+    }
+
+    #[test]
+    fn bait_exposure_store_rebuilds_ordered_archive_and_active_history() {
+        let event_log = unique_temp_path("full-family-exposure-rebuild.jsonl");
+        let archive = event_log_archive_path(&event_log, 1);
+        let session_id = SessionId::new();
+        let bait_id = BaitId("full-family-bait".to_string());
+        let archived_exposure_id = ExposureId("archived-exposure".to_string());
+        let active_exposure_id = ExposureId("active-exposure".to_string());
+        let exposure_event = |exposure_id: ExposureId, observed_at| {
+            let mut event = Event::new(
+                session_id,
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id: bait_id.clone(),
+                    bait_class: None,
+                    exposure_id,
+                    surface: "/docs".to_string(),
+                    header_value_mint: None,
+                },
+            );
+            event.observed_at =
+                chrono::DateTime::from_timestamp(observed_at, 0).expect("timestamp");
+            event
+        };
+        let archived = exposure_event(archived_exposure_id.clone(), 1_000);
+        let active = exposure_event(active_exposure_id.clone(), 1_001);
+        fs::write(
+            &archive,
+            format!(
+                "{}\n",
+                serde_json::to_string(&archived).expect("archive event should serialize")
+            ),
+        )
+        .expect("archive should write");
+        fs::write(
+            &event_log,
+            format!(
+                "{}\n",
+                serde_json::to_string(&active).expect("active event should serialize")
+            ),
+        )
+        .expect("active should write");
+
+        let store = BaitExposureStore::open_or_rebuild(&event_log, 1_002)
+            .expect("missing sidecar should rebuild from the ordered full family");
+        assert_eq!(
+            store.exposure_for_action_at(session_id, &bait_id, 1_002),
+            Some(active_exposure_id)
+        );
+
+        drop(store);
+        fs::remove_file(sidecar_state_path(&event_log, ".exposures.json"))
+            .expect("rebuilt sidecar should remove");
+        fs::remove_file(&event_log).expect("active segment should remove");
+        let archive_only = BaitExposureStore::open_or_rebuild(&event_log, 1_002)
+            .expect("archive-only crash window should rebuild");
+        assert_eq!(
+            archive_only.exposure_for_action_at(session_id, &bait_id, 1_002),
+            Some(archived_exposure_id)
         );
     }
 
@@ -20635,9 +20963,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let store =
-            BaitExposureStore::from_event_log_reader_at(Cursor::new(format!("{jsonl}\n")), now)
-                .expect("event log should rebuild");
+        let event_log = unique_temp_path("exposure-ttl-rebuild.jsonl");
+        fs::write(&event_log, format!("{jsonl}\n")).expect("event log should write");
+        let store = BaitExposureStore::from_event_log_at(&event_log, now)
+            .expect("event log should rebuild through the bounded scanner");
 
         assert_eq!(store.len(), 1);
         assert_eq!(store.ttl_evicted, 1);
@@ -20652,13 +20981,14 @@ mod tests {
 
     #[test]
     fn bait_exposure_store_rebuild_rejects_malformed_event_log_line() {
-        let error = BaitExposureStore::from_event_log_reader(Cursor::new("{not json}\n"))
-            .expect_err("malformed log should fail");
+        let event_log = unique_temp_path("exposure-malformed-event.jsonl");
+        fs::write(&event_log, "{not json}\n").expect("malformed event log should write");
+        let error =
+            BaitExposureStore::from_event_log(&event_log).expect_err("malformed log should fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error
-            .to_string()
-            .contains("could not rebuild bait exposure store from event log line 1"));
+        assert!(error.to_string().contains("invalid event JSON"));
+        assert!(error.to_string().contains("line 1 column"));
     }
 
     #[test]
@@ -20679,12 +21009,14 @@ mod tests {
         value["schema_version"] = Value::from(u64::from(EVENT_SCHEMA_VERSION) + 1);
         let line = serde_json::to_string(&value).expect("event value should serialize");
 
-        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!("{line}\n")))
-            .expect_err("unsupported schema should fail");
+        let event_log = unique_temp_path("exposure-unsupported-schema.jsonl");
+        fs::write(&event_log, format!("{line}\n")).expect("event log should write");
+        let error = BaitExposureStore::from_event_log(&event_log)
+            .expect_err("unsupported schema should fail through the bounded scanner");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains(&format!(
-            "unsupported schema_version {}; expected {EVENT_SCHEMA_VERSION}",
+            "unsupported schema version {}; expected {EVENT_SCHEMA_VERSION}",
             EVENT_SCHEMA_VERSION + 1
         )));
     }
@@ -20711,9 +21043,11 @@ mod tests {
         let valid = bait_exposed_jsonl_line(session_id);
         let truncated = "{\"schema_version\":2,\"id\":\"half-written";
 
-        let store =
-            BaitExposureStore::from_event_log_reader(Cursor::new(format!("{valid}\n{truncated}")))
-                .expect("crash-torn tail should be tolerated");
+        let event_log = unique_temp_path("exposure-torn-tail.jsonl");
+        fs::write(&event_log, format!("{valid}\n{truncated}"))
+            .expect("torn event log should write");
+        let store = BaitExposureStore::from_event_log(&event_log)
+            .expect("crash-torn tail should be tolerated by the bounded scanner");
 
         assert_eq!(store.len(), 1);
         assert_eq!(store.torn_tail_line, Some(2));
@@ -20724,14 +21058,14 @@ mod tests {
         let session_id = SessionId::new();
         let valid = bait_exposed_jsonl_line(session_id);
 
-        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!(
-            "{{not json}}\n{valid}\n"
-        )))
-        .expect_err("mid-file corruption must fail");
+        let event_log = unique_temp_path("exposure-mid-file-corruption.jsonl");
+        fs::write(&event_log, format!("{{not json}}\n{valid}\n"))
+            .expect("corrupt event log should write");
+        let error = BaitExposureStore::from_event_log(&event_log)
+            .expect_err("mid-file corruption must fail");
 
-        assert!(error
-            .to_string()
-            .contains("could not rebuild bait exposure store from event log line 1"));
+        assert!(error.to_string().contains("invalid event JSON"));
+        assert!(error.to_string().contains("line 1 column"));
     }
 
     #[test]
@@ -20740,14 +21074,14 @@ mod tests {
         let valid = bait_exposed_jsonl_line(session_id);
         let truncated = "{\"schema_version\":2,\"id\":\"half-written";
 
-        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!(
-            "{valid}\n{truncated}\n"
-        )))
-        .expect_err("corrupt final line with trailing newline must fail");
+        let event_log = unique_temp_path("exposure-terminated-corruption.jsonl");
+        fs::write(&event_log, format!("{valid}\n{truncated}\n"))
+            .expect("corrupt event log should write");
+        let error = BaitExposureStore::from_event_log(&event_log)
+            .expect_err("corrupt final line with trailing newline must fail");
 
-        assert!(error
-            .to_string()
-            .contains("could not rebuild bait exposure store from event log line 2"));
+        assert!(error.to_string().contains("invalid event JSON"));
+        assert!(error.to_string().contains("line 2 column"));
     }
 
     #[test]

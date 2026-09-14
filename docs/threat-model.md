@@ -85,6 +85,28 @@ issue
 `#253` separately owns live persistent-volume corruption and unavailability
 qualification for the supported deployment.
 
+The production event-log recovery family is finite: one active 33,554,432-byte
+segment plus three canonical 39-digit archives, at most 134,217,728 bytes in
+total, with no record larger than 1,048,576 bytes before its newline. Recovery
+streams fixed-size chunks, checks a limit-plus-one sentinel independently of
+metadata, accepts only complete schema-v2 events, and rejects duplicate event
+IDs across the family. Numeric archives that are not exactly 39 ASCII digits,
+a fourth archive, symlinks, non-regular family members, invalid complete
+records, and unterminated archive tails fail closed. Nonnumeric neighboring
+files are not family members.
+
+Production preflights that family and its active-tail repair plan without the
+lease or mutation, then repeats the authoritative validation under the lease.
+The resulting stream reconstructs both bounded bait-security sidecars and one
+selected response/policy index for at most 8,192 pending workflows. This makes
+startup work linear in retained family bytes rather than pending sessions
+times family bytes. Only after the scan succeeds may the active tail be
+repaired, an archive-only crash window receive a new active file, policy
+migration/eviction persist, sidecars replace, or the listener bind. Diagnostics
+report only aggregate limits/counts and repair class, never durable IDs or raw
+records. Live PVC faults and descriptor-pinned directory hardening remain
+tracked outside this source-only control.
+
 The committed bait-exposure and consumed-proof sidecars are each capped at
 4,194,304 bytes and 4,096 records. Reads retain at most one byte beyond the
 limit, and writes serialize through the same ceiling before any temp file is
@@ -98,9 +120,10 @@ replacement uses an owner-only, fixed reserved `<sidecar>.tmp` created with
 `create_new`, file sync, rename, and parent sync, preserving the previous file
 on pre-rename failure. Authoritative open under the single-writer lease removes
 one regular crash-left temp only after validating the committed sidecar and
-rejects a symlink or non-regular temp. Missing sidecars still use the existing
-event-log reconstruction path; bounding that JSONL recovery input is separate
-#254 work, and live PVC proof remains #253.
+rejects a symlink or non-regular temp. Missing sidecars rebuild from the
+already-validated ordered complete event-log family, including the archive-only
+post-rename crash window. Existing valid sidecars remain authoritative. Live
+PVC proof remains #253.
 
 ## Defensive Boundary
 

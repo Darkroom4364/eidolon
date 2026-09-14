@@ -195,6 +195,7 @@ pub struct PolicyStateStore {
     records: HashMap<SessionId, SessionPolicyRecord>,
     fail_closed_for_unknown_sessions: bool,
     last_eviction: EvictionStats,
+    startup_persist_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +430,7 @@ impl PolicyStateStore {
             records: HashMap::new(),
             fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         }
     }
 
@@ -443,6 +445,21 @@ impl PolicyStateStore {
     /// authoritative against path races.
     pub fn validate_without_mutation(path: impl AsRef<Path>) -> io::Result<()> {
         Self::load_at(path.as_ref().to_path_buf(), current_unix_secs(), false).map(drop)
+    }
+
+    /// Prepare the authoritative under-lease snapshot without mutating it.
+    /// The caller can validate dependent durable inputs before committing any
+    /// required startup migration or eviction with `finish_prepared_startup`.
+    pub fn prepare_open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::load_at(path.as_ref().to_path_buf(), current_unix_secs(), false)
+    }
+
+    pub fn finish_prepared_startup(mut self) -> io::Result<Self> {
+        if self.startup_persist_required {
+            self.persist()?;
+            self.startup_persist_required = false;
+        }
+        Ok(self)
     }
 
     /// Open the store with an explicit "now" (test hook for eviction runs).
@@ -464,6 +481,7 @@ impl PolicyStateStore {
             records,
             fail_closed_for_unknown_sessions,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         };
 
         // Legacy records written before last_seen tracking get one grace
@@ -477,9 +495,11 @@ impl PolicyStateStore {
 
         let stats = store.evict(now);
         store.last_eviction = stats;
-        if !stats.is_clean() || needs_schema_migration {
+        store.startup_persist_required = !stats.is_clean() || needs_schema_migration;
+        if store.startup_persist_required {
             if persist_changes {
                 store.persist()?;
+                store.startup_persist_required = false;
             } else {
                 store.serialize_current_state()?;
             }
@@ -591,6 +611,32 @@ impl PolicyStateStore {
             .collect::<Vec<_>>();
         sessions.sort_by_key(|session_id| session_id.0);
         sessions
+    }
+
+    pub fn pending_event_log_recovery_coordinates(
+        &self,
+    ) -> Vec<(SessionId, RequestId, Option<Uuid>)> {
+        let mut targets = self
+            .records
+            .iter()
+            .filter_map(|(session_id, record)| {
+                record
+                    .controlled_reality_pending_update
+                    .as_ref()
+                    .map(|pending| {
+                        (
+                            *session_id,
+                            pending.request_id,
+                            pending
+                                .expected_policy_changed
+                                .as_ref()
+                                .map(|event| event.id),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|(session_id, _, _)| session_id.0);
+        targets
     }
 
     /// Expire stale lower-rung sessions before refreshing the current session.
@@ -1956,6 +2002,146 @@ mod tests {
     }
 
     #[test]
+    fn prepared_startup_defers_legacy_migration_until_explicit_finish() {
+        let path = unique_temp_path("prepared-legacy-migration");
+        let session_id = SessionId::new();
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "schema_version": MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [{
+                "session_id": session_id.0,
+                "policy_state": "blocked",
+            }],
+        }))
+        .expect("legacy prepared fixture should serialize");
+        fs::write(&path, &legacy).expect("legacy prepared fixture should write");
+
+        let prepared = PolicyStateStore::prepare_open(&path)
+            .expect("legacy snapshot should prepare without mutation");
+        assert!(prepared.startup_persist_required);
+        assert_eq!(prepared.policy_state(session_id), PolicyState::Blocked);
+        assert_eq!(
+            fs::read(&path).expect("prepared source should remain readable"),
+            legacy
+        );
+        assert!(!path.with_extension("tmp").exists());
+
+        let finished = prepared
+            .finish_prepared_startup()
+            .expect("explicit finish should persist migration");
+        assert!(!finished.startup_persist_required);
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("migrated state should read"))
+                .expect("migrated state should parse");
+        assert_eq!(migrated["schema_version"], POLICY_STORE_SCHEMA_VERSION);
+        assert_eq!(
+            migrated["sessions"]
+                .as_array()
+                .expect("sessions should be an array")
+                .len(),
+            1
+        );
+        fs::remove_file(path).expect("prepared legacy fixture should remove");
+    }
+
+    #[test]
+    fn prepared_startup_defers_ttl_eviction_and_missing_state_remains_absent() {
+        let missing = unique_temp_path("prepared-missing-state");
+        let missing_store = PolicyStateStore::prepare_open(&missing)
+            .expect("missing snapshot should prepare without creation");
+        assert!(!missing_store.startup_persist_required);
+        missing_store
+            .finish_prepared_startup()
+            .expect("missing snapshot should finish without creation");
+        assert!(!missing.exists());
+
+        let path = unique_temp_path("prepared-ttl-eviction");
+        let stale_session = SessionId::new();
+        let stale = serde_json::to_vec(&serde_json::json!({
+            "schema_version": POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [{
+                "session_id": stale_session.0,
+                "policy_state": "observe",
+                "last_seen_unix_secs": 1,
+            }],
+        }))
+        .expect("stale fixture should serialize");
+        fs::write(&path, &stale).expect("stale fixture should write");
+
+        let prepared = PolicyStateStore::prepare_open(&path)
+            .expect("stale snapshot should prepare without mutation");
+        assert!(prepared.startup_persist_required);
+        assert_eq!(prepared.last_eviction_stats().ttl_evicted, 1);
+        assert!(prepared.is_empty());
+        assert_eq!(
+            fs::read(&path).expect("stale source should remain readable"),
+            stale
+        );
+        assert!(!path.with_extension("tmp").exists());
+
+        let finished = prepared
+            .finish_prepared_startup()
+            .expect("explicit finish should persist eviction");
+        assert!(!finished.startup_persist_required);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("evicted state should read"))
+                .expect("evicted state should parse");
+        assert_eq!(persisted["sessions"], serde_json::json!([]));
+        fs::remove_file(path).expect("prepared eviction fixture should remove");
+    }
+
+    #[test]
+    fn pending_event_log_coordinates_are_selected_and_deterministically_sorted() {
+        let first_session = SessionId(Uuid::from_u128(1));
+        let second_session = SessionId(Uuid::from_u128(2));
+        let settled_session = SessionId(Uuid::from_u128(3));
+        let first_request = RequestId(Uuid::from_u128(11));
+        let second_request = RequestId(Uuid::from_u128(12));
+        let mut store = PolicyStateStore::in_memory();
+        for session_id in [second_session, first_session] {
+            store
+                .set_policy_state(session_id, PolicyState::ControlledReality)
+                .expect("controlled state should stage");
+        }
+        store
+            .set_policy_state(settled_session, PolicyState::Suspicious)
+            .expect("settled state should persist");
+        store
+            .note_controlled_reality_interaction(
+                second_session,
+                second_request,
+                ControlledRealityRequestAction::BranchRead,
+                4,
+            )
+            .expect("second pending workflow should stage");
+        store
+            .note_controlled_reality_interaction(
+                first_session,
+                first_request,
+                ControlledRealityRequestAction::BranchRead,
+                4,
+            )
+            .expect("first pending workflow should stage");
+        let expected_policy = test_blocked_policy_event(first_session, first_request);
+        let expected_policy_id = expected_policy.id;
+        store
+            .stage_controlled_reality_policy_state(
+                first_session,
+                first_request,
+                PolicyState::Blocked,
+                expected_policy,
+            )
+            .expect("first policy transition should stage");
+
+        assert_eq!(
+            store.pending_event_log_recovery_coordinates(),
+            vec![
+                (first_session, first_request, Some(expected_policy_id)),
+                (second_session, second_request, None),
+            ]
+        );
+    }
+
+    #[test]
     fn maximum_widest_production_store_has_explicit_byte_headroom() {
         const REQUIRED_HEADROOM_BYTES: usize = 8 * 1024 * 1024;
 
@@ -1991,6 +2177,7 @@ mod tests {
             records,
             fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         };
 
         let serialized = store
@@ -2022,6 +2209,7 @@ mod tests {
                 .collect(),
             fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         }
     }
 
@@ -2630,6 +2818,7 @@ mod tests {
             records: HashMap::from([(session_id, record)]),
             fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         };
         fs::write(
             &path,
@@ -2935,6 +3124,7 @@ mod tests {
             )]),
             fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         };
         let template: serde_json::Value = serde_json::from_slice(
             &template_store
