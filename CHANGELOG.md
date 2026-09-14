@@ -32,8 +32,9 @@ Initial research-alpha source release.
   streaming validation, global duplicate-event rejection, active-only tail
   repair, immutable full-family verification, missing-only full-family sidecar
   reconstruction, pre-mutation workflow-contract validation, evidence-safe
-  deferred rotation, and one selected pending-workflow index built during the
-  authoritative under-lease scan
+  deferred rotation, preflight sizing for missing recovery appends and final
+  quarantine-bearing proof state, and one selected pending-workflow index built
+  during the authoritative under-lease scan
 
 ### Limitations
 

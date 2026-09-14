@@ -233,8 +233,10 @@ family at 128 MiB, and each schema-v2 JSON record at 1 MiB excluding its
 newline. A fixed-chunk streaming scan validates the complete family and rejects
 duplicate event IDs before any recovered state is committed. Both the
 pre-lease scan and the authoritative scan validate every pending workflow's
-complete response and expected-policy contract before mutation. During the one
-authoritative indexing scan under the writer lease, callbacks run only for
+complete response and expected-policy contract before mutation, including the
+bounded serialization of any missing policy event that reconciliation must
+append. During the one authoritative indexing scan under the writer lease,
+callbacks run only for
 missing exposure/proof sidecars and a selected index captures response and
 expected policy evidence for at most 8,192 pending workflows. Existing valid
 sidecars remain authoritative and bypass reconstruction. A fixed-memory
@@ -243,6 +245,11 @@ to repair/open to the authoritative scan. Reconciliation uses the selected
 index instead of rescanning every segment for every pending session; live
 ordinary response/policy events are not retained in it, and resolved workflow
 payloads are removed.
+
+Missing consumed-proof state receives its history-triggered migration
+quarantine in memory before the authoritative pre-mutation semantic and
+canonical-size check, so validation covers the exact representation later
+persisted.
 
 The active file may be absent in the post-rename rotation crash window; its
 archives still recover and a new active file is created only after validation.

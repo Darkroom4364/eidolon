@@ -97,7 +97,9 @@ files are not family members.
 
 Production preflights that family, its active-tail repair plan, and complete
 pending response/policy contracts without the lease or mutation, then repeats
-the authoritative validation under the lease. The resulting stream
+the authoritative validation under the lease. Any missing expected policy
+event that reconciliation would append is size-checked through the production
+record serializer during both phases. The resulting stream
 reconstructs only missing bounded bait-security sidecars and builds one
 selected response/policy index for at most 8,192 pending workflows; existing
 valid sidecars remain authoritative. A fixed-memory SHA-256 pass verifies the
@@ -131,7 +133,8 @@ already-validated ordered complete event-log family, including the archive-only
 post-rename crash window. Existing valid sidecars remain authoritative. Live
 PVC proof remains #253. Missing-sidecar reconstruction must also pass the same
 identifier, timestamp, lifetime, capacity, and canonical-size semantics as a
-loaded sidecar before durable startup mutation.
+loaded sidecar before durable startup mutation; consumed-proof reconstruction
+adds its history quarantine before that final size check.
 
 ## Defensive Boundary
 

@@ -137,8 +137,10 @@ Missing-sidecar reconstruction consumes the same already-validated event
 stream used for pending-workflow recovery; it does not reopen or buffer the
 family, and it runs only when the corresponding valid committed sidecar is
 absent. Reconstructed state must pass the same identifier, timestamp, lifetime,
-capacity, and canonical-write semantics as loaded state. Production performs a
-read-only event-family, repair-plan, and complete pending-contract preflight
+capacity, and canonical-write semantics as loaded state; proof reconstruction
+adds any history-triggered migration quarantine before validating the exact
+bytes to be persisted. Production performs a read-only event-family,
+repair-plan, and complete pending-contract preflight
 before taking the durable-state lease, then repeats the authoritative scan and
 contract checks under that lease before policy migration/eviction, event/debug
 writer open, sidecar replacement, or listener startup. A fixed-memory SHA-256
@@ -158,8 +160,10 @@ policy workflows. Durable appends update that in-memory index; lookup no
 longer rescans the family once per pending session. Ordinary live
 response/policy events are excluded from the selected payload index, resolved
 workflow payloads are removed, and rotation will not prune selected unresolved
-evidence. An active segment exactly at the byte ceiling stays in place until
-reconciliation completes and rotates before its next append.
+evidence. A missing policy event required for recovery is passed through the
+same bounded record serializer during both validation phases before any
+startup mutation. An active segment exactly at the byte ceiling stays in place
+until reconciliation completes and rotates before its next append.
 
 ## Compatibility rules
 

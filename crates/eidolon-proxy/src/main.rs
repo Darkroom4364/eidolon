@@ -35,9 +35,10 @@ use eidolon_proxy::{
     },
     debug_log::FileDebugLogWriter,
     event_log::{
-        scan_event_log_family, DurableResponseMatch, EventLogRecoveryScan, EventLogRecoveryTarget,
-        FileEventLogWriter, JsonlTailRepairOutcome, LOG_ARCHIVES_KEPT, LOG_ROTATE_BYTES,
-        MAX_EVENT_LOG_FAMILY_BYTES, MAX_EVENT_LOG_RECORD_BYTES,
+        scan_event_log_family, validate_event_log_record_without_mutation, DurableResponseMatch,
+        EventLogRecoveryScan, EventLogRecoveryTarget, FileEventLogWriter, JsonlTailRepairOutcome,
+        LOG_ARCHIVES_KEPT, LOG_ROTATE_BYTES, MAX_EVENT_LOG_FAMILY_BYTES,
+        MAX_EVENT_LOG_RECORD_BYTES,
     },
     http_request::{
         canonical_request_target, normalized_request_host, HttpHeader, HttpRequest, HttpVersion,
@@ -2302,15 +2303,20 @@ fn validate_pending_event_log_recovery(
                     ));
                 }
                 if let Some(expected_policy_changed) = pending.expected_policy_changed.as_ref() {
-                    if let Some(actual) = recovery.indexed_durable_event_by_id(
+                    match recovery.indexed_durable_event_by_id(
                         session_id,
                         request_id,
                         expected_policy_changed.id,
                     )? {
-                        if actual != *expected_policy_changed {
-                            return Err(invalid_data(
-                                "durable policy transition conflicted with its pending contract",
-                            ));
+                        Some(actual) => {
+                            if actual != *expected_policy_changed {
+                                return Err(invalid_data(
+                                    "durable policy transition conflicted with its pending contract",
+                                ));
+                            }
+                        }
+                        None => {
+                            validate_event_log_record_without_mutation(expected_policy_changed)?
                         }
                     }
                 }
@@ -2419,13 +2425,15 @@ fn run_proxy_with_shutdown(
             }
             Ok(())
         })?;
+    let recovered_event_log_history_exists = event_log_recovery.stats.family_bytes > 0;
     if rebuild_bait_exposures {
         recovered_bait_exposures.torn_tail_line = event_log_recovery.active_torn_tail_line;
         recovered_bait_exposures.validate_recovered_state(now)?;
     }
     if rebuild_consumed_bait_proofs {
         recovered_consumed_bait_proofs.torn_tail_line = event_log_recovery.active_torn_tail_line;
-        recovered_consumed_bait_proofs.validate_recovered_state(now)?;
+        recovered_consumed_bait_proofs
+            .prepare_recovered_state_for_persistence(now, recovered_event_log_history_exists)?;
     }
     validate_pending_event_log_recovery(&prepared_policy_store, &event_log_recovery)?;
     let event_log_recovery_stats = event_log_recovery.stats;
@@ -2467,7 +2475,7 @@ fn run_proxy_with_shutdown(
         prepared_consumed_bait_proofs,
         (
             recovered_consumed_bait_proofs,
-            event_log_recovery_stats.family_bytes > 0,
+            recovered_event_log_history_exists,
         ),
     )?;
     let restored_consumed_bait_proof_count = consumed_bait_proofs.consumed.len();
@@ -3583,11 +3591,7 @@ impl ConsumedBaitProofStore {
             None => {
                 let (mut store, history_exists) = recovered;
                 store.path = Some(state_path.clone());
-                if history_exists {
-                    store.migration_quarantine_until =
-                        Some(now.saturating_add(MAX_BAIT_PROOF_TTL_SECS));
-                }
-                store.validate_canonical_serialization()?;
+                store.prepare_recovered_state_for_persistence(now, history_exists)?;
                 remove_stale_auxiliary_state_temp(&state_path)?;
                 store.persist()?;
                 Ok(store)
@@ -3764,6 +3768,16 @@ impl ConsumedBaitProofStore {
             }
         }
         self.validate_canonical_serialization()
+    }
+
+    fn prepare_recovered_state_for_persistence(
+        &mut self,
+        now: u64,
+        history_exists: bool,
+    ) -> io::Result<()> {
+        self.migration_quarantine_until =
+            history_exists.then_some(now.saturating_add(MAX_BAIT_PROOF_TTL_SECS));
+        self.validate_recovered_state(now)
     }
 
     fn check_and_mark(
@@ -9330,6 +9344,8 @@ mod tests {
     };
     use serde_json::Value;
 
+    const PRODUCTION_PROFILE_TEST_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
     struct ShortReader {
         bytes: Cursor<Vec<u8>>,
         max_read: usize,
@@ -10626,7 +10642,7 @@ mod tests {
             )
         });
         let address = started_received
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(PRODUCTION_PROFILE_TEST_STARTUP_TIMEOUT)
             .expect("production profile server should bind");
 
         ProductionProfileServer {
@@ -12164,6 +12180,159 @@ mod tests {
             assert!(
                 !error.to_string().contains(&private),
                 "pending conflict diagnostic leaked `{private}`"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn oversized_missing_recovery_policy_event_fails_before_production_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let private_session = SessionId(uuid::Uuid::from_u128(0x0fee_d314));
+        let private_request = RequestId(uuid::Uuid::from_u128(0x0caf_e314));
+        let transition =
+            policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+                PolicyState::ControlledReality,
+                "route:controlled_follow_up",
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+            )
+            .expect("oversized recovery fixture should have a blocked transition");
+        let mut expected_policy_changed =
+            policy::policy_changed_event(private_session, private_request, &transition);
+        let EventKind::PolicyChanged { reason, .. } = &mut expected_policy_changed.kind else {
+            panic!("recovery fixture should remain a policy transition")
+        };
+        reason.clear();
+        let empty_reason_len = serde_json::to_vec(&expected_policy_changed)
+            .expect("empty-reason recovery event should serialize")
+            .len();
+        let EventKind::PolicyChanged { reason, .. } = &mut expected_policy_changed.kind else {
+            panic!("recovery fixture should remain a policy transition")
+        };
+        *reason = "x".repeat(
+            (MAX_EVENT_LOG_RECORD_BYTES + 1)
+                .checked_sub(empty_reason_len)
+                .expect("recovery event envelope should fit the record ceiling"),
+        );
+        assert_eq!(
+            serde_json::to_vec(&expected_policy_changed)
+                .expect("sized recovery event should serialize")
+                .len(),
+            MAX_EVENT_LOG_RECORD_BYTES + 1
+        );
+        let expected_policy_event_id = expected_policy_changed.id;
+
+        let response = Event::new(
+            private_session,
+            EventSource::Proxy,
+            PolicyState::Blocked,
+            EventKind::ResponseServed {
+                status: 403,
+                routing_decision: RoutingDecision::EidolonOwned,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(private_request);
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [{
+                "session_id": private_session.0,
+                "policy_state": "controlled_reality",
+                "controlled_reality_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                "controlled_reality_workflow_state": "ready",
+                "controlled_reality_origin_request_id": null,
+                "controlled_reality_pending_update": {
+                    "request_id": private_request.0,
+                    "request_action": "branch_read",
+                    "previous_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 1,
+                    "previous_state": "ready",
+                    "previous_origin_request_id": null,
+                    "commit_policy_state": "blocked",
+                    "expected_policy_changed": expected_policy_changed,
+                    "expected_response": {
+                        "event_id": response.id,
+                        "policy_state": "blocked",
+                        "status": 403,
+                        "routing_decision": "eidolon_owned",
+                        "interaction_kind": null,
+                        "controlled_reality_sha256": controlled_reality_semantics_sha256(&None)
+                            .expect("absent response semantics should serialize"),
+                    },
+                },
+            }],
+        }))
+        .expect("oversized recovery policy state should serialize");
+        assert!(
+            policy_before.len() < eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES,
+            "the policy store ceiling must not be the rejection under test"
+        );
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("pending policy state should write");
+        let event_before = format!(
+            "{}\n{{\"schema_version\":",
+            serde_json::to_string(&response).expect("durable response should serialize")
+        )
+        .into_bytes();
+        fs::write(&fixture.event_log_path, &event_before)
+            .expect("repairable event family should write");
+
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let debug_before = br#"{"sentinel":"oversized-recovery-policy"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"oversized-recovery-policy-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("oversized missing recovery event must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("serialized event exceeds"));
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            response.id.to_string(),
+            expected_policy_event_id.to_string(),
+        ] {
+            assert!(
+                !error.to_string().contains(&private),
+                "oversized recovery diagnostic leaked `{private}`"
             );
         }
         assert!(started_received.try_recv().is_err());
@@ -20112,6 +20281,85 @@ mod tests {
             consumed_bytes.len() * 2 < MAX_CONSUMED_PROOF_STORE_BYTES,
             "maximum canonical consumed-proof state should retain more than 50% byte headroom"
         );
+    }
+
+    #[test]
+    fn recovered_proof_quarantine_is_included_in_the_pre_mutation_size_check() {
+        let now = 1_700_000_000;
+        let expires_at = now + MAX_BAIT_PROOF_TTL_SECS;
+        let mut store = ConsumedBaitProofStore::default();
+        for index in 0..4_u8 {
+            store.consumed.insert(
+                (
+                    SessionId(uuid::Uuid::from_u128(index as u128 + 1)),
+                    BaitId(format!("proof-{index}-{}", "x".repeat(900_000))),
+                    [index; 32],
+                ),
+                expires_at,
+            );
+        }
+        let fifth_session = SessionId(uuid::Uuid::from_u128(5));
+        let fifth_digest = [5_u8; 32];
+        let mut fifth_bait = BaitId("proof-tail".to_string());
+        store.consumed.insert(
+            (fifth_session, fifth_bait.clone(), fifth_digest),
+            expires_at,
+        );
+        let initial_len = serde_json::to_vec_pretty(&store.canonical_state())
+            .expect("initial reconstructed proof state should serialize")
+            .len();
+        let padding = MAX_CONSUMED_PROOF_STORE_BYTES
+            .checked_sub(initial_len)
+            .expect("reconstructed proof fixture should retain byte headroom");
+        let expiry = store
+            .consumed
+            .remove(&(fifth_session, fifth_bait.clone(), fifth_digest))
+            .expect("tail proof fixture should exist");
+        fifth_bait.0.push_str(&"x".repeat(padding));
+        store
+            .consumed
+            .insert((fifth_session, fifth_bait.clone(), fifth_digest), expiry);
+
+        let without_quarantine = serialize_auxiliary_state(
+            &store.canonical_state(),
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            "consumed proof state",
+        )
+        .expect("exact-limit reconstructed state without quarantine should fit");
+        assert_eq!(without_quarantine.len(), MAX_CONSUMED_PROOF_STORE_BYTES);
+        store
+            .validate_recovered_state(now)
+            .expect("the pre-quarantine representation alone should validate");
+
+        let error = store
+            .prepare_recovered_state_for_persistence(now, true)
+            .expect_err("quarantine expansion beyond the byte ceiling must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds the fixed"));
+        let expanded_len = serde_json::to_vec_pretty(&store.canonical_state())
+            .expect("expanded proof state should serialize for the boundary assertion")
+            .len();
+        assert!(expanded_len > MAX_CONSUMED_PROOF_STORE_BYTES);
+
+        let shrink = expanded_len - MAX_CONSUMED_PROOF_STORE_BYTES;
+        let expiry = store
+            .consumed
+            .remove(&(fifth_session, fifth_bait.clone(), fifth_digest))
+            .expect("expanded tail proof fixture should exist");
+        fifth_bait.0.truncate(fifth_bait.0.len() - shrink);
+        store
+            .consumed
+            .insert((fifth_session, fifth_bait, fifth_digest), expiry);
+        store
+            .prepare_recovered_state_for_persistence(now, true)
+            .expect("the exact final quarantine-bearing representation should fit");
+        let exact_final = serialize_auxiliary_state(
+            &store.canonical_state(),
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            "consumed proof state",
+        )
+        .expect("exact final proof state should serialize");
+        assert_eq!(exact_final.len(), MAX_CONSUMED_PROOF_STORE_BYTES);
     }
 
     #[test]

@@ -162,22 +162,22 @@ impl EventLogRecoveryIndex {
     }
 
     fn rotation_would_prune_recovery_evidence(&self) -> bool {
-        if self.archive_event_ids.len() < LOG_ARCHIVES_KEPT {
-            return false;
-        }
-        let Some(oldest_event_ids) = self.archive_event_ids.front() else {
-            return false;
-        };
-        self.durable_responses.values().any(|response| {
-            matches!(
-                response,
-                DurableResponseMatch::Unique { event_id, .. }
-                    if oldest_event_ids.contains(event_id)
-            )
-        }) || self
-            .durable_events
-            .keys()
-            .any(|event_id| oldest_event_ids.contains(event_id))
+        self.archive_event_ids.len() >= LOG_ARCHIVES_KEPT
+            && self
+                .archive_event_ids
+                .front()
+                .is_some_and(|oldest_event_ids| {
+                    self.durable_responses.values().any(|response| {
+                        matches!(
+                            response,
+                            DurableResponseMatch::Unique { event_id, .. }
+                                if oldest_event_ids.contains(event_id)
+                        )
+                    }) || self
+                        .durable_events
+                        .keys()
+                        .any(|event_id| oldest_event_ids.contains(event_id))
+                })
     }
 }
 
@@ -273,8 +273,7 @@ impl Write for BoundedEventSerialization {
         let allocation_bound = MAX_EVENT_LOG_RECORD_BYTES + 1;
         let remaining = allocation_bound.saturating_sub(self.bytes.len());
         let retained = buffer.len().min(remaining);
-        let required = self.bytes.len() + retained;
-        self.bytes.reserve_exact(required - self.bytes.len());
+        self.bytes.reserve_exact(retained);
         self.bytes.extend_from_slice(&buffer[..retained]);
         Ok(buffer.len())
     }
@@ -293,6 +292,23 @@ fn serialize_event_bounded(event: &Event) -> io::Result<Vec<u8>> {
         )
     })?;
     sink.finish()
+}
+
+/// Validate one event through the exact bounded serializer used by appends,
+/// without opening or mutating the event-log family.
+pub fn validate_event_log_record_without_mutation(event: &Event) -> io::Result<()> {
+    serialize_event_bounded(event).map(drop)?;
+    validate_event_write_schema(event)
+}
+
+fn validate_event_write_schema(event: &Event) -> io::Result<()> {
+    if event.schema_version != eidolon_core::EVENT_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "event writer received an unsupported schema version",
+        ));
+    }
+    Ok(())
 }
 
 pub struct EventLogWriter<W> {
@@ -580,12 +596,7 @@ impl<W: Write> EventLogWriter<W> {
         let mut batch_ids = HashSet::with_capacity(events.len());
         let mut batch_responses = HashSet::with_capacity(events.len());
         for event in events {
-            if event.schema_version != eidolon_core::EVENT_SCHEMA_VERSION {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "event writer received an unsupported schema version",
-                ));
-            }
+            validate_event_write_schema(event)?;
             if self.recovery_index.event_ids.contains(&event.id) || !batch_ids.insert(event.id) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -2929,6 +2940,8 @@ mod tests {
     fn exact_record_limit_is_accepted_and_limit_plus_one_is_rejected() {
         let exact = TestFamily::new("record-exact.jsonl");
         let exact_event = event_with_serialized_len(super::MAX_EVENT_LOG_RECORD_BYTES);
+        super::validate_event_log_record_without_mutation(&exact_event)
+            .expect("read-only append validation should accept the exact record limit");
         write_events(&exact.path, &[&exact_event]);
         let scan = super::scan_event_log_family(&exact.path, &[], |_| Ok(()))
             .expect("exact record limit should validate");
@@ -2936,6 +2949,9 @@ mod tests {
 
         let over = TestFamily::new("record-over.jsonl");
         let over_event = event_with_serialized_len(super::MAX_EVENT_LOG_RECORD_BYTES + 1);
+        let preflight_error = super::validate_event_log_record_without_mutation(&over_event)
+            .expect_err("read-only append validation must reject record limit plus one");
+        assert_eq!(preflight_error.kind(), io::ErrorKind::InvalidData);
         write_events(&over.path, &[&over_event]);
         let error = super::scan_event_log_family(&over.path, &[], |_| Ok(()))
             .err()
@@ -2954,6 +2970,45 @@ mod tests {
                 .len(),
             super::MAX_EVENT_LOG_RECORD_BYTES as u64 + 1
         );
+    }
+
+    #[test]
+    fn bounded_event_serialization_capacity_stays_within_the_record_sentinel() {
+        let allocation_bound = super::MAX_EVENT_LOG_RECORD_BYTES + 1;
+        let first_len = super::MAX_EVENT_LOG_RECORD_BYTES / 2;
+        let mut serialization = super::BoundedEventSerialization::new();
+        let first = vec![b'a'; first_len];
+        assert_eq!(
+            serialization
+                .write(&first)
+                .expect("first bounded chunk should write"),
+            first.len()
+        );
+        assert!(serialization.bytes.capacity() <= allocation_bound);
+
+        let second = vec![b'b'; allocation_bound - first_len];
+        assert_eq!(
+            serialization
+                .write(&second)
+                .expect("second bounded chunk should write"),
+            second.len()
+        );
+        assert_eq!(serialization.bytes.len(), allocation_bound);
+        assert!(serialization.bytes.capacity() <= allocation_bound);
+
+        let ignored = [b'c'; 64];
+        assert_eq!(
+            serialization
+                .write(&ignored)
+                .expect("post-sentinel input should be consumed without allocation"),
+            ignored.len()
+        );
+        assert_eq!(serialization.bytes.len(), allocation_bound);
+        assert!(serialization.bytes.capacity() <= allocation_bound);
+        let error = serialization
+            .finish()
+            .expect_err("the retained sentinel byte must make the record invalid");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -3469,6 +3524,43 @@ mod tests {
         assert!(writer.recovery_index.durable_responses.is_empty());
         assert!(writer.recovery_index.durable_events.is_empty());
         assert!(!writer.unavailable_after_io_failure);
+
+        let valid_policy = policy_event(session_id, request_id);
+        let mut wrong_session = valid_policy.clone();
+        wrong_session.session_id = SessionId::new();
+        let mut wrong_request = valid_policy.clone();
+        wrong_request.request_id = Some(RequestId::new());
+        let mut wrong_source = valid_policy.clone();
+        wrong_source.source = EventSource::Proxy;
+        let mut wrong_kind = valid_policy;
+        wrong_kind.kind = request_event("GET", "/wrong-policy-kind").kind;
+        for (label, invalid_policy) in [
+            ("wrong session", wrong_session),
+            ("wrong request", wrong_request),
+            ("wrong source", wrong_source),
+            ("wrong event kind", wrong_kind),
+        ] {
+            let error = writer
+                .write_durable_response_transaction(&response, Some(&invalid_policy))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{label}");
+            assert_eq!(writer.current_len, 0, "{label}");
+            assert_eq!(writer.unresolved_durable_response_count(), 0, "{label}");
+            assert!(writer.recovery_index.event_ids.is_empty(), "{label}");
+            assert!(
+                writer.recovery_index.durable_responses.is_empty(),
+                "{label}"
+            );
+            assert!(writer.recovery_index.durable_events.is_empty(), "{label}");
+            assert!(!writer.unavailable_after_io_failure, "{label}");
+            assert_eq!(
+                std::fs::metadata(&family.path)
+                    .expect("active metadata should remain readable")
+                    .len(),
+                0,
+                "{label}"
+            );
+        }
 
         let mut unsupported = response.clone();
         unsupported.schema_version = eidolon_core::EVENT_SCHEMA_VERSION - 1;

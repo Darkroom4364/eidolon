@@ -250,7 +250,9 @@ rebuild/quarantine behavior, but reconstruction now uses the bounded ordered
 event-log family described below rather than only the active file. Rebuilt
 state must pass the same non-empty identifier, non-future timestamp, maximum
 lifetime, capacity, and canonical write checks as an existing sidecar before
-any durable writer opens.
+any durable writer opens. Proof reconstruction adds the history-triggered
+migration quarantine before this check, so the size check covers the exact
+state later persisted.
 
 Generated session-proof responses carry `Cache-Control: private, no-store` and
 `Vary: Cookie`. Eidolon strips validators, range metadata, and CDN-specific
@@ -284,7 +286,9 @@ unterminated archive tails block startup. Nonnumeric neighbors are ignored.
 Production checks this family and every pending response/policy contract
 read-only before acquiring the writer lease, then repeats the authoritative
 scan and contract checks under the lease before durable mutation. The
-under-lease indexing scan is one streaming pass for only the missing
+validation includes bounded serialization of a missing expected policy event
+that recovery would need to append. The under-lease indexing scan is one
+streaming pass for only the missing
 exposure/proof sidecars and all pending workflow evidence; existing valid
 sidecars remain authoritative, and the family is not read once per pending
 session. Before repair/open, a fixed-memory SHA-256 pass verifies that ordered
