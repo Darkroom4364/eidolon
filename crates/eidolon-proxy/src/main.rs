@@ -13035,6 +13035,8 @@ mod tests {
         assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
         assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
         assert!(!fixture.policy_state_path.with_extension("tmp").exists());
+        assert!(!sidecar_state_path(&exposure_path, ".tmp").exists());
+        assert!(!sidecar_state_path(&proof_path, ".tmp").exists());
         assert!(!continuity_path.exists());
         assert!(upstream_recorder.finish().is_empty());
         fixture.stop();
@@ -13105,6 +13107,8 @@ mod tests {
         assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
         assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
         assert!(!fixture.policy_state_path.with_extension("tmp").exists());
+        assert!(!sidecar_state_path(&exposure_path, ".tmp").exists());
+        assert!(!sidecar_state_path(&proof_path, ".tmp").exists());
         assert!(!continuity_path.exists());
         assert!(upstream_recorder.finish().is_empty());
         fixture.stop();
