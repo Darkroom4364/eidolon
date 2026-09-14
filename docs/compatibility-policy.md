@@ -190,10 +190,11 @@ archive selection, parent sync, and pruning, so rotation cannot commit a rename
 and then fail solely because `Path::parent()` is empty.
 The active event-log file name is limited to 215 UTF-8 bytes, leaving exactly
 40 bytes for the dot and 39-digit suffix under the supported Linux 255-byte
-component limit. Every configured durable writer is excluded from that numeric
-archive namespace, and both scans compare existing family-member identities
-against the complete writable-target set so a differently named hard link
-cannot become a second writer for retained evidence.
+component limit. Every configured durable writer is excluded from the event
+and debug numeric archive namespaces, and both scans compare existing
+family-member identities against the complete writable-target set so a
+differently named hard link cannot become a second writer for retained
+evidence.
 
 ## Compatibility rules
 

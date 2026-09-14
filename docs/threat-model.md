@@ -100,9 +100,9 @@ records, and unterminated archive tails fail closed. Nonnumeric neighboring
 files are not family members.
 The active file name is capped at 215 UTF-8 bytes so every canonical suffix
 fits the supported Linux component limit. Production excludes every configured
-writer from the canonical event-archive namespace and compares existing family
-member identities with all writable targets during both scans, including hard
-links with unrelated names.
+writer from the canonical event- and debug-archive namespaces and compares
+existing event-family member identities with all writable targets during both
+scans, including hard links with unrelated names.
 
 Production preflights that family, its active-tail repair plan, and complete
 pending response/policy contracts without the lease or mutation, then repeats

@@ -297,10 +297,10 @@ event schemas, duplicate event IDs, invalid complete records, and
 unterminated archive tails block startup. Nonnumeric neighbors are ignored.
 Keep the active event-log file name at or below 215 UTF-8 bytes; this reserves
 the complete 40-byte archive suffix within the supported Linux 255-byte file
-name limit. No policy, lease, continuity, sidecar, temp, or debug target may use
-the event log's canonical numeric archive namespace or hard-link an existing
-family member. The configured active event log must not itself hard-link a
-retained archive.
+name limit. No configured durable target may use the event or debug log's
+canonical numeric archive namespace. No policy, lease, continuity, sidecar,
+temp, or debug target may hard-link an existing event-family member. The
+configured active event log must not itself hard-link a retained archive.
 
 Production checks this family and every pending response/policy contract
 read-only before acquiring the writer lease, then repeats the authoritative

@@ -872,8 +872,11 @@ impl ConfigBuilder {
                 .map(|(label, path)| (*label, path.as_path()))
                 .collect::<Vec<_>>();
             ensure_production_durable_paths_are_distinct(&writable_path_refs)?;
-            ensure_production_writable_paths_avoid_event_archive_namespace(
-                &event_log_path,
+            ensure_production_writable_paths_avoid_rotating_log_archive_namespaces(
+                &[
+                    ("event-log", event_log_path.as_path()),
+                    ("debug-log", debug_log_path),
+                ],
                 &writable_path_refs,
             )?;
             let read_only_inputs = [
@@ -1814,22 +1817,26 @@ fn production_writable_paths(
     ]
 }
 
-fn ensure_production_writable_paths_avoid_event_archive_namespace(
-    event_log_path: &Path,
+fn ensure_production_writable_paths_avoid_rotating_log_archive_namespaces(
+    rotating_logs: &[(&str, &Path)],
     writable_paths: &[(&str, &Path)],
 ) -> Result<(), ConfigError> {
-    let event_target = canonical_durable_file_target(event_log_path)?;
-    let event_parent = event_target.parent().ok_or_else(|| {
-        ConfigError::new("event log durable target has no resolved parent directory")
-    })?;
-    for (label, path) in writable_paths {
-        let candidate = canonical_durable_file_target(path)?;
-        if candidate.parent() == Some(event_parent)
-            && has_canonical_event_log_archive_name(&event_target, &candidate)
-        {
-            return Err(ConfigError::new(format!(
-                "`--profile production` reserves the event-log archive namespace: {label} targets a canonical event-log archive"
-            )));
+    for (rotating_label, rotating_path) in rotating_logs {
+        let rotating_target = canonical_durable_file_target(rotating_path)?;
+        let rotating_parent = rotating_target.parent().ok_or_else(|| {
+            ConfigError::new(format!(
+                "{rotating_label} durable target has no resolved parent directory"
+            ))
+        })?;
+        for (label, path) in writable_paths {
+            let candidate = canonical_durable_file_target(path)?;
+            if candidate.parent() == Some(rotating_parent)
+                && has_canonical_event_log_archive_name(&rotating_target, &candidate)
+            {
+                return Err(ConfigError::new(format!(
+                    "`--profile production` reserves the {rotating_label} archive namespace: {label} targets a canonical {rotating_label} archive"
+                )));
+            }
         }
     }
     Ok(())
@@ -2577,7 +2584,12 @@ fn run_proxy_with_shutdown(
             }
             Ok(())
         })?;
-    validate_production_event_family_path_isolation_without_mutation(&config, &event_log_recovery)?;
+    if profile == RuntimeProfile::Production {
+        validate_production_event_family_path_isolation_without_mutation(
+            &config,
+            &event_log_recovery,
+        )?;
+    }
     let recovered_event_log_history_exists = event_log_recovery.stats.family_bytes > 0;
     finalize_recovered_bait_security_sidecars_without_mutation(
         rebuild_bait_exposures,
@@ -11289,6 +11301,42 @@ mod tests {
     }
 
     #[test]
+    fn lab_startup_without_debug_log_skips_production_event_family_isolation() {
+        let occupied_listener =
+            TcpListener::bind("127.0.0.1:0").expect("occupied lab address should bind");
+        let listen_addr = occupied_listener
+            .local_addr()
+            .expect("occupied lab address should resolve")
+            .to_string();
+        let event_log_path = unique_temp_path("lab-no-debug-events.jsonl");
+        let policy_state_path = unique_temp_path("lab-no-debug-policy.json");
+        let intervention_control_path = unique_temp_path("lab-no-debug-control.txt");
+        let args = [
+            "--listen-addr".to_string(),
+            listen_addr,
+            "--event-log".to_string(),
+            path_str(&event_log_path, "lab event path should be UTF-8").to_string(),
+            "--policy-state".to_string(),
+            path_str(&policy_state_path, "lab policy path should be UTF-8").to_string(),
+            "--intervention-control".to_string(),
+            path_str(
+                &intervention_control_path,
+                "lab control path should be UTF-8",
+            )
+            .to_string(),
+        ];
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let config = run_config(&args).expect("lab config without a debug log should parse");
+        assert_eq!(config.profile, RuntimeProfile::Lab);
+        assert!(config.debug_log_path.is_none());
+
+        let error = run_proxy_with_production_shutdown(config, async {}, None)
+            .expect_err("the occupied address should stop lab startup after state preparation");
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
     fn continuity_key_mode_distinguishes_configured_fallback_and_disabled() {
         assert_eq!(ingress_continuity_key_mode(true, true), "configured");
         assert_eq!(ingress_continuity_key_mode(true, false), "configured");
@@ -14445,6 +14493,33 @@ mod tests {
                     .to_string()
                     .contains("reserves the event-log archive namespace"),
                 "unexpected archive namespace error: {error}"
+            );
+        }
+
+        let debug_archive_namespace_target = event_log_archive_path(&fixture.debug_log_path, 1);
+        for existing in [false, true] {
+            if existing {
+                fs::write(&debug_archive_namespace_target, b"\n")
+                    .expect("existing debug archive namespace target should write");
+            }
+            let mut args = fixture.args.clone();
+            let event_index = args
+                .iter()
+                .position(|value| value == "--event-log")
+                .expect("fixture should configure an event log");
+            args[event_index + 1] = path_str(
+                &debug_archive_namespace_target,
+                "debug archive namespace target should be UTF-8",
+            )
+            .to_string();
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let error = run_config(&args)
+                .expect_err("missing and existing debug archive targets must stay reserved");
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserves the debug-log archive namespace"),
+                "unexpected debug archive namespace error: {error}"
             );
         }
 

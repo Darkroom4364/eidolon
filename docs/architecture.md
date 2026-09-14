@@ -232,17 +232,17 @@ order, followed by the active segment. Each segment is capped at 32 MiB, the
 family at 128 MiB, and each schema-v2 JSON record at 1 MiB excluding its
 newline. The active file name is capped at 215 UTF-8 bytes, reserving the dot
 and 39-digit suffix within the supported Linux 255-byte component limit.
-Production reserves that numeric namespace from every configured durable
-writer and compares existing family-member identities against those writers in
-both scans. A fixed-chunk streaming scan validates the complete family and
-rejects duplicate event IDs before any recovered state is committed. Both the
-pre-lease scan and the authoritative scan validate every pending workflow's
-complete response and expected-policy contract before mutation, including the
-bounded serialization of any missing policy event that reconciliation must
-append. During each scan, callbacks run only for missing exposure/proof
-sidecars, immediately finalize their semantic and canonical-size checks, and a
-selected index captures response and expected policy evidence for at most
-8,192 pending workflows. Existing valid sidecars remain authoritative and
+Production reserves both event- and debug-log numeric archive namespaces from
+every configured durable writer and compares existing event-family identities
+against those writers in both scans. A fixed-chunk streaming scan validates the
+complete family and rejects duplicate event IDs before any recovered state is
+committed. Both the pre-lease scan and the authoritative scan validate every
+pending workflow's complete response and expected-policy contract before
+mutation, including the bounded serialization of any missing policy event that
+reconciliation must append. During each scan, callbacks run only for missing
+exposure/proof sidecars, immediately finalize their semantic and canonical-size
+checks, and a selected index captures response and expected policy evidence for
+at most 8,192 pending workflows. Existing valid sidecars remain authoritative and
 bypass reconstruction. The under-lease result is the one used for opening and
 reconciliation. A fixed-memory
 SHA-256 verification pass then binds the ordered membership and bytes presented
