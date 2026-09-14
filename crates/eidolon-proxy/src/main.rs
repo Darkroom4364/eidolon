@@ -30968,6 +30968,7 @@ mod tests {
         let session_b = SessionId::new();
         let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
         let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
+        wait_for_bait_proof_window_headroom(&bait);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
