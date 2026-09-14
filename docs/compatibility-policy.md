@@ -138,13 +138,14 @@ parent-directory sync. After validating the committed file, authoritative open
 under the single-writer lease removes one regular crash-left temp; a symlink or
 non-regular object at the reserved path fails closed. The fixed name bounds
 crash residue and is part of the deployment recovery-file allowlist.
-Missing-sidecar reconstruction consumes the same already-validated event
+During both the pre-lease and authoritative under-lease scans,
+missing-sidecar reconstruction consumes that scan's already-validated event
 stream used for pending-workflow recovery; it does not reopen or buffer the
 family, and it runs only when the corresponding valid committed sidecar is
-absent. Reconstructed state must pass the same identifier, timestamp, lifetime,
-capacity, and canonical-write semantics as loaded state; proof reconstruction
-adds any history-triggered migration quarantine before validating the exact
-bytes to be persisted. Production performs a read-only event-family,
+absent. Each phase requires reconstructed state to pass the same identifier,
+timestamp, lifetime, capacity, and canonical-write semantics as loaded state;
+proof reconstruction adds any history-triggered migration quarantine before
+validating the exact bytes to be persisted. Production performs a read-only event-family,
 repair-plan, and complete pending-contract preflight
 before taking the durable-state lease, then repeats the authoritative scan and
 contract checks under that lease before policy migration/eviction, event/debug
@@ -168,7 +169,12 @@ workflow payloads are removed, and rotation will not prune selected unresolved
 evidence. A missing policy event required for recovery is passed through the
 same bounded record serializer during both validation phases before any
 startup mutation. The same phases simulate the complete ordered append,
-rotation, and resolution plan against the active segment's post-repair length.
+rotation, and resolution plan against the active segment's post-repair length,
+including a checked fixed-width archive-suffix successor for every required
+rotation. An exhausted 39-digit namespace therefore fails before mutation,
+while a recovery with no rotation needs no new suffix. The authoritative
+policy plan also carries its single validated reconciliation timestamp into
+the live writes, so a timestamp-width change cannot invalidate its byte count.
 If a required append would rotate a three-archive family before the oldest
 selected evidence is resolved, startup fails without applying the tail repair
 or opening a writer. An active segment exactly at the byte ceiling stays in

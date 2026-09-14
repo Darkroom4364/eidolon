@@ -227,7 +227,10 @@ will persist in deterministic session order. This uses one full-state byte
 count plus exact per-record deltas rather than repeatedly serializing the whole
 store. A compact current-schema input can therefore fit the read limit yet fail
 before the lease if its first recovery snapshot would exceed the write limit;
-exactly 33,554,432 bytes remains valid.
+exactly 33,554,432 bytes remains valid. The authoritative plan samples one
+reconciliation timestamp and carries it unchanged into every corresponding
+policy write, including `last_seen`, so decimal-width changes cannot create a
+post-validation overflow.
 Duplicate session IDs never use file order to select a policy. If protected
 enforcement records alone fill the record bound, a sticky persisted fallback
 makes every unknown session `blocked` before older protected metadata is
@@ -295,13 +298,17 @@ scan and contract checks under the lease before durable mutation. The
 validation includes bounded serialization of a missing expected policy event
 that recovery would need to append. It then simulates those appends and each
 workflow resolution in the same sorted order used at startup, beginning from
-the active segment's post-tail-repair length. A rotation that would discard the
+the active segment's post-tail-repair length. Every required rotation also
+advances the canonical 39-digit suffix with the same checked successor rule as
+the writer; namespace exhaustion fails before the lease, while a fitting
+append does not require suffix capacity. A rotation that would discard the
 oldest of three archives while it still holds selected unresolved evidence is
 rejected before the lease or any durable-file change. The under-lease indexing
-scan is one streaming pass for only the missing
-exposure/proof sidecars and all pending workflow evidence; existing valid
-sidecars remain authoritative, and the family is not read once per pending
-session. Before repair/open, a fixed-memory SHA-256 pass verifies that ordered
+scan repeats the pre-lease reconstruction and final semantic/canonical-size
+validation for only the missing exposure/proof sidecars while indexing all
+pending workflow evidence; existing valid sidecars remain authoritative, and
+the family is not read once per pending session. Before repair/open, a
+fixed-memory SHA-256 pass verifies that ordered
 family membership and contents still match that scan. Missing active state is
 supported for an empty deployment and for the post-rename crash window when
 canonical archives remain. A new active file is created only after the family

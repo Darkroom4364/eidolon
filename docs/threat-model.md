@@ -84,7 +84,9 @@ contracts, and colliding policy/response event IDs before durable side effects.
 It also byte-counts every ordered canonical policy snapshot that recovery will
 persist, including `last_seen` refreshes, so compact current-schema expansion
 cannot fail only after other startup files have changed. Exact-limit outputs
-remain accepted. Issue `#253` separately owns live persistent-volume corruption
+remain accepted. The authoritative plan's sampled timestamp is reused by the
+live recovery writes, closing decimal-width drift after validation. Issue
+`#253` separately owns live persistent-volume corruption
 and unavailability qualification for the supported deployment.
 
 The production event-log recovery family is finite: one active 33,554,432-byte
@@ -103,10 +105,14 @@ the authoritative validation under the lease. Any missing expected policy
 event that reconciliation would append is size-checked through the production
 record serializer during both phases. Those phases also simulate the complete
 sorted append/rotation/resolution sequence from the active segment's
-post-repair length. A required rotation cannot evict the oldest of three
+post-repair length and apply the writer's checked canonical-suffix successor to
+every required rotation. A maximum 39-digit suffix therefore blocks a planned
+rotation before mutation but does not block a fitting append. A required
+rotation cannot evict the oldest of three
 archives while any later unresolved workflow still depends on evidence there.
 The resulting stream
-reconstructs only missing bounded bait-security sidecars and builds one
+reconstructs and fully validates only missing bounded bait-security sidecars in
+both the pre-lease and authoritative scans and builds one
 selected response/policy index for at most 8,192 pending workflows; existing
 valid sidecars remain authoritative. A fixed-memory SHA-256 pass verifies the
 same ordered membership and bytes before repair/open. This makes startup work

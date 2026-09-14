@@ -235,11 +235,12 @@ duplicate event IDs before any recovered state is committed. Both the
 pre-lease scan and the authoritative scan validate every pending workflow's
 complete response and expected-policy contract before mutation, including the
 bounded serialization of any missing policy event that reconciliation must
-append. During the one authoritative indexing scan under the writer lease,
-callbacks run only for
-missing exposure/proof sidecars and a selected index captures response and
-expected policy evidence for at most 8,192 pending workflows. Existing valid
-sidecars remain authoritative and bypass reconstruction. A fixed-memory
+append. During each scan, callbacks run only for missing exposure/proof
+sidecars, immediately finalize their semantic and canonical-size checks, and a
+selected index captures response and expected policy evidence for at most
+8,192 pending workflows. Existing valid sidecars remain authoritative and
+bypass reconstruction. The under-lease result is the one used for opening and
+reconciliation. A fixed-memory
 SHA-256 verification pass then binds the ordered membership and bytes presented
 to repair/open to the authoritative scan. Reconciliation uses the selected
 index instead of rescanning every segment for every pending session; live
@@ -247,10 +248,14 @@ ordinary response/policy events are not retained in it, and resolved workflow
 payloads are removed. Before opening the writer, an index-only simulator applies
 the same sorted append and resolution sequence from the active segment's
 post-repair length. It rejects any rotation that would prune selected evidence
-from the oldest retained archive. Policy recovery independently counts the
+from the oldest retained archive and advances the canonical archive namespace
+with the writer's checked successor rule for every planned rotation. Policy
+recovery independently counts the
 initial canonical representation and exact per-record canonical deltas, so
 every ordered snapshot that reconciliation will persist is proven within the
 32 MiB write limit without serializing the complete store once per workflow.
+Its authoritative timestamp is bound through both the plan and the live
+`last_seen` writes.
 
 Missing consumed-proof state receives its history-triggered migration
 quarantine in memory before the authoritative pre-mutation semantic and

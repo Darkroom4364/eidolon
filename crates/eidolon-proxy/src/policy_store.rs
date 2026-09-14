@@ -752,6 +752,7 @@ impl PolicyStateStore {
     pub fn validate_pending_reconciliation_plan_without_mutation(
         &self,
         decisions: &[PendingControlledRealityRecoveryDecision],
+        reconciliation_unix_secs: u64,
     ) -> io::Result<()> {
         let pending_sessions = self.pending_controlled_reality_sessions();
         if decisions.len() != pending_sessions.len()
@@ -791,10 +792,7 @@ impl PolicyStateStore {
             let before_bytes = self.serialized_record_envelope_len(decision.session_id, record)?;
             let mut reconciled = record.clone();
             apply_pending_reconciliation(&mut reconciled, &pending, decision.durable_response_seen);
-            // `insert_record` refreshes this field before every real
-            // reconciliation persistence. Its decimal width is therefore
-            // part of the planned canonical snapshot.
-            reconciled.last_seen_unix_secs = current_unix_secs();
+            reconciled.last_seen_unix_secs = reconciliation_unix_secs;
             let after_bytes =
                 self.serialized_record_envelope_len(decision.session_id, &reconciled)?;
             planned_bytes = planned_bytes
@@ -850,8 +848,16 @@ impl PolicyStateStore {
     }
 
     fn insert_record(&mut self, session_id: SessionId, record: SessionPolicyRecord) {
-        let mut record = record;
-        record.last_seen_unix_secs = current_unix_secs();
+        self.insert_record_at(session_id, record, current_unix_secs());
+    }
+
+    fn insert_record_at(
+        &mut self,
+        session_id: SessionId,
+        mut record: SessionPolicyRecord,
+        now: u64,
+    ) {
+        record.last_seen_unix_secs = now;
         let existed = match self.records.entry(session_id) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.insert(record);
@@ -874,7 +880,7 @@ impl PolicyStateStore {
             return;
         }
 
-        let mut stats = self.evict(current_unix_secs());
+        let mut stats = self.evict(now);
         if !self.records.contains_key(&session_id) {
             if !self.fail_closed_for_unknown_sessions {
                 self.fail_closed_for_unknown_sessions = true;
@@ -1228,6 +1234,21 @@ impl PolicyStateStore {
         request_id: RequestId,
         durable_response_seen: bool,
     ) -> io::Result<bool> {
+        self.reconcile_pending_controlled_reality_at(
+            session_id,
+            request_id,
+            durable_response_seen,
+            current_unix_secs(),
+        )
+    }
+
+    pub fn reconcile_pending_controlled_reality_at(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        durable_response_seen: bool,
+        reconciliation_unix_secs: u64,
+    ) -> io::Result<bool> {
         let record = self.record(session_id);
         let Some(pending_update) =
             pending_update_for_reconciliation(&record, request_id, durable_response_seen)?
@@ -1238,7 +1259,7 @@ impl PolicyStateStore {
         self.mutate_and_persist(|store| {
             let mut record = store.record(session_id);
             apply_pending_reconciliation(&mut record, &pending_update, durable_response_seen);
-            store.insert_record(session_id, record);
+            store.insert_record_at(session_id, record, reconciliation_unix_secs);
             true
         })
     }
@@ -2392,7 +2413,7 @@ mod tests {
         };
         let mut after_first = store.clone();
         assert!(after_first
-            .reconcile_pending_controlled_reality(first_session, first_request, false)
+            .reconcile_pending_controlled_reality_at(first_session, first_request, false, 9)
             .expect("empty-reason first workflow should reconcile"));
         let empty_reason_bytes = after_first
             .serialized_current_state_len()
@@ -2428,7 +2449,7 @@ mod tests {
         ];
         let mut exact_after_first = store.clone();
         assert!(exact_after_first
-            .reconcile_pending_controlled_reality(first_session, first_request, false)
+            .reconcile_pending_controlled_reality_at(first_session, first_request, false, 9)
             .expect("first exact-limit workflow should reconcile"));
         assert_eq!(
             exact_after_first
@@ -2440,7 +2461,7 @@ mod tests {
         let mut exact_persisted = store.clone();
         exact_persisted.path = Some(exact_path.clone());
         assert!(exact_persisted
-            .reconcile_pending_controlled_reality(first_session, first_request, false)
+            .reconcile_pending_controlled_reality_at(first_session, first_request, false, 9)
             .expect("the exact-limit snapshot should persist"));
         assert_eq!(
             fs::metadata(&exact_path)
@@ -2450,8 +2471,13 @@ mod tests {
         );
         fs::remove_file(&exact_path).expect("exact-limit snapshot should remove");
         store
-            .validate_pending_reconciliation_plan_without_mutation(&decisions)
+            .validate_pending_reconciliation_plan_without_mutation(&decisions, 9)
             .expect("an exact-limit first snapshot should validate");
+        let timestamp_error = store
+            .validate_pending_reconciliation_plan_without_mutation(&decisions, 10)
+            .expect_err("a wider persisted timestamp must be part of planning");
+        assert_eq!(timestamp_error.kind(), io::ErrorKind::InvalidData);
+        assert!(timestamp_error.to_string().contains("exceeds the fixed"));
 
         let mut oversized = store;
         let Some(Event {
@@ -2467,7 +2493,7 @@ mod tests {
         };
         reason.push('x');
         let error = oversized
-            .validate_pending_reconciliation_plan_without_mutation(&decisions)
+            .validate_pending_reconciliation_plan_without_mutation(&decisions, 9)
             .expect_err("the first canonical snapshot one byte over must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("exceeds the fixed"));

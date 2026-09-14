@@ -263,6 +263,7 @@ fn insert_recovery_evidence_location(
 }
 
 pub struct EventLogRecoveryScan {
+    path: PathBuf,
     index: EventLogRecoveryIndex,
     family_snapshot: Vec<EventLogSegmentSnapshot>,
     active_snapshot: EventLogActiveSnapshot,
@@ -337,6 +338,13 @@ impl EventLogRecoveryScan {
             ));
         }
         let (mut archives, mut active) = self.index.recovery_evidence_locations()?;
+        let mut latest_archive_suffix = self
+            .family_snapshot
+            .iter()
+            .filter(|segment| segment.kind == EventLogSegmentKind::Archive)
+            .filter_map(|segment| archive_suffix(&self.path, &segment.path))
+            .max()
+            .map(str::to_string);
 
         for step in steps {
             let workflow = (step.session_id, step.request_id);
@@ -369,12 +377,20 @@ impl EventLogRecoveryScan {
                         }
                         archives.pop_front();
                     }
+                    // Runtime stamps are u128 nanosecond counts, while the
+                    // canonical 39-digit namespace extends beyond u128::MAX.
+                    // Starting at the largest possible stamp upper-bounds any
+                    // later clock sample without consuming the remaining
+                    // high suffixes needed by this bounded plan.
+                    latest_archive_suffix = Some(next_archive_suffix_after(
+                        latest_archive_suffix.as_deref(),
+                        u128::MAX,
+                    )?);
                     archives.push_back(std::mem::take(&mut active));
-                    current_len = 0;
+                    current_len = incoming;
+                } else {
+                    current_len = next_len;
                 }
-                current_len = current_len
-                    .checked_add(incoming)
-                    .ok_or_else(|| io::Error::other("event log recovery length overflow"))?;
                 active.insert(workflow);
             }
 
@@ -1069,6 +1085,7 @@ fn scan_event_log_family_with_selection(
     stats.indexed_policy_event_count = index.durable_events.len();
 
     Ok(EventLogRecoveryScan {
+        path: path.to_path_buf(),
         index,
         family_snapshot,
         active_snapshot,
@@ -1724,16 +1741,19 @@ fn rotate_log_now_with_sync(
     sync_parent: impl Fn(&Path) -> io::Result<()>,
 ) -> io::Result<PathBuf> {
     sync_file(path)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let archive = next_archive_path(path, now)?;
+    let archive = next_archive_path(path, archive_timestamp_now())?;
     std::fs::rename(path, &archive)?;
     sync_parent(path)?;
     prune_log_archives(path, &archive, LOG_ARCHIVES_KEPT)?;
     sync_parent(path)?;
     Ok(archive)
+}
+
+fn archive_timestamp_now() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 fn sync_log_file(path: &Path) -> io::Result<()> {
@@ -1763,7 +1783,7 @@ fn next_archive_path(path: &Path, initial_stamp: u128) -> io::Result<PathBuf> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut suffix = format!("{initial_stamp:039}");
+    let mut latest_suffix = None::<String>;
     match std::fs::read_dir(parent) {
         Ok(entries) => {
             for entry in entries {
@@ -1771,14 +1791,18 @@ fn next_archive_path(path: &Path, initial_stamp: u128) -> io::Result<PathBuf> {
                 let Some(existing) = archive_suffix(path, &candidate) else {
                     continue;
                 };
-                if existing >= suffix.as_str() {
-                    suffix = increment_archive_suffix(existing)?;
+                if latest_suffix
+                    .as_deref()
+                    .is_none_or(|latest| existing > latest)
+                {
+                    latest_suffix = Some(existing.to_string());
                 }
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
+    let mut suffix = next_archive_suffix_after(latest_suffix.as_deref(), initial_stamp)?;
 
     loop {
         let mut archive = path.as_os_str().to_os_string();
@@ -1788,6 +1812,14 @@ fn next_archive_path(path: &Path, initial_stamp: u128) -> io::Result<PathBuf> {
             return Ok(archive);
         }
         suffix = increment_archive_suffix(&suffix)?;
+    }
+}
+
+fn next_archive_suffix_after(latest: Option<&str>, initial_stamp: u128) -> io::Result<String> {
+    let initial = format!("{initial_stamp:039}");
+    match latest {
+        Some(existing) if existing >= initial.as_str() => increment_archive_suffix(existing),
+        _ => Ok(initial),
     }
 }
 
@@ -2028,6 +2060,12 @@ mod tests {
 
         fn archive(&self, stamp: u128) -> std::path::PathBuf {
             archive_path(&self.path, stamp)
+        }
+
+        fn archive_with_suffix(&self, suffix: &str) -> std::path::PathBuf {
+            let mut archive = self.path.as_os_str().to_os_string();
+            archive.push(format!(".{suffix}"));
+            archive.into()
         }
     }
 
@@ -3570,6 +3608,78 @@ mod tests {
         let safe_order = [unsafe_order[1], unsafe_order[0]];
         scan.validate_reconciliation_plan(&safe_order)
             .expect("ordered resolution should make the later rotation safe");
+    }
+
+    #[test]
+    fn reconciliation_plan_checks_archive_namespace_only_when_rotation_is_required() {
+        let family = TestFamily::new("recovery-namespace-boundary.jsonl");
+        let exhausted_suffix = "9".repeat(39);
+        std::fs::write(family.archive_with_suffix(&exhausted_suffix), b"\n")
+            .expect("maximum archive suffix should write");
+        std::fs::write(&family.path, b"").expect("empty active should write");
+        let step = super::EventLogRecoveryPlanStep {
+            session_id: SessionId::new(),
+            request_id: RequestId::new(),
+            recovered_policy_event_bytes: Some(1),
+        };
+
+        let fitting = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("exhausted namespace with a fitting append should scan");
+        assert_eq!(fitting.stats.archive_count, 1);
+        fitting
+            .validate_reconciliation_plan(&[step])
+            .expect("a fitting recovery append must not require archive namespace room");
+
+        std::fs::write(&family.path, vec![b'\n'; super::LOG_ROTATE_BYTES as usize])
+            .expect("exact-limit active should write");
+        let rotating = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("exhausted namespace with a full active should scan");
+        assert_eq!(rotating.stats.active_bytes, super::LOG_ROTATE_BYTES);
+        assert_eq!(
+            rotating.active_tail_repair,
+            super::JsonlTailRepairOutcome::NotNeeded
+        );
+        let archive_suffix = rotating
+            .family_snapshot
+            .iter()
+            .find_map(|segment| super::archive_suffix(&rotating.path, &segment.path))
+            .expect("maximum archive suffix should remain in the scan snapshot");
+        assert_eq!(archive_suffix, exhausted_suffix);
+        let error = rotating
+            .validate_reconciliation_plan(&[step])
+            .expect_err("a required recovery rotation must reject an exhausted namespace");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("namespace is exhausted"));
+    }
+
+    #[test]
+    fn reconciliation_plan_tracks_length_and_namespace_across_multiple_rotations() {
+        let family = TestFamily::new("multi-rotation-recovery-namespace.jsonl");
+        let near_exhausted_suffix = format!("{}7", "9".repeat(38));
+        std::fs::write(family.archive_with_suffix(&near_exhausted_suffix), b"\n")
+            .expect("near-maximum archive suffix should write");
+        std::fs::write(&family.path, vec![b'\n'; super::LOG_ROTATE_BYTES as usize])
+            .expect("exact-limit active should write");
+        let scan = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("near-exhausted family should scan");
+        assert_eq!(scan.stats.archive_count, 1);
+        assert_eq!(scan.stats.active_bytes, super::LOG_ROTATE_BYTES);
+        let maximum_append = super::MAX_EVENT_LOG_RECORD_BYTES as u64 + 1;
+        let steps = (0_u128..63)
+            .map(|index| super::EventLogRecoveryPlanStep {
+                session_id: SessionId(uuid::Uuid::from_u128(index + 1)),
+                request_id: RequestId(uuid::Uuid::from_u128(index + 101)),
+                recovered_policy_event_bytes: Some(maximum_append),
+            })
+            .collect::<Vec<_>>();
+
+        scan.validate_reconciliation_plan(&steps[..62])
+            .expect("exactly two planned rotations should consume the final two suffixes");
+        let error = scan
+            .validate_reconciliation_plan(&steps)
+            .expect_err("the third planned rotation must exhaust the archive namespace");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("namespace is exhausted"));
     }
 
     #[test]
