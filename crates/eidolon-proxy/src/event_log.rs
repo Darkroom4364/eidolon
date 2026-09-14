@@ -29,11 +29,23 @@ pub const MAX_EVENT_LOG_FAMILY_BYTES: u64 = LOG_ROTATE_BYTES * (LOG_ARCHIVES_KEP
 const EVENT_LOG_READ_CHUNK_BYTES: usize = 8 * 1024;
 const EVENT_LOG_ARCHIVE_SUFFIX_DIGITS: usize = 39;
 
+type RecoveryWorkflow = (SessionId, RequestId);
+type RecoveryEvidence = HashSet<RecoveryWorkflow>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EventLogRecoveryTarget {
     pub session_id: SessionId,
     pub request_id: RequestId,
     pub expected_policy_event_id: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventLogRecoveryPlanStep {
+    pub session_id: SessionId,
+    pub request_id: RequestId,
+    /// Exact serialized bytes, including the JSONL newline, that recovery
+    /// must append before this workflow can be resolved.
+    pub recovered_policy_event_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -179,6 +191,75 @@ impl EventLogRecoveryIndex {
                         .any(|event_id| oldest_event_ids.contains(event_id))
                 })
     }
+
+    fn recovery_evidence_locations(
+        &self,
+    ) -> io::Result<(VecDeque<RecoveryEvidence>, RecoveryEvidence)> {
+        let mut archives = (0..self.archive_event_ids.len())
+            .map(|_| HashSet::new())
+            .collect::<VecDeque<_>>();
+        let mut active = HashSet::new();
+
+        for (workflow, response) in &self.durable_responses {
+            let DurableResponseMatch::Unique { event_id, .. } = response else {
+                continue;
+            };
+            insert_recovery_evidence_location(
+                &self.archive_event_ids,
+                &self.active_event_ids,
+                &mut archives,
+                &mut active,
+                *event_id,
+                *workflow,
+            )?;
+        }
+        for (event_id, event) in &self.durable_events {
+            let request_id = event.request_id.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "indexed recovery event did not identify its workflow",
+                )
+            })?;
+            insert_recovery_evidence_location(
+                &self.archive_event_ids,
+                &self.active_event_ids,
+                &mut archives,
+                &mut active,
+                *event_id,
+                (event.session_id, request_id),
+            )?;
+        }
+
+        Ok((archives, active))
+    }
+}
+
+fn insert_recovery_evidence_location(
+    archive_event_ids: &VecDeque<HashSet<Uuid>>,
+    active_event_ids: &HashSet<Uuid>,
+    archives: &mut VecDeque<RecoveryEvidence>,
+    active: &mut RecoveryEvidence,
+    event_id: Uuid,
+    workflow: RecoveryWorkflow,
+) -> io::Result<()> {
+    if active_event_ids.contains(&event_id) {
+        active.insert(workflow);
+        return Ok(());
+    }
+    if let Some(index) = archive_event_ids
+        .iter()
+        .position(|segment_event_ids| segment_event_ids.contains(&event_id))
+    {
+        archives
+            .get_mut(index)
+            .expect("recovery evidence archive indexes must remain aligned")
+            .insert(workflow);
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "indexed workflow evidence was absent from the scanned event-log family",
+    ))
 }
 
 pub struct EventLogRecoveryScan {
@@ -225,6 +306,84 @@ impl EventLogRecoveryScan {
             ));
         }
         Ok(Some(event.clone()))
+    }
+
+    /// Validate the exact ordered startup recovery writes against the
+    /// post-tail-repair active length and the same evidence-retention rule as
+    /// the live writer. This is deliberately index-only: pending count cannot
+    /// amplify event-family scans.
+    pub fn validate_reconciliation_plan(
+        &self,
+        steps: &[EventLogRecoveryPlanStep],
+    ) -> io::Result<()> {
+        if steps.len() > crate::policy_store::MAX_POLICY_SESSIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log recovery plan exceeds the policy session limit",
+            ));
+        }
+        let mut seen = HashSet::with_capacity(steps.len());
+        let mut current_len = match self.active_tail_repair {
+            JsonlTailRepairOutcome::NotNeeded => self.stats.active_bytes,
+            JsonlTailRepairOutcome::AppendedNewline { previous_len } => previous_len
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("event log repair length overflow"))?,
+            JsonlTailRepairOutcome::Truncated { repaired_len, .. } => repaired_len,
+        };
+        if current_len > LOG_ROTATE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log recovery plan starts beyond the fixed segment limit",
+            ));
+        }
+        let (mut archives, mut active) = self.index.recovery_evidence_locations()?;
+
+        for step in steps {
+            let workflow = (step.session_id, step.request_id);
+            if !seen.insert(workflow) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "event log recovery plan contains a duplicate workflow",
+                ));
+            }
+            if let Some(incoming) = step.recovered_policy_event_bytes {
+                if incoming > LOG_ROTATE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "event log recovery write exceeds the fixed segment limit",
+                    ));
+                }
+                let next_len = current_len
+                    .checked_add(incoming)
+                    .ok_or_else(|| io::Error::other("event log recovery length overflow"))?;
+                if next_len > LOG_ROTATE_BYTES {
+                    if archives.len() >= LOG_ARCHIVES_KEPT {
+                        if archives
+                            .front()
+                            .is_some_and(|evidence| !evidence.is_empty())
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "event log recovery rotation would prune unresolved workflow evidence",
+                            ));
+                        }
+                        archives.pop_front();
+                    }
+                    archives.push_back(std::mem::take(&mut active));
+                    current_len = 0;
+                }
+                current_len = current_len
+                    .checked_add(incoming)
+                    .ok_or_else(|| io::Error::other("event log recovery length overflow"))?;
+                active.insert(workflow);
+            }
+
+            for evidence in &mut archives {
+                evidence.remove(&workflow);
+            }
+            active.remove(&workflow);
+        }
+        Ok(())
     }
 }
 
@@ -297,8 +456,20 @@ fn serialize_event_bounded(event: &Event) -> io::Result<Vec<u8>> {
 /// Validate one event through the exact bounded serializer used by appends,
 /// without opening or mutating the event-log family.
 pub fn validate_event_log_record_without_mutation(event: &Event) -> io::Result<()> {
-    serialize_event_bounded(event).map(drop)?;
+    event_log_record_append_bytes_without_mutation(event).map(drop)
+}
+
+/// Return the exact bytes one validated JSONL append will consume, without
+/// opening or mutating the event-log family.
+pub fn event_log_record_append_bytes_without_mutation(event: &Event) -> io::Result<u64> {
+    let serialized = serialize_event_bounded(event)?;
     validate_event_write_schema(event)
+        .and_then(|()| {
+            u64::try_from(serialized.len())
+                .map_err(|_| io::Error::other("serialized event length did not fit in u64"))
+        })?
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("serialized event append length overflow"))
 }
 
 fn validate_event_write_schema(event: &Event) -> io::Result<()> {
@@ -3341,6 +3512,64 @@ mod tests {
         assert!(canonical_archives
             .iter()
             .all(|path| super::archive_suffix(&family.path, path).is_some()));
+    }
+
+    #[test]
+    fn reconciliation_plan_releases_ordered_evidence_before_a_required_rotation() {
+        let family = TestFamily::new("ordered-recovery-rotation.jsonl");
+        let first_session = SessionId(uuid::Uuid::from_u128(1));
+        let first_request = RequestId::new();
+        let second_session = SessionId(uuid::Uuid::from_u128(2));
+        let second_request = RequestId::new();
+        let first_response = response_event(first_session, first_request, 202);
+        let second_response = response_event(second_session, second_request, 202);
+        let recovered_policy = policy_event(second_session, second_request);
+        write_events(&family.archive(1), &[&first_response]);
+        write_events(&family.archive(2), &[&second_response]);
+        write_events(
+            &family.archive(3),
+            &[&request_event("GET", "/archive-three")],
+        );
+        std::fs::write(&family.path, vec![b'\n'; super::LOG_ROTATE_BYTES as usize])
+            .expect("exact-limit active should write");
+        let targets = [
+            super::EventLogRecoveryTarget {
+                session_id: first_session,
+                request_id: first_request,
+                expected_policy_event_id: None,
+            },
+            super::EventLogRecoveryTarget {
+                session_id: second_session,
+                request_id: second_request,
+                expected_policy_event_id: Some(recovered_policy.id),
+            },
+        ];
+        let scan = super::scan_event_log_family(&family.path, &targets, |_| Ok(()))
+            .expect("full family should scan");
+        let append_bytes = super::event_log_record_append_bytes_without_mutation(&recovered_policy)
+            .expect("recovered policy event should fit");
+
+        let unsafe_order = [
+            super::EventLogRecoveryPlanStep {
+                session_id: second_session,
+                request_id: second_request,
+                recovered_policy_event_bytes: Some(append_bytes),
+            },
+            super::EventLogRecoveryPlanStep {
+                session_id: first_session,
+                request_id: first_request,
+                recovered_policy_event_bytes: None,
+            },
+        ];
+        let error = scan
+            .validate_reconciliation_plan(&unsafe_order)
+            .expect_err("rotation before the oldest evidence resolves must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("would prune unresolved"));
+
+        let safe_order = [unsafe_order[1], unsafe_order[0]];
+        scan.validate_reconciliation_plan(&safe_order)
+            .expect("ordered resolution should make the later rotation safe");
     }
 
     #[test]

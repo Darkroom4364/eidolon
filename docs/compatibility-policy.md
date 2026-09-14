@@ -30,7 +30,7 @@ Eidolon releases use semantic versioning. Within a major release line:
 | --- | --- | --- | --- |
 | Event log (`events.jsonl`) | `schema_version` per record | `2` (one 33,554,432-byte active segment, three 33,554,432-byte archives, 134,217,728-byte family, 1,048,576-byte record excluding newline) | Production recovery accepts only schema-v2 events in the bounded family. Canonical archives are `<event-log>.<39 ASCII digits>`; all-digit noncanonical names, a fourth archive, symlinks, non-regular members, over-limit segments/records, invalid complete records, duplicate event IDs, conflicting selected workflow evidence, or membership/content changes before repair fail closed. |
 | Debug log (`debug.jsonl`) | `schema_version` + `run_kind` envelope | `1` (`eidolon_proxy_debug`) | Server-side diagnostic only; no supported reader today. A validating reader is tracked by issue #252. |
-| Policy state (`policy-state.json`) | `schema_version` | `3` (reads `1..=3`; maximum 33,554,432 bytes and 8,192 retained records) | Missing state initializes empty. Existing empty, malformed, truncated, oversized, unsupported-version, duplicate-session, or internally inconsistent pending-workflow state fails startup before migration or listener bind. A staged controlled-reality-to-blocked event accepts its legacy omitted persistence metadata or coherent post-containment metadata; rate-limit and pre-containment retry metadata is rejected for that transition. Writers reject an oversized current-schema snapshot before opening the temp file (`policy_store.rs`). |
+| Policy state (`policy-state.json`) | `schema_version` | `3` (reads `1..=3`; maximum 33,554,432 bytes and 8,192 retained records) | Missing state initializes empty. Existing empty, malformed, truncated, oversized, unsupported-version, duplicate-session, or internally inconsistent pending-workflow state fails startup before migration or listener bind. A staged controlled-reality-to-blocked event accepts its legacy omitted persistence metadata or coherent post-containment metadata; rate-limit and pre-containment retry metadata is rejected for that transition. Writers and ordered startup reconciliation reject an oversized canonical snapshot before opening the temp file (`policy_store.rs`). |
 | Session continuity sidecar (`<policy-state>.continuity.json`) | `schema_version` | `2` (reads `1..=2`) | Unsupported versions, an unverifiable signer, or a live record whose continuity key is unavailable prevent startup (`session_continuity_store.rs`). |
 | Bait exposure sidecar (`<event-log>.exposures.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour TTL) | Missing state rebuilds in canonical archive order followed by the active event-log segment, including the archive-only post-rename crash window. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, empty-identifier, future-timestamp, duplicate-key, or canonical-rewrite-over-limit state fails production preflight before the writer lease or durable-file mutation. Writers enforce the same byte ceiling before creating the reserved temp file. |
 | Consumed proof sidecar (`<event-log>.consumed-proofs.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour maximum proof/quarantine lifetime) | Missing state rebuilds from the complete ordered event-log family, including archive-only history, and prior history activates the bounded migration quarantine. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, invalid-digest/identifier/lifetime, duplicate-key, or canonical-rewrite-over-limit state fails production preflight. Writers enforce the same byte ceiling before creating the reserved temp file. |
@@ -50,7 +50,12 @@ File metadata is only an early rejection; the bounded read remains authoritative
 if the file changes. Read acceptance does not bypass the same write bound: if a
 schema migration or startup compaction would expand the current-schema snapshot
 beyond the limit, startup fails before opening the temp file and leaves the
-source snapshot unchanged. A duplicate `session_id` is invalid regardless of
+source snapshot unchanged. When pending workflows require startup persistence,
+production counts the exact current canonical form and each ordered
+per-session replacement delta before opening any writer. Every snapshot that
+reconciliation will persist must fit; an exact-limit snapshot is accepted, and
+the first snapshot one byte over is rejected even when the compact current-
+schema input itself fits. A duplicate `session_id` is invalid regardless of
 record contents, schema 1--3, or input order, so ordering can never select an
 enforcement state. Snapshot-local pending depth/workflow/origin, transition,
 event-association, and response-state invariants are also validated for schema
@@ -162,8 +167,13 @@ response/policy events are excluded from the selected payload index, resolved
 workflow payloads are removed, and rotation will not prune selected unresolved
 evidence. A missing policy event required for recovery is passed through the
 same bounded record serializer during both validation phases before any
-startup mutation. An active segment exactly at the byte ceiling stays in place
-until reconciliation completes and rotates before its next append.
+startup mutation. The same phases simulate the complete ordered append,
+rotation, and resolution plan against the active segment's post-repair length.
+If a required append would rotate a three-archive family before the oldest
+selected evidence is resolved, startup fails without applying the tail repair
+or opening a writer. An active segment exactly at the byte ceiling stays in
+place until reconciliation completes unless that validated recovery plan must
+append; ordinary traffic rotates it before its next append.
 
 ## Compatibility rules
 

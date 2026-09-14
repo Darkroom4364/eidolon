@@ -244,7 +244,13 @@ SHA-256 verification pass then binds the ordered membership and bytes presented
 to repair/open to the authoritative scan. Reconciliation uses the selected
 index instead of rescanning every segment for every pending session; live
 ordinary response/policy events are not retained in it, and resolved workflow
-payloads are removed.
+payloads are removed. Before opening the writer, an index-only simulator applies
+the same sorted append and resolution sequence from the active segment's
+post-repair length. It rejects any rotation that would prune selected evidence
+from the oldest retained archive. Policy recovery independently counts the
+initial canonical representation and exact per-record canonical deltas, so
+every ordered snapshot that reconciliation will persist is proven within the
+32 MiB write limit without serializing the complete store once per workflow.
 
 Missing consumed-proof state receives its history-triggered migration
 quarantine in memory before the authoritative pre-mutation semantic and
@@ -258,11 +264,12 @@ for valid JSON or truncate one invalid final fragment. An unterminated archive,
 mid-file corruption, unsupported schema, noncanonical numeric archive,
 symlink, non-regular member, or family whose membership or contents change
 between scan and repair fails startup. An exactly full active segment is not
-rotated during open: recovery reconciles first, and the next append rotates it.
-Rotation refuses to prune an archive that still contains selected unresolved
-workflow evidence. Descriptor-pinned directory traversal, storage encryption,
-multiple writers, and history beyond the retained family remain outside this
-source boundary.
+rotated merely by open: recovery either performs its already-validated append
+plan or reconciles without changing the segment, and the next ordinary append
+rotates it. Rotation refuses to prune an archive that still contains selected
+unresolved workflow evidence. Descriptor-pinned directory traversal, storage
+encryption, multiple writers, and history beyond the retained family remain
+outside this source boundary.
 
 Issue `#176` moved response rendering across a closed, authenticated process
 boundary. The renderer cannot choose routing, policy, evidence, headers, cache

@@ -222,6 +222,12 @@ Production validates the bounded snapshot without mutation before touching
 migration or eviction, then re-reads it under the acquired lease; invalid state
 leaves absent or existing lease metadata unchanged, while a file changed
 between those reads must pass the authoritative second validation.
+Pending recovery also validates the exact canonical size of every snapshot it
+will persist in deterministic session order. This uses one full-state byte
+count plus exact per-record deltas rather than repeatedly serializing the whole
+store. A compact current-schema input can therefore fit the read limit yet fail
+before the lease if its first recovery snapshot would exceed the write limit;
+exactly 33,554,432 bytes remains valid.
 Duplicate session IDs never use file order to select a policy. If protected
 enforcement records alone fill the record bound, a sticky persisted fallback
 makes every unknown session `blocked` before older protected metadata is
@@ -287,8 +293,12 @@ Production checks this family and every pending response/policy contract
 read-only before acquiring the writer lease, then repeats the authoritative
 scan and contract checks under the lease before durable mutation. The
 validation includes bounded serialization of a missing expected policy event
-that recovery would need to append. The under-lease indexing scan is one
-streaming pass for only the missing
+that recovery would need to append. It then simulates those appends and each
+workflow resolution in the same sorted order used at startup, beginning from
+the active segment's post-tail-repair length. A rotation that would discard the
+oldest of three archives while it still holds selected unresolved evidence is
+rejected before the lease or any durable-file change. The under-lease indexing
+scan is one streaming pass for only the missing
 exposure/proof sidecars and all pending workflow evidence; existing valid
 sidecars remain authoritative, and the family is not read once per pending
 session. Before repair/open, a fixed-memory SHA-256 pass verifies that ordered
@@ -297,10 +307,11 @@ supported for an empty deployment and for the post-rename crash window when
 canonical archives remain. A new active file is created only after the family
 validates. Only the active segment may append a missing newline to one valid
 final event or truncate one invalid final fragment; archives are immutable
-recovery input. An exactly full active segment remains in place through
-reconciliation and rotates before the next append. Rotation fails closed
-rather than prune an archive holding unresolved selected evidence. Correct the
-named file or archive set and restart—the same path is accepted once it
+recovery input. An exactly full active segment remains in place when recovery
+has nothing to append; a validated required recovery append may rotate it.
+Rotation fails closed rather than prune an archive holding unresolved selected
+evidence. Correct the named file or archive set and restart—the same path is
+accepted once it
 satisfies the contract. Do not delete retained history merely to bypass a
 validation error; preserve a copy for incident analysis and restore from a
 known-good quiesced backup when integrity is uncertain.

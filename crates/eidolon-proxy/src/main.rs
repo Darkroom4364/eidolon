@@ -35,10 +35,10 @@ use eidolon_proxy::{
     },
     debug_log::FileDebugLogWriter,
     event_log::{
-        scan_event_log_family, validate_event_log_record_without_mutation, DurableResponseMatch,
-        EventLogRecoveryScan, EventLogRecoveryTarget, FileEventLogWriter, JsonlTailRepairOutcome,
-        LOG_ARCHIVES_KEPT, LOG_ROTATE_BYTES, MAX_EVENT_LOG_FAMILY_BYTES,
-        MAX_EVENT_LOG_RECORD_BYTES,
+        event_log_record_append_bytes_without_mutation, scan_event_log_family,
+        DurableResponseMatch, EventLogRecoveryPlanStep, EventLogRecoveryScan,
+        EventLogRecoveryTarget, FileEventLogWriter, JsonlTailRepairOutcome, LOG_ARCHIVES_KEPT,
+        LOG_ROTATE_BYTES, MAX_EVENT_LOG_FAMILY_BYTES, MAX_EVENT_LOG_RECORD_BYTES,
     },
     http_request::{
         canonical_request_target, normalized_request_host, HttpHeader, HttpRequest, HttpVersion,
@@ -49,7 +49,7 @@ use eidolon_proxy::{
     policy::{self, InterventionMode},
     policy_store::{
         ControlledRealityPendingInteractionKind, ControlledRealityPendingResponse,
-        ControlledRealityProgress, PolicyStateStore,
+        ControlledRealityProgress, PendingControlledRealityRecoveryDecision, PolicyStateStore,
     },
     production_runtime::{
         dispatch_production_upstream, serve_production_http1, ProductionPreServiceRejection,
@@ -2229,7 +2229,10 @@ fn validate_pending_event_log_recovery(
     policy_store: &PolicyStateStore,
     recovery: &EventLogRecoveryScan,
 ) -> io::Result<()> {
-    for session_id in policy_store.pending_controlled_reality_sessions() {
+    let pending_sessions = policy_store.pending_controlled_reality_sessions();
+    let mut event_log_steps = Vec::with_capacity(pending_sessions.len());
+    let mut policy_decisions = Vec::with_capacity(pending_sessions.len());
+    for session_id in pending_sessions {
         let record = policy_store.record(session_id);
         let Some(pending) = record.controlled_reality_pending_update else {
             continue;
@@ -2241,7 +2244,7 @@ fn validate_pending_event_log_recovery(
             ));
         }
 
-        match (
+        let (durable_response_seen, recovered_policy_event_bytes) = match (
             pending.expected_response,
             recovery.indexed_durable_response(session_id, request_id),
         ) {
@@ -2260,6 +2263,7 @@ fn validate_pending_event_log_recovery(
                         ));
                     }
                 }
+                (false, None)
             }
             (None, DurableResponseMatch::Unique { .. }) => {
                 return Err(invalid_data(
@@ -2302,7 +2306,9 @@ fn validate_pending_event_log_recovery(
                         "durable response conflicted with its pending response contract",
                     ));
                 }
-                if let Some(expected_policy_changed) = pending.expected_policy_changed.as_ref() {
+                let recovered_policy_event_bytes = if let Some(expected_policy_changed) =
+                    pending.expected_policy_changed.as_ref()
+                {
                     match recovery.indexed_durable_event_by_id(
                         session_id,
                         request_id,
@@ -2314,15 +2320,31 @@ fn validate_pending_event_log_recovery(
                                     "durable policy transition conflicted with its pending contract",
                                 ));
                             }
+                            None
                         }
-                        None => {
-                            validate_event_log_record_without_mutation(expected_policy_changed)?
-                        }
+                        None => Some(event_log_record_append_bytes_without_mutation(
+                            expected_policy_changed,
+                        )?),
                     }
-                }
+                } else {
+                    None
+                };
+                (true, recovered_policy_event_bytes)
             }
-        }
+        };
+        event_log_steps.push(EventLogRecoveryPlanStep {
+            session_id,
+            request_id,
+            recovered_policy_event_bytes,
+        });
+        policy_decisions.push(PendingControlledRealityRecoveryDecision {
+            session_id,
+            request_id,
+            durable_response_seen,
+        });
     }
+    recovery.validate_reconciliation_plan(&event_log_steps)?;
+    policy_store.validate_pending_reconciliation_plan_without_mutation(&policy_decisions)?;
     Ok(())
 }
 
@@ -12343,6 +12365,298 @@ mod tests {
         assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
         assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
         assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn unsafe_recovery_rotation_fails_before_production_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let private_session = SessionId(uuid::Uuid::from_u128(0x0fee_d315));
+        let private_request = RequestId(uuid::Uuid::from_u128(0x0caf_e315));
+        let transition =
+            policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+                PolicyState::ControlledReality,
+                "route:controlled_follow_up",
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+            )
+            .expect("rotation recovery fixture should have a blocked transition");
+        let expected_policy_changed =
+            policy::policy_changed_event(private_session, private_request, &transition);
+        let expected_policy_event_id = expected_policy_changed.id;
+        let response = Event::new(
+            private_session,
+            EventSource::Proxy,
+            PolicyState::Blocked,
+            EventKind::ResponseServed {
+                status: 403,
+                routing_decision: RoutingDecision::EidolonOwned,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(private_request);
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [{
+                "session_id": private_session.0,
+                "policy_state": "controlled_reality",
+                "controlled_reality_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                "controlled_reality_workflow_state": "ready",
+                "controlled_reality_origin_request_id": null,
+                "controlled_reality_pending_update": {
+                    "request_id": private_request.0,
+                    "request_action": "branch_read",
+                    "previous_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 1,
+                    "previous_state": "ready",
+                    "previous_origin_request_id": null,
+                    "commit_policy_state": "blocked",
+                    "expected_policy_changed": expected_policy_changed,
+                    "expected_response": {
+                        "event_id": response.id,
+                        "policy_state": "blocked",
+                        "status": 403,
+                        "routing_decision": "eidolon_owned",
+                        "interaction_kind": null,
+                        "controlled_reality_sha256": controlled_reality_semantics_sha256(&None)
+                            .expect("absent response semantics should serialize"),
+                    },
+                },
+            }],
+        }))
+        .expect("rotation recovery policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("pending policy state should write");
+
+        let oldest_archive = event_log_archive_path(&fixture.event_log_path, 1);
+        let middle_archive = event_log_archive_path(&fixture.event_log_path, 2);
+        let newest_archive = event_log_archive_path(&fixture.event_log_path, 3);
+        let oldest_before = format!(
+            "{}\n",
+            serde_json::to_string(&response).expect("durable response should serialize")
+        )
+        .into_bytes();
+        let neighbor_before = b"\n".to_vec();
+        let mut active_before = vec![b'\n'; LOG_ROTATE_BYTES as usize - 2];
+        active_before.push(b' ');
+        assert_eq!(active_before.len(), LOG_ROTATE_BYTES as usize - 1);
+        fs::write(&oldest_archive, &oldest_before).expect("oldest archive should write");
+        fs::write(&middle_archive, &neighbor_before).expect("middle archive should write");
+        fs::write(&newest_archive, &neighbor_before).expect("newest archive should write");
+        fs::write(&fixture.event_log_path, &active_before).expect("full active log should write");
+
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let debug_before = br#"{"sentinel":"unsafe-recovery-rotation"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"unsafe-recovery-rotation-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("unsafe recovery rotation must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("would prune unresolved"));
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            response.id.to_string(),
+            expected_policy_event_id.to_string(),
+        ] {
+            assert!(
+                !error.to_string().contains(&private),
+                "unsafe rotation diagnostic leaked `{private}`"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), active_before);
+        assert_eq!(fs::read(&oldest_archive).unwrap(), oldest_before);
+        assert_eq!(fs::read(&middle_archive).unwrap(), neighbor_before);
+        assert_eq!(fs::read(&newest_archive).unwrap(), neighbor_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn current_schema_reconciliation_expansion_fails_before_production_startup_mutation() {
+        const PENDING_WORKFLOWS: u128 = 2;
+
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let last_session = SessionId(uuid::Uuid::from_u128(PENDING_WORKFLOWS));
+        let last_request = RequestId(uuid::Uuid::from_u128(10_000 + PENDING_WORKFLOWS));
+        let last_policy_event_id = {
+            let mut store = PolicyStateStore::open(&fixture.policy_state_path)
+                .expect("policy store should open for expansion setup");
+            for index in 1..=PENDING_WORKFLOWS {
+                let session_id = SessionId(uuid::Uuid::from_u128(index));
+                let request_id = RequestId(uuid::Uuid::from_u128(10_000 + index));
+                store
+                    .set_policy_state(session_id, PolicyState::ControlledReality)
+                    .expect("controlled policy state should persist");
+                store
+                    .note_controlled_reality_interaction(
+                        session_id,
+                        request_id,
+                        eidolon_proxy::policy_store::ControlledRealityRequestAction::UnknownResource,
+                        u32::MAX,
+                    )
+                    .expect("pending workflow should persist");
+            }
+            let transition =
+                policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+                    PolicyState::ControlledReality,
+                    "route:controlled_follow_up",
+                    2,
+                    0,
+                )
+                .expect("expansion fixture should have a blocked transition");
+            let expected_policy_changed =
+                policy::policy_changed_event(last_session, last_request, &transition);
+            let event_id = expected_policy_changed.id;
+            store
+                .stage_controlled_reality_policy_state(
+                    last_session,
+                    last_request,
+                    PolicyState::Blocked,
+                    expected_policy_changed,
+                )
+                .expect("last pending policy transition should persist");
+            event_id
+        };
+        let mut compact_state: Value = serde_json::from_slice(
+            &fs::read(&fixture.policy_state_path).expect("staged policy state should read"),
+        )
+        .expect("staged policy state should parse");
+        {
+            let sessions = compact_state["sessions"]
+                .as_array_mut()
+                .expect("policy sessions should be an array");
+            let last = sessions
+                .iter_mut()
+                .find(|session| session["session_id"] == json!(last_session.0))
+                .expect("last pending session should exist");
+            last["controlled_reality_pending_update"]["expected_policy_changed"]["kind"]
+                ["reason"] = Value::String(String::new());
+        }
+        let empty_reason_bytes = serde_json::to_vec(&compact_state)
+            .expect("compact empty-reason state should serialize")
+            .len();
+        let reason_bytes = eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES
+            .checked_sub(empty_reason_bytes)
+            .expect("compact current-schema envelope should fit the byte limit");
+        {
+            let sessions = compact_state["sessions"]
+                .as_array_mut()
+                .expect("policy sessions should remain an array");
+            let last = sessions
+                .iter_mut()
+                .find(|session| session["session_id"] == json!(last_session.0))
+                .expect("last pending session should remain present");
+            last["controlled_reality_pending_update"]["expected_policy_changed"]["kind"]
+                ["reason"] = Value::String("x".repeat(reason_bytes));
+        }
+        let policy_before = serde_json::to_vec(&compact_state)
+            .expect("compact current-schema state should serialize");
+        assert_eq!(
+            policy_before.len(),
+            eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES
+        );
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("exact-limit compact policy state should write");
+
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("event sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let debug_before = br#"{"sentinel":"policy-reconciliation-expansion"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"policy-reconciliation-expansion-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("oversized first reconciliation snapshot must reject startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("serialized policy state store exceeds"));
+        for private in [
+            last_session.0.to_string(),
+            last_request.0.to_string(),
+            last_policy_event_id.to_string(),
+        ] {
+            assert!(
+                !error.to_string().contains(&private),
+                "policy expansion diagnostic leaked `{private}`"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!fixture.policy_state_path.with_extension("tmp").exists());
         assert!(!continuity_path.exists());
         assert!(upstream_recorder.finish().is_empty());
         fixture.stop();

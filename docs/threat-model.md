@@ -80,10 +80,12 @@ limit is checked before replacement writes, so an oversized mutation cannot
 replace the last good snapshot. These controls bound source startup and fail
 closed on files presented at startup. Pending recovery additionally rejects
 impossible workflow/origin/depth combinations, non-deterministic response
-contracts, and colliding policy/response event IDs before durable side effects;
-issue
-`#253` separately owns live persistent-volume corruption and unavailability
-qualification for the supported deployment.
+contracts, and colliding policy/response event IDs before durable side effects.
+It also byte-counts every ordered canonical policy snapshot that recovery will
+persist, including `last_seen` refreshes, so compact current-schema expansion
+cannot fail only after other startup files have changed. Exact-limit outputs
+remain accepted. Issue `#253` separately owns live persistent-volume corruption
+and unavailability qualification for the supported deployment.
 
 The production event-log recovery family is finite: one active 33,554,432-byte
 segment plus three canonical 39-digit archives, at most 134,217,728 bytes in
@@ -99,15 +101,21 @@ Production preflights that family, its active-tail repair plan, and complete
 pending response/policy contracts without the lease or mutation, then repeats
 the authoritative validation under the lease. Any missing expected policy
 event that reconciliation would append is size-checked through the production
-record serializer during both phases. The resulting stream
+record serializer during both phases. Those phases also simulate the complete
+sorted append/rotation/resolution sequence from the active segment's
+post-repair length. A required rotation cannot evict the oldest of three
+archives while any later unresolved workflow still depends on evidence there.
+The resulting stream
 reconstructs only missing bounded bait-security sidecars and builds one
 selected response/policy index for at most 8,192 pending workflows; existing
 valid sidecars remain authoritative. A fixed-memory SHA-256 pass verifies the
 same ordered membership and bytes before repair/open. This makes startup work
 linear in retained family bytes rather than pending sessions times family
 bytes. Live appends add payloads only for durable pending workflows and remove
-them at resolution. An exactly full active segment remains unrotated through
-reconciliation, and rotation refuses to prune selected unresolved evidence.
+them at resolution. An exactly full active segment remains unrotated when
+recovery has no append; any required recovery rotation has already passed the
+evidence-retention simulation. The live guard still refuses to prune selected
+unresolved evidence.
 Only after validation succeeds may the active tail be repaired, an archive-only
 crash window receive a new active file, policy migration/eviction persist,
 sidecars replace, or the listener bind. Diagnostics report only aggregate
