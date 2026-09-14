@@ -31,7 +31,8 @@ Initial research-alpha source release.
 - bounded schema-v2 event-log recovery across one active 32 MiB segment and
   three canonical numeric archives (128 MiB total), with a 1 MiB record cap,
   a 215-byte active-file-name limit, reserved archive-namespace and hard-link
-  isolation, streaming validation, global duplicate-event rejection,
+  isolation (including active-to-archive aliases), streaming validation,
+  global duplicate-event rejection,
   active-only tail repair, immutable full-family verification, missing-only
   full-family sidecar reconstruction, pre-mutation workflow-contract
   validation, evidence-safe deferred rotation, preflight sizing for missing

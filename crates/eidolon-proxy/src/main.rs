@@ -2008,7 +2008,7 @@ fn validate_production_event_family_path_isolation_without_mutation(
     );
     for family_path in recovery.family_segment_paths() {
         for (label, writable_path) in &writable_paths {
-            if *label == "event-log" {
+            if *label == "event-log" && family_path == *writable_path {
                 continue;
             }
             let aliases = durable_paths_alias(family_path, writable_path)
@@ -12957,6 +12957,76 @@ mod tests {
         assert!(started_received.try_recv().is_err());
         assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
         assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!fixture.policy_state_path.with_extension("tmp").exists());
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn active_event_log_hard_link_to_archive_fails_before_existing_lease_or_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        let archive_path = event_log_archive_path(&fixture.event_log_path, 1);
+        fs::write(&archive_path, &event_before).expect("empty archive should write");
+        fs::hard_link(&archive_path, &fixture.event_log_path)
+            .expect("active hard link to the archive should create");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure state should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof state should serialize");
+        let debug_before = br#"{"sentinel":"active-archive-hard-link"}"#.to_vec();
+        fs::write(&exposure_path, &exposure_before).expect("exposure state should write");
+        fs::write(&proof_path, &proof_before).expect("proof state should write");
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"active-archive-hard-link-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("an active hard link to an event archive must reject startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "production writable target event-log aliases an event-log family member"
+        );
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&archive_path).unwrap(), event_before);
         assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
         assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
         assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
