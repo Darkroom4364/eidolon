@@ -129,9 +129,10 @@ byte; file metadata is only an early check, so growth after metadata cannot
 bypass the bound. The 4,096-record and byte ceilings apply jointly. All rows
 validate before TTL pruning or map construction, and duplicate logical keys
 fail even when identical or expired, so file order never chooses correlation or
-replay state. Production validates existing sidecars without mutation before
-the writer lease, including a dry run of the canonical pretty-printed rewrite,
-then repeats the bounded validation during authoritative open. Successful
+replay state. Production validates existing sidecars and rejects a symlink or
+non-regular reserved temp without mutation before the writer lease, including
+a dry run of the canonical pretty-printed rewrite, then repeats the bounded
+validation during authoritative open. Successful
 rewrites use the fixed reserved `<sidecar>.tmp` path with owner-only
 `create_new` creation in the same directory, file sync, atomic rename, and
 parent-directory sync. After validating the committed file, authoritative open
@@ -180,6 +181,9 @@ selected evidence is resolved, startup fails without applying the tail repair
 or opening a writer. An active segment exactly at the byte ceiling stays in
 place until reconciliation completes unless that validated recovery plan must
 append; ordinary traffic rotates it before its next append.
+Bare relative event-log paths resolve the current directory consistently for
+archive selection, parent sync, and pruning, so rotation cannot commit a rename
+and then fail solely because `Path::parent()` is empty.
 
 ## Compatibility rules
 

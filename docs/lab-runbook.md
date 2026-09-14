@@ -275,8 +275,9 @@ verify their respective 4,194,304-byte limit before creating an owner-only,
 same-directory `<sidecar>.tmp` with `create_new`, then sync, rename, and sync the
 parent. During authoritative open under the single-writer lease, one regular
 crash-left temp is removed only after the committed sidecar validates; a
-symlink or non-regular object at the reserved path fails closed. This fixed
-name bounds crash residue and matches the Kubernetes recovery allowlist. A
+symlink or non-regular object at the reserved path fails closed during the
+read-only pre-lease check and again during authoritative open. This fixed name
+bounds crash residue and matches the Kubernetes recovery allowlist. A
 would-exceed or other pre-rename failure leaves the last durable file unchanged
 and rolls back exposure state or makes proof acceptance unavailable according
 to the existing fail-closed contract.
@@ -322,6 +323,8 @@ accepted once it
 satisfies the contract. Do not delete retained history merely to bypass a
 validation error; preserve a copy for incident analysis and restore from a
 known-good quiesced backup when integrity is uncertain.
+Bare relative event-log paths use `.` consistently for archive discovery,
+directory sync, and pruning; absolute paths remain recommended operationally.
 
 The `state.event_log_contract`, `state.policy_store`,
 `state.bait_exposure_store`, and `state.consumed_proof_store` effective

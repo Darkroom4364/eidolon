@@ -1840,14 +1840,19 @@ fn increment_archive_suffix(suffix: &str) -> io::Result<String> {
 }
 
 fn prune_log_archives(path: &Path, fresh_archive: &Path, keep: usize) -> io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
 
     let mut archives = Vec::new();
     for entry in std::fs::read_dir(parent)? {
         let candidate = entry?.path();
-        if candidate == fresh_archive {
+        // `read_dir(".")` yields `./name`, while a rotation of the bare
+        // relative path `name` produces the lexical path `name.<suffix>`.
+        // They name the same adjacent archive, so compare the file name in
+        // the already-selected parent rather than the full lexical path.
+        if candidate.file_name() == fresh_archive.file_name() {
             continue;
         }
         let Some(suffix) = archive_suffix(path, &candidate) else {
@@ -2547,6 +2552,45 @@ mod tests {
 
         fs::remove_file(first).expect("first archive should remove");
         fs::remove_file(second).expect("second archive should remove");
+    }
+
+    #[test]
+    fn bare_relative_path_rotation_prunes_from_the_current_directory() {
+        let unique = unique_temp_path("bare-relative-rotation.jsonl");
+        let path = std::path::PathBuf::from(
+            unique
+                .file_name()
+                .expect("unique relative event path should have a file name"),
+        );
+        let archive_path =
+            |suffix: u128| std::path::PathBuf::from(format!("{}.{suffix:039}", path.display()));
+        let oldest = archive_path(1);
+        let retained_one = archive_path(2);
+        let retained_two = archive_path(3);
+        std::fs::write(&oldest, b"oldest\n").expect("oldest archive should write");
+        std::fs::write(&retained_one, b"retained one\n")
+            .expect("first retained archive should write");
+        std::fs::write(&retained_two, b"retained two\n")
+            .expect("second retained archive should write");
+        std::fs::write(&path, b"active\n").expect("relative active log should write");
+
+        let archive = super::rotate_log_now(&path)
+            .expect("relative rotation must not fail after renaming the active log");
+
+        assert!(!path.exists());
+        assert!(archive.is_file());
+        assert!(!oldest.exists());
+        assert!(retained_one.is_file());
+        assert!(retained_two.is_file());
+        let archive_count = std::fs::read_dir(".")
+            .expect("current directory should list")
+            .filter_map(Result::ok)
+            .filter(|entry| super::archive_suffix(&path, &entry.path()).is_some())
+            .count();
+        assert_eq!(archive_count, super::LOG_ARCHIVES_KEPT);
+        std::fs::remove_file(retained_one).expect("first retained archive should remove");
+        std::fs::remove_file(retained_two).expect("second retained archive should remove");
+        std::fs::remove_file(archive).expect("relative archive should remove");
     }
 
     #[test]

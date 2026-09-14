@@ -3496,19 +3496,27 @@ fn auxiliary_state_temp_path(path: &Path) -> PathBuf {
     sidecar_state_path(path, ".tmp")
 }
 
-/// Authoritative store opening runs under the process-wide writer lease. A
-/// fixed reserved name keeps crash residue bounded, while `create_new` still
-/// prevents a collision or symlink from being followed during replacement.
-fn remove_stale_auxiliary_state_temp(path: &Path) -> io::Result<()> {
+/// Validate bounded crash residue without changing it. Production calls this
+/// before the writer lease and repeats it when authoritative opening removes a
+/// regular stale file. `create_new` still prevents a changed path or symlink
+/// from being followed during replacement.
+fn validate_auxiliary_state_temp_without_mutation(path: &Path) -> io::Result<bool> {
     let temp = auxiliary_state_temp_path(path);
     match fs::symlink_metadata(&temp) {
         Ok(metadata) if !metadata.is_file() => Err(invalid_data(
             "auxiliary state temporary path is not a regular file",
         )),
-        Ok(_) => fs::remove_file(temp),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn remove_stale_auxiliary_state_temp(path: &Path) -> io::Result<()> {
+    if validate_auxiliary_state_temp_without_mutation(path)? {
+        fs::remove_file(auxiliary_state_temp_path(path))?;
+    }
+    Ok(())
 }
 
 fn sync_state_parent_directory(path: &Path) -> io::Result<()> {
@@ -3608,11 +3616,12 @@ fn prepare_bait_security_sidecars_without_mutation(
         MAX_BAIT_EXPOSURE_STORE_BYTES,
     )?
     .map(|bytes| {
-        let store = BaitExposureStore::from_state_bytes(exposure_path, &bytes, now)?;
+        let store = BaitExposureStore::from_state_bytes(exposure_path.clone(), &bytes, now)?;
         store.validate_canonical_serialization()?;
         Ok::<BaitExposureStore, io::Error>(store)
     })
     .transpose()?;
+    validate_auxiliary_state_temp_without_mutation(&exposure_path)?;
 
     let consumed_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
     let consumed_bait_proofs = read_auxiliary_state_file(
@@ -3621,11 +3630,12 @@ fn prepare_bait_security_sidecars_without_mutation(
         MAX_CONSUMED_PROOF_STORE_BYTES,
     )?
     .map(|bytes| {
-        let store = ConsumedBaitProofStore::from_state_bytes(consumed_path, &bytes, now)?;
+        let store = ConsumedBaitProofStore::from_state_bytes(consumed_path.clone(), &bytes, now)?;
         store.validate_canonical_serialization()?;
         Ok::<ConsumedBaitProofStore, io::Error>(store)
     })
     .transpose()?;
+    validate_auxiliary_state_temp_without_mutation(&consumed_path)?;
 
     Ok(PreparedBaitSecuritySidecars {
         bait_exposures,
@@ -12888,6 +12898,75 @@ mod tests {
         assert!(!fixture.policy_state_path.with_extension("tmp").exists());
         assert!(!continuity_path.exists());
         assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn nonregular_sidecar_temp_fails_before_existing_lease_or_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("event sentinel should write");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let debug_before = br#"{"sentinel":"nonregular-sidecar-temp"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let exposure_temp = auxiliary_state_temp_path(&exposure_path);
+        fs::create_dir(&exposure_temp).expect("nonregular reserved temp should create");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"nonregular-sidecar-temp-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("nonregular reserved temp must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "auxiliary state temporary path is not a regular file"
+        );
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(fs::metadata(&exposure_temp).unwrap().is_dir());
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fs::remove_dir(exposure_temp).expect("nonregular reserved temp should remove");
         fixture.stop();
     }
 

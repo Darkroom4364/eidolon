@@ -272,9 +272,10 @@ between scan and repair fails startup. An exactly full active segment is not
 rotated merely by open: recovery either performs its already-validated append
 plan or reconciles without changing the segment, and the next ordinary append
 rotates it. Rotation refuses to prune an archive that still contains selected
-unresolved workflow evidence. Descriptor-pinned directory traversal, storage
-encryption, multiple writers, and history beyond the retained family remain
-outside this source boundary.
+unresolved workflow evidence. Bare relative paths consistently treat `.` as
+their archive parent through selection, sync, and pruning. Descriptor-pinned
+directory traversal, storage encryption, multiple writers, and history beyond
+the retained family remain outside this source boundary.
 
 Issue `#176` moved response rendering across a closed, authenticated process
 boundary. The renderer cannot choose routing, policy, evidence, headers, cache

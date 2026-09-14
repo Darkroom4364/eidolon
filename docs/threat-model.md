@@ -121,7 +121,9 @@ bytes. Live appends add payloads only for durable pending workflows and remove
 them at resolution. An exactly full active segment remains unrotated when
 recovery has no append; any required recovery rotation has already passed the
 evidence-retention simulation. The live guard still refuses to prune selected
-unresolved evidence.
+unresolved evidence. Bare relative paths consistently use the current directory
+for archive discovery, sync, and pruning, avoiding a post-rename empty-parent
+failure.
 Only after validation succeeds may the active tail be repaired, an archive-only
 crash window receive a new active file, policy migration/eviction persist,
 sidecars replace, or the listener bind. Diagnostics report only aggregate
@@ -134,7 +136,8 @@ The committed bait-exposure and consumed-proof sidecars are each capped at
 limit, and writes serialize through the same ceiling before any temp file is
 created. Production preflights existing sidecars without acquiring the writer
 lease or mutating policy/log state, including a dry run of the canonical
-pretty-printed rewrite, then repeats the bounded checks during authoritative
+pretty-printed rewrite and rejection of a symlink or non-regular reserved temp,
+then repeats the bounded checks during authoritative
 open. Empty, malformed, future-schema, over-capacity,
 future-lifetime, and duplicate logical-key state fails closed; duplicates are
 checked before expiry filtering so an expired row cannot hide ambiguity. Atomic
