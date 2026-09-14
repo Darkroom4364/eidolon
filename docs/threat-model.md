@@ -98,6 +98,11 @@ IDs across the family. Numeric archives that are not exactly 39 ASCII digits,
 a fourth archive, symlinks, non-regular family members, invalid complete
 records, and unterminated archive tails fail closed. Nonnumeric neighboring
 files are not family members.
+The active file name is capped at 215 UTF-8 bytes so every canonical suffix
+fits the supported Linux component limit. Production excludes every configured
+writer from the canonical event-archive namespace and compares existing family
+member identities with all writable targets during both scans, including hard
+links with unrelated names.
 
 Production preflights that family, its active-tail repair plan, and complete
 pending response/policy contracts without the lease or mutation, then repeats
@@ -108,12 +113,11 @@ sorted append/rotation/resolution sequence from the active segment's
 post-repair length and apply the writer's checked canonical-suffix successor to
 every required rotation. A maximum 39-digit suffix therefore blocks a planned
 rotation before mutation but does not block a fitting append. A required
-rotation cannot evict the oldest of three
-archives while any later unresolved workflow still depends on evidence there.
-The resulting stream
-reconstructs and fully validates only missing bounded bait-security sidecars in
-both the pre-lease and authoritative scans and builds one
-selected response/policy index for at most 8,192 pending workflows; existing
+rotation cannot evict the oldest of three archives while any later unresolved
+workflow still depends on evidence there. The resulting stream reconstructs
+and fully validates only missing bounded bait-security sidecars in both the
+pre-lease and authoritative scans and builds one selected response/policy
+index for at most 8,192 pending workflows; existing
 valid sidecars remain authoritative. A fixed-memory SHA-256 pass verifies the
 same ordered membership and bytes before repair/open. This makes startup work
 linear in retained family bytes rather than pending sessions times family
@@ -137,10 +141,10 @@ limit, and writes serialize through the same ceiling before any temp file is
 created. Production preflights existing sidecars without acquiring the writer
 lease or mutating policy/log state, including a dry run of the canonical
 pretty-printed rewrite and rejection of a symlink or non-regular reserved temp,
-then repeats the bounded checks during authoritative
-open. Empty, malformed, future-schema, over-capacity,
-future-lifetime, and duplicate logical-key state fails closed; duplicates are
-checked before expiry filtering so an expired row cannot hide ambiguity. Atomic
+then repeats the bounded checks during authoritative open. Empty, malformed,
+future-schema, over-capacity, future-lifetime, and duplicate logical-key state
+fails closed; duplicates are checked before expiry filtering so an expired row
+cannot hide ambiguity. Atomic
 replacement uses an owner-only, fixed reserved `<sidecar>.tmp` created with
 `create_new`, file sync, rename, and parent sync, preserving the previous file
 on pre-rename failure. Authoritative open under the single-writer lease removes
@@ -152,6 +156,9 @@ PVC proof remains #253. Missing-sidecar reconstruction must also pass the same
 identifier, timestamp, lifetime, capacity, and canonical-size semantics as a
 loaded sidecar before durable startup mutation; consumed-proof reconstruction
 adds its history quarantine before that final size check.
+The policy snapshot's reserved temp path is also checked without mutation in
+both preparation phases and immediately before persistence; a symlink or
+non-regular object cannot defer failure until after lease or event-log effects.
 
 ## Defensive Boundary
 

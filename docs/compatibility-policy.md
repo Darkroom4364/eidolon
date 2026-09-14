@@ -132,13 +132,17 @@ fail even when identical or expired, so file order never chooses correlation or
 replay state. Production validates existing sidecars and rejects a symlink or
 non-regular reserved temp without mutation before the writer lease, including
 a dry run of the canonical pretty-printed rewrite, then repeats the bounded
-validation during authoritative open. Successful
-rewrites use the fixed reserved `<sidecar>.tmp` path with owner-only
+validation during authoritative open. Successful rewrites use the fixed
+reserved `<sidecar>.tmp` path with owner-only
 `create_new` creation in the same directory, file sync, atomic rename, and
 parent-directory sync. After validating the committed file, authoritative open
 under the single-writer lease removes one regular crash-left temp; a symlink or
 non-regular object at the reserved path fails closed. The fixed name bounds
 crash residue and is part of the deployment recovery-file allowlist.
+The policy snapshot's reserved replacement path is likewise type-checked
+without mutation during both preparation phases and immediately before a
+persist. A symlink or non-regular object there fails before lease acquisition,
+tail repair, or policy migration.
 During both the pre-lease and authoritative under-lease scans,
 missing-sidecar reconstruction consumes that scan's already-validated event
 stream used for pending-workflow recovery; it does not reopen or buffer the
@@ -146,8 +150,8 @@ family, and it runs only when the corresponding valid committed sidecar is
 absent. Each phase requires reconstructed state to pass the same identifier,
 timestamp, lifetime, capacity, and canonical-write semantics as loaded state;
 proof reconstruction adds any history-triggered migration quarantine before
-validating the exact bytes to be persisted. Production performs a read-only event-family,
-repair-plan, and complete pending-contract preflight
+validating the exact bytes to be persisted. Production performs a read-only
+event-family, repair-plan, and complete pending-contract preflight
 before taking the durable-state lease, then repeats the authoritative scan and
 contract checks under that lease before policy migration/eviction, event/debug
 writer open, sidecar replacement, or listener startup. A fixed-memory SHA-256
@@ -184,6 +188,12 @@ append; ordinary traffic rotates it before its next append.
 Bare relative event-log paths resolve the current directory consistently for
 archive selection, parent sync, and pruning, so rotation cannot commit a rename
 and then fail solely because `Path::parent()` is empty.
+The active event-log file name is limited to 215 UTF-8 bytes, leaving exactly
+40 bytes for the dot and 39-digit suffix under the supported Linux 255-byte
+component limit. Every configured durable writer is excluded from that numeric
+archive namespace, and both scans compare existing family-member identities
+against the complete writable-target set so a differently named hard link
+cannot become a second writer for retained evidence.
 
 ## Compatibility rules
 

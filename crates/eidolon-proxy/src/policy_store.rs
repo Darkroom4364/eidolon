@@ -573,6 +573,7 @@ impl PolicyStateStore {
     }
 
     fn load_at(path: PathBuf, now: u64, persist_changes: bool) -> io::Result<Self> {
+        validate_policy_state_temp_without_mutation(&path)?;
         let (records, fail_closed_for_unknown_sessions, needs_schema_migration) =
             match read_policy_store_bytes(&path) {
                 Ok(bytes) => deserialize_records(&bytes, &path)?,
@@ -1352,6 +1353,7 @@ impl PolicyStateStore {
         };
 
         let serialized = self.serialize_current_state()?;
+        validate_policy_state_temp_without_mutation(path)?;
         let temp_path = path.with_extension("tmp");
 
         let mut file = fs::OpenOptions::new()
@@ -1435,6 +1437,18 @@ impl PolicyStateStore {
             )
         })?;
         Ok(serialized.bytes)
+    }
+}
+
+fn validate_policy_state_temp_without_mutation(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path.with_extension("tmp")) {
+        Ok(metadata) if !metadata.is_file() => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "policy state temporary path is not a regular file",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -2169,6 +2183,49 @@ mod tests {
         assert!(!path.with_extension("tmp").exists());
 
         fs::remove_file(path).expect("legacy preflight fixture should remove");
+    }
+
+    #[test]
+    fn policy_temp_type_is_checked_during_preflight_and_repeated_before_persist() {
+        let path = unique_temp_path("policy-temp-type-validation");
+        let temp = path.with_extension("tmp");
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "schema_version": MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("legacy temp-type fixture should serialize");
+        fs::write(&path, &legacy).expect("legacy temp-type fixture should write");
+        fs::create_dir(&temp).expect("nonregular policy temp should create");
+
+        let error = PolicyStateStore::validate_without_mutation(&path)
+            .expect_err("nonregular policy temp must fail read-only validation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "policy state temporary path is not a regular file"
+        );
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+        assert!(fs::metadata(&temp).unwrap().is_dir());
+
+        fs::remove_dir(&temp).expect("preflight temp directory should remove");
+        let prepared = PolicyStateStore::prepare_open(&path)
+            .expect("legacy state should prepare after temp correction");
+        assert!(prepared.startup_persist_required);
+        fs::create_dir(&temp).expect("raced nonregular policy temp should create");
+
+        let error = prepared
+            .finish_prepared_startup()
+            .expect_err("persistence must repeat the policy temp type check");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "policy state temporary path is not a regular file"
+        );
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+        assert!(fs::metadata(&temp).unwrap().is_dir());
+
+        fs::remove_dir(temp).expect("raced temp directory should remove");
+        fs::remove_file(path).expect("legacy temp-type fixture should remove");
     }
 
     #[test]

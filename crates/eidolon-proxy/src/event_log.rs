@@ -26,8 +26,14 @@ pub const MAX_EVENT_LOG_RECORD_BYTES: usize = 1024 * 1024;
 /// Maximum bytes in the complete supported active-plus-archive family.
 pub const MAX_EVENT_LOG_FAMILY_BYTES: u64 = LOG_ROTATE_BYTES * (LOG_ARCHIVES_KEPT as u64 + 1);
 
+/// Decimal digits in every writer-produced event-log archive suffix.
+pub const EVENT_LOG_ARCHIVE_SUFFIX_DIGITS: usize = 39;
+
+/// Maximum UTF-8 bytes in the active file name while reserving the dot and
+/// canonical suffix within the supported Linux 255-byte component ceiling.
+pub const MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES: usize = 255 - (EVENT_LOG_ARCHIVE_SUFFIX_DIGITS + 1);
+
 const EVENT_LOG_READ_CHUNK_BYTES: usize = 8 * 1024;
-const EVENT_LOG_ARCHIVE_SUFFIX_DIGITS: usize = 39;
 
 type RecoveryWorkflow = (SessionId, RequestId);
 type RecoveryEvidence = HashSet<RecoveryWorkflow>;
@@ -273,6 +279,15 @@ pub struct EventLogRecoveryScan {
 }
 
 impl EventLogRecoveryScan {
+    /// Ordered immutable paths whose identities were validated by this scan.
+    /// Production uses these paths to repeat durable-target isolation before
+    /// the scan can be consumed by authoritative writer opening.
+    pub fn family_segment_paths(&self) -> impl Iterator<Item = &Path> {
+        self.family_snapshot
+            .iter()
+            .map(|segment| segment.path.as_path())
+    }
+
     pub fn indexed_durable_response(
         &self,
         session_id: SessionId,
@@ -521,6 +536,13 @@ impl FileEventLogWriter {
         recovery: EventLogRecoveryScan,
     ) -> io::Result<Self> {
         let path = path.as_ref();
+        validate_event_log_archive_path_capacity(path)?;
+        if path != recovery.path {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "event log recovery scan path does not match writer path",
+            ));
+        }
         verify_event_log_family_snapshot(path, &recovery.family_snapshot)?;
         let startup_tail_repair = apply_event_log_tail_repair(
             path,
@@ -1096,6 +1118,7 @@ fn scan_event_log_family_with_selection(
 }
 
 fn event_log_family_inventory(path: &Path) -> io::Result<Vec<EventLogSegment>> {
+    validate_event_log_archive_path_capacity(path)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1779,6 +1802,7 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
 }
 
 fn next_archive_path(path: &Path, initial_stamp: u128) -> io::Result<PathBuf> {
+    validate_event_log_archive_path_capacity(path)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1839,6 +1863,27 @@ fn increment_archive_suffix(suffix: &str) -> io::Result<String> {
     ))
 }
 
+fn validate_event_log_archive_path_capacity(path: &Path) -> io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "event log path has no UTF-8 file name",
+            )
+        })?;
+    if file_name.len() > MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "event log file name exceeds the fixed {MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES} byte limit required for canonical archives"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn prune_log_archives(path: &Path, fresh_archive: &Path, keep: usize) -> io::Result<()> {
     let parent = path
         .parent()
@@ -1884,6 +1929,13 @@ fn archive_suffix<'a>(path: &Path, candidate: &'a Path) -> Option<&'a str> {
     (suffix.len() == EVENT_LOG_ARCHIVE_SUFFIX_DIGITS
         && suffix.bytes().all(|byte| byte.is_ascii_digit()))
     .then_some(suffix)
+}
+
+/// Whether `candidate` uses the canonical numeric archive file name for
+/// `path`. Callers that need target identity must also compare resolved parent
+/// directories; this predicate deliberately concerns the reserved name only.
+pub fn has_canonical_event_log_archive_name(path: &Path, candidate: &Path) -> bool {
+    archive_suffix(path, candidate).is_some()
 }
 
 #[cfg(test)]
@@ -2923,6 +2975,8 @@ mod tests {
         assert_eq!(super::LOG_ARCHIVES_KEPT, 3);
         assert_eq!(super::MAX_EVENT_LOG_FAMILY_BYTES, 134_217_728);
         assert_eq!(super::MAX_EVENT_LOG_RECORD_BYTES, 1_048_576);
+        assert_eq!(super::EVENT_LOG_ARCHIVE_SUFFIX_DIGITS, 39);
+        assert_eq!(super::MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES, 215);
 
         let ingress_limit = crate::http_request::MAX_HTTP_HEADER_BYTES;
         let candidates = [
@@ -2952,6 +3006,58 @@ mod tests {
             super::MAX_EVENT_LOG_RECORD_BYTES - widest > 900_000,
             "widest bounded runtime fixture used {widest} bytes"
         );
+    }
+
+    #[test]
+    fn archive_file_name_capacity_reserves_the_complete_canonical_suffix() {
+        let unique = unique_temp_path("archive-file-name-capacity");
+        let seed = unique
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unique path should have a UTF-8 file name");
+        assert!(seed.len() < super::MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES);
+        let exact = format!(
+            "{seed}{}",
+            "x".repeat(super::MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES - seed.len())
+        );
+        let over = format!("{exact}x");
+        let parent = unique.parent().expect("unique path should have a parent");
+
+        for path in [
+            std::path::PathBuf::from(&exact),
+            std::path::Path::new(".").join(&exact),
+            parent.join(&exact),
+        ] {
+            super::validate_event_log_archive_path_capacity(&path)
+                .expect("exact active file-name limit should fit every path form");
+        }
+        for path in [
+            std::path::PathBuf::from(&over),
+            std::path::Path::new(".").join(&over),
+            parent.join(&over),
+        ] {
+            let error = super::validate_event_log_archive_path_capacity(&path)
+                .expect_err("limit plus one must fail every path form");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error
+                .to_string()
+                .contains("required for canonical archives"));
+        }
+
+        let archive = super::next_archive_path(&parent.join(&exact), 42)
+            .expect("exact-limit active name should produce an archive path");
+        assert_eq!(
+            archive
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("archive should have a UTF-8 file name")
+                .len(),
+            255
+        );
+        assert!(super::has_canonical_event_log_archive_name(
+            &parent.join(exact),
+            &archive
+        ));
     }
 
     #[test]
@@ -3724,6 +3830,26 @@ mod tests {
             .expect_err("the third planned rotation must exhaust the archive namespace");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("namespace is exhausted"));
+    }
+
+    #[test]
+    fn recovery_scan_is_bound_to_the_exact_writer_path() {
+        let scanned = TestFamily::new("scan-path-binding-source.jsonl");
+        let other = TestFamily::new("scan-path-binding-destination.jsonl");
+        let scan = super::scan_event_log_family(&scanned.path, &[], |_| Ok(()))
+            .expect("absent source family should scan");
+
+        let error = FileEventLogWriter::open_with_recovery(&other.path, scan)
+            .err()
+            .expect("a recovery scan must not authorize another writer path");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "event log recovery scan path does not match writer path"
+        );
+        assert!(!scanned.path.exists());
+        assert!(!other.path.exists());
     }
 
     #[test]

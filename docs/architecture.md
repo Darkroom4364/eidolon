@@ -230,8 +230,12 @@ Production startup treats the retained event-log family as one bounded
 recovery input: up to three `<event-log>.<39 ASCII digits>` archives in suffix
 order, followed by the active segment. Each segment is capped at 32 MiB, the
 family at 128 MiB, and each schema-v2 JSON record at 1 MiB excluding its
-newline. A fixed-chunk streaming scan validates the complete family and rejects
-duplicate event IDs before any recovered state is committed. Both the
+newline. The active file name is capped at 215 UTF-8 bytes, reserving the dot
+and 39-digit suffix within the supported Linux 255-byte component limit.
+Production reserves that numeric namespace from every configured durable
+writer and compares existing family-member identities against those writers in
+both scans. A fixed-chunk streaming scan validates the complete family and
+rejects duplicate event IDs before any recovered state is committed. Both the
 pre-lease scan and the authoritative scan validate every pending workflow's
 complete response and expected-policy contract before mutation, including the
 bounded serialization of any missing policy event that reconciliation must
@@ -255,7 +259,9 @@ initial canonical representation and exact per-record canonical deltas, so
 every ordered snapshot that reconciliation will persist is proven within the
 32 MiB write limit without serializing the complete store once per workflow.
 Its authoritative timestamp is bound through both the plan and the live
-`last_seen` writes.
+`last_seen` writes. Policy preparation also rejects a symlink or non-regular
+`policy_state_path.with_extension("tmp")` without mutation, and persistence
+repeats that check before opening the reserved temporary path.
 
 Missing consumed-proof state receives its history-triggered migration
 quarantine in memory before the authoritative pre-mutation semantic and

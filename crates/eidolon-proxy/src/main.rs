@@ -35,10 +35,11 @@ use eidolon_proxy::{
     },
     debug_log::FileDebugLogWriter,
     event_log::{
-        event_log_record_append_bytes_without_mutation, scan_event_log_family,
-        DurableResponseMatch, EventLogRecoveryPlanStep, EventLogRecoveryScan,
-        EventLogRecoveryTarget, FileEventLogWriter, JsonlTailRepairOutcome, LOG_ARCHIVES_KEPT,
-        LOG_ROTATE_BYTES, MAX_EVENT_LOG_FAMILY_BYTES, MAX_EVENT_LOG_RECORD_BYTES,
+        event_log_record_append_bytes_without_mutation, has_canonical_event_log_archive_name,
+        scan_event_log_family, DurableResponseMatch, EventLogRecoveryPlanStep,
+        EventLogRecoveryScan, EventLogRecoveryTarget, FileEventLogWriter, JsonlTailRepairOutcome,
+        LOG_ARCHIVES_KEPT, LOG_ROTATE_BYTES, MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES,
+        MAX_EVENT_LOG_FAMILY_BYTES, MAX_EVENT_LOG_RECORD_BYTES,
     },
     http_request::{
         canonical_request_target, normalized_request_host, HttpHeader, HttpRequest, HttpVersion,
@@ -864,40 +865,17 @@ impl ConfigBuilder {
         };
         if profile == RuntimeProfile::Production {
             let debug_log_path = debug_log_path.as_deref().expect("validated above");
-            let event_exposures_path = sidecar_state_path(&event_log_path, ".exposures.json");
-            let event_consumed_proofs_path =
-                sidecar_state_path(&event_log_path, ".consumed-proofs.json");
-            let continuity_path = sidecar_state_path(&policy_state_path, ".continuity.json");
-            let writable_paths = vec![
-                ("event-log", event_log_path.clone()),
-                ("event-log-exposures", event_exposures_path.clone()),
-                (
-                    "event-log-exposures-temp",
-                    sidecar_state_path(&event_exposures_path, ".tmp"),
-                ),
-                (
-                    "event-log-consumed-proofs",
-                    event_consumed_proofs_path.clone(),
-                ),
-                (
-                    "event-log-consumed-proofs-temp",
-                    sidecar_state_path(&event_consumed_proofs_path, ".tmp"),
-                ),
-                ("policy-state", policy_state_path.clone()),
-                ("policy-state-lease", state_lease_path(&policy_state_path)),
-                ("policy-state-temp", policy_state_path.with_extension("tmp")),
-                ("policy-continuity", continuity_path.clone()),
-                (
-                    "policy-continuity-temp",
-                    sidecar_state_path(&continuity_path, ".tmp"),
-                ),
-                ("debug-log", debug_log_path.to_path_buf()),
-            ];
+            let writable_paths =
+                production_writable_paths(&event_log_path, &policy_state_path, debug_log_path);
             let writable_path_refs = writable_paths
                 .iter()
                 .map(|(label, path)| (*label, path.as_path()))
                 .collect::<Vec<_>>();
             ensure_production_durable_paths_are_distinct(&writable_path_refs)?;
+            ensure_production_writable_paths_avoid_event_archive_namespace(
+                &event_log_path,
+                &writable_path_refs,
+            )?;
             let read_only_inputs = [
                 ("bait-profile", self.bait_profile_path.as_deref()),
                 (
@@ -1064,6 +1042,7 @@ fn event_log_contract_projection() -> Value {
         "max_archives": LOG_ARCHIVES_KEPT,
         "max_family_bytes": MAX_EVENT_LOG_FAMILY_BYTES,
         "max_record_bytes": MAX_EVENT_LOG_RECORD_BYTES,
+        "max_active_file_name_bytes": MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES,
         "schema": {
             "current": EVENT_SCHEMA_VERSION,
             "minimum_supported": EVENT_SCHEMA_VERSION,
@@ -1800,6 +1779,62 @@ fn meaningful_parent(path: &Path) -> Option<&Path> {
         .filter(|parent| !parent.as_os_str().is_empty())
 }
 
+fn production_writable_paths(
+    event_log_path: &Path,
+    policy_state_path: &Path,
+    debug_log_path: &Path,
+) -> Vec<(&'static str, PathBuf)> {
+    let event_exposures_path = sidecar_state_path(event_log_path, ".exposures.json");
+    let event_consumed_proofs_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
+    let continuity_path = sidecar_state_path(policy_state_path, ".continuity.json");
+    vec![
+        ("event-log", event_log_path.to_path_buf()),
+        ("event-log-exposures", event_exposures_path.clone()),
+        (
+            "event-log-exposures-temp",
+            sidecar_state_path(&event_exposures_path, ".tmp"),
+        ),
+        (
+            "event-log-consumed-proofs",
+            event_consumed_proofs_path.clone(),
+        ),
+        (
+            "event-log-consumed-proofs-temp",
+            sidecar_state_path(&event_consumed_proofs_path, ".tmp"),
+        ),
+        ("policy-state", policy_state_path.to_path_buf()),
+        ("policy-state-lease", state_lease_path(policy_state_path)),
+        ("policy-state-temp", policy_state_path.with_extension("tmp")),
+        ("policy-continuity", continuity_path.clone()),
+        (
+            "policy-continuity-temp",
+            sidecar_state_path(&continuity_path, ".tmp"),
+        ),
+        ("debug-log", debug_log_path.to_path_buf()),
+    ]
+}
+
+fn ensure_production_writable_paths_avoid_event_archive_namespace(
+    event_log_path: &Path,
+    writable_paths: &[(&str, &Path)],
+) -> Result<(), ConfigError> {
+    let event_target = canonical_durable_file_target(event_log_path)?;
+    let event_parent = event_target.parent().ok_or_else(|| {
+        ConfigError::new("event log durable target has no resolved parent directory")
+    })?;
+    for (label, path) in writable_paths {
+        let candidate = canonical_durable_file_target(path)?;
+        if candidate.parent() == Some(event_parent)
+            && has_canonical_event_log_archive_name(&event_target, &candidate)
+        {
+            return Err(ConfigError::new(format!(
+                "`--profile production` reserves the event-log archive namespace: {label} targets a canonical event-log archive"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn ensure_production_durable_paths_are_distinct(
     paths: &[(&str, &Path)],
 ) -> Result<(), ConfigError> {
@@ -1956,6 +1991,36 @@ fn durable_paths_alias(left: &Path, right: &Path) -> Result<bool, ConfigError> {
     }
 
     Ok(false)
+}
+
+fn validate_production_event_family_path_isolation_without_mutation(
+    config: &ProxyConfig,
+    recovery: &EventLogRecoveryScan,
+) -> io::Result<()> {
+    let debug_log_path = config
+        .debug_log_path
+        .as_deref()
+        .ok_or_else(|| invalid_data("production debug log path is missing"))?;
+    let writable_paths = production_writable_paths(
+        &config.event_log_path,
+        &config.policy_state_path,
+        debug_log_path,
+    );
+    for family_path in recovery.family_segment_paths() {
+        for (label, writable_path) in &writable_paths {
+            if *label == "event-log" {
+                continue;
+            }
+            let aliases = durable_paths_alias(family_path, writable_path)
+                .map_err(|error| invalid_data(error.to_string()))?;
+            if aliases {
+                return Err(invalid_data(format!(
+                    "production writable target {label} aliases an event-log family member"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_production_path_components_are_not_symlinks(path: &Path) -> Result<(), ConfigError> {
@@ -2421,6 +2486,7 @@ fn validate_production_recovery_without_mutation(config: &ProxyConfig) -> io::Re
             }
             Ok(())
         })?;
+    validate_production_event_family_path_isolation_without_mutation(config, &event_log_recovery)?;
     finalize_recovered_bait_security_sidecars_without_mutation(
         rebuild_bait_exposures,
         rebuild_consumed_bait_proofs,
@@ -2511,6 +2577,7 @@ fn run_proxy_with_shutdown(
             }
             Ok(())
         })?;
+    validate_production_event_family_path_isolation_without_mutation(&config, &event_log_recovery)?;
     let recovered_event_log_history_exists = event_log_recovery.stats.family_bytes > 0;
     finalize_recovered_bait_security_sidecars_without_mutation(
         rebuild_bait_exposures,
@@ -12902,6 +12969,231 @@ mod tests {
     }
 
     #[test]
+    fn event_archive_hard_link_alias_fails_before_existing_lease_or_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("active event log should write");
+        let archive_path = event_log_archive_path(&fixture.event_log_path, 1);
+        let archive_event = Event::new(
+            SessionId::new(),
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::ResponseServed {
+                status: 204,
+                routing_decision: RoutingDecision::ProtectedUpstream,
+                controlled_reality: None,
+            },
+        );
+        let archive_before = format!(
+            "{}\n",
+            serde_json::to_string(&archive_event).expect("archive event should serialize")
+        )
+        .into_bytes();
+        fs::write(&archive_path, &archive_before).expect("event archive should write");
+        fs::hard_link(&archive_path, &fixture.debug_log_path)
+            .expect("debug hard link to the archive should create");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure state should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof state should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure state should write");
+        fs::write(&proof_path, &proof_before).expect("proof state should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"archive-hard-link-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("a writable hard link to an event archive must reject startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "production writable target debug-log aliases an event-log family member"
+        );
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&archive_path).unwrap(), archive_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), archive_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn overlong_event_file_name_fails_before_tail_repair_or_existing_lease_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let mut fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let seed = fixture
+            .event_log_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture event log should have a UTF-8 file name");
+        assert!(seed.len() <= MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES);
+        let overlong_name = format!(
+            "{seed}{}",
+            "x".repeat(MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES + 1 - seed.len())
+        );
+        let event_log_path = fixture
+            .event_log_path
+            .parent()
+            .expect("fixture event log should have a parent")
+            .join(overlong_name);
+        let event_index = fixture
+            .args
+            .iter()
+            .position(|value| value == "--event-log")
+            .expect("fixture should configure an event log");
+        fixture.args[event_index + 1] =
+            path_str(&event_log_path, "overlong event path should be UTF-8").to_string();
+        let event = Event::new(
+            SessionId::new(),
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::ResponseServed {
+                status: 204,
+                routing_decision: RoutingDecision::ProtectedUpstream,
+                controlled_reality: None,
+            },
+        );
+        let event_before = serde_json::to_vec(&event).expect("repairable event should serialize");
+        fs::write(&event_log_path, &event_before).expect("overlong active name should still write");
+        let policy_before = br#"{"schema_version":1,"sessions":[]}"#.to_vec();
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("legacy policy state should write");
+        let debug_before = br#"{"sentinel":"overlong-event-file-name"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"overlong-event-file-name-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let exposure_path = sidecar_state_path(&event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&event_log_path, ".consumed-proofs.json");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("unrepresentable archive names must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(&format!(
+            "fixed {MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES} byte limit"
+        )));
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!exposure_path.exists());
+        assert!(!proof_path.exists());
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn nonregular_policy_temp_fails_before_tail_repair_or_existing_lease_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event = Event::new(
+            SessionId::new(),
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::ResponseServed {
+                status: 204,
+                routing_decision: RoutingDecision::ProtectedUpstream,
+                controlled_reality: None,
+            },
+        );
+        let event_before = serde_json::to_vec(&event).expect("repairable event should serialize");
+        fs::write(&fixture.event_log_path, &event_before)
+            .expect("repairable active event should write");
+        let policy_before = br#"{"schema_version":1,"sessions":[]}"#.to_vec();
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("legacy policy state should write");
+        let policy_temp = fixture.policy_state_path.with_extension("tmp");
+        fs::create_dir(&policy_temp).expect("nonregular policy temp should create");
+        let debug_before = br#"{"sentinel":"nonregular-policy-temp"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"nonregular-policy-temp-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("nonregular policy temp must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "policy state temporary path is not a regular file"
+        );
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(fs::metadata(&policy_temp).unwrap().is_dir());
+        assert!(!exposure_path.exists());
+        assert!(!proof_path.exists());
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fs::remove_dir(policy_temp).expect("nonregular policy temp should remove");
+        fixture.stop();
+    }
+
+    #[test]
     fn nonregular_sidecar_temp_fails_before_existing_lease_or_startup_mutation() {
         let profile_path = write_bait_profile(session_minted_profile_json());
         let bait_signing_secret = write_bait_signing_secret("mint-secret");
@@ -14032,6 +14324,33 @@ mod tests {
             assert!(
                 error.to_string().contains("resolve to the same target"),
                 "unexpected writable alias error for --{flag}: {error}"
+            );
+        }
+
+        let archive_namespace_target = event_log_archive_path(&fixture.event_log_path, 1);
+        for existing in [false, true] {
+            if existing {
+                fs::write(&archive_namespace_target, b"\n")
+                    .expect("existing archive namespace target should write");
+            }
+            let mut args = fixture.args.clone();
+            let debug_index = args
+                .iter()
+                .position(|value| value == "--debug-log")
+                .expect("fixture should configure a debug log");
+            args[debug_index + 1] = path_str(
+                &archive_namespace_target,
+                "archive namespace target should be UTF-8",
+            )
+            .to_string();
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let error = run_config(&args)
+                .expect_err("missing and existing event archive targets must stay reserved");
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserves the event-log archive namespace"),
+                "unexpected archive namespace error: {error}"
             );
         }
 
@@ -16949,6 +17268,15 @@ mod tests {
 
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        let proof_window = bait
+            .expected_action
+            .header_value_mint
+            .as_ref()
+            .and_then(|mint| mint.proof_window_seconds)
+            .expect("minted test bait should use a proof window");
+        while proof_window.saturating_sub(now_unix_secs() % proof_window) < 10 {
+            thread::sleep(Duration::from_millis(25));
+        }
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("minted bait should render")
             .into_owned();

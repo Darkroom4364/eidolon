@@ -270,8 +270,11 @@ by `no-store`, so operators must invalidate any proof-bearing URL cached by an
 older deployment.
 
 Policy-state writes verify the same 33,554,432-byte limit before opening the
-temp file, then use fsync and rename. Bait-security sidecar writes likewise
-verify their respective 4,194,304-byte limit before creating an owner-only,
+temp file, then use fsync and rename. Production rejects a symlink or
+non-regular policy-state temp during read-only preflight, repeats the check
+under the lease, and checks again immediately before persistence.
+Bait-security sidecar writes likewise verify their respective 4,194,304-byte
+limit before creating an owner-only,
 same-directory `<sidecar>.tmp` with `create_new`, then sync, rename, and sync the
 parent. During authoritative open under the single-writer lease, one regular
 crash-left temp is removed only after the committed sidecar validates; a
@@ -292,6 +295,11 @@ All-digit suffixes of any other length, a fourth archive, symlinks,
 directories/non-regular members, oversized segments or records, unsupported
 event schemas, duplicate event IDs, invalid complete records, and
 unterminated archive tails block startup. Nonnumeric neighbors are ignored.
+Keep the active event-log file name at or below 215 UTF-8 bytes; this reserves
+the complete 40-byte archive suffix within the supported Linux 255-byte file
+name limit. No policy, lease, continuity, sidecar, temp, or debug target may use
+the event log's canonical numeric archive namespace or hard-link an existing
+family member.
 
 Production checks this family and every pending response/policy contract
 read-only before acquiring the writer lease, then repeats the authoritative
@@ -319,16 +327,16 @@ recovery input. An exactly full active segment remains in place when recovery
 has nothing to append; a validated required recovery append may rotate it.
 Rotation fails closed rather than prune an archive holding unresolved selected
 evidence. Correct the named file or archive set and restart—the same path is
-accepted once it
-satisfies the contract. Do not delete retained history merely to bypass a
-validation error; preserve a copy for incident analysis and restore from a
-known-good quiesced backup when integrity is uncertain.
+accepted once it satisfies the contract. Do not delete retained history merely
+to bypass a validation error; preserve a copy for incident analysis and restore
+from a known-good quiesced backup when integrity is uncertain.
 Bare relative event-log paths use `.` consistently for archive discovery,
 directory sync, and pruning; absolute paths remain recommended operationally.
 
 The `state.event_log_contract`, `state.policy_store`,
 `state.bait_exposure_store`, and `state.consumed_proof_store` effective
-configuration projections report only byte/record/TTL/schema bounds. Their
+configuration projections report only byte/record/TTL/schema bounds, including
+the event log's active-file-name limit. Their
 server-side `proxy_started.fields` counterparts add configured state paths and
 aggregate event-family segment/record/byte counts, selected pending-match
 counts, and startup outcomes, but never file contents or durable
