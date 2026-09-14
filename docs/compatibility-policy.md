@@ -28,7 +28,7 @@ Eidolon releases use semantic versioning. Within a major release line:
 
 | Artifact | Version field | Current | Reader fail-closed rule |
 | --- | --- | --- | --- |
-| Event log (`events.jsonl`) | `schema_version` per record | `2` (one 33,554,432-byte active segment, three 33,554,432-byte archives, 134,217,728-byte family, 1,048,576-byte record excluding newline) | Production recovery accepts only schema-v2 events in the bounded family. Canonical archives are `<event-log>.<39 ASCII digits>`; all-digit noncanonical names, a fourth archive, symlinks, non-regular members, over-limit segments/records, invalid complete records, duplicate event IDs, and conflicting selected workflow evidence fail closed. |
+| Event log (`events.jsonl`) | `schema_version` per record | `2` (one 33,554,432-byte active segment, three 33,554,432-byte archives, 134,217,728-byte family, 1,048,576-byte record excluding newline) | Production recovery accepts only schema-v2 events in the bounded family. Canonical archives are `<event-log>.<39 ASCII digits>`; all-digit noncanonical names, a fourth archive, symlinks, non-regular members, over-limit segments/records, invalid complete records, duplicate event IDs, conflicting selected workflow evidence, or membership/content changes before repair fail closed. |
 | Debug log (`debug.jsonl`) | `schema_version` + `run_kind` envelope | `1` (`eidolon_proxy_debug`) | Server-side diagnostic only; no supported reader today. A validating reader is tracked by issue #252. |
 | Policy state (`policy-state.json`) | `schema_version` | `3` (reads `1..=3`; maximum 33,554,432 bytes and 8,192 retained records) | Missing state initializes empty. Existing empty, malformed, truncated, oversized, unsupported-version, duplicate-session, or internally inconsistent pending-workflow state fails startup before migration or listener bind. A staged controlled-reality-to-blocked event accepts its legacy omitted persistence metadata or coherent post-containment metadata; rate-limit and pre-containment retry metadata is rejected for that transition. Writers reject an oversized current-schema snapshot before opening the temp file (`policy_store.rs`). |
 | Session continuity sidecar (`<policy-state>.continuity.json`) | `schema_version` | `2` (reads `1..=2`) | Unsupported versions, an unverifiable signer, or a live record whose continuity key is unavailable prevent startup (`session_continuity_store.rs`). |
@@ -135,12 +135,17 @@ non-regular object at the reserved path fails closed. The fixed name bounds
 crash residue and is part of the deployment recovery-file allowlist.
 Missing-sidecar reconstruction consumes the same already-validated event
 stream used for pending-workflow recovery; it does not reopen or buffer the
-family. Production performs a read-only event-family and repair-plan preflight
-before taking the durable-state lease, then performs the authoritative scan
-under that lease before policy migration/eviction, event/debug writer open,
-sidecar replacement, or listener startup. Only the active segment may repair
-one unterminated valid record by appending a newline or discard one invalid
-final fragment. Archives must end on a delimiter and are never repaired.
+family, and it runs only when the corresponding valid committed sidecar is
+absent. Reconstructed state must pass the same identifier, timestamp, lifetime,
+capacity, and canonical-write semantics as loaded state. Production performs a
+read-only event-family, repair-plan, and complete pending-contract preflight
+before taking the durable-state lease, then repeats the authoritative scan and
+contract checks under that lease before policy migration/eviction, event/debug
+writer open, sidecar replacement, or listener startup. A fixed-memory SHA-256
+pass binds repair/open to the scanned ordered membership and bytes. Only the
+active segment may repair one unterminated valid record by appending a newline
+or discard one invalid final fragment. Archives must end on a delimiter and are
+never repaired.
 
 The authoritative scanner reads through fixed-size chunks, admits no more
 than the segment limit plus one sentinel and no more than the record limit plus
@@ -150,7 +155,11 @@ active segment, validates every complete record, and rejects duplicate event
 IDs across segments. It simultaneously reconstructs bounded sidecar state and
 indexes only the response/policy evidence needed by at most 8,192 pending
 policy workflows. Durable appends update that in-memory index; lookup no
-longer rescans the family once per pending session.
+longer rescans the family once per pending session. Ordinary live
+response/policy events are excluded from the selected payload index, resolved
+workflow payloads are removed, and rotation will not prune selected unresolved
+evidence. An active segment exactly at the byte ceiling stays in place until
+reconciliation completes and rotates before its next append.
 
 ## Compatibility rules
 

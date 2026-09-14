@@ -95,17 +95,23 @@ a fourth archive, symlinks, non-regular family members, invalid complete
 records, and unterminated archive tails fail closed. Nonnumeric neighboring
 files are not family members.
 
-Production preflights that family and its active-tail repair plan without the
-lease or mutation, then repeats the authoritative validation under the lease.
-The resulting stream reconstructs both bounded bait-security sidecars and one
-selected response/policy index for at most 8,192 pending workflows. This makes
-startup work linear in retained family bytes rather than pending sessions
-times family bytes. Only after the scan succeeds may the active tail be
-repaired, an archive-only crash window receive a new active file, policy
-migration/eviction persist, sidecars replace, or the listener bind. Diagnostics
-report only aggregate limits/counts and repair class, never durable IDs or raw
-records. Live PVC faults and descriptor-pinned directory hardening remain
-tracked outside this source-only control.
+Production preflights that family, its active-tail repair plan, and complete
+pending response/policy contracts without the lease or mutation, then repeats
+the authoritative validation under the lease. The resulting stream
+reconstructs only missing bounded bait-security sidecars and builds one
+selected response/policy index for at most 8,192 pending workflows; existing
+valid sidecars remain authoritative. A fixed-memory SHA-256 pass verifies the
+same ordered membership and bytes before repair/open. This makes startup work
+linear in retained family bytes rather than pending sessions times family
+bytes. Live appends add payloads only for durable pending workflows and remove
+them at resolution. An exactly full active segment remains unrotated through
+reconciliation, and rotation refuses to prune selected unresolved evidence.
+Only after validation succeeds may the active tail be repaired, an archive-only
+crash window receive a new active file, policy migration/eviction persist,
+sidecars replace, or the listener bind. Diagnostics report only aggregate
+limits/counts and repair class, never durable IDs or raw records. Live PVC
+faults and descriptor-pinned directory hardening remain tracked outside this
+source-only control.
 
 The committed bait-exposure and consumed-proof sidecars are each capped at
 4,194,304 bytes and 4,096 records. Reads retain at most one byte beyond the
@@ -123,7 +129,9 @@ one regular crash-left temp only after validating the committed sidecar and
 rejects a symlink or non-regular temp. Missing sidecars rebuild from the
 already-validated ordered complete event-log family, including the archive-only
 post-rename crash window. Existing valid sidecars remain authoritative. Live
-PVC proof remains #253.
+PVC proof remains #253. Missing-sidecar reconstruction must also pass the same
+identifier, timestamp, lifetime, capacity, and canonical-size semantics as a
+loaded sidecar before durable startup mutation.
 
 ## Defensive Boundary
 

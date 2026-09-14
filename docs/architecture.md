@@ -231,19 +231,29 @@ recovery input: up to three `<event-log>.<39 ASCII digits>` archives in suffix
 order, followed by the active segment. Each segment is capped at 32 MiB, the
 family at 128 MiB, and each schema-v2 JSON record at 1 MiB excluding its
 newline. A fixed-chunk streaming scan validates the complete family and rejects
-duplicate event IDs before any recovered state is committed. During the one
-authoritative scan under the writer lease, callbacks reconstruct missing
-exposure/proof sidecars and a selected index captures response and expected
-policy evidence for at most 8,192 pending workflows. Reconciliation then uses
-that index instead of rescanning every segment for every pending session.
+duplicate event IDs before any recovered state is committed. Both the
+pre-lease scan and the authoritative scan validate every pending workflow's
+complete response and expected-policy contract before mutation. During the one
+authoritative indexing scan under the writer lease, callbacks run only for
+missing exposure/proof sidecars and a selected index captures response and
+expected policy evidence for at most 8,192 pending workflows. Existing valid
+sidecars remain authoritative and bypass reconstruction. A fixed-memory
+SHA-256 verification pass then binds the ordered membership and bytes presented
+to repair/open to the authoritative scan. Reconciliation uses the selected
+index instead of rescanning every segment for every pending session; live
+ordinary response/policy events are not retained in it, and resolved workflow
+payloads are removed.
 
 The active file may be absent in the post-rename rotation crash window; its
 archives still recover and a new active file is created only after validation.
 Only the active segment has a repair plan: append one missing final delimiter
 for valid JSON or truncate one invalid final fragment. An unterminated archive,
 mid-file corruption, unsupported schema, noncanonical numeric archive,
-symlink, non-regular member, or file that changes shape between scan and repair
-fails startup. Descriptor-pinned directory traversal, storage encryption,
+symlink, non-regular member, or family whose membership or contents change
+between scan and repair fails startup. An exactly full active segment is not
+rotated during open: recovery reconciles first, and the next append rotates it.
+Rotation refuses to prune an archive that still contains selected unresolved
+workflow evidence. Descriptor-pinned directory traversal, storage encryption,
 multiple writers, and history beyond the retained family remain outside this
 source boundary.
 

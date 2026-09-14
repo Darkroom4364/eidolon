@@ -247,7 +247,10 @@ read limit but would expand beyond the write limit fails before the writer
 lease. A valid file padded with JSON whitespace is accepted exactly at the byte
 limit when its canonical rewrite also fits. Missing sidecars retain the
 rebuild/quarantine behavior, but reconstruction now uses the bounded ordered
-event-log family described below rather than only the active file.
+event-log family described below rather than only the active file. Rebuilt
+state must pass the same non-empty identifier, non-future timestamp, maximum
+lifetime, capacity, and canonical write checks as an existing sidecar before
+any durable writer opens.
 
 Generated session-proof responses carry `Cache-Control: private, no-store` and
 `Vary: Cookie`. Eidolon strips validators, range metadata, and CDN-specific
@@ -267,9 +270,9 @@ would-exceed or other pre-rename failure leaves the last durable file unchanged
 and rolls back exposure state or makes proof acceptance unavailable according
 to the existing fail-closed contract.
 The JSONL event and debug logs rotate at 32 MiB to collision-safe timestamped
-archives, keeping exactly 3 archives plus the active segment per log. Together
+archives, keeping up to 3 archives plus the active segment per log. Together
 those logs consume at most about 256 MiB before filesystem overhead, below the
-lab's 1 GiB PVC. The production event family is therefore exactly bounded to
+lab's 1 GiB PVC. The production event family is therefore bounded to at most
 134,217,728 bytes: up to three archives named
 `<event-log>.<39 ASCII digits>`, followed by the active segment. Each event
 record is limited to 1,048,576 serialized JSON bytes excluding its newline.
@@ -278,19 +281,25 @@ directories/non-regular members, oversized segments or records, unsupported
 event schemas, duplicate event IDs, invalid complete records, and
 unterminated archive tails block startup. Nonnumeric neighbors are ignored.
 
-Production checks this family read-only before acquiring the writer lease and
-scans it authoritatively again under the lease before durable mutation. The
-under-lease scan is one streaming pass for missing exposure/proof sidecars and
-all pending workflow evidence; it does not read the family once per pending
-session. Missing active state is supported for an empty deployment and for the
-post-rename crash window when canonical archives remain. A new active file is
-created only after the family validates. Only the active segment may append a
-missing newline to one valid final event or truncate one invalid final
-fragment; archives are immutable recovery input. Correct the named file or
-archive set and restart—the same path is accepted once it satisfies the
-contract. Do not delete retained history merely to bypass a validation error;
-preserve a copy for incident analysis and restore from a known-good quiesced
-backup when integrity is uncertain.
+Production checks this family and every pending response/policy contract
+read-only before acquiring the writer lease, then repeats the authoritative
+scan and contract checks under the lease before durable mutation. The
+under-lease indexing scan is one streaming pass for only the missing
+exposure/proof sidecars and all pending workflow evidence; existing valid
+sidecars remain authoritative, and the family is not read once per pending
+session. Before repair/open, a fixed-memory SHA-256 pass verifies that ordered
+family membership and contents still match that scan. Missing active state is
+supported for an empty deployment and for the post-rename crash window when
+canonical archives remain. A new active file is created only after the family
+validates. Only the active segment may append a missing newline to one valid
+final event or truncate one invalid final fragment; archives are immutable
+recovery input. An exactly full active segment remains in place through
+reconciliation and rotates before the next append. Rotation fails closed
+rather than prune an archive holding unresolved selected evidence. Correct the
+named file or archive set and restart—the same path is accepted once it
+satisfies the contract. Do not delete retained history merely to bypass a
+validation error; preserve a copy for incident analysis and restore from a
+known-good quiesced backup when integrity is uncertain.
 
 The `state.event_log_contract`, `state.policy_store`,
 `state.bait_exposure_store`, and `state.consumed_proof_store` effective

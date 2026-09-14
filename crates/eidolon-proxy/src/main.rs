@@ -35,9 +35,9 @@ use eidolon_proxy::{
     },
     debug_log::FileDebugLogWriter,
     event_log::{
-        scan_event_log_family, validate_event_log_family_without_mutation, DurableResponseMatch,
-        EventLogRecoveryTarget, FileEventLogWriter, JsonlTailRepairOutcome, LOG_ARCHIVES_KEPT,
-        LOG_ROTATE_BYTES, MAX_EVENT_LOG_FAMILY_BYTES, MAX_EVENT_LOG_RECORD_BYTES,
+        scan_event_log_family, DurableResponseMatch, EventLogRecoveryScan, EventLogRecoveryTarget,
+        FileEventLogWriter, JsonlTailRepairOutcome, LOG_ARCHIVES_KEPT, LOG_ROTATE_BYTES,
+        MAX_EVENT_LOG_FAMILY_BYTES, MAX_EVENT_LOG_RECORD_BYTES,
     },
     http_request::{
         canonical_request_target, normalized_request_host, HttpHeader, HttpRequest, HttpVersion,
@@ -2210,6 +2210,116 @@ fn ingress_continuity_key_mode(
     }
 }
 
+fn event_log_recovery_targets(policy_store: &PolicyStateStore) -> Vec<EventLogRecoveryTarget> {
+    policy_store
+        .pending_event_log_recovery_coordinates()
+        .into_iter()
+        .map(
+            |(session_id, request_id, expected_policy_event_id)| EventLogRecoveryTarget {
+                session_id,
+                request_id,
+                expected_policy_event_id,
+            },
+        )
+        .collect()
+}
+
+fn validate_pending_event_log_recovery(
+    policy_store: &PolicyStateStore,
+    recovery: &EventLogRecoveryScan,
+) -> io::Result<()> {
+    for session_id in policy_store.pending_controlled_reality_sessions() {
+        let record = policy_store.record(session_id);
+        let Some(pending) = record.controlled_reality_pending_update else {
+            continue;
+        };
+        let request_id = pending.request_id;
+        if pending.commit_policy_state.is_some() != pending.expected_policy_changed.is_some() {
+            return Err(invalid_data(
+                "pending controlled-reality policy transition contract was incomplete",
+            ));
+        }
+
+        match (
+            pending.expected_response,
+            recovery.indexed_durable_response(session_id, request_id),
+        ) {
+            (_, DurableResponseMatch::Missing) => {
+                if let Some(expected_policy_changed) = pending.expected_policy_changed.as_ref() {
+                    if recovery
+                        .indexed_durable_event_by_id(
+                            session_id,
+                            request_id,
+                            expected_policy_changed.id,
+                        )?
+                        .is_some()
+                    {
+                        return Err(invalid_data(
+                            "durable policy transition existed without its workflow response",
+                        ));
+                    }
+                }
+            }
+            (None, DurableResponseMatch::Unique { .. }) => {
+                return Err(invalid_data(
+                    "durable response existed without a pending response contract",
+                ));
+            }
+            (
+                Some(expected),
+                DurableResponseMatch::Unique {
+                    event_id,
+                    policy_state,
+                    status,
+                    routing_decision,
+                    controlled_reality,
+                },
+            ) => {
+                let interaction_kind =
+                    controlled_reality
+                        .as_ref()
+                        .map(|interaction| match &interaction.action {
+                            eidolon_core::ControlledRealityInteractionAction::JobSubmitted => {
+                                ControlledRealityPendingInteractionKind::JobSubmitted
+                            }
+                            eidolon_core::ControlledRealityInteractionAction::StatusRead => {
+                                ControlledRealityPendingInteractionKind::StatusRead
+                            }
+                            eidolon_core::ControlledRealityInteractionAction::ArtifactRead {
+                                ..
+                            } => ControlledRealityPendingInteractionKind::ArtifactRead,
+                        });
+                if event_id != expected.event_id
+                    || policy_state != expected.policy_state
+                    || status != expected.status
+                    || routing_decision != expected.routing_decision
+                    || interaction_kind != expected.interaction_kind
+                    || controlled_reality_semantics_sha256(&controlled_reality)?
+                        != expected.controlled_reality_sha256
+                {
+                    return Err(invalid_data(
+                        "durable response conflicted with its pending response contract",
+                    ));
+                }
+                if let Some(expected_policy_changed) = pending.expected_policy_changed.as_ref() {
+                    if let Some(actual) = recovery.indexed_durable_event_by_id(
+                        session_id,
+                        request_id,
+                        expected_policy_changed.id,
+                    )? {
+                        if actual != *expected_policy_changed {
+                            return Err(invalid_data(
+                                "durable policy transition conflicted with its pending contract",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_proxy_with_shutdown(
     config: ProxyConfig,
     production_shutdown: ProductionShutdown,
@@ -2219,8 +2329,11 @@ fn run_proxy_with_shutdown(
     let profile = config.profile;
     let listen_addr = config.listen_addr;
     if profile == RuntimeProfile::Production {
-        PolicyStateStore::validate_without_mutation(&config.policy_state_path)?;
-        validate_event_log_family_without_mutation(&config.event_log_path)?;
+        let policy_store = PolicyStateStore::prepare_open(&config.policy_state_path)?;
+        let recovery_targets = event_log_recovery_targets(&policy_store);
+        let event_log_recovery =
+            scan_event_log_family(&config.event_log_path, &recovery_targets, |_| Ok(()))?;
+        validate_pending_event_log_recovery(&policy_store, &event_log_recovery)?;
         validate_bait_security_sidecars_without_mutation(
             &config.event_log_path,
             current_unix_secs(),
@@ -2282,31 +2395,39 @@ fn run_proxy_with_shutdown(
     });
     let now = current_unix_secs();
     let prepared_policy_store = PolicyStateStore::prepare_open(&config.policy_state_path)?;
-    let recovery_targets = prepared_policy_store
-        .pending_event_log_recovery_coordinates()
-        .into_iter()
-        .map(
-            |(session_id, request_id, expected_policy_event_id)| EventLogRecoveryTarget {
-                session_id,
-                request_id,
-                expected_policy_event_id,
-            },
-        )
-        .collect::<Vec<_>>();
+    let recovery_targets = event_log_recovery_targets(&prepared_policy_store);
+    let PreparedBaitSecuritySidecars {
+        bait_exposures: prepared_bait_exposures,
+        consumed_bait_proofs: prepared_consumed_bait_proofs,
+    } = prepare_bait_security_sidecars_without_mutation(&config.event_log_path, now)?;
+    let rebuild_bait_exposures = prepared_bait_exposures.is_none();
+    let rebuild_consumed_bait_proofs = prepared_consumed_bait_proofs.is_none();
     let mut recovered_bait_exposures = BaitExposureStore::default();
     let mut recovered_consumed_bait_proofs = ConsumedBaitProofStore::default();
     let event_log_recovery =
         scan_event_log_family(&config.event_log_path, &recovery_targets, |event| {
-            recovered_bait_exposures.apply_event_log_event(event, now);
-            recovered_consumed_bait_proofs.apply_event_log_event(
-                event,
-                &bait_registry,
-                bait_signing_secret.as_deref(),
-                now,
-            )
+            if rebuild_bait_exposures {
+                recovered_bait_exposures.apply_event_log_event(event, now)?;
+            }
+            if rebuild_consumed_bait_proofs {
+                recovered_consumed_bait_proofs.apply_event_log_event(
+                    event,
+                    &bait_registry,
+                    bait_signing_secret.as_deref(),
+                    now,
+                )?;
+            }
+            Ok(())
         })?;
-    recovered_bait_exposures.torn_tail_line = event_log_recovery.active_torn_tail_line;
-    recovered_consumed_bait_proofs.torn_tail_line = event_log_recovery.active_torn_tail_line;
+    if rebuild_bait_exposures {
+        recovered_bait_exposures.torn_tail_line = event_log_recovery.active_torn_tail_line;
+        recovered_bait_exposures.validate_recovered_state(now)?;
+    }
+    if rebuild_consumed_bait_proofs {
+        recovered_consumed_bait_proofs.torn_tail_line = event_log_recovery.active_torn_tail_line;
+        recovered_consumed_bait_proofs.validate_recovered_state(now)?;
+    }
+    validate_pending_event_log_recovery(&prepared_policy_store, &event_log_recovery)?;
     let event_log_recovery_stats = event_log_recovery.stats;
     let continuity_history_exists = event_log_recovery_stats.family_bytes > 0
         || path_has_nonempty_file(&config.policy_state_path)?;
@@ -2329,6 +2450,7 @@ fn run_proxy_with_shutdown(
     let bait_exposures = BaitExposureStore::open_or_rebuild_with_recovery(
         &config.event_log_path,
         now,
+        prepared_bait_exposures,
         recovered_bait_exposures,
     )?;
     let restored_bait_exposure_count = bait_exposures.len();
@@ -2342,6 +2464,7 @@ fn run_proxy_with_shutdown(
     let consumed_bait_proofs = ConsumedBaitProofStore::open_or_rebuild_with_recovery(
         &config.event_log_path,
         now,
+        prepared_consumed_bait_proofs,
         (
             recovered_consumed_bait_proofs,
             event_log_recovery_stats.family_bytes > 0,
@@ -3372,26 +3495,48 @@ fn validate_bait_security_sidecars_without_mutation(
     event_log_path: &Path,
     now: u64,
 ) -> io::Result<()> {
+    prepare_bait_security_sidecars_without_mutation(event_log_path, now).map(drop)
+}
+
+struct PreparedBaitSecuritySidecars {
+    bait_exposures: Option<BaitExposureStore>,
+    consumed_bait_proofs: Option<ConsumedBaitProofStore>,
+}
+
+fn prepare_bait_security_sidecars_without_mutation(
+    event_log_path: &Path,
+    now: u64,
+) -> io::Result<PreparedBaitSecuritySidecars> {
     let exposure_path = sidecar_state_path(event_log_path, ".exposures.json");
-    if let Some(bytes) = read_auxiliary_state_file(
+    let bait_exposures = read_auxiliary_state_file(
         &exposure_path,
         "bait exposure state",
         MAX_BAIT_EXPOSURE_STORE_BYTES,
-    )? {
-        BaitExposureStore::from_state_bytes(exposure_path, &bytes, now)?
-            .validate_canonical_serialization()?;
-    }
+    )?
+    .map(|bytes| {
+        let store = BaitExposureStore::from_state_bytes(exposure_path, &bytes, now)?;
+        store.validate_canonical_serialization()?;
+        Ok::<BaitExposureStore, io::Error>(store)
+    })
+    .transpose()?;
 
     let consumed_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
-    if let Some(bytes) = read_auxiliary_state_file(
+    let consumed_bait_proofs = read_auxiliary_state_file(
         &consumed_path,
         "consumed proof state",
         MAX_CONSUMED_PROOF_STORE_BYTES,
-    )? {
-        ConsumedBaitProofStore::from_state_bytes(consumed_path, &bytes, now)?
-            .validate_canonical_serialization()?;
-    }
-    Ok(())
+    )?
+    .map(|bytes| {
+        let store = ConsumedBaitProofStore::from_state_bytes(consumed_path, &bytes, now)?;
+        store.validate_canonical_serialization()?;
+        Ok::<ConsumedBaitProofStore, io::Error>(store)
+    })
+    .transpose()?;
+
+    Ok(PreparedBaitSecuritySidecars {
+        bait_exposures,
+        consumed_bait_proofs,
+    })
 }
 
 impl ConsumedBaitProofStore {
@@ -3402,24 +3547,34 @@ impl ConsumedBaitProofStore {
         signing_secret: Option<&str>,
         now: u64,
     ) -> io::Result<Self> {
-        let history_exists = event_log_history_exists(event_log_path)?;
-        let recovered = Self::from_event_log(event_log_path, registry, signing_secret, now)?;
-        Self::open_or_rebuild_with_recovery(event_log_path, now, (recovered, history_exists))
+        let state_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
+        let prepared = read_auxiliary_state_file(
+            &state_path,
+            "consumed proof state",
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+        )?
+        .map(|bytes| Self::from_state_bytes(state_path, &bytes, now))
+        .transpose()?;
+        let recovered = if prepared.is_none() {
+            (
+                Self::from_event_log(event_log_path, registry, signing_secret, now)?,
+                event_log_history_exists(event_log_path)?,
+            )
+        } else {
+            (Self::default(), false)
+        };
+        Self::open_or_rebuild_with_recovery(event_log_path, now, prepared, recovered)
     }
 
     fn open_or_rebuild_with_recovery(
         event_log_path: &Path,
         now: u64,
+        prepared: Option<Self>,
         recovered: (Self, bool),
     ) -> io::Result<Self> {
         let state_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
-        match read_auxiliary_state_file(
-            &state_path,
-            "consumed proof state",
-            MAX_CONSUMED_PROOF_STORE_BYTES,
-        )? {
-            Some(bytes) => {
-                let store = Self::from_state_bytes(state_path.clone(), &bytes, now)?;
+        match prepared {
+            Some(store) => {
                 store.validate_canonical_serialization()?;
                 remove_stale_auxiliary_state_temp(&state_path)?;
                 store.persist()?;
@@ -3544,6 +3699,11 @@ impl ConsumedBaitProofStore {
         ) {
             return Ok(());
         }
+        if bait_id.0.trim().is_empty() {
+            return Err(invalid_data(
+                "reconstructed consumed proof contains an empty bait identifier",
+            ));
+        }
         let Some(bait) = registry.baits().iter().find(|bait| bait.id == *bait_id) else {
             return Ok(());
         };
@@ -3562,6 +3722,11 @@ impl ConsumedBaitProofStore {
         if expires_at <= now {
             return Ok(());
         }
+        if expires_at.saturating_sub(now) > MAX_BAIT_PROOF_TTL_SECS {
+            return Err(invalid_data(
+                "reconstructed consumed proof expiry exceeds the maximum proof lifetime",
+            ));
+        }
         let key = (
             event.session_id,
             bait_id.clone(),
@@ -3578,6 +3743,27 @@ impl ConsumedBaitProofStore {
         }
         self.consumed.insert(key, expires_at);
         Ok(())
+    }
+
+    fn validate_recovered_state(&self, now: u64) -> io::Result<()> {
+        if self.consumed.len() > MAX_CONSUMED_BAIT_PROOFS {
+            return Err(invalid_data(
+                "reconstructed consumed proof state exceeds configured capacity",
+            ));
+        }
+        for ((_, bait_id, _), expires_at) in &self.consumed {
+            if bait_id.0.trim().is_empty() {
+                return Err(invalid_data(
+                    "reconstructed consumed proof contains an empty bait identifier",
+                ));
+            }
+            if *expires_at <= now || expires_at.saturating_sub(now) > MAX_BAIT_PROOF_TTL_SECS {
+                return Err(invalid_data(
+                    "reconstructed consumed proof has an invalid expiry",
+                ));
+            }
+        }
+        self.validate_canonical_serialization()
     }
 
     fn check_and_mark(
@@ -3725,23 +3911,31 @@ fn proof_expiry_epoch_seconds(bait: &Bait, proof_value: &str) -> io::Result<u64>
 impl BaitExposureStore {
     #[cfg(test)]
     fn open_or_rebuild(event_log_path: &Path, now: u64) -> io::Result<Self> {
-        let recovered = Self::from_event_log_at(event_log_path, now)?;
-        Self::open_or_rebuild_with_recovery(event_log_path, now, recovered)
+        let state_path = sidecar_state_path(event_log_path, ".exposures.json");
+        let prepared = read_auxiliary_state_file(
+            &state_path,
+            "bait exposure state",
+            MAX_BAIT_EXPOSURE_STORE_BYTES,
+        )?
+        .map(|bytes| Self::from_state_bytes(state_path, &bytes, now))
+        .transpose()?;
+        let recovered = if prepared.is_none() {
+            Self::from_event_log_at(event_log_path, now)?
+        } else {
+            Self::default()
+        };
+        Self::open_or_rebuild_with_recovery(event_log_path, now, prepared, recovered)
     }
 
     fn open_or_rebuild_with_recovery(
         event_log_path: &Path,
-        now: u64,
+        _now: u64,
+        prepared: Option<Self>,
         recovered: Self,
     ) -> io::Result<Self> {
         let state_path = sidecar_state_path(event_log_path, ".exposures.json");
-        match read_auxiliary_state_file(
-            &state_path,
-            "bait exposure state",
-            MAX_BAIT_EXPOSURE_STORE_BYTES,
-        )? {
-            Some(bytes) => {
-                let store = Self::from_state_bytes(state_path.clone(), &bytes, now)?;
+        match prepared {
+            Some(store) => {
                 store.validate_canonical_serialization()?;
                 remove_stale_auxiliary_state_temp(&state_path)?;
                 store.persist()?;
@@ -3818,10 +4012,8 @@ impl BaitExposureStore {
     #[cfg(test)]
     fn from_event_log_at(path: &Path, now: u64) -> io::Result<Self> {
         let mut store = Self::default();
-        let recovery = scan_event_log_family(path, &[], |event| {
-            store.apply_event_log_event(event, now);
-            Ok(())
-        })?;
+        let recovery =
+            scan_event_log_family(path, &[], |event| store.apply_event_log_event(event, now))?;
         store.torn_tail_line = recovery.active_torn_tail_line;
         if let Some(line_number) = store.torn_tail_line {
             eprintln!(
@@ -3831,15 +4023,25 @@ impl BaitExposureStore {
         Ok(store)
     }
 
-    fn apply_event_log_event(&mut self, event: &Event, now: u64) {
+    fn apply_event_log_event(&mut self, event: &Event, now: u64) -> io::Result<()> {
         if let EventKind::BaitExposed {
             bait_id,
             exposure_id,
             ..
         } = &event.kind
         {
-            let observed_at_unix_secs =
-                u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
+            if bait_id.0.trim().is_empty() || exposure_id.0.trim().is_empty() {
+                return Err(invalid_data(
+                    "reconstructed bait exposure contains an empty identifier",
+                ));
+            }
+            let observed_at_unix_secs = u64::try_from(event.observed_at.timestamp())
+                .map_err(|_| invalid_data("reconstructed bait exposure predates Unix time"))?;
+            if observed_at_unix_secs > now {
+                return Err(invalid_data(
+                    "reconstructed bait exposure contains a future-dated timestamp",
+                ));
+            }
             self.apply_record_exposure_at(
                 event.session_id,
                 bait_id.clone(),
@@ -3848,6 +4050,28 @@ impl BaitExposureStore {
                 now,
             );
         }
+        Ok(())
+    }
+
+    fn validate_recovered_state(&self, now: u64) -> io::Result<()> {
+        if self.exposures.len() > MAX_BAIT_EXPOSURES {
+            return Err(invalid_data(
+                "reconstructed bait exposure state exceeds the fixed record limit",
+            ));
+        }
+        for ((_, bait_id), record) in &self.exposures {
+            if bait_id.0.trim().is_empty() || record.exposure_id.0.trim().is_empty() {
+                return Err(invalid_data(
+                    "reconstructed bait exposure contains an empty identifier",
+                ));
+            }
+            if record.observed_at_unix_secs > now {
+                return Err(invalid_data(
+                    "reconstructed bait exposure contains a future-dated timestamp",
+                ));
+            }
+        }
+        self.validate_canonical_serialization()
     }
 
     fn len(&self) -> usize {
@@ -11824,6 +12048,135 @@ mod tests {
                 "startup recovery projection leaked `{private}`"
             );
         }
+    }
+
+    #[test]
+    fn conflicting_pending_response_fails_before_production_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let private_session = SessionId(uuid::Uuid::from_u128(0x0fee_d313));
+        let private_request = RequestId(uuid::Uuid::from_u128(0x0caf_e313));
+        let expected_event_id = uuid::Uuid::from_u128(0x0bad_e313);
+        let expected = {
+            let mut store = PolicyStateStore::open(&fixture.policy_state_path)
+                .expect("policy store should open for pending setup");
+            store
+                .set_policy_state(private_session, PolicyState::ControlledReality)
+                .expect("controlled state should persist");
+            let progress = store
+                .note_controlled_reality_interaction(
+                    private_session,
+                    private_request,
+                    eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+                    MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+                )
+                .expect("pending workflow should persist");
+            let expected = ControlledRealityResponder.expected_response(
+                private_session,
+                progress,
+                eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+            );
+            store
+                .set_pending_controlled_reality_response(
+                    private_session,
+                    private_request,
+                    ControlledRealityPendingResponse {
+                        event_id: expected_event_id,
+                        policy_state: PolicyState::ControlledReality,
+                        status: expected.status,
+                        routing_decision: expected.routing_decision,
+                        interaction_kind: Some(
+                            ControlledRealityPendingInteractionKind::JobSubmitted,
+                        ),
+                        controlled_reality_sha256: controlled_reality_semantics_sha256(
+                            &expected.interaction,
+                        )
+                        .expect("expected interaction should serialize"),
+                    },
+                )
+                .expect("pending response contract should persist");
+            expected
+        };
+        let policy_before = fs::read(&fixture.policy_state_path)
+            .expect("pending policy state should remain readable");
+        let conflicting = Event::new(
+            private_session,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: expected.status.saturating_add(1),
+                routing_decision: expected.routing_decision,
+                controlled_reality: expected.interaction,
+            },
+        )
+        .with_request_id(private_request);
+        let event_before = format!(
+            "{}\n{{\"schema_version\":",
+            serde_json::to_string(&conflicting).expect("conflicting event should serialize")
+        )
+        .into_bytes();
+        fs::write(&fixture.event_log_path, &event_before)
+            .expect("conflicting repairable event family should write");
+
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let debug_before = br#"{"sentinel":"pending-conflict"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"pending-conflict-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("conflicting pending response must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("durable response conflicted"));
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            expected_event_id.to_string(),
+            conflicting.id.to_string(),
+        ] {
+            assert!(
+                !error.to_string().contains(&private),
+                "pending conflict diagnostic leaked `{private}`"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
     }
 
     #[test]
@@ -20512,6 +20865,186 @@ mod tests {
             "sidecar recovery alone must not create an active event log"
         );
         assert!(sidecar_state_path(&event_log, ".consumed-proofs.json").is_file());
+    }
+
+    #[test]
+    fn committed_sidecars_skip_incompatible_event_history_reconstruction() {
+        let loaded = default_loaded_bait_profile();
+        let bait = loaded
+            .registry
+            .baits()
+            .iter()
+            .find(|bait| {
+                bait.expected_action.header_value.is_some()
+                    && bait.expected_action.header_value_mint.is_none()
+            })
+            .expect("default profile should contain a static header bait")
+            .clone();
+        let now = 1_000;
+        let session_id = SessionId::new();
+        let mut incompatible_proof = Event::new(
+            session_id,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
+                exposure_id: None,
+                method: "POST".to_string(),
+                path: bait.expected_action.path.clone(),
+                header_value_mint: bait.header_value_mint_audit(),
+                header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            },
+        );
+        incompatible_proof.observed_at =
+            chrono::DateTime::from_timestamp(now as i64, 0).expect("timestamp");
+        let mut future_exposure = Event::new(
+            session_id,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
+                exposure_id: ExposureId("future-exposure".to_string()),
+                surface: "/docs".to_string(),
+                header_value_mint: None,
+            },
+        );
+        future_exposure.observed_at =
+            chrono::DateTime::from_timestamp(now as i64 + 1, 0).expect("future timestamp");
+        let event_log = unique_temp_path("authoritative-sidecars-skip-rebuild.jsonl");
+        fs::write(
+            &event_log,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&incompatible_proof).expect("proof event should serialize"),
+                serde_json::to_string(&future_exposure).expect("exposure event should serialize")
+            ),
+        )
+        .expect("incompatible history should write");
+        let exposure_path = sidecar_state_path(&event_log, ".exposures.json");
+        let proof_path = sidecar_state_path(&event_log, ".consumed-proofs.json");
+        fs::write(
+            &exposure_path,
+            serde_json::to_vec(&StoredBaitExposureState {
+                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                exposures: Vec::new(),
+            })
+            .expect("exposure sidecar should serialize"),
+        )
+        .expect("exposure sidecar should write");
+        fs::write(
+            &proof_path,
+            serde_json::to_vec(&StoredConsumedProofState {
+                schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                migration_quarantine_until: None,
+                consumed: Vec::new(),
+            })
+            .expect("proof sidecar should serialize"),
+        )
+        .expect("proof sidecar should write");
+
+        let exposures = BaitExposureStore::open_or_rebuild(&event_log, now)
+            .expect("committed exposure sidecar should remain authoritative");
+        let proofs =
+            ConsumedBaitProofStore::open_or_rebuild(&event_log, &loaded.registry, None, now)
+                .expect("committed proof sidecar should bypass incompatible reconstruction");
+        assert!(exposures.exposures.is_empty());
+        assert!(proofs.consumed.is_empty());
+    }
+
+    #[test]
+    fn missing_sidecars_reject_semantically_invalid_reconstructed_state() {
+        let now = 1_000;
+        for (label, bait_id, exposure_id, observed_at, expected) in [
+            (
+                "empty-exposure-id",
+                BaitId("valid-bait".to_string()),
+                ExposureId(" ".to_string()),
+                now,
+                "empty identifier",
+            ),
+            (
+                "future-exposure",
+                BaitId("valid-bait".to_string()),
+                ExposureId("valid-exposure".to_string()),
+                now + 1,
+                "future-dated",
+            ),
+        ] {
+            let event_log = unique_temp_path(&format!("invalid-rebuilt-{label}.jsonl"));
+            let mut event = Event::new(
+                SessionId::new(),
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id,
+                    bait_class: None,
+                    exposure_id,
+                    surface: "/docs".to_string(),
+                    header_value_mint: None,
+                },
+            );
+            event.observed_at =
+                chrono::DateTime::from_timestamp(observed_at as i64, 0).expect("timestamp");
+            let bytes = format!(
+                "{}\n",
+                serde_json::to_string(&event).expect("invalid semantic event should serialize")
+            )
+            .into_bytes();
+            fs::write(&event_log, &bytes).expect("invalid semantic history should write");
+
+            let error = BaitExposureStore::open_or_rebuild(&event_log, now)
+                .expect_err("missing exposure sidecar must reject invalid reconstructed state");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            assert!(error.to_string().contains(expected), "{label}: {error}");
+            assert_eq!(fs::read(&event_log).unwrap(), bytes);
+            assert!(!sidecar_state_path(&event_log, ".exposures.json").exists());
+        }
+
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&profile_path).expect("minted profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait")
+            .clone();
+        let event_log = unique_temp_path("overlong-rebuilt-proof.jsonl");
+        let mut event = Event::new(
+            SessionId::new(),
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
+                exposure_id: None,
+                method: "POST".to_string(),
+                path: bait.expected_action.path.clone(),
+                header_value_mint: bait.header_value_mint_audit(),
+                header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            },
+        );
+        event.observed_at =
+            chrono::DateTime::from_timestamp((now + MAX_BAIT_PROOF_TTL_SECS + 1) as i64, 0)
+                .expect("future proof timestamp");
+        let bytes = format!(
+            "{}\n",
+            serde_json::to_string(&event).expect("overlong proof event should serialize")
+        )
+        .into_bytes();
+        fs::write(&event_log, &bytes).expect("overlong proof history should write");
+
+        let error = ConsumedBaitProofStore::open_or_rebuild(
+            &event_log,
+            &loaded.registry,
+            Some("mint-secret"),
+            now,
+        )
+        .expect_err("missing proof sidecar must reject an overlong recovered lifetime");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("maximum proof lifetime"));
+        assert_eq!(fs::read(&event_log).unwrap(), bytes);
+        assert!(!sidecar_state_path(&event_log, ".consumed-proofs.json").exists());
     }
 
     #[test]

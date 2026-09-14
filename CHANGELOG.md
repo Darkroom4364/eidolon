@@ -30,8 +30,10 @@ Initial research-alpha source release.
 - bounded schema-v2 event-log recovery across one active 32 MiB segment and
   three canonical numeric archives (128 MiB total), with a 1 MiB record cap,
   streaming validation, global duplicate-event rejection, active-only tail
-  repair, full-family sidecar reconstruction, and one pending-workflow index
-  built during the authoritative under-lease scan
+  repair, immutable full-family verification, missing-only full-family sidecar
+  reconstruction, pre-mutation workflow-contract validation, evidence-safe
+  deferred rotation, and one selected pending-workflow index built during the
+  authoritative under-lease scan
 
 ### Limitations
 
