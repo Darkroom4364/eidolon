@@ -3999,6 +3999,24 @@ mod tests {
     }
 
     #[test]
+    fn recovery_index_requires_workflow_coordinates_for_policy_evidence() {
+        let mut event = policy_event(SessionId::new(), RequestId::new());
+        event.request_id = None;
+        let mut index = super::EventLogRecoveryIndex::default();
+        index.durable_events.insert(event.id, event);
+
+        let error = index
+            .recovery_evidence_locations()
+            .expect_err("policy evidence without a request id must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "indexed recovery event did not identify its workflow"
+        );
+    }
+
+    #[test]
     fn selected_live_index_ignores_ordinary_events_and_releases_resolved_workflows() {
         let family = TestFamily::new("selected-live-index-scope.jsonl");
         let scan = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
