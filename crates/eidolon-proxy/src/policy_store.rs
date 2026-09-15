@@ -195,6 +195,7 @@ pub struct PolicyStateStore {
     records: HashMap<SessionId, SessionPolicyRecord>,
     fail_closed_for_unknown_sessions: bool,
     last_eviction: EvictionStats,
+    startup_persist_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +272,13 @@ pub struct ControlledRealityPendingResponse {
     pub controlled_reality_sha256: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingControlledRealityRecoveryDecision {
+    pub session_id: SessionId,
+    pub request_id: RequestId,
+    pub durable_response_seen: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlledRealityPendingInteractionKind {
@@ -302,6 +310,27 @@ enum PolicyPersistOutcome {
 /// large in-memory field cannot make the replacement buffer grow unbounded.
 struct BoundedPolicyStoreSerialization {
     bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct CountingPolicyStoreSerialization {
+    bytes: u64,
+}
+
+impl Write for CountingPolicyStoreSerialization {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let incoming = u64::try_from(buffer.len())
+            .map_err(|_| io::Error::other("policy serialization length did not fit in u64"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(incoming)
+            .ok_or_else(|| io::Error::other("policy serialization length overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl BoundedPolicyStoreSerialization {
@@ -372,6 +401,83 @@ impl SessionPolicyRecord {
     }
 }
 
+impl StoredSessionPolicy {
+    fn from_record(session_id: SessionId, record: &SessionPolicyRecord) -> Self {
+        Self {
+            session_id,
+            policy_state: record.policy_state,
+            controlled_reality_depth: record.controlled_reality_depth,
+            controlled_reality_workflow_state: record.controlled_reality_workflow_state,
+            controlled_reality_origin_request_id: record.controlled_reality_origin_request_id,
+            controlled_reality_pending_update: record.controlled_reality_pending_update.clone(),
+            last_seen_unix_secs: record.last_seen_unix_secs,
+            reality_escape_attempt_count: record.reality_escape_attempt_count,
+            discovery_surface_fanout: record.discovery_surface_fanout,
+            discovery_request_count: record.discovery_request_count,
+            discovery_query_seen: record.discovery_query_seen,
+            discovery_legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
+            discovery_linked_bait_surface_fanout: record.discovery_linked_bait_surface_fanout,
+            discovery_decoy_write_probe_count: record.discovery_decoy_write_probe_count,
+            discovery_decoy_write_probe_fanout: record.discovery_decoy_write_probe_fanout,
+            discovery_decoy_write_probe_seen: false,
+            discovery_linked_bait_surface_seen: false,
+        }
+    }
+}
+
+fn pending_update_for_reconciliation(
+    record: &SessionPolicyRecord,
+    request_id: RequestId,
+    durable_response_seen: bool,
+) -> io::Result<Option<ControlledRealityPendingUpdate>> {
+    let Some(pending_update) = record.controlled_reality_pending_update.clone() else {
+        return Ok(None);
+    };
+    if pending_update.request_id != request_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "controlled-reality workflow recovery request id did not match pending state",
+        ));
+    }
+    if durable_response_seen && pending_update.expected_response.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "controlled-reality workflow cannot roll forward without a response contract",
+        ));
+    }
+    if durable_response_seen
+        && pending_update.commit_policy_state.is_some()
+            != pending_update.expected_policy_changed.is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "controlled-reality policy transition contract was incomplete",
+        ));
+    }
+    Ok(Some(pending_update))
+}
+
+fn apply_pending_reconciliation(
+    record: &mut SessionPolicyRecord,
+    pending_update: &ControlledRealityPendingUpdate,
+    durable_response_seen: bool,
+) {
+    if !durable_response_seen {
+        record.controlled_reality_depth = pending_update.previous_depth;
+        record.controlled_reality_workflow_state = pending_update.previous_state;
+        record.controlled_reality_origin_request_id = pending_update.previous_origin_request_id;
+    } else if let Some(policy_state) = pending_update.commit_policy_state {
+        record.policy_state = policy_state;
+        if policy_state != PolicyState::ControlledReality {
+            record.controlled_reality_depth = 0;
+            record.controlled_reality_workflow_state = ControlledRealityWorkflowState::Ready;
+            record.controlled_reality_origin_request_id = None;
+            record.reality_escape_attempt_count = 0;
+        }
+    }
+    record.controlled_reality_pending_update = None;
+}
+
 impl Default for SessionPolicyRecord {
     fn default() -> Self {
         Self::new(crate::policy::initial_policy_state())
@@ -429,6 +535,7 @@ impl PolicyStateStore {
             records: HashMap::new(),
             fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         }
     }
 
@@ -445,12 +552,28 @@ impl PolicyStateStore {
         Self::load_at(path.as_ref().to_path_buf(), current_unix_secs(), false).map(drop)
     }
 
+    /// Prepare the authoritative under-lease snapshot without mutating it.
+    /// The caller can validate dependent durable inputs before committing any
+    /// required startup migration or eviction with `finish_prepared_startup`.
+    pub fn prepare_open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::load_at(path.as_ref().to_path_buf(), current_unix_secs(), false)
+    }
+
+    pub fn finish_prepared_startup(mut self) -> io::Result<Self> {
+        if self.startup_persist_required {
+            self.persist()?;
+            self.startup_persist_required = false;
+        }
+        Ok(self)
+    }
+
     /// Open the store with an explicit "now" (test hook for eviction runs).
     pub fn open_at(path: impl AsRef<Path>, now: u64) -> io::Result<Self> {
         Self::load_at(path.as_ref().to_path_buf(), now, true)
     }
 
     fn load_at(path: PathBuf, now: u64, persist_changes: bool) -> io::Result<Self> {
+        validate_policy_state_temp_without_mutation(&path)?;
         let (records, fail_closed_for_unknown_sessions, needs_schema_migration) =
             match read_policy_store_bytes(&path) {
                 Ok(bytes) => deserialize_records(&bytes, &path)?,
@@ -464,6 +587,7 @@ impl PolicyStateStore {
             records,
             fail_closed_for_unknown_sessions,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         };
 
         // Legacy records written before last_seen tracking get one grace
@@ -477,9 +601,11 @@ impl PolicyStateStore {
 
         let stats = store.evict(now);
         store.last_eviction = stats;
-        if !stats.is_clean() || needs_schema_migration {
+        store.startup_persist_required = !stats.is_clean() || needs_schema_migration;
+        if store.startup_persist_required {
             if persist_changes {
                 store.persist()?;
+                store.startup_persist_required = false;
             } else {
                 store.serialize_current_state()?;
             }
@@ -593,6 +719,94 @@ impl PolicyStateStore {
         sessions
     }
 
+    pub fn pending_event_log_recovery_coordinates(
+        &self,
+    ) -> Vec<(SessionId, RequestId, Option<Uuid>)> {
+        let mut targets = self
+            .records
+            .iter()
+            .filter_map(|(session_id, record)| {
+                record
+                    .controlled_reality_pending_update
+                    .as_ref()
+                    .map(|pending| {
+                        (
+                            *session_id,
+                            pending.request_id,
+                            pending
+                                .expected_policy_changed
+                                .as_ref()
+                                .map(|event| event.id),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by_key(|(session_id, _, _)| session_id.0);
+        targets
+    }
+
+    /// Validate every policy snapshot that ordered startup reconciliation
+    /// will persist. The initial current-schema file may be compact enough to
+    /// read while its pretty canonical form is over the write limit, so this
+    /// uses exact counting plus per-record canonical deltas instead of
+    /// repeatedly materializing the complete store.
+    pub fn validate_pending_reconciliation_plan_without_mutation(
+        &self,
+        decisions: &[PendingControlledRealityRecoveryDecision],
+        reconciliation_unix_secs: u64,
+    ) -> io::Result<()> {
+        let pending_sessions = self.pending_controlled_reality_sessions();
+        if decisions.len() != pending_sessions.len()
+            || decisions
+                .iter()
+                .zip(&pending_sessions)
+                .any(|(decision, session_id)| decision.session_id != *session_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "policy reconciliation plan did not match every pending workflow in order",
+            ));
+        }
+        if decisions.is_empty() {
+            return Ok(());
+        }
+
+        let mut planned_bytes = self.serialized_current_state_len()?;
+        for decision in decisions {
+            let record = self.records.get(&decision.session_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "policy reconciliation plan referenced an absent session",
+                )
+            })?;
+            let pending = pending_update_for_reconciliation(
+                record,
+                decision.request_id,
+                decision.durable_response_seen,
+            )?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "policy reconciliation plan referenced a settled session",
+                )
+            })?;
+            let before_bytes = self.serialized_record_envelope_len(decision.session_id, record)?;
+            let mut reconciled = record.clone();
+            apply_pending_reconciliation(&mut reconciled, &pending, decision.durable_response_seen);
+            reconciled.last_seen_unix_secs = reconciliation_unix_secs;
+            let after_bytes =
+                self.serialized_record_envelope_len(decision.session_id, &reconciled)?;
+            planned_bytes = planned_bytes
+                .checked_sub(before_bytes)
+                .and_then(|remaining| remaining.checked_add(after_bytes))
+                .ok_or_else(|| io::Error::other("policy reconciliation size overflow"))?;
+            if planned_bytes > MAX_POLICY_STORE_BYTES as u64 {
+                return Err(oversized_serialized_policy_store_error());
+            }
+        }
+        Ok(())
+    }
+
     /// Expire stale lower-rung sessions before refreshing the current session.
     ///
     /// Persisting eviction before the refresh prevents an old session from
@@ -635,8 +849,16 @@ impl PolicyStateStore {
     }
 
     fn insert_record(&mut self, session_id: SessionId, record: SessionPolicyRecord) {
-        let mut record = record;
-        record.last_seen_unix_secs = current_unix_secs();
+        self.insert_record_at(session_id, record, current_unix_secs());
+    }
+
+    fn insert_record_at(
+        &mut self,
+        session_id: SessionId,
+        mut record: SessionPolicyRecord,
+        now: u64,
+    ) {
+        record.last_seen_unix_secs = now;
         let existed = match self.records.entry(session_id) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.insert(record);
@@ -659,7 +881,7 @@ impl PolicyStateStore {
             return;
         }
 
-        let mut stats = self.evict(current_unix_secs());
+        let mut stats = self.evict(now);
         if !self.records.contains_key(&session_id) {
             if !self.fail_closed_for_unknown_sessions {
                 self.fail_closed_for_unknown_sessions = true;
@@ -1013,50 +1235,32 @@ impl PolicyStateStore {
         request_id: RequestId,
         durable_response_seen: bool,
     ) -> io::Result<bool> {
-        let Some(pending_update) = self.record(session_id).controlled_reality_pending_update else {
+        self.reconcile_pending_controlled_reality_at(
+            session_id,
+            request_id,
+            durable_response_seen,
+            current_unix_secs(),
+        )
+    }
+
+    pub fn reconcile_pending_controlled_reality_at(
+        &mut self,
+        session_id: SessionId,
+        request_id: RequestId,
+        durable_response_seen: bool,
+        reconciliation_unix_secs: u64,
+    ) -> io::Result<bool> {
+        let record = self.record(session_id);
+        let Some(pending_update) =
+            pending_update_for_reconciliation(&record, request_id, durable_response_seen)?
+        else {
             return Ok(false);
         };
-        if pending_update.request_id != request_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "controlled-reality workflow recovery request id did not match pending state",
-            ));
-        }
-        if durable_response_seen && pending_update.expected_response.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "controlled-reality workflow cannot roll forward without a response contract",
-            ));
-        }
-        if durable_response_seen
-            && pending_update.commit_policy_state.is_some()
-                != pending_update.expected_policy_changed.is_some()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "controlled-reality policy transition contract was incomplete",
-            ));
-        }
 
         self.mutate_and_persist(|store| {
             let mut record = store.record(session_id);
-            if !durable_response_seen {
-                record.controlled_reality_depth = pending_update.previous_depth;
-                record.controlled_reality_workflow_state = pending_update.previous_state;
-                record.controlled_reality_origin_request_id =
-                    pending_update.previous_origin_request_id;
-            } else if let Some(policy_state) = pending_update.commit_policy_state {
-                record.policy_state = policy_state;
-                if policy_state != PolicyState::ControlledReality {
-                    record.controlled_reality_depth = 0;
-                    record.controlled_reality_workflow_state =
-                        ControlledRealityWorkflowState::Ready;
-                    record.controlled_reality_origin_request_id = None;
-                    record.reality_escape_attempt_count = 0;
-                }
-            }
-            record.controlled_reality_pending_update = None;
-            store.insert_record(session_id, record);
+            apply_pending_reconciliation(&mut record, &pending_update, durable_response_seen);
+            store.insert_record_at(session_id, record, reconciliation_unix_secs);
             true
         })
     }
@@ -1149,6 +1353,7 @@ impl PolicyStateStore {
         };
 
         let serialized = self.serialize_current_state()?;
+        validate_policy_state_temp_without_mutation(path)?;
         let temp_path = path.with_extension("tmp");
 
         let mut file = fs::OpenOptions::new()
@@ -1180,37 +1385,23 @@ impl PolicyStateStore {
         }
     }
 
-    fn serialize_current_state(&self) -> io::Result<Vec<u8>> {
+    fn current_stored_state(&self) -> StoredPolicyState {
         let mut sessions: Vec<StoredSessionPolicy> = self
             .records
             .iter()
-            .map(|(session_id, record)| StoredSessionPolicy {
-                session_id: *session_id,
-                policy_state: record.policy_state,
-                controlled_reality_depth: record.controlled_reality_depth,
-                controlled_reality_workflow_state: record.controlled_reality_workflow_state,
-                controlled_reality_origin_request_id: record.controlled_reality_origin_request_id,
-                controlled_reality_pending_update: record.controlled_reality_pending_update.clone(),
-                last_seen_unix_secs: record.last_seen_unix_secs,
-                reality_escape_attempt_count: record.reality_escape_attempt_count,
-                discovery_surface_fanout: record.discovery_surface_fanout,
-                discovery_request_count: record.discovery_request_count,
-                discovery_query_seen: record.discovery_query_seen,
-                discovery_legacy_openapi_query_seen: record.discovery_legacy_openapi_query_seen,
-                discovery_linked_bait_surface_fanout: record.discovery_linked_bait_surface_fanout,
-                discovery_decoy_write_probe_count: record.discovery_decoy_write_probe_count,
-                discovery_decoy_write_probe_fanout: record.discovery_decoy_write_probe_fanout,
-                discovery_decoy_write_probe_seen: false,
-                discovery_linked_bait_surface_seen: false,
-            })
+            .map(|(session_id, record)| StoredSessionPolicy::from_record(*session_id, record))
             .collect();
         sessions.sort_by_key(|record| record.session_id.0);
 
-        let stored = StoredPolicyState {
+        StoredPolicyState {
             schema_version: POLICY_STORE_SCHEMA_VERSION,
             fail_closed_for_unknown_sessions: self.fail_closed_for_unknown_sessions,
             sessions,
-        };
+        }
+    }
+
+    fn serialize_current_state(&self) -> io::Result<Vec<u8>> {
+        let stored = self.current_stored_state();
         let mut serialized = BoundedPolicyStoreSerialization::new();
         serde_json::to_writer_pretty(&mut serialized, &stored).map_err(|error| {
             io::Error::new(
@@ -1219,6 +1410,45 @@ impl PolicyStateStore {
             )
         })?;
         serialized.finish()
+    }
+
+    fn serialized_current_state_len(&self) -> io::Result<u64> {
+        self.serialized_stored_state_len(&self.current_stored_state())
+    }
+
+    fn serialized_record_envelope_len(
+        &self,
+        session_id: SessionId,
+        record: &SessionPolicyRecord,
+    ) -> io::Result<u64> {
+        self.serialized_stored_state_len(&StoredPolicyState {
+            schema_version: POLICY_STORE_SCHEMA_VERSION,
+            fail_closed_for_unknown_sessions: self.fail_closed_for_unknown_sessions,
+            sessions: vec![StoredSessionPolicy::from_record(session_id, record)],
+        })
+    }
+
+    fn serialized_stored_state_len(&self, stored: &StoredPolicyState) -> io::Result<u64> {
+        let mut serialized = CountingPolicyStoreSerialization::default();
+        serde_json::to_writer_pretty(&mut serialized, stored).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to serialize policy state store: {error}"),
+            )
+        })?;
+        Ok(serialized.bytes)
+    }
+}
+
+fn validate_policy_state_temp_without_mutation(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path.with_extension("tmp")) {
+        Ok(metadata) if !metadata.is_file() => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "policy state temporary path is not a regular file",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1956,6 +2186,189 @@ mod tests {
     }
 
     #[test]
+    fn policy_temp_type_is_checked_during_preflight_and_repeated_before_persist() {
+        let path = unique_temp_path("policy-temp-type-validation");
+        let temp = path.with_extension("tmp");
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "schema_version": MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("legacy temp-type fixture should serialize");
+        fs::write(&path, &legacy).expect("legacy temp-type fixture should write");
+        fs::create_dir(&temp).expect("nonregular policy temp should create");
+
+        let error = PolicyStateStore::validate_without_mutation(&path)
+            .expect_err("nonregular policy temp must fail read-only validation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "policy state temporary path is not a regular file"
+        );
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+        assert!(fs::metadata(&temp).unwrap().is_dir());
+
+        fs::remove_dir(&temp).expect("preflight temp directory should remove");
+        let prepared = PolicyStateStore::prepare_open(&path)
+            .expect("legacy state should prepare after temp correction");
+        assert!(prepared.startup_persist_required);
+        fs::create_dir(&temp).expect("raced nonregular policy temp should create");
+
+        let error = prepared
+            .finish_prepared_startup()
+            .expect_err("persistence must repeat the policy temp type check");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "policy state temporary path is not a regular file"
+        );
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+        assert!(fs::metadata(&temp).unwrap().is_dir());
+
+        fs::remove_dir(temp).expect("raced temp directory should remove");
+        fs::remove_file(path).expect("legacy temp-type fixture should remove");
+    }
+
+    #[test]
+    fn prepared_startup_defers_legacy_migration_until_explicit_finish() {
+        let path = unique_temp_path("prepared-legacy-migration");
+        let session_id = SessionId::new();
+        let legacy = serde_json::to_vec(&serde_json::json!({
+            "schema_version": MIN_SUPPORTED_POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [{
+                "session_id": session_id.0,
+                "policy_state": "blocked",
+            }],
+        }))
+        .expect("legacy prepared fixture should serialize");
+        fs::write(&path, &legacy).expect("legacy prepared fixture should write");
+
+        let prepared = PolicyStateStore::prepare_open(&path)
+            .expect("legacy snapshot should prepare without mutation");
+        assert!(prepared.startup_persist_required);
+        assert_eq!(prepared.policy_state(session_id), PolicyState::Blocked);
+        assert_eq!(
+            fs::read(&path).expect("prepared source should remain readable"),
+            legacy
+        );
+        assert!(!path.with_extension("tmp").exists());
+
+        let finished = prepared
+            .finish_prepared_startup()
+            .expect("explicit finish should persist migration");
+        assert!(!finished.startup_persist_required);
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("migrated state should read"))
+                .expect("migrated state should parse");
+        assert_eq!(migrated["schema_version"], POLICY_STORE_SCHEMA_VERSION);
+        assert_eq!(
+            migrated["sessions"]
+                .as_array()
+                .expect("sessions should be an array")
+                .len(),
+            1
+        );
+        fs::remove_file(path).expect("prepared legacy fixture should remove");
+    }
+
+    #[test]
+    fn prepared_startup_defers_ttl_eviction_and_missing_state_remains_absent() {
+        let missing = unique_temp_path("prepared-missing-state");
+        let missing_store = PolicyStateStore::prepare_open(&missing)
+            .expect("missing snapshot should prepare without creation");
+        assert!(!missing_store.startup_persist_required);
+        missing_store
+            .finish_prepared_startup()
+            .expect("missing snapshot should finish without creation");
+        assert!(!missing.exists());
+
+        let path = unique_temp_path("prepared-ttl-eviction");
+        let stale_session = SessionId::new();
+        let stale = serde_json::to_vec(&serde_json::json!({
+            "schema_version": POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [{
+                "session_id": stale_session.0,
+                "policy_state": "observe",
+                "last_seen_unix_secs": 1,
+            }],
+        }))
+        .expect("stale fixture should serialize");
+        fs::write(&path, &stale).expect("stale fixture should write");
+
+        let prepared = PolicyStateStore::prepare_open(&path)
+            .expect("stale snapshot should prepare without mutation");
+        assert!(prepared.startup_persist_required);
+        assert_eq!(prepared.last_eviction_stats().ttl_evicted, 1);
+        assert!(prepared.is_empty());
+        assert_eq!(
+            fs::read(&path).expect("stale source should remain readable"),
+            stale
+        );
+        assert!(!path.with_extension("tmp").exists());
+
+        let finished = prepared
+            .finish_prepared_startup()
+            .expect("explicit finish should persist eviction");
+        assert!(!finished.startup_persist_required);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("evicted state should read"))
+                .expect("evicted state should parse");
+        assert_eq!(persisted["sessions"], serde_json::json!([]));
+        fs::remove_file(path).expect("prepared eviction fixture should remove");
+    }
+
+    #[test]
+    fn pending_event_log_coordinates_are_selected_and_deterministically_sorted() {
+        let first_session = SessionId(Uuid::from_u128(1));
+        let second_session = SessionId(Uuid::from_u128(2));
+        let settled_session = SessionId(Uuid::from_u128(3));
+        let first_request = RequestId(Uuid::from_u128(11));
+        let second_request = RequestId(Uuid::from_u128(12));
+        let mut store = PolicyStateStore::in_memory();
+        for session_id in [second_session, first_session] {
+            store
+                .set_policy_state(session_id, PolicyState::ControlledReality)
+                .expect("controlled state should stage");
+        }
+        store
+            .set_policy_state(settled_session, PolicyState::Suspicious)
+            .expect("settled state should persist");
+        store
+            .note_controlled_reality_interaction(
+                second_session,
+                second_request,
+                ControlledRealityRequestAction::BranchRead,
+                4,
+            )
+            .expect("second pending workflow should stage");
+        store
+            .note_controlled_reality_interaction(
+                first_session,
+                first_request,
+                ControlledRealityRequestAction::BranchRead,
+                4,
+            )
+            .expect("first pending workflow should stage");
+        let expected_policy = test_blocked_policy_event(first_session, first_request);
+        let expected_policy_id = expected_policy.id;
+        store
+            .stage_controlled_reality_policy_state(
+                first_session,
+                first_request,
+                PolicyState::Blocked,
+                expected_policy,
+            )
+            .expect("first policy transition should stage");
+
+        assert_eq!(
+            store.pending_event_log_recovery_coordinates(),
+            vec![
+                (first_session, first_request, Some(expected_policy_id)),
+                (second_session, second_request, None),
+            ]
+        );
+    }
+
+    #[test]
     fn maximum_widest_production_store_has_explicit_byte_headroom() {
         const REQUIRED_HEADROOM_BYTES: usize = 8 * 1024 * 1024;
 
@@ -1991,6 +2404,7 @@ mod tests {
             records,
             fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         };
 
         let serialized = store
@@ -2003,6 +2417,143 @@ mod tests {
             "widest production store used {} bytes and left only {headroom} bytes",
             serialized.len()
         );
+    }
+
+    #[test]
+    fn ordered_reconciliation_size_plan_accepts_exact_limit_and_rejects_one_over() {
+        let first_session = SessionId(Uuid::from_u128(1));
+        let first_request = RequestId(Uuid::from_u128(2));
+        let second_session = SessionId(Uuid::from_u128(3));
+        let second_request = RequestId(Uuid::from_u128(4));
+        let first_record = SessionPolicyRecord {
+            policy_state: PolicyState::ControlledReality,
+            controlled_reality_pending_update: Some(ControlledRealityPendingUpdate {
+                request_id: first_request,
+                request_action: ControlledRealityRequestAction::UnknownResource,
+                previous_depth: 0,
+                previous_state: ControlledRealityWorkflowState::Ready,
+                previous_origin_request_id: None,
+                commit_policy_state: None,
+                expected_policy_changed: None,
+                expected_response: None,
+            }),
+            ..SessionPolicyRecord::new(PolicyState::ControlledReality)
+        };
+        let mut second_record = widest_production_record(
+            second_session,
+            second_request,
+            Uuid::from_u128(5),
+            Uuid::from_u128(6),
+        );
+        let Some(Event {
+            kind: EventKind::PolicyChanged { reason, .. },
+            ..
+        }) = second_record
+            .controlled_reality_pending_update
+            .as_mut()
+            .and_then(|pending| pending.expected_policy_changed.as_mut())
+        else {
+            panic!("second recovery record should contain a policy event")
+        };
+        reason.clear();
+        let mut store = PolicyStateStore {
+            path: None,
+            records: [
+                (first_session, first_record),
+                (second_session, second_record),
+            ]
+            .into_iter()
+            .collect(),
+            fail_closed_for_unknown_sessions: false,
+            last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
+        };
+        let mut after_first = store.clone();
+        assert!(after_first
+            .reconcile_pending_controlled_reality_at(first_session, first_request, false, 9)
+            .expect("empty-reason first workflow should reconcile"));
+        let empty_reason_bytes = after_first
+            .serialized_current_state_len()
+            .expect("empty-reason state should count");
+        let reason_bytes = (MAX_POLICY_STORE_BYTES as u64)
+            .checked_sub(empty_reason_bytes)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .expect("policy envelope should leave room for the exact-limit reason");
+        let Some(Event {
+            kind: EventKind::PolicyChanged { reason, .. },
+            ..
+        }) = store
+            .records
+            .get_mut(&second_session)
+            .and_then(|record| record.controlled_reality_pending_update.as_mut())
+            .and_then(|pending| pending.expected_policy_changed.as_mut())
+        else {
+            panic!("second recovery record should remain mutable")
+        };
+        *reason = "x".repeat(reason_bytes);
+
+        let decisions = [
+            PendingControlledRealityRecoveryDecision {
+                session_id: first_session,
+                request_id: first_request,
+                durable_response_seen: false,
+            },
+            PendingControlledRealityRecoveryDecision {
+                session_id: second_session,
+                request_id: second_request,
+                durable_response_seen: false,
+            },
+        ];
+        let mut exact_after_first = store.clone();
+        assert!(exact_after_first
+            .reconcile_pending_controlled_reality_at(first_session, first_request, false, 9)
+            .expect("first exact-limit workflow should reconcile"));
+        assert_eq!(
+            exact_after_first
+                .serialized_current_state_len()
+                .expect("exact-limit state should count"),
+            MAX_POLICY_STORE_BYTES as u64
+        );
+        let exact_path = unique_temp_path("exact-reconciliation-snapshot");
+        let mut exact_persisted = store.clone();
+        exact_persisted.path = Some(exact_path.clone());
+        assert!(exact_persisted
+            .reconcile_pending_controlled_reality_at(first_session, first_request, false, 9)
+            .expect("the exact-limit snapshot should persist"));
+        assert_eq!(
+            fs::metadata(&exact_path)
+                .expect("exact-limit snapshot metadata should read")
+                .len(),
+            MAX_POLICY_STORE_BYTES as u64
+        );
+        fs::remove_file(&exact_path).expect("exact-limit snapshot should remove");
+        store
+            .validate_pending_reconciliation_plan_without_mutation(&decisions, 9)
+            .expect("an exact-limit first snapshot should validate");
+        let timestamp_error = store
+            .validate_pending_reconciliation_plan_without_mutation(&decisions, 10)
+            .expect_err("a wider persisted timestamp must be part of planning");
+        assert_eq!(timestamp_error.kind(), io::ErrorKind::InvalidData);
+        assert!(timestamp_error.to_string().contains("exceeds the fixed"));
+
+        let mut oversized = store;
+        let Some(Event {
+            kind: EventKind::PolicyChanged { reason, .. },
+            ..
+        }) = oversized
+            .records
+            .get_mut(&second_session)
+            .and_then(|record| record.controlled_reality_pending_update.as_mut())
+            .and_then(|pending| pending.expected_policy_changed.as_mut())
+        else {
+            panic!("oversized recovery record should remain mutable")
+        };
+        reason.push('x');
+        let error = oversized
+            .validate_pending_reconciliation_plan_without_mutation(&decisions, 9)
+            .expect_err("the first canonical snapshot one byte over must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds the fixed"));
     }
 
     fn store_with(records: Vec<(SessionId, PolicyState, u64)>) -> PolicyStateStore {
@@ -2022,6 +2573,7 @@ mod tests {
                 .collect(),
             fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         }
     }
 
@@ -2630,6 +3182,7 @@ mod tests {
             records: HashMap::from([(session_id, record)]),
             fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         };
         fs::write(
             &path,
@@ -2935,6 +3488,7 @@ mod tests {
             )]),
             fail_closed_for_unknown_sessions: false,
             last_eviction: EvictionStats::default(),
+            startup_persist_required: false,
         };
         let template: serde_json::Value = serde_json::from_slice(
             &template_store

@@ -28,12 +28,12 @@ Eidolon releases use semantic versioning. Within a major release line:
 
 | Artifact | Version field | Current | Reader fail-closed rule |
 | --- | --- | --- | --- |
-| Event log (`events.jsonl`) | `schema_version` per record | `2` | Readers reject any other version with an actionable error (`eidolon-trace` reader enforces; tested). |
+| Event log (`events.jsonl`) | `schema_version` per record | `2` (one 33,554,432-byte active segment, three 33,554,432-byte archives, 134,217,728-byte family, 1,048,576-byte record excluding newline) | Production recovery accepts only schema-v2 events in the bounded family. Canonical archives are `<event-log>.<39 ASCII digits>`; all-digit noncanonical names, a fourth archive, symlinks, non-regular members, over-limit segments/records, invalid complete records, duplicate event IDs, conflicting selected workflow evidence, or membership/content changes before repair fail closed. |
 | Debug log (`debug.jsonl`) | `schema_version` + `run_kind` envelope | `1` (`eidolon_proxy_debug`) | Server-side diagnostic only; no supported reader today. A validating reader is tracked by issue #252. |
-| Policy state (`policy-state.json`) | `schema_version` | `3` (reads `1..=3`; maximum 33,554,432 bytes and 8,192 retained records) | Missing state initializes empty. Existing empty, malformed, truncated, oversized, unsupported-version, duplicate-session, or internally inconsistent pending-workflow state fails startup before migration or listener bind. A staged controlled-reality-to-blocked event accepts its legacy omitted persistence metadata or coherent post-containment metadata; rate-limit and pre-containment retry metadata is rejected for that transition. Writers reject an oversized current-schema snapshot before opening the temp file (`policy_store.rs`). |
+| Policy state (`policy-state.json`) | `schema_version` | `3` (reads `1..=3`; maximum 33,554,432 bytes and 8,192 retained records) | Missing state initializes empty. Existing empty, malformed, truncated, oversized, unsupported-version, duplicate-session, or internally inconsistent pending-workflow state fails startup before migration or listener bind. A staged controlled-reality-to-blocked event accepts its legacy omitted persistence metadata or coherent post-containment metadata; rate-limit and pre-containment retry metadata is rejected for that transition. Writers and ordered startup reconciliation reject an oversized canonical snapshot before opening the temp file (`policy_store.rs`). |
 | Session continuity sidecar (`<policy-state>.continuity.json`) | `schema_version` | `2` (reads `1..=2`) | Unsupported versions, an unverifiable signer, or a live record whose continuity key is unavailable prevent startup (`session_continuity_store.rs`). |
-| Bait exposure sidecar (`<event-log>.exposures.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour TTL) | Missing state rebuilds from the current event log. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, empty-identifier, future-timestamp, duplicate-key, or canonical-rewrite-over-limit state fails production preflight before the writer lease or durable-file mutation. Writers enforce the same byte ceiling before creating the reserved temp file. |
-| Consumed proof sidecar (`<event-log>.consumed-proofs.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour maximum proof/quarantine lifetime) | Missing state rebuilds from the current event log and prior history activates the bounded migration quarantine. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, invalid-digest/identifier/lifetime, duplicate-key, or canonical-rewrite-over-limit state fails production preflight. Writers enforce the same byte ceiling before creating the reserved temp file. |
+| Bait exposure sidecar (`<event-log>.exposures.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour TTL) | Missing state rebuilds in canonical archive order followed by the active event-log segment, including the archive-only post-rename crash window. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, empty-identifier, future-timestamp, duplicate-key, or canonical-rewrite-over-limit state fails production preflight before the writer lease or durable-file mutation. Writers enforce the same byte ceiling before creating the reserved temp file. |
+| Consumed proof sidecar (`<event-log>.consumed-proofs.json`) | `schema_version` | `1` (maximum 4,194,304 bytes, 4,096 records, 24-hour maximum proof/quarantine lifetime) | Missing state rebuilds from the complete ordered event-log family, including archive-only history, and prior history activates the bounded migration quarantine. Existing empty, malformed, oversized, unsupported-version, over-capacity, unknown-field, invalid-digest/identifier/lifetime, duplicate-key, or canonical-rewrite-over-limit state fails production preflight. Writers enforce the same byte ceiling before creating the reserved temp file. |
 | Bait profile config | `schema_version` | `1` | Any other version rejected at load (`main.rs`). |
 | Ingress trust config | `schema_version` | `1` | Any other version rejected at load (`ingress_identity.rs`). |
 | Session signing key ring (`key-ring.json`) | key `version` integers + `active_key_version` | shape v1 (unversioned shape) | The JSON shape is validated strictly (unique u32 versions, active present, 64-hex keys); unknown key *versions* in cookies fail closed to a fresh mint. A shape version field may be added in a future minor release and will follow this policy. |
@@ -50,7 +50,12 @@ File metadata is only an early rejection; the bounded read remains authoritative
 if the file changes. Read acceptance does not bypass the same write bound: if a
 schema migration or startup compaction would expand the current-schema snapshot
 beyond the limit, startup fails before opening the temp file and leaves the
-source snapshot unchanged. A duplicate `session_id` is invalid regardless of
+source snapshot unchanged. When pending workflows require startup persistence,
+production counts the exact current canonical form and each ordered
+per-session replacement delta before opening any writer. Every snapshot that
+reconciliation will persist must fit; an exact-limit snapshot is accepted, and
+the first snapshot one byte over is rejected even when the compact current-
+schema input itself fits. A duplicate `session_id` is invalid regardless of
 record contents, schema 1--3, or input order, so ordering can never select an
 enforcement state. Snapshot-local pending depth/workflow/origin, transition,
 event-association, and response-state invariants are also validated for schema
@@ -124,17 +129,72 @@ byte; file metadata is only an early check, so growth after metadata cannot
 bypass the bound. The 4,096-record and byte ceilings apply jointly. All rows
 validate before TTL pruning or map construction, and duplicate logical keys
 fail even when identical or expired, so file order never chooses correlation or
-replay state. Production validates existing sidecars without mutation before
-the writer lease, including a dry run of the canonical pretty-printed rewrite,
-then repeats the bounded validation during authoritative open. Successful
-rewrites use the fixed reserved `<sidecar>.tmp` path with owner-only
+replay state. Production validates existing sidecars and rejects a symlink or
+non-regular reserved temp without mutation before the writer lease, including
+a dry run of the canonical pretty-printed rewrite, then repeats the bounded
+validation during authoritative open. Successful rewrites use the fixed
+reserved `<sidecar>.tmp` path with owner-only
 `create_new` creation in the same directory, file sync, atomic rename, and
 parent-directory sync. After validating the committed file, authoritative open
 under the single-writer lease removes one regular crash-left temp; a symlink or
 non-regular object at the reserved path fails closed. The fixed name bounds
 crash residue and is part of the deployment recovery-file allowlist.
-Bounding the missing-sidecar event-log reconstruction path is separate #254
-follow-on work and is not implied by these sidecar-file bounds.
+The policy snapshot's reserved replacement path is likewise type-checked
+without mutation during both preparation phases and immediately before a
+persist. A symlink or non-regular object there fails before lease acquisition,
+tail repair, or policy migration.
+During both the pre-lease and authoritative under-lease scans,
+missing-sidecar reconstruction consumes that scan's already-validated event
+stream used for pending-workflow recovery; it does not reopen or buffer the
+family, and it runs only when the corresponding valid committed sidecar is
+absent. Each phase requires reconstructed state to pass the same identifier,
+timestamp, lifetime, capacity, and canonical-write semantics as loaded state;
+proof reconstruction adds any history-triggered migration quarantine before
+validating the exact bytes to be persisted. Production performs a read-only
+event-family, repair-plan, and complete pending-contract preflight
+before taking the durable-state lease, then repeats the authoritative scan and
+contract checks under that lease before policy migration/eviction, event/debug
+writer open, sidecar replacement, or listener startup. A fixed-memory SHA-256
+pass binds repair/open to the scanned ordered membership and bytes. Only the
+active segment may repair one unterminated valid record by appending a newline
+or discard one invalid final fragment. Archives must end on a delimiter and are
+never repaired.
+
+The authoritative scanner reads through fixed-size chunks, admits no more
+than the segment limit plus one sentinel and no more than the record limit plus
+one sentinel, and treats metadata only as an early rejection. It orders the
+three fixed-width archive suffixes numerically/lexicographically before the
+active segment, validates every complete record, and rejects duplicate event
+IDs across segments. It simultaneously reconstructs bounded sidecar state and
+indexes only the response/policy evidence needed by at most 8,192 pending
+policy workflows. Durable appends update that in-memory index; lookup no
+longer rescans the family once per pending session. Ordinary live
+response/policy events are excluded from the selected payload index, resolved
+workflow payloads are removed, and rotation will not prune selected unresolved
+evidence. A missing policy event required for recovery is passed through the
+same bounded record serializer during both validation phases before any
+startup mutation. The same phases simulate the complete ordered append,
+rotation, and resolution plan against the active segment's post-repair length,
+including a checked fixed-width archive-suffix successor for every required
+rotation. An exhausted 39-digit namespace therefore fails before mutation,
+while a recovery with no rotation needs no new suffix. The authoritative
+policy plan also carries its single validated reconciliation timestamp into
+the live writes, so a timestamp-width change cannot invalidate its byte count.
+If a required append would rotate a three-archive family before the oldest
+selected evidence is resolved, startup fails without applying the tail repair
+or opening a writer. An active segment exactly at the byte ceiling stays in
+place until reconciliation completes unless that validated recovery plan must
+append; ordinary traffic rotates it before its next append.
+Bare relative event-log paths resolve the current directory consistently for
+archive selection, parent sync, and pruning, so rotation cannot commit a rename
+and then fail solely because `Path::parent()` is empty.
+The active event-log file name is limited to 215 UTF-8 bytes, leaving exactly
+40 bytes for the dot and 39-digit suffix under the supported Linux 255-byte
+component limit. Every configured durable writer is excluded from the event
+and debug numeric archive namespaces, and both scans compare existing
+family-member identities against the complete writable-target set so a
+differently named hard link cannot become a second writer for retained
+evidence.
 
 ## Compatibility rules
 

@@ -1,7 +1,7 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     fs::{File, OpenOptions},
-    io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -9,9 +9,61 @@ use eidolon_core::{
     ControlledRealityInteraction, Event, EventKind, EventSource, PolicyState, RequestId,
     RoutingDecision, SessionId,
 };
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub type FileEventLogWriter = EventLogWriter<BufWriter<File>>;
+
+/// Maximum size of one active or retained event-log segment.
+pub const LOG_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Number of retained numeric archives in addition to the active segment.
+pub const LOG_ARCHIVES_KEPT: usize = 3;
+
+/// Maximum serialized size of one schema-v2 event, excluding its newline.
+pub const MAX_EVENT_LOG_RECORD_BYTES: usize = 1024 * 1024;
+
+/// Maximum bytes in the complete supported active-plus-archive family.
+pub const MAX_EVENT_LOG_FAMILY_BYTES: u64 = LOG_ROTATE_BYTES * (LOG_ARCHIVES_KEPT as u64 + 1);
+
+/// Decimal digits in every writer-produced event-log archive suffix.
+pub const EVENT_LOG_ARCHIVE_SUFFIX_DIGITS: usize = 39;
+
+/// Maximum UTF-8 bytes in the active file name while reserving the dot and
+/// canonical suffix within the supported Linux 255-byte component ceiling.
+pub const MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES: usize = 255 - (EVENT_LOG_ARCHIVE_SUFFIX_DIGITS + 1);
+
+const EVENT_LOG_READ_CHUNK_BYTES: usize = 8 * 1024;
+
+type RecoveryWorkflow = (SessionId, RequestId);
+type RecoveryEvidence = HashSet<RecoveryWorkflow>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventLogRecoveryTarget {
+    pub session_id: SessionId,
+    pub request_id: RequestId,
+    pub expected_policy_event_id: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventLogRecoveryPlanStep {
+    pub session_id: SessionId,
+    pub request_id: RequestId,
+    /// Exact serialized bytes, including the JSONL newline, that recovery
+    /// must append before this workflow can be resolved.
+    pub recovered_policy_event_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventLogRecoveryStats {
+    pub archive_count: usize,
+    pub segment_count: usize,
+    pub record_count: usize,
+    pub family_bytes: u64,
+    pub active_bytes: u64,
+    pub indexed_durable_response_count: usize,
+    pub indexed_policy_event_count: usize,
+}
 
 fn open_event_log_sink(path: &Path) -> io::Result<BufWriter<File>> {
     open_event_log_sink_with_parent_sync(path, sync_parent_directory)
@@ -63,6 +115,404 @@ pub enum DurableResponseMatch {
     },
 }
 
+#[derive(Debug, Default)]
+struct EventLogRecoveryIndex {
+    durable_responses: HashMap<(SessionId, RequestId), DurableResponseMatch>,
+    durable_events: HashMap<Uuid, Event>,
+    event_ids: HashSet<Uuid>,
+    archive_event_ids: VecDeque<HashSet<Uuid>>,
+    active_event_ids: HashSet<Uuid>,
+    track_all_durable_matches: bool,
+}
+
+impl EventLogRecoveryIndex {
+    fn tracking_all_durable_matches() -> Self {
+        Self {
+            track_all_durable_matches: true,
+            ..Self::default()
+        }
+    }
+
+    fn rotate_active(&mut self) {
+        self.archive_event_ids
+            .push_back(std::mem::take(&mut self.active_event_ids));
+        while self.archive_event_ids.len() > LOG_ARCHIVES_KEPT {
+            if let Some(pruned) = self.archive_event_ids.pop_front() {
+                for event_id in pruned {
+                    self.event_ids.remove(&event_id);
+                    self.durable_events.remove(&event_id);
+                }
+                self.durable_responses.retain(|_, response| {
+                    matches!(
+                        response,
+                        DurableResponseMatch::Unique { event_id, .. }
+                            if self.event_ids.contains(event_id)
+                    )
+                });
+            }
+        }
+    }
+
+    fn add_active_event_ids(&mut self, events: &[&Event]) {
+        for event in events {
+            self.event_ids.insert(event.id);
+            self.active_event_ids.insert(event.id);
+            if !self.track_all_durable_matches {
+                continue;
+            }
+            if let (Some(request_id), Some(response)) =
+                (event.request_id, durable_response_match(event))
+            {
+                self.durable_responses
+                    .insert((event.session_id, request_id), response);
+            }
+            if matches!(&event.kind, EventKind::PolicyChanged { .. }) {
+                self.durable_events.insert(event.id, (*event).clone());
+            }
+        }
+    }
+
+    fn remove_workflow(&mut self, session_id: SessionId, request_id: RequestId) {
+        self.durable_responses.remove(&(session_id, request_id));
+        self.durable_events.retain(|_, event| {
+            event.session_id != session_id || event.request_id != Some(request_id)
+        });
+    }
+
+    fn rotation_would_prune_recovery_evidence(&self) -> bool {
+        self.archive_event_ids.len() >= LOG_ARCHIVES_KEPT
+            && self
+                .archive_event_ids
+                .front()
+                .is_some_and(|oldest_event_ids| {
+                    self.durable_responses.values().any(|response| {
+                        matches!(
+                            response,
+                            DurableResponseMatch::Unique { event_id, .. }
+                                if oldest_event_ids.contains(event_id)
+                        )
+                    }) || self
+                        .durable_events
+                        .keys()
+                        .any(|event_id| oldest_event_ids.contains(event_id))
+                })
+    }
+
+    fn recovery_evidence_locations(
+        &self,
+    ) -> io::Result<(VecDeque<RecoveryEvidence>, RecoveryEvidence)> {
+        let mut archives = (0..self.archive_event_ids.len())
+            .map(|_| HashSet::new())
+            .collect::<VecDeque<_>>();
+        let mut active = HashSet::new();
+
+        for (workflow, response) in &self.durable_responses {
+            let DurableResponseMatch::Unique { event_id, .. } = response else {
+                continue;
+            };
+            insert_recovery_evidence_location(
+                &self.archive_event_ids,
+                &self.active_event_ids,
+                &mut archives,
+                &mut active,
+                *event_id,
+                *workflow,
+            )?;
+        }
+        for (event_id, event) in &self.durable_events {
+            let request_id = event.request_id.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "indexed recovery event did not identify its workflow",
+                )
+            })?;
+            insert_recovery_evidence_location(
+                &self.archive_event_ids,
+                &self.active_event_ids,
+                &mut archives,
+                &mut active,
+                *event_id,
+                (event.session_id, request_id),
+            )?;
+        }
+
+        Ok((archives, active))
+    }
+}
+
+fn insert_recovery_evidence_location(
+    archive_event_ids: &VecDeque<HashSet<Uuid>>,
+    active_event_ids: &HashSet<Uuid>,
+    archives: &mut VecDeque<RecoveryEvidence>,
+    active: &mut RecoveryEvidence,
+    event_id: Uuid,
+    workflow: RecoveryWorkflow,
+) -> io::Result<()> {
+    if active_event_ids.contains(&event_id) {
+        active.insert(workflow);
+        return Ok(());
+    }
+    if let Some(index) = archive_event_ids
+        .iter()
+        .position(|segment_event_ids| segment_event_ids.contains(&event_id))
+    {
+        archives
+            .get_mut(index)
+            .expect("recovery evidence archive indexes must remain aligned")
+            .insert(workflow);
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "indexed workflow evidence was absent from the scanned event-log family",
+    ))
+}
+
+pub struct EventLogRecoveryScan {
+    path: PathBuf,
+    index: EventLogRecoveryIndex,
+    family_snapshot: Vec<EventLogSegmentSnapshot>,
+    active_snapshot: EventLogActiveSnapshot,
+    pub stats: EventLogRecoveryStats,
+    pub active_tail_repair: JsonlTailRepairOutcome,
+    pub active_torn_tail_line: Option<usize>,
+}
+
+impl EventLogRecoveryScan {
+    /// Ordered immutable paths whose identities were validated by this scan.
+    /// Production uses these paths to repeat durable-target isolation before
+    /// the scan can be consumed by authoritative writer opening.
+    pub fn family_segment_paths(&self) -> impl Iterator<Item = &Path> {
+        self.family_snapshot
+            .iter()
+            .map(|segment| segment.path.as_path())
+    }
+
+    pub fn indexed_durable_response(
+        &self,
+        session_id: SessionId,
+        request_id: RequestId,
+    ) -> DurableResponseMatch {
+        self.index
+            .durable_responses
+            .get(&(session_id, request_id))
+            .cloned()
+            .unwrap_or(DurableResponseMatch::Missing)
+    }
+
+    pub fn indexed_durable_event_by_id(
+        &self,
+        session_id: SessionId,
+        request_id: RequestId,
+        event_id: Uuid,
+    ) -> io::Result<Option<Event>> {
+        let Some(event) = self.index.durable_events.get(&event_id) else {
+            return Ok(None);
+        };
+        if event.session_id != session_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable event id matched the wrong session",
+            ));
+        }
+        if event.request_id != Some(request_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable event id matched the wrong request",
+            ));
+        }
+        Ok(Some(event.clone()))
+    }
+
+    /// Validate the exact ordered startup recovery writes against the
+    /// post-tail-repair active length and the same evidence-retention rule as
+    /// the live writer. This is deliberately index-only: pending count cannot
+    /// amplify event-family scans.
+    pub fn validate_reconciliation_plan(
+        &self,
+        steps: &[EventLogRecoveryPlanStep],
+    ) -> io::Result<()> {
+        if steps.len() > crate::policy_store::MAX_POLICY_SESSIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log recovery plan exceeds the policy session limit",
+            ));
+        }
+        let mut seen = HashSet::with_capacity(steps.len());
+        let mut current_len = match self.active_tail_repair {
+            JsonlTailRepairOutcome::NotNeeded => self.stats.active_bytes,
+            JsonlTailRepairOutcome::AppendedNewline { previous_len } => previous_len
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("event log repair length overflow"))?,
+            JsonlTailRepairOutcome::Truncated { repaired_len, .. } => repaired_len,
+        };
+        if current_len > LOG_ROTATE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log recovery plan starts beyond the fixed segment limit",
+            ));
+        }
+        let (mut archives, mut active) = self.index.recovery_evidence_locations()?;
+        let mut latest_archive_suffix = self
+            .family_snapshot
+            .iter()
+            .filter(|segment| segment.kind == EventLogSegmentKind::Archive)
+            .filter_map(|segment| archive_suffix(&self.path, &segment.path))
+            .max()
+            .map(str::to_string);
+
+        for step in steps {
+            let workflow = (step.session_id, step.request_id);
+            if !seen.insert(workflow) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "event log recovery plan contains a duplicate workflow",
+                ));
+            }
+            if let Some(incoming) = step.recovered_policy_event_bytes {
+                if incoming > LOG_ROTATE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "event log recovery write exceeds the fixed segment limit",
+                    ));
+                }
+                let next_len = current_len
+                    .checked_add(incoming)
+                    .ok_or_else(|| io::Error::other("event log recovery length overflow"))?;
+                if next_len > LOG_ROTATE_BYTES {
+                    if archives.len() >= LOG_ARCHIVES_KEPT {
+                        if archives
+                            .front()
+                            .is_some_and(|evidence| !evidence.is_empty())
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "event log recovery rotation would prune unresolved workflow evidence",
+                            ));
+                        }
+                        archives.pop_front();
+                    }
+                    // Runtime stamps are u128 nanosecond counts, while the
+                    // canonical 39-digit namespace extends beyond u128::MAX.
+                    // Starting at the largest possible stamp upper-bounds any
+                    // later clock sample without consuming the remaining
+                    // high suffixes needed by this bounded plan.
+                    latest_archive_suffix = Some(next_archive_suffix_after(
+                        latest_archive_suffix.as_deref(),
+                        u128::MAX,
+                    )?);
+                    archives.push_back(std::mem::take(&mut active));
+                    current_len = incoming;
+                } else {
+                    current_len = next_len;
+                }
+                active.insert(workflow);
+            }
+
+            for evidence in &mut archives {
+                evidence.remove(&workflow);
+            }
+            active.remove(&workflow);
+        }
+        Ok(())
+    }
+}
+
+fn durable_response_match(event: &Event) -> Option<DurableResponseMatch> {
+    let EventKind::ResponseServed {
+        status,
+        routing_decision,
+        controlled_reality,
+    } = &event.kind
+    else {
+        return None;
+    };
+    Some(DurableResponseMatch::Unique {
+        event_id: event.id,
+        policy_state: event.policy_state,
+        status: *status,
+        routing_decision: *routing_decision,
+        controlled_reality: controlled_reality.clone(),
+    })
+}
+
+struct BoundedEventSerialization {
+    bytes: Vec<u8>,
+}
+
+impl BoundedEventSerialization {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(EVENT_LOG_READ_CHUNK_BYTES),
+        }
+    }
+
+    fn finish(self) -> io::Result<Vec<u8>> {
+        if self.bytes.len() > MAX_EVENT_LOG_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serialized event exceeds the fixed record limit",
+            ));
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl Write for BoundedEventSerialization {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let allocation_bound = MAX_EVENT_LOG_RECORD_BYTES + 1;
+        let remaining = allocation_bound.saturating_sub(self.bytes.len());
+        let retained = buffer.len().min(remaining);
+        self.bytes.reserve_exact(retained);
+        self.bytes.extend_from_slice(&buffer[..retained]);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_event_bounded(event: &Event) -> io::Result<Vec<u8>> {
+    let mut sink = BoundedEventSerialization::new();
+    serde_json::to_writer(&mut sink, event).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "failed to serialize event as JSON",
+        )
+    })?;
+    sink.finish()
+}
+
+/// Validate one event through the exact bounded serializer used by appends,
+/// without opening or mutating the event-log family.
+pub fn validate_event_log_record_without_mutation(event: &Event) -> io::Result<()> {
+    event_log_record_append_bytes_without_mutation(event).map(drop)
+}
+
+/// Return the exact bytes one validated JSONL append will consume, without
+/// opening or mutating the event-log family.
+pub fn event_log_record_append_bytes_without_mutation(event: &Event) -> io::Result<u64> {
+    let serialized = serialize_event_bounded(event)?;
+    validate_event_write_schema(event)
+        .and_then(|()| {
+            u64::try_from(serialized.len())
+                .map_err(|_| io::Error::other("serialized event length did not fit in u64"))
+        })?
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("serialized event append length overflow"))
+}
+
+fn validate_event_write_schema(event: &Event) -> io::Result<()> {
+    if event.schema_version != eidolon_core::EVENT_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "event writer received an unsupported schema version",
+        ));
+    }
+    Ok(())
+}
+
 pub struct EventLogWriter<W> {
     sink: W,
     reopen: Option<Box<dyn Fn() -> io::Result<W> + Send + Sync>>,
@@ -70,24 +520,43 @@ pub struct EventLogWriter<W> {
     current_len: u64,
     startup_tail_repair: JsonlTailRepairOutcome,
     unresolved_durable_responses: HashSet<(SessionId, RequestId)>,
+    recovery_index: EventLogRecoveryIndex,
+    unavailable_after_io_failure: bool,
 }
 
 impl FileEventLogWriter {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let startup_tail_repair = repair_event_log_tail(path.as_ref())?;
-        report_jsonl_tail_repair("event", path.as_ref(), startup_tail_repair);
-
-        if let Some(archive) = rotate_log_if_oversized(path.as_ref())? {
-            eprintln!(
-                "eidolon log rotation: archived oversized event log to {}",
-                archive.display()
-            );
-        }
-
-        let current_len = std::fs::metadata(path.as_ref())
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
         let path = path.as_ref().to_path_buf();
+        let recovery = scan_event_log_family_all(&path, |_| Ok(()))?;
+        Self::open_with_recovery(path, recovery)
+    }
+
+    pub fn open_with_recovery(
+        path: impl AsRef<Path>,
+        recovery: EventLogRecoveryScan,
+    ) -> io::Result<Self> {
+        let path = path.as_ref();
+        validate_event_log_archive_path_capacity(path)?;
+        if path != recovery.path {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "event log recovery scan path does not match writer path",
+            ));
+        }
+        verify_event_log_family_snapshot(path, &recovery.family_snapshot)?;
+        let startup_tail_repair = apply_event_log_tail_repair(
+            path,
+            recovery.active_snapshot,
+            recovery.active_tail_repair,
+        )?;
+        report_jsonl_tail_repair("event", path, startup_tail_repair);
+
+        let current_len = match std::fs::metadata(path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        let path = path.to_path_buf();
         let reopen_path = path.clone();
         let sink = open_event_log_sink(&path)?;
 
@@ -98,12 +567,21 @@ impl FileEventLogWriter {
             current_len,
             startup_tail_repair,
             unresolved_durable_responses: HashSet::new(),
+            recovery_index: recovery.index,
+            unavailable_after_io_failure: false,
         })
     }
 
     pub fn sync_all(&mut self) -> io::Result<()> {
-        self.sink.flush()?;
-        self.sink.get_ref().sync_all()
+        self.ensure_available()?;
+        let result = self
+            .sink
+            .flush()
+            .and_then(|()| self.sink.get_ref().sync_all());
+        if result.is_err() {
+            self.unavailable_after_io_failure = true;
+        }
+        result
     }
 
     /// Check the durable log family while the caller holds the writer lock.
@@ -116,75 +594,16 @@ impl FileEventLogWriter {
         request_id: RequestId,
     ) -> io::Result<DurableResponseMatch> {
         self.sync_all()?;
-        let path = self.path.as_deref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "file event log has no configured path",
-            )
-        })?;
-
-        let mut matched = None;
-        for segment in event_log_family_paths(path)? {
-            let reader = BufReader::new(File::open(&segment)?);
-            for (line_index, line) in reader.lines().enumerate() {
-                let line = line?;
-                let event: Event = serde_json::from_str(&line).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "invalid event JSON at {}:{}: {error}",
-                            segment.display(),
-                            line_index + 1
-                        ),
-                    )
-                })?;
-                if event.session_id != session_id || event.request_id != Some(request_id) {
-                    continue;
-                }
-                let EventKind::ResponseServed {
-                    status,
-                    routing_decision,
-                    controlled_reality,
-                } = event.kind
-                else {
-                    continue;
-                };
-                if event.source != EventSource::Proxy {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "durable response event had a non-proxy source",
-                    ));
-                }
-                if matched.is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "multiple durable response events matched one request",
-                    ));
-                }
-                matched = Some((
-                    event.id,
-                    event.policy_state,
-                    status,
-                    routing_decision,
-                    controlled_reality,
-                ));
-            }
+        let result = self
+            .recovery_index
+            .durable_responses
+            .get(&(session_id, request_id))
+            .cloned()
+            .unwrap_or(DurableResponseMatch::Missing);
+        if !matches!(result, DurableResponseMatch::Missing) {
+            self.unresolved_durable_responses
+                .insert((session_id, request_id));
         }
-
-        let result = match matched {
-            Some((event_id, policy_state, status, routing_decision, controlled_reality)) => {
-                self.unresolved_durable_responses
-                    .insert((session_id, request_id));
-                DurableResponseMatch::Unique {
-                    event_id,
-                    policy_state,
-                    status,
-                    routing_decision,
-                    controlled_reality,
-                }
-            }
-            None => DurableResponseMatch::Missing,
-        };
         Ok(result)
     }
 
@@ -209,6 +628,12 @@ impl FileEventLogWriter {
                 "durable workflow event must be a response_served event",
             ));
         }
+        if event.source != EventSource::Proxy {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable response event must have a proxy source",
+            ));
+        }
         if let Some(policy_changed) = policy_changed {
             if policy_changed.session_id != event.session_id
                 || policy_changed.request_id != Some(request_id)
@@ -227,16 +652,49 @@ impl FileEventLogWriter {
                 "event log has an unresolved durable workflow response",
             ));
         }
+        if self
+            .recovery_index
+            .durable_responses
+            .contains_key(&(event.session_id, request_id))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "multiple durable response events matched one request",
+            ));
+        }
+        if !self.recovery_index.track_all_durable_matches
+            && self.recovery_index.durable_responses.len()
+                >= crate::policy_store::MAX_POLICY_SESSIONS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable response index exceeds the policy session limit",
+            ));
+        }
 
-        let result = (|| {
-            let mut events = vec![event];
-            events.extend(policy_changed);
-            self.write_events_unchecked(&events)?;
-            self.sync_all()
-        })();
+        let mut events = vec![event];
+        events.extend(policy_changed);
+        let write_result = self.write_events_unchecked(&events);
+        if let Err(error) = write_result {
+            if self.unavailable_after_io_failure {
+                self.unresolved_durable_responses
+                    .insert((event.session_id, request_id));
+            }
+            return Err(error);
+        }
+        self.recovery_index.durable_responses.insert(
+            (event.session_id, request_id),
+            durable_response_match(event)
+                .expect("validated response event must produce a durable match"),
+        );
+        if let Some(policy_changed) = policy_changed {
+            self.recovery_index
+                .durable_events
+                .insert(policy_changed.id, policy_changed.clone());
+        }
         self.unresolved_durable_responses
             .insert((event.session_id, request_id));
-        result
+        self.sync_all()
     }
 
     pub fn durable_event_by_id(
@@ -246,47 +704,16 @@ impl FileEventLogWriter {
         event_id: Uuid,
     ) -> io::Result<Option<Event>> {
         self.sync_all()?;
-        let path = self.path.as_deref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "file event log has no configured path",
-            )
-        })?;
-
-        let mut matched = None;
-        for segment in event_log_family_paths(path)? {
-            let reader = BufReader::new(File::open(&segment)?);
-            for (line_index, line) in reader.lines().enumerate() {
-                let line = line?;
-                let event: Event = serde_json::from_str(&line).map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "invalid event JSON at {}:{}: {error}",
-                            segment.display(),
-                            line_index + 1
-                        ),
-                    )
-                })?;
-                if event.id != event_id {
-                    continue;
-                }
-                if event.session_id != session_id || event.request_id != Some(request_id) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "durable event id matched the wrong workflow",
-                    ));
-                }
-                if matched.is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "durable workflow event id appeared more than once",
-                    ));
-                }
-                matched = Some(event);
-            }
+        let Some(event) = self.recovery_index.durable_events.get(&event_id) else {
+            return Ok(None);
+        };
+        if event.session_id != session_id || event.request_id != Some(request_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable event id matched the wrong workflow",
+            ));
         }
-        Ok(matched)
+        Ok(Some(event.clone()))
     }
 
     pub fn write_recovered_policy_event(&mut self, event: &Event) -> io::Result<()> {
@@ -308,6 +735,9 @@ impl FileEventLogWriter {
             ));
         }
         self.write_event_unchecked(event)?;
+        self.recovery_index
+            .durable_events
+            .insert(event.id, event.clone());
         self.sync_all()
     }
 
@@ -319,10 +749,13 @@ impl FileEventLogWriter {
     pub fn resolve_durable_response(&mut self, session_id: SessionId, request_id: RequestId) {
         self.unresolved_durable_responses
             .remove(&(session_id, request_id));
+        self.recovery_index.remove_workflow(session_id, request_id);
     }
 
     pub fn resolve_all_durable_responses(&mut self) {
         self.unresolved_durable_responses.clear();
+        self.recovery_index.durable_responses.clear();
+        self.recovery_index.durable_events.clear();
     }
 
     #[cfg(test)]
@@ -340,6 +773,8 @@ impl<W: Write> EventLogWriter<W> {
             current_len: 0,
             startup_tail_repair: JsonlTailRepairOutcome::NotNeeded,
             unresolved_durable_responses: HashSet::new(),
+            recovery_index: EventLogRecoveryIndex::tracking_all_durable_matches(),
+            unavailable_after_io_failure: false,
         }
     }
 
@@ -362,38 +797,109 @@ impl<W: Write> EventLogWriter<W> {
     }
 
     fn write_events_unchecked(&mut self, events: &[&Event]) -> io::Result<()> {
+        self.ensure_available()?;
         let serialized = events
             .iter()
-            .map(|event| {
-                serde_json::to_vec(event).map_err(|err| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("failed to serialize event as JSON: {err}"),
-                    )
-                })
-            })
+            .map(|event| serialize_event_bounded(event))
             .collect::<io::Result<Vec<_>>>()?;
+        let mut batch_ids = HashSet::with_capacity(events.len());
+        let mut batch_responses = HashSet::with_capacity(events.len());
+        for event in events {
+            validate_event_write_schema(event)?;
+            if self.recovery_index.event_ids.contains(&event.id) || !batch_ids.insert(event.id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "event log contains a duplicate event id",
+                ));
+            }
+            if let (Some(request_id), Some(_)) = (event.request_id, durable_response_match(event)) {
+                if event.source != EventSource::Proxy {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "durable response event had a non-proxy source",
+                    ));
+                }
+                let key = (event.session_id, request_id);
+                if self.recovery_index.durable_responses.contains_key(&key)
+                    || !batch_responses.insert(key)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "multiple durable response events matched one request",
+                    ));
+                }
+            }
+        }
         let incoming = serialized
             .iter()
             .try_fold(0_u64, |total, event| {
                 total.checked_add(event.len() as u64 + 1)
             })
             .ok_or_else(|| io::Error::other("event batch length overflow"))?;
-
-        self.rotate_if_needed(incoming)?;
-        for event in serialized {
-            self.sink.write_all(&event)?;
-            self.sink.write_all(b"\n")?;
+        if incoming > LOG_ROTATE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "serialized event batch exceeds the fixed segment limit",
+            ));
         }
-        self.current_len += incoming;
-        self.sink.flush()
+        if self.path.is_some()
+            && self
+                .current_len
+                .checked_add(incoming)
+                .is_none_or(|next| next > LOG_ROTATE_BYTES)
+            && self.recovery_index.rotation_would_prune_recovery_evidence()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "event log rotation would prune unresolved workflow evidence",
+            ));
+        }
+
+        if let Err(error) = self.rotate_if_needed(incoming) {
+            self.unavailable_after_io_failure = true;
+            return Err(error);
+        }
+        for event in serialized {
+            if let Err(error) = self
+                .sink
+                .write_all(&event)
+                .and_then(|()| self.sink.write_all(b"\n"))
+            {
+                self.unavailable_after_io_failure = true;
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.sink.flush() {
+            self.unavailable_after_io_failure = true;
+            return Err(error);
+        }
+        let Some(current_len) = self.current_len.checked_add(incoming) else {
+            self.unavailable_after_io_failure = true;
+            return Err(io::Error::other("event log length overflow"));
+        };
+        self.current_len = current_len;
+        self.recovery_index.add_active_event_ids(events);
+        Ok(())
+    }
+
+    fn ensure_available(&self) -> io::Result<()> {
+        if self.unavailable_after_io_failure {
+            return Err(io::Error::other(
+                "event log writer is unavailable after an earlier I/O failure",
+            ));
+        }
+        Ok(())
     }
 
     fn rotate_if_needed(&mut self, incoming: u64) -> io::Result<()> {
         let (Some(path), Some(reopen)) = (self.path.clone(), self.reopen.as_ref()) else {
             return Ok(());
         };
-        if self.current_len + incoming <= LOG_ROTATE_BYTES {
+        if self
+            .current_len
+            .checked_add(incoming)
+            .is_some_and(|next| next <= LOG_ROTATE_BYTES)
+        {
             return Ok(());
         }
 
@@ -406,54 +912,651 @@ impl<W: Write> EventLogWriter<W> {
 
         self.sink = reopen()?;
         self.current_len = 0;
+        self.recovery_index.rotate_active();
         Ok(())
     }
 }
 
-/// Line source for startup reconstruction of a JSONL log.
-///
-/// The whole file is buffered once (reconstruction reads it fully anyway),
-/// which lets a crash-torn final line be distinguished from corruption
-/// elsewhere: only the last non-empty line of a file without a trailing
-/// newline may be a torn tail.
-pub struct JsonlReconstructionSource {
-    pub lines: Vec<String>,
-    pub last_non_empty_index: Option<usize>,
-    pub ends_with_newline: bool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventLogSegmentKind {
+    Archive,
+    Active,
 }
 
-impl JsonlReconstructionSource {
-    /// Whether the given zero-based line index may be a crash-torn tail
-    /// rather than corruption: the final non-empty line of a file that does
-    /// not end with a newline.
-    pub fn is_torn_tail(&self, index: usize) -> bool {
-        Some(index) == self.last_non_empty_index && !self.ends_with_newline
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventLogActiveSnapshot {
+    Missing,
+    Present { bytes: u64 },
+}
+
+#[derive(Debug)]
+struct EventLogSegment {
+    path: PathBuf,
+    kind: EventLogSegmentKind,
+    advertised_len: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EventLogSegmentSnapshot {
+    path: PathBuf,
+    kind: EventLogSegmentKind,
+    bytes: u64,
+    sha256: [u8; 32],
+}
+
+struct EventLogSegmentScan {
+    event_ids: HashSet<Uuid>,
+    tail_repair: JsonlTailRepairOutcome,
+    torn_tail_line: Option<usize>,
+    bytes: u64,
+    records: usize,
+    sha256: [u8; 32],
+}
+
+enum RecoverySelection {
+    All,
+    Targets {
+        workflows: HashSet<(SessionId, RequestId)>,
+        policy_events: HashMap<Uuid, (SessionId, RequestId)>,
+    },
+}
+
+impl RecoverySelection {
+    fn targets(targets: &[EventLogRecoveryTarget]) -> io::Result<Self> {
+        if targets.len() > crate::policy_store::MAX_POLICY_SESSIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log recovery target count exceeds the policy session limit",
+            ));
+        }
+        let mut workflows = HashSet::with_capacity(targets.len());
+        let mut policy_events = HashMap::with_capacity(targets.len());
+        for target in targets {
+            if !workflows.insert((target.session_id, target.request_id)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "event log recovery contains a duplicate workflow target",
+                ));
+            }
+            if let Some(event_id) = target.expected_policy_event_id {
+                if policy_events
+                    .insert(event_id, (target.session_id, target.request_id))
+                    .is_some()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "event log recovery contains a duplicate policy event target",
+                    ));
+                }
+            }
+        }
+        Ok(Self::Targets {
+            workflows,
+            policy_events,
+        })
+    }
+
+    fn tracks_workflow(&self, session_id: SessionId, request_id: RequestId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Targets { workflows, .. } => workflows.contains(&(session_id, request_id)),
+        }
+    }
+
+    fn tracked_policy_workflow(&self, event: &Event) -> Option<(SessionId, RequestId)> {
+        match self {
+            Self::All => matches!(event.kind, EventKind::PolicyChanged { .. })
+                .then(|| {
+                    event
+                        .request_id
+                        .map(|request_id| (event.session_id, request_id))
+                })
+                .flatten(),
+            Self::Targets { policy_events, .. } => policy_events.get(&event.id).copied(),
+        }
     }
 }
 
-pub fn read_jsonl_reconstruction(reader: impl BufRead) -> io::Result<JsonlReconstructionSource> {
-    let mut text = String::new();
-    let mut reader = reader;
-    reader.read_to_string(&mut text)?;
+pub fn validate_event_log_family_without_mutation(
+    path: &Path,
+) -> io::Result<EventLogRecoveryStats> {
+    scan_event_log_family(path, &[], |_| Ok(())).map(|scan| scan.stats)
+}
 
-    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-    let last_non_empty_index = lines.iter().rposition(|line| !line.trim().is_empty());
+pub fn scan_event_log_family(
+    path: &Path,
+    targets: &[EventLogRecoveryTarget],
+    on_event: impl FnMut(&Event) -> io::Result<()>,
+) -> io::Result<EventLogRecoveryScan> {
+    scan_event_log_family_with_selection(path, RecoverySelection::targets(targets)?, on_event)
+}
 
-    Ok(JsonlReconstructionSource {
-        ends_with_newline: text.ends_with('\n'),
-        lines,
-        last_non_empty_index,
+fn scan_event_log_family_all(
+    path: &Path,
+    on_event: impl FnMut(&Event) -> io::Result<()>,
+) -> io::Result<EventLogRecoveryScan> {
+    scan_event_log_family_with_selection(path, RecoverySelection::All, on_event)
+}
+
+fn scan_event_log_family_with_selection(
+    path: &Path,
+    selection: RecoverySelection,
+    mut on_event: impl FnMut(&Event) -> io::Result<()>,
+) -> io::Result<EventLogRecoveryScan> {
+    let segments = event_log_family_inventory(path)?;
+    let mut active_snapshot = EventLogActiveSnapshot::Missing;
+    let mut family_snapshot = Vec::with_capacity(segments.len());
+    let mut index = if matches!(&selection, RecoverySelection::All) {
+        EventLogRecoveryIndex::tracking_all_durable_matches()
+    } else {
+        EventLogRecoveryIndex::default()
+    };
+    let mut stats = EventLogRecoveryStats {
+        archive_count: segments
+            .iter()
+            .filter(|segment| segment.kind == EventLogSegmentKind::Archive)
+            .count(),
+        segment_count: segments.len(),
+        ..EventLogRecoveryStats::default()
+    };
+    let mut active_tail_repair = JsonlTailRepairOutcome::NotNeeded;
+    let mut active_torn_tail_line = None;
+
+    for segment in segments {
+        let EventLogSegmentScan {
+            event_ids,
+            tail_repair,
+            torn_tail_line,
+            bytes,
+            records,
+            sha256,
+        } = scan_event_log_segment(&segment, &selection, &mut index, &mut on_event)?;
+        stats.family_bytes = stats
+            .family_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("event log family byte count overflow"))?;
+        if stats.family_bytes > MAX_EVENT_LOG_FAMILY_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log family exceeds the fixed byte limit",
+            ));
+        }
+        stats.record_count = stats
+            .record_count
+            .checked_add(records)
+            .ok_or_else(|| io::Error::other("event log record count overflow"))?;
+        family_snapshot.push(EventLogSegmentSnapshot {
+            path: segment.path.clone(),
+            kind: segment.kind,
+            bytes,
+            sha256,
+        });
+        match segment.kind {
+            EventLogSegmentKind::Archive => index.archive_event_ids.push_back(event_ids),
+            EventLogSegmentKind::Active => {
+                index.active_event_ids = event_ids;
+                active_snapshot = EventLogActiveSnapshot::Present { bytes };
+                stats.active_bytes = bytes;
+                active_tail_repair = tail_repair;
+                active_torn_tail_line = torn_tail_line;
+            }
+        }
+    }
+
+    stats.indexed_durable_response_count = index.durable_responses.len();
+    stats.indexed_policy_event_count = index.durable_events.len();
+
+    Ok(EventLogRecoveryScan {
+        path: path.to_path_buf(),
+        index,
+        family_snapshot,
+        active_snapshot,
+        stats,
+        active_tail_repair,
+        active_torn_tail_line,
     })
 }
 
-/// Disk budget for the append-only JSONL logs (event and debug): the active
-/// segment rotates once it reaches this size.
-pub const LOG_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+fn event_log_family_inventory(path: &Path) -> io::Result<Vec<EventLogSegment>> {
+    validate_event_log_archive_path_capacity(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "event log path has no UTF-8 file name",
+            )
+        })?;
+    let archive_prefix = format!("{base}.");
+    let mut archives = Vec::new();
+    match std::fs::read_dir(parent) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let Some(suffix) = name.strip_prefix(&archive_prefix) else {
+                    continue;
+                };
+                if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                    continue;
+                }
+                if suffix.len() != EVENT_LOG_ARCHIVE_SUFFIX_DIGITS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "event log family contains a noncanonical numeric archive name",
+                    ));
+                }
+                if archives.len() >= LOG_ARCHIVES_KEPT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "event log family exceeds the fixed archive count",
+                    ));
+                }
+                let candidate = entry.path();
+                let metadata = std::fs::symlink_metadata(&candidate)?;
+                validate_event_log_segment_metadata(&candidate, &metadata)?;
+                archives.push((suffix.to_string(), candidate, metadata.len()));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    archives.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
 
-/// Number of rotated archives retained per log in addition to the active
-/// segment. Older archives are pruned on rotation, bounding total disk use
-/// to roughly `LOG_ROTATE_BYTES * (LOG_ARCHIVES_KEPT + 1)` per log.
-pub const LOG_ARCHIVES_KEPT: usize = 3;
+    let mut segments = archives
+        .into_iter()
+        .map(|(_, path, advertised_len)| EventLogSegment {
+            path,
+            kind: EventLogSegmentKind::Archive,
+            advertised_len,
+        })
+        .collect::<Vec<_>>();
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            validate_event_log_segment_metadata(path, &metadata)?;
+            segments.push(EventLogSegment {
+                path: path.to_path_buf(),
+                kind: EventLogSegmentKind::Active,
+                advertised_len: metadata.len(),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(segments)
+}
+
+fn validate_event_log_segment_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> io::Result<()> {
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "event log family member `{}` is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.len() > LOG_ROTATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "event log segment `{}` exceeds the fixed {} byte limit",
+                path.display(),
+                LOG_ROTATE_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn scan_event_log_segment(
+    segment: &EventLogSegment,
+    selection: &RecoverySelection,
+    index: &mut EventLogRecoveryIndex,
+    on_event: &mut impl FnMut(&Event) -> io::Result<()>,
+) -> io::Result<EventLogSegmentScan> {
+    if segment.advertised_len > LOG_ROTATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "event log segment exceeds the fixed byte limit",
+        ));
+    }
+    let file = File::open(&segment.path)?;
+    let opened_metadata = file.metadata()?;
+    validate_event_log_segment_metadata(&segment.path, &opened_metadata)?;
+    scan_event_log_reader(file, segment, selection, index, on_event)
+}
+
+fn scan_event_log_reader(
+    mut reader: impl Read,
+    segment: &EventLogSegment,
+    selection: &RecoverySelection,
+    index: &mut EventLogRecoveryIndex,
+    on_event: &mut impl FnMut(&Event) -> io::Result<()>,
+) -> io::Result<EventLogSegmentScan> {
+    if segment.advertised_len > LOG_ROTATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "event log segment exceeds the fixed byte limit",
+        ));
+    }
+    let mut chunk = [0_u8; EVENT_LOG_READ_CHUNK_BYTES];
+    let mut record = Vec::with_capacity(EVENT_LOG_READ_CHUNK_BYTES);
+    let mut total_bytes = 0_u64;
+    let mut consumed_bytes = 0_u64;
+    let mut record_start = 0_u64;
+    let mut line_number = 1_usize;
+    let mut record_count = 0_usize;
+    let mut segment_event_ids = HashSet::new();
+    let mut sha256 = Sha256::new();
+
+    loop {
+        let remaining = (LOG_ROTATE_BYTES + 1).saturating_sub(total_bytes);
+        if remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log segment exceeds the fixed byte limit",
+            ));
+        }
+        let requested = usize::try_from(remaining)
+            .unwrap_or(EVENT_LOG_READ_CHUNK_BYTES)
+            .min(EVENT_LOG_READ_CHUNK_BYTES);
+        let read = loop {
+            match reader.read(&mut chunk[..requested]) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        if read > requested {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log reader returned an invalid byte count",
+            ));
+        }
+        if read == 0 {
+            break;
+        }
+        total_bytes = total_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("event log segment byte count overflow"))?;
+        if total_bytes > LOG_ROTATE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log segment exceeds the fixed byte limit",
+            ));
+        }
+        sha256.update(&chunk[..read]);
+
+        for byte in &chunk[..read] {
+            consumed_bytes += 1;
+            if *byte == b'\n' {
+                if !record.iter().all(u8::is_ascii_whitespace) {
+                    let event = deserialize_event_record(&record, &segment.path, line_number)?;
+                    process_recovery_event(
+                        event,
+                        selection,
+                        index,
+                        &mut segment_event_ids,
+                        on_event,
+                    )?;
+                    record_count += 1;
+                }
+                record.clear();
+                line_number += 1;
+                record_start = consumed_bytes;
+                continue;
+            }
+            if record.len() >= MAX_EVENT_LOG_RECORD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "event log record at `{}` line {} exceeds the fixed {} byte limit",
+                        segment.path.display(),
+                        line_number,
+                        MAX_EVENT_LOG_RECORD_BYTES
+                    ),
+                ));
+            }
+            record.push(*byte);
+        }
+    }
+
+    let mut torn_tail_line = None;
+    let tail_repair = if record.is_empty() {
+        JsonlTailRepairOutcome::NotNeeded
+    } else if record.iter().all(u8::is_ascii_whitespace) {
+        if segment.kind == EventLogSegmentKind::Archive {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log archive has an unterminated final record",
+            ));
+        }
+        if total_bytes == LOG_ROTATE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log active tail has no room for its newline repair",
+            ));
+        }
+        JsonlTailRepairOutcome::AppendedNewline {
+            previous_len: total_bytes,
+        }
+    } else {
+        match serde_json::from_slice::<Event>(&record) {
+            Ok(event) => {
+                validate_event_schema(&event, &segment.path, line_number)?;
+                if segment.kind == EventLogSegmentKind::Archive {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "event log archive has an unterminated final record",
+                    ));
+                }
+                if total_bytes == LOG_ROTATE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "event log active tail has no room for its newline repair",
+                    ));
+                }
+                process_recovery_event(event, selection, index, &mut segment_event_ids, on_event)?;
+                record_count += 1;
+                JsonlTailRepairOutcome::AppendedNewline {
+                    previous_len: total_bytes,
+                }
+            }
+            Err(_) if segment.kind == EventLogSegmentKind::Active => {
+                torn_tail_line = Some(line_number);
+                JsonlTailRepairOutcome::Truncated {
+                    original_len: total_bytes,
+                    repaired_len: record_start,
+                }
+            }
+            Err(error) => return Err(invalid_event_json_error(&segment.path, line_number, &error)),
+        }
+    };
+
+    Ok(EventLogSegmentScan {
+        event_ids: segment_event_ids,
+        tail_repair,
+        torn_tail_line,
+        bytes: total_bytes,
+        records: record_count,
+        sha256: sha256.finalize().into(),
+    })
+}
+
+fn verify_event_log_family_snapshot(
+    path: &Path,
+    expected: &[EventLogSegmentSnapshot],
+) -> io::Result<()> {
+    let current = event_log_family_inventory(path)?;
+    if current.len() != expected.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "event log family membership changed after authoritative recovery scan",
+        ));
+    }
+
+    for (segment, expected) in current.iter().zip(expected) {
+        if segment.path != expected.path || segment.kind != expected.kind {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log family ordering changed after authoritative recovery scan",
+            ));
+        }
+        let actual = fingerprint_event_log_segment(segment)?;
+        if actual.bytes != expected.bytes || actual.sha256 != expected.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log family contents changed after authoritative recovery scan",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn fingerprint_event_log_segment(segment: &EventLogSegment) -> io::Result<EventLogSegmentSnapshot> {
+    let mut file = File::open(&segment.path)?;
+    let metadata = file.metadata()?;
+    validate_event_log_segment_metadata(&segment.path, &metadata)?;
+    let mut chunk = [0_u8; EVENT_LOG_READ_CHUNK_BYTES];
+    let mut bytes = 0_u64;
+    let mut sha256 = Sha256::new();
+    loop {
+        let remaining = (LOG_ROTATE_BYTES + 1).saturating_sub(bytes);
+        if remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log segment exceeds the fixed byte limit",
+            ));
+        }
+        let requested = usize::try_from(remaining)
+            .unwrap_or(EVENT_LOG_READ_CHUNK_BYTES)
+            .min(EVENT_LOG_READ_CHUNK_BYTES);
+        let read = loop {
+            match file.read(&mut chunk[..requested]) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("event log segment byte count overflow"))?;
+        if bytes > LOG_ROTATE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log segment exceeds the fixed byte limit",
+            ));
+        }
+        sha256.update(&chunk[..read]);
+    }
+
+    Ok(EventLogSegmentSnapshot {
+        path: segment.path.clone(),
+        kind: segment.kind,
+        bytes,
+        sha256: sha256.finalize().into(),
+    })
+}
+
+fn deserialize_event_record(record: &[u8], path: &Path, line_number: usize) -> io::Result<Event> {
+    let event: Event = serde_json::from_slice(record)
+        .map_err(|error| invalid_event_json_error(path, line_number, &error))?;
+    validate_event_schema(&event, path, line_number)?;
+    Ok(event)
+}
+
+fn validate_event_schema(event: &Event, path: &Path, line_number: usize) -> io::Result<()> {
+    if event.schema_version != eidolon_core::EVENT_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "event log record at `{}` line {} has unsupported schema version {}; expected {}",
+                path.display(),
+                line_number,
+                event.schema_version,
+                eidolon_core::EVENT_SCHEMA_VERSION
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_event_json_error(
+    path: &Path,
+    line_number: usize,
+    error: &serde_json::Error,
+) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "invalid event JSON at `{}` line {} column {}",
+            path.display(),
+            line_number,
+            error.column()
+        ),
+    )
+}
+
+fn process_recovery_event(
+    event: Event,
+    selection: &RecoverySelection,
+    index: &mut EventLogRecoveryIndex,
+    segment_event_ids: &mut HashSet<Uuid>,
+    on_event: &mut impl FnMut(&Event) -> io::Result<()>,
+) -> io::Result<()> {
+    if !index.event_ids.insert(event.id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "event log family contains a duplicate event id",
+        ));
+    }
+    segment_event_ids.insert(event.id);
+
+    if let (Some(request_id), Some(response)) = (event.request_id, durable_response_match(&event)) {
+        if selection.tracks_workflow(event.session_id, request_id) {
+            if event.source != EventSource::Proxy {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "durable response event had a non-proxy source",
+                ));
+            }
+            if index
+                .durable_responses
+                .insert((event.session_id, request_id), response)
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "multiple durable response events matched one request",
+                ));
+            }
+        }
+    }
+
+    if let Some((session_id, request_id)) = selection.tracked_policy_workflow(&event) {
+        if event.session_id != session_id || event.request_id != Some(request_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable event id matched the wrong workflow",
+            ));
+        }
+        index.durable_events.insert(event.id, event.clone());
+    }
+
+    on_event(&event)
+}
 
 /// Repair an incomplete final JSONL record before the file is opened for
 /// append. A valid final JSON value only needs its missing delimiter restored;
@@ -464,10 +1567,90 @@ pub fn repair_jsonl_tail(path: &Path) -> io::Result<JsonlTailRepairOutcome> {
     })
 }
 
-fn repair_event_log_tail(path: &Path) -> io::Result<JsonlTailRepairOutcome> {
-    repair_jsonl_tail_with(path, |record| {
-        serde_json::from_slice::<Event>(record).is_ok()
-    })
+fn apply_event_log_tail_repair(
+    path: &Path,
+    snapshot: EventLogActiveSnapshot,
+    repair: JsonlTailRepairOutcome,
+) -> io::Result<JsonlTailRepairOutcome> {
+    let expected_len = match snapshot {
+        EventLogActiveSnapshot::Missing => {
+            return match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if repair == JsonlTailRepairOutcome::NotNeeded {
+                        Ok(repair)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "event log recovery planned a repair for a missing active segment",
+                        ))
+                    }
+                }
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "event log active segment appeared after authoritative recovery scan",
+                )),
+                Err(error) => Err(error),
+            };
+        }
+        EventLogActiveSnapshot::Present { bytes } => bytes,
+    };
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "event log active segment disappeared after authoritative recovery scan",
+            )
+        } else {
+            error
+        }
+    })?;
+    validate_event_log_segment_metadata(path, &metadata)?;
+    if metadata.len() != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "event log active segment changed after authoritative recovery scan",
+        ));
+    }
+
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let opened_metadata = file.metadata()?;
+    validate_event_log_segment_metadata(path, &opened_metadata)?;
+    if opened_metadata.len() != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "event log active segment changed while applying its recovery plan",
+        ));
+    }
+
+    match repair {
+        JsonlTailRepairOutcome::NotNeeded => {}
+        JsonlTailRepairOutcome::AppendedNewline { previous_len } => {
+            if previous_len != expected_len || previous_len >= LOG_ROTATE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "event log newline repair does not match the authoritative scan",
+                ));
+            }
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(b"\n")?;
+            file.sync_data()?;
+        }
+        JsonlTailRepairOutcome::Truncated {
+            original_len,
+            repaired_len,
+        } => {
+            if original_len != expected_len || repaired_len > original_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "event log truncation repair does not match the authoritative scan",
+                ));
+            }
+            file.set_len(repaired_len)?;
+            file.sync_data()?;
+        }
+    }
+    Ok(repair)
 }
 
 fn repair_jsonl_tail_with(
@@ -556,9 +1739,11 @@ pub fn report_jsonl_tail_repair(log_name: &str, path: &Path, outcome: JsonlTailR
 /// exceeds the rotation budget (used at open time). Returns the archive
 /// path when a rotation happened.
 pub fn rotate_log_if_oversized(path: &Path) -> io::Result<Option<PathBuf>> {
-    let oversized = std::fs::metadata(path)
-        .map(|metadata| metadata.len() >= LOG_ROTATE_BYTES)
-        .unwrap_or(false);
+    let oversized = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len() >= LOG_ROTATE_BYTES,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
     if !oversized {
         return Ok(None);
     }
@@ -579,16 +1764,19 @@ fn rotate_log_now_with_sync(
     sync_parent: impl Fn(&Path) -> io::Result<()>,
 ) -> io::Result<PathBuf> {
     sync_file(path)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let archive = next_archive_path(path, now);
+    let archive = next_archive_path(path, archive_timestamp_now())?;
     std::fs::rename(path, &archive)?;
     sync_parent(path)?;
     prune_log_archives(path, &archive, LOG_ARCHIVES_KEPT)?;
     sync_parent(path)?;
     Ok(archive)
+}
+
+fn archive_timestamp_now() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
 }
 
 fn sync_log_file(path: &Path) -> io::Result<()> {
@@ -613,35 +1801,111 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn next_archive_path(path: &Path, initial_stamp: u128) -> PathBuf {
-    let mut stamp = initial_stamp;
+fn next_archive_path(path: &Path, initial_stamp: u128) -> io::Result<PathBuf> {
+    validate_event_log_archive_path_capacity(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut latest_suffix = None::<String>;
+    match std::fs::read_dir(parent) {
+        Ok(entries) => {
+            for entry in entries {
+                let candidate = entry?.path();
+                let Some(existing) = archive_suffix(path, &candidate) else {
+                    continue;
+                };
+                if latest_suffix
+                    .as_deref()
+                    .is_none_or(|latest| existing > latest)
+                {
+                    latest_suffix = Some(existing.to_string());
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut suffix = next_archive_suffix_after(latest_suffix.as_deref(), initial_stamp)?;
+
     loop {
         let mut archive = path.as_os_str().to_os_string();
-        archive.push(format!(".{stamp:039}"));
+        archive.push(format!(".{suffix}"));
         let archive = PathBuf::from(archive);
-        if !archive.exists() {
-            return archive;
+        if !archive.try_exists()? {
+            return Ok(archive);
         }
-        stamp = stamp.saturating_add(1);
+        suffix = increment_archive_suffix(&suffix)?;
     }
 }
 
-fn prune_log_archives(path: &Path, fresh_archive: &Path, keep: usize) -> io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
+fn next_archive_suffix_after(latest: Option<&str>, initial_stamp: u128) -> io::Result<String> {
+    let initial = format!("{initial_stamp:039}");
+    match latest {
+        Some(existing) if existing >= initial.as_str() => increment_archive_suffix(existing),
+        _ => Ok(initial),
+    }
+}
 
-    let mut archives: Vec<(PathBuf, String)> = std::fs::read_dir(parent)?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter_map(|candidate| {
-            if candidate == fresh_archive {
-                return None;
-            }
-            let suffix = archive_suffix(path, &candidate)?.to_string();
-            Some((candidate, suffix))
-        })
-        .collect();
+fn increment_archive_suffix(suffix: &str) -> io::Result<String> {
+    let mut next = suffix.as_bytes().to_vec();
+    for index in (0..next.len()).rev() {
+        if next[index] != b'9' {
+            next[index] += 1;
+            next[index + 1..].fill(b'0');
+            return String::from_utf8(next)
+                .map_err(|_| io::Error::other("event log archive suffix became invalid UTF-8"));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "event log archive namespace is exhausted",
+    ))
+}
+
+fn validate_event_log_archive_path_capacity(path: &Path) -> io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "event log path has no UTF-8 file name",
+            )
+        })?;
+    if file_name.len() > MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "event log file name exceeds the fixed {MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES} byte limit required for canonical archives"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn prune_log_archives(path: &Path, fresh_archive: &Path, keep: usize) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut archives = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let candidate = entry?.path();
+        // `read_dir(".")` yields `./name`, while a rotation of the bare
+        // relative path `name` produces the lexical path `name.<suffix>`.
+        // They name the same adjacent archive, so compare the file name in
+        // the already-selected parent rather than the full lexical path.
+        if candidate.file_name() == fresh_archive.file_name() {
+            continue;
+        }
+        let Some(suffix) = archive_suffix(path, &candidate) else {
+            continue;
+        };
+        let suffix = suffix.to_string();
+        archives.push((candidate, suffix));
+    }
     archives.sort_by(|(_, left), (_, right)| {
         left.len().cmp(&right.len()).then_with(|| left.cmp(right))
     });
@@ -662,9 +1926,19 @@ fn archive_suffix<'a>(path: &Path, candidate: &'a Path) -> Option<&'a str> {
     let base = path.file_name()?.to_str()?;
     let candidate = candidate.file_name()?.to_str()?;
     let suffix = candidate.strip_prefix(base)?.strip_prefix('.')?;
-    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(suffix)
+    (suffix.len() == EVENT_LOG_ARCHIVE_SUFFIX_DIGITS
+        && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+    .then_some(suffix)
 }
 
+/// Whether `candidate` uses the canonical numeric archive file name for
+/// `path`. Callers that need target identity must also compare resolved parent
+/// directories; this predicate deliberately concerns the reserved name only.
+pub fn has_canonical_event_log_archive_name(path: &Path, candidate: &Path) -> bool {
+    archive_suffix(path, candidate).is_some()
+}
+
+#[cfg(test)]
 fn event_log_family_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
     let parent = path
         .parent()
@@ -693,7 +1967,7 @@ fn event_log_family_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
+    use std::io::{self, Cursor, Read, Write};
 
     use eidolon_core::{
         Event, EventKind, EventSource, IngressIdentity, PolicyState, RequestId, RoutingDecision,
@@ -703,7 +1977,6 @@ mod tests {
 
     use super::{DurableResponseMatch, EventLogWriter, FileEventLogWriter, JsonlTailRepairOutcome};
 
-    #[cfg(unix)]
     fn unique_temp_path(label: &str) -> std::path::PathBuf {
         use std::{
             env,
@@ -719,6 +1992,171 @@ mod tests {
             "eidolon-event-log-{label}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    fn archive_path(path: &std::path::Path, stamp: u128) -> std::path::PathBuf {
+        let mut archive = path.as_os_str().to_os_string();
+        archive.push(format!(".{stamp:039}"));
+        archive.into()
+    }
+
+    fn event_jsonl(events: &[&Event]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut bytes, event).expect("event should serialize");
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn write_events(path: &std::path::Path, events: &[&Event]) {
+        std::fs::write(path, event_jsonl(events)).expect("event fixture should write");
+    }
+
+    fn response_event(session_id: SessionId, request_id: RequestId, status: u16) -> Event {
+        Event::new(
+            session_id,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status,
+                routing_decision: RoutingDecision::ControlledReality,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(request_id)
+    }
+
+    fn policy_event(session_id: SessionId, request_id: RequestId) -> Event {
+        Event::new(
+            session_id,
+            EventSource::PolicyRouter,
+            PolicyState::Blocked,
+            EventKind::PolicyChanged {
+                from: PolicyState::ControlledReality,
+                to: PolicyState::Blocked,
+                reason: "event-log recovery test".to_string(),
+            },
+        )
+        .with_request_id(request_id)
+    }
+
+    fn event_with_serialized_len(target: usize) -> Event {
+        let mut event = request_event("GET", "");
+        let baseline = serde_json::to_vec(&event)
+            .expect("baseline event should serialize")
+            .len();
+        assert!(target >= baseline, "target must fit the event envelope");
+        let EventKind::RequestSeen { path, .. } = &mut event.kind else {
+            unreachable!("request_event must produce request_seen")
+        };
+        *path = "x".repeat(target - baseline);
+        assert_eq!(
+            serde_json::to_vec(&event)
+                .expect("sized event should serialize")
+                .len(),
+            target
+        );
+        event
+    }
+
+    struct ShortReader<R> {
+        inner: R,
+        maximum_read: usize,
+    }
+
+    impl<R: Read> Read for ShortReader<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let limit = buffer.len().min(self.maximum_read);
+            self.inner.read(&mut buffer[..limit])
+        }
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("synthetic event-log read failure"))
+        }
+    }
+
+    struct FailsIfRead;
+
+    impl Read for FailsIfRead {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            panic!("metadata precheck must reject before reading")
+        }
+    }
+
+    struct RepeatingByteReader {
+        remaining: u64,
+        byte: u8,
+    }
+
+    impl Read for RepeatingByteReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let read = usize::try_from(self.remaining)
+                .unwrap_or(buffer.len())
+                .min(buffer.len());
+            buffer[..read].fill(self.byte);
+            self.remaining -= read as u64;
+            Ok(read)
+        }
+    }
+
+    struct TestFamily {
+        path: std::path::PathBuf,
+    }
+
+    impl TestFamily {
+        fn new(label: &str) -> Self {
+            Self {
+                path: unique_temp_path(label),
+            }
+        }
+
+        fn archive(&self, stamp: u128) -> std::path::PathBuf {
+            archive_path(&self.path, stamp)
+        }
+
+        fn archive_with_suffix(&self, suffix: &str) -> std::path::PathBuf {
+            let mut archive = self.path.as_os_str().to_os_string();
+            archive.push(format!(".{suffix}"));
+            archive.into()
+        }
+    }
+
+    impl Drop for TestFamily {
+        fn drop(&mut self) {
+            let Some(parent) = self.path.parent() else {
+                return;
+            };
+            let Some(base) = self.path.file_name().and_then(|name| name.to_str()) else {
+                return;
+            };
+            let prefix = format!("{base}.");
+            let Ok(entries) = std::fs::read_dir(parent) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let candidate = entry.path();
+                let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if name != base && !name.starts_with(&prefix) {
+                    continue;
+                }
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        let _ = std::fs::remove_dir_all(candidate);
+                    }
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(candidate);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
     }
 
     fn request_event(method: &str, path: &str) -> Event {
@@ -1002,31 +2440,43 @@ mod tests {
     }
 
     #[test]
-    fn oversized_log_rotates_on_open_and_keeps_only_bounded_archives() {
+    fn exact_limit_log_defers_rotation_until_append_and_keeps_bounded_archives() {
         use std::fs;
 
         let path = unique_temp_path("oversized.jsonl");
-        let event_line = format!(
+        let mut active = format!(
             "{}\n",
             serde_json::to_string(&request_event("GET", "/oversized"))
                 .expect("event should serialize")
-        );
-        let repetitions = (super::LOG_ROTATE_BYTES as usize / event_line.len()) + 1;
-        fs::write(&path, event_line.repeat(repetitions)).expect("oversized log should write");
-        for index in 0..5 {
-            fs::write(
-                format!("{}.10000000{index}", path.display()),
-                b"stale archive",
-            )
-            .expect("stale archive should write");
+        )
+        .into_bytes();
+        active.resize(super::LOG_ROTATE_BYTES as usize, b'\n');
+        fs::write(&path, active).expect("exact-limit log should write");
+        for index in 0..2 {
+            let archive = format!("{}.{index:039}", path.display());
+            let archived_event = format!(
+                "{}\n",
+                serde_json::to_string(&request_event("GET", &format!("/archive-{index}")))
+                    .expect("archive event should serialize")
+            );
+            fs::write(archive, archived_event).expect("archive should write");
         }
 
-        let _writer = FileEventLogWriter::open(&path).expect("event log should open");
+        let mut writer = FileEventLogWriter::open(&path).expect("event log should open");
 
         let active = fs::metadata(&path)
             .expect("active log metadata should read")
             .len();
-        assert_eq!(active, 0, "oversized log must rotate to a fresh segment");
+        assert_eq!(
+            active,
+            super::LOG_ROTATE_BYTES,
+            "startup must preserve recovery evidence until reconciliation"
+        );
+        assert_eq!(writer.recovery_index.archive_event_ids.len(), 2);
+        writer
+            .write_event(&request_event("GET", "/after-startup"))
+            .expect("the first append should rotate the full active segment");
+        assert_eq!(writer.recovery_index.archive_event_ids.len(), 3);
 
         let prefix = format!("{}.", path.display());
         let archives: Vec<_> = fs::read_dir(path.parent().expect("temp dir"))
@@ -1050,24 +2500,13 @@ mod tests {
                     .to_string()
             })
             .collect::<Vec<_>>();
-        for stale in ["100000000", "100000001", "100000002"] {
-            assert!(
-                !suffixes.iter().any(|suffix| suffix == stale),
-                "old archive {stale} should be pruned"
-            );
-        }
-        for retained in ["100000003", "100000004"] {
-            assert!(
-                suffixes.iter().any(|suffix| suffix == retained),
-                "new archive {retained} should be retained"
-            );
-        }
         assert_eq!(
             suffixes.iter().filter(|suffix| suffix.len() == 39).count(),
-            1,
-            "the fresh nanosecond archive must be retained"
+            super::LOG_ARCHIVES_KEPT,
+            "every retained archive must use the canonical suffix"
         );
 
+        drop(writer);
         fs::remove_file(&path).expect("active log should remove");
         for archive in archives {
             fs::remove_file(archive).expect("archive should remove");
@@ -1110,10 +2549,11 @@ mod tests {
         use std::fs;
 
         let path = unique_temp_path("archive-collision.jsonl");
-        let occupied = super::next_archive_path(&path, 42);
+        let occupied = super::next_archive_path(&path, 42).expect("archive path should resolve");
         fs::write(&occupied, b"occupied").expect("occupied archive should write");
 
-        let candidate = super::next_archive_path(&path, 42);
+        let candidate =
+            super::next_archive_path(&path, 42).expect("next archive path should resolve");
 
         assert_ne!(candidate, occupied);
         assert!(candidate
@@ -1121,6 +2561,31 @@ mod tests {
             .ends_with("000000000000000000000000000000000000043"));
 
         fs::remove_file(occupied).expect("occupied archive should remove");
+    }
+
+    #[test]
+    fn archive_name_stays_monotonic_when_the_clock_moves_backward() {
+        let family = TestFamily::new("archive-clock-regression.jsonl");
+        let future = family.archive(1_000);
+        std::fs::write(&future, b"").expect("future archive should write");
+
+        let candidate = super::next_archive_path(&family.path, 42)
+            .expect("clock regression should advance beyond retained archives");
+
+        assert_eq!(candidate, family.archive(1_001));
+    }
+
+    #[test]
+    fn exhausted_archive_namespace_fails_closed() {
+        let family = TestFamily::new("archive-namespace-exhausted.jsonl");
+        let exhausted = format!("{}.{}", family.path.display(), "9".repeat(39));
+        std::fs::write(exhausted, b"").expect("maximum archive suffix should write");
+
+        let error = super::next_archive_path(&family.path, 42)
+            .expect_err("exhausted archive suffix must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("namespace is exhausted"));
     }
 
     #[test]
@@ -1139,6 +2604,45 @@ mod tests {
 
         fs::remove_file(first).expect("first archive should remove");
         fs::remove_file(second).expect("second archive should remove");
+    }
+
+    #[test]
+    fn bare_relative_path_rotation_prunes_from_the_current_directory() {
+        let unique = unique_temp_path("bare-relative-rotation.jsonl");
+        let path = std::path::PathBuf::from(
+            unique
+                .file_name()
+                .expect("unique relative event path should have a file name"),
+        );
+        let archive_path =
+            |suffix: u128| std::path::PathBuf::from(format!("{}.{suffix:039}", path.display()));
+        let oldest = archive_path(1);
+        let retained_one = archive_path(2);
+        let retained_two = archive_path(3);
+        std::fs::write(&oldest, b"oldest\n").expect("oldest archive should write");
+        std::fs::write(&retained_one, b"retained one\n")
+            .expect("first retained archive should write");
+        std::fs::write(&retained_two, b"retained two\n")
+            .expect("second retained archive should write");
+        std::fs::write(&path, b"active\n").expect("relative active log should write");
+
+        let archive = super::rotate_log_now(&path)
+            .expect("relative rotation must not fail after renaming the active log");
+
+        assert!(!path.exists());
+        assert!(archive.is_file());
+        assert!(!oldest.exists());
+        assert!(retained_one.is_file());
+        assert!(retained_two.is_file());
+        let archive_count = std::fs::read_dir(".")
+            .expect("current directory should list")
+            .filter_map(Result::ok)
+            .filter(|entry| super::archive_suffix(&path, &entry.path()).is_some())
+            .count();
+        assert_eq!(archive_count, super::LOG_ARCHIVES_KEPT);
+        std::fs::remove_file(retained_one).expect("first retained archive should remove");
+        std::fs::remove_file(retained_two).expect("second retained archive should remove");
+        std::fs::remove_file(archive).expect("relative archive should remove");
     }
 
     #[test]
@@ -1248,15 +2752,17 @@ mod tests {
         writer
             .write_event(&response)
             .expect("first response should write");
-        writer
-            .write_event(&response)
-            .expect("duplicate response should write");
-
         let error = writer
-            .durable_response(session_id, request_id)
-            .expect_err("duplicate response must fail closed");
+            .write_event(&response)
+            .expect_err("duplicate response id must fail at write time");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            writer
+                .durable_response(session_id, request_id)
+                .expect("first response should remain indexed"),
+            DurableResponseMatch::Unique { .. }
+        ));
         drop(writer);
         fs::remove_file(path).expect("event log should remove");
     }
@@ -1283,15 +2789,17 @@ mod tests {
         writer
             .write_event(&policy_event)
             .expect("first policy event should write");
-        writer
-            .write_event(&policy_event)
-            .expect("duplicate policy event should write");
-
         let error = writer
-            .durable_event_by_id(session_id, request_id, policy_event.id)
-            .expect_err("duplicate policy event id must fail closed");
+            .write_event(&policy_event)
+            .expect_err("duplicate policy event id must fail at write time");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            writer
+                .durable_event_by_id(session_id, request_id, policy_event.id)
+                .expect("first policy event should remain indexed"),
+            Some(policy_event)
+        );
         drop(writer);
         fs::remove_file(path).expect("event log should remove");
     }
@@ -1458,6 +2966,1263 @@ mod tests {
         drop(writer);
         for segment in super::event_log_family_paths(&path).expect("event log family should list") {
             fs::remove_file(segment).expect("event log segment should remove");
+        }
+    }
+
+    #[test]
+    fn production_event_log_limits_and_runtime_event_headroom_are_explicit() {
+        assert_eq!(super::LOG_ROTATE_BYTES, 33_554_432);
+        assert_eq!(super::LOG_ARCHIVES_KEPT, 3);
+        assert_eq!(super::MAX_EVENT_LOG_FAMILY_BYTES, 134_217_728);
+        assert_eq!(super::MAX_EVENT_LOG_RECORD_BYTES, 1_048_576);
+        assert_eq!(super::EVENT_LOG_ARCHIVE_SUFFIX_DIGITS, 39);
+        assert_eq!(super::MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES, 215);
+
+        let ingress_limit = crate::http_request::MAX_HTTP_HEADER_BYTES;
+        let candidates = [
+            request_event("GET", &"x".repeat(ingress_limit)),
+            Event::new(
+                SessionId::new(),
+                EventSource::PolicyRouter,
+                PolicyState::Blocked,
+                EventKind::RealityEscapeAttempt {
+                    method: "M".repeat(32),
+                    path: "x".repeat(ingress_limit),
+                    routing_decision: RoutingDecision::EidolonOwned,
+                    reason: "production:controlled_reality_branch_escape".to_string(),
+                },
+            ),
+        ];
+        let widest = candidates
+            .iter()
+            .map(|event| {
+                super::serialize_event_bounded(event)
+                    .expect("widest bounded runtime event should serialize")
+                    .len()
+            })
+            .max()
+            .expect("candidate set should not be empty");
+        assert!(
+            super::MAX_EVENT_LOG_RECORD_BYTES - widest > 900_000,
+            "widest bounded runtime fixture used {widest} bytes"
+        );
+    }
+
+    #[test]
+    fn archive_file_name_capacity_reserves_the_complete_canonical_suffix() {
+        let unique = unique_temp_path("archive-file-name-capacity");
+        let seed = unique
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("unique path should have a UTF-8 file name");
+        assert!(seed.len() < super::MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES);
+        let exact = format!(
+            "{seed}{}",
+            "x".repeat(super::MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES - seed.len())
+        );
+        let over = format!("{exact}x");
+        let parent = unique.parent().expect("unique path should have a parent");
+
+        for path in [
+            std::path::PathBuf::from(&exact),
+            std::path::Path::new(".").join(&exact),
+            parent.join(&exact),
+        ] {
+            super::validate_event_log_archive_path_capacity(&path)
+                .expect("exact active file-name limit should fit every path form");
+        }
+        for path in [
+            std::path::PathBuf::from(&over),
+            std::path::Path::new(".").join(&over),
+            parent.join(&over),
+        ] {
+            let error = super::validate_event_log_archive_path_capacity(&path)
+                .expect_err("limit plus one must fail every path form");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error
+                .to_string()
+                .contains("required for canonical archives"));
+        }
+
+        let archive = super::next_archive_path(&parent.join(&exact), 42)
+            .expect("exact-limit active name should produce an archive path");
+        assert_eq!(
+            archive
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("archive should have a UTF-8 file name")
+                .len(),
+            255
+        );
+        assert!(super::has_canonical_event_log_archive_name(
+            &parent.join(exact),
+            &archive
+        ));
+    }
+
+    #[test]
+    fn family_inventory_accepts_absent_empty_archive_only_and_full_ordered_family() {
+        let family = TestFamily::new("inventory-supported-shapes.jsonl");
+        let absent = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("absent family should validate");
+        assert_eq!(absent.stats, super::EventLogRecoveryStats::default());
+
+        std::fs::write(&family.path, b"").expect("empty active should write");
+        let empty = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("empty active should validate");
+        assert_eq!(empty.stats.segment_count, 1);
+        assert_eq!(empty.stats.active_bytes, 0);
+        std::fs::remove_file(&family.path).expect("empty active should remove");
+
+        let archive_one = request_event("GET", "/archive-1");
+        let archive_two = request_event("GET", "/archive-2");
+        let archive_three = request_event("GET", "/archive-3");
+        for (stamp, event) in [(3, &archive_three), (1, &archive_one), (2, &archive_two)] {
+            write_events(&family.archive(stamp), &[event]);
+        }
+        let mut observed = Vec::new();
+        let archive_only = super::scan_event_log_family(&family.path, &[], |event| {
+            let EventKind::RequestSeen { path, .. } = &event.kind else {
+                panic!("fixture should contain request events")
+            };
+            observed.push(path.clone());
+            Ok(())
+        })
+        .expect("archive-only crash window should validate");
+        assert_eq!(archive_only.stats.archive_count, 3);
+        assert_eq!(archive_only.stats.segment_count, 3);
+        assert_eq!(archive_only.stats.record_count, 3);
+        assert_eq!(observed, ["/archive-1", "/archive-2", "/archive-3"]);
+
+        let active = request_event("GET", "/active");
+        write_events(&family.path, &[&active]);
+        observed.clear();
+        let full = super::scan_event_log_family(&family.path, &[], |event| {
+            let EventKind::RequestSeen { path, .. } = &event.kind else {
+                panic!("fixture should contain request events")
+            };
+            observed.push(path.clone());
+            Ok(())
+        })
+        .expect("active plus three archives should validate");
+        assert_eq!(full.stats.archive_count, 3);
+        assert_eq!(full.stats.segment_count, 4);
+        assert_eq!(full.stats.record_count, 4);
+        assert_eq!(
+            observed,
+            ["/archive-1", "/archive-2", "/archive-3", "/active"]
+        );
+    }
+
+    #[test]
+    fn family_inventory_rejects_fourth_and_noncanonical_numeric_archives() {
+        let too_many = TestFamily::new("inventory-four-archives.jsonl");
+        for stamp in 1..=4 {
+            std::fs::write(too_many.archive(stamp), b"").expect("archive should write");
+        }
+        let error = super::scan_event_log_family(&too_many.path, &[], |_| Ok(()))
+            .err()
+            .expect("fourth archive must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("archive count"));
+
+        let noncanonical = TestFamily::new("inventory-noncanonical.jsonl");
+        let short_numeric = format!("{}.1", noncanonical.path.display());
+        std::fs::write(&short_numeric, b"").expect("short numeric neighbor should write");
+        let error = super::scan_event_log_family(&noncanonical.path, &[], |_| Ok(()))
+            .err()
+            .expect("all-digit noncanonical suffix must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("noncanonical"));
+    }
+
+    #[test]
+    fn family_inventory_ignores_unrelated_nonnumeric_neighbors() {
+        let family = TestFamily::new("inventory-neighbors.jsonl");
+        let event = request_event("GET", "/active");
+        write_events(&family.path, &[&event]);
+        for suffix in [
+            "backup",
+            "123x",
+            "",
+            "00000000000000000000000000000000000000x",
+        ] {
+            let neighbor = format!("{}.{}", family.path.display(), suffix);
+            std::fs::write(neighbor, b"not an event").expect("neighbor should write");
+        }
+
+        let scan = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("nonnumeric neighbors should be ignored");
+        assert_eq!(scan.stats.archive_count, 0);
+        assert_eq!(scan.stats.segment_count, 1);
+        assert_eq!(scan.stats.record_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn family_inventory_rejects_symlinks_and_nonregular_members() {
+        let symlink_family = TestFamily::new("inventory-symlink.jsonl");
+        let target = unique_temp_path("inventory-symlink-target.jsonl");
+        std::fs::write(&target, b"").expect("symlink target should write");
+        std::os::unix::fs::symlink(&target, &symlink_family.path)
+            .expect("active symlink should create");
+        let error = super::scan_event_log_family(&symlink_family.path, &[], |_| Ok(()))
+            .err()
+            .expect("active symlink must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not a regular file"));
+        std::fs::remove_file(target).expect("symlink target should remove");
+
+        let directory_family = TestFamily::new("inventory-directory.jsonl");
+        std::fs::create_dir(directory_family.archive(1)).expect("archive directory should create");
+        let error = super::scan_event_log_family(&directory_family.path, &[], |_| Ok(()))
+            .err()
+            .expect("archive directory must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn streaming_scanner_handles_short_reads_and_propagates_io_failures() {
+        let event = request_event("GET", "/short-reads");
+        let bytes = event_jsonl(&[&event]);
+        let segment = super::EventLogSegment {
+            path: unique_temp_path("synthetic-reader.jsonl"),
+            kind: super::EventLogSegmentKind::Active,
+            advertised_len: bytes.len() as u64,
+        };
+        let selection = super::RecoverySelection::targets(&[]).expect("empty selection");
+        let mut index = super::EventLogRecoveryIndex::default();
+        let mut observed = 0;
+        let scan = super::scan_event_log_reader(
+            ShortReader {
+                inner: Cursor::new(bytes.clone()),
+                maximum_read: 3,
+            },
+            &segment,
+            &selection,
+            &mut index,
+            &mut |_| {
+                observed += 1;
+                Ok(())
+            },
+        )
+        .expect("short reads should be reassembled");
+        assert_eq!(scan.bytes, bytes.len() as u64);
+        assert_eq!(scan.records, 1);
+        assert_eq!(observed, 1);
+
+        let mut index = super::EventLogRecoveryIndex::default();
+        let error = super::scan_event_log_reader(
+            FailingReader,
+            &segment,
+            &selection,
+            &mut index,
+            &mut |_| Ok(()),
+        )
+        .err()
+        .expect("ordinary read errors must propagate");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "synthetic event-log read failure");
+
+        let oversized_metadata = super::EventLogSegment {
+            advertised_len: super::LOG_ROTATE_BYTES + 1,
+            ..segment
+        };
+        let mut index = super::EventLogRecoveryIndex::default();
+        let error = super::scan_event_log_reader(
+            FailsIfRead,
+            &oversized_metadata,
+            &selection,
+            &mut index,
+            &mut |_| Ok(()),
+        )
+        .err()
+        .expect("oversized metadata must reject before reading");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn authoritative_segment_read_rejects_limit_plus_one_despite_small_metadata() {
+        let segment = super::EventLogSegment {
+            path: unique_temp_path("synthetic-growth.jsonl"),
+            kind: super::EventLogSegmentKind::Active,
+            advertised_len: 0,
+        };
+        let selection = super::RecoverySelection::targets(&[]).expect("empty selection");
+        let mut index = super::EventLogRecoveryIndex::default();
+        let error = super::scan_event_log_reader(
+            RepeatingByteReader {
+                remaining: super::LOG_ROTATE_BYTES + 1,
+                byte: b'\n',
+            },
+            &segment,
+            &selection,
+            &mut index,
+            &mut |_| Ok(()),
+        )
+        .err()
+        .expect("limit-plus-one authoritative read must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("segment"));
+    }
+
+    #[test]
+    fn exact_segment_limit_is_accepted_and_limit_plus_one_is_rejected() {
+        let exact = TestFamily::new("segment-exact.jsonl");
+        let mut file = std::io::BufWriter::new(
+            std::fs::File::create(&exact.path).expect("exact segment should create"),
+        );
+        let block = vec![b'\n'; super::EVENT_LOG_READ_CHUNK_BYTES];
+        for _ in 0..super::LOG_ROTATE_BYTES / block.len() as u64 {
+            file.write_all(&block).expect("blank block should write");
+        }
+        file.flush().expect("exact segment should flush");
+        drop(file);
+        let scan = super::scan_event_log_family(&exact.path, &[], |_| Ok(()))
+            .expect("exact segment limit should validate");
+        assert_eq!(scan.stats.family_bytes, super::LOG_ROTATE_BYTES);
+        assert_eq!(scan.stats.active_bytes, super::LOG_ROTATE_BYTES);
+
+        let over = TestFamily::new("segment-over.jsonl");
+        let file = std::fs::File::create(&over.path).expect("over-limit segment should create");
+        file.set_len(super::LOG_ROTATE_BYTES + 1)
+            .expect("over-limit segment should size");
+        let error = super::scan_event_log_family(&over.path, &[], |_| Ok(()))
+            .err()
+            .expect("segment limit plus one must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("segment"));
+    }
+
+    #[test]
+    fn exact_record_limit_is_accepted_and_limit_plus_one_is_rejected() {
+        let exact = TestFamily::new("record-exact.jsonl");
+        let exact_event = event_with_serialized_len(super::MAX_EVENT_LOG_RECORD_BYTES);
+        super::validate_event_log_record_without_mutation(&exact_event)
+            .expect("read-only append validation should accept the exact record limit");
+        write_events(&exact.path, &[&exact_event]);
+        let scan = super::scan_event_log_family(&exact.path, &[], |_| Ok(()))
+            .expect("exact record limit should validate");
+        assert_eq!(scan.stats.record_count, 1);
+
+        let over = TestFamily::new("record-over.jsonl");
+        let over_event = event_with_serialized_len(super::MAX_EVENT_LOG_RECORD_BYTES + 1);
+        let preflight_error = super::validate_event_log_record_without_mutation(&over_event)
+            .expect_err("read-only append validation must reject record limit plus one");
+        assert_eq!(preflight_error.kind(), io::ErrorKind::InvalidData);
+        write_events(&over.path, &[&over_event]);
+        let error = super::scan_event_log_family(&over.path, &[], |_| Ok(()))
+            .err()
+            .expect("record limit plus one must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("record"));
+
+        let written = TestFamily::new("record-exact-writer.jsonl");
+        let mut writer = FileEventLogWriter::open(&written.path).expect("writer should open");
+        writer
+            .write_event(&exact_event)
+            .expect("writer should accept an exact-limit record");
+        assert_eq!(
+            std::fs::metadata(&written.path)
+                .expect("written segment should have metadata")
+                .len(),
+            super::MAX_EVENT_LOG_RECORD_BYTES as u64 + 1
+        );
+    }
+
+    #[test]
+    fn bounded_event_serialization_capacity_stays_within_the_record_sentinel() {
+        let allocation_bound = super::MAX_EVENT_LOG_RECORD_BYTES + 1;
+        let first_len = super::MAX_EVENT_LOG_RECORD_BYTES / 2;
+        let mut serialization = super::BoundedEventSerialization::new();
+        let first = vec![b'a'; first_len];
+        assert_eq!(
+            serialization
+                .write(&first)
+                .expect("first bounded chunk should write"),
+            first.len()
+        );
+        assert!(serialization.bytes.capacity() <= allocation_bound);
+
+        let second = vec![b'b'; allocation_bound - first_len];
+        assert_eq!(
+            serialization
+                .write(&second)
+                .expect("second bounded chunk should write"),
+            second.len()
+        );
+        assert_eq!(serialization.bytes.len(), allocation_bound);
+        assert!(serialization.bytes.capacity() <= allocation_bound);
+
+        let ignored = [b'c'; 64];
+        assert_eq!(
+            serialization
+                .write(&ignored)
+                .expect("post-sentinel input should be consumed without allocation"),
+            ignored.len()
+        );
+        assert_eq!(serialization.bytes.len(), allocation_bound);
+        assert!(serialization.bytes.capacity() <= allocation_bound);
+        let error = serialization
+            .finish()
+            .expect_err("the retained sentinel byte must make the record invalid");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn invalid_utf8_blank_lines_and_active_tail_rules_are_strict() {
+        let complete_invalid = TestFamily::new("utf8-complete.jsonl");
+        std::fs::write(&complete_invalid.path, [0xff, b'\n'])
+            .expect("invalid complete record should write");
+        let error = super::scan_event_log_family(&complete_invalid.path, &[], |_| Ok(()))
+            .err()
+            .expect("invalid UTF-8 complete record must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 1 column"));
+
+        let torn = TestFamily::new("utf8-torn-active.jsonl");
+        std::fs::write(&torn.path, [0xff]).expect("invalid active tail should write");
+        let scan = super::scan_event_log_family(&torn.path, &[], |_| Ok(()))
+            .expect("invalid final active fragment should produce a repair plan");
+        assert_eq!(
+            scan.active_tail_repair,
+            JsonlTailRepairOutcome::Truncated {
+                original_len: 1,
+                repaired_len: 0,
+            }
+        );
+        let writer = FileEventLogWriter::open_with_recovery(&torn.path, scan)
+            .expect("authoritative active-tail repair should apply");
+        assert_eq!(
+            writer.startup_tail_repair(),
+            JsonlTailRepairOutcome::Truncated {
+                original_len: 1,
+                repaired_len: 0,
+            }
+        );
+        assert_eq!(
+            std::fs::metadata(&torn.path)
+                .expect("repaired active should exist")
+                .len(),
+            0
+        );
+        drop(writer);
+
+        let blanks = TestFamily::new("blank-lines.jsonl");
+        let event = request_event("GET", "/after-blanks");
+        let mut bytes = b"\n \t\r\n".to_vec();
+        bytes.extend(event_jsonl(&[&event]));
+        bytes.extend_from_slice(b"\n\t \n");
+        std::fs::write(&blanks.path, bytes).expect("blank-line fixture should write");
+        let scan = super::scan_event_log_family(&blanks.path, &[], |_| Ok(()))
+            .expect("blank lines should be ignored");
+        assert_eq!(scan.stats.record_count, 1);
+        assert_eq!(scan.active_tail_repair, JsonlTailRepairOutcome::NotNeeded);
+    }
+
+    #[test]
+    fn archives_reject_unterminated_records_and_invalid_tails() {
+        let valid_unterminated = TestFamily::new("archive-valid-unterminated.jsonl");
+        let event = request_event("GET", "/archive-tail");
+        std::fs::write(
+            valid_unterminated.archive(1),
+            serde_json::to_vec(&event).expect("event should serialize"),
+        )
+        .expect("unterminated archive should write");
+        let error = super::scan_event_log_family(&valid_unterminated.path, &[], |_| Ok(()))
+            .err()
+            .expect("unterminated valid archive record must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unterminated"));
+
+        let invalid_unterminated = TestFamily::new("archive-invalid-unterminated.jsonl");
+        std::fs::write(invalid_unterminated.archive(1), [0xff])
+            .expect("invalid archive tail should write");
+        let error = super::scan_event_log_family(&invalid_unterminated.path, &[], |_| Ok(()))
+            .err()
+            .expect("invalid archive tail must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("line 1 column"));
+    }
+
+    #[test]
+    fn unsupported_schema_and_duplicate_ids_across_segments_are_rejected() {
+        let unsupported = TestFamily::new("unsupported-schema.jsonl");
+        let mut event = request_event("GET", "/old-schema");
+        event.schema_version = eidolon_core::EVENT_SCHEMA_VERSION - 1;
+        write_events(&unsupported.path, &[&event]);
+        let error = super::scan_event_log_family(&unsupported.path, &[], |_| Ok(()))
+            .err()
+            .expect("unsupported schema must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unsupported schema"));
+
+        let duplicate = TestFamily::new("duplicate-cross-segment.jsonl");
+        let event = request_event("GET", "/duplicate");
+        write_events(&duplicate.archive(1), &[&event]);
+        write_events(&duplicate.path, &[&event]);
+        let error = super::scan_event_log_family(&duplicate.path, &[], |_| Ok(()))
+            .err()
+            .expect("duplicate family event id must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("duplicate event id"));
+        assert!(
+            !error.to_string().contains(&event.id.to_string()),
+            "diagnostic must not disclose a durable identifier"
+        );
+    }
+
+    #[test]
+    fn one_scan_builds_selected_response_and_policy_indexes_across_archives() {
+        let family = TestFamily::new("selected-recovery-index.jsonl");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let response = response_event(session_id, request_id, 202);
+        let policy = policy_event(session_id, request_id);
+        write_events(&family.archive(1), &[&response]);
+        write_events(&family.path, &[&policy]);
+        let targets = [super::EventLogRecoveryTarget {
+            session_id,
+            request_id,
+            expected_policy_event_id: Some(policy.id),
+        }];
+        let mut callback_count = 0;
+        let scan = super::scan_event_log_family(&family.path, &targets, |_| {
+            callback_count += 1;
+            Ok(())
+        })
+        .expect("selected recovery scan should succeed");
+        assert_eq!(callback_count, 2, "each record must be visited once");
+        assert_eq!(scan.stats.record_count, 2);
+        assert_eq!(scan.stats.indexed_durable_response_count, 1);
+        assert_eq!(scan.stats.indexed_policy_event_count, 1);
+
+        let mut writer = FileEventLogWriter::open_with_recovery(&family.path, scan)
+            .expect("writer should consume the scanned index");
+        assert_eq!(
+            writer
+                .durable_response(session_id, request_id)
+                .expect("response lookup should use the index"),
+            DurableResponseMatch::Unique {
+                event_id: response.id,
+                policy_state: PolicyState::ControlledReality,
+                status: 202,
+                routing_decision: RoutingDecision::ControlledReality,
+                controlled_reality: None,
+            }
+        );
+        assert_eq!(
+            writer
+                .durable_event_by_id(session_id, request_id, policy.id)
+                .expect("policy lookup should use the index"),
+            Some(policy.clone())
+        );
+        let wrong_session = writer
+            .durable_event_by_id(SessionId::new(), request_id, policy.id)
+            .expect_err("policy lookup must reject a wrong session alone");
+        assert_eq!(wrong_session.kind(), io::ErrorKind::InvalidData);
+        let wrong_request = writer
+            .durable_event_by_id(session_id, RequestId::new(), policy.id)
+            .expect_err("policy lookup must reject a wrong request alone");
+        assert_eq!(wrong_request.kind(), io::ErrorKind::InvalidData);
+        writer.resolve_durable_response(session_id, request_id);
+    }
+
+    #[test]
+    fn conflicting_selected_recovery_matches_fail_independent_of_creation_order() {
+        let family = TestFamily::new("conflicting-recovery-index.jsonl");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let later = response_event(session_id, request_id, 203);
+        let earlier = response_event(session_id, request_id, 202);
+        write_events(&family.archive(2), &[&later]);
+        write_events(&family.archive(1), &[&earlier]);
+        let targets = [super::EventLogRecoveryTarget {
+            session_id,
+            request_id,
+            expected_policy_event_id: None,
+        }];
+        let error = super::scan_event_log_family(&family.path, &targets, |_| Ok(()))
+            .err()
+            .expect("conflicting durable responses must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("multiple durable response"));
+        assert!(!error.to_string().contains(&earlier.id.to_string()));
+        assert!(!error.to_string().contains(&later.id.to_string()));
+
+        let mismatched = TestFamily::new("mismatched-policy-index.jsonl");
+        let policy = policy_event(SessionId::new(), RequestId::new());
+        write_events(&mismatched.path, &[&policy]);
+        let targets = [super::EventLogRecoveryTarget {
+            session_id,
+            request_id,
+            expected_policy_event_id: Some(policy.id),
+        }];
+        let error = super::scan_event_log_family(&mismatched.path, &targets, |_| Ok(()))
+            .err()
+            .expect("policy event for the wrong workflow must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("wrong workflow"));
+        assert!(!error.to_string().contains(&policy.id.to_string()));
+    }
+
+    #[test]
+    fn recovery_target_count_is_bounded_at_policy_session_capacity() {
+        let family = TestFamily::new("recovery-target-bound.jsonl");
+        let mut targets = (0..crate::policy_store::MAX_POLICY_SESSIONS)
+            .map(|_| super::EventLogRecoveryTarget {
+                session_id: SessionId::new(),
+                request_id: RequestId::new(),
+                expected_policy_event_id: None,
+            })
+            .collect::<Vec<_>>();
+        let scan = super::scan_event_log_family(&family.path, &targets, |_| Ok(()))
+            .expect("exact pending-session capacity should validate");
+        assert_eq!(scan.stats, super::EventLogRecoveryStats::default());
+
+        targets.push(super::EventLogRecoveryTarget {
+            session_id: SessionId::new(),
+            request_id: RequestId::new(),
+            expected_policy_event_id: None,
+        });
+        let error = super::scan_event_log_family(&family.path, &targets, |_| Ok(()))
+            .err()
+            .expect("pending-session capacity plus one must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("target count"));
+
+        let duplicate = [targets[0], targets[0]];
+        let error = super::scan_event_log_family(&family.path, &duplicate, |_| Ok(()))
+            .err()
+            .expect("duplicate workflow targets must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("duplicate workflow target"));
+    }
+
+    #[test]
+    fn archive_only_index_survives_the_post_rename_missing_active_window() {
+        let family = TestFamily::new("archive-only-index.jsonl");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let response = response_event(session_id, request_id, 202);
+        write_events(&family.archive(1), &[&response]);
+        let targets = [super::EventLogRecoveryTarget {
+            session_id,
+            request_id,
+            expected_policy_event_id: None,
+        }];
+        let scan = super::scan_event_log_family(&family.path, &targets, |_| Ok(()))
+            .expect("archive-only family should scan");
+        assert_eq!(scan.stats.archive_count, 1);
+        assert_eq!(scan.stats.segment_count, 1);
+
+        let mut writer = FileEventLogWriter::open_with_recovery(&family.path, scan)
+            .expect("writer should create the missing active only after validation");
+        assert!(family.path.is_file());
+        assert_eq!(
+            writer
+                .durable_response(session_id, request_id)
+                .expect("archived response should remain indexed"),
+            DurableResponseMatch::Unique {
+                event_id: response.id,
+                policy_state: PolicyState::ControlledReality,
+                status: 202,
+                routing_decision: RoutingDecision::ControlledReality,
+                controlled_reality: None,
+            }
+        );
+        writer.resolve_durable_response(session_id, request_id);
+    }
+
+    #[test]
+    fn full_active_defers_rotation_until_selected_oldest_archive_evidence_is_resolved() {
+        let family = TestFamily::new("full-active-selected-oldest-evidence.jsonl");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let response = response_event(session_id, request_id, 202);
+        write_events(&family.archive(1), &[&response]);
+        write_events(&family.archive(2), &[&request_event("GET", "/archive-two")]);
+        write_events(
+            &family.archive(3),
+            &[&request_event("GET", "/archive-three")],
+        );
+        std::fs::write(&family.path, vec![b'\n'; super::LOG_ROTATE_BYTES as usize])
+            .expect("exact-limit active should write");
+        let targets = [super::EventLogRecoveryTarget {
+            session_id,
+            request_id,
+            expected_policy_event_id: None,
+        }];
+        let scan = super::scan_event_log_family(&family.path, &targets, |_| Ok(()))
+            .expect("full family should scan");
+        let mut writer = FileEventLogWriter::open_with_recovery(&family.path, scan)
+            .expect("opening must not rotate selected recovery evidence away");
+        assert_eq!(writer.recovery_index.archive_event_ids.len(), 3);
+        assert_eq!(
+            std::fs::metadata(&family.path)
+                .expect("active metadata should read")
+                .len(),
+            super::LOG_ROTATE_BYTES
+        );
+        assert!(matches!(
+            writer
+                .durable_response(session_id, request_id)
+                .expect("oldest archived response should remain indexed"),
+            DurableResponseMatch::Unique { event_id, .. } if event_id == response.id
+        ));
+
+        let noncanonical_neighbor = family.path.with_file_name(format!(
+            "{}.7",
+            family.path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&noncanonical_neighbor, b"unrelated")
+            .expect("runtime noncanonical neighbor should write");
+        let blocked = writer
+            .write_recovered_policy_event(&policy_event(session_id, request_id))
+            .expect_err("rotation must not prune unresolved recovery evidence");
+        assert_eq!(blocked.kind(), io::ErrorKind::WouldBlock);
+        assert!(!writer.unavailable_after_io_failure);
+        assert_eq!(writer.recovery_index.archive_event_ids.len(), 3);
+
+        writer.resolve_durable_response(session_id, request_id);
+        writer
+            .write_event(&request_event("GET", "/after-recovery"))
+            .expect("rotation should proceed after durable recovery resolves");
+        assert_eq!(writer.recovery_index.archive_event_ids.len(), 3);
+        assert!(noncanonical_neighbor.is_file());
+        let canonical_archives = super::event_log_family_paths(&family.path)
+            .expect("canonical family should enumerate")
+            .into_iter()
+            .filter(|path| path != &family.path)
+            .collect::<Vec<_>>();
+        assert_eq!(canonical_archives.len(), super::LOG_ARCHIVES_KEPT);
+        assert!(canonical_archives
+            .iter()
+            .all(|path| super::archive_suffix(&family.path, path).is_some()));
+    }
+
+    #[test]
+    fn reconciliation_plan_releases_ordered_evidence_before_a_required_rotation() {
+        let family = TestFamily::new("ordered-recovery-rotation.jsonl");
+        let first_session = SessionId(uuid::Uuid::from_u128(1));
+        let first_request = RequestId::new();
+        let second_session = SessionId(uuid::Uuid::from_u128(2));
+        let second_request = RequestId::new();
+        let first_response = response_event(first_session, first_request, 202);
+        let second_response = response_event(second_session, second_request, 202);
+        let recovered_policy = policy_event(second_session, second_request);
+        write_events(&family.archive(1), &[&first_response]);
+        write_events(&family.archive(2), &[&second_response]);
+        write_events(
+            &family.archive(3),
+            &[&request_event("GET", "/archive-three")],
+        );
+        std::fs::write(&family.path, vec![b'\n'; super::LOG_ROTATE_BYTES as usize])
+            .expect("exact-limit active should write");
+        let targets = [
+            super::EventLogRecoveryTarget {
+                session_id: first_session,
+                request_id: first_request,
+                expected_policy_event_id: None,
+            },
+            super::EventLogRecoveryTarget {
+                session_id: second_session,
+                request_id: second_request,
+                expected_policy_event_id: Some(recovered_policy.id),
+            },
+        ];
+        let scan = super::scan_event_log_family(&family.path, &targets, |_| Ok(()))
+            .expect("full family should scan");
+        let append_bytes = super::event_log_record_append_bytes_without_mutation(&recovered_policy)
+            .expect("recovered policy event should fit");
+
+        let unsafe_order = [
+            super::EventLogRecoveryPlanStep {
+                session_id: second_session,
+                request_id: second_request,
+                recovered_policy_event_bytes: Some(append_bytes),
+            },
+            super::EventLogRecoveryPlanStep {
+                session_id: first_session,
+                request_id: first_request,
+                recovered_policy_event_bytes: None,
+            },
+        ];
+        let error = scan
+            .validate_reconciliation_plan(&unsafe_order)
+            .expect_err("rotation before the oldest evidence resolves must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("would prune unresolved"));
+
+        let safe_order = [unsafe_order[1], unsafe_order[0]];
+        scan.validate_reconciliation_plan(&safe_order)
+            .expect("ordered resolution should make the later rotation safe");
+    }
+
+    #[test]
+    fn reconciliation_plan_checks_archive_namespace_only_when_rotation_is_required() {
+        let family = TestFamily::new("recovery-namespace-boundary.jsonl");
+        let exhausted_suffix = "9".repeat(39);
+        std::fs::write(family.archive_with_suffix(&exhausted_suffix), b"\n")
+            .expect("maximum archive suffix should write");
+        std::fs::write(&family.path, b"").expect("empty active should write");
+        let step = super::EventLogRecoveryPlanStep {
+            session_id: SessionId::new(),
+            request_id: RequestId::new(),
+            recovered_policy_event_bytes: Some(1),
+        };
+
+        let fitting = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("exhausted namespace with a fitting append should scan");
+        assert_eq!(fitting.stats.archive_count, 1);
+        fitting
+            .validate_reconciliation_plan(&[step])
+            .expect("a fitting recovery append must not require archive namespace room");
+
+        std::fs::write(&family.path, vec![b'\n'; super::LOG_ROTATE_BYTES as usize])
+            .expect("exact-limit active should write");
+        let rotating = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("exhausted namespace with a full active should scan");
+        assert_eq!(rotating.stats.active_bytes, super::LOG_ROTATE_BYTES);
+        assert_eq!(
+            rotating.active_tail_repair,
+            super::JsonlTailRepairOutcome::NotNeeded
+        );
+        let archive_suffix = rotating
+            .family_snapshot
+            .iter()
+            .find_map(|segment| super::archive_suffix(&rotating.path, &segment.path))
+            .expect("maximum archive suffix should remain in the scan snapshot");
+        assert_eq!(archive_suffix, exhausted_suffix);
+        let error = rotating
+            .validate_reconciliation_plan(&[step])
+            .expect_err("a required recovery rotation must reject an exhausted namespace");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("namespace is exhausted"));
+    }
+
+    #[test]
+    fn reconciliation_plan_tracks_length_and_namespace_across_multiple_rotations() {
+        let family = TestFamily::new("multi-rotation-recovery-namespace.jsonl");
+        let near_exhausted_suffix = format!("{}7", "9".repeat(38));
+        std::fs::write(family.archive_with_suffix(&near_exhausted_suffix), b"\n")
+            .expect("near-maximum archive suffix should write");
+        std::fs::write(&family.path, vec![b'\n'; super::LOG_ROTATE_BYTES as usize])
+            .expect("exact-limit active should write");
+        let scan = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("near-exhausted family should scan");
+        assert_eq!(scan.stats.archive_count, 1);
+        assert_eq!(scan.stats.active_bytes, super::LOG_ROTATE_BYTES);
+        let maximum_append = super::MAX_EVENT_LOG_RECORD_BYTES as u64 + 1;
+        let steps = (0_u128..63)
+            .map(|index| super::EventLogRecoveryPlanStep {
+                session_id: SessionId(uuid::Uuid::from_u128(index + 1)),
+                request_id: RequestId(uuid::Uuid::from_u128(index + 101)),
+                recovered_policy_event_bytes: Some(maximum_append),
+            })
+            .collect::<Vec<_>>();
+
+        scan.validate_reconciliation_plan(&steps[..62])
+            .expect("exactly two planned rotations should consume the final two suffixes");
+        let error = scan
+            .validate_reconciliation_plan(&steps)
+            .expect_err("the third planned rotation must exhaust the archive namespace");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("namespace is exhausted"));
+    }
+
+    #[test]
+    fn recovery_scan_is_bound_to_the_exact_writer_path() {
+        let scanned = TestFamily::new("scan-path-binding-source.jsonl");
+        let other = TestFamily::new("scan-path-binding-destination.jsonl");
+        let scan = super::scan_event_log_family(&scanned.path, &[], |_| Ok(()))
+            .expect("absent source family should scan");
+
+        let error = FileEventLogWriter::open_with_recovery(&other.path, scan)
+            .err()
+            .expect("a recovery scan must not authorize another writer path");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "event log recovery scan path does not match writer path"
+        );
+        assert!(!scanned.path.exists());
+        assert!(!other.path.exists());
+    }
+
+    #[test]
+    fn authoritative_scan_detects_active_path_changes_before_repair_or_creation() {
+        let changed = TestFamily::new("active-changed-after-scan.jsonl");
+        std::fs::write(&changed.path, b"").expect("empty active should write");
+        let scan = super::scan_event_log_family(&changed.path, &[], |_| Ok(()))
+            .expect("empty active should scan");
+        std::fs::write(&changed.path, b"\n").expect("active should change after scan");
+        let error = FileEventLogWriter::open_with_recovery(&changed.path, scan)
+            .err()
+            .expect("changed active must fail before mutation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(
+            std::fs::read(&changed.path).expect("active should read"),
+            b"\n"
+        );
+
+        let appeared = TestFamily::new("active-appeared-after-scan.jsonl");
+        let scan = super::scan_event_log_family(&appeared.path, &[], |_| Ok(()))
+            .expect("missing active should scan");
+        std::fs::write(&appeared.path, b"").expect("active should appear after scan");
+        let error = FileEventLogWriter::open_with_recovery(&appeared.path, scan)
+            .err()
+            .expect("appeared active must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("membership changed"));
+
+        let same_length = TestFamily::new("active-same-length-change.jsonl");
+        let original_event = request_event("GET", "/before");
+        let mut replacement_event = original_event.clone();
+        replacement_event.id = uuid::Uuid::new_v4();
+        let EventKind::RequestSeen { path, .. } = &mut replacement_event.kind else {
+            unreachable!("request fixture should remain a request event")
+        };
+        *path = "/after-".to_string();
+        let original = format!(
+            "{}\n",
+            serde_json::to_string(&original_event).expect("original event should serialize")
+        )
+        .into_bytes();
+        let replacement = format!(
+            "{}\n",
+            serde_json::to_string(&replacement_event).expect("replacement event should serialize")
+        )
+        .into_bytes();
+        assert_eq!(original.len(), replacement.len());
+        std::fs::write(&same_length.path, &original).expect("original active should write");
+        let scan = super::scan_event_log_family(&same_length.path, &[], |_| Ok(()))
+            .expect("original active should scan");
+        std::fs::write(&same_length.path, &replacement)
+            .expect("same-length replacement should write");
+        let error = FileEventLogWriter::open_with_recovery(&same_length.path, scan)
+            .err()
+            .expect("same-length active replacement must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("contents changed"));
+        assert_eq!(
+            std::fs::read(&same_length.path).expect("replacement active should read"),
+            replacement
+        );
+
+        let archive_changed = TestFamily::new("archive-same-length-change.jsonl");
+        let archive = archive_changed.archive(1);
+        std::fs::write(&archive, &original).expect("original archive should write");
+        let scan = super::scan_event_log_family(&archive_changed.path, &[], |_| Ok(()))
+            .expect("original archive should scan");
+        std::fs::write(&archive, &replacement).expect("replacement archive should write");
+        let error = FileEventLogWriter::open_with_recovery(&archive_changed.path, scan)
+            .err()
+            .expect("same-length archive replacement must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("contents changed"));
+        assert!(
+            !archive_changed.path.exists(),
+            "rejected archive replacement must not create the active segment"
+        );
+
+        std::fs::remove_file(&appeared.path).expect("appeared active should remove");
+        let corrected = super::scan_event_log_family(&appeared.path, &[], |_| Ok(()))
+            .expect("corrected path should rescan");
+        let writer = FileEventLogWriter::open_with_recovery(&appeared.path, corrected)
+            .expect("same path should open after correction");
+        assert!(appeared.path.is_file());
+        drop(writer);
+    }
+
+    #[test]
+    fn oversized_serialization_has_no_writer_or_rotation_side_effects() {
+        let family = TestFamily::new("oversized-write-no-effects.jsonl");
+        let mut writer = FileEventLogWriter::open(&family.path).expect("writer should open");
+        let mut event = event_with_serialized_len(super::MAX_EVENT_LOG_RECORD_BYTES + 1);
+        let event_id = event.id;
+        let error = writer
+            .write_event(&event)
+            .expect_err("oversized event must fail before append or rotation");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(writer.current_len, 0);
+        assert!(!writer.recovery_index.event_ids.contains(&event_id));
+        assert_eq!(
+            std::fs::metadata(&family.path)
+                .expect("active should remain")
+                .len(),
+            0
+        );
+        assert_eq!(
+            super::event_log_family_paths(&family.path)
+                .expect("family should enumerate")
+                .len(),
+            1
+        );
+
+        let EventKind::RequestSeen { path, .. } = &mut event.kind else {
+            unreachable!("sized event should remain a request")
+        };
+        *path = "/corrected".to_string();
+        writer
+            .write_event(&event)
+            .expect("rejected event id must remain available after correction");
+        assert!(writer.recovery_index.event_ids.contains(&event_id));
+        assert!(writer.current_len > 0);
+    }
+
+    #[test]
+    fn recovery_index_workflow_removal_matches_both_coordinates() {
+        let target_session = SessionId::new();
+        let target_request = RequestId::new();
+        let other_session = SessionId::new();
+        let other_request = RequestId::new();
+        let target = policy_event(target_session, target_request);
+        let same_session = policy_event(target_session, other_request);
+        let same_request = policy_event(other_session, target_request);
+        let unrelated = policy_event(other_session, other_request);
+        let mut index = super::EventLogRecoveryIndex::default();
+        for event in [&target, &same_session, &same_request, &unrelated] {
+            index.durable_events.insert(event.id, event.clone());
+        }
+
+        index.remove_workflow(target_session, target_request);
+
+        assert!(!index.durable_events.contains_key(&target.id));
+        assert_eq!(index.durable_events.len(), 3);
+        for preserved in [&same_session, &same_request, &unrelated] {
+            assert_eq!(index.durable_events.get(&preserved.id), Some(preserved));
+        }
+    }
+
+    #[test]
+    fn recovery_index_requires_workflow_coordinates_for_policy_evidence() {
+        let mut event = policy_event(SessionId::new(), RequestId::new());
+        event.request_id = None;
+        let mut index = super::EventLogRecoveryIndex::default();
+        index.durable_events.insert(event.id, event);
+
+        let error = index
+            .recovery_evidence_locations()
+            .expect_err("policy evidence without a request id must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "indexed recovery event did not identify its workflow"
+        );
+    }
+
+    #[test]
+    fn selected_live_index_ignores_ordinary_events_and_releases_resolved_workflows() {
+        let family = TestFamily::new("selected-live-index-scope.jsonl");
+        let scan = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("empty selected family should scan");
+        let mut writer = FileEventLogWriter::open_with_recovery(&family.path, scan)
+            .expect("selected writer should open");
+
+        for _ in 0..=crate::policy_store::MAX_POLICY_SESSIONS {
+            let response = response_event(SessionId::new(), RequestId::new(), 200);
+            writer
+                .write_event(&response)
+                .expect("ordinary response should append without entering recovery index");
+        }
+        assert!(writer.recovery_index.durable_responses.is_empty());
+        assert!(writer.recovery_index.durable_events.is_empty());
+
+        for _ in 0..4 {
+            let session_id = SessionId::new();
+            let request_id = RequestId::new();
+            let response = response_event(session_id, request_id, 202);
+            let policy = policy_event(session_id, request_id);
+            writer
+                .write_durable_response_transaction(&response, Some(&policy))
+                .expect("durable workflow should append and pin");
+            assert_eq!(writer.recovery_index.durable_responses.len(), 1);
+            assert_eq!(writer.recovery_index.durable_events.len(), 1);
+            writer.resolve_durable_response(session_id, request_id);
+            assert!(writer.recovery_index.durable_responses.is_empty());
+            assert!(writer.recovery_index.durable_events.is_empty());
+        }
+    }
+
+    #[test]
+    fn durable_transaction_pre_io_rejections_leave_recovery_state_unchanged() {
+        let family = TestFamily::new("durable-pre-io-rejection.jsonl");
+        let scan = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
+            .expect("empty selected family should scan");
+        let mut writer = FileEventLogWriter::open_with_recovery(&family.path, scan)
+            .expect("selected writer should open");
+        let session_id = SessionId::new();
+        let request_id = RequestId::new();
+        let response = response_event(session_id, request_id, 202);
+        let mut oversized_policy = policy_event(session_id, request_id);
+        let EventKind::PolicyChanged { reason, .. } = &mut oversized_policy.kind else {
+            unreachable!("policy fixture should be policy_changed")
+        };
+        *reason = "x".repeat(super::MAX_EVENT_LOG_RECORD_BYTES);
+
+        let error = writer
+            .write_durable_response_transaction(&response, Some(&oversized_policy))
+            .expect_err("oversized durable policy event must be rejected before I/O");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(writer.current_len, 0);
+        assert_eq!(writer.unresolved_durable_response_count(), 0);
+        assert!(writer.recovery_index.event_ids.is_empty());
+        assert!(writer.recovery_index.durable_responses.is_empty());
+        assert!(writer.recovery_index.durable_events.is_empty());
+        assert!(!writer.unavailable_after_io_failure);
+
+        let valid_policy = policy_event(session_id, request_id);
+        let mut wrong_session = valid_policy.clone();
+        wrong_session.session_id = SessionId::new();
+        let mut wrong_request = valid_policy.clone();
+        wrong_request.request_id = Some(RequestId::new());
+        let mut wrong_source = valid_policy.clone();
+        wrong_source.source = EventSource::Proxy;
+        let mut wrong_kind = valid_policy;
+        wrong_kind.kind = request_event("GET", "/wrong-policy-kind").kind;
+        for (label, invalid_policy) in [
+            ("wrong session", wrong_session),
+            ("wrong request", wrong_request),
+            ("wrong source", wrong_source),
+            ("wrong event kind", wrong_kind),
+        ] {
+            let error = writer
+                .write_durable_response_transaction(&response, Some(&invalid_policy))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{label}");
+            assert_eq!(writer.current_len, 0, "{label}");
+            assert_eq!(writer.unresolved_durable_response_count(), 0, "{label}");
+            assert!(writer.recovery_index.event_ids.is_empty(), "{label}");
+            assert!(
+                writer.recovery_index.durable_responses.is_empty(),
+                "{label}"
+            );
+            assert!(writer.recovery_index.durable_events.is_empty(), "{label}");
+            assert!(!writer.unavailable_after_io_failure, "{label}");
+            assert_eq!(
+                std::fs::metadata(&family.path)
+                    .expect("active metadata should remain readable")
+                    .len(),
+                0,
+                "{label}"
+            );
+        }
+
+        let mut unsupported = response.clone();
+        unsupported.schema_version = eidolon_core::EVENT_SCHEMA_VERSION - 1;
+        let error = writer
+            .write_durable_response(&unsupported)
+            .expect_err("unsupported durable response schema must be rejected before I/O");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(writer.current_len, 0);
+        assert_eq!(writer.unresolved_durable_response_count(), 0);
+        assert!(!writer.unavailable_after_io_failure);
+
+        let seed = request_event("GET", "/seed-duplicate-id");
+        writer.write_event(&seed).expect("seed event should append");
+        let stable_len = writer.current_len;
+        let mut duplicate = response.clone();
+        duplicate.id = seed.id;
+        let error = writer
+            .write_durable_response(&duplicate)
+            .expect_err("duplicate durable response id must be rejected before I/O");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(writer.current_len, stable_len);
+        assert_eq!(writer.unresolved_durable_response_count(), 0);
+        assert!(writer.recovery_index.durable_responses.is_empty());
+        assert!(writer.recovery_index.durable_events.is_empty());
+        assert!(!writer.unavailable_after_io_failure);
+
+        writer
+            .write_durable_response(&response)
+            .expect("corrected durable response should remain appendable");
+        assert_eq!(writer.unresolved_durable_response_count(), 1);
+        writer.resolve_durable_response(session_id, request_id);
+    }
+
+    #[test]
+    fn partial_write_and_flush_failures_poison_the_writer_before_future_appends() {
+        let first = request_event("GET", "/first");
+        let second = request_event("GET", "/second");
+        let mut partial = EventLogWriter::new(PartialThenFail {
+            bytes: Vec::new(),
+            remaining_before_failure: 16,
+        });
+
+        let error = partial
+            .write_event(&first)
+            .expect_err("partial write must propagate");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(partial.unavailable_after_io_failure);
+        assert_eq!(partial.current_len, 0);
+        assert!(partial.recovery_index.event_ids.is_empty());
+        let partial_bytes = partial.sink.bytes.clone();
+        let retry = partial
+            .write_event(&second)
+            .expect_err("poisoned writer must reject future appends");
+        assert_eq!(retry.kind(), io::ErrorKind::Other);
+        assert_eq!(partial.sink.bytes, partial_bytes);
+
+        let mut flush = EventLogWriter::new(FlushFailingSink { bytes: Vec::new() });
+        let error = flush
+            .write_event(&first)
+            .expect_err("flush failure must propagate");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(flush.unavailable_after_io_failure);
+        assert_eq!(flush.current_len, 0);
+        assert!(flush.recovery_index.event_ids.is_empty());
+        let flushed_bytes = flush.sink.bytes.clone();
+        let retry = flush
+            .write_event(&second)
+            .expect_err("flush-failed writer must reject future appends");
+        assert_eq!(retry.kind(), io::ErrorKind::Other);
+        assert_eq!(flush.sink.bytes, flushed_bytes);
+    }
+
+    struct PartialThenFail {
+        bytes: Vec<u8>,
+        remaining_before_failure: usize,
+    }
+
+    impl Write for PartialThenFail {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.remaining_before_failure == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "synthetic partial write failure",
+                ));
+            }
+            let written = buffer.len().min(self.remaining_before_failure);
+            self.bytes.extend_from_slice(&buffer[..written]);
+            self.remaining_before_failure -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FlushFailingSink {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FlushFailingSink {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "synthetic flush failure",
+            ))
         }
     }
 

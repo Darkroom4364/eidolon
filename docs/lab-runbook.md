@@ -222,6 +222,15 @@ Production validates the bounded snapshot without mutation before touching
 migration or eviction, then re-reads it under the acquired lease; invalid state
 leaves absent or existing lease metadata unchanged, while a file changed
 between those reads must pass the authoritative second validation.
+Pending recovery also validates the exact canonical size of every snapshot it
+will persist in deterministic session order. This uses one full-state byte
+count plus exact per-record deltas rather than repeatedly serializing the whole
+store. A compact current-schema input can therefore fit the read limit yet fail
+before the lease if its first recovery snapshot would exceed the write limit;
+exactly 33,554,432 bytes remains valid. The authoritative plan samples one
+reconciliation timestamp and carries it unchanged into every corresponding
+policy write, including `last_seen`, so decimal-width changes cannot create a
+post-validation overflow.
 Duplicate session IDs never use file order to select a policy. If protected
 enforcement records alone fill the record bound, a sticky persisted fallback
 makes every unknown session `blocked` before older protected metadata is
@@ -246,8 +255,13 @@ dry-runs the canonical pretty-printed rewrite, so a compact file that fits the
 read limit but would expand beyond the write limit fails before the writer
 lease. A valid file padded with JSON whitespace is accepted exactly at the byte
 limit when its canonical rewrite also fits. Missing sidecars retain the
-existing rebuild/quarantine behavior; the JSONL reconstruction input is a
-separate bound and is not covered by these sidecar limits.
+rebuild/quarantine behavior, but reconstruction now uses the bounded ordered
+event-log family described below rather than only the active file. Rebuilt
+state must pass the same non-empty identifier, non-future timestamp, maximum
+lifetime, capacity, and canonical write checks as an existing sidecar before
+any durable writer opens. Proof reconstruction adds the history-triggered
+migration quarantine before this check, so the size check covers the exact
+state later persisted.
 
 Generated session-proof responses carry `Cache-Control: private, no-store` and
 `Vary: Cookie`. Eidolon strips validators, range metadata, and CDN-specific
@@ -256,28 +270,79 @@ by `no-store`, so operators must invalidate any proof-bearing URL cached by an
 older deployment.
 
 Policy-state writes verify the same 33,554,432-byte limit before opening the
-temp file, then use fsync and rename. Bait-security sidecar writes likewise
-verify their respective 4,194,304-byte limit before creating an owner-only,
+temp file, then use fsync and rename. Production rejects a symlink or
+non-regular policy-state temp during read-only preflight, repeats the check
+under the lease, and checks again immediately before persistence.
+Bait-security sidecar writes likewise verify their respective 4,194,304-byte
+limit before creating an owner-only,
 same-directory `<sidecar>.tmp` with `create_new`, then sync, rename, and sync the
 parent. During authoritative open under the single-writer lease, one regular
 crash-left temp is removed only after the committed sidecar validates; a
-symlink or non-regular object at the reserved path fails closed. This fixed
-name bounds crash residue and matches the Kubernetes recovery allowlist. A
+symlink or non-regular object at the reserved path fails closed during the
+read-only pre-lease check and again during authoritative open. This fixed name
+bounds crash residue and matches the Kubernetes recovery allowlist. A
 would-exceed or other pre-rename failure leaves the last durable file unchanged
 and rolls back exposure state or makes proof acceptance unavailable according
 to the existing fail-closed contract.
 The JSONL event and debug logs rotate at 32 MiB to collision-safe timestamped
-archives, keeping exactly 3 archives plus the active segment per log. Together
+archives, keeping up to 3 archives plus the active segment per log. Together
 those logs consume at most about 256 MiB before filesystem overhead, below the
-lab's 1 GiB PVC. Startup restores a missing newline or truncates only an
-invalid final fragment before appending, while corruption anywhere earlier
-still fails with the exact line number. The `state.policy_store`,
+lab's 1 GiB PVC. The production event family is therefore bounded to at most
+134,217,728 bytes: up to three archives named
+`<event-log>.<39 ASCII digits>`, followed by the active segment. Each event
+record is limited to 1,048,576 serialized JSON bytes excluding its newline.
+All-digit suffixes of any other length, a fourth archive, symlinks,
+directories/non-regular members, oversized segments or records, unsupported
+event schemas, duplicate event IDs, invalid complete records, and
+unterminated archive tails block startup. Nonnumeric neighbors are ignored.
+Keep the active event-log file name at or below 215 UTF-8 bytes; this reserves
+the complete 40-byte archive suffix within the supported Linux 255-byte file
+name limit. No configured durable target may use the event or debug log's
+canonical numeric archive namespace. No policy, lease, continuity, sidecar,
+temp, or debug target may hard-link an existing event-family member. The
+configured active event log must not itself hard-link a retained archive.
+
+Production checks this family and every pending response/policy contract
+read-only before acquiring the writer lease, then repeats the authoritative
+scan and contract checks under the lease before durable mutation. The
+validation includes bounded serialization of a missing expected policy event
+that recovery would need to append. It then simulates those appends and each
+workflow resolution in the same sorted order used at startup, beginning from
+the active segment's post-tail-repair length. Every required rotation also
+advances the canonical 39-digit suffix with the same checked successor rule as
+the writer; namespace exhaustion fails before the lease, while a fitting
+append does not require suffix capacity. A rotation that would discard the
+oldest of three archives while it still holds selected unresolved evidence is
+rejected before the lease or any durable-file change. The under-lease indexing
+scan repeats the pre-lease reconstruction and final semantic/canonical-size
+validation for only the missing exposure/proof sidecars while indexing all
+pending workflow evidence; existing valid sidecars remain authoritative, and
+the family is not read once per pending session. Before repair/open, a
+fixed-memory SHA-256 pass verifies that ordered
+family membership and contents still match that scan. Missing active state is
+supported for an empty deployment and for the post-rename crash window when
+canonical archives remain. A new active file is created only after the family
+validates. Only the active segment may append a missing newline to one valid
+final event or truncate one invalid final fragment; archives are immutable
+recovery input. An exactly full active segment remains in place when recovery
+has nothing to append; a validated required recovery append may rotate it.
+Rotation fails closed rather than prune an archive holding unresolved selected
+evidence. Correct the named file or archive set and restart—the same path is
+accepted once it satisfies the contract. Do not delete retained history merely
+to bypass a validation error; preserve a copy for incident analysis and restore
+from a known-good quiesced backup when integrity is uncertain.
+Bare relative event-log paths use `.` consistently for archive discovery,
+directory sync, and pruning; absolute paths remain recommended operationally.
+
+The `state.event_log_contract`, `state.policy_store`,
 `state.bait_exposure_store`, and `state.consumed_proof_store` effective
-configuration projections report only byte/record/TTL/schema bounds. Their
+configuration projections report only byte/record/TTL/schema bounds, including
+the event log's active-file-name limit. Their
 server-side `proxy_started.fields` counterparts add configured state paths and
-aggregate startup outcomes, but never file contents or durable
-session/request/bait/proof identifiers. Persistence failures use the exact
-`eidolon persistence failure:` marker.
+aggregate event-family segment/record/byte counts, selected pending-match
+counts, and startup outcomes, but never file contents or durable
+session/request/event/bait/proof identifiers. Persistence failures use the
+exact `eidolon persistence failure:` marker.
 
 These source controls do not prove behavior when a mounted persistent volume
 becomes corrupt or unavailable while the pod is running. Issue `#253` owns
@@ -301,7 +366,7 @@ This repairs the observed legacy ownership blocker, but by itself does not
 prove live upgrade, rollback, or storage-driver portability.
 
 Production first performs read-only bounded validation of existing policy,
-bait-exposure, and consumed-proof state. It then takes an exclusive
+event-family, bait-exposure, and consumed-proof state. It then takes an exclusive
 operating-system writer lease at `<policy-state-path>.lock` before opening
 durable writers or binding its listener. A second process using the same
 policy-state path fails startup instead of overlapping writes. The operating

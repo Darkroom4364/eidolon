@@ -80,27 +80,85 @@ limit is checked before replacement writes, so an oversized mutation cannot
 replace the last good snapshot. These controls bound source startup and fail
 closed on files presented at startup. Pending recovery additionally rejects
 impossible workflow/origin/depth combinations, non-deterministic response
-contracts, and colliding policy/response event IDs before durable side effects;
-issue
-`#253` separately owns live persistent-volume corruption and unavailability
-qualification for the supported deployment.
+contracts, and colliding policy/response event IDs before durable side effects.
+It also byte-counts every ordered canonical policy snapshot that recovery will
+persist, including `last_seen` refreshes, so compact current-schema expansion
+cannot fail only after other startup files have changed. Exact-limit outputs
+remain accepted. The authoritative plan's sampled timestamp is reused by the
+live recovery writes, closing decimal-width drift after validation. Issue
+`#253` separately owns live persistent-volume corruption
+and unavailability qualification for the supported deployment.
+
+The production event-log recovery family is finite: one active 33,554,432-byte
+segment plus three canonical 39-digit archives, at most 134,217,728 bytes in
+total, with no record larger than 1,048,576 bytes before its newline. Recovery
+streams fixed-size chunks, checks a limit-plus-one sentinel independently of
+metadata, accepts only complete schema-v2 events, and rejects duplicate event
+IDs across the family. Numeric archives that are not exactly 39 ASCII digits,
+a fourth archive, symlinks, non-regular family members, invalid complete
+records, and unterminated archive tails fail closed. Nonnumeric neighboring
+files are not family members.
+The active file name is capped at 215 UTF-8 bytes so every canonical suffix
+fits the supported Linux component limit. Production excludes every configured
+writer from the canonical event- and debug-archive namespaces and compares
+existing event-family member identities with all writable targets during both
+scans, including hard links with unrelated names.
+
+Production preflights that family, its active-tail repair plan, and complete
+pending response/policy contracts without the lease or mutation, then repeats
+the authoritative validation under the lease. Any missing expected policy
+event that reconciliation would append is size-checked through the production
+record serializer during both phases. Those phases also simulate the complete
+sorted append/rotation/resolution sequence from the active segment's
+post-repair length and apply the writer's checked canonical-suffix successor to
+every required rotation. A maximum 39-digit suffix therefore blocks a planned
+rotation before mutation but does not block a fitting append. A required
+rotation cannot evict the oldest of three archives while any later unresolved
+workflow still depends on evidence there. The resulting stream reconstructs
+and fully validates only missing bounded bait-security sidecars in both the
+pre-lease and authoritative scans and builds one selected response/policy
+index for at most 8,192 pending workflows; existing
+valid sidecars remain authoritative. A fixed-memory SHA-256 pass verifies the
+same ordered membership and bytes before repair/open. This makes startup work
+linear in retained family bytes rather than pending sessions times family
+bytes. Live appends add payloads only for durable pending workflows and remove
+them at resolution. An exactly full active segment remains unrotated when
+recovery has no append; any required recovery rotation has already passed the
+evidence-retention simulation. The live guard still refuses to prune selected
+unresolved evidence. Bare relative paths consistently use the current directory
+for archive discovery, sync, and pruning, avoiding a post-rename empty-parent
+failure.
+Only after validation succeeds may the active tail be repaired, an archive-only
+crash window receive a new active file, policy migration/eviction persist,
+sidecars replace, or the listener bind. Diagnostics report only aggregate
+limits/counts and repair class, never durable IDs or raw records. Live PVC
+faults and descriptor-pinned directory hardening remain tracked outside this
+source-only control.
 
 The committed bait-exposure and consumed-proof sidecars are each capped at
 4,194,304 bytes and 4,096 records. Reads retain at most one byte beyond the
 limit, and writes serialize through the same ceiling before any temp file is
 created. Production preflights existing sidecars without acquiring the writer
 lease or mutating policy/log state, including a dry run of the canonical
-pretty-printed rewrite, then repeats the bounded checks during authoritative
-open. Empty, malformed, future-schema, over-capacity,
-future-lifetime, and duplicate logical-key state fails closed; duplicates are
-checked before expiry filtering so an expired row cannot hide ambiguity. Atomic
+pretty-printed rewrite and rejection of a symlink or non-regular reserved temp,
+then repeats the bounded checks during authoritative open. Empty, malformed,
+future-schema, over-capacity, future-lifetime, and duplicate logical-key state
+fails closed; duplicates are checked before expiry filtering so an expired row
+cannot hide ambiguity. Atomic
 replacement uses an owner-only, fixed reserved `<sidecar>.tmp` created with
 `create_new`, file sync, rename, and parent sync, preserving the previous file
 on pre-rename failure. Authoritative open under the single-writer lease removes
 one regular crash-left temp only after validating the committed sidecar and
-rejects a symlink or non-regular temp. Missing sidecars still use the existing
-event-log reconstruction path; bounding that JSONL recovery input is separate
-#254 work, and live PVC proof remains #253.
+rejects a symlink or non-regular temp. Missing sidecars rebuild from the
+already-validated ordered complete event-log family, including the archive-only
+post-rename crash window. Existing valid sidecars remain authoritative. Live
+PVC proof remains #253. Missing-sidecar reconstruction must also pass the same
+identifier, timestamp, lifetime, capacity, and canonical-size semantics as a
+loaded sidecar before durable startup mutation; consumed-proof reconstruction
+adds its history quarantine before that final size check.
+The policy snapshot's reserved temp path is also checked without mutation in
+both preparation phases and immediately before persistence; a symlink or
+non-regular object cannot defer failure until after lease or event-log effects.
 
 ## Defensive Boundary
 

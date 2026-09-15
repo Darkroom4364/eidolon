@@ -21,12 +21,23 @@ Initial research-alpha source release.
 - policy-state schema 1--3 loading with a 32 MiB startup/write bound,
   order-independent duplicate-session rejection, and pre-migration pending
   workflow/response/event-contract validation; production preflights invalid
-  state before touching lease metadata and revalidates under the lease
+  state and its reserved temp type before touching lease metadata and
+  revalidates under the lease and immediately before persistence
 - schema-v1 bait-exposure and consumed-proof sidecars with independent 4 MiB
   startup/write bounds, strict duplicate-key and lifetime validation, and
   owner-only atomic replacement through a bounded reserved temp; production
   preflights existing sidecars and their canonical rewrite before lease or
   durable-log effects
+- bounded schema-v2 event-log recovery across one active 32 MiB segment and
+  three canonical numeric archives (128 MiB total), with a 1 MiB record cap,
+  a 215-byte active-file-name limit, reserved event/debug archive namespaces
+  and hard-link isolation (including active-to-archive aliases), streaming
+  validation, global duplicate-event rejection,
+  active-only tail repair, immutable full-family verification, missing-only
+  full-family sidecar reconstruction, pre-mutation workflow-contract
+  validation, evidence-safe deferred rotation, preflight sizing for missing
+  recovery appends and final quarantine-bearing proof state, and one selected
+  pending-workflow index built during the authoritative under-lease scan
 
 ### Limitations
 

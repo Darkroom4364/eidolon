@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fmt, fs,
     future::Future,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -35,7 +35,11 @@ use eidolon_proxy::{
     },
     debug_log::FileDebugLogWriter,
     event_log::{
-        read_jsonl_reconstruction, DurableResponseMatch, FileEventLogWriter, JsonlTailRepairOutcome,
+        event_log_record_append_bytes_without_mutation, has_canonical_event_log_archive_name,
+        scan_event_log_family, DurableResponseMatch, EventLogRecoveryPlanStep,
+        EventLogRecoveryScan, EventLogRecoveryTarget, FileEventLogWriter, JsonlTailRepairOutcome,
+        LOG_ARCHIVES_KEPT, LOG_ROTATE_BYTES, MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES,
+        MAX_EVENT_LOG_FAMILY_BYTES, MAX_EVENT_LOG_RECORD_BYTES,
     },
     http_request::{
         canonical_request_target, normalized_request_host, HttpHeader, HttpRequest, HttpVersion,
@@ -46,7 +50,7 @@ use eidolon_proxy::{
     policy::{self, InterventionMode},
     policy_store::{
         ControlledRealityPendingInteractionKind, ControlledRealityPendingResponse,
-        ControlledRealityProgress, PolicyStateStore,
+        ControlledRealityProgress, PendingControlledRealityRecoveryDecision, PolicyStateStore,
     },
     production_runtime::{
         dispatch_production_upstream, serve_production_http1, ProductionPreServiceRejection,
@@ -861,40 +865,20 @@ impl ConfigBuilder {
         };
         if profile == RuntimeProfile::Production {
             let debug_log_path = debug_log_path.as_deref().expect("validated above");
-            let event_exposures_path = sidecar_state_path(&event_log_path, ".exposures.json");
-            let event_consumed_proofs_path =
-                sidecar_state_path(&event_log_path, ".consumed-proofs.json");
-            let continuity_path = sidecar_state_path(&policy_state_path, ".continuity.json");
-            let writable_paths = vec![
-                ("event-log", event_log_path.clone()),
-                ("event-log-exposures", event_exposures_path.clone()),
-                (
-                    "event-log-exposures-temp",
-                    sidecar_state_path(&event_exposures_path, ".tmp"),
-                ),
-                (
-                    "event-log-consumed-proofs",
-                    event_consumed_proofs_path.clone(),
-                ),
-                (
-                    "event-log-consumed-proofs-temp",
-                    sidecar_state_path(&event_consumed_proofs_path, ".tmp"),
-                ),
-                ("policy-state", policy_state_path.clone()),
-                ("policy-state-lease", state_lease_path(&policy_state_path)),
-                ("policy-state-temp", policy_state_path.with_extension("tmp")),
-                ("policy-continuity", continuity_path.clone()),
-                (
-                    "policy-continuity-temp",
-                    sidecar_state_path(&continuity_path, ".tmp"),
-                ),
-                ("debug-log", debug_log_path.to_path_buf()),
-            ];
+            let writable_paths =
+                production_writable_paths(&event_log_path, &policy_state_path, debug_log_path);
             let writable_path_refs = writable_paths
                 .iter()
                 .map(|(label, path)| (*label, path.as_path()))
                 .collect::<Vec<_>>();
             ensure_production_durable_paths_are_distinct(&writable_path_refs)?;
+            ensure_production_writable_paths_avoid_rotating_log_archive_namespaces(
+                &[
+                    ("event-log", event_log_path.as_path()),
+                    ("debug-log", debug_log_path),
+                ],
+                &writable_path_refs,
+            )?;
             let read_only_inputs = [
                 ("bait-profile", self.bait_profile_path.as_deref()),
                 (
@@ -1055,6 +1039,21 @@ fn policy_store_contract_projection() -> Value {
     })
 }
 
+fn event_log_contract_projection() -> Value {
+    json!({
+        "max_segment_bytes": LOG_ROTATE_BYTES,
+        "max_archives": LOG_ARCHIVES_KEPT,
+        "max_family_bytes": MAX_EVENT_LOG_FAMILY_BYTES,
+        "max_record_bytes": MAX_EVENT_LOG_RECORD_BYTES,
+        "max_active_file_name_bytes": MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES,
+        "schema": {
+            "current": EVENT_SCHEMA_VERSION,
+            "minimum_supported": EVENT_SCHEMA_VERSION,
+            "maximum_supported": EVENT_SCHEMA_VERSION,
+        },
+    })
+}
+
 fn bait_exposure_store_contract_projection() -> Value {
     json!({
         "max_bytes": MAX_BAIT_EXPOSURE_STORE_BYTES,
@@ -1116,6 +1115,7 @@ fn effective_config_projection(config: &ProxyConfig) -> Value {
         },
         "state": {
             "event_log": "configured",
+            "event_log_contract": event_log_contract_projection(),
             "policy_state": "configured",
             "debug_log": config.debug_log_path.is_some(),
             "policy_store": policy_store_contract_projection(),
@@ -1782,6 +1782,66 @@ fn meaningful_parent(path: &Path) -> Option<&Path> {
         .filter(|parent| !parent.as_os_str().is_empty())
 }
 
+fn production_writable_paths(
+    event_log_path: &Path,
+    policy_state_path: &Path,
+    debug_log_path: &Path,
+) -> Vec<(&'static str, PathBuf)> {
+    let event_exposures_path = sidecar_state_path(event_log_path, ".exposures.json");
+    let event_consumed_proofs_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
+    let continuity_path = sidecar_state_path(policy_state_path, ".continuity.json");
+    vec![
+        ("event-log", event_log_path.to_path_buf()),
+        ("event-log-exposures", event_exposures_path.clone()),
+        (
+            "event-log-exposures-temp",
+            sidecar_state_path(&event_exposures_path, ".tmp"),
+        ),
+        (
+            "event-log-consumed-proofs",
+            event_consumed_proofs_path.clone(),
+        ),
+        (
+            "event-log-consumed-proofs-temp",
+            sidecar_state_path(&event_consumed_proofs_path, ".tmp"),
+        ),
+        ("policy-state", policy_state_path.to_path_buf()),
+        ("policy-state-lease", state_lease_path(policy_state_path)),
+        ("policy-state-temp", policy_state_path.with_extension("tmp")),
+        ("policy-continuity", continuity_path.clone()),
+        (
+            "policy-continuity-temp",
+            sidecar_state_path(&continuity_path, ".tmp"),
+        ),
+        ("debug-log", debug_log_path.to_path_buf()),
+    ]
+}
+
+fn ensure_production_writable_paths_avoid_rotating_log_archive_namespaces(
+    rotating_logs: &[(&str, &Path)],
+    writable_paths: &[(&str, &Path)],
+) -> Result<(), ConfigError> {
+    for (rotating_label, rotating_path) in rotating_logs {
+        let rotating_target = canonical_durable_file_target(rotating_path)?;
+        let rotating_parent = rotating_target.parent().ok_or_else(|| {
+            ConfigError::new(format!(
+                "{rotating_label} durable target has no resolved parent directory"
+            ))
+        })?;
+        for (label, path) in writable_paths {
+            let candidate = canonical_durable_file_target(path)?;
+            if candidate.parent() == Some(rotating_parent)
+                && has_canonical_event_log_archive_name(&rotating_target, &candidate)
+            {
+                return Err(ConfigError::new(format!(
+                    "`--profile production` reserves the {rotating_label} archive namespace: {label} targets a canonical {rotating_label} archive"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_production_durable_paths_are_distinct(
     paths: &[(&str, &Path)],
 ) -> Result<(), ConfigError> {
@@ -1938,6 +1998,36 @@ fn durable_paths_alias(left: &Path, right: &Path) -> Result<bool, ConfigError> {
     }
 
     Ok(false)
+}
+
+fn validate_production_event_family_path_isolation_without_mutation(
+    config: &ProxyConfig,
+    recovery: &EventLogRecoveryScan,
+) -> io::Result<()> {
+    let debug_log_path = config
+        .debug_log_path
+        .as_deref()
+        .ok_or_else(|| invalid_data("production debug log path is missing"))?;
+    let writable_paths = production_writable_paths(
+        &config.event_log_path,
+        &config.policy_state_path,
+        debug_log_path,
+    );
+    for family_path in recovery.family_segment_paths() {
+        for (label, writable_path) in &writable_paths {
+            if *label == "event-log" && family_path == *writable_path {
+                continue;
+            }
+            let aliases = durable_paths_alias(family_path, writable_path)
+                .map_err(|error| invalid_data(error.to_string()))?;
+            if aliases {
+                return Err(invalid_data(format!(
+                    "production writable target {label} aliases an event-log family member"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_production_path_components_are_not_symlinks(path: &Path) -> Result<(), ConfigError> {
@@ -2193,6 +2283,228 @@ fn ingress_continuity_key_mode(
     }
 }
 
+fn event_log_recovery_targets(policy_store: &PolicyStateStore) -> Vec<EventLogRecoveryTarget> {
+    policy_store
+        .pending_event_log_recovery_coordinates()
+        .into_iter()
+        .map(
+            |(session_id, request_id, expected_policy_event_id)| EventLogRecoveryTarget {
+                session_id,
+                request_id,
+                expected_policy_event_id,
+            },
+        )
+        .collect()
+}
+
+fn validate_pending_event_log_recovery(
+    policy_store: &PolicyStateStore,
+    recovery: &EventLogRecoveryScan,
+    reconciliation_unix_secs: u64,
+) -> io::Result<()> {
+    let pending_sessions = policy_store.pending_controlled_reality_sessions();
+    let mut event_log_steps = Vec::with_capacity(pending_sessions.len());
+    let mut policy_decisions = Vec::with_capacity(pending_sessions.len());
+    for session_id in pending_sessions {
+        let record = policy_store.record(session_id);
+        let Some(pending) = record.controlled_reality_pending_update else {
+            continue;
+        };
+        let request_id = pending.request_id;
+        if pending.commit_policy_state.is_some() != pending.expected_policy_changed.is_some() {
+            return Err(invalid_data(
+                "pending controlled-reality policy transition contract was incomplete",
+            ));
+        }
+
+        let (durable_response_seen, recovered_policy_event_bytes) = match (
+            pending.expected_response,
+            recovery.indexed_durable_response(session_id, request_id),
+        ) {
+            (_, DurableResponseMatch::Missing) => {
+                if let Some(expected_policy_changed) = pending.expected_policy_changed.as_ref() {
+                    if recovery
+                        .indexed_durable_event_by_id(
+                            session_id,
+                            request_id,
+                            expected_policy_changed.id,
+                        )?
+                        .is_some()
+                    {
+                        return Err(invalid_data(
+                            "durable policy transition existed without its workflow response",
+                        ));
+                    }
+                }
+                (false, None)
+            }
+            (None, DurableResponseMatch::Unique { .. }) => {
+                return Err(invalid_data(
+                    "durable response existed without a pending response contract",
+                ));
+            }
+            (
+                Some(expected),
+                DurableResponseMatch::Unique {
+                    event_id,
+                    policy_state,
+                    status,
+                    routing_decision,
+                    controlled_reality,
+                },
+            ) => {
+                let interaction_kind =
+                    controlled_reality
+                        .as_ref()
+                        .map(|interaction| match &interaction.action {
+                            eidolon_core::ControlledRealityInteractionAction::JobSubmitted => {
+                                ControlledRealityPendingInteractionKind::JobSubmitted
+                            }
+                            eidolon_core::ControlledRealityInteractionAction::StatusRead => {
+                                ControlledRealityPendingInteractionKind::StatusRead
+                            }
+                            eidolon_core::ControlledRealityInteractionAction::ArtifactRead {
+                                ..
+                            } => ControlledRealityPendingInteractionKind::ArtifactRead,
+                        });
+                if event_id != expected.event_id
+                    || policy_state != expected.policy_state
+                    || status != expected.status
+                    || routing_decision != expected.routing_decision
+                    || interaction_kind != expected.interaction_kind
+                    || controlled_reality_semantics_sha256(&controlled_reality)?
+                        != expected.controlled_reality_sha256
+                {
+                    return Err(invalid_data(
+                        "durable response conflicted with its pending response contract",
+                    ));
+                }
+                let recovered_policy_event_bytes = if let Some(expected_policy_changed) =
+                    pending.expected_policy_changed.as_ref()
+                {
+                    match recovery.indexed_durable_event_by_id(
+                        session_id,
+                        request_id,
+                        expected_policy_changed.id,
+                    )? {
+                        Some(actual) => {
+                            if actual != *expected_policy_changed {
+                                return Err(invalid_data(
+                                    "durable policy transition conflicted with its pending contract",
+                                ));
+                            }
+                            None
+                        }
+                        None => Some(event_log_record_append_bytes_without_mutation(
+                            expected_policy_changed,
+                        )?),
+                    }
+                } else {
+                    None
+                };
+                (true, recovered_policy_event_bytes)
+            }
+        };
+        event_log_steps.push(EventLogRecoveryPlanStep {
+            session_id,
+            request_id,
+            recovered_policy_event_bytes,
+        });
+        policy_decisions.push(PendingControlledRealityRecoveryDecision {
+            session_id,
+            request_id,
+            durable_response_seen,
+        });
+    }
+    recovery.validate_reconciliation_plan(&event_log_steps)?;
+    policy_store.validate_pending_reconciliation_plan_without_mutation(
+        &policy_decisions,
+        reconciliation_unix_secs,
+    )?;
+    Ok(())
+}
+
+fn load_bait_recovery_inputs(
+    config: &ProxyConfig,
+) -> io::Result<(LoadedBaitProfile, Option<Arc<str>>)> {
+    let loaded_bait_profile = match &config.bait_profile_path {
+        Some(path) => load_bait_profile(path).map_err(|error| invalid_data(error.to_string()))?,
+        None => default_loaded_bait_profile(),
+    };
+    let bait_signing_secret = match &config.bait_signing_secret_path {
+        Some(path) => Some(load_bait_signing_secret(path)?),
+        None => None,
+    };
+    if bait_profile_requires_signing_secret(&loaded_bait_profile) && bait_signing_secret.is_none() {
+        return Err(invalid_data(
+            "bait profile contains session-minted bait values but no bait signing secret file was configured",
+        ));
+    }
+    Ok((loaded_bait_profile, bait_signing_secret))
+}
+
+fn finalize_recovered_bait_security_sidecars_without_mutation(
+    rebuild_bait_exposures: bool,
+    rebuild_consumed_bait_proofs: bool,
+    recovered_bait_exposures: &mut BaitExposureStore,
+    recovered_consumed_bait_proofs: &mut ConsumedBaitProofStore,
+    event_log_recovery: &EventLogRecoveryScan,
+    now: u64,
+) -> io::Result<()> {
+    if rebuild_bait_exposures {
+        recovered_bait_exposures.torn_tail_line = event_log_recovery.active_torn_tail_line;
+        recovered_bait_exposures.validate_recovered_state(now)?;
+    }
+    if rebuild_consumed_bait_proofs {
+        recovered_consumed_bait_proofs.torn_tail_line = event_log_recovery.active_torn_tail_line;
+        recovered_consumed_bait_proofs.prepare_recovered_state_for_persistence(
+            now,
+            event_log_recovery.stats.family_bytes > 0,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_production_recovery_without_mutation(config: &ProxyConfig) -> io::Result<()> {
+    let now = current_unix_secs();
+    let policy_store = PolicyStateStore::prepare_open(&config.policy_state_path)?;
+    let recovery_targets = event_log_recovery_targets(&policy_store);
+    let PreparedBaitSecuritySidecars {
+        bait_exposures: prepared_bait_exposures,
+        consumed_bait_proofs: prepared_consumed_bait_proofs,
+    } = prepare_bait_security_sidecars_without_mutation(&config.event_log_path, now)?;
+    let rebuild_bait_exposures = prepared_bait_exposures.is_none();
+    let rebuild_consumed_bait_proofs = prepared_consumed_bait_proofs.is_none();
+    let (loaded_bait_profile, bait_signing_secret) = load_bait_recovery_inputs(config)?;
+    let mut recovered_bait_exposures = BaitExposureStore::default();
+    let mut recovered_consumed_bait_proofs = ConsumedBaitProofStore::default();
+    let event_log_recovery =
+        scan_event_log_family(&config.event_log_path, &recovery_targets, |event| {
+            if rebuild_bait_exposures {
+                recovered_bait_exposures.apply_event_log_event(event, now)?;
+            }
+            if rebuild_consumed_bait_proofs {
+                recovered_consumed_bait_proofs.apply_event_log_event(
+                    event,
+                    &loaded_bait_profile.registry,
+                    bait_signing_secret.as_deref(),
+                    now,
+                )?;
+            }
+            Ok(())
+        })?;
+    validate_production_event_family_path_isolation_without_mutation(config, &event_log_recovery)?;
+    finalize_recovered_bait_security_sidecars_without_mutation(
+        rebuild_bait_exposures,
+        rebuild_consumed_bait_proofs,
+        &mut recovered_bait_exposures,
+        &mut recovered_consumed_bait_proofs,
+        &event_log_recovery,
+        now,
+    )?;
+    validate_pending_event_log_recovery(&policy_store, &event_log_recovery, now)
+}
+
 fn run_proxy_with_shutdown(
     config: ProxyConfig,
     production_shutdown: ProductionShutdown,
@@ -2202,11 +2514,7 @@ fn run_proxy_with_shutdown(
     let profile = config.profile;
     let listen_addr = config.listen_addr;
     if profile == RuntimeProfile::Production {
-        PolicyStateStore::validate_without_mutation(&config.policy_state_path)?;
-        validate_bait_security_sidecars_without_mutation(
-            &config.event_log_path,
-            current_unix_secs(),
-        )?;
+        validate_production_recovery_without_mutation(&config)?;
     }
     let (ingress_transport_auth_secret, previous_ingress_transport_auth_secret) =
         load_ingress_transport_auth_secrets(
@@ -2228,19 +2536,7 @@ fn run_proxy_with_shutdown(
         ingress_transport_auth_secret.is_some(),
     );
     let state_lease = DurableStateLease::acquire_for_policy_state(&config.policy_state_path)?;
-    let loaded_bait_profile = match &config.bait_profile_path {
-        Some(path) => load_bait_profile(path).map_err(|error| invalid_data(error.to_string()))?,
-        None => default_loaded_bait_profile(),
-    };
-    let bait_signing_secret = match &config.bait_signing_secret_path {
-        Some(path) => Some(load_bait_signing_secret(path)?),
-        None => None,
-    };
-    if bait_profile_requires_signing_secret(&loaded_bait_profile) && bait_signing_secret.is_none() {
-        return Err(invalid_data(
-            "bait profile contains session-minted bait values but no bait signing secret file was configured",
-        ));
-    }
+    let (loaded_bait_profile, bait_signing_secret) = load_bait_recovery_inputs(&config)?;
     let bait_profile_debug = bait_profile_debug_value(&loaded_bait_profile.metadata);
     let bait_registry = Arc::new(loaded_bait_profile.registry);
     let bait_content = loaded_bait_profile.content;
@@ -2263,9 +2559,54 @@ fn run_proxy_with_shutdown(
         "key_version_count": session_authority.key_version_count(),
     });
     let now = current_unix_secs();
-    let continuity_history_exists = event_log_history_exists(&config.event_log_path)?
+    let prepared_policy_store = PolicyStateStore::prepare_open(&config.policy_state_path)?;
+    let recovery_targets = event_log_recovery_targets(&prepared_policy_store);
+    let PreparedBaitSecuritySidecars {
+        bait_exposures: prepared_bait_exposures,
+        consumed_bait_proofs: prepared_consumed_bait_proofs,
+    } = prepare_bait_security_sidecars_without_mutation(&config.event_log_path, now)?;
+    let rebuild_bait_exposures = prepared_bait_exposures.is_none();
+    let rebuild_consumed_bait_proofs = prepared_consumed_bait_proofs.is_none();
+    let mut recovered_bait_exposures = BaitExposureStore::default();
+    let mut recovered_consumed_bait_proofs = ConsumedBaitProofStore::default();
+    let event_log_recovery =
+        scan_event_log_family(&config.event_log_path, &recovery_targets, |event| {
+            if rebuild_bait_exposures {
+                recovered_bait_exposures.apply_event_log_event(event, now)?;
+            }
+            if rebuild_consumed_bait_proofs {
+                recovered_consumed_bait_proofs.apply_event_log_event(
+                    event,
+                    &bait_registry,
+                    bait_signing_secret.as_deref(),
+                    now,
+                )?;
+            }
+            Ok(())
+        })?;
+    if profile == RuntimeProfile::Production {
+        validate_production_event_family_path_isolation_without_mutation(
+            &config,
+            &event_log_recovery,
+        )?;
+    }
+    let recovered_event_log_history_exists = event_log_recovery.stats.family_bytes > 0;
+    finalize_recovered_bait_security_sidecars_without_mutation(
+        rebuild_bait_exposures,
+        rebuild_consumed_bait_proofs,
+        &mut recovered_bait_exposures,
+        &mut recovered_consumed_bait_proofs,
+        &event_log_recovery,
+        now,
+    )?;
+    validate_pending_event_log_recovery(&prepared_policy_store, &event_log_recovery, now)?;
+    let event_log_recovery_stats = event_log_recovery.stats;
+    let continuity_history_exists = event_log_recovery_stats.family_bytes > 0
         || path_has_nonempty_file(&config.policy_state_path)?;
-    let policy_store = PolicyStateStore::open(&config.policy_state_path)?;
+    let event_log_writer =
+        FileEventLogWriter::open_with_recovery(&config.event_log_path, event_log_recovery)?;
+    let event_log_tail_repair = event_log_writer.startup_tail_repair();
+    let policy_store = prepared_policy_store.finish_prepared_startup()?;
     let policy_store_eviction = policy_store.last_eviction_stats();
     let policy_store_session_count = policy_store.len();
     let policy_store_fail_closed_for_unknown_sessions =
@@ -2278,7 +2619,12 @@ fn run_proxy_with_shutdown(
         }
         None => (None, None),
     };
-    let bait_exposures = BaitExposureStore::open_or_rebuild(&config.event_log_path, now)?;
+    let bait_exposures = BaitExposureStore::open_or_rebuild_with_recovery(
+        &config.event_log_path,
+        now,
+        prepared_bait_exposures,
+        recovered_bait_exposures,
+    )?;
     let restored_bait_exposure_count = bait_exposures.len();
     let restored_bait_exposure_ttl_evicted = bait_exposures.ttl_evicted;
     let restored_bait_exposure_torn_tail_line = bait_exposures.torn_tail_line;
@@ -2287,11 +2633,14 @@ fn run_proxy_with_shutdown(
         .clone()
         .ok_or_else(|| io::Error::other("bait exposure store opened without a state path"))?;
     let bait_exposure_state_bytes = fs::metadata(&bait_exposure_state_path)?.len();
-    let consumed_bait_proofs = ConsumedBaitProofStore::open_or_rebuild(
+    let consumed_bait_proofs = ConsumedBaitProofStore::open_or_rebuild_with_recovery(
         &config.event_log_path,
-        &bait_registry,
-        bait_signing_secret.as_deref(),
         now,
+        prepared_consumed_bait_proofs,
+        (
+            recovered_consumed_bait_proofs,
+            recovered_event_log_history_exists,
+        ),
     )?;
     let restored_consumed_bait_proof_count = consumed_bait_proofs.consumed.len();
     let restored_consumed_bait_proof_torn_tail_line = consumed_bait_proofs.torn_tail_line;
@@ -2339,8 +2688,6 @@ fn run_proxy_with_shutdown(
                     "reconciled_floor_count": reconciled_floor_count,
                 })
             });
-    let event_log_writer = FileEventLogWriter::open(&config.event_log_path)?;
-    let event_log_tail_repair = event_log_writer.startup_tail_repair();
     let controlled_reality_backend = match &config.controlled_reality_backend {
         Some(backend) => Some(Arc::new(
             ControlledRealityBackendClient::from_target(
@@ -2388,7 +2735,7 @@ fn run_proxy_with_shutdown(
         bait_exposures: Arc::new(Mutex::new(bait_exposures)),
         consumed_bait_proofs: Arc::new(Mutex::new(consumed_bait_proofs)),
     };
-    reconcile_all_pending_controlled_reality_interactions(&runtime)?;
+    reconcile_all_pending_controlled_reality_interactions_at(&runtime, now)?;
     let policy_store_bytes = std::fs::metadata(&config.policy_state_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -2441,6 +2788,17 @@ fn run_proxy_with_shutdown(
                 },
             },
             "event_log_tail_repair": jsonl_tail_repair_debug(event_log_tail_repair),
+            "event_log_recovery": {
+                "archive_count": event_log_recovery_stats.archive_count,
+                "segment_count": event_log_recovery_stats.segment_count,
+                "record_count": event_log_recovery_stats.record_count,
+                "family_bytes": event_log_recovery_stats.family_bytes,
+                "active_bytes": event_log_recovery_stats.active_bytes,
+                "targeted_pending_workflow_count": recovery_targets.len(),
+                "indexed_durable_response_count": event_log_recovery_stats.indexed_durable_response_count,
+                "indexed_policy_event_count": event_log_recovery_stats.indexed_policy_event_count,
+                "contract": event_log_contract_projection(),
+            },
             "debug_log_tail_repair": debug_log_tail_repair.map(jsonl_tail_repair_debug),
             "event_log_bytes": std::fs::metadata(&config.event_log_path)
                 .map(|metadata| metadata.len())
@@ -3217,19 +3575,27 @@ fn auxiliary_state_temp_path(path: &Path) -> PathBuf {
     sidecar_state_path(path, ".tmp")
 }
 
-/// Authoritative store opening runs under the process-wide writer lease. A
-/// fixed reserved name keeps crash residue bounded, while `create_new` still
-/// prevents a collision or symlink from being followed during replacement.
-fn remove_stale_auxiliary_state_temp(path: &Path) -> io::Result<()> {
+/// Validate bounded crash residue without changing it. Production calls this
+/// before the writer lease and repeats it when authoritative opening removes a
+/// regular stale file. `create_new` still prevents a changed path or symlink
+/// from being followed during replacement.
+fn validate_auxiliary_state_temp_without_mutation(path: &Path) -> io::Result<bool> {
     let temp = auxiliary_state_temp_path(path);
     match fs::symlink_metadata(&temp) {
         Ok(metadata) if !metadata.is_file() => Err(invalid_data(
             "auxiliary state temporary path is not a regular file",
         )),
-        Ok(_) => fs::remove_file(temp),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn remove_stale_auxiliary_state_temp(path: &Path) -> io::Result<()> {
+    if validate_auxiliary_state_temp_without_mutation(path)? {
+        fs::remove_file(auxiliary_state_temp_path(path))?;
+    }
+    Ok(())
 }
 
 fn sync_state_parent_directory(path: &Path) -> io::Result<()> {
@@ -3273,6 +3639,7 @@ fn parse_digest_hex(value: &str) -> io::Result<[u8; 32]> {
     Ok(digest)
 }
 
+#[cfg(test)]
 fn event_log_history_exists(path: &Path) -> io::Result<bool> {
     if path_has_nonempty_file(path)? {
         return Ok(true);
@@ -3304,33 +3671,59 @@ fn path_has_nonempty_file(path: &Path) -> io::Result<bool> {
     }
 }
 
+#[cfg(test)]
 fn validate_bait_security_sidecars_without_mutation(
     event_log_path: &Path,
     now: u64,
 ) -> io::Result<()> {
+    prepare_bait_security_sidecars_without_mutation(event_log_path, now).map(drop)
+}
+
+struct PreparedBaitSecuritySidecars {
+    bait_exposures: Option<BaitExposureStore>,
+    consumed_bait_proofs: Option<ConsumedBaitProofStore>,
+}
+
+fn prepare_bait_security_sidecars_without_mutation(
+    event_log_path: &Path,
+    now: u64,
+) -> io::Result<PreparedBaitSecuritySidecars> {
     let exposure_path = sidecar_state_path(event_log_path, ".exposures.json");
-    if let Some(bytes) = read_auxiliary_state_file(
+    let bait_exposures = read_auxiliary_state_file(
         &exposure_path,
         "bait exposure state",
         MAX_BAIT_EXPOSURE_STORE_BYTES,
-    )? {
-        BaitExposureStore::from_state_bytes(exposure_path, &bytes, now)?
-            .validate_canonical_serialization()?;
-    }
+    )?
+    .map(|bytes| {
+        let store = BaitExposureStore::from_state_bytes(exposure_path.clone(), &bytes, now)?;
+        store.validate_canonical_serialization()?;
+        Ok::<BaitExposureStore, io::Error>(store)
+    })
+    .transpose()?;
+    validate_auxiliary_state_temp_without_mutation(&exposure_path)?;
 
     let consumed_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
-    if let Some(bytes) = read_auxiliary_state_file(
+    let consumed_bait_proofs = read_auxiliary_state_file(
         &consumed_path,
         "consumed proof state",
         MAX_CONSUMED_PROOF_STORE_BYTES,
-    )? {
-        ConsumedBaitProofStore::from_state_bytes(consumed_path, &bytes, now)?
-            .validate_canonical_serialization()?;
-    }
-    Ok(())
+    )?
+    .map(|bytes| {
+        let store = ConsumedBaitProofStore::from_state_bytes(consumed_path.clone(), &bytes, now)?;
+        store.validate_canonical_serialization()?;
+        Ok::<ConsumedBaitProofStore, io::Error>(store)
+    })
+    .transpose()?;
+    validate_auxiliary_state_temp_without_mutation(&consumed_path)?;
+
+    Ok(PreparedBaitSecuritySidecars {
+        bait_exposures,
+        consumed_bait_proofs,
+    })
 }
 
 impl ConsumedBaitProofStore {
+    #[cfg(test)]
     fn open_or_rebuild(
         event_log_path: &Path,
         registry: &BaitRegistry,
@@ -3338,28 +3731,42 @@ impl ConsumedBaitProofStore {
         now: u64,
     ) -> io::Result<Self> {
         let state_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
-        match read_auxiliary_state_file(
+        let prepared = read_auxiliary_state_file(
             &state_path,
             "consumed proof state",
             MAX_CONSUMED_PROOF_STORE_BYTES,
-        )? {
-            Some(bytes) => {
-                let store = Self::from_state_bytes(state_path.clone(), &bytes, now)?;
+        )?
+        .map(|bytes| Self::from_state_bytes(state_path, &bytes, now))
+        .transpose()?;
+        let recovered = if prepared.is_none() {
+            (
+                Self::from_event_log(event_log_path, registry, signing_secret, now)?,
+                event_log_history_exists(event_log_path)?,
+            )
+        } else {
+            (Self::default(), false)
+        };
+        Self::open_or_rebuild_with_recovery(event_log_path, now, prepared, recovered)
+    }
+
+    fn open_or_rebuild_with_recovery(
+        event_log_path: &Path,
+        now: u64,
+        prepared: Option<Self>,
+        recovered: (Self, bool),
+    ) -> io::Result<Self> {
+        let state_path = sidecar_state_path(event_log_path, ".consumed-proofs.json");
+        match prepared {
+            Some(store) => {
                 store.validate_canonical_serialization()?;
                 remove_stale_auxiliary_state_temp(&state_path)?;
                 store.persist()?;
                 Ok(store)
             }
             None => {
-                let history_exists = event_log_history_exists(event_log_path)?;
-                let mut store =
-                    Self::from_event_log(event_log_path, registry, signing_secret, now)?;
+                let (mut store, history_exists) = recovered;
                 store.path = Some(state_path.clone());
-                if history_exists {
-                    store.migration_quarantine_until =
-                        Some(now.saturating_add(MAX_BAIT_PROOF_TTL_SECS));
-                }
-                store.validate_canonical_serialization()?;
+                store.prepare_recovered_state_for_persistence(now, history_exists)?;
                 remove_stale_auxiliary_state_temp(&state_path)?;
                 store.persist()?;
                 Ok(store)
@@ -3429,92 +3836,123 @@ impl ConsumedBaitProofStore {
         })
     }
 
+    #[cfg(test)]
     fn from_event_log(
         path: &Path,
         registry: &BaitRegistry,
         signing_secret: Option<&str>,
         now: u64,
     ) -> io::Result<Self> {
-        let file = match fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(error),
-        };
         let mut store = Self::default();
-        let source = read_jsonl_reconstruction(BufReader::new(file))?;
-        for (line_index, line) in source.lines.iter().enumerate() {
-            let line_number = line_index + 1;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let event: Event = match serde_json::from_str(line) {
-                Ok(event) => event,
-                Err(_error) if source.is_torn_tail(line_index) => {
-                    store.torn_tail_line = Some(line_number);
-                    eprintln!(
-                        "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
-                    );
-                    break;
-                }
-                Err(error) => {
-                    return Err(invalid_data(format!(
-                        "could not rebuild consumed bait proof store from event log line {line_number}: {error}"
-                    )))
-                }
-            };
-            if event.schema_version != EVENT_SCHEMA_VERSION {
-                return Err(invalid_data(format!(
-                    "could not rebuild consumed bait proof store from event log line {}: unsupported schema version {}",
-                    line_index + 1,
-                    event.schema_version
-                )));
-            }
-            let EventKind::BaitActionObserved {
-                bait_id,
-                header_value_mint_status,
-                ..
-            } = event.kind
-            else {
-                continue;
-            };
-            if !matches!(
-                header_value_mint_status,
-                Some(BaitHeaderValueMintStatus::MatchedSessionValue)
-                    | Some(BaitHeaderValueMintStatus::ReplaySeen)
-            ) {
-                continue;
-            }
-            let Some(bait) = registry.baits().iter().find(|bait| bait.id == bait_id) else {
-                continue;
-            };
-            let issued_at = u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
-            let rendered = eidolon_bait::render_bait_for_session_at(
-                bait,
-                event.session_id,
-                signing_secret,
-                issued_at,
-            )
-            .map_err(|error| invalid_data(error.to_string()))?;
-            let Some(proof_value) = rendered.expected_action.header_value.clone() else {
-                continue;
-            };
-            let expires_at = proof_expiry_epoch_seconds(bait, &proof_value)?;
-            if expires_at <= now {
-                continue;
-            }
-            let key = (event.session_id, bait_id, proof_digest(&proof_value));
-            if let Some(existing_expiry) = store.consumed.get_mut(&key) {
-                *existing_expiry = expires_at;
-                continue;
-            }
-            if store.consumed.len() >= MAX_CONSUMED_BAIT_PROOFS {
-                return Err(invalid_data(
-                    "active consumed bait proof state exceeds configured capacity",
-                ));
-            }
-            store.consumed.insert(key, expires_at);
+        let recovery = scan_event_log_family(path, &[], |event| {
+            store.apply_event_log_event(event, registry, signing_secret, now)
+        })?;
+        store.torn_tail_line = recovery.active_torn_tail_line;
+        if let Some(line_number) = store.torn_tail_line {
+            eprintln!(
+                "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
+            );
         }
         Ok(store)
+    }
+
+    fn apply_event_log_event(
+        &mut self,
+        event: &Event,
+        registry: &BaitRegistry,
+        signing_secret: Option<&str>,
+        now: u64,
+    ) -> io::Result<()> {
+        let EventKind::BaitActionObserved {
+            bait_id,
+            header_value_mint_status,
+            ..
+        } = &event.kind
+        else {
+            return Ok(());
+        };
+        if !matches!(
+            header_value_mint_status,
+            Some(BaitHeaderValueMintStatus::MatchedSessionValue)
+                | Some(BaitHeaderValueMintStatus::ReplaySeen)
+        ) {
+            return Ok(());
+        }
+        if bait_id.0.trim().is_empty() {
+            return Err(invalid_data(
+                "reconstructed consumed proof contains an empty bait identifier",
+            ));
+        }
+        let Some(bait) = registry.baits().iter().find(|bait| bait.id == *bait_id) else {
+            return Ok(());
+        };
+        let issued_at = u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
+        let rendered = eidolon_bait::render_bait_for_session_at(
+            bait,
+            event.session_id,
+            signing_secret,
+            issued_at,
+        )
+        .map_err(|error| invalid_data(error.to_string()))?;
+        let Some(proof_value) = rendered.expected_action.header_value.clone() else {
+            return Ok(());
+        };
+        let expires_at = proof_expiry_epoch_seconds(bait, &proof_value)?;
+        if expires_at <= now {
+            return Ok(());
+        }
+        if expires_at.saturating_sub(now) > MAX_BAIT_PROOF_TTL_SECS {
+            return Err(invalid_data(
+                "reconstructed consumed proof expiry exceeds the maximum proof lifetime",
+            ));
+        }
+        let key = (
+            event.session_id,
+            bait_id.clone(),
+            proof_digest(&proof_value),
+        );
+        if let Some(existing_expiry) = self.consumed.get_mut(&key) {
+            *existing_expiry = expires_at;
+            return Ok(());
+        }
+        if self.consumed.len() >= MAX_CONSUMED_BAIT_PROOFS {
+            return Err(invalid_data(
+                "active consumed bait proof state exceeds configured capacity",
+            ));
+        }
+        self.consumed.insert(key, expires_at);
+        Ok(())
+    }
+
+    fn validate_recovered_state(&self, now: u64) -> io::Result<()> {
+        if self.consumed.len() > MAX_CONSUMED_BAIT_PROOFS {
+            return Err(invalid_data(
+                "reconstructed consumed proof state exceeds configured capacity",
+            ));
+        }
+        for ((_, bait_id, _), expires_at) in &self.consumed {
+            if bait_id.0.trim().is_empty() {
+                return Err(invalid_data(
+                    "reconstructed consumed proof contains an empty bait identifier",
+                ));
+            }
+            if *expires_at <= now || expires_at.saturating_sub(now) > MAX_BAIT_PROOF_TTL_SECS {
+                return Err(invalid_data(
+                    "reconstructed consumed proof has an invalid expiry",
+                ));
+            }
+        }
+        self.validate_canonical_serialization()
+    }
+
+    fn prepare_recovered_state_for_persistence(
+        &mut self,
+        now: u64,
+        history_exists: bool,
+    ) -> io::Result<()> {
+        self.migration_quarantine_until =
+            history_exists.then_some(now.saturating_add(MAX_BAIT_PROOF_TTL_SECS));
+        self.validate_recovered_state(now)
     }
 
     fn check_and_mark(
@@ -3660,22 +4098,40 @@ fn proof_expiry_epoch_seconds(bait: &Bait, proof_value: &str) -> io::Result<u64>
 }
 
 impl BaitExposureStore {
+    #[cfg(test)]
     fn open_or_rebuild(event_log_path: &Path, now: u64) -> io::Result<Self> {
         let state_path = sidecar_state_path(event_log_path, ".exposures.json");
-        match read_auxiliary_state_file(
+        let prepared = read_auxiliary_state_file(
             &state_path,
             "bait exposure state",
             MAX_BAIT_EXPOSURE_STORE_BYTES,
-        )? {
-            Some(bytes) => {
-                let store = Self::from_state_bytes(state_path.clone(), &bytes, now)?;
+        )?
+        .map(|bytes| Self::from_state_bytes(state_path, &bytes, now))
+        .transpose()?;
+        let recovered = if prepared.is_none() {
+            Self::from_event_log_at(event_log_path, now)?
+        } else {
+            Self::default()
+        };
+        Self::open_or_rebuild_with_recovery(event_log_path, now, prepared, recovered)
+    }
+
+    fn open_or_rebuild_with_recovery(
+        event_log_path: &Path,
+        _now: u64,
+        prepared: Option<Self>,
+        recovered: Self,
+    ) -> io::Result<Self> {
+        let state_path = sidecar_state_path(event_log_path, ".exposures.json");
+        match prepared {
+            Some(store) => {
                 store.validate_canonical_serialization()?;
                 remove_stale_auxiliary_state_temp(&state_path)?;
                 store.persist()?;
                 Ok(store)
             }
             None => {
-                let mut store = Self::from_event_log_at(event_log_path, now)?;
+                let mut store = recovered;
                 store.path = Some(state_path.clone());
                 store.validate_canonical_serialization()?;
                 remove_stale_auxiliary_state_temp(&state_path)?;
@@ -3742,87 +4198,69 @@ impl BaitExposureStore {
         Self::from_event_log_at(path, current_unix_secs())
     }
 
-    fn from_event_log_at(path: &Path, now: u64) -> io::Result<Self> {
-        let file = match fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(error),
-        };
-
-        Self::from_event_log_reader_at(BufReader::new(file), now)
-    }
-
     #[cfg(test)]
-    fn from_event_log_reader(reader: impl BufRead) -> io::Result<Self> {
-        Self::from_event_log_reader_at(reader, current_unix_secs())
+    fn from_event_log_at(path: &Path, now: u64) -> io::Result<Self> {
+        let mut store = Self::default();
+        let recovery =
+            scan_event_log_family(path, &[], |event| store.apply_event_log_event(event, now))?;
+        store.torn_tail_line = recovery.active_torn_tail_line;
+        if let Some(line_number) = store.torn_tail_line {
+            eprintln!(
+                "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
+            );
+        }
+        Ok(store)
     }
 
-    fn from_event_log_reader_at(reader: impl BufRead, now: u64) -> io::Result<Self> {
-        let source = read_jsonl_reconstruction(reader)?;
-        let mut store = Self::default();
-        let mut torn_tail_line = None;
-
-        for (line_index, line) in source.lines.iter().enumerate() {
-            let line_number = line_index + 1;
-            if line.trim().is_empty() {
-                continue;
+    fn apply_event_log_event(&mut self, event: &Event, now: u64) -> io::Result<()> {
+        if let EventKind::BaitExposed {
+            bait_id,
+            exposure_id,
+            ..
+        } = &event.kind
+        {
+            if bait_id.0.trim().is_empty() || exposure_id.0.trim().is_empty() {
+                return Err(invalid_data(
+                    "reconstructed bait exposure contains an empty identifier",
+                ));
             }
-
-            let value: Value = match serde_json::from_str(line) {
-                Ok(value) => value,
-                Err(_error) if source.is_torn_tail(line_index) => {
-                    torn_tail_line = Some(line_number);
-                    eprintln!(
-                        "eidolon startup: ignoring crash-torn event log tail at line {line_number}; reconstructed up to the tear"
-                    );
-                    break;
-                }
-                Err(error) => {
-                    return Err(invalid_data(format!(
-                        "could not rebuild bait exposure store from event log line {line_number}: {error}"
-                    )))
-                }
-            };
-            let schema_version = value
-                .get("schema_version")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    invalid_data(format!(
-                        "could not rebuild bait exposure store from event log line {line_number}: missing schema_version"
-                    ))
-                })?;
-            if schema_version != u64::from(EVENT_SCHEMA_VERSION) {
-                return Err(invalid_data(format!(
-                    "could not rebuild bait exposure store from event log line {line_number}: unsupported schema_version {schema_version}; expected {EVENT_SCHEMA_VERSION}"
-                )));
+            let observed_at_unix_secs = u64::try_from(event.observed_at.timestamp())
+                .map_err(|_| invalid_data("reconstructed bait exposure predates Unix time"))?;
+            if observed_at_unix_secs > now {
+                return Err(invalid_data(
+                    "reconstructed bait exposure contains a future-dated timestamp",
+                ));
             }
+            self.apply_record_exposure_at(
+                event.session_id,
+                bait_id.clone(),
+                exposure_id.clone(),
+                observed_at_unix_secs,
+                now,
+            );
+        }
+        Ok(())
+    }
 
-            let event: Event = serde_json::from_value(value).map_err(|error| {
-                invalid_data(format!(
-                    "could not rebuild bait exposure store from event log line {line_number}: {error}"
-                ))
-            })?;
-
-            if let EventKind::BaitExposed {
-                bait_id,
-                exposure_id,
-                ..
-            } = event.kind
-            {
-                let observed_at_unix_secs =
-                    u64::try_from(event.observed_at.timestamp()).unwrap_or_default();
-                store.apply_record_exposure_at(
-                    event.session_id,
-                    bait_id,
-                    exposure_id,
-                    observed_at_unix_secs,
-                    now,
-                );
+    fn validate_recovered_state(&self, now: u64) -> io::Result<()> {
+        if self.exposures.len() > MAX_BAIT_EXPOSURES {
+            return Err(invalid_data(
+                "reconstructed bait exposure state exceeds the fixed record limit",
+            ));
+        }
+        for ((_, bait_id), record) in &self.exposures {
+            if bait_id.0.trim().is_empty() || record.exposure_id.0.trim().is_empty() {
+                return Err(invalid_data(
+                    "reconstructed bait exposure contains an empty identifier",
+                ));
+            }
+            if record.observed_at_unix_secs > now {
+                return Err(invalid_data(
+                    "reconstructed bait exposure contains a future-dated timestamp",
+                ));
             }
         }
-
-        store.torn_tail_line = torn_tail_line;
-        Ok(store)
+        self.validate_canonical_serialization()
     }
 
     fn len(&self) -> usize {
@@ -6845,6 +7283,14 @@ fn reconcile_pending_controlled_reality_interaction(
     runtime: &ProxyRuntime,
     session_id: SessionId,
 ) -> io::Result<()> {
+    reconcile_pending_controlled_reality_interaction_at(runtime, session_id, current_unix_secs())
+}
+
+fn reconcile_pending_controlled_reality_interaction_at(
+    runtime: &ProxyRuntime,
+    session_id: SessionId,
+    reconciliation_unix_secs: u64,
+) -> io::Result<()> {
     let record = runtime
         .policy_store
         .lock()
@@ -6966,7 +7412,12 @@ fn reconcile_pending_controlled_reality_interaction(
         .policy_store
         .lock()
         .map_err(|_| io::Error::other("policy state store lock poisoned"))?
-        .reconcile_pending_controlled_reality(session_id, request_id, durable_response_seen)?;
+        .reconcile_pending_controlled_reality_at(
+            session_id,
+            request_id,
+            durable_response_seen,
+            reconciliation_unix_secs,
+        )?;
     runtime
         .event_log
         .lock()
@@ -6976,6 +7427,13 @@ fn reconcile_pending_controlled_reality_interaction(
 }
 
 fn reconcile_all_pending_controlled_reality_interactions(runtime: &ProxyRuntime) -> io::Result<()> {
+    reconcile_all_pending_controlled_reality_interactions_at(runtime, current_unix_secs())
+}
+
+fn reconcile_all_pending_controlled_reality_interactions_at(
+    runtime: &ProxyRuntime,
+    reconciliation_unix_secs: u64,
+) -> io::Result<()> {
     let sessions = runtime
         .policy_store
         .lock()
@@ -6986,7 +7444,11 @@ fn reconcile_all_pending_controlled_reality_interactions(runtime: &ProxyRuntime)
     }
     for session_id in sessions {
         let _guard = runtime.controlled_reality_workflow_locks.lock(session_id)?;
-        reconcile_pending_controlled_reality_interaction(runtime, session_id)?;
+        reconcile_pending_controlled_reality_interaction_at(
+            runtime,
+            session_id,
+            reconciliation_unix_secs,
+        )?;
     }
     runtime
         .event_log
@@ -9081,6 +9543,8 @@ mod tests {
     };
     use serde_json::Value;
 
+    const PRODUCTION_PROFILE_TEST_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
     struct ShortReader {
         bytes: Cursor<Vec<u8>>,
         max_read: usize,
@@ -9258,6 +9722,18 @@ mod tests {
                 "eidolon-proxy-{label}-{}-{counter}-{nanos}",
                 std::process::id()
             ))
+    }
+
+    fn event_log_archive_path(path: &Path, stamp: u128) -> PathBuf {
+        let mut archive = path.as_os_str().to_os_string();
+        archive.push(format!(".{stamp:039}"));
+        archive.into()
+    }
+
+    fn event_log_archive_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut archive = path.as_os_str().to_os_string();
+        archive.push(format!(".{suffix}"));
+        archive.into()
     }
 
     fn write_bait_profile(contents: &str) -> PathBuf {
@@ -10371,7 +10847,7 @@ mod tests {
             )
         });
         let address = started_received
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(PRODUCTION_PROFILE_TEST_STARTUP_TIMEOUT)
             .expect("production profile server should bind");
 
         ProductionProfileServer {
@@ -10531,6 +11007,30 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default()
+    }
+
+    fn wait_for_bait_proof_window_headroom(bait: &Bait) {
+        const MINIMUM_HEADROOM_SECS: u64 = 10;
+        let proof_window = bait
+            .expected_action
+            .header_value_mint
+            .as_ref()
+            .and_then(|mint| mint.proof_window_seconds)
+            .expect("minted test bait should use a proof window");
+        assert!(
+            proof_window >= MINIMUM_HEADROOM_SECS,
+            "minted test bait must provide enough proof-window headroom"
+        );
+        let wait_deadline = Instant::now()
+            .checked_add(Duration::from_secs(MINIMUM_HEADROOM_SECS + 2))
+            .expect("proof-window wait deadline should fit");
+        while proof_window.saturating_sub(now_unix_secs() % proof_window) < MINIMUM_HEADROOM_SECS {
+            assert!(
+                Instant::now() < wait_deadline,
+                "system clock did not leave the proof-window boundary"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
     }
 
     fn minted_cookie_value(session_id: SessionId) -> String {
@@ -10801,6 +11301,42 @@ mod tests {
     }
 
     #[test]
+    fn lab_startup_without_debug_log_skips_production_event_family_isolation() {
+        let occupied_listener =
+            TcpListener::bind("127.0.0.1:0").expect("occupied lab address should bind");
+        let listen_addr = occupied_listener
+            .local_addr()
+            .expect("occupied lab address should resolve")
+            .to_string();
+        let event_log_path = unique_temp_path("lab-no-debug-events.jsonl");
+        let policy_state_path = unique_temp_path("lab-no-debug-policy.json");
+        let intervention_control_path = unique_temp_path("lab-no-debug-control.txt");
+        let args = [
+            "--listen-addr".to_string(),
+            listen_addr,
+            "--event-log".to_string(),
+            path_str(&event_log_path, "lab event path should be UTF-8").to_string(),
+            "--policy-state".to_string(),
+            path_str(&policy_state_path, "lab policy path should be UTF-8").to_string(),
+            "--intervention-control".to_string(),
+            path_str(
+                &intervention_control_path,
+                "lab control path should be UTF-8",
+            )
+            .to_string(),
+        ];
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let config = run_config(&args).expect("lab config without a debug log should parse");
+        assert_eq!(config.profile, RuntimeProfile::Lab);
+        assert!(config.debug_log_path.is_none());
+
+        let error = run_proxy_with_production_shutdown(config, async {}, None)
+            .expect_err("the occupied address should stop lab startup after state preparation");
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
     fn continuity_key_mode_distinguishes_configured_fallback_and_disabled() {
         assert_eq!(ingress_continuity_key_mode(true, true), "configured");
         assert_eq!(ingress_continuity_key_mode(true, false), "configured");
@@ -10968,6 +11504,10 @@ mod tests {
         assert_eq!(
             effective["state"]["policy_store"],
             policy_store_contract_projection()
+        );
+        assert_eq!(
+            effective["state"]["event_log_contract"],
+            event_log_contract_projection()
         );
         assert_eq!(
             effective["state"]["bait_exposure_store"],
@@ -11630,6 +12170,1414 @@ mod tests {
         assert!(!startup_debug.contains(&malformed_session.0.to_string()));
         assert!(!startup_debug.contains(PRIVATE_VALUE));
         assert!(!startup_debug.contains(&corrected_session.0.to_string()));
+    }
+
+    #[test]
+    fn invalid_event_family_fails_before_production_effects_and_allows_correction() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let private_session = SessionId(uuid::Uuid::from_u128(0x0fee_d312));
+        let private_request = RequestId(uuid::Uuid::from_u128(0x0caf_e312));
+        const PRIVATE_PATH: &str = "/private-event-family-path";
+        let event = Event::new(
+            private_session,
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::RequestSeen {
+                method: "GET".to_string(),
+                path: PRIVATE_PATH.to_string(),
+                safe_headers: Vec::new(),
+                ingress_identity: Default::default(),
+                authenticated_ingress_rule_rejection: None,
+                local_ingress_trust_scope_rejection: None,
+                trusted_ingress_soften_match: None,
+                ingress_signals: Default::default(),
+                discovery_recon_score: Default::default(),
+                routing_decision: RoutingDecision::ProtectedUpstream,
+            },
+        )
+        .with_request_id(private_request);
+        let line = serde_json::to_string(&event).expect("private event should serialize");
+        let invalid_family = format!("{line}\n{line}\n").into_bytes();
+        fs::write(&fixture.event_log_path, &invalid_family)
+            .expect("duplicate event family should write");
+
+        let legacy_policy = br#"{"schema_version":1,"sessions":[]}"#.to_vec();
+        fs::write(&fixture.policy_state_path, &legacy_policy)
+            .expect("legacy policy state should write");
+        let debug_sentinel = br#"{"sentinel":true}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_sentinel).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_sentinel = b"preflight-must-not-touch-lease".to_vec();
+        fs::write(&lease_path, &lease_sentinel).expect("lease sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("duplicate event family must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("duplicate event id"));
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            event.id.to_string(),
+            PRIVATE_PATH.to_string(),
+        ] {
+            assert!(
+                !diagnostic.contains(&private),
+                "event preflight diagnostic leaked `{private}`"
+            );
+        }
+        assert!(
+            started_received.try_recv().is_err(),
+            "invalid family must fail before listener bind"
+        );
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(
+            fs::read(&fixture.event_log_path).expect("invalid event family should read"),
+            invalid_family
+        );
+        assert_eq!(
+            fs::read(&fixture.policy_state_path).expect("policy state should read"),
+            legacy_policy,
+            "event rejection must precede policy migration"
+        );
+        assert_eq!(
+            fs::read(&fixture.debug_log_path).expect("debug sentinel should read"),
+            debug_sentinel
+        );
+        assert_eq!(
+            fs::read(&lease_path).expect("lease sentinel should read"),
+            lease_sentinel
+        );
+        for absent in [&exposure_path, &proof_path, &continuity_path] {
+            assert!(
+                !absent.exists(),
+                "event rejection created `{}`",
+                absent.display()
+            );
+        }
+        let lease = DurableStateLease::acquire_for_policy_state(&fixture.policy_state_path)
+            .expect("rejected preflight must leave the lease acquirable");
+        drop(lease);
+
+        let corrected_family = format!("{line}\n").into_bytes();
+        fs::write(&fixture.event_log_path, &corrected_family)
+            .expect("corrected event family should write");
+        let debug_log_path = fixture.debug_log_path.clone();
+        let server = start_production_profile_server(fixture);
+        assert!(server.address.ip().is_loopback());
+        server.stop();
+
+        assert!(
+            upstream_recorder.finish().is_empty(),
+            "preflight and corrected startup must not reach upstream"
+        );
+        let startup = debug_values(&debug_log_path)
+            .into_iter()
+            .find(|entry| entry["event"] == "proxy_started")
+            .expect("corrected startup should emit a recovery projection");
+        assert_eq!(startup["fields"]["event_log_recovery"]["archive_count"], 0);
+        assert_eq!(startup["fields"]["event_log_recovery"]["segment_count"], 1);
+        assert_eq!(startup["fields"]["event_log_recovery"]["record_count"], 1);
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["family_bytes"],
+            corrected_family.len()
+        );
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["active_bytes"],
+            corrected_family.len()
+        );
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["targeted_pending_workflow_count"],
+            0
+        );
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["indexed_durable_response_count"],
+            0
+        );
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["indexed_policy_event_count"],
+            0
+        );
+        assert_eq!(
+            startup["fields"]["event_log_recovery"]["contract"],
+            event_log_contract_projection()
+        );
+        let startup_debug = startup.to_string();
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            event.id.to_string(),
+            PRIVATE_PATH.to_string(),
+        ] {
+            assert!(
+                !startup_debug.contains(&private),
+                "startup recovery projection leaked `{private}`"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_pending_response_fails_before_production_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let private_session = SessionId(uuid::Uuid::from_u128(0x0fee_d313));
+        let private_request = RequestId(uuid::Uuid::from_u128(0x0caf_e313));
+        let expected_event_id = uuid::Uuid::from_u128(0x0bad_e313);
+        let expected = {
+            let mut store = PolicyStateStore::open(&fixture.policy_state_path)
+                .expect("policy store should open for pending setup");
+            store
+                .set_policy_state(private_session, PolicyState::ControlledReality)
+                .expect("controlled state should persist");
+            let progress = store
+                .note_controlled_reality_interaction(
+                    private_session,
+                    private_request,
+                    eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+                    MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+                )
+                .expect("pending workflow should persist");
+            let expected = ControlledRealityResponder.expected_response(
+                private_session,
+                progress,
+                eidolon_proxy::policy_store::ControlledRealityRequestAction::JobSubmitted,
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+            );
+            store
+                .set_pending_controlled_reality_response(
+                    private_session,
+                    private_request,
+                    ControlledRealityPendingResponse {
+                        event_id: expected_event_id,
+                        policy_state: PolicyState::ControlledReality,
+                        status: expected.status,
+                        routing_decision: expected.routing_decision,
+                        interaction_kind: Some(
+                            ControlledRealityPendingInteractionKind::JobSubmitted,
+                        ),
+                        controlled_reality_sha256: controlled_reality_semantics_sha256(
+                            &expected.interaction,
+                        )
+                        .expect("expected interaction should serialize"),
+                    },
+                )
+                .expect("pending response contract should persist");
+            expected
+        };
+        let policy_before = fs::read(&fixture.policy_state_path)
+            .expect("pending policy state should remain readable");
+        let conflicting = Event::new(
+            private_session,
+            EventSource::Proxy,
+            PolicyState::ControlledReality,
+            EventKind::ResponseServed {
+                status: expected.status.saturating_add(1),
+                routing_decision: expected.routing_decision,
+                controlled_reality: expected.interaction,
+            },
+        )
+        .with_request_id(private_request);
+        let event_before = format!(
+            "{}\n{{\"schema_version\":",
+            serde_json::to_string(&conflicting).expect("conflicting event should serialize")
+        )
+        .into_bytes();
+        fs::write(&fixture.event_log_path, &event_before)
+            .expect("conflicting repairable event family should write");
+
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let debug_before = br#"{"sentinel":"pending-conflict"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"pending-conflict-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("conflicting pending response must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("durable response conflicted"));
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            expected_event_id.to_string(),
+            conflicting.id.to_string(),
+        ] {
+            assert!(
+                !error.to_string().contains(&private),
+                "pending conflict diagnostic leaked `{private}`"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn oversized_missing_recovery_policy_event_fails_before_production_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let private_session = SessionId(uuid::Uuid::from_u128(0x0fee_d314));
+        let private_request = RequestId(uuid::Uuid::from_u128(0x0caf_e314));
+        let transition =
+            policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+                PolicyState::ControlledReality,
+                "route:controlled_follow_up",
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+            )
+            .expect("oversized recovery fixture should have a blocked transition");
+        let mut expected_policy_changed =
+            policy::policy_changed_event(private_session, private_request, &transition);
+        let EventKind::PolicyChanged { reason, .. } = &mut expected_policy_changed.kind else {
+            panic!("recovery fixture should remain a policy transition")
+        };
+        reason.clear();
+        let empty_reason_len = serde_json::to_vec(&expected_policy_changed)
+            .expect("empty-reason recovery event should serialize")
+            .len();
+        let EventKind::PolicyChanged { reason, .. } = &mut expected_policy_changed.kind else {
+            panic!("recovery fixture should remain a policy transition")
+        };
+        *reason = "x".repeat(
+            (MAX_EVENT_LOG_RECORD_BYTES + 1)
+                .checked_sub(empty_reason_len)
+                .expect("recovery event envelope should fit the record ceiling"),
+        );
+        assert_eq!(
+            serde_json::to_vec(&expected_policy_changed)
+                .expect("sized recovery event should serialize")
+                .len(),
+            MAX_EVENT_LOG_RECORD_BYTES + 1
+        );
+        let expected_policy_event_id = expected_policy_changed.id;
+
+        let response = Event::new(
+            private_session,
+            EventSource::Proxy,
+            PolicyState::Blocked,
+            EventKind::ResponseServed {
+                status: 403,
+                routing_decision: RoutingDecision::EidolonOwned,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(private_request);
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [{
+                "session_id": private_session.0,
+                "policy_state": "controlled_reality",
+                "controlled_reality_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                "controlled_reality_workflow_state": "ready",
+                "controlled_reality_origin_request_id": null,
+                "controlled_reality_pending_update": {
+                    "request_id": private_request.0,
+                    "request_action": "branch_read",
+                    "previous_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 1,
+                    "previous_state": "ready",
+                    "previous_origin_request_id": null,
+                    "commit_policy_state": "blocked",
+                    "expected_policy_changed": expected_policy_changed,
+                    "expected_response": {
+                        "event_id": response.id,
+                        "policy_state": "blocked",
+                        "status": 403,
+                        "routing_decision": "eidolon_owned",
+                        "interaction_kind": null,
+                        "controlled_reality_sha256": controlled_reality_semantics_sha256(&None)
+                            .expect("absent response semantics should serialize"),
+                    },
+                },
+            }],
+        }))
+        .expect("oversized recovery policy state should serialize");
+        assert!(
+            policy_before.len() < eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES,
+            "the policy store ceiling must not be the rejection under test"
+        );
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("pending policy state should write");
+        let event_before = format!(
+            "{}\n{{\"schema_version\":",
+            serde_json::to_string(&response).expect("durable response should serialize")
+        )
+        .into_bytes();
+        fs::write(&fixture.event_log_path, &event_before)
+            .expect("repairable event family should write");
+
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let debug_before = br#"{"sentinel":"oversized-recovery-policy"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"oversized-recovery-policy-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("oversized missing recovery event must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("serialized event exceeds"));
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            response.id.to_string(),
+            expected_policy_event_id.to_string(),
+        ] {
+            assert!(
+                !error.to_string().contains(&private),
+                "oversized recovery diagnostic leaked `{private}`"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn unsafe_recovery_rotation_fails_before_production_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let private_session = SessionId(uuid::Uuid::from_u128(0x0fee_d315));
+        let private_request = RequestId(uuid::Uuid::from_u128(0x0caf_e315));
+        let transition =
+            policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+                PolicyState::ControlledReality,
+                "route:controlled_follow_up",
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+            )
+            .expect("rotation recovery fixture should have a blocked transition");
+        let expected_policy_changed =
+            policy::policy_changed_event(private_session, private_request, &transition);
+        let expected_policy_event_id = expected_policy_changed.id;
+        let response = Event::new(
+            private_session,
+            EventSource::Proxy,
+            PolicyState::Blocked,
+            EventKind::ResponseServed {
+                status: 403,
+                routing_decision: RoutingDecision::EidolonOwned,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(private_request);
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [{
+                "session_id": private_session.0,
+                "policy_state": "controlled_reality",
+                "controlled_reality_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                "controlled_reality_workflow_state": "ready",
+                "controlled_reality_origin_request_id": null,
+                "controlled_reality_pending_update": {
+                    "request_id": private_request.0,
+                    "request_action": "branch_read",
+                    "previous_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 1,
+                    "previous_state": "ready",
+                    "previous_origin_request_id": null,
+                    "commit_policy_state": "blocked",
+                    "expected_policy_changed": expected_policy_changed,
+                    "expected_response": {
+                        "event_id": response.id,
+                        "policy_state": "blocked",
+                        "status": 403,
+                        "routing_decision": "eidolon_owned",
+                        "interaction_kind": null,
+                        "controlled_reality_sha256": controlled_reality_semantics_sha256(&None)
+                            .expect("absent response semantics should serialize"),
+                    },
+                },
+            }],
+        }))
+        .expect("rotation recovery policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("pending policy state should write");
+
+        let oldest_archive = event_log_archive_path(&fixture.event_log_path, 1);
+        let middle_archive = event_log_archive_path(&fixture.event_log_path, 2);
+        let newest_archive = event_log_archive_path(&fixture.event_log_path, 3);
+        let oldest_before = format!(
+            "{}\n",
+            serde_json::to_string(&response).expect("durable response should serialize")
+        )
+        .into_bytes();
+        let neighbor_before = b"\n".to_vec();
+        let mut active_before = vec![b'\n'; LOG_ROTATE_BYTES as usize - 2];
+        active_before.push(b' ');
+        assert_eq!(active_before.len(), LOG_ROTATE_BYTES as usize - 1);
+        fs::write(&oldest_archive, &oldest_before).expect("oldest archive should write");
+        fs::write(&middle_archive, &neighbor_before).expect("middle archive should write");
+        fs::write(&newest_archive, &neighbor_before).expect("newest archive should write");
+        fs::write(&fixture.event_log_path, &active_before).expect("full active log should write");
+
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let debug_before = br#"{"sentinel":"unsafe-recovery-rotation"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"unsafe-recovery-rotation-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("unsafe recovery rotation must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("would prune unresolved"));
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            response.id.to_string(),
+            expected_policy_event_id.to_string(),
+        ] {
+            assert!(
+                !error.to_string().contains(&private),
+                "unsafe rotation diagnostic leaked `{private}`"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), active_before);
+        assert_eq!(fs::read(&oldest_archive).unwrap(), oldest_before);
+        assert_eq!(fs::read(&middle_archive).unwrap(), neighbor_before);
+        assert_eq!(fs::read(&newest_archive).unwrap(), neighbor_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn exhausted_recovery_archive_namespace_fails_before_production_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let private_session = SessionId(uuid::Uuid::from_u128(0x0fee_d316));
+        let private_request = RequestId(uuid::Uuid::from_u128(0x0caf_e316));
+        let transition =
+            policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+                PolicyState::ControlledReality,
+                "route:controlled_follow_up",
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                MAX_CONTROLLED_REALITY_ACTION_DEPTH,
+            )
+            .expect("namespace recovery fixture should have a blocked transition");
+        let expected_policy_changed =
+            policy::policy_changed_event(private_session, private_request, &transition);
+        let expected_policy_event_id = expected_policy_changed.id;
+        let response = Event::new(
+            private_session,
+            EventSource::Proxy,
+            PolicyState::Blocked,
+            EventKind::ResponseServed {
+                status: 403,
+                routing_decision: RoutingDecision::EidolonOwned,
+                controlled_reality: None,
+            },
+        )
+        .with_request_id(private_request);
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [{
+                "session_id": private_session.0,
+                "policy_state": "controlled_reality",
+                "controlled_reality_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 2,
+                "controlled_reality_workflow_state": "ready",
+                "controlled_reality_origin_request_id": null,
+                "controlled_reality_pending_update": {
+                    "request_id": private_request.0,
+                    "request_action": "branch_read",
+                    "previous_depth": MAX_CONTROLLED_REALITY_ACTION_DEPTH + 1,
+                    "previous_state": "ready",
+                    "previous_origin_request_id": null,
+                    "commit_policy_state": "blocked",
+                    "expected_policy_changed": expected_policy_changed,
+                    "expected_response": {
+                        "event_id": response.id,
+                        "policy_state": "blocked",
+                        "status": 403,
+                        "routing_decision": "eidolon_owned",
+                        "interaction_kind": null,
+                        "controlled_reality_sha256": controlled_reality_semantics_sha256(&None)
+                            .expect("absent response semantics should serialize"),
+                    },
+                },
+            }],
+        }))
+        .expect("namespace recovery policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("pending policy state should write");
+
+        let exhausted_archive =
+            event_log_archive_path_with_suffix(&fixture.event_log_path, &"9".repeat(39));
+        let archive_before = b"\n".to_vec();
+        fs::write(&exhausted_archive, &archive_before)
+            .expect("maximum archive suffix should write");
+        let mut active_before = format!(
+            "{}\n",
+            serde_json::to_string(&response).expect("durable response should serialize")
+        )
+        .into_bytes();
+        active_before.resize(LOG_ROTATE_BYTES as usize, b'\n');
+        fs::write(&fixture.event_log_path, &active_before)
+            .expect("exact-limit active log should write");
+
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let debug_before = br#"{"sentinel":"exhausted-recovery-namespace"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"exhausted-recovery-namespace-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("exhausted recovery namespace must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("archive namespace is exhausted"));
+        for private in [
+            private_session.0.to_string(),
+            private_request.0.to_string(),
+            response.id.to_string(),
+            expected_policy_event_id.to_string(),
+        ] {
+            assert!(
+                !error.to_string().contains(&private),
+                "namespace recovery diagnostic leaked `{private}`"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), active_before);
+        assert_eq!(fs::read(&exhausted_archive).unwrap(), archive_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn current_schema_reconciliation_expansion_fails_before_production_startup_mutation() {
+        const PENDING_WORKFLOWS: u128 = 2;
+
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let last_session = SessionId(uuid::Uuid::from_u128(PENDING_WORKFLOWS));
+        let last_request = RequestId(uuid::Uuid::from_u128(10_000 + PENDING_WORKFLOWS));
+        let last_policy_event_id = {
+            let mut store = PolicyStateStore::open(&fixture.policy_state_path)
+                .expect("policy store should open for expansion setup");
+            for index in 1..=PENDING_WORKFLOWS {
+                let session_id = SessionId(uuid::Uuid::from_u128(index));
+                let request_id = RequestId(uuid::Uuid::from_u128(10_000 + index));
+                store
+                    .set_policy_state(session_id, PolicyState::ControlledReality)
+                    .expect("controlled policy state should persist");
+                store
+                    .note_controlled_reality_interaction(
+                        session_id,
+                        request_id,
+                        eidolon_proxy::policy_store::ControlledRealityRequestAction::UnknownResource,
+                        u32::MAX,
+                    )
+                    .expect("pending workflow should persist");
+            }
+            let transition =
+                policy::transition_to_blocked_from_repeated_controlled_reality_depth_limit(
+                    PolicyState::ControlledReality,
+                    "route:controlled_follow_up",
+                    2,
+                    0,
+                )
+                .expect("expansion fixture should have a blocked transition");
+            let expected_policy_changed =
+                policy::policy_changed_event(last_session, last_request, &transition);
+            let event_id = expected_policy_changed.id;
+            store
+                .stage_controlled_reality_policy_state(
+                    last_session,
+                    last_request,
+                    PolicyState::Blocked,
+                    expected_policy_changed,
+                )
+                .expect("last pending policy transition should persist");
+            event_id
+        };
+        let mut compact_state: Value = serde_json::from_slice(
+            &fs::read(&fixture.policy_state_path).expect("staged policy state should read"),
+        )
+        .expect("staged policy state should parse");
+        {
+            let sessions = compact_state["sessions"]
+                .as_array_mut()
+                .expect("policy sessions should be an array");
+            let last = sessions
+                .iter_mut()
+                .find(|session| session["session_id"] == json!(last_session.0))
+                .expect("last pending session should exist");
+            last["controlled_reality_pending_update"]["expected_policy_changed"]["kind"]
+                ["reason"] = Value::String(String::new());
+        }
+        let empty_reason_bytes = serde_json::to_vec(&compact_state)
+            .expect("compact empty-reason state should serialize")
+            .len();
+        let reason_bytes = eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES
+            .checked_sub(empty_reason_bytes)
+            .expect("compact current-schema envelope should fit the byte limit");
+        {
+            let sessions = compact_state["sessions"]
+                .as_array_mut()
+                .expect("policy sessions should remain an array");
+            let last = sessions
+                .iter_mut()
+                .find(|session| session["session_id"] == json!(last_session.0))
+                .expect("last pending session should remain present");
+            last["controlled_reality_pending_update"]["expected_policy_changed"]["kind"]
+                ["reason"] = Value::String("x".repeat(reason_bytes));
+        }
+        let policy_before = serde_json::to_vec(&compact_state)
+            .expect("compact current-schema state should serialize");
+        assert_eq!(
+            policy_before.len(),
+            eidolon_proxy::policy_store::MAX_POLICY_STORE_BYTES
+        );
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("exact-limit compact policy state should write");
+
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("event sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let debug_before = br#"{"sentinel":"policy-reconciliation-expansion"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"policy-reconciliation-expansion-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("oversized first reconciliation snapshot must reject startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("serialized policy state store exceeds"));
+        for private in [
+            last_session.0.to_string(),
+            last_request.0.to_string(),
+            last_policy_event_id.to_string(),
+        ] {
+            assert!(
+                !error.to_string().contains(&private),
+                "policy expansion diagnostic leaked `{private}`"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!fixture.policy_state_path.with_extension("tmp").exists());
+        assert!(!sidecar_state_path(&exposure_path, ".tmp").exists());
+        assert!(!sidecar_state_path(&proof_path, ".tmp").exists());
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn active_event_log_hard_link_to_archive_fails_before_existing_lease_or_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        let archive_path = event_log_archive_path(&fixture.event_log_path, 1);
+        fs::write(&archive_path, &event_before).expect("empty archive should write");
+        fs::hard_link(&archive_path, &fixture.event_log_path)
+            .expect("active hard link to the archive should create");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure state should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof state should serialize");
+        let debug_before = br#"{"sentinel":"active-archive-hard-link"}"#.to_vec();
+        fs::write(&exposure_path, &exposure_before).expect("exposure state should write");
+        fs::write(&proof_path, &proof_before).expect("proof state should write");
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"active-archive-hard-link-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("an active hard link to an event archive must reject startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "production writable target event-log aliases an event-log family member"
+        );
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&archive_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!fixture.policy_state_path.with_extension("tmp").exists());
+        assert!(!sidecar_state_path(&exposure_path, ".tmp").exists());
+        assert!(!sidecar_state_path(&proof_path, ".tmp").exists());
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn event_archive_hard_link_alias_fails_before_existing_lease_or_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("active event log should write");
+        let archive_path = event_log_archive_path(&fixture.event_log_path, 1);
+        let archive_event = Event::new(
+            SessionId::new(),
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::ResponseServed {
+                status: 204,
+                routing_decision: RoutingDecision::ProtectedUpstream,
+                controlled_reality: None,
+            },
+        );
+        let archive_before = format!(
+            "{}\n",
+            serde_json::to_string(&archive_event).expect("archive event should serialize")
+        )
+        .into_bytes();
+        fs::write(&archive_path, &archive_before).expect("event archive should write");
+        fs::hard_link(&archive_path, &fixture.debug_log_path)
+            .expect("debug hard link to the archive should create");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure state should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof state should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure state should write");
+        fs::write(&proof_path, &proof_before).expect("proof state should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"archive-hard-link-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("a writable hard link to an event archive must reject startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "production writable target debug-log aliases an event-log family member"
+        );
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&archive_path).unwrap(), archive_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), archive_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn overlong_event_file_name_fails_before_tail_repair_or_existing_lease_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let mut fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let seed = fixture
+            .event_log_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("fixture event log should have a UTF-8 file name");
+        assert!(seed.len() <= MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES);
+        let overlong_name = format!(
+            "{seed}{}",
+            "x".repeat(MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES + 1 - seed.len())
+        );
+        let event_log_path = fixture
+            .event_log_path
+            .parent()
+            .expect("fixture event log should have a parent")
+            .join(overlong_name);
+        let event_index = fixture
+            .args
+            .iter()
+            .position(|value| value == "--event-log")
+            .expect("fixture should configure an event log");
+        fixture.args[event_index + 1] =
+            path_str(&event_log_path, "overlong event path should be UTF-8").to_string();
+        let event = Event::new(
+            SessionId::new(),
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::ResponseServed {
+                status: 204,
+                routing_decision: RoutingDecision::ProtectedUpstream,
+                controlled_reality: None,
+            },
+        );
+        let event_before = serde_json::to_vec(&event).expect("repairable event should serialize");
+        fs::write(&event_log_path, &event_before).expect("overlong active name should still write");
+        let policy_before = br#"{"schema_version":1,"sessions":[]}"#.to_vec();
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("legacy policy state should write");
+        let debug_before = br#"{"sentinel":"overlong-event-file-name"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"overlong-event-file-name-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let exposure_path = sidecar_state_path(&event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&event_log_path, ".consumed-proofs.json");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("unrepresentable archive names must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(&format!(
+            "fixed {MAX_EVENT_LOG_ACTIVE_FILE_NAME_BYTES} byte limit"
+        )));
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!exposure_path.exists());
+        assert!(!proof_path.exists());
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn nonregular_policy_temp_fails_before_tail_repair_or_existing_lease_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event = Event::new(
+            SessionId::new(),
+            EventSource::Proxy,
+            PolicyState::Observe,
+            EventKind::ResponseServed {
+                status: 204,
+                routing_decision: RoutingDecision::ProtectedUpstream,
+                controlled_reality: None,
+            },
+        );
+        let event_before = serde_json::to_vec(&event).expect("repairable event should serialize");
+        fs::write(&fixture.event_log_path, &event_before)
+            .expect("repairable active event should write");
+        let policy_before = br#"{"schema_version":1,"sessions":[]}"#.to_vec();
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("legacy policy state should write");
+        let policy_temp = fixture.policy_state_path.with_extension("tmp");
+        fs::create_dir(&policy_temp).expect("nonregular policy temp should create");
+        let debug_before = br#"{"sentinel":"nonregular-policy-temp"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"nonregular-policy-temp-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("nonregular policy temp must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "policy state temporary path is not a regular file"
+        );
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(fs::metadata(&policy_temp).unwrap().is_dir());
+        assert!(!exposure_path.exists());
+        assert!(!proof_path.exists());
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fs::remove_dir(policy_temp).expect("nonregular policy temp should remove");
+        fixture.stop();
+    }
+
+    #[test]
+    fn nonregular_sidecar_temp_fails_before_existing_lease_or_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("event sentinel should write");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let debug_before = br#"{"sentinel":"nonregular-sidecar-temp"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let exposure_temp = auxiliary_state_temp_path(&exposure_path);
+        fs::create_dir(&exposure_temp).expect("nonregular reserved temp should create");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"nonregular-sidecar-temp-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("nonregular reserved temp must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "auxiliary state temporary path is not a regular file"
+        );
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(fs::metadata(&exposure_temp).unwrap().is_dir());
+        assert!(!continuity_path.exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fs::remove_dir(exposure_temp).expect("nonregular reserved temp should remove");
+        fixture.stop();
+    }
+
+    #[test]
+    fn invalid_reconstructed_exposure_fails_before_existing_lease_or_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let private_session = SessionId(uuid::Uuid::from_u128(0x0fee_d317));
+        let private_bait = BaitId("private-future-reconstructed-bait".to_string());
+        let private_exposure = ExposureId("private-future-reconstructed-exposure".to_string());
+        let now = current_unix_secs();
+        let mut future_exposure = Event::new(
+            private_session,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: private_bait.clone(),
+                bait_class: None,
+                exposure_id: private_exposure.clone(),
+                surface: "/docs".to_string(),
+                header_value_mint: None,
+            },
+        );
+        future_exposure.observed_at = chrono::DateTime::from_timestamp((now + 3_600) as i64, 0)
+            .expect("future exposure timestamp should construct");
+        let event_before = format!(
+            "{}\n",
+            serde_json::to_string(&future_exposure).expect("future exposure should serialize")
+        )
+        .into_bytes();
+        fs::write(&fixture.event_log_path, &event_before)
+            .expect("future exposure history should write");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let debug_before = br#"{"sentinel":"invalid-reconstructed-exposure"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        assert!(!exposure_path.exists());
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"invalid-reconstructed-exposure-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("future reconstructed exposure must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("future-dated"));
+        for private in [
+            private_session.0.to_string(),
+            private_bait.0,
+            private_exposure.0,
+            future_exposure.id.to_string(),
+        ] {
+            assert!(
+                !error.to_string().contains(&private),
+                "reconstruction diagnostic leaked `{private}`"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!exposure_path.exists());
+        assert!(!continuity_path.exists());
+        assert!(auxiliary_state_temp_paths(&exposure_path).is_empty());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn oversized_reconstructed_exposure_fails_before_absent_lease_or_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let now = current_unix_secs();
+        let mut event_before = Vec::new();
+        for index in 0_u128..5 {
+            let mut event = Event::new(
+                SessionId(uuid::Uuid::from_u128(index + 1)),
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id: BaitId(format!("oversized-reconstructed-bait-{index}")),
+                    bait_class: None,
+                    exposure_id: ExposureId(format!("{index}-{}", "x".repeat(900_000))),
+                    surface: "/docs".to_string(),
+                    header_value_mint: None,
+                },
+            );
+            event.observed_at = chrono::DateTime::from_timestamp(now as i64, 0)
+                .expect("current exposure timestamp should construct");
+            let serialized = serde_json::to_vec(&event).expect("large exposure should serialize");
+            assert!(serialized.len() <= MAX_EVENT_LOG_RECORD_BYTES);
+            event_before.extend_from_slice(&serialized);
+            event_before.push(b'\n');
+        }
+        assert!(event_before.len() < LOG_ROTATE_BYTES as usize);
+        fs::write(&fixture.event_log_path, &event_before)
+            .expect("oversized reconstructed exposure history should write");
+        let debug_before = br#"{"sentinel":"oversized-reconstructed-exposure"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        assert!(!exposure_path.exists());
+        assert!(!fixture.policy_state_path.exists());
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        assert!(!lease_path.exists());
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("oversized reconstructed exposure must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "serialized bait exposure state exceeds the fixed {} byte limit",
+                MAX_BAIT_EXPOSURE_STORE_BYTES
+            )
+        );
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert!(!fixture.policy_state_path.exists());
+        assert!(!lease_path.exists());
+        assert!(!exposure_path.exists());
+        assert!(!continuity_path.exists());
+        assert!(auxiliary_state_temp_paths(&exposure_path).is_empty());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
     }
 
     #[test]
@@ -12525,6 +14473,60 @@ mod tests {
             );
         }
 
+        let archive_namespace_target = event_log_archive_path(&fixture.event_log_path, 1);
+        for existing in [false, true] {
+            if existing {
+                fs::write(&archive_namespace_target, b"\n")
+                    .expect("existing archive namespace target should write");
+            }
+            let mut args = fixture.args.clone();
+            let debug_index = args
+                .iter()
+                .position(|value| value == "--debug-log")
+                .expect("fixture should configure a debug log");
+            args[debug_index + 1] = path_str(
+                &archive_namespace_target,
+                "archive namespace target should be UTF-8",
+            )
+            .to_string();
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let error = run_config(&args)
+                .expect_err("missing and existing event archive targets must stay reserved");
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserves the event-log archive namespace"),
+                "unexpected archive namespace error: {error}"
+            );
+        }
+
+        let debug_archive_namespace_target = event_log_archive_path(&fixture.debug_log_path, 1);
+        for existing in [false, true] {
+            if existing {
+                fs::write(&debug_archive_namespace_target, b"\n")
+                    .expect("existing debug archive namespace target should write");
+            }
+            let mut args = fixture.args.clone();
+            let event_index = args
+                .iter()
+                .position(|value| value == "--event-log")
+                .expect("fixture should configure an event log");
+            args[event_index + 1] = path_str(
+                &debug_archive_namespace_target,
+                "debug archive namespace target should be UTF-8",
+            )
+            .to_string();
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let error = run_config(&args)
+                .expect_err("missing and existing debug archive targets must stay reserved");
+            assert!(
+                error
+                    .to_string()
+                    .contains("reserves the debug-log archive namespace"),
+                "unexpected debug archive namespace error: {error}"
+            );
+        }
+
         let writable_input_aliases = [
             ("--bait-profile", fixture.event_log_path.clone()),
             ("--bait-signing-secret-file", event_exposures.clone()),
@@ -12740,6 +14742,7 @@ mod tests {
                 },
                 "state": {
                     "event_log": "configured",
+                    "event_log_contract": event_log_contract_projection(),
                     "policy_state": "configured",
                     "debug_log": true,
                     "policy_store": policy_store_contract_projection(),
@@ -14089,6 +16092,7 @@ mod tests {
         let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
         let session_b = SessionId::new();
         let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered_a = render_bait_for_session(&bait, session_a, Some(signing_secret.as_ref()))
             .expect("session A bait should render")
             .into_owned();
@@ -14377,6 +16381,7 @@ mod tests {
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -15017,6 +17022,7 @@ mod tests {
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -15080,6 +17086,7 @@ mod tests {
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -15164,6 +17171,7 @@ mod tests {
         let secret: Arc<str> = Arc::from("mint-secret");
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("render")
             .into_owned();
@@ -15291,6 +17299,7 @@ mod tests {
         let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
         let session_b = SessionId::new();
         let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered_a = render_bait_for_session(&bait, session_a, Some(signing_secret.as_ref()))
             .expect("session A bait should render")
             .into_owned();
@@ -15438,6 +17447,7 @@ mod tests {
 
         let session = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session, Some(secret.as_ref()))
             .expect("minted bait should render")
             .into_owned();
@@ -15632,6 +17642,7 @@ mod tests {
         );
 
         let replay_session = SessionId::new();
+        wait_for_bait_proof_window_headroom(&bait);
         let replay_proof = render_bait_for_session(&bait, replay_session, Some("mint-secret"))
             .expect("minted bait should render")
             .into_owned();
@@ -19567,6 +21578,85 @@ mod tests {
     }
 
     #[test]
+    fn recovered_proof_quarantine_is_included_in_the_pre_mutation_size_check() {
+        let now = 1_700_000_000;
+        let expires_at = now + MAX_BAIT_PROOF_TTL_SECS;
+        let mut store = ConsumedBaitProofStore::default();
+        for index in 0..4_u8 {
+            store.consumed.insert(
+                (
+                    SessionId(uuid::Uuid::from_u128(index as u128 + 1)),
+                    BaitId(format!("proof-{index}-{}", "x".repeat(900_000))),
+                    [index; 32],
+                ),
+                expires_at,
+            );
+        }
+        let fifth_session = SessionId(uuid::Uuid::from_u128(5));
+        let fifth_digest = [5_u8; 32];
+        let mut fifth_bait = BaitId("proof-tail".to_string());
+        store.consumed.insert(
+            (fifth_session, fifth_bait.clone(), fifth_digest),
+            expires_at,
+        );
+        let initial_len = serde_json::to_vec_pretty(&store.canonical_state())
+            .expect("initial reconstructed proof state should serialize")
+            .len();
+        let padding = MAX_CONSUMED_PROOF_STORE_BYTES
+            .checked_sub(initial_len)
+            .expect("reconstructed proof fixture should retain byte headroom");
+        let expiry = store
+            .consumed
+            .remove(&(fifth_session, fifth_bait.clone(), fifth_digest))
+            .expect("tail proof fixture should exist");
+        fifth_bait.0.push_str(&"x".repeat(padding));
+        store
+            .consumed
+            .insert((fifth_session, fifth_bait.clone(), fifth_digest), expiry);
+
+        let without_quarantine = serialize_auxiliary_state(
+            &store.canonical_state(),
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            "consumed proof state",
+        )
+        .expect("exact-limit reconstructed state without quarantine should fit");
+        assert_eq!(without_quarantine.len(), MAX_CONSUMED_PROOF_STORE_BYTES);
+        store
+            .validate_recovered_state(now)
+            .expect("the pre-quarantine representation alone should validate");
+
+        let error = store
+            .prepare_recovered_state_for_persistence(now, true)
+            .expect_err("quarantine expansion beyond the byte ceiling must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds the fixed"));
+        let expanded_len = serde_json::to_vec_pretty(&store.canonical_state())
+            .expect("expanded proof state should serialize for the boundary assertion")
+            .len();
+        assert!(expanded_len > MAX_CONSUMED_PROOF_STORE_BYTES);
+
+        let shrink = expanded_len - MAX_CONSUMED_PROOF_STORE_BYTES;
+        let expiry = store
+            .consumed
+            .remove(&(fifth_session, fifth_bait.clone(), fifth_digest))
+            .expect("expanded tail proof fixture should exist");
+        fifth_bait.0.truncate(fifth_bait.0.len() - shrink);
+        store
+            .consumed
+            .insert((fifth_session, fifth_bait, fifth_digest), expiry);
+        store
+            .prepare_recovered_state_for_persistence(now, true)
+            .expect("the exact final quarantine-bearing representation should fit");
+        let exact_final = serialize_auxiliary_state(
+            &store.canonical_state(),
+            MAX_CONSUMED_PROOF_STORE_BYTES,
+            "consumed proof state",
+        )
+        .expect("exact final proof state should serialize");
+        assert_eq!(exact_final.len(), MAX_CONSUMED_PROOF_STORE_BYTES);
+    }
+
+    #[test]
     fn auxiliary_state_rejects_future_exposure_and_overlong_proof_quarantine() {
         let future_exposure = serde_json::to_vec(&StoredBaitExposureState {
             schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
@@ -20222,11 +22312,14 @@ mod tests {
         );
         event.observed_at = chrono::DateTime::from_timestamp(1_200, 0).expect("timestamp");
         let event_log = unique_temp_path("consumed-proof-rebuild.jsonl");
+        let mut second_event = event.clone();
+        second_event.id = uuid::Uuid::new_v4();
         fs::write(
             &event_log,
             format!(
-                "{line}\n{line}\n",
-                line = serde_json::to_string(&event).expect("serialize")
+                "{first}\n{second}\n",
+                first = serde_json::to_string(&event).expect("serialize first event"),
+                second = serde_json::to_string(&second_event).expect("serialize second event"),
             ),
         )
         .expect("write event log");
@@ -20249,6 +22342,251 @@ mod tests {
             store.check_and_mark(session, bait.id, proof, 1_260, 1_259),
             ConsumeProofOutcome::Replay
         );
+    }
+
+    #[test]
+    fn consumed_proof_store_restores_archive_only_proofs_and_replay_state() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&profile_path).expect("profile");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("bait")
+            .clone();
+        let session = SessionId::new();
+        let mut event = Event::new(
+            session,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
+                exposure_id: None,
+                method: "POST".to_string(),
+                path: bait.expected_action.path.clone(),
+                header_value_mint: bait.header_value_mint_audit(),
+                header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            },
+        );
+        event.observed_at = chrono::DateTime::from_timestamp(1_200, 0).expect("timestamp");
+        let event_log = unique_temp_path("archive-only-consumed-proof.jsonl");
+        let archive = event_log_archive_path(&event_log, 1);
+        fs::write(
+            &archive,
+            format!(
+                "{}\n",
+                serde_json::to_string(&event).expect("event should serialize")
+            ),
+        )
+        .expect("archive should write");
+        assert!(
+            !event_log.exists(),
+            "active crash-window path must be absent"
+        );
+        let rendered =
+            eidolon_bait::render_bait_for_session_at(&bait, session, Some("mint-secret"), 1_200)
+                .expect("render")
+                .into_owned();
+        let proof = rendered.expected_action.header_value.expect("proof");
+
+        let mut store = ConsumedBaitProofStore::open_or_rebuild(
+            &event_log,
+            &loaded.registry,
+            Some("mint-secret"),
+            1_259,
+        )
+        .expect("missing proof sidecar should rebuild from archive-only history");
+
+        assert_eq!(store.consumed.len(), 1);
+        assert_eq!(
+            store.check_and_mark(session, bait.id, proof, 1_260, 1_259),
+            ConsumeProofOutcome::Replay
+        );
+        assert!(
+            !event_log.exists(),
+            "sidecar recovery alone must not create an active event log"
+        );
+        assert!(sidecar_state_path(&event_log, ".consumed-proofs.json").is_file());
+    }
+
+    #[test]
+    fn committed_sidecars_skip_incompatible_event_history_reconstruction() {
+        let loaded = default_loaded_bait_profile();
+        let bait = loaded
+            .registry
+            .baits()
+            .iter()
+            .find(|bait| {
+                bait.expected_action.header_value.is_some()
+                    && bait.expected_action.header_value_mint.is_none()
+            })
+            .expect("default profile should contain a static header bait")
+            .clone();
+        let now = 1_000;
+        let session_id = SessionId::new();
+        let mut incompatible_proof = Event::new(
+            session_id,
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
+                exposure_id: None,
+                method: "POST".to_string(),
+                path: bait.expected_action.path.clone(),
+                header_value_mint: bait.header_value_mint_audit(),
+                header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            },
+        );
+        incompatible_proof.observed_at =
+            chrono::DateTime::from_timestamp(now as i64, 0).expect("timestamp");
+        let mut future_exposure = Event::new(
+            session_id,
+            EventSource::SurfaceController,
+            PolicyState::Observe,
+            EventKind::BaitExposed {
+                bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
+                exposure_id: ExposureId("future-exposure".to_string()),
+                surface: "/docs".to_string(),
+                header_value_mint: None,
+            },
+        );
+        future_exposure.observed_at =
+            chrono::DateTime::from_timestamp(now as i64 + 1, 0).expect("future timestamp");
+        let event_log = unique_temp_path("authoritative-sidecars-skip-rebuild.jsonl");
+        fs::write(
+            &event_log,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&incompatible_proof).expect("proof event should serialize"),
+                serde_json::to_string(&future_exposure).expect("exposure event should serialize")
+            ),
+        )
+        .expect("incompatible history should write");
+        let exposure_path = sidecar_state_path(&event_log, ".exposures.json");
+        let proof_path = sidecar_state_path(&event_log, ".consumed-proofs.json");
+        fs::write(
+            &exposure_path,
+            serde_json::to_vec(&StoredBaitExposureState {
+                schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+                exposures: Vec::new(),
+            })
+            .expect("exposure sidecar should serialize"),
+        )
+        .expect("exposure sidecar should write");
+        fs::write(
+            &proof_path,
+            serde_json::to_vec(&StoredConsumedProofState {
+                schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+                migration_quarantine_until: None,
+                consumed: Vec::new(),
+            })
+            .expect("proof sidecar should serialize"),
+        )
+        .expect("proof sidecar should write");
+
+        let exposures = BaitExposureStore::open_or_rebuild(&event_log, now)
+            .expect("committed exposure sidecar should remain authoritative");
+        let proofs =
+            ConsumedBaitProofStore::open_or_rebuild(&event_log, &loaded.registry, None, now)
+                .expect("committed proof sidecar should bypass incompatible reconstruction");
+        assert!(exposures.exposures.is_empty());
+        assert!(proofs.consumed.is_empty());
+    }
+
+    #[test]
+    fn missing_sidecars_reject_semantically_invalid_reconstructed_state() {
+        let now = 1_000;
+        for (label, bait_id, exposure_id, observed_at, expected) in [
+            (
+                "empty-exposure-id",
+                BaitId("valid-bait".to_string()),
+                ExposureId(" ".to_string()),
+                now,
+                "empty identifier",
+            ),
+            (
+                "future-exposure",
+                BaitId("valid-bait".to_string()),
+                ExposureId("valid-exposure".to_string()),
+                now + 1,
+                "future-dated",
+            ),
+        ] {
+            let event_log = unique_temp_path(&format!("invalid-rebuilt-{label}.jsonl"));
+            let mut event = Event::new(
+                SessionId::new(),
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id,
+                    bait_class: None,
+                    exposure_id,
+                    surface: "/docs".to_string(),
+                    header_value_mint: None,
+                },
+            );
+            event.observed_at =
+                chrono::DateTime::from_timestamp(observed_at as i64, 0).expect("timestamp");
+            let bytes = format!(
+                "{}\n",
+                serde_json::to_string(&event).expect("invalid semantic event should serialize")
+            )
+            .into_bytes();
+            fs::write(&event_log, &bytes).expect("invalid semantic history should write");
+
+            let error = BaitExposureStore::open_or_rebuild(&event_log, now)
+                .expect_err("missing exposure sidecar must reject invalid reconstructed state");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{label}");
+            assert!(error.to_string().contains(expected), "{label}: {error}");
+            assert_eq!(fs::read(&event_log).unwrap(), bytes);
+            assert!(!sidecar_state_path(&event_log, ".exposures.json").exists());
+        }
+
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let loaded = load_bait_profile(&profile_path).expect("minted profile should load");
+        let bait = loaded
+            .registry
+            .bait_for_surface("/docs/minted-trace")
+            .expect("minted bait")
+            .clone();
+        let event_log = unique_temp_path("overlong-rebuilt-proof.jsonl");
+        let mut event = Event::new(
+            SessionId::new(),
+            EventSource::BaitEngine,
+            PolicyState::Observe,
+            EventKind::BaitActionObserved {
+                bait_id: bait.id.clone(),
+                bait_class: Some(bait.bait_class),
+                exposure_id: None,
+                method: "POST".to_string(),
+                path: bait.expected_action.path.clone(),
+                header_value_mint: bait.header_value_mint_audit(),
+                header_value_mint_status: Some(BaitHeaderValueMintStatus::MatchedSessionValue),
+            },
+        );
+        event.observed_at =
+            chrono::DateTime::from_timestamp((now + MAX_BAIT_PROOF_TTL_SECS + 1) as i64, 0)
+                .expect("future proof timestamp");
+        let bytes = format!(
+            "{}\n",
+            serde_json::to_string(&event).expect("overlong proof event should serialize")
+        )
+        .into_bytes();
+        fs::write(&event_log, &bytes).expect("overlong proof history should write");
+
+        let error = ConsumedBaitProofStore::open_or_rebuild(
+            &event_log,
+            &loaded.registry,
+            Some("mint-secret"),
+            now,
+        )
+        .expect_err("missing proof sidecar must reject an overlong recovered lifetime");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("maximum proof lifetime"));
+        assert_eq!(fs::read(&event_log).unwrap(), bytes);
+        assert!(!sidecar_state_path(&event_log, ".consumed-proofs.json").exists());
     }
 
     #[test]
@@ -20320,8 +22658,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let store = BaitExposureStore::from_event_log_reader(Cursor::new(format!("{jsonl}\n")))
-            .expect("event log should rebuild");
+        let event_log = unique_temp_path("exposure-full-family-rebuild.jsonl");
+        fs::write(&event_log, format!("{jsonl}\n")).expect("event log should write");
+        let store = BaitExposureStore::from_event_log(&event_log)
+            .expect("event log should rebuild through the bounded scanner");
 
         assert_eq!(store.len(), 2);
         assert_eq!(
@@ -20331,6 +22671,69 @@ mod tests {
         assert_eq!(
             store.exposure_for_action(session_id, &other_bait_id),
             Some(other_exposure_id)
+        );
+    }
+
+    #[test]
+    fn bait_exposure_store_rebuilds_ordered_archive_and_active_history() {
+        let event_log = unique_temp_path("full-family-exposure-rebuild.jsonl");
+        let archive = event_log_archive_path(&event_log, 1);
+        let session_id = SessionId::new();
+        let bait_id = BaitId("full-family-bait".to_string());
+        let archived_exposure_id = ExposureId("archived-exposure".to_string());
+        let active_exposure_id = ExposureId("active-exposure".to_string());
+        let exposure_event = |exposure_id: ExposureId, observed_at| {
+            let mut event = Event::new(
+                session_id,
+                EventSource::SurfaceController,
+                PolicyState::Observe,
+                EventKind::BaitExposed {
+                    bait_id: bait_id.clone(),
+                    bait_class: None,
+                    exposure_id,
+                    surface: "/docs".to_string(),
+                    header_value_mint: None,
+                },
+            );
+            event.observed_at =
+                chrono::DateTime::from_timestamp(observed_at, 0).expect("timestamp");
+            event
+        };
+        let archived = exposure_event(archived_exposure_id.clone(), 1_000);
+        let active = exposure_event(active_exposure_id.clone(), 1_001);
+        fs::write(
+            &archive,
+            format!(
+                "{}\n",
+                serde_json::to_string(&archived).expect("archive event should serialize")
+            ),
+        )
+        .expect("archive should write");
+        fs::write(
+            &event_log,
+            format!(
+                "{}\n",
+                serde_json::to_string(&active).expect("active event should serialize")
+            ),
+        )
+        .expect("active should write");
+
+        let store = BaitExposureStore::open_or_rebuild(&event_log, 1_002)
+            .expect("missing sidecar should rebuild from the ordered full family");
+        assert_eq!(
+            store.exposure_for_action_at(session_id, &bait_id, 1_002),
+            Some(active_exposure_id)
+        );
+
+        drop(store);
+        fs::remove_file(sidecar_state_path(&event_log, ".exposures.json"))
+            .expect("rebuilt sidecar should remove");
+        fs::remove_file(&event_log).expect("active segment should remove");
+        let archive_only = BaitExposureStore::open_or_rebuild(&event_log, 1_002)
+            .expect("archive-only crash window should rebuild");
+        assert_eq!(
+            archive_only.exposure_for_action_at(session_id, &bait_id, 1_002),
+            Some(archived_exposure_id)
         );
     }
 
@@ -20635,9 +23038,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let store =
-            BaitExposureStore::from_event_log_reader_at(Cursor::new(format!("{jsonl}\n")), now)
-                .expect("event log should rebuild");
+        let event_log = unique_temp_path("exposure-ttl-rebuild.jsonl");
+        fs::write(&event_log, format!("{jsonl}\n")).expect("event log should write");
+        let store = BaitExposureStore::from_event_log_at(&event_log, now)
+            .expect("event log should rebuild through the bounded scanner");
 
         assert_eq!(store.len(), 1);
         assert_eq!(store.ttl_evicted, 1);
@@ -20652,13 +23056,14 @@ mod tests {
 
     #[test]
     fn bait_exposure_store_rebuild_rejects_malformed_event_log_line() {
-        let error = BaitExposureStore::from_event_log_reader(Cursor::new("{not json}\n"))
-            .expect_err("malformed log should fail");
+        let event_log = unique_temp_path("exposure-malformed-event.jsonl");
+        fs::write(&event_log, "{not json}\n").expect("malformed event log should write");
+        let error =
+            BaitExposureStore::from_event_log(&event_log).expect_err("malformed log should fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error
-            .to_string()
-            .contains("could not rebuild bait exposure store from event log line 1"));
+        assert!(error.to_string().contains("invalid event JSON"));
+        assert!(error.to_string().contains("line 1 column"));
     }
 
     #[test]
@@ -20679,12 +23084,14 @@ mod tests {
         value["schema_version"] = Value::from(u64::from(EVENT_SCHEMA_VERSION) + 1);
         let line = serde_json::to_string(&value).expect("event value should serialize");
 
-        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!("{line}\n")))
-            .expect_err("unsupported schema should fail");
+        let event_log = unique_temp_path("exposure-unsupported-schema.jsonl");
+        fs::write(&event_log, format!("{line}\n")).expect("event log should write");
+        let error = BaitExposureStore::from_event_log(&event_log)
+            .expect_err("unsupported schema should fail through the bounded scanner");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains(&format!(
-            "unsupported schema_version {}; expected {EVENT_SCHEMA_VERSION}",
+            "unsupported schema version {}; expected {EVENT_SCHEMA_VERSION}",
             EVENT_SCHEMA_VERSION + 1
         )));
     }
@@ -20711,9 +23118,11 @@ mod tests {
         let valid = bait_exposed_jsonl_line(session_id);
         let truncated = "{\"schema_version\":2,\"id\":\"half-written";
 
-        let store =
-            BaitExposureStore::from_event_log_reader(Cursor::new(format!("{valid}\n{truncated}")))
-                .expect("crash-torn tail should be tolerated");
+        let event_log = unique_temp_path("exposure-torn-tail.jsonl");
+        fs::write(&event_log, format!("{valid}\n{truncated}"))
+            .expect("torn event log should write");
+        let store = BaitExposureStore::from_event_log(&event_log)
+            .expect("crash-torn tail should be tolerated by the bounded scanner");
 
         assert_eq!(store.len(), 1);
         assert_eq!(store.torn_tail_line, Some(2));
@@ -20724,14 +23133,14 @@ mod tests {
         let session_id = SessionId::new();
         let valid = bait_exposed_jsonl_line(session_id);
 
-        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!(
-            "{{not json}}\n{valid}\n"
-        )))
-        .expect_err("mid-file corruption must fail");
+        let event_log = unique_temp_path("exposure-mid-file-corruption.jsonl");
+        fs::write(&event_log, format!("{{not json}}\n{valid}\n"))
+            .expect("corrupt event log should write");
+        let error = BaitExposureStore::from_event_log(&event_log)
+            .expect_err("mid-file corruption must fail");
 
-        assert!(error
-            .to_string()
-            .contains("could not rebuild bait exposure store from event log line 1"));
+        assert!(error.to_string().contains("invalid event JSON"));
+        assert!(error.to_string().contains("line 1 column"));
     }
 
     #[test]
@@ -20740,14 +23149,14 @@ mod tests {
         let valid = bait_exposed_jsonl_line(session_id);
         let truncated = "{\"schema_version\":2,\"id\":\"half-written";
 
-        let error = BaitExposureStore::from_event_log_reader(Cursor::new(format!(
-            "{valid}\n{truncated}\n"
-        )))
-        .expect_err("corrupt final line with trailing newline must fail");
+        let event_log = unique_temp_path("exposure-terminated-corruption.jsonl");
+        fs::write(&event_log, format!("{valid}\n{truncated}\n"))
+            .expect("corrupt event log should write");
+        let error = BaitExposureStore::from_event_log(&event_log)
+            .expect_err("corrupt final line with trailing newline must fail");
 
-        assert!(error
-            .to_string()
-            .contains("could not rebuild bait exposure store from event log line 2"));
+        assert!(error.to_string().contains("invalid event JSON"));
+        assert!(error.to_string().contains("line 2 column"));
     }
 
     #[test]
@@ -27793,6 +30202,7 @@ mod tests {
 
         let session_id = SessionId::new();
         let cookie = format!("eidolon_session={}", minted_cookie_value(session_id));
+        wait_for_bait_proof_window_headroom(&bait);
         let rendered = render_bait_for_session(&bait, session_id, Some(signing_secret.as_ref()))
             .expect("session bait should render")
             .into_owned();
@@ -28558,6 +30968,7 @@ mod tests {
         let session_b = SessionId::new();
         let cookie_a = format!("eidolon_session={}", minted_cookie_value(session_a));
         let cookie_b = format!("eidolon_session={}", minted_cookie_value(session_b));
+        wait_for_bait_proof_window_headroom(&bait);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")

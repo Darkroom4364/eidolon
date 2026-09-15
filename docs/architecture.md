@@ -226,6 +226,63 @@ validated interaction linked to the exported request. The artifact SHA-256
 identifies the synthetic bytes and does not prove that the decoy narrative is
 true.
 
+Production startup treats the retained event-log family as one bounded
+recovery input: up to three `<event-log>.<39 ASCII digits>` archives in suffix
+order, followed by the active segment. Each segment is capped at 32 MiB, the
+family at 128 MiB, and each schema-v2 JSON record at 1 MiB excluding its
+newline. The active file name is capped at 215 UTF-8 bytes, reserving the dot
+and 39-digit suffix within the supported Linux 255-byte component limit.
+Production reserves both event- and debug-log numeric archive namespaces from
+every configured durable writer and compares existing event-family identities
+against those writers in both scans. A fixed-chunk streaming scan validates the
+complete family and rejects duplicate event IDs before any recovered state is
+committed. Both the pre-lease scan and the authoritative scan validate every
+pending workflow's complete response and expected-policy contract before
+mutation, including the bounded serialization of any missing policy event that
+reconciliation must append. During each scan, callbacks run only for missing
+exposure/proof sidecars, immediately finalize their semantic and canonical-size
+checks, and a selected index captures response and expected policy evidence for
+at most 8,192 pending workflows. Existing valid sidecars remain authoritative and
+bypass reconstruction. The under-lease result is the one used for opening and
+reconciliation. A fixed-memory
+SHA-256 verification pass then binds the ordered membership and bytes presented
+to repair/open to the authoritative scan. Reconciliation uses the selected
+index instead of rescanning every segment for every pending session; live
+ordinary response/policy events are not retained in it, and resolved workflow
+payloads are removed. Before opening the writer, an index-only simulator applies
+the same sorted append and resolution sequence from the active segment's
+post-repair length. It rejects any rotation that would prune selected evidence
+from the oldest retained archive and advances the canonical archive namespace
+with the writer's checked successor rule for every planned rotation. Policy
+recovery independently counts the
+initial canonical representation and exact per-record canonical deltas, so
+every ordered snapshot that reconciliation will persist is proven within the
+32 MiB write limit without serializing the complete store once per workflow.
+Its authoritative timestamp is bound through both the plan and the live
+`last_seen` writes. Policy preparation also rejects a symlink or non-regular
+`policy_state_path.with_extension("tmp")` without mutation, and persistence
+repeats that check before opening the reserved temporary path.
+
+Missing consumed-proof state receives its history-triggered migration
+quarantine in memory before the authoritative pre-mutation semantic and
+canonical-size check, so validation covers the exact representation later
+persisted.
+
+The active file may be absent in the post-rename rotation crash window; its
+archives still recover and a new active file is created only after validation.
+Only the active segment has a repair plan: append one missing final delimiter
+for valid JSON or truncate one invalid final fragment. An unterminated archive,
+mid-file corruption, unsupported schema, noncanonical numeric archive,
+symlink, non-regular member, or family whose membership or contents change
+between scan and repair fails startup. An exactly full active segment is not
+rotated merely by open: recovery either performs its already-validated append
+plan or reconciles without changing the segment, and the next ordinary append
+rotates it. Rotation refuses to prune an archive that still contains selected
+unresolved workflow evidence. Bare relative paths consistently treat `.` as
+their archive parent through selection, sync, and pruning. Descriptor-pinned
+directory traversal, storage encryption, multiple writers, and history beyond
+the retained family remain outside this source boundary.
+
 Issue `#176` moved response rendering across a closed, authenticated process
 boundary. The renderer cannot choose routing, policy, evidence, headers, cache
 policy, or artifact identity, and it receives no raw request or session
