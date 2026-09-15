@@ -3975,6 +3975,30 @@ mod tests {
     }
 
     #[test]
+    fn recovery_index_workflow_removal_matches_both_coordinates() {
+        let target_session = SessionId::new();
+        let target_request = RequestId::new();
+        let other_session = SessionId::new();
+        let other_request = RequestId::new();
+        let target = policy_event(target_session, target_request);
+        let same_session = policy_event(target_session, other_request);
+        let same_request = policy_event(other_session, target_request);
+        let unrelated = policy_event(other_session, other_request);
+        let mut index = super::EventLogRecoveryIndex::default();
+        for event in [&target, &same_session, &same_request, &unrelated] {
+            index.durable_events.insert(event.id, event.clone());
+        }
+
+        index.remove_workflow(target_session, target_request);
+
+        assert!(!index.durable_events.contains_key(&target.id));
+        assert_eq!(index.durable_events.len(), 3);
+        for preserved in [&same_session, &same_request, &unrelated] {
+            assert_eq!(index.durable_events.get(&preserved.id), Some(preserved));
+        }
+    }
+
+    #[test]
     fn selected_live_index_ignores_ordinary_events_and_releases_resolved_workflows() {
         let family = TestFamily::new("selected-live-index-scope.jsonl");
         let scan = super::scan_event_log_family(&family.path, &[], |_| Ok(()))
