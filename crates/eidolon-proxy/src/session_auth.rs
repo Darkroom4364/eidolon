@@ -2165,6 +2165,45 @@ mod tests {
         ContinuityKey::authenticated_ingress(raw, "edge-secret")
     }
 
+    #[test]
+    fn durable_serialization_excludes_lab_peer_records() {
+        let authenticated_key = ingress_key("durable-client");
+        let authenticated_record = ContinuityRecord {
+            session_id: SessionId::new(),
+            floor: Some(PolicyState::Blocked),
+            last_seen: NOW,
+            last_recovery_at: None,
+            recovery_count: 0,
+        };
+        let lab_record = ContinuityRecord {
+            session_id: SessionId::new(),
+            floor: Some(PolicyState::Suspicious),
+            last_seen: NOW,
+            last_recovery_at: None,
+            recovery_count: 0,
+        };
+
+        let stored = stored_continuity_state_from_parts(
+            &continuity_state_key_id_hex("edge-secret"),
+            None,
+            [
+                (peer_key(), lab_record),
+                (authenticated_key, authenticated_record),
+            ],
+        )
+        .expect("mixed continuity records should serialize");
+
+        assert_eq!(stored.records.len(), 1);
+        assert_eq!(
+            stored.records[0].session_id,
+            authenticated_record.session_id
+        );
+        assert_eq!(
+            stored.records[0].key_digest_hex,
+            encode_hex(&authenticated_key.digest())
+        );
+    }
+
     fn ingress_key_with_secret(raw: &str, continuity_key: &str) -> ContinuityKey {
         ContinuityKey::authenticated_ingress(raw, continuity_key)
     }
@@ -3322,6 +3361,7 @@ mod tests {
         assert_eq!(fs::read(&state_path).expect("reread checkpoint"), original);
         assert!(!state_path.with_extension("json.tmp").exists());
 
+        let duplicate_prepared = prepared.clone();
         let startup = restored
             .commit_prepared_durable_continuity(prepared, NOW + 3)
             .expect("prepared continuity should commit");
@@ -3340,6 +3380,15 @@ mod tests {
         );
         assert_eq!(recovered.session_id, first.session_id);
         assert_eq!(recovered.enforcement_floor, Some(PolicyState::Blocked));
+
+        let error = restored
+            .commit_prepared_durable_continuity(duplicate_prepared, NOW + 5)
+            .expect_err("durable continuity cannot be committed twice");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "durable continuity must be committed before continuity records exist"
+        );
     }
 
     #[test]

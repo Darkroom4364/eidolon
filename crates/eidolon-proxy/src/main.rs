@@ -2634,8 +2634,10 @@ fn run_proxy_with_shutdown(
     )?;
     validate_pending_event_log_recovery(&prepared_policy_store, &event_log_recovery, now)?;
     let event_log_recovery_stats = event_log_recovery.stats;
-    let continuity_history_exists = event_log_recovery_stats.family_bytes > 0
-        || path_has_nonempty_file(&config.policy_state_path)?;
+    let continuity_history_exists = continuity_history_exists(
+        event_log_recovery_stats.family_bytes,
+        &config.policy_state_path,
+    )?;
     let durable_continuity_startup = if let Some(continuity_key) = ingress_continuity_key.as_deref()
     {
         let continuity_state_path = continuity_state_path
@@ -2655,11 +2657,10 @@ fn run_proxy_with_shutdown(
             session_authority.commit_prepared_durable_continuity(authoritative_prepare, now)?;
         let reconciled_floor_count =
             session_authority.reconcile_durable_continuity_floors(|session_id| {
-                if prepared_policy_store.uses_fail_closed_fallback(session_id) {
-                    PolicyState::Blocked
-                } else {
-                    prepared_policy_store.policy_state(session_id)
-                }
+                reconciled_continuity_floor(
+                    prepared_policy_store.uses_fail_closed_fallback(session_id),
+                    prepared_policy_store.policy_state(session_id),
+                )
             })?;
         Some((startup, reconciled_floor_count))
     } else {
@@ -3700,6 +3701,24 @@ fn event_log_history_exists(path: &Path) -> io::Result<bool> {
             .any(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+fn continuity_history_exists(
+    event_family_bytes: u64,
+    policy_state_path: &Path,
+) -> io::Result<bool> {
+    Ok(event_family_bytes > 0 || path_has_nonempty_file(policy_state_path)?)
+}
+
+fn reconciled_continuity_floor(
+    uses_fail_closed_fallback: bool,
+    policy_state: PolicyState,
+) -> PolicyState {
+    if uses_fail_closed_fallback {
+        PolicyState::Blocked
+    } else {
+        policy_state
     }
 }
 
@@ -13450,6 +13469,34 @@ mod tests {
         assert!(!sidecar_state_path(&continuity_path, ".tmp").exists());
         assert!(upstream_recorder.finish().is_empty());
         fixture.stop();
+    }
+
+    #[test]
+    fn continuity_floor_reconciliation_blocks_fail_closed_fallback_sessions() {
+        assert_eq!(
+            reconciled_continuity_floor(true, PolicyState::Observe),
+            PolicyState::Blocked
+        );
+        assert_eq!(
+            reconciled_continuity_floor(false, PolicyState::Suspicious),
+            PolicyState::Suspicious
+        );
+    }
+
+    #[test]
+    fn continuity_history_requires_nonempty_event_or_policy_state() {
+        let policy_path = unique_temp_path("continuity-history-policy");
+        assert!(!continuity_history_exists(0, &policy_path).unwrap());
+        assert!(continuity_history_exists(1, &policy_path).unwrap());
+
+        fs::write(&policy_path, []).expect("empty policy fixture should write");
+        assert!(!continuity_history_exists(0, &policy_path).unwrap());
+        assert!(continuity_history_exists(1, &policy_path).unwrap());
+
+        fs::write(&policy_path, b"{}").expect("nonempty policy fixture should write");
+        assert!(continuity_history_exists(0, &policy_path).unwrap());
+        assert!(continuity_history_exists(1, &policy_path).unwrap());
+        fs::remove_file(policy_path).expect("policy fixture should remove");
     }
 
     fn continuity_key_id_from_empty_state(continuity_path: &Path) -> String {
