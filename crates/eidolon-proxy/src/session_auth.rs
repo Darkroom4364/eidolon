@@ -3395,6 +3395,37 @@ mod tests {
     }
 
     #[test]
+    fn prepared_commit_rejects_each_inconsistent_in_memory_continuity_index() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let prepared = test_authority()
+            .prepare_durable_continuity_with_previous(&state_path, "edge-secret", None, false, NOW)
+            .expect("missing continuity state should prepare");
+        let key = ingress_key("inconsistent-client");
+        let record = ContinuityRecord {
+            session_id: SessionId::new(),
+            floor: Some(PolicyState::Blocked),
+            last_seen: NOW,
+            last_recovery_at: None,
+            recovery_count: 0,
+        };
+
+        let mut map_only = test_authority();
+        map_only.continuity.insert(key, record);
+        let error = map_only
+            .commit_prepared_durable_continuity(prepared.clone(), NOW)
+            .expect_err("a populated map without order must reject commit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let mut order_only = test_authority();
+        order_only.continuity_order.push_back(key);
+        let error = order_only
+            .commit_prepared_durable_continuity(prepared, NOW)
+            .expect_err("a populated order without map must reject commit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn prepared_durable_continuity_commit_rejects_raced_snapshot_without_authority_mutation() {
         let dir = TestDir::new();
         let state_path = dir.path("continuity.json");
