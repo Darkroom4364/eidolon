@@ -35,7 +35,8 @@ use sha2::{Digest, Sha256};
 
 use crate::session::{SessionCookiePolicy, SESSION_COOKIE_NAME};
 use crate::session_continuity_store::{
-    self, IntegrityKey, StateCommitOutcome, StoredContinuityRecord, StoredContinuityState,
+    self, IntegrityKey, PreparedContinuityStartup, StateCommitOutcome, StoredContinuityRecord,
+    StoredContinuityState,
 };
 
 type SessionMac = Hmac<Sha256>;
@@ -515,6 +516,58 @@ pub struct DurableContinuityStartup {
     pub migration_quarantine_until: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedDurableContinuityStartup {
+    prepared_store: PreparedContinuityStartup,
+    active_key_id: String,
+    previous_key_id: Option<String>,
+    active_integrity_key: IntegrityKey,
+    canonical_state: StoredContinuityState,
+    restored_records: Vec<(ContinuityKey, ContinuityRecord)>,
+    startup: DurableContinuityStartup,
+}
+
+impl PreparedDurableContinuityStartup {
+    pub fn startup(&self) -> &DurableContinuityStartup {
+        &self.startup
+    }
+}
+
+fn stored_continuity_state_from_parts(
+    transport_key_id_hex: &str,
+    migration_quarantine_until: Option<u64>,
+    records: impl IntoIterator<Item = (ContinuityKey, ContinuityRecord)>,
+) -> io::Result<StoredContinuityState> {
+    let mut stored_records = Vec::new();
+    for (key, record) in records {
+        if key.source() != ContinuitySource::AuthenticatedIngress {
+            continue;
+        }
+        let continuity_key_id_hex =
+            key.key_id()
+                .map(|key_id| encode_hex(&key_id))
+                .ok_or_else(|| {
+                    invalid_data("authenticated continuity record key identifier is missing")
+                })?;
+        stored_records.push(StoredContinuityRecord {
+            key_digest_hex: encode_hex(&key.digest()),
+            continuity_key_id_hex: Some(continuity_key_id_hex),
+            session_id: record.session_id,
+            enforcement_floor: record.floor,
+            last_seen: record.last_seen,
+            last_recovery_at: record.last_recovery_at,
+            recovery_count: record.recovery_count,
+        });
+    }
+    Ok(StoredContinuityState {
+        schema_version: session_continuity_store::SESSION_CONTINUITY_SCHEMA_VERSION,
+        transport_key_id_hex: transport_key_id_hex.to_owned(),
+        migration_quarantine_until,
+        records: stored_records,
+        integrity_mac_hex: String::new(),
+    })
+}
+
 impl SessionAuthority {
     /// Build an authority from an explicit key set. `active_key_version` must
     /// be present in `keys`; every listed version verifies cookies.
@@ -645,25 +698,21 @@ impl SessionAuthority {
         )
     }
 
-    /// Load continuity state under one active and at most one previous key.
-    /// Existing schema-v1 records inherit their snapshot's signing key;
-    /// every successful startup rewrites the validated snapshot as schema v2
-    /// under the active integrity key before traffic is served.
-    pub fn enable_durable_continuity_with_previous(
-        &mut self,
+    pub fn prepare_durable_continuity_with_previous(
+        &self,
         path: &Path,
         active_continuity_key: &str,
         previous_continuity_key: Option<&str>,
         history_exists: bool,
         now: u64,
-    ) -> io::Result<DurableContinuityStartup> {
+    ) -> io::Result<PreparedDurableContinuityStartup> {
         if self.continuity_state_path.is_some()
             || !self.continuity.is_empty()
             || !self.continuity_order.is_empty()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "durable continuity must be enabled before continuity records exist",
+                "durable continuity must be prepared before continuity records exist",
             ));
         }
         let active_continuity_key = active_continuity_key.trim();
@@ -710,7 +759,8 @@ impl SessionAuthority {
         {
             key_candidates.push((previous_key_id, previous_integrity_key));
         }
-        let loaded = session_continuity_store::load_with_key_candidates(path, &key_candidates)?;
+        let prepared_store = session_continuity_store::prepare_startup(path, &key_candidates)?;
+        let loaded = prepared_store.loaded.clone();
         let mut ttl_evicted_record_count = 0;
         let mut restored_record_count = 0;
         let mut active_key_record_count = 0;
@@ -796,30 +846,96 @@ impl SessionAuthority {
             migration_quarantine_until = Some(now.saturating_add(self.continuity_ttl_secs));
         }
 
-        for (key, record) in restored_records {
+        let canonical_state = stored_continuity_state_from_parts(
+            &active_key_id,
+            migration_quarantine_until,
+            restored_records.iter().copied(),
+        )?;
+        session_continuity_store::validate_canonical_state(
+            &canonical_state,
+            &active_integrity_key,
+        )?;
+
+        Ok(PreparedDurableContinuityStartup {
+            prepared_store,
+            active_key_id,
+            previous_key_id,
+            active_integrity_key,
+            canonical_state,
+            restored_records,
+            startup: DurableContinuityStartup {
+                path: path.to_path_buf(),
+                restored_record_count,
+                active_key_record_count,
+                previous_key_record_count,
+                ttl_evicted_record_count,
+                loaded_schema_version,
+                migration_quarantine_until,
+            },
+        })
+    }
+
+    /// Load continuity state under one active and at most one previous key.
+    /// Existing schema-v1 records inherit their snapshot's signing key;
+    /// every successful startup rewrites the validated snapshot as schema v2
+    /// under the active integrity key before traffic is served.
+    pub fn enable_durable_continuity_with_previous(
+        &mut self,
+        path: &Path,
+        active_continuity_key: &str,
+        previous_continuity_key: Option<&str>,
+        history_exists: bool,
+        now: u64,
+    ) -> io::Result<DurableContinuityStartup> {
+        let prepared = self.prepare_durable_continuity_with_previous(
+            path,
+            active_continuity_key,
+            previous_continuity_key,
+            history_exists,
+            now,
+        )?;
+        self.commit_prepared_durable_continuity(prepared, now)
+    }
+
+    pub fn commit_prepared_durable_continuity(
+        &mut self,
+        prepared: PreparedDurableContinuityStartup,
+        now: u64,
+    ) -> io::Result<DurableContinuityStartup> {
+        if self.continuity_state_path.is_some()
+            || !self.continuity.is_empty()
+            || !self.continuity_order.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable continuity must be committed before continuity records exist",
+            ));
+        }
+        match session_continuity_store::commit_prepared_startup(
+            &prepared.prepared_store,
+            &prepared.canonical_state,
+            &prepared.active_integrity_key,
+        )? {
+            StateCommitOutcome::Durable => {}
+            StateCommitOutcome::CommittedDurabilityUncertain => {
+                return Err(io::Error::other(
+                    "continuity state was committed but parent-directory durability is uncertain",
+                ));
+            }
+        }
+        for (key, record) in prepared.restored_records {
             self.continuity.insert(key, record);
             self.continuity_order.push_back(key);
         }
-
-        self.continuity_state_path = Some(path.to_path_buf());
-        self.continuity_state_key_id_hex = Some(active_key_id);
-        self.previous_continuity_state_key_id_hex = previous_key_id;
-        self.continuity_integrity_key = Some(active_integrity_key);
-        self.continuity_migration_quarantine_until = migration_quarantine_until;
+        self.continuity_state_path = Some(prepared.startup.path.clone());
+        self.continuity_state_key_id_hex = Some(prepared.active_key_id);
+        self.previous_continuity_state_key_id_hex = prepared.previous_key_id;
+        self.continuity_integrity_key = Some(prepared.active_integrity_key);
+        self.continuity_migration_quarantine_until = prepared.startup.migration_quarantine_until;
         self.continuity_last_checkpoint_at = now;
-        self.continuity_dirty = true;
-        self.continuity_checkpoint_dirty = true;
-        self.persist_continuity_state_durably()?;
-
-        Ok(DurableContinuityStartup {
-            path: path.to_path_buf(),
-            restored_record_count,
-            active_key_record_count,
-            previous_key_record_count,
-            ttl_evicted_record_count,
-            loaded_schema_version,
-            migration_quarantine_until,
-        })
+        self.continuity_dirty = false;
+        self.continuity_checkpoint_dirty = false;
+        Ok(prepared.startup)
     }
 
     /// Reconcile restored continuity floors against the authoritative policy
@@ -1815,39 +1931,15 @@ impl SessionAuthority {
     fn stored_continuity_state(&self) -> io::Result<StoredContinuityState> {
         let transport_key_id_hex = self
             .continuity_state_key_id_hex
-            .clone()
+            .as_deref()
             .ok_or_else(|| invalid_data("durable continuity state key identifier is missing"))?;
-        let mut records = Vec::new();
-        for key in &self.continuity_order {
-            if key.source() != ContinuitySource::AuthenticatedIngress {
-                continue;
-            }
-            let Some(record) = self.continuity.get(key) else {
-                continue;
-            };
-            let continuity_key_id_hex =
-                key.key_id()
-                    .map(|key_id| encode_hex(&key_id))
-                    .ok_or_else(|| {
-                        invalid_data("authenticated continuity record key identifier is missing")
-                    })?;
-            records.push(StoredContinuityRecord {
-                key_digest_hex: encode_hex(&key.digest()),
-                continuity_key_id_hex: Some(continuity_key_id_hex),
-                session_id: record.session_id,
-                enforcement_floor: record.floor,
-                last_seen: record.last_seen,
-                last_recovery_at: record.last_recovery_at,
-                recovery_count: record.recovery_count,
-            });
-        }
-        Ok(StoredContinuityState {
-            schema_version: session_continuity_store::SESSION_CONTINUITY_SCHEMA_VERSION,
+        stored_continuity_state_from_parts(
             transport_key_id_hex,
-            migration_quarantine_until: self.continuity_migration_quarantine_until,
-            records,
-            integrity_mac_hex: String::new(),
-        })
+            self.continuity_migration_quarantine_until,
+            self.continuity_order
+                .iter()
+                .filter_map(|key| self.continuity.get(key).map(|record| (*key, *record))),
+        )
     }
 
     fn persist_continuity_state(&self) -> io::Result<StateCommitOutcome> {
@@ -3188,6 +3280,157 @@ mod tests {
     }
 
     #[test]
+    fn prepared_durable_continuity_is_read_only_until_explicit_commit() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let continuity_key = ingress_key("prepared-client");
+        let mut writer = test_authority();
+        writer
+            .enable_durable_continuity(&state_path, "edge-secret", false, NOW)
+            .expect("durable continuity should initialize");
+        let first = writer.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(continuity_key),
+            NOW + 1,
+        );
+        writer.note_enforcement_with_continuity(
+            Some(continuity_key),
+            first.session_id,
+            PolicyState::Blocked,
+            NOW + 2,
+        );
+        writer
+            .persist_continuity_state_durably()
+            .expect("checkpoint continuity");
+        let original = fs::read(&state_path).expect("read checkpoint");
+        drop(writer);
+
+        let mut restored = test_authority();
+        let prepared = restored
+            .prepare_durable_continuity_with_previous(
+                &state_path,
+                "edge-secret",
+                None,
+                true,
+                NOW + 3,
+            )
+            .expect("continuity startup should prepare");
+        assert_eq!(prepared.startup().restored_record_count, 1);
+        assert_eq!(prepared.startup().active_key_record_count, 1);
+        assert!(restored.continuity.is_empty());
+        assert!(restored.continuity_state_path.is_none());
+        assert_eq!(fs::read(&state_path).expect("reread checkpoint"), original);
+        assert!(!state_path.with_extension("json.tmp").exists());
+
+        let startup = restored
+            .commit_prepared_durable_continuity(prepared, NOW + 3)
+            .expect("prepared continuity should commit");
+        assert_eq!(startup.restored_record_count, 1);
+        assert_eq!(restored.continuity.len(), 1);
+        assert_eq!(
+            restored.continuity_state_path.as_deref(),
+            Some(state_path.as_path())
+        );
+        assert!(!restored.continuity_dirty);
+        assert!(!restored.continuity_checkpoint_dirty);
+        let recovered = restored.resolve_with_continuity(
+            [("Host", "proxy.local")],
+            Some(continuity_key),
+            NOW + 4,
+        );
+        assert_eq!(recovered.session_id, first.session_id);
+        assert_eq!(recovered.enforcement_floor, Some(PolicyState::Blocked));
+    }
+
+    #[test]
+    fn prepared_durable_continuity_commit_rejects_raced_snapshot_without_authority_mutation() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let continuity_key = ingress_key("raced-client");
+        let mut writer = test_authority();
+        writer
+            .enable_durable_continuity(&state_path, "edge-secret", false, NOW)
+            .expect("durable continuity should initialize");
+        writer.resolve_with_continuity([("Host", "proxy.local")], Some(continuity_key), NOW + 1);
+        writer
+            .persist_continuity_state_durably()
+            .expect("checkpoint continuity");
+        let original = fs::read(&state_path).expect("read checkpoint");
+        drop(writer);
+
+        let mut restored = test_authority();
+        let prepared = restored
+            .prepare_durable_continuity_with_previous(
+                &state_path,
+                "edge-secret",
+                None,
+                true,
+                NOW + 2,
+            )
+            .expect("continuity startup should prepare");
+        let mut replacement = original.clone();
+        let first = replacement
+            .iter_mut()
+            .find(|byte| **byte == b'{')
+            .expect("state should contain object start");
+        *first = b' ';
+        assert_eq!(replacement.len(), original.len());
+        fs::write(&state_path, &replacement).expect("write raced equal-length replacement");
+
+        let error = restored
+            .commit_prepared_durable_continuity(prepared, NOW + 2)
+            .expect_err("raced continuity sidecar must fail commit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session continuity store changed after startup preparation"
+        );
+        assert!(restored.continuity.is_empty());
+        assert!(restored.continuity_state_path.is_none());
+        assert_eq!(
+            fs::read(&state_path).expect("raced state remains"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn prepared_durable_continuity_missing_history_quarantine_commits_only_at_finish() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let mut authority = test_authority();
+        let prepared = authority
+            .prepare_durable_continuity_with_previous(&state_path, "edge-secret", None, true, NOW)
+            .expect("missing history should prepare quarantine");
+        assert_eq!(prepared.startup().restored_record_count, 0);
+        assert_eq!(
+            prepared.startup().migration_quarantine_until,
+            Some(NOW + DEFAULT_CONTINUITY_TTL_SECS)
+        );
+        assert!(!state_path.exists());
+        assert!(authority.continuity_migration_quarantine_until().is_none());
+
+        authority
+            .commit_prepared_durable_continuity(prepared, NOW)
+            .expect("quarantine startup should commit");
+        assert_eq!(
+            authority.continuity_migration_quarantine_until(),
+            Some(NOW + DEFAULT_CONTINUITY_TTL_SECS)
+        );
+        let stored = session_continuity_store::load_state(
+            &state_path,
+            &IntegrityKey::derive("edge-secret").expect("integrity key"),
+            &continuity_state_key_id_hex("edge-secret"),
+        )
+        .expect("load committed quarantine")
+        .expect("quarantine state should exist");
+        assert_eq!(
+            stored.migration_quarantine_until,
+            Some(NOW + DEFAULT_CONTINUITY_TTL_SECS)
+        );
+        assert!(stored.records.is_empty());
+    }
+
+    #[test]
     fn durable_authenticated_continuity_survives_restart_without_raw_identity_storage() {
         let dir = TestDir::new();
         let state_path = dir.path("continuity.json");
@@ -3242,6 +3485,95 @@ mod tests {
         assert_eq!(after_restart.session_id, first.session_id);
         assert_eq!(
             after_restart.enforcement_floor,
+            Some(PolicyState::ControlledReality)
+        );
+    }
+
+    #[test]
+    fn prepared_durable_continuity_overlap_restores_previous_key_without_precommit_mutation() {
+        const RAW_IDENTITY: &str = "prepared-overlap-client";
+        const OLD_KEY: &str = "prepared-overlap-old-key";
+        const NEW_KEY: &str = "prepared-overlap-new-key";
+
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let old_binding = ingress_key_with_secret(RAW_IDENTITY, OLD_KEY);
+        let mut old = test_authority();
+        old.enable_durable_continuity(&state_path, OLD_KEY, false, NOW)
+            .expect("old-key state should initialize");
+        let first =
+            old.resolve_with_continuity([("Host", "proxy.local")], Some(old_binding), NOW + 1);
+        old.note_enforcement_with_continuity(
+            Some(old_binding),
+            first.session_id,
+            PolicyState::ControlledReality,
+            NOW + 2,
+        );
+        old.persist_continuity_state_durably()
+            .expect("old-key state should checkpoint");
+        let mut v1 = old
+            .stored_continuity_state()
+            .expect("old-key state should serialize");
+        v1.schema_version = 1;
+        for record in &mut v1.records {
+            record.continuity_key_id_hex = None;
+        }
+        session_continuity_store::persist_state(
+            &state_path,
+            &v1,
+            &IntegrityKey::derive(OLD_KEY).expect("old integrity key"),
+        )
+        .expect("schema-v1 fixture should persist");
+        let v1_bytes = fs::read(&state_path).expect("read v1 fixture");
+        drop(old);
+
+        let mut overlap = test_authority();
+        let prepared = overlap
+            .prepare_durable_continuity_with_previous(
+                &state_path,
+                NEW_KEY,
+                Some(OLD_KEY),
+                true,
+                NOW + 3,
+            )
+            .expect("overlap should prepare schema-v1 state");
+        assert_eq!(prepared.startup().loaded_schema_version, Some(1));
+        assert_eq!(prepared.startup().restored_record_count, 1);
+        assert_eq!(prepared.startup().active_key_record_count, 0);
+        assert_eq!(prepared.startup().previous_key_record_count, 1);
+        assert!(overlap.continuity.is_empty());
+        assert!(overlap.continuity_state_path.is_none());
+        assert_eq!(
+            fs::read(&state_path).expect("v1 remains before commit"),
+            v1_bytes
+        );
+
+        let startup = overlap
+            .commit_prepared_durable_continuity(prepared, NOW + 3)
+            .expect("prepared overlap should commit");
+        assert_eq!(startup.previous_key_record_count, 1);
+        let active_key_id = continuity_state_key_id_hex(NEW_KEY);
+        let previous_key_id = continuity_state_key_id_hex(OLD_KEY);
+        let upgraded = session_continuity_store::load_state(
+            &state_path,
+            &IntegrityKey::derive(NEW_KEY).expect("new integrity key"),
+            &active_key_id,
+        )
+        .expect("upgraded state should verify under active key")
+        .expect("upgraded state should exist");
+        assert_eq!(upgraded.schema_version, 2);
+        assert_eq!(
+            upgraded.records[0].continuity_key_id_hex.as_deref(),
+            Some(previous_key_id.as_str())
+        );
+        let recovered = overlap.resolve_with_continuity_candidates(
+            [("Host", "proxy.local")],
+            Some(ingress_key_candidates(RAW_IDENTITY, NEW_KEY, OLD_KEY)),
+            NOW + 4,
+        );
+        assert_eq!(recovered.session_id, first.session_id);
+        assert_eq!(
+            recovered.enforcement_floor,
             Some(PolicyState::ControlledReality)
         );
     }

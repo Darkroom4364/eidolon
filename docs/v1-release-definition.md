@@ -161,6 +161,13 @@ artifact must provide the evidence for every checked item.
   restart can reproduce only the same bounded synthetic response and cannot
   mutate policy, evidence, or protected state.
 - State has explicit size, TTL, retention, compaction, and migration bounds.
+- Policy, event-family, bait-security sidecars, and authenticated-continuity
+  sidecars are prepared read-only before durable writer effects and repeated
+  under the single-writer lease before canonical commit.
+- Invalid authenticated-continuity state, bad MACs, non-regular reserved temp
+  paths, future records, over-capacity records, and unavailable key provenance
+  fail startup before listener, renderer, upstream, event, policy, debug, bait
+  sidecar, continuity replacement, or lease-metadata mutation.
 - Partial writes, unavailable storage, stale reads, and version mismatch have
   deterministic fail-closed behavior.
 - Backup and restore are exercised against a non-empty contained session and
@@ -346,10 +353,10 @@ Partial:
 
 Missing release blockers:
 
-- production Hyper/Tower HTTP transport
-- restart-safe single-writer state and replay handling
-- one production profile with secure cookies, shared-ingress-safe sessions,
-  persistent keys, and no target bypass
+- remaining live restart-safe single-writer state and replay handling proof
+- supported production profile qualification with secure cookies,
+  shared-ingress-safe sessions, persistent keys, continuity prepare/fail-closed
+  startup evidence, and no target bypass
 - release-cluster deployment and restart proof
 - supported upgrade, rollback, backup, and restore
 - release metrics, alerting, SLO, load, and soak evidence

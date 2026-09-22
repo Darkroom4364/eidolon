@@ -20,6 +20,7 @@ hmac.workspace = true
 hyper.workspace = true
 http-body-util.workspace = true
 ipnet.workspace = true
+libc.workspace = true
 serde.workspace = true
 hyper-util.workspace = true
 serde_json.workspace = true

@@ -133,7 +133,20 @@ crash window receive a new active file, policy migration/eviction persist,
 sidecars replace, or the listener bind. Diagnostics report only aggregate
 limits/counts and repair class, never durable IDs or raw records. Live PVC
 faults and descriptor-pinned directory hardening remain tracked outside this
-source-only control.
+source-only control. The process-held writer lease assumes cooperative writers
+sharing a stable, operator-controlled storage namespace. An actor able to
+rename or unlink the lease path, replace the durable directory or one of its
+ancestors, or replace the backing mount while the proxy runs is outside this
+lease claim: file locks attach to the opened file object, not permanently to a
+replaceable pathname. Such write authority must not be granted to sidecars or
+other tenants of the durable volume.
+
+The continuity sidecar MAC authenticates bytes and key provenance; it does not
+prove freshness. Restoring an older otherwise valid sidecar together with, or
+independently of, PVC state is not detected by schema v2. Strong rollback
+detection requires a monotonic commitment outside the PVC and backup rollback
+domain. Until such an anchor is supported, backup/restore evidence establishes
+only coherent exact-state restoration, not freshness or anti-rollback.
 
 The committed bait-exposure and consumed-proof sidecars are each capped at
 4,194,304 bytes and 4,096 records. Reads retain at most one byte beyond the

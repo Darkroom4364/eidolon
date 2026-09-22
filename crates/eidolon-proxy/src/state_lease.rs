@@ -33,9 +33,18 @@ impl DurableStateLease {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let mut file = options.open(&path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "durable state writer lease `{}` must be a regular file",
+                    path.display()
+                ),
+            ));
+        }
 
         #[cfg(unix)]
         {
@@ -169,6 +178,37 @@ mod tests {
         ));
 
         fs::remove_file(parent).expect("parent fixture should remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_symlink_is_rejected_without_mutating_its_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let state_path = unique_temp_path("symlink");
+        let lock_path = state_lease_path(&state_path);
+        let victim_path = unique_temp_path("symlink-victim");
+        let victim_before = b"victim-must-remain-unchanged";
+        fs::write(&victim_path, victim_before).expect("victim fixture should write");
+        fs::set_permissions(&victim_path, fs::Permissions::from_mode(0o640))
+            .expect("victim permissions should set");
+        symlink(&victim_path, &lock_path).expect("lease symlink should create");
+
+        DurableStateLease::acquire_for_policy_state(&state_path)
+            .expect_err("lease symlink must fail closed");
+
+        assert_eq!(fs::read(&victim_path).unwrap(), victim_before);
+        assert_eq!(
+            fs::metadata(&victim_path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(fs::symlink_metadata(&lock_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        fs::remove_file(lock_path).expect("lease symlink should remove");
+        fs::remove_file(victim_path).expect("victim fixture should remove");
     }
 
     #[cfg(unix)]

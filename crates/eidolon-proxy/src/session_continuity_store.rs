@@ -14,7 +14,7 @@ use std::{
 use eidolon_core::{PolicyState, SessionId};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 pub const SESSION_CONTINUITY_SCHEMA_VERSION: u16 = 2;
 pub const MIN_SUPPORTED_SESSION_CONTINUITY_SCHEMA_VERSION: u16 = 1;
@@ -100,6 +100,68 @@ pub type StoredContinuityState = State;
 pub type StoredContinuityRecord = Record;
 pub type StateCommitOutcome = CommitOutcome;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotFingerprint {
+    metadata: Option<FileFingerprint>,
+    temp_metadata: Option<FileFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    len: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedContinuityStartup {
+    pub path: PathBuf,
+    pub loaded: Option<State>,
+    pub fingerprint: SnapshotFingerprint,
+}
+
+pub fn prepare_startup(
+    path: impl AsRef<Path>,
+    key_candidates: &[(&str, &IntegrityKey)],
+) -> io::Result<PreparedContinuityStartup> {
+    let path = path.as_ref();
+    validate_temporary_path(path)?;
+    let (loaded, metadata) = load_snapshot_with_key_candidates(path, key_candidates)?;
+    let fingerprint = SnapshotFingerprint {
+        metadata,
+        temp_metadata: file_fingerprint(&temporary_path(path)?)?,
+    };
+    Ok(PreparedContinuityStartup {
+        path: path.to_path_buf(),
+        loaded,
+        fingerprint,
+    })
+}
+
+pub fn verify_prepared_snapshot(prepared: &PreparedContinuityStartup) -> io::Result<()> {
+    validate_temporary_path(&prepared.path)?;
+    let current = snapshot_fingerprint(&prepared.path)?;
+    if current != prepared.fingerprint {
+        return Err(invalid_data(
+            "session continuity store changed after startup preparation",
+        ));
+    }
+    Ok(())
+}
+
+pub fn commit_prepared_startup(
+    prepared: &PreparedContinuityStartup,
+    state: &State,
+    integrity_key: &IntegrityKey,
+) -> io::Result<CommitOutcome> {
+    verify_prepared_snapshot(prepared)?;
+    let _ = serialize(state, integrity_key)?;
+    persist(&prepared.path, state, integrity_key)
+}
+
+pub fn validate_canonical_state(state: &State, integrity_key: &IntegrityKey) -> io::Result<()> {
+    serialize(state, integrity_key).map(drop)
+}
+
 pub fn load(
     path: impl AsRef<Path>,
     integrity_key: &IntegrityKey,
@@ -117,12 +179,31 @@ pub fn load_with_key_candidates(
     path: impl AsRef<Path>,
     key_candidates: &[(&str, &IntegrityKey)],
 ) -> io::Result<Option<State>> {
-    let path = path.as_ref();
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+    load_snapshot_with_key_candidates(path.as_ref(), key_candidates).map(|(state, _)| state)
+}
+
+fn load_snapshot_with_key_candidates(
+    path: &Path,
+    key_candidates: &[(&str, &IntegrityKey)],
+) -> io::Result<(Option<State>, Option<FileFingerprint>)> {
+    let _path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            return Err(invalid_data(format!(
+                "session continuity store path `{}` is not a regular file",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((None, None)),
         Err(error) => return Err(error),
     };
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid_data(format!(
+            "session continuity store path `{}` is not a regular file",
+            path.display()
+        )));
+    }
 
     let mut bytes = Vec::new();
     file.take((MAX_CONTINUITY_STORE_BYTES + 1) as u64)
@@ -170,7 +251,11 @@ pub fn load_with_key_candidates(
         ));
     }
     verify_integrity(&state, integrity_key)?;
-    Ok(Some(state))
+    let fingerprint = FileFingerprint {
+        len: bytes.len() as u64,
+        sha256: Sha256::digest(&bytes).into(),
+    };
+    Ok((Some(state), Some(fingerprint)))
 }
 
 pub fn persist(
@@ -449,6 +534,56 @@ fn sync_parent(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn snapshot_fingerprint(path: &Path) -> io::Result<SnapshotFingerprint> {
+    Ok(SnapshotFingerprint {
+        metadata: file_fingerprint(path)?,
+        temp_metadata: file_fingerprint(&temporary_path(path)?)?,
+    })
+}
+
+fn file_fingerprint(path: &Path) -> io::Result<Option<FileFingerprint>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(invalid_data(format!(
+                    "session continuity store path `{}` is not a regular file",
+                    path.display()
+                )));
+            }
+            let file = File::open(path)?;
+            let mut bytes = Vec::new();
+            file.take((MAX_CONTINUITY_STORE_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_CONTINUITY_STORE_BYTES {
+                return Err(invalid_data(format!(
+                    "session continuity store `{}` exceeds {} bytes",
+                    path.display(),
+                    MAX_CONTINUITY_STORE_BYTES
+                )));
+            }
+            let sha256 = Sha256::digest(&bytes).into();
+            Ok(Some(FileFingerprint {
+                len: metadata.len(),
+                sha256,
+            }))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_temporary_path(path: &Path) -> io::Result<()> {
+    let temp_path = temporary_path(path)?;
+    match fs::symlink_metadata(&temp_path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(invalid_data(
+            "session continuity temporary path is not a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -532,6 +667,31 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn prepared_startup_rejects_a_symlinked_committed_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TestDir::new();
+        let victim = dir.path("victim.json");
+        let path = dir.path("continuity.json");
+        let key = IntegrityKey::derive("continuity-key").unwrap();
+        persist(&victim, &state(), &key).expect("victim fixture should persist");
+        let victim_before = fs::read(&victim).expect("victim fixture should read");
+        symlink(&victim, &path).expect("committed sidecar symlink should create");
+
+        let error = prepare_startup(&path, &[("ab", &key)])
+            .expect_err("committed sidecar symlink must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not a regular file"));
+        assert_eq!(fs::read(&victim).unwrap(), victim_before);
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
     fn v1_state() -> State {
         let mut state = state();
         state.schema_version = 1;
@@ -553,6 +713,10 @@ mod tests {
         persist(path, state, &integrity_key())
     }
 
+    fn prepare_test(path: &Path) -> io::Result<PreparedContinuityStartup> {
+        prepare_startup(path, &[(&"ab".repeat(32), &integrity_key())])
+    }
+
     fn verified_state(path: &Path) -> State {
         load_test(path)
             .expect("load verified state")
@@ -572,6 +736,141 @@ mod tests {
         .expect("write tampered state");
         let error = load_test(&path).expect_err("tampered state must fail");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn prepared_startup_is_read_only_for_missing_valid_v1_and_stale_regular_temp() {
+        let dir = TestDir::new();
+        let path = dir.path("continuity.json");
+        let temp_path = dir.path("continuity.json.tmp");
+
+        let missing = prepare_test(&path).expect("missing state should prepare");
+        assert_eq!(missing.loaded, None);
+        assert!(!path.exists());
+        assert!(!temp_path.exists());
+
+        persist_test(&path, &v1_state()).expect("persist v1 state");
+        let original = fs::read(&path).expect("read v1 state");
+        let prepared = prepare_test(&path).expect("v1 state should prepare without rewrite");
+        assert_eq!(prepared.loaded.as_ref().unwrap().schema_version, 1);
+        assert_eq!(fs::read(&path).expect("reread v1 state"), original);
+        assert!(!temp_path.exists());
+
+        fs::write(&temp_path, b"stale crash residue").expect("write stale regular temp");
+        let temp_original = fs::read(&temp_path).expect("read stale temp");
+        prepare_test(&path).expect("regular stale temp should prepare without deletion");
+        assert_eq!(fs::read(&path).expect("reread v1 state"), original);
+        assert_eq!(
+            fs::read(&temp_path).expect("reread stale temp"),
+            temp_original
+        );
+    }
+
+    #[test]
+    fn prepared_startup_rejects_nonregular_temp_without_mutation() {
+        let dir = TestDir::new();
+        let path = dir.path("continuity.json");
+        let temp_path = dir.path("continuity.json.tmp");
+        persist_test(&path, &state()).expect("persist state");
+        let original = fs::read(&path).expect("read state");
+
+        fs::create_dir(&temp_path).expect("create temp directory");
+        let error = prepare_test(&path).expect_err("directory temp must fail prepare");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session continuity temporary path is not a regular file"
+        );
+        assert_eq!(fs::read(&path).expect("reread state"), original);
+        assert!(fs::metadata(&temp_path).unwrap().is_dir());
+        fs::remove_dir(&temp_path).expect("remove temp directory");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&path, &temp_path).expect("create temp symlink");
+            let error = prepare_test(&path).expect_err("symlink temp must fail prepare");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                "session continuity temporary path is not a regular file"
+            );
+            assert_eq!(
+                fs::read(&path).expect("reread state after symlink"),
+                original
+            );
+            assert!(fs::symlink_metadata(&temp_path)
+                .expect("temp symlink metadata")
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[test]
+    fn prepared_commit_detects_sidecar_and_temp_races_before_replacement() {
+        let dir = TestDir::new();
+        let path = dir.path("continuity.json");
+        let temp_path = dir.path("continuity.json.tmp");
+        persist_test(&path, &state()).expect("persist state");
+        let original = fs::read(&path).expect("read state");
+        let prepared = prepare_test(&path).expect("prepare state");
+        let mut equal_length_replacement = original.clone();
+        let first = equal_length_replacement
+            .iter_mut()
+            .find(|byte| **byte == b'{')
+            .expect("json should contain object start");
+        *first = b' ';
+        assert_eq!(equal_length_replacement.len(), original.len());
+        fs::write(&path, &equal_length_replacement).expect("write equal-length replacement");
+
+        let error = commit_prepared_startup(&prepared, &state(), &integrity_key())
+            .expect_err("equal-length replacement must fail commit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session continuity store changed after startup preparation"
+        );
+        assert_eq!(
+            fs::read(&path).expect("replacement remains"),
+            equal_length_replacement
+        );
+        assert!(!temp_path.exists());
+
+        persist_test(&path, &state()).expect("restore valid state");
+        let prepared = prepare_test(&path).expect("prepare state again");
+        fs::write(&temp_path, b"late stale temp").expect("create temp after prepare");
+        let error = commit_prepared_startup(&prepared, &state(), &integrity_key())
+            .expect_err("temp membership change must fail commit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session continuity store changed after startup preparation"
+        );
+        assert_eq!(
+            fs::read(&temp_path).expect("late temp remains"),
+            b"late stale temp"
+        );
+    }
+
+    #[test]
+    fn prepared_commit_repeats_nonregular_temp_rejection() {
+        let dir = TestDir::new();
+        let path = dir.path("continuity.json");
+        let temp_path = dir.path("continuity.json.tmp");
+        persist_test(&path, &state()).expect("persist state");
+        let original = fs::read(&path).expect("read state");
+        let prepared = prepare_test(&path).expect("prepare state");
+        fs::create_dir(&temp_path).expect("create raced temp directory");
+
+        let error = commit_prepared_startup(&prepared, &state(), &integrity_key())
+            .expect_err("nonregular temp must fail commit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session continuity temporary path is not a regular file"
+        );
+        assert_eq!(fs::read(&path).expect("original state remains"), original);
+        assert!(fs::metadata(&temp_path).unwrap().is_dir());
     }
 
     #[test]
@@ -706,6 +1005,62 @@ mod tests {
         assert_eq!(
             load_test(&path).unwrap_err().kind(),
             io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn prepared_startup_covers_exact_record_bound_and_rejects_plus_one() {
+        let dir = TestDir::new();
+        let path = dir.path("continuity.json");
+        let mut bounded = state();
+        bounded.records = (0..MAX_CONTINUITY_RECORDS)
+            .map(|index| Record {
+                key_digest_hex: format!("{index:064x}"),
+                continuity_key_id_hex: Some("ab".repeat(32)),
+                session_id: SessionId(Uuid::from_u128(index as u128 + 1)),
+                enforcement_floor: None,
+                last_seen: 200,
+                last_recovery_at: None,
+                recovery_count: 0,
+            })
+            .collect();
+        persist_test(&path, &bounded).expect("exact record bound should persist");
+        let prepared = prepare_test(&path).expect("exact record bound should prepare");
+        assert_eq!(
+            prepared
+                .loaded
+                .as_ref()
+                .expect("prepared state")
+                .records
+                .len(),
+            MAX_CONTINUITY_RECORDS
+        );
+
+        let mut over_bound = bounded;
+        over_bound.records.push(Record {
+            key_digest_hex: format!("{:064x}", MAX_CONTINUITY_RECORDS),
+            continuity_key_id_hex: Some("ab".repeat(32)),
+            session_id: SessionId(Uuid::from_u128(MAX_CONTINUITY_RECORDS as u128 + 1)),
+            enforcement_floor: None,
+            last_seen: 200,
+            last_recovery_at: None,
+            recovery_count: 0,
+        });
+        over_bound.integrity_mac_hex = "00".repeat(32);
+        fs::write(
+            &path,
+            serde_json::to_vec(&over_bound).expect("serialize over-bound state"),
+        )
+        .expect("write over-bound state");
+        let error = prepare_test(&path).expect_err("record bound plus one must fail prepare");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "session continuity store has {} records; maximum is {}",
+                MAX_CONTINUITY_RECORDS + 1,
+                MAX_CONTINUITY_RECORDS
+            )
         );
     }
 

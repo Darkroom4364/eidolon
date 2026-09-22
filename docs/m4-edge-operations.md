@@ -152,8 +152,10 @@ Session identity on this deployment:
 - the compatibility bootstrap means rotating transport auth does not remediate
   compromise of the old key bytes now retained as the continuity key
 - if that sidecar is missing while prior state exists, unknown authenticated
-  identities fail closed for a bounded migration quarantine; corrupt or
-  continuity-key-mismatched sidecar state prevents startup
+  identities fail closed for a bounded migration quarantine; corrupt,
+  continuity-key-mismatched, future-dated, over-capacity, bad-MAC, or
+  unavailable-previous-key sidecar state prevents startup before durable
+  writer, listener, renderer, or upstream effects
 - the source runtime supports one bounded previous transport credential and
   one bounded previous continuity key. `--previous-ingress-continuity-key-file`
   lazily and durably moves returning bindings to the active key before request
