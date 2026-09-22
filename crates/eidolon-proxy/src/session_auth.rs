@@ -902,10 +902,13 @@ impl SessionAuthority {
         prepared: PreparedDurableContinuityStartup,
         now: u64,
     ) -> io::Result<DurableContinuityStartup> {
-        if self.continuity_state_path.is_some()
-            || !self.continuity.is_empty()
-            || !self.continuity_order.is_empty()
-        {
+        if self.continuity_state_path.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable continuity must be committed before continuity records exist",
+            ));
+        }
+        if !self.continuity.is_empty() || !self.continuity_order.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "durable continuity must be committed before continuity records exist",

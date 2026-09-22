@@ -2573,24 +2573,17 @@ fn run_proxy_with_shutdown(
         "key_version_count": session_authority.key_version_count(),
     });
     let now = current_unix_secs();
-    let continuity_state_path = ingress_continuity_key
-        .as_ref()
-        .map(|_| sidecar_state_path(&config.policy_state_path, ".continuity.json"));
-    let prelease_durable_continuity_prepare = match (
-        ingress_continuity_key.as_deref(),
-        continuity_state_path.as_deref(),
-    ) {
-        (Some(continuity_key), Some(path)) => {
-            Some(session_authority.prepare_durable_continuity_with_previous(
-                path,
-                continuity_key,
-                previous_ingress_continuity_key.as_deref(),
-                path_has_nonempty_file(&config.policy_state_path)?,
-                now,
-            )?)
-        }
-        _ => None,
-    };
+    if let Some(continuity_key) = ingress_continuity_key.as_deref() {
+        let continuity_state_path =
+            sidecar_state_path(&config.policy_state_path, ".continuity.json");
+        session_authority.prepare_durable_continuity_with_previous(
+            &continuity_state_path,
+            continuity_key,
+            previous_ingress_continuity_key.as_deref(),
+            path_has_nonempty_file(&config.policy_state_path)?,
+            now,
+        )?;
+    }
     let state_lease = DurableStateLease::acquire_for_policy_state(&config.policy_state_path)?;
     let prepared_policy_store = PolicyStateStore::prepare_open(&config.policy_state_path)?;
     let recovery_targets = event_log_recovery_targets(&prepared_policy_store);
@@ -2640,14 +2633,12 @@ fn run_proxy_with_shutdown(
     )?;
     let durable_continuity_startup = if let Some(continuity_key) = ingress_continuity_key.as_deref()
     {
-        let continuity_state_path = continuity_state_path
-            .as_deref()
-            .ok_or_else(|| io::Error::other("continuity state path missing after key load"))?;
-        drop(prelease_durable_continuity_prepare);
+        let continuity_state_path =
+            sidecar_state_path(&config.policy_state_path, ".continuity.json");
         #[cfg(test)]
         run_test_before_authoritative_continuity_prepare();
         let authoritative_prepare = session_authority.prepare_durable_continuity_with_previous(
-            continuity_state_path,
+            &continuity_state_path,
             continuity_key,
             previous_ingress_continuity_key.as_deref(),
             continuity_history_exists,
@@ -2664,7 +2655,6 @@ fn run_proxy_with_shutdown(
             })?;
         Some((startup, reconciled_floor_count))
     } else {
-        drop(prelease_durable_continuity_prepare);
         None
     };
     let event_log_writer =
