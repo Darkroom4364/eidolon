@@ -238,7 +238,13 @@ Reserved and now captured in authenticated request audit events:
   state rewrites.
 - If the sidecar is missing while prior state exists, unknown authenticated
   identities fail closed for a bounded migration quarantine. Corrupt state or
-  state bound to a different continuity key prevents startup.
+  state bound to a different continuity key prevents startup. Production
+  prepares the continuity sidecar read-only before acquiring the durable writer
+  lease and repeats that prepare under the lease before committing the exact
+  canonical rewrite, so malformed state, bad MACs, non-regular reserved temp
+  paths, future records, over-capacity state, or live bindings whose key
+  provenance is unavailable fail before policy/event/debug/bait sidecar,
+  listener, renderer, or upstream effects.
 - The active transport credential, optional previous transport credential,
   active continuity key, and optional previous continuity key have separate
   roles. Transport credentials authenticate the adapter request. Continuity

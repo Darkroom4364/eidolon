@@ -82,6 +82,21 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use eidolon_proxy::http_request::canonicalize_request_target;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_BEFORE_AUTHORITATIVE_CONTINUITY_PREPARE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_test_before_authoritative_continuity_prepare() {
+    TEST_BEFORE_AUTHORITATIVE_CONTINUITY_PREPARE.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 const DEFAULT_UPSTREAM: &str = "http://127.0.0.1:9001";
 const DEFAULT_EVENT_LOG: &str = "/tmp/eidolon-events.jsonl";
@@ -2535,7 +2550,6 @@ fn run_proxy_with_shutdown(
         config.ingress_continuity_key_path.is_some(),
         ingress_transport_auth_secret.is_some(),
     );
-    let state_lease = DurableStateLease::acquire_for_policy_state(&config.policy_state_path)?;
     let (loaded_bait_profile, bait_signing_secret) = load_bait_recovery_inputs(&config)?;
     let bait_profile_debug = bait_profile_debug_value(&loaded_bait_profile.metadata);
     let bait_registry = Arc::new(loaded_bait_profile.registry);
@@ -2559,6 +2573,18 @@ fn run_proxy_with_shutdown(
         "key_version_count": session_authority.key_version_count(),
     });
     let now = current_unix_secs();
+    if let Some(continuity_key) = ingress_continuity_key.as_deref() {
+        let continuity_state_path =
+            sidecar_state_path(&config.policy_state_path, ".continuity.json");
+        session_authority.prepare_durable_continuity_with_previous(
+            &continuity_state_path,
+            continuity_key,
+            previous_ingress_continuity_key.as_deref(),
+            path_has_nonempty_file(&config.policy_state_path)?,
+            now,
+        )?;
+    }
+    let state_lease = DurableStateLease::acquire_for_policy_state(&config.policy_state_path)?;
     let prepared_policy_store = PolicyStateStore::prepare_open(&config.policy_state_path)?;
     let recovery_targets = event_log_recovery_targets(&prepared_policy_store);
     let PreparedBaitSecuritySidecars {
@@ -2601,8 +2627,36 @@ fn run_proxy_with_shutdown(
     )?;
     validate_pending_event_log_recovery(&prepared_policy_store, &event_log_recovery, now)?;
     let event_log_recovery_stats = event_log_recovery.stats;
-    let continuity_history_exists = event_log_recovery_stats.family_bytes > 0
-        || path_has_nonempty_file(&config.policy_state_path)?;
+    let continuity_history_exists = continuity_history_exists(
+        event_log_recovery_stats.family_bytes,
+        &config.policy_state_path,
+    )?;
+    let durable_continuity_startup = if let Some(continuity_key) = ingress_continuity_key.as_deref()
+    {
+        let continuity_state_path =
+            sidecar_state_path(&config.policy_state_path, ".continuity.json");
+        #[cfg(test)]
+        run_test_before_authoritative_continuity_prepare();
+        let authoritative_prepare = session_authority.prepare_durable_continuity_with_previous(
+            &continuity_state_path,
+            continuity_key,
+            previous_ingress_continuity_key.as_deref(),
+            continuity_history_exists,
+            now,
+        )?;
+        let startup =
+            session_authority.commit_prepared_durable_continuity(authoritative_prepare, now)?;
+        let reconciled_floor_count =
+            session_authority.reconcile_durable_continuity_floors(|session_id| {
+                reconciled_continuity_floor(
+                    prepared_policy_store.uses_fail_closed_fallback(session_id),
+                    prepared_policy_store.policy_state(session_id),
+                )
+            })?;
+        Some((startup, reconciled_floor_count))
+    } else {
+        None
+    };
     let event_log_writer =
         FileEventLogWriter::open_with_recovery(&config.event_log_path, event_log_recovery)?;
     let event_log_tail_repair = event_log_writer.startup_tail_repair();
@@ -2650,29 +2704,6 @@ fn run_proxy_with_shutdown(
         .ok_or_else(|| io::Error::other("consumed proof store opened without a state path"))?;
     let consumed_proof_state_bytes = fs::metadata(&consumed_proof_state_path)?.len();
     let consumed_proof_migration_quarantine_until = consumed_bait_proofs.migration_quarantine_until;
-    let durable_continuity_startup = if let Some(continuity_key) = ingress_continuity_key.as_deref()
-    {
-        let continuity_state_path =
-            sidecar_state_path(&config.policy_state_path, ".continuity.json");
-        let startup = session_authority.enable_durable_continuity_with_previous(
-            &continuity_state_path,
-            continuity_key,
-            previous_ingress_continuity_key.as_deref(),
-            continuity_history_exists,
-            now,
-        )?;
-        let reconciled_floor_count =
-            session_authority.reconcile_durable_continuity_floors(|session_id| {
-                if policy_store.uses_fail_closed_fallback(session_id) {
-                    PolicyState::Blocked
-                } else {
-                    policy_store.policy_state(session_id)
-                }
-            })?;
-        Some((startup, reconciled_floor_count))
-    } else {
-        None
-    };
     let durable_continuity_debug =
         durable_continuity_startup
             .as_ref()
@@ -3660,6 +3691,24 @@ fn event_log_history_exists(path: &Path) -> io::Result<bool> {
             .any(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+fn continuity_history_exists(
+    event_family_bytes: u64,
+    policy_state_path: &Path,
+) -> io::Result<bool> {
+    Ok(event_family_bytes > 0 || path_has_nonempty_file(policy_state_path)?)
+}
+
+fn reconciled_continuity_floor(
+    uses_fail_closed_fallback: bool,
+    policy_state: PolicyState,
+) -> PolicyState {
+    if uses_fail_closed_fallback {
+        PolicyState::Blocked
+    } else {
+        policy_state
     }
 }
 
@@ -13336,6 +13385,585 @@ mod tests {
         assert!(!continuity_path.exists());
         assert!(upstream_recorder.finish().is_empty());
         fs::remove_dir(policy_temp).expect("nonregular policy temp should remove");
+        fixture.stop();
+    }
+
+    fn assert_continuity_startup_failure_preserves_existing_state(
+        label: &str,
+        continuity_before: Vec<u8>,
+        expected_error: impl FnOnce(&io::Error),
+    ) {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("event sentinel should write");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let debug_before = format!(r#"{{"sentinel":"{label}"}}"#).into_bytes();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        fs::write(&continuity_path, &continuity_before).expect("continuity sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = format!("{label}-lease-sentinel").into_bytes();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("continuity failure must reject production startup");
+
+        expected_error(&error);
+        let diagnostic = error.to_string();
+        for secret in &fixture.supplied_secrets {
+            assert!(
+                !diagnostic.contains(secret),
+                "diagnostic leaked configured secret"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&continuity_path).unwrap(), continuity_before);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!sidecar_state_path(&continuity_path, ".tmp").exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn continuity_floor_reconciliation_blocks_fail_closed_fallback_sessions() {
+        assert_eq!(
+            reconciled_continuity_floor(true, PolicyState::Observe),
+            PolicyState::Blocked
+        );
+        assert_eq!(
+            reconciled_continuity_floor(false, PolicyState::Suspicious),
+            PolicyState::Suspicious
+        );
+    }
+
+    #[test]
+    fn continuity_history_requires_nonempty_event_or_policy_state() {
+        let policy_path = unique_temp_path("continuity-history-policy");
+        assert!(!continuity_history_exists(0, &policy_path).unwrap());
+        assert!(continuity_history_exists(1, &policy_path).unwrap());
+
+        fs::write(&policy_path, []).expect("empty policy fixture should write");
+        assert!(!continuity_history_exists(0, &policy_path).unwrap());
+        assert!(continuity_history_exists(1, &policy_path).unwrap());
+
+        fs::write(&policy_path, b"{}").expect("nonempty policy fixture should write");
+        assert!(continuity_history_exists(0, &policy_path).unwrap());
+        assert!(continuity_history_exists(1, &policy_path).unwrap());
+        fs::remove_file(policy_path).expect("policy fixture should remove");
+    }
+
+    fn continuity_key_id_from_empty_state(continuity_path: &Path) -> String {
+        let mut authority = SessionAuthority::ephemeral();
+        authority
+            .enable_durable_continuity(
+                continuity_path,
+                "continuity-key",
+                false,
+                current_unix_secs(),
+            )
+            .expect("empty continuity state should initialize");
+        let state: serde_json::Value = serde_json::from_slice(
+            &fs::read(continuity_path).expect("continuity state should read"),
+        )
+        .expect("continuity state should parse");
+        state["transport_key_id_hex"]
+            .as_str()
+            .expect("continuity key id should be a string")
+            .to_string()
+    }
+
+    #[test]
+    fn authoritative_continuity_failure_under_lease_precedes_other_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("event sentinel should write");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let debug_before = br#"{"sentinel":"authoritative-continuity"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let mut authority = SessionAuthority::ephemeral();
+        authority
+            .enable_durable_continuity(
+                &continuity_path,
+                "continuity-key",
+                false,
+                current_unix_secs(),
+            )
+            .expect("valid continuity fixture should persist");
+        drop(authority);
+        let continuity_before = fs::read(&continuity_path).expect("continuity fixture should read");
+        let continuity_for_hook = continuity_path.clone();
+        TEST_BEFORE_AUTHORITATIVE_CONTINUITY_PREPARE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(&continuity_for_hook, b"authoritative-invalid-state")
+                    .expect("authoritative race fixture should write");
+            }));
+        });
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("authoritative continuity prepare must reject raced state");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("could not parse session continuity store"));
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(
+            fs::read(&continuity_path).unwrap(),
+            b"authoritative-invalid-state"
+        );
+        assert!(!sidecar_state_path(&continuity_path, ".tmp").exists());
+        assert!(upstream_recorder.finish().is_empty());
+        assert_ne!(fs::read(&continuity_path).unwrap(), continuity_before);
+        fixture.stop();
+    }
+
+    #[test]
+    fn invalid_continuity_state_fails_before_existing_lease_or_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("event sentinel should write");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let debug_before = br#"{"sentinel":"invalid-continuity-state"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let invalid_continuity = br#"{"schema_version":2,"transport_key_id_hex":"not-redacted-secret","records":[],"integrity_mac_hex":"00"}"#.to_vec();
+        fs::write(&continuity_path, &invalid_continuity)
+            .expect("invalid continuity sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"invalid-continuity-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("invalid continuity state must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("transport_key_id_hex must be exactly 64 lowercase hex characters"),
+            "unexpected diagnostic: {diagnostic}"
+        );
+        assert!(!diagnostic.contains("not-redacted-secret"));
+        for secret in &fixture.supplied_secrets {
+            assert!(
+                !diagnostic.contains(secret),
+                "diagnostic leaked configured secret"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&continuity_path).unwrap(), invalid_continuity);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!sidecar_state_path(&continuity_path, ".tmp").exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn future_continuity_record_fails_before_existing_lease_or_startup_mutation() {
+        let continuity_scratch = unique_temp_path("future-continuity-key-id");
+        let active_key_id = continuity_key_id_from_empty_state(&continuity_scratch);
+        let continuity_state = eidolon_proxy::session_continuity_store::StoredContinuityState {
+            schema_version:
+                eidolon_proxy::session_continuity_store::SESSION_CONTINUITY_SCHEMA_VERSION,
+            transport_key_id_hex: active_key_id.clone(),
+            migration_quarantine_until: None,
+            records: vec![
+                eidolon_proxy::session_continuity_store::StoredContinuityRecord {
+                    key_digest_hex: "11".repeat(32),
+                    continuity_key_id_hex: Some(active_key_id),
+                    session_id: SessionId::new(),
+                    enforcement_floor: Some(PolicyState::Blocked),
+                    last_seen: current_unix_secs()
+                        .saturating_add(24 * 60 * 60)
+                        .saturating_add(1),
+                    last_recovery_at: None,
+                    recovery_count: 0,
+                },
+            ],
+            integrity_mac_hex: String::new(),
+        };
+        eidolon_proxy::session_continuity_store::persist_state(
+            &continuity_scratch,
+            &continuity_state,
+            &eidolon_proxy::session_continuity_store::IntegrityKey::derive("continuity-key")
+                .expect("continuity integrity key"),
+        )
+        .expect("future continuity fixture should persist");
+        let continuity_before = fs::read(&continuity_scratch).expect("future fixture should read");
+        let _ = fs::remove_file(&continuity_scratch);
+
+        assert_continuity_startup_failure_preserves_existing_state(
+            "future-continuity-state",
+            continuity_before,
+            |error| {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(
+                    error.to_string(),
+                    "continuity state contains a future-dated last-seen timestamp"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn unavailable_continuity_record_key_fails_before_existing_lease_or_startup_mutation() {
+        let continuity_scratch = unique_temp_path("unavailable-continuity-key-id");
+        let active_key_id = continuity_key_id_from_empty_state(&continuity_scratch);
+        let continuity_state = eidolon_proxy::session_continuity_store::StoredContinuityState {
+            schema_version:
+                eidolon_proxy::session_continuity_store::SESSION_CONTINUITY_SCHEMA_VERSION,
+            transport_key_id_hex: active_key_id,
+            migration_quarantine_until: None,
+            records: vec![
+                eidolon_proxy::session_continuity_store::StoredContinuityRecord {
+                    key_digest_hex: "22".repeat(32),
+                    continuity_key_id_hex: Some("cd".repeat(32)),
+                    session_id: SessionId::new(),
+                    enforcement_floor: Some(PolicyState::Blocked),
+                    last_seen: current_unix_secs(),
+                    last_recovery_at: None,
+                    recovery_count: 0,
+                },
+            ],
+            integrity_mac_hex: String::new(),
+        };
+        eidolon_proxy::session_continuity_store::persist_state(
+            &continuity_scratch,
+            &continuity_state,
+            &eidolon_proxy::session_continuity_store::IntegrityKey::derive("continuity-key")
+                .expect("continuity integrity key"),
+        )
+        .expect("unavailable-key continuity fixture should persist");
+        let continuity_before =
+            fs::read(&continuity_scratch).expect("unavailable-key fixture should read");
+        let _ = fs::remove_file(&continuity_scratch);
+
+        assert_continuity_startup_failure_preserves_existing_state(
+            "unavailable-continuity-key-state",
+            continuity_before,
+            |error| {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(
+                    error.to_string(),
+                    "live continuity binding requires an unavailable previous continuity key"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn over_capacity_continuity_state_fails_before_existing_lease_or_startup_mutation() {
+        let continuity_scratch = unique_temp_path("over-capacity-continuity");
+        let active_key_id = continuity_key_id_from_empty_state(&continuity_scratch);
+        let continuity_state = eidolon_proxy::session_continuity_store::StoredContinuityState {
+            schema_version:
+                eidolon_proxy::session_continuity_store::SESSION_CONTINUITY_SCHEMA_VERSION,
+            transport_key_id_hex: active_key_id.clone(),
+            migration_quarantine_until: None,
+            records: (0..=eidolon_proxy::session_continuity_store::MAX_CONTINUITY_RECORDS)
+                .map(
+                    |index| eidolon_proxy::session_continuity_store::StoredContinuityRecord {
+                        key_digest_hex: format!("{index:064x}"),
+                        continuity_key_id_hex: Some(active_key_id.clone()),
+                        session_id: SessionId(uuid::Uuid::from_u128(index as u128 + 1)),
+                        enforcement_floor: None,
+                        last_seen: current_unix_secs(),
+                        last_recovery_at: None,
+                        recovery_count: 0,
+                    },
+                )
+                .collect(),
+            integrity_mac_hex: "00".repeat(32),
+        };
+        let continuity_before = serde_json::to_vec(&continuity_state)
+            .expect("over-capacity continuity fixture should serialize");
+
+        assert_continuity_startup_failure_preserves_existing_state(
+            "over-capacity-continuity-state",
+            continuity_before,
+            |error| {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "session continuity store has {} records; maximum is {}",
+                        eidolon_proxy::session_continuity_store::MAX_CONTINUITY_RECORDS + 1,
+                        eidolon_proxy::session_continuity_store::MAX_CONTINUITY_RECORDS
+                    )
+                );
+            },
+        );
+        let _ = fs::remove_file(&continuity_scratch);
+    }
+
+    #[test]
+    fn bad_mac_continuity_state_fails_before_existing_lease_or_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("event sentinel should write");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let debug_before = br#"{"sentinel":"bad-mac-continuity-state"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let mut continuity_writer = SessionAuthority::ephemeral();
+        continuity_writer
+            .enable_durable_continuity(
+                &continuity_path,
+                "continuity-key",
+                false,
+                current_unix_secs(),
+            )
+            .expect("valid continuity sentinel should write");
+        let mut continuity_json: serde_json::Value = serde_json::from_slice(
+            &fs::read(&continuity_path).expect("continuity sentinel should read"),
+        )
+        .expect("continuity sentinel should parse");
+        continuity_json["integrity_mac_hex"] = serde_json::Value::String("00".repeat(32));
+        let invalid_continuity = serde_json::to_vec_pretty(&continuity_json)
+            .expect("bad-mac continuity should serialize");
+        fs::write(&continuity_path, &invalid_continuity)
+            .expect("bad-mac continuity sentinel should write");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"bad-mac-continuity-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("bad continuity MAC must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let diagnostic = error.to_string();
+        assert!(
+            diagnostic.contains("session continuity store integrity verification failed"),
+            "unexpected diagnostic: {diagnostic}"
+        );
+        for secret in &fixture.supplied_secrets {
+            assert!(
+                !diagnostic.contains(secret),
+                "diagnostic leaked configured secret"
+            );
+        }
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert_eq!(fs::read(&continuity_path).unwrap(), invalid_continuity);
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(!sidecar_state_path(&continuity_path, ".tmp").exists());
+        assert!(upstream_recorder.finish().is_empty());
+        fixture.stop();
+    }
+
+    #[test]
+    fn nonregular_continuity_temp_fails_before_existing_lease_or_startup_mutation() {
+        let profile_path = write_bait_profile(session_minted_profile_json());
+        let bait_signing_secret = write_bait_signing_secret("mint-secret");
+        let (upstream, upstream_recorder) =
+            spawn_recording_upstream([json_response(r#"{"unexpected":true}"#)]);
+        let fixture = CompleteProductionProfileFixture::new(
+            &upstream,
+            &profile_path,
+            &bait_signing_secret,
+            "mint-secret",
+        );
+        let event_before = b"\n".to_vec();
+        fs::write(&fixture.event_log_path, &event_before).expect("event sentinel should write");
+        let policy_before = serde_json::to_vec(&json!({
+            "schema_version": eidolon_proxy::policy_store::POLICY_STORE_SCHEMA_VERSION,
+            "sessions": [],
+        }))
+        .expect("empty policy state should serialize");
+        fs::write(&fixture.policy_state_path, &policy_before)
+            .expect("empty policy state should write");
+        let debug_before = br#"{"sentinel":"nonregular-continuity-temp"}"#.to_vec();
+        fs::write(&fixture.debug_log_path, &debug_before).expect("debug sentinel should write");
+        let exposure_path = sidecar_state_path(&fixture.event_log_path, ".exposures.json");
+        let proof_path = sidecar_state_path(&fixture.event_log_path, ".consumed-proofs.json");
+        let exposure_before = serde_json::to_vec(&StoredBaitExposureState {
+            schema_version: BAIT_EXPOSURE_STATE_SCHEMA_VERSION,
+            exposures: Vec::new(),
+        })
+        .expect("exposure sentinel should serialize");
+        let proof_before = serde_json::to_vec(&StoredConsumedProofState {
+            schema_version: CONSUMED_PROOF_STATE_SCHEMA_VERSION,
+            migration_quarantine_until: None,
+            consumed: Vec::new(),
+        })
+        .expect("proof sentinel should serialize");
+        fs::write(&exposure_path, &exposure_before).expect("exposure sentinel should write");
+        fs::write(&proof_path, &proof_before).expect("proof sentinel should write");
+        let continuity_path = sidecar_state_path(&fixture.policy_state_path, ".continuity.json");
+        let continuity_temp = sidecar_state_path(&continuity_path, ".tmp");
+        fs::create_dir(&continuity_temp).expect("continuity temp directory should create");
+        let lease_path = state_lease_path(&fixture.policy_state_path);
+        let lease_before = b"nonregular-continuity-temp-lease-sentinel".to_vec();
+        fs::write(&lease_path, &lease_before).expect("lease sentinel should write");
+        let (started, started_received) = mpsc::channel();
+
+        let error = run_proxy_with_production_shutdown(fixture.parse(), async {}, Some(started))
+            .expect_err("nonregular continuity temp must reject production startup");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "session continuity temporary path is not a regular file"
+        );
+        assert!(started_received.try_recv().is_err());
+        assert_eq!(fixture.renderer.synchronized_accepted_connection_count(), 0);
+        assert_eq!(fs::read(&fixture.event_log_path).unwrap(), event_before);
+        assert_eq!(fs::read(&fixture.policy_state_path).unwrap(), policy_before);
+        assert_eq!(fs::read(&fixture.debug_log_path).unwrap(), debug_before);
+        assert_eq!(fs::read(&exposure_path).unwrap(), exposure_before);
+        assert_eq!(fs::read(&proof_path).unwrap(), proof_before);
+        assert!(!continuity_path.exists());
+        assert!(fs::metadata(&continuity_temp).unwrap().is_dir());
+        assert_eq!(fs::read(&lease_path).unwrap(), lease_before);
+        assert!(upstream_recorder.finish().is_empty());
+        fs::remove_dir(continuity_temp).expect("continuity temp directory should remove");
         fixture.stop();
     }
 

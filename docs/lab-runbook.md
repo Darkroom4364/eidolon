@@ -136,7 +136,7 @@ The proxy assigns a first-party `eidolon_session` cookie when no valid session c
 
 Session cookies are authenticated. The value has the form `v1.<key-version>.<issued-at>.<session-uuid>.<hmac-sha256-hex>`; the proxy verifies the proof, key version, and server-side age before accepting a cookie. A missing, malformed, forged, unknown-key, or expired cookie never supplies the session identity: the request receives a proxy-minted session instead, and the deterministic outcome (`absent`, `valid`, `malformed`, `unknown_key_version`, `bad_signature`, `expired`) is recorded in the server-side debug log as a `session_resolved` audit event together with the continuity outcome. Cookie discard or rapid rotation from one direct peer is absorbed by a bounded continuity map (24h TTL, 4096 peers, one recovery per 60s cooldown): the peer is re-bound to its existing session with its enforcement floor intact, and excess rotation mints fresh sessions that still inherit that floor, so rotation cannot reset policy or evidence state. The floor ranks `blocked` highest and never downgrades an already-loaded state.
 
-Signing keys come from `--session-signing-key-file <PATH>` with JSON shape `{"active_key_version": 2, "keys": [{"version": 1, "key_hex": "<64 hex>"}, {"version": 2, "key_hex": "<64 hex>"}]}`. Every listed version verifies cookies; only the active version mints. Rotate by adding the new version, marking it active, and dropping retired versions once cookies older than the 7-day server-side lifetime have aged out. Cookies signed by a retired-but-listed version are accepted and transparently re-minted under the active version on the response. The Kubernetes lab manifests require this file from Secret `eidolon-session-signing`, key `key-ring.json`, mounted read-only at `/var/run/secrets/eidolon-session-signing/key-ring.json`. The Secret must exist before the proxy pod starts and must be backed up with the PVC as one recovery set. Update it with overlapping key versions and restart the `Recreate` Deployment to load a new active version; remove a retired version only after its cookie lifetime has elapsed and another controlled restart can load the reduced ring. Losing or replacing the ring invalidates outstanding cookies even if PVC state survives. Outside this manifest path, omitting the flag still creates an ephemeral process key and loses cookie validity at restart. Authenticated-ingress mappings are HMAC-minimized and persisted beside policy state at `<policy-state-path>.continuity.json`; raw continuity identities and Lab peer keys are excluded. The HMAC-authenticated sidecar writes schema v2 and reads schema versions 1 through 2, and new durable mappings are limited to 64 per rolling 60-second window. `--ingress-continuity-key-file <PATH>` separates continuity minimization and sidecar integrity from request transport authentication. Existing deployments must initially provision it with the current transport-secret bytes so existing sidecar state remains readable. The continuity key is backup-critical and must remain stable while transport credentials rotate. All key files are secrets and must stay outside the event and debug logs.
+Signing keys come from `--session-signing-key-file <PATH>` with JSON shape `{"active_key_version": 2, "keys": [{"version": 1, "key_hex": "<64 hex>"}, {"version": 2, "key_hex": "<64 hex>"}]}`. Every listed version verifies cookies; only the active version mints. Rotate by adding the new version, marking it active, and dropping retired versions once cookies older than the 7-day server-side lifetime have aged out. Cookies signed by a retired-but-listed version are accepted and transparently re-minted under the active version on the response. The Kubernetes lab manifests require this file from Secret `eidolon-session-signing`, key `key-ring.json`, mounted read-only at `/var/run/secrets/eidolon-session-signing/key-ring.json`. The Secret must exist before the proxy pod starts and must be backed up with the PVC as one recovery set. Update it with overlapping key versions and restart the `Recreate` Deployment to load a new active version; remove a retired version only after its cookie lifetime has elapsed and another controlled restart can load the reduced ring. Losing or replacing the ring invalidates outstanding cookies even if PVC state survives. Outside this manifest path, omitting the flag still creates an ephemeral process key and loses cookie validity at restart. Authenticated-ingress mappings are HMAC-minimized and persisted beside policy state at `<policy-state-path>.continuity.json`; raw continuity identities and Lab peer keys are excluded. The HMAC-authenticated sidecar writes schema v2 and reads schema versions 1 through 2, and new durable mappings are limited to 64 per rolling 60-second window. Its MAC authenticates content but is not a freshness proof: restoring an older valid sidecar is not detected without a monotonic anchor outside the PVC/backup rollback domain. Backup/restore therefore proves only coherent exact-state restoration, not anti-rollback. `--ingress-continuity-key-file <PATH>` separates continuity minimization and sidecar integrity from request transport authentication. Existing deployments must initially provision it with the current transport-secret bytes so existing sidecar state remains readable. The continuity key is backup-critical and must remain stable while transport credentials rotate. All key files are secrets and must stay outside the event and debug logs.
 
 The production profile also requires one or more repeatable
 `--trusted-ingress-source-cidr <CIDR>` options (maximum 32). These authorize
@@ -284,6 +284,27 @@ bounds crash residue and matches the Kubernetes recovery allowlist. A
 would-exceed or other pre-rename failure leaves the last durable file unchanged
 and rolls back exposure state or makes proof acceptance unavailable according
 to the existing fail-closed contract.
+
+Authenticated-continuity startup follows the same prepare-before-effects rule.
+Production checks `<policy-state-path>.continuity.json` and its fixed
+`<policy-state-path>.continuity.json.tmp` path with `symlink_metadata` before
+acquiring the durable writer lease: an absent temp or regular crash residue is
+accepted without deletion, while a symlink, directory, or other non-regular
+object fails closed. Existing continuity state is read through the 2 MiB
+limit-plus-one buffer, schema/MAC/record/key-provenance/timestamp/quarantine
+semantics are validated, TTL/capacity filtering and schema-v1-to-v2 migration
+are planned without mutation, and the canonical rewrite size is checked before
+any temp creation. After acquiring the lease, production repeats the prepare on
+an authoritative snapshot, verifies that the prepared file and temp membership
+have not changed before commit, then writes exactly the prepared canonical
+state. Empty, malformed, oversized, over-capacity, future-dated,
+key-mismatched, bad-MAC, or unavailable-previous-key continuity state fails
+before event-tail repair, policy migration, debug-log open, bait-sidecar
+replacement, continuity replacement, listener notification, renderer access,
+or protected-upstream work. Failures discovered by the prelease prepare leave
+absent or existing lease metadata intact; an authoritative revalidation failure
+under the acquired lease may create or refresh only the bounded lease metadata
+before startup exits.
 The JSONL event and debug logs rotate at 32 MiB to collision-safe timestamped
 archives, keeping up to 3 archives plus the active segment per log. Together
 those logs consume at most about 256 MiB before filesystem overhead, below the
@@ -460,9 +481,15 @@ proves that:
 - the protected upstream observes zero writes beyond the labelled baseline
 
 This proves the single-writer guarantee against a forced overlap on the owned
-kind/local-path profile only. It does not prove cross-node storage
-portability, HA coordination, or lease behavior after a holder crash (the
-operating system releases process-held leases on exit).
+kind/local-path profile only. It assumes cooperative writers and an
+operator-controlled namespace whose lease path, durable directory, ancestors,
+and backing mount cannot be renamed or replaced while the proxy runs. File
+locks attach to opened file objects, so another container or process with that
+namespace-mutation authority is outside the lease boundary and must not share
+write access to the volume. The smoke does not prove cross-node storage
+portability, HA coordination, hostile namespace replacement, or lease behavior
+after a holder crash (the operating system releases process-held leases on
+exit).
 
 Every request handled by the proxy is assigned an opaque `request_id` (a random v4 UUID; it encodes no secrets, client identity, or request data). Every event derived from that request — `request_seen`, bait exposure and action events, policy decisions and changes, responses, rate limits, and reality-escape audits — carries that id, so concurrent requests sharing one session cookie can still be separated causally. Trace and edge-export reducers join events strictly by `request_id`; sessions whose events predate request identifiers are exported with `request_linkage: unknown_legacy` and no cross-event joins are attempted.
 

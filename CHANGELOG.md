@@ -17,7 +17,10 @@ Initial research-alpha source release.
 - fail-closed unsafe-action routing, request-linked causality,
   integrity-protected session identity, and bounded recoverable state
 - continuity sidecar schema v2 with schema-v1 migration and a bounded,
-  fail-closed active/previous continuity-key rotation path
+  fail-closed active/previous continuity-key rotation path; production now
+  validates and prepares continuity state read-only before the durable writer
+  lease, repeats the authoritative prepare under the lease, and commits only
+  the prepared canonical state before serving traffic
 - policy-state schema 1--3 loading with a 32 MiB startup/write bound,
   order-independent duplicate-session rejection, and pre-migration pending
   workflow/response/event-contract validation; production preflights invalid
