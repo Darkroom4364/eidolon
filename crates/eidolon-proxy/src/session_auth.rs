@@ -914,6 +914,11 @@ impl SessionAuthority {
                 "durable continuity must be committed before continuity records exist",
             ));
         }
+        if prepared.restored_records.len() > self.continuity_capacity {
+            return Err(invalid_data(
+                "prepared continuity state exceeds configured capacity",
+            ));
+        }
         match session_continuity_store::commit_prepared_startup(
             &prepared.prepared_store,
             &prepared.canonical_state,
@@ -3392,6 +3397,55 @@ mod tests {
             error.to_string(),
             "durable continuity must be committed before continuity records exist"
         );
+    }
+
+    #[test]
+    fn prepared_commit_revalidates_configured_capacity_before_mutation() {
+        let dir = TestDir::new();
+        let state_path = dir.path("continuity.json");
+        let mut writer = test_authority();
+        writer
+            .enable_durable_continuity(&state_path, "edge-secret", false, NOW)
+            .expect("durable continuity should initialize");
+        for raw in ["client-a", "client-b"] {
+            writer.resolve_with_continuity(
+                [("Host", "proxy.local")],
+                Some(ingress_key(raw)),
+                NOW + 1,
+            );
+        }
+        writer
+            .persist_continuity_state_durably()
+            .expect("two records should checkpoint");
+        let state_before = fs::read(&state_path).expect("checkpoint should read");
+        drop(writer);
+
+        let mut restored = test_authority();
+        let prepared = restored
+            .prepare_durable_continuity_with_previous(
+                &state_path,
+                "edge-secret",
+                None,
+                true,
+                NOW + 2,
+            )
+            .expect("two records should prepare at the default capacity");
+        restored
+            .set_continuity_capacity(1)
+            .expect("empty authority may lower its capacity before commit");
+
+        let error = restored
+            .commit_prepared_durable_continuity(prepared, NOW + 2)
+            .expect_err("commit must revalidate the current configured capacity");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "prepared continuity state exceeds configured capacity"
+        );
+        assert!(restored.continuity.is_empty());
+        assert!(restored.continuity_order.is_empty());
+        assert!(restored.continuity_state_path.is_none());
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
     }
 
     #[test]
