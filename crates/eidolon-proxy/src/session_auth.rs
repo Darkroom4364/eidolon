@@ -3446,6 +3446,25 @@ mod tests {
         assert!(restored.continuity_order.is_empty());
         assert!(restored.continuity_state_path.is_none());
         assert_eq!(fs::read(&state_path).unwrap(), state_before);
+
+        let mut exact_capacity = test_authority();
+        let prepared = exact_capacity
+            .prepare_durable_continuity_with_previous(
+                &state_path,
+                "edge-secret",
+                None,
+                true,
+                NOW + 3,
+            )
+            .expect("two records should prepare again");
+        exact_capacity
+            .set_continuity_capacity(2)
+            .expect("empty authority may set the exact restored capacity");
+        let startup = exact_capacity
+            .commit_prepared_durable_continuity(prepared, NOW + 3)
+            .expect("exact configured capacity must remain valid");
+        assert_eq!(startup.restored_record_count, 2);
+        assert_eq!(exact_capacity.continuity.len(), 2);
     }
 
     #[test]
