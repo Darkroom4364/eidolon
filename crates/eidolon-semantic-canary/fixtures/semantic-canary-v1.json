@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "corpus_version": "v1",
+  "cases": [
+    {
+      "id": "equivalent_paraphrase",
+      "class": "equivalent",
+      "reference": "Synthetic archive accepts sealed records after local validation.",
+      "candidate": "Local validation accepts sealed archive records.",
+      "expected": "equivalent"
+    },
+    {
+      "id": "contradiction",
+      "class": "contradiction",
+      "reference": "Synthetic archive accepts sealed records after local validation.",
+      "candidate": "Synthetic archive does not accept sealed records after local validation.",
+      "expected": "contradiction"
+    },
+    {
+      "id": "unrelated_lexical_overlap",
+      "class": "lexical_overlap_hard_negative",
+      "reference": "Synthetic archive accepts sealed records after local validation.",
+      "candidate": "Synthetic archive lantern catalog tracks blue paper labels.",
+      "expected": "abstain"
+    },
+    {
+      "id": "benign_near_neighbor",
+      "class": "benign_near_neighbor",
+      "reference": "Synthetic archive accepts sealed records after local validation.",
+      "candidate": "Synthetic archive records local weather notes after validation.",
+      "expected": "abstain"
+    },
+    {
+      "id": "exact_copy",
+      "class": "exact_copy",
+      "reference": "Synthetic archive accepts sealed records after local validation.",
+      "candidate": "Synthetic archive accepts sealed records after local validation.",
+      "expected": "equivalent"
+    }
+  ]
+}

@@ -3,6 +3,7 @@ members = [
     "crates/eidolon-core",
     "crates/eidolon-bait",
     "crates/eidolon-trace",
+    "crates/eidolon-semantic-canary",
     "crates/eidolon-proxy",
     "examples/demo-target",
 ]
