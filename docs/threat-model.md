@@ -222,6 +222,35 @@ Bait must not include:
 - real customer data
 - instructions that improve attacker capability against third parties
 
+## Semantic-Canary Benchmark Boundary
+
+Semantic canaries are synthetic, inert benchmark fixtures for measuring whether
+meaning survives controlled paraphrase and whether negative controls remain
+distinguishable. In the initial phase they are evaluated offline only.
+
+Protected assets for this benchmark lane are:
+
+- truthful fixture labels and scorer results
+- a disclosure-safe synthetic fixture corpus
+- strict separation from runtime policy, routing, containment, and evidence
+
+Adversarial and failure inputs include malicious or malformed fixture text,
+lexical-overlap shortcuts, negation and contradiction, paraphrase drift, scorer
+nondeterminism or version drift, corpus leakage or memorization, prompt-injection
+style text trying to induce tool or network use, oversized or high-cardinality
+manifests, report oversharing, and operator promotion of similarity into causal
+or attribution claims.
+
+Controls are inert-data parsing only, no tool or network execution contract,
+strict schema, size, count, and time bounds, held-out and benign near-neighbor
+controls, repeated-run version and hash metadata, an abstention band, false
+positive breakdowns, allowlisted summary export, and explicit non-causality
+labels.
+
+This boundary does not model, identify, or attribute an external attacker.
+Scanner, actor, intent, autonomy, model, vendor, family, maliciousness, and
+production efficacy claims remain unsupported by semantic benchmark scores.
+
 ## M2.5 Controlled-Reality Boundary
 
 M2.5 controlled reality is in scope only for the owned Lab and one narrow decoy admin/API branch.
@@ -258,3 +287,9 @@ High-confidence bait-derived autonomous recon/action chain observed
 ```
 
 Eidolon detects behavior, not ontology. It does not need to prove the actor is an LLM.
+
+Semantic-canary benchmark labels, similarity scores, contradiction results, or
+action-shape observations are not causal runtime evidence. Keep direct
+observations, fixture labels, scorer outputs, derived benchmark evaluations,
+and same-session accepted bait proof as separate evidence classes. Ambiguity
+means unknown or abstained, never confirmation.

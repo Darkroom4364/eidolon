@@ -110,6 +110,9 @@ artifact must provide the evidence for every checked item.
 - CLI help, examples, manifests, runbooks, and actual defaults agree.
 - The production profile cannot silently inherit Lab-only flags or insecure
   cookie defaults.
+- Offline semantic-canary benchmark work is not supported Shield behavior and
+  cannot satisfy, replace, or weaken runtime bait-proof, routing, evidence, or
+  compatibility requirements.
 
 ### Gate 2: Production HTTP Boundary
 
@@ -242,8 +245,8 @@ Cryptographic receipts, SCITT, and broad telemetry fusion are not v1 blockers.
   including one non-OpenAPI chain, pass the deterministic release suite.
 - Negative controls prove wrong-session, wrong-proof, static bait, ordinary
   application traffic, and ambiguous request behavior.
-- Scanner capability, substrate quality, and Eidolon defensive effect remain
-  separate result sets.
+- Scanner capability, substrate quality, Eidolon defensive effect, and any
+  semantic-canary benchmark result remain separate result sets.
 
 No pwnkit, XBow, model-family, or benchmark score is required to pass this
 gate.
@@ -319,6 +322,8 @@ These may proceed when useful, but they do not block v1.0:
 - Linux arm64 production images and multi-architecture release matrices
 - managed-cloud, multi-cluster, and multi-region deployment
 - broad controlled-reality worlds or LLM-generated deception
+- runtime semantic inference, semantic-canary routing, semantic-score policy
+  input, or promotion of semantic similarity to accepted bait proof
 - pwnkit, XBow, or other offensive-agent benchmark expansion
 - Kali-to-microVM transfer and Firecracker execution lanes
 - browser-agent fingerprinting or model-family attribution

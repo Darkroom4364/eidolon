@@ -63,6 +63,8 @@ Eidolon is not:
 - an MCP firewall
 - a prompt-injection scanner
 - a promise to perfectly detect "AI attackers"
+- a way to attribute actor identity, intent, autonomy, model, vendor, or model
+  family from semantic similarity or benchmark behavior
 
 The project is defensive. It may degrade hostile behavior inside a protected boundary, but it must not compromise infrastructure outside that boundary.
 
@@ -194,6 +196,11 @@ the causal-bait, request-linked evidence, fail-closed unsafe-action routing,
 and controlled-reality research baseline. Issue `#213` recorded a one-time
 advisory engineering review; findings `#207` through `#212` were resolved
 independently, and proposed repository-wide enforcement in `#214` was retired.
+
+Semantic-canary/GDOP-style work is currently an offline, synthetic benchmark
+lane only. It is not production routing, actor attribution, model fingerprinting,
+or accepted bait proof. Any future runtime work requires separate review under
+`docs/semantic-canary-benchmark.md`; this benchmark does not authorize it.
 
 The repository already includes:
 

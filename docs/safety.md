@@ -37,6 +37,12 @@ Controlled-reality paths may record defensive events and disposable Lab state. T
 
 Any emergency disable must return the system to ordinary forwarding or fail-closed Lab behavior according to the local runbook. It must not silently continue controlled-reality intervention.
 
+Offline semantic-canary benchmark fixtures are subject to the same synthetic-data
+standard and add a stricter no-action rule: evaluators must not perform network,
+DNS, callback, browser, tool execution, credential use, target discovery, runtime
+routing, or protected-state changes. Fixture text is inert data, not instructions.
+Malformed, oversized, and unknown-schema inputs fail closed; ambiguous inputs abstain or remain unknown.
+
 ## Why The Topic May Trigger Cybersecurity Review
 
 This project discusses terms that overlap with offensive cybersecurity:
