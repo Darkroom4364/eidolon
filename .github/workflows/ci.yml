@@ -62,6 +62,15 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --locked
 
+      - name: Verify offline semantic-canary qualification boundary
+        run: |
+          cargo test -p eidolon-semantic-canary --all-targets --locked
+          cargo run -p eidolon-semantic-canary --bin eidolon-semantic-canary-qualify --locked > semantic-canary-qualification.json
+          test "$(jq -r '.held_out' semantic-canary-qualification.json)" = 'true'
+          test "$(jq -r '.repetitions' semantic-canary-qualification.json)" = '3'
+          test "$(jq -r '.summary.corpus_version' semantic-canary-qualification.json)" = 'heldout_v1'
+          ! grep -Eq 'reference|candidate|results|Synthetic kiln|heldout_equivalent_reordered' semantic-canary-qualification.json
+
       - name: Test production HTTP fuzz driver
         run: cargo test -p eidolon-proxy --features fuzzing --lib fuzzing::tests --locked
 

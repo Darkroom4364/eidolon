@@ -223,6 +223,15 @@ pub fn export_report_summary_json(report: &BenchmarkReport) -> Result<Vec<u8>, B
         .map_err(|error| BenchmarkError::InvalidJson(error.to_string()))
 }
 
+/// Serializes qualification metadata and its nested summary. The artifact has
+/// no raw fixture text, candidate text, or case identifiers.
+pub fn export_qualification_summary_json(
+    report: &QualificationReport,
+) -> Result<Vec<u8>, BenchmarkError> {
+    serde_json::to_vec_pretty(report)
+        .map_err(|error| BenchmarkError::InvalidJson(error.to_string()))
+}
+
 /// Repeats deterministic scoring of the checked-in held-out corpus under a
 /// documented fixed seed. The lexical baseline consumes no randomness; the seed
 /// is qualification metadata that pins future compatible scorer runs.

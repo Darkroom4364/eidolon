@@ -202,6 +202,13 @@ lane only. It is not production routing, actor attribution, model fingerprinting
 or accepted bait proof. Any future runtime work requires separate review under
 `docs/semantic-canary-benchmark.md`; this benchmark does not authorize it.
 
+Run the deterministic embedded held-out qualification and emit its summary-only
+artifact with:
+
+```sh
+cargo run -p eidolon-semantic-canary --bin eidolon-semantic-canary-qualify --locked
+```
+
 The repository already includes:
 
 - a Rust reverse proxy with per-session policy state, controlled reality, and
