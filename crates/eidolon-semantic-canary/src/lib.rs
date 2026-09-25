@@ -17,6 +17,9 @@ pub const MAX_ID_BYTES: usize = 64;
 pub const MAX_TEXT_BYTES: usize = 1024;
 
 pub const CANONICAL_CORPUS: &[u8] = include_bytes!("../fixtures/semantic-canary-v1.json");
+pub const HELD_OUT_CORPUS: &[u8] = include_bytes!("../fixtures/semantic-canary-heldout-v1.json");
+pub const QUALIFICATION_REPETITIONS: u8 = 3;
+pub const QUALIFICATION_FIXED_SEED: u64 = 0x5345_4d43_414e_4152;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +47,7 @@ pub enum FixtureClass {
     LexicalOverlapHardNegative,
     BenignNearNeighbor,
     ExactCopy,
+    Unrelated,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -74,6 +78,29 @@ pub struct BenchmarkReport {
     pub confusion: BTreeMap<Decision, BTreeMap<Decision, u32>>,
     pub class_confusion: BTreeMap<FixtureClass, BTreeMap<Decision, u32>>,
     pub results: Vec<CaseResult>,
+}
+
+/// Summary-only artifact intended for qualification export. It deliberately has
+/// no fixture text, candidate text, or per-case identifiers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BenchmarkSummary {
+    pub schema_version: u16,
+    pub scorer_version: &'static str,
+    pub corpus_version: String,
+    pub corpus_sha256: String,
+    pub cases_scored: u32,
+    pub abstained: u32,
+    pub confusion: BTreeMap<Decision, BTreeMap<Decision, u32>>,
+    pub class_confusion: BTreeMap<FixtureClass, BTreeMap<Decision, u32>>,
+    pub limitations: [&'static str; 3],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct QualificationReport {
+    pub fixed_seed: u64,
+    pub repetitions: u8,
+    pub held_out: bool,
+    pub summary: BenchmarkSummary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,6 +198,51 @@ pub fn score_corpus_json(input: &[u8]) -> Result<BenchmarkReport, BenchmarkError
     })
 }
 
+/// Produces a summary-only artifact. No raw fixture or prediction text is exported.
+pub fn summarize_report(report: &BenchmarkReport) -> BenchmarkSummary {
+    BenchmarkSummary {
+        schema_version: report.schema_version,
+        scorer_version: report.scorer_version,
+        corpus_version: report.corpus_version.clone(),
+        corpus_sha256: report.corpus_sha256.clone(),
+        cases_scored: report.cases_scored,
+        abstained: report.abstained,
+        confusion: report.confusion.clone(),
+        class_confusion: report.class_confusion.clone(),
+        limitations: [
+            "offline synthetic benchmark inference only",
+            "not runtime causal evidence, routing, containment, or policy input",
+            "not actor, model, vendor, intent, autonomy, or maliciousness attribution",
+        ],
+    }
+}
+
+/// Serializes a summary-only artifact without raw fixture/prediction text.
+pub fn export_report_summary_json(report: &BenchmarkReport) -> Result<Vec<u8>, BenchmarkError> {
+    serde_json::to_vec_pretty(&summarize_report(report))
+        .map_err(|error| BenchmarkError::InvalidJson(error.to_string()))
+}
+
+/// Repeats deterministic scoring of the checked-in held-out corpus under a
+/// documented fixed seed. The lexical baseline consumes no randomness; the seed
+/// is qualification metadata that pins future compatible scorer runs.
+pub fn qualify_held_out() -> Result<QualificationReport, BenchmarkError> {
+    let first = score_corpus_json(HELD_OUT_CORPUS)?;
+    for _ in 1..QUALIFICATION_REPETITIONS {
+        if score_corpus_json(HELD_OUT_CORPUS)? != first {
+            return Err(BenchmarkError::InvalidJson(
+                "non-deterministic qualification result".to_owned(),
+            ));
+        }
+    }
+    Ok(QualificationReport {
+        fixed_seed: QUALIFICATION_FIXED_SEED,
+        repetitions: QUALIFICATION_REPETITIONS,
+        held_out: true,
+        summary: summarize_report(&first),
+    })
+}
+
 fn validate_case(case: &CaseInput, ids: &mut BTreeSet<String>) -> Result<(), BenchmarkError> {
     let invalid = |reason| BenchmarkError::InvalidCase {
         id: case.id.clone(),
@@ -194,6 +266,7 @@ fn validate_case(case: &CaseInput, ids: &mut BTreeSet<String>) -> Result<(), Ben
         FixtureClass::LexicalOverlapHardNegative | FixtureClass::BenignNearNeighbor => {
             case.expected == Decision::Abstain
         }
+        FixtureClass::Unrelated => case.expected == Decision::Unrelated,
     };
     if !aligned {
         return Err(invalid("class and expected decision disagree"));
@@ -293,6 +366,47 @@ mod tests {
             .iter()
             .all(|result| result.expected == result.observed));
         assert_eq!(first.corpus_sha256.len(), 64);
+    }
+    #[test]
+    fn held_out_qualification_is_repeated_separate_and_exact() {
+        let canonical = score_corpus_json(CANONICAL_CORPUS).unwrap();
+        let held_out = score_corpus_json(HELD_OUT_CORPUS).unwrap();
+        let qualification = qualify_held_out().unwrap();
+        assert_ne!(canonical.corpus_sha256, held_out.corpus_sha256);
+        assert_eq!(held_out.corpus_version, "heldout_v1");
+        assert_eq!(held_out.cases_scored, 6);
+        assert!(held_out
+            .results
+            .iter()
+            .all(|result| result.expected == result.observed));
+        assert_eq!(qualification.fixed_seed, QUALIFICATION_FIXED_SEED);
+        assert_eq!(qualification.repetitions, QUALIFICATION_REPETITIONS);
+        assert!(qualification.held_out);
+        assert_eq!(qualification.summary, summarize_report(&held_out));
+        let canonical_ids: BTreeSet<_> =
+            canonical.results.iter().map(|result| &result.id).collect();
+        assert!(held_out
+            .results
+            .iter()
+            .all(|result| !canonical_ids.contains(&result.id)));
+    }
+    #[test]
+    fn summary_export_has_no_raw_text_or_case_identifiers() {
+        let report = score_corpus_json(HELD_OUT_CORPUS).unwrap();
+        let export = String::from_utf8(export_report_summary_json(&report).unwrap()).unwrap();
+        for forbidden in [
+            "reference",
+            "candidate",
+            "results",
+            "heldout_equivalent_reordered",
+            "Synthetic kiln",
+            "amber tiles",
+        ] {
+            assert!(!export.contains(forbidden), "export leaked {forbidden:?}");
+        }
+        assert!(export.contains("corpus_sha256"));
+        assert!(export.contains("limitations"));
+        assert!(export.contains("heldout_v1"));
     }
     #[test]
     fn rejects_checked_in_invalid_controls() {

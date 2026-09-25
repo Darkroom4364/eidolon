@@ -158,7 +158,8 @@ Accepted when:
 
 Accepted only with repeated fixed-seed results, held-out templates, zero unsafe
 fixture content, explicit limitations, and an artifact exporter that omits raw
-fixture and prediction text by default.
+fixture and prediction text by default. Qualification metadata records the held-out
+corpus version and SHA-256, scorer version, repetition count, and fixed seed.
 
 ## Future Runtime Work Is Outside This Contract
 
