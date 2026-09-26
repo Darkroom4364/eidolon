@@ -14,9 +14,14 @@ fn cli_emits_exact_summary_only_qualification_artifact() {
     let expected = export_qualification_summary_json(&qualify_held_out().unwrap()).unwrap();
     assert_eq!(output.stdout.strip_suffix(b"\n").unwrap(), expected);
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["contract_version"],
+        "eidolon.semantic-canary-qualification/v1"
+    );
     assert_eq!(value["held_out"], true);
     assert_eq!(value["repetitions"], 3);
-    assert!(value["fixed_seed"].as_u64().is_some());
+    assert_eq!(value["fixed_seed"], "0x53454d43414e4152");
+    assert!(value["fixed_seed"].as_u64().is_none());
     for forbidden in [
         "reference",
         "candidate",

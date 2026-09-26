@@ -160,6 +160,9 @@ Accepted only with repeated fixed-seed results, held-out templates, zero unsafe
 fixture content, explicit limitations, and an artifact exporter that omits raw
 fixture and prediction text by default. Qualification metadata records the held-out
 corpus version and SHA-256, scorer version, repetition count, and fixed seed.
+The exported qualification envelope has its own versioned contract identifier,
+and the fixed seed is encoded as a canonical hexadecimal string so JSON
+consumers do not lose integer precision.
 
 ## Future Runtime Work Is Outside This Contract
 

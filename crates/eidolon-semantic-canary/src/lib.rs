@@ -19,7 +19,8 @@ pub const MAX_TEXT_BYTES: usize = 1024;
 pub const CANONICAL_CORPUS: &[u8] = include_bytes!("../fixtures/semantic-canary-v1.json");
 pub const HELD_OUT_CORPUS: &[u8] = include_bytes!("../fixtures/semantic-canary-heldout-v1.json");
 pub const QUALIFICATION_REPETITIONS: u8 = 3;
-pub const QUALIFICATION_FIXED_SEED: u64 = 0x5345_4d43_414e_4152;
+pub const QUALIFICATION_CONTRACT_VERSION: &str = "eidolon.semantic-canary-qualification/v1";
+pub const QUALIFICATION_FIXED_SEED: &str = "0x53454d43414e4152";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,7 +98,8 @@ pub struct BenchmarkSummary {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct QualificationReport {
-    pub fixed_seed: u64,
+    pub contract_version: &'static str,
+    pub fixed_seed: &'static str,
     pub repetitions: u8,
     pub held_out: bool,
     pub summary: BenchmarkSummary,
@@ -250,6 +252,7 @@ pub fn qualify_held_out() -> Result<QualificationReport, BenchmarkError> {
         }
     }
     Ok(QualificationReport {
+        contract_version: QUALIFICATION_CONTRACT_VERSION,
         fixed_seed: QUALIFICATION_FIXED_SEED,
         repetitions: QUALIFICATION_REPETITIONS,
         held_out: true,
@@ -395,6 +398,10 @@ mod tests {
             .results
             .iter()
             .all(|result| result.expected == result.observed));
+        assert_eq!(
+            qualification.contract_version,
+            QUALIFICATION_CONTRACT_VERSION
+        );
         assert_eq!(qualification.fixed_seed, QUALIFICATION_FIXED_SEED);
         assert_eq!(qualification.repetitions, QUALIFICATION_REPETITIONS);
         assert!(qualification.held_out);

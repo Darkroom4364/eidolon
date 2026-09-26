@@ -67,6 +67,8 @@ jobs:
           python3 scripts/ci/check-semantic-canary-capabilities.py
           cargo test -p eidolon-semantic-canary --all-targets --locked
           cargo run -p eidolon-semantic-canary --bin eidolon-semantic-canary-qualify --locked > semantic-canary-qualification.json
+          test "$(jq -r '.contract_version' semantic-canary-qualification.json)" = 'eidolon.semantic-canary-qualification/v1'
+          test "$(jq -r '.fixed_seed' semantic-canary-qualification.json)" = '0x53454d43414e4152'
           test "$(jq -r '.held_out' semantic-canary-qualification.json)" = 'true'
           test "$(jq -r '.repetitions' semantic-canary-qualification.json)" = '3'
           test "$(jq -r '.summary.corpus_version' semantic-canary-qualification.json)" = 'heldout_v1'
