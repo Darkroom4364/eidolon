@@ -43,6 +43,7 @@ Semantic-canary benchmark changes must also preserve the offline capability
 boundary and summary-only export contract:
 
 ```sh
+python3 scripts/ci/check-semantic-canary-capabilities.py
 cargo test -p eidolon-semantic-canary --all-targets --locked
 cargo run -p eidolon-semantic-canary --bin eidolon-semantic-canary-qualify --locked
 ```

@@ -64,6 +64,7 @@ jobs:
 
       - name: Verify offline semantic-canary qualification boundary
         run: |
+          python3 scripts/ci/check-semantic-canary-capabilities.py
           cargo test -p eidolon-semantic-canary --all-targets --locked
           cargo run -p eidolon-semantic-canary --bin eidolon-semantic-canary-qualify --locked > semantic-canary-qualification.json
           test "$(jq -r '.held_out' semantic-canary-qualification.json)" = 'true'

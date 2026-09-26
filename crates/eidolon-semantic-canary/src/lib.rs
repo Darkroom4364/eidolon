@@ -109,6 +109,7 @@ pub enum BenchmarkError {
     InvalidJson(String),
     UnsupportedSchema { actual: u16 },
     InvalidCorpusVersion,
+    EmptyCorpus,
     TooManyCases { actual: usize, maximum: usize },
     InvalidCase { id: String, reason: &'static str },
 }
@@ -122,6 +123,7 @@ impl std::fmt::Display for BenchmarkError {
             Self::InvalidJson(error) => write!(f, "invalid corpus JSON: {error}"),
             Self::UnsupportedSchema { actual } => write!(f, "unsupported schema version: {actual}"),
             Self::InvalidCorpusVersion => f.write_str("invalid corpus version"),
+            Self::EmptyCorpus => f.write_str("corpus must contain at least one case"),
             Self::TooManyCases { actual, maximum } => {
                 write!(f, "corpus has {actual} cases; maximum is {maximum}")
             }
@@ -149,6 +151,9 @@ pub fn score_corpus_json(input: &[u8]) -> Result<BenchmarkReport, BenchmarkError
     }
     if !valid_identifier(&corpus.corpus_version, MAX_ID_BYTES) {
         return Err(BenchmarkError::InvalidCorpusVersion);
+    }
+    if corpus.cases.is_empty() {
+        return Err(BenchmarkError::EmptyCorpus);
     }
     if corpus.cases.len() > MAX_CASES {
         return Err(BenchmarkError::TooManyCases {
@@ -292,12 +297,14 @@ fn valid_identifier(value: &str, limit: usize) -> bool {
 }
 
 fn safe_synthetic_text(value: &str) -> bool {
-    value.is_ascii()
-        && !value.contains("http://")
-        && !value.contains("https://")
-        && !value.contains('@')
-        && !value.contains("secret")
-        && !value.contains("password")
+    if !value.is_ascii() || value.contains('@') {
+        return false;
+    }
+    let normalized = value.to_ascii_lowercase();
+    !normalized.contains("http://")
+        && !normalized.contains("https://")
+        && !normalized.contains("secret")
+        && !normalized.contains("password")
 }
 
 fn classify(reference: &str, candidate: &str) -> Decision {
@@ -311,8 +318,8 @@ fn classify(reference: &str, candidate: &str) -> Decision {
     }
     let overlap = left.intersection(&right).count();
     let smaller = left.len().min(right.len());
-    let negated = contains_negation(candidate);
-    if negated && overlap * 2 >= smaller {
+    let polarity_mismatch = contains_negation(reference) != contains_negation(candidate);
+    if polarity_mismatch && overlap * 2 >= smaller {
         return Decision::Contradiction;
     }
     if overlap == 0 {
@@ -435,6 +442,30 @@ mod tests {
             score_corpus_json(include_bytes!("../fixtures/invalid/oversize-text.json")),
             Err(BenchmarkError::InvalidCase { .. })
         ));
+    }
+    #[test]
+    fn contradiction_detection_is_symmetric_across_polarity() {
+        let positive = "Synthetic archive accepts sealed records after local validation.";
+        let negative = "Synthetic archive does not accept sealed records after local validation.";
+        assert_eq!(classify(positive, negative), Decision::Contradiction);
+        assert_eq!(classify(negative, positive), Decision::Contradiction);
+        assert_eq!(classify(negative, negative), Decision::Equivalent);
+    }
+    #[test]
+    fn rejects_empty_corpus_and_case_insensitive_unsafe_markers() {
+        assert!(matches!(
+            score_corpus_json(br#"{"schema_version":1,"corpus_version":"v1","cases":[]}"#),
+            Err(BenchmarkError::EmptyCorpus)
+        ));
+        for text in ["HTTPS://example.test", "Secret marker", "PASSWORD marker"] {
+            let corpus = format!(
+                r#"{{"schema_version":1,"corpus_version":"v1","cases":[{{"id":"unsafe","class":"equivalent","reference":"{text}","candidate":"{text}","expected":"equivalent"}}]}}"#
+            );
+            assert!(matches!(
+                score_corpus_json(corpus.as_bytes()),
+                Err(BenchmarkError::InvalidCase { .. })
+            ));
+        }
     }
     #[test]
     fn rejects_bounds_and_unsafe_text() {
