@@ -157,6 +157,7 @@ crates/
   eidolon-core/   shared event, bait, policy, and scoring types
   eidolon-bait/   bait generation and verification primitives
   eidolon-trace/  event correlation and trace reconstruction
+  eidolon-semantic-canary/  bounded offline synthetic benchmark scorer
   eidolon-proxy/  reverse proxy entrypoint
 
 docs/
@@ -186,6 +187,7 @@ examples/
   m3/
   metrics/
   qualification/
+  semantic-canary/
   shield-lab/
 ```
 
