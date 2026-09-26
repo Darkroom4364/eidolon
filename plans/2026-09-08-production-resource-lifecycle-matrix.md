@@ -18,7 +18,7 @@ head: `a6c1227952127dc15063f2d9820cba614e51d609`, tree
 C3c starting HEAD: `d8b5cfdbbdef538146142d653151a73b22d0765d`, tree
 `c597e1977d1c3f63354256312aa607bfd2785f91`, branch
 `test/production-resource-lifecycle-c3c`. The dedicated
-`/Users/darkroom/Projects/.worktrees/eidolon-release-lifecycle-c3c-20260908`
+`$EIDOLON_WORKTREE`
 worktree was clean at those exact values before editing. Those values identify
 the base. Initial implementation head
 `0cdfc70bb57f18f72d5bcacfe0aa91b6285c358e`, tree

@@ -20,7 +20,7 @@ remain open**.
 
 Starting head: `264cea2bab8b275eb78709eb3e43a9f7fc855ab9`, the reviewed
 C3 documentation head. The dedicated
-`/Users/darkroom/Projects/.worktrees/eidolon-release-http-fuzz-c4-20260909`
+`$EIDOLON_WORKTREE`
 worktree was clean at that exact head before C4 editing.
 
 This document records bounded parser, policy, and canonicalization fuzz
