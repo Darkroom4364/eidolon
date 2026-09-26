@@ -39,4 +39,17 @@ Shell and deployment changes should also run their adjacent `test-*.sh`
 fixtures. Security-relevant changes need a regression test for the failure
 path, not only a happy-path test.
 
+Semantic-canary benchmark changes must also preserve the offline capability
+boundary and summary-only export contract:
+
+```sh
+python3 scripts/ci/check-semantic-canary-capabilities.py
+cargo test -p eidolon-semantic-canary --all-targets --locked
+cargo run -p eidolon-semantic-canary --bin eidolon-semantic-canary-qualify --locked
+```
+
+Do not add proxy/runtime, network, DNS, browser/tool, credential, or subprocess
+dependencies to that crate. See
+[docs/semantic-canary-benchmark.md](docs/semantic-canary-benchmark.md).
+
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).

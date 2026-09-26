@@ -131,6 +131,17 @@ Issues:
 4. Define and collect first evaluation metrics
 5. Add baseline modes: no defense, static token, static honeypot, WAF-style block
 6. Add owned-target-only safety guardrail
+7. Define the offline semantic-canary benchmark contract, evidence taxonomy,
+   prohibited claims, data-handling rules, and owner/reviewer expectations.
+8. Add a synthetic semantic-canary corpus with paraphrase, contradiction,
+   unrelated lexical-overlap hard-negative, benign near-neighbor, exact-copy,
+   malformed, and oversize controls.
+9. Add an offline scorer with an explicit dependency/capability allowlist that
+   rejects unknown or oversized inputs, reports deterministic per-class confusion
+   and abstention metrics with corpus version and hash metadata, exports summaries
+   without raw text by default, imports nothing from proxy/runtime crates, and
+   cannot obtain outbound, DNS, tool, browser, subprocess, credential, or runtime
+   control capabilities.
 
 ## M1 Observation And Intervention Proxy
 

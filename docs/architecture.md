@@ -337,6 +337,13 @@ expected_action:
   value: rel_2025_04_b7f2
 ```
 
+Semantic-canary benchmark work is a separate offline lane. It may reuse bait and
+canary language to describe synthetic fixtures that test paraphrase,
+contradiction, lexical-overlap negatives, and abstention behavior, but it is not
+the runtime bait engine. It must not change `BaitClass`, `ExpectedAction`,
+`SurfaceController`, routing, containment, or protected state. Its results are
+benchmark inferences, not `BaitActionObserved` events or accepted proof.
+
 ## 4. Trace Intelligence
 
 Trace intelligence turns raw events into behavior.

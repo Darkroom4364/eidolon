@@ -48,6 +48,11 @@ prioritized independently.
    effect remain separate evaluation lanes and headline metrics.
 10. Secrets, bodies, cookies, query values, sensitive path segments, and
     incidental personal data are minimized before export or signing.
+11. Semantic similarity, classification, or equivalence scores are offline
+    benchmark inferences only. They do not alter served content, routing,
+    containment, policy, protected state, `EventKind::BaitActionObserved`, or
+    `ProofOutcome::Accepted`; only same-session, request-linked, accepted bait
+    proof may support a confirmed runtime causal chain.
 
 ## Priority Guidance
 

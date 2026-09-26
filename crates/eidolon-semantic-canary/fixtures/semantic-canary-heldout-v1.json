@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "corpus_version": "heldout_v1",
+  "cases": [
+    {
+      "id": "heldout_equivalent_reordered",
+      "class": "equivalent",
+      "reference": "Synthetic kiln records amber tiles after local review.",
+      "candidate": "After local review, amber tile records are kept by the synthetic kiln.",
+      "expected": "equivalent"
+    },
+    {
+      "id": "heldout_contradiction",
+      "class": "contradiction",
+      "reference": "Synthetic kiln records amber tiles after local review.",
+      "candidate": "Synthetic kiln does not record amber tiles after local review.",
+      "expected": "contradiction"
+    },
+    {
+      "id": "heldout_exact_copy",
+      "class": "exact_copy",
+      "reference": "Synthetic lantern index stores violet labels after review.",
+      "candidate": "Synthetic lantern index stores violet labels after review.",
+      "expected": "equivalent"
+    },
+    {
+      "id": "heldout_lexical_overlap_negative",
+      "class": "lexical_overlap_hard_negative",
+      "reference": "Synthetic kiln records amber tiles after local review.",
+      "candidate": "Synthetic kiln catalog stores blue paper labels.",
+      "expected": "abstain"
+    },
+    {
+      "id": "heldout_benign_neighbor",
+      "class": "benign_near_neighbor",
+      "reference": "Synthetic kiln records amber tiles after local review.",
+      "candidate": "Synthetic kiln notebook tracks spring weather notes daily.",
+      "expected": "abstain"
+    },
+    {
+      "id": "heldout_unrelated",
+      "class": "unrelated",
+      "reference": "Synthetic orchard counts silver pears before sorting.",
+      "candidate": "Observatory maps quiet comet paths at dusk.",
+      "expected": "unrelated"
+    }
+  ]
+}
