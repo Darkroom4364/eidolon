@@ -3861,7 +3861,10 @@ mod tests {
                 POLICY_STORE_SCHEMA_VERSION
             )
         );
-        assert!(!error.to_string().contains("999"));
+        assert!(!error
+            .to_string()
+            .replace(&path.display().to_string(), "")
+            .contains("999"));
         assert_eq!(
             fs::read(&path).expect("unsupported state should remain readable"),
             unsupported
