@@ -2,7 +2,7 @@
 
 All notable changes to Eidolon are documented here.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-11-27
 
 Initial research-alpha source release.
 
@@ -46,6 +46,8 @@ Initial research-alpha source release.
 
 - research Lab software, not a production security boundary
 - no managed-cluster, high-availability, or multi-replica renderer claim
-- no published crates, container images, or hosted service
+- source-only release; no published crates, container images, or hosted service
+- semantic-canary scoring is an offline synthetic benchmark only, not runtime
+  routing, containment, actor attribution, or accepted bait proof
 
 [0.1.0]: https://github.com/Darkroom4364/eidolon/releases/tag/v0.1.0
