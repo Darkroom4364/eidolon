@@ -2,7 +2,7 @@
 
 All notable changes to Eidolon are documented here.
 
-## [0.1.0] - 2026-09-26
+## [0.1.0] - 2026-11-27
 
 Initial research-alpha source release.
 
