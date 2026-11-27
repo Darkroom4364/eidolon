@@ -1,0 +1,6 @@
+[advisories]
+# Unmaintained with no drop-in successor; revisit on replacement.
+ignore = [
+    "RUSTSEC-2026-0543", # chrono is unmaintained
+    "RUSTSEC-2026-0542", # humantime is unmaintained (vendor/hyper dev tooling)
+]

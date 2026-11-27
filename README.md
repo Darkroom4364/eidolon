@@ -1,6 +1,6 @@
 # Eidolon
 
-Eidolon is a Rust-first active defense project for autonomous cyber agents.
+Eidolon is a proof of concept Rust-first active defense project for autonomous cyber agents.
 
 > **Release status:** Eidolon `v0.1.0` is a research alpha for owned,
 > authorized lab environments. It is not production-ready, a security
